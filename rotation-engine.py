@@ -87,7 +87,7 @@ def save_quota_state(state):
 
 
 def load_assignments():
-    return load_json(ASSIGNMENTS_FILE, {"terminals": {}})
+    return load_json(ASSIGNMENTS_FILE, {"sessions": {}})
 
 
 def save_assignments(assignments):
@@ -98,58 +98,63 @@ def load_profiles():
     return load_json(PROFILES_FILE, {"accounts": {}})
 
 
-def get_my_pid():
-    """Get the Claude Code parent PID (the terminal session)."""
-    # Walk up to find the claude process PID
-    # Use PPID if we're called from a hook/statusline (child of claude)
-    ppid = os.getppid()
-    return str(ppid)
+SESSION_ID_FILE = ACCOUNTS_DIR / ".session_id"
 
 
-def is_pid_alive(pid):
-    """Check if a process is still running."""
+def get_session_id():
+    """Get current session ID. Passed via env or file."""
+    # Env var takes priority (set by statusline/hook callers)
+    sid = os.environ.get("CLAUDE_SQUAD_SESSION")
+    if sid:
+        return sid
+    # Fallback: read from file (set by last statusline call)
     try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
+        return SESSION_ID_FILE.read_text().strip()
+    except FileNotFoundError:
+        return None
 
 
-def cleanup_dead_terminals(assignments):
-    """Remove assignments for terminals that no longer exist."""
-    dead = []
-    for pid, info in assignments.get("terminals", {}).items():
-        if not is_pid_alive(pid):
-            dead.append(pid)
-    for pid in dead:
-        del assignments["terminals"][pid]
-    return len(dead) > 0
+def set_session_id(sid):
+    """Cache session ID for non-statusline callers (hooks)."""
+    SESSION_ID_FILE.write_text(sid)
 
 
-def get_account_for_pid(assignments, pid):
-    """Get which account a terminal PID is using."""
-    info = assignments.get("terminals", {}).get(pid, {})
+def cleanup_stale_sessions(assignments):
+    """Remove sessions older than 24 hours (likely dead)."""
+    now = time.time()
+    stale = []
+    for sid, info in assignments.get("sessions", {}).items():
+        age = now - info.get("assigned_at", 0)
+        if age > 86400:  # 24 hours
+            stale.append(sid)
+    for sid in stale:
+        del assignments["sessions"][sid]
+    return len(stale) > 0
+
+
+def get_account_for_session(assignments, session_id):
+    """Get which account a session is using."""
+    info = assignments.get("sessions", {}).get(session_id, {})
     return info.get("account")
 
 
-def get_pids_for_account(assignments, account):
-    """Get all terminal PIDs using a given account."""
-    pids = []
-    for pid, info in assignments.get("terminals", {}).items():
-        if info.get("account") == str(account):
-            pids.append(pid)
-    return pids
+def get_sessions_for_account(assignments, account):
+    """Get all session IDs using a given account."""
+    return [
+        sid for sid, info in assignments.get("sessions", {}).items()
+        if info.get("account") == str(account)
+    ]
 
 
 def count_account_users(assignments, account):
-    """How many live terminals are using this account."""
-    return len(get_pids_for_account(assignments, account))
+    """How many sessions are using this account."""
+    return len(get_sessions_for_account(assignments, account))
 
 
 def log_rotation(from_acct, to_acct, reason, pid=None):
     entry = {
         "time": time.time(),
-        "pid": pid or get_my_pid(),
+        "pid": pid or get_session_id(),
         "from": from_acct,
         "to": to_acct,
         "reason": reason,
@@ -254,12 +259,12 @@ def pick_best_account(state, assignments, exclude=None):
 
 # ─── Rotation Decision ────────────────────────────────────
 
-def check_rotation_for_pid(state, assignments, pid):
+def check_rotation_for_session(state, assignments, session_id):
     """
-    Check if a specific terminal should rotate.
+    Check if a specific session should rotate.
     Returns: (should_rotate, target, reason)
     """
-    current = get_account_for_pid(assignments, pid)
+    current = get_account_for_session(assignments, session_id)
     if not current:
         return False, None, "no assignment"
 
@@ -365,16 +370,17 @@ def extract_current(account_num):
     return True
 
 
-def swap_to(account_num, pid=None, save_current=True):
-    """Swap keychain to account N. Updates assignment for PID."""
+def swap_to(account_num, session_id=None, save_current=True):
+    """Swap keychain to account N. Updates assignment for session."""
     cred_file = CREDS_DIR / f"{account_num}.json"
     if not cred_file.exists():
         print(f"error: no credentials for account {account_num}", file=sys.stderr)
         return False
 
     # Save current credentials before overwriting
-    if save_current:
-        current = get_account_for_pid(load_assignments(), pid or get_my_pid())
+    sid = session_id or get_session_id()
+    if save_current and sid:
+        current = get_account_for_session(load_assignments(), sid)
         if current and (CREDS_DIR / f"{current}.json").exists():
             current_creds = read_keychain()
             if current_creds:
@@ -386,14 +392,17 @@ def swap_to(account_num, pid=None, save_current=True):
     if not write_keychain(creds):
         return False
 
-    # Update assignment
-    pid = pid or get_my_pid()
-    assignments = load_assignments()
-    assignments.setdefault("terminals", {})[pid] = {
-        "account": str(account_num),
-        "assigned_at": time.time(),
-    }
-    save_assignments(assignments)
+    # Update assignment if we have a session
+    if sid:
+        assignments = load_assignments()
+        assignments.setdefault("sessions", {})[sid] = {
+            "account": str(account_num),
+            "assigned_at": time.time(),
+        }
+        save_assignments(assignments)
+
+    # Also update .current for non-session callers (ccc swap)
+    CURRENT_FILE.write_text(str(account_num))
 
     profiles = load_profiles()
     email = profiles.get("accounts", {}).get(str(account_num), {}).get("email", "unknown")
@@ -405,15 +414,15 @@ def swap_to(account_num, pid=None, save_current=True):
 
 def claim_account(pid=None):
     """Claim the best available account for a terminal."""
-    pid = pid or get_my_pid()
+    pid = pid or get_session_id()
 
     with StateLock():
         state = load_quota_state()
         assignments = load_assignments()
-        cleanup_dead_terminals(assignments)
+        cleanup_stale_sessions(assignments)
 
         # Already assigned?
-        existing = get_account_for_pid(assignments, pid)
+        existing = get_account_for_session(assignments, pid)
         if existing:
             profiles = load_profiles()
             email = profiles.get("accounts", {}).get(existing, {}).get("email", "?")
@@ -425,14 +434,14 @@ def claim_account(pid=None):
             print("error: no accounts available", file=sys.stderr)
             return None
 
-        assignments.setdefault("terminals", {})[pid] = {
+        assignments.setdefault("sessions", {})[pid] = {
             "account": target,
             "assigned_at": time.time(),
         }
         save_assignments(assignments)
 
     # Swap keychain (outside lock — keychain has its own locking)
-    if swap_to(target, pid=pid, save_current=False):
+    if swap_to(target, session_id=pid, save_current=False):
         log_rotation(None, target, "initial claim", pid)
         return target
     return None
@@ -440,12 +449,12 @@ def claim_account(pid=None):
 
 def release_account(pid=None):
     """Release a terminal's account assignment."""
-    pid = pid or get_my_pid()
+    pid = pid or get_session_id()
     with StateLock():
         assignments = load_assignments()
-        account = get_account_for_pid(assignments, pid)
-        if pid in assignments.get("terminals", {}):
-            del assignments["terminals"][pid]
+        account = get_account_for_session(assignments, pid)
+        if pid in assignments.get("sessions", {}):
+            del assignments["sessions"][pid]
             save_assignments(assignments)
             print(f"Released account {account}")
         else:
@@ -454,15 +463,14 @@ def release_account(pid=None):
 
 # ─── Quota Update + Auto-Rotate ───────────────────────────
 
-def update_and_maybe_rotate(json_str, pid=None):
+def update_and_maybe_rotate(json_str):
     """
     Called from statusline every few seconds.
-    1. Updates quota state for current account
-    2. Checks if rotation needed
-    3. Auto-swaps if needed
+    1. Extracts session_id from the statusline JSON
+    2. Updates quota state for current account
+    3. Checks if rotation needed
+    4. Auto-swaps if needed
     """
-    pid = pid or get_my_pid()
-
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError:
@@ -472,19 +480,27 @@ def update_and_maybe_rotate(json_str, pid=None):
     if not rate_limits:
         return
 
+    # Extract session_id from statusline input — this is stable per Claude Code session
+    sid = data.get("session_id")
+    if not sid:
+        return
+
+    # Cache session_id for hooks (which don't get the JSON input)
+    set_session_id(sid)
+
     with StateLock():
         state = load_quota_state()
         assignments = load_assignments()
-        cleanup_dead_terminals(assignments)
+        cleanup_stale_sessions(assignments)
 
-        # Determine which account this terminal is on
-        current = get_account_for_pid(assignments, pid)
+        # Determine which account this session is on
+        current = get_account_for_session(assignments, sid)
 
         if not current:
             # Auto-claim on first statusline call
             target = pick_best_account(state, assignments)
             if target:
-                assignments.setdefault("terminals", {})[pid] = {
+                assignments.setdefault("sessions", {})[sid] = {
                     "account": target,
                     "assigned_at": time.time(),
                 }
@@ -493,7 +509,7 @@ def update_and_maybe_rotate(json_str, pid=None):
             else:
                 return
 
-        # Update quota for this account
+        # Update quota ONLY for this session's account
         state.setdefault("accounts", {})[current] = {
             "five_hour": rate_limits.get("five_hour", {}),
             "seven_day": rate_limits.get("seven_day", {}),
@@ -501,24 +517,22 @@ def update_and_maybe_rotate(json_str, pid=None):
         }
         save_quota_state(state)
 
-        # Check if THIS terminal should rotate
-        should, target, reason = check_rotation_for_pid(state, assignments, pid)
+        # Check if THIS session should rotate
+        should, target, reason = check_rotation_for_session(state, assignments, sid)
 
     # Swap outside the lock
     if should and target:
         with StateLock():
-            # Re-check assignments under lock (another terminal may have claimed it)
             assignments = load_assignments()
-            cleanup_dead_terminals(assignments)
-            # Update our assignment
-            assignments.setdefault("terminals", {})[pid] = {
+            cleanup_stale_sessions(assignments)
+            assignments.setdefault("sessions", {})[sid] = {
                 "account": target,
                 "assigned_at": time.time(),
             }
             save_assignments(assignments)
 
-        if swap_to(target, pid=pid):
-            log_rotation(current, target, reason, pid)
+        if swap_to(target, session_id=sid):
+            log_rotation(current, target, reason, sid)
             # Output goes to stderr so statusline still works
             print(f"[auto-rotate] → account {target} ({reason})", file=sys.stderr)
 
@@ -529,7 +543,7 @@ def show_status():
     state = load_quota_state()
     profiles = load_profiles()
     assignments = load_assignments()
-    cleanup_dead_terminals(assignments)
+    cleanup_stale_sessions(assignments)
 
     print("Claude Code Account Rotation")
     print("=" * 55)
@@ -543,7 +557,7 @@ def show_status():
         if not email and not has_creds:
             continue
 
-        terminals = get_pids_for_account(assignments, n)
+        terminals = get_sessions_for_account(assignments, n)
         terminal_str = f" [{len(terminals)} terminal{'s' if len(terminals)!=1 else ''}]" if terminals else ""
 
         if not has_creds:
@@ -588,9 +602,9 @@ def show_status():
 
 def statusline_quota(pid=None):
     """Compact string for statusline."""
-    pid = pid or get_my_pid()
+    pid = pid or get_session_id()
     assignments = load_assignments()
-    current = get_account_for_pid(assignments, pid)
+    current = get_account_for_session(assignments, pid)
 
     if not current:
         # Fallback: read .current file
@@ -635,10 +649,10 @@ def main():
         show_status()
 
     elif cmd == "check":
-        pid = get_my_pid()
+        pid = get_session_id()
         state = load_quota_state()
         assignments = load_assignments()
-        should, target, reason = check_rotation_for_pid(state, assignments, pid)
+        should, target, reason = check_rotation_for_session(state, assignments, pid)
         result = {"should_rotate": should, "target": target, "reason": reason}
         if should:
             profiles = load_profiles()
@@ -683,21 +697,21 @@ def main():
         print(statusline_quota())
 
     elif cmd == "auto-rotate":
-        pid = get_my_pid()
+        pid = get_session_id()
         state = load_quota_state()
         assignments = load_assignments()
-        should, target, reason = check_rotation_for_pid(state, assignments, pid)
+        should, target, reason = check_rotation_for_session(state, assignments, pid)
         if should and target:
             with StateLock():
                 assignments = load_assignments()
-                cleanup_dead_terminals(assignments)
-                assignments.setdefault("terminals", {})[pid] = {
+                cleanup_stale_sessions(assignments)
+                assignments.setdefault("sessions", {})[pid] = {
                     "account": target,
                     "assigned_at": time.time(),
                 }
                 save_assignments(assignments)
-            if swap_to(target, pid=pid):
-                log_rotation(get_account_for_pid(load_assignments(), pid), target, reason, pid)
+            if swap_to(target, session_id=pid):
+                log_rotation(get_account_for_session(load_assignments(), pid), target, reason, pid)
                 profiles = load_profiles()
                 email = profiles.get("accounts", {}).get(target, {}).get("email", "")
                 print(f"[auto-rotate] → account {target} ({email}) — {reason}")

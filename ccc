@@ -126,6 +126,7 @@ for f in ['$ACCOUNTS_DIR/mm.json', '$HOME/.claude/settings-mm.json']:
   for n in 1 2 3 4 5 6 7; do
     local settings_file="$ACCOUNTS_DIR/${n}.json"
     local config_dir="$ACCOUNTS_DIR/${n}"
+    local cred_file="$ACCOUNTS_DIR/credentials/${n}.json"
     local marker=" "
     [[ "$current" == "$n" ]] && marker="→"
 
@@ -139,6 +140,12 @@ for f in ['$ACCOUNTS_DIR/mm.json', '$HOME/.claude/settings-mm.json']:
       local email
       email=$(get_profile_field "$n" "email")
       echo " $marker$n  ${email:-account $n} (oauth)"
+    elif [[ -f "$cred_file" ]]; then
+      local email
+      email=$(get_profile_field "$n" "email")
+      local method
+      method=$(get_profile_field "$n" "method")
+      echo " $marker$n  ${email:-account $n} (${method:-oauth})"
     else
       echo "  $n  (not configured)"
     fi
@@ -375,6 +382,9 @@ except: print('account $n')
       [[ "$1" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $1"
       python3 "$HOME/.claude/accounts/rotation-engine.py" swap "$1"
       ;;
+    verify)
+      python3 "$HOME/.claude/accounts/rotation-engine.py" verify
+      ;;
     quota)
       python3 "$HOME/.claude/accounts/rotation-engine.py" status
       ;;
@@ -399,6 +409,7 @@ MANAGEMENT:
   ccc login <N>        OAuth login for account N (1-7)
   ccc extract <N>      Save current keychain creds as account N
   ccc swap <N>         Swap keychain to account N (no browser)
+  ccc verify           Check for credential cross-contamination
   ccc help             This message
 
 SETUP (one-time per account):

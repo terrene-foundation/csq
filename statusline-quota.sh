@@ -10,7 +10,8 @@ model_name=$(echo "$input" | jq -r '.model.display_name')
 project_name=$(basename "$current_dir")
 
 # Feed quota data to rotation engine (non-blocking, background)
-echo "$input" | python3 "$HOME/.claude/accounts/rotation-engine.py" update 2>/dev/null &
+# Pass Claude Code PID (our parent) to disambiguate multi-terminal sessions
+echo "$input" | python3 "$HOME/.claude/accounts/rotation-engine.py" update --ppid $PPID 2>/dev/null &
 
 # Change to the current directory for git operations
 cd "$current_dir" 2>/dev/null || cd ~

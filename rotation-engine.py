@@ -102,21 +102,42 @@ def load_profiles():
 SESSION_ID_FILE = ACCOUNTS_DIR / ".session_id"
 
 
-def get_session_id():
-    """Get current session ID. Passed via env or file."""
-    # Env var takes priority (set by statusline/hook callers)
+def _get_ppid_flag():
+    """Extract --ppid <value> from sys.argv if present."""
+    if "--ppid" in sys.argv:
+        idx = sys.argv.index("--ppid")
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return None
+
+
+def get_session_id(claude_pid=None):
+    """Get current session ID. Passed via env, per-terminal file, or shared file.
+
+    claude_pid: The Claude Code process PID (PPID of the calling script).
+    Used to disambiguate sessions in multi-terminal setups.
+    """
     sid = os.environ.get("CLAUDE_SQUAD_SESSION")
     if sid:
         return sid
-    # Fallback: read from file (set by last statusline call)
+    # Per-terminal file (keyed by Claude Code process PID)
+    if claude_pid:
+        try:
+            return (ACCOUNTS_DIR / f".session_id.{claude_pid}").read_text().strip()
+        except FileNotFoundError:
+            pass
+    # Fallback: shared file (last statusline call)
     try:
         return SESSION_ID_FILE.read_text().strip()
     except FileNotFoundError:
         return None
 
 
-def set_session_id(sid):
+def set_session_id(sid, claude_pid=None):
     """Cache session ID for non-statusline callers (hooks)."""
+    if claude_pid:
+        (ACCOUNTS_DIR / f".session_id.{claude_pid}").write_text(sid)
+    # Always write shared file for backward compatibility
     SESSION_ID_FILE.write_text(sid)
 
 
@@ -371,29 +392,41 @@ def extract_current(account_num):
     return True
 
 
-def swap_to(account_num, session_id=None, save_current=True):
+def swap_to(account_num, session_id=None):
     """Swap keychain to account N. Updates assignment for session."""
     cred_file = CREDS_DIR / f"{account_num}.json"
     if not cred_file.exists():
         print(f"error: no credentials for account {account_num}", file=sys.stderr)
         return False
 
-    # Save current credentials before overwriting
-    sid = session_id or get_session_id()
-    if save_current and sid:
-        current = get_account_for_session(load_assignments(), sid)
-        if current and (CREDS_DIR / f"{current}.json").exists():
-            current_creds = read_keychain()
-            if current_creds:
-                cf = CREDS_DIR / f"{current}.json"
-                cf.write_text(json.dumps(current_creds, indent=2))
-                cf.chmod(0o600)
+    # Save current keychain credentials back to the CORRECT file.
+    # Identify by matching refresh tokens, NOT session assignment — prevents cross-contamination.
+    current_creds = read_keychain()
+    if current_creds:
+        kc_refresh = current_creds.get("claudeAiOauth", {}).get("refreshToken", "")
+        if kc_refresh:
+            for n in map(str, range(1, MAX_ACCOUNTS + 1)):
+                if n == str(account_num):
+                    continue  # Don't overwrite target before loading it
+                cf = CREDS_DIR / f"{n}.json"
+                if not cf.exists():
+                    continue
+                try:
+                    stored = json.loads(cf.read_text())
+                    stored_refresh = stored.get("claudeAiOauth", {}).get("refreshToken", "")
+                    if stored_refresh == kc_refresh:
+                        cf.write_text(json.dumps(current_creds, indent=2))
+                        cf.chmod(0o600)
+                        break
+                except (json.JSONDecodeError, OSError):
+                    continue
 
     creds = json.loads(cred_file.read_text())
     if not write_keychain(creds):
         return False
 
     # Update assignment if we have a session
+    sid = session_id or get_session_id()
     if sid:
         assignments = load_assignments()
         assignments.setdefault("sessions", {})[sid] = {
@@ -442,7 +475,7 @@ def claim_account(pid=None):
         save_assignments(assignments)
 
     # Swap keychain (outside lock — keychain has its own locking)
-    if swap_to(target, session_id=pid, save_current=False):
+    if swap_to(target, session_id=pid):
         log_rotation(None, target, "initial claim", pid)
         return target
     return None
@@ -464,7 +497,7 @@ def release_account(pid=None):
 
 # ─── Quota Update + Auto-Rotate ───────────────────────────
 
-def update_and_maybe_rotate(json_str):
+def update_and_maybe_rotate(json_str, claude_pid=None):
     """
     Called from statusline every few seconds.
     1. Extracts session_id from the statusline JSON
@@ -487,7 +520,7 @@ def update_and_maybe_rotate(json_str):
         return
 
     # Cache session_id for hooks (which don't get the JSON input)
-    set_session_id(sid)
+    set_session_id(sid, claude_pid=claude_pid)
 
     with StateLock():
         state = load_quota_state()
@@ -518,27 +551,18 @@ def update_and_maybe_rotate(json_str):
         }
         save_quota_state(state)
 
-    # Keep stored credentials fresh (refresh tokens rotate)
-    # ONLY save if keychain account matches current account (prevent cross-contamination)
+    # Keep stored credentials fresh — match by refresh token to prevent cross-contamination.
+    # Unlike the old email-based check (which called `claude auth status` subprocess and was
+    # racey in multi-terminal setups), token matching is atomic and subprocess-free.
     cred_file = CREDS_DIR / f"{current}.json"
     if cred_file.exists():
         try:
             current_creds = read_keychain()
             if current_creds:
-                # Verify the keychain creds belong to this account
-                # by checking the stored email matches
-                stored_email = load_profiles().get("accounts", {}).get(current, {}).get("email", "")
-                result = subprocess.run(
-                    ["claude", "auth", "status", "--json"],
-                    capture_output=True, text=True, timeout=5
-                )
-                keychain_email = ""
-                if result.returncode == 0:
-                    try:
-                        keychain_email = json.loads(result.stdout).get("email", "")
-                    except json.JSONDecodeError:
-                        pass
-                if stored_email and keychain_email and stored_email == keychain_email:
+                kc_refresh = current_creds.get("claudeAiOauth", {}).get("refreshToken", "")
+                stored = json.loads(cred_file.read_text())
+                stored_refresh = stored.get("claudeAiOauth", {}).get("refreshToken", "")
+                if kc_refresh and stored_refresh and kc_refresh == stored_refresh:
                     cred_file.write_text(json.dumps(current_creds, indent=2))
                     cred_file.chmod(0o600)
         except Exception:
@@ -810,6 +834,48 @@ def refresh_all_accounts():
     print("\nDone.")
 
 
+# ─── Credential Verification ─────────────────────────────
+
+def verify_credentials():
+    """Check credential files for cross-contamination."""
+    import hashlib
+
+    profiles = load_profiles()
+    hashes = {}
+
+    for n in map(str, range(1, MAX_ACCOUNTS + 1)):
+        cred_file = CREDS_DIR / f"{n}.json"
+        if not cred_file.exists():
+            continue
+        content = cred_file.read_bytes()
+        h = hashlib.md5(content).hexdigest()[:12]
+        hashes.setdefault(h, []).append(n)
+
+    if not hashes:
+        print("No credential files found.")
+        return
+
+    contaminated = False
+    for h, accounts in hashes.items():
+        if len(accounts) > 1:
+            contaminated = True
+            emails = [profiles.get("accounts", {}).get(n, {}).get("email", "?") for n in accounts]
+            print(f"  CONTAMINATED: accounts {', '.join(accounts)} have identical credentials")
+            print(f"    Expected different creds for: {', '.join(emails)}")
+            print(f"    Fix: re-login each with 'ccc login N'")
+
+    for h, accounts in hashes.items():
+        if len(accounts) == 1:
+            n = accounts[0]
+            email = profiles.get("accounts", {}).get(n, {}).get("email", "?")
+            print(f"  OK: account {n} ({email}) — unique credentials")
+
+    if contaminated:
+        print(f"\nCredential contamination detected! Re-login affected accounts.")
+    else:
+        print("\nAll credentials are unique. No contamination detected.")
+
+
 # ─── Main ─────────────────────────────────────────────────
 
 def main():
@@ -819,7 +885,8 @@ def main():
         show_status()
 
     elif cmd == "check":
-        pid = get_session_id()
+        ppid = _get_ppid_flag()
+        pid = get_session_id(claude_pid=ppid)
         state = load_quota_state()
         assignments = load_assignments()
         should, target, reason = check_rotation_for_session(state, assignments, pid)
@@ -860,8 +927,9 @@ def main():
             sys.exit(1)
 
     elif cmd == "update":
-        json_str = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
-        update_and_maybe_rotate(json_str)
+        ppid = _get_ppid_flag()
+        json_str = sys.stdin.read()
+        update_and_maybe_rotate(json_str, claude_pid=ppid)
 
     elif cmd == "statusline":
         print(statusline_quota())
@@ -870,26 +938,71 @@ def main():
         refresh_all_accounts()
 
     elif cmd == "auto-rotate":
-        pid = get_session_id()
-        state = load_quota_state()
-        assignments = load_assignments()
-        should, target, reason = check_rotation_for_session(state, assignments, pid)
-        if should and target:
+        ppid = _get_ppid_flag()
+        force = "--force" in sys.argv
+        pid = get_session_id(claude_pid=ppid)
+
+        if force and pid:
+            # Force: mark current as exhausted and swap immediately, bypassing checks.
+            # The user is telling us they're rate-limited — don't second-guess them.
             with StateLock():
+                state = load_quota_state()
                 assignments = load_assignments()
-                cleanup_stale_sessions(assignments)
-                assignments.setdefault("sessions", {})[pid] = {
-                    "account": target,
-                    "assigned_at": time.time(),
-                }
-                save_assignments(assignments)
-            if swap_to(target, session_id=pid):
-                log_rotation(get_account_for_session(load_assignments(), pid), target, reason, pid)
-                profiles = load_profiles()
-                email = profiles.get("accounts", {}).get(target, {}).get("email", "")
-                print(f"[auto-rotate] → account {target} ({email}) — {reason}")
+                current = get_account_for_session(assignments, pid)
+                if current:
+                    acct = state.setdefault("accounts", {}).setdefault(current, {})
+                    acct["five_hour"] = {
+                        "used_percentage": 100,
+                        "resets_at": time.time() + 18000,
+                    }
+                    save_quota_state(state)
+
+            state = load_quota_state()
+            assignments = load_assignments()
+            current = get_account_for_session(assignments, pid)
+            target = pick_best_account(state, assignments, exclude=current)
+            if target:
+                with StateLock():
+                    assignments = load_assignments()
+                    assignments.setdefault("sessions", {})[pid] = {
+                        "account": target,
+                        "assigned_at": time.time(),
+                    }
+                    save_assignments(assignments)
+                if swap_to(target, session_id=pid):
+                    log_rotation(current, target, "force rotate", pid)
+                    profiles = load_profiles()
+                    email = profiles.get("accounts", {}).get(target, {}).get("email", "")
+                    print(f"[force-rotate] → account {target} ({email})")
+                else:
+                    sys.exit(1)
             else:
-                sys.exit(1)
+                show_status()
+                print("\nNo accounts available to rotate to — all in cooldown.")
+        else:
+            # Normal: check quota data and rotate if needed
+            state = load_quota_state()
+            assignments = load_assignments()
+            should, target, reason = check_rotation_for_session(state, assignments, pid)
+            if should and target:
+                with StateLock():
+                    assignments = load_assignments()
+                    cleanup_stale_sessions(assignments)
+                    assignments.setdefault("sessions", {})[pid] = {
+                        "account": target,
+                        "assigned_at": time.time(),
+                    }
+                    save_assignments(assignments)
+                if swap_to(target, session_id=pid):
+                    log_rotation(get_account_for_session(load_assignments(), pid), target, reason, pid)
+                    profiles = load_profiles()
+                    email = profiles.get("accounts", {}).get(target, {}).get("email", "")
+                    print(f"[auto-rotate] → account {target} ({email}) — {reason}")
+                else:
+                    sys.exit(1)
+
+    elif cmd == "verify":
+        verify_credentials()
 
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)

@@ -152,34 +152,26 @@ cmd_login() {
   local n="$1"
   [[ "$n" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $n"
 
-  local config_dir="$ACCOUNTS_DIR/${n}"
-  mkdir -p "$config_dir"
-
-  # Symlink shared config into the isolated config dir
-  for shared in settings.json settings.local.json keybindings.json statusline-command.sh plugins; do
-    local src="$HOME/.claude/$shared"
-    local dst="$config_dir/$shared"
-    if [[ -e "$src" ]] && [[ ! -e "$dst" ]]; then
-      ln -sf "$src" "$dst"
-    fi
-  done
-
   echo "Logging in to account $n..."
   echo "A browser will open. Sign in with the account you want for slot $n."
   echo ""
 
-  CLAUDE_CONFIG_DIR="$config_dir" claude auth login
+  claude auth login || die "login failed"
 
-  # Get the email after login
+  # Get the email
   local email
-  email=$(CLAUDE_CONFIG_DIR="$config_dir" claude auth status 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null || echo "unknown")
+  email=$(claude auth status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null || echo "unknown")
 
-  # Update profiles.json
+  # Update profile
+  _update_profile "$n" "$email" "oauth"
+
+  # Extract keychain credentials (refresh token is long-lived ~1 year)
+  python3 "$HOME/.claude/accounts/rotation-engine.py" extract "$n" 2>/dev/null
+  # Fix email (extract may pick up wrong email from session)
   _update_profile "$n" "$email" "oauth"
 
   echo ""
-  echo "Account $n configured: $email"
-  echo "Launch with: ccc $n"
+  echo "Account $n ($email) configured."
 }
 
 cmd_add() {
@@ -346,6 +338,37 @@ main() {
       [[ "$1" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $1"
       python3 "$HOME/.claude/accounts/rotation-engine.py" extract "$1"
       ;;
+    setup-token)
+      shift
+      [[ $# -ge 1 ]] || die "usage: ccc setup-token <1-7> <token>"
+      local n="$1"
+      [[ "$n" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $n"
+
+      if [[ $# -ge 2 ]]; then
+        local token="$2"
+      else
+        read -rsp "Paste the setup-token for account $n: " token
+        echo ""
+      fi
+
+      [[ -n "$token" ]] || die "token cannot be empty"
+
+      # Store the long-lived token
+      mkdir -p "$HOME/.claude/accounts/tokens"
+      echo "$token" > "$HOME/.claude/accounts/tokens/${n}.token"
+      chmod 600 "$HOME/.claude/accounts/tokens/${n}.token"
+
+      local email
+      email=$(python3 -c "
+import json
+try:
+    d = json.load(open('$HOME/.claude/accounts/profiles.json'))
+    print(d.get('accounts',{}).get('$n',{}).get('email','account $n'))
+except: print('account $n')
+" 2>/dev/null)
+
+      echo "Stored 1-year token for account $n ($email)"
+      ;;
     swap)
       shift
       [[ $# -ge 1 ]] || die "usage: ccc swap <1-7>"
@@ -354,6 +377,9 @@ main() {
       ;;
     quota)
       python3 "$HOME/.claude/accounts/rotation-engine.py" status
+      ;;
+    refresh)
+      python3 "$HOME/.claude/accounts/rotation-engine.py" refresh
       ;;
     help|-h|--help)
       cat <<'HELP'

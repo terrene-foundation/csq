@@ -41,6 +41,7 @@ PROFILES_FILE = ACCOUNTS_DIR / "profiles.json"
 CURRENT_FILE = ACCOUNTS_DIR / ".current"
 HISTORY_FILE = ACCOUNTS_DIR / "rotation-history.jsonl"
 LOCK_FILE = ACCOUNTS_DIR / ".lock"
+TOKENS_DIR = ACCOUNTS_DIR / "tokens"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 MAX_ACCOUNTS = 7
 
@@ -518,14 +519,28 @@ def update_and_maybe_rotate(json_str):
         save_quota_state(state)
 
     # Keep stored credentials fresh (refresh tokens rotate)
-    # Run outside lock, non-blocking
+    # ONLY save if keychain account matches current account (prevent cross-contamination)
     cred_file = CREDS_DIR / f"{current}.json"
     if cred_file.exists():
         try:
             current_creds = read_keychain()
             if current_creds:
-                cred_file.write_text(json.dumps(current_creds, indent=2))
-                cred_file.chmod(0o600)
+                # Verify the keychain creds belong to this account
+                # by checking the stored email matches
+                stored_email = load_profiles().get("accounts", {}).get(current, {}).get("email", "")
+                result = subprocess.run(
+                    ["claude", "auth", "status", "--json"],
+                    capture_output=True, text=True, timeout=5
+                )
+                keychain_email = ""
+                if result.returncode == 0:
+                    try:
+                        keychain_email = json.loads(result.stdout).get("email", "")
+                    except json.JSONDecodeError:
+                        pass
+                if stored_email and keychain_email and stored_email == keychain_email:
+                    cred_file.write_text(json.dumps(current_creds, indent=2))
+                    cred_file.chmod(0o600)
         except Exception:
             pass
 
@@ -658,8 +673,9 @@ def statusline_quota(pid=None):
 
 def refresh_account_quota(account_num):
     """
-    Run a sandboxed claude -p call with account N's token.
-    Claude Code includes rate_limits in its output/statusline.
+    Run a sandboxed claude -p call with account N's refresh token.
+    Refresh tokens are long-lived (~1 year) and can be exchanged for fresh
+    access tokens via the public OAuth endpoint. Costs ~5 output tokens per call.
     Returns (account_num, result_dict) or (account_num, None).
     """
     cred_file = CREDS_DIR / f"{account_num}.json"
@@ -668,50 +684,55 @@ def refresh_account_quota(account_num):
 
     try:
         creds = json.loads(cred_file.read_text())
-        token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-        if not token:
+        refresh_token = creds.get("claudeAiOauth", {}).get("refreshToken", "")
+        if not refresh_token:
             return account_num, None
 
-        refresh_token = creds.get("claudeAiOauth", {}).get("refreshToken", "")
-        scopes = creds.get("claudeAiOauth", {}).get("scopes", [])
-
-        # Sandboxed: pass refresh token so the sandboxed CC can authenticate
-        # --bare: no hooks, no CLAUDE.md, no auto-memory
-        # -p ".": single-shot, 1 token, exits immediately
         env = os.environ.copy()
-        # Use refresh token (1-year lifetime); CC exchanges it for a fresh access token
-        # Cannot use --bare (skips OAuth). Use --system-prompt to minimize output.
-        if refresh_token:
-            env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
-            env["CLAUDE_CODE_OAUTH_SCOPES"] = ",".join(scopes) if scopes else "user:inference"
-        else:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
+        env["CLAUDE_CODE_OAUTH_SCOPES"] = "user:inference"
 
         result = subprocess.run(
-            ["claude", "-p", "x", "--system-prompt", "Reply x",
-             "--output-format", "json"],
+            ["claude", "-p", "x", "--system-prompt", "Reply x", "--output-format", "json"],
             capture_output=True, text=True, timeout=30, env=env
         )
 
         if result.returncode == 0:
-            # Parse JSON output for rate limit info
             try:
                 output = json.loads(result.stdout)
-                # The JSON output may include rate_limits
-                rate_limits = output.get("rate_limits")
-                if rate_limits:
-                    return account_num, rate_limits
+                # Output is a JSON array of events
+                if isinstance(output, list):
+                    rate_info = {}
+                    for item in output:
+                        # rate_limit_event has the quota data
+                        if item.get("type") == "rate_limit_event":
+                            rli = item.get("rate_limit_info", {})
+                            rtype = rli.get("rateLimitType", "")
+                            resets = rli.get("resetsAt", 0)
+                            status = rli.get("status", "")
+                            if rtype == "five_hour":
+                                rate_info["five_hour"] = {
+                                    "used_percentage": 100 if status == "rejected" else 0,
+                                    "resets_at": resets,
+                                }
+                            elif rtype == "seven_day":
+                                rate_info["seven_day"] = {
+                                    "used_percentage": 100 if status == "rejected" else 0,
+                                    "resets_at": resets,
+                                }
+                    if rate_info:
+                        return account_num, rate_info
+                    # Call succeeded but no rate_limit_event = account has quota
+                    return account_num, {"available": True}
             except json.JSONDecodeError:
                 pass
-            # Call succeeded = account has quota
             return account_num, {"available": True}
 
-        # Check stderr for rate limit messages
-        if "rate" in result.stderr.lower() or "limit" in result.stderr.lower():
+        # Check stderr for rate limit / auth errors
+        stderr = result.stderr.lower()
+        if "rate" in stderr or "limit" in stderr:
             return account_num, {"rate_limited": True}
-
-        # Auth error = token expired
-        if "401" in result.stderr or "auth" in result.stderr.lower():
+        if "401" in result.stderr or "auth" in stderr:
             return account_num, {"expired": True}
 
         return account_num, None

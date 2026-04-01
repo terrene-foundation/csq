@@ -8,7 +8,12 @@ set -euo pipefail
 REPO_URL="https://raw.githubusercontent.com/terrene-foundation/claude-squad/main"
 ACCOUNTS_DIR="$HOME/.claude/accounts"
 CREDS_DIR="$ACCOUNTS_DIR/credentials"
-BIN_DIR="$HOME/.local/bin"
+# Prefer ~/bin if it exists and is on PATH, else ~/.local/bin
+if [[ -d "$HOME/bin" ]] && echo "$PATH" | grep -q "$HOME/bin"; then
+    BIN_DIR="$HOME/bin"
+else
+    BIN_DIR="$HOME/.local/bin"
+fi
 
 # Colors
 RED='\033[0;31m'

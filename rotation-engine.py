@@ -640,6 +640,131 @@ def statusline_quota(pid=None):
     return " ".join(parts)
 
 
+# ─── Refresh All Accounts (parallel) ──────────────────────
+
+def refresh_account_quota(account_num):
+    """
+    Run a sandboxed claude -p call with account N's token.
+    Claude Code includes rate_limits in its output/statusline.
+    Returns (account_num, result_dict) or (account_num, None).
+    """
+    cred_file = CREDS_DIR / f"{account_num}.json"
+    if not cred_file.exists():
+        return account_num, None
+
+    try:
+        creds = json.loads(cred_file.read_text())
+        token = creds.get("claudeAiOauth", {}).get("accessToken", "")
+        if not token:
+            return account_num, None
+
+        # Sandboxed: CLAUDE_CODE_OAUTH_TOKEN bypasses keychain
+        # --bare: no hooks, no CLAUDE.md, no auto-memory
+        # -p ".": single-shot, 1 token, exits immediately
+        env = os.environ.copy()
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+
+        result = subprocess.run(
+            ["claude", "-p", ".", "--bare", "--output-format", "json"],
+            capture_output=True, text=True, timeout=30, env=env
+        )
+
+        if result.returncode == 0:
+            # Parse JSON output for rate limit info
+            try:
+                output = json.loads(result.stdout)
+                # The JSON output may include rate_limits
+                rate_limits = output.get("rate_limits")
+                if rate_limits:
+                    return account_num, rate_limits
+            except json.JSONDecodeError:
+                pass
+            # Call succeeded = account has quota
+            return account_num, {"available": True}
+
+        # Check stderr for rate limit messages
+        if "rate" in result.stderr.lower() or "limit" in result.stderr.lower():
+            return account_num, {"rate_limited": True}
+
+        # Auth error = token expired
+        if "401" in result.stderr or "auth" in result.stderr.lower():
+            return account_num, {"expired": True}
+
+        return account_num, None
+    except subprocess.TimeoutExpired:
+        return account_num, None
+    except Exception:
+        return account_num, None
+
+
+def refresh_all_accounts():
+    """Poll all accounts in parallel using sandboxed claude calls."""
+    import concurrent.futures
+
+    profiles = load_profiles()
+    accounts = [n for n in map(str, range(1, MAX_ACCOUNTS + 1))
+                if (CREDS_DIR / f"{n}.json").exists()]
+
+    if not accounts:
+        print("No accounts configured.")
+        return
+
+    print(f"Refreshing {len(accounts)} accounts in parallel...")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+        futures = {executor.submit(refresh_account_quota, n): n for n in accounts}
+        results = {}
+        for future in concurrent.futures.as_completed(futures):
+            n, data = future.result()
+            results[n] = data
+            email = profiles.get("accounts", {}).get(n, {}).get("email", "?")
+            if data is None:
+                print(f"  {n}  ✗ {email} — failed")
+            elif data.get("expired"):
+                print(f"  {n}  ✗ {email} — token expired (re-login needed)")
+            elif data.get("rate_limited"):
+                print(f"  {n}  ◌ {email} — rate limited")
+            elif data.get("five_hour") or data.get("seven_day"):
+                five_pct = data.get("five_hour", {}).get("used_percentage", "?")
+                seven_pct = data.get("seven_day", {}).get("used_percentage", "?")
+                print(f"  {n}  ● {email} — 5h:{five_pct}% 7d:{seven_pct}%")
+            elif data.get("available"):
+                print(f"  {n}  ● {email} — available")
+            else:
+                print(f"  {n}  ? {email} — unknown")
+
+    # Update quota state
+    with StateLock():
+        state = load_quota_state()
+        for n, data in results.items():
+            if data is None or data.get("expired"):
+                continue
+            existing = state.get("accounts", {}).get(n, {})
+
+            if data.get("five_hour") or data.get("seven_day"):
+                # Got real rate_limits data
+                state.setdefault("accounts", {})[n] = {
+                    "five_hour": data.get("five_hour", existing.get("five_hour", {})),
+                    "seven_day": data.get("seven_day", existing.get("seven_day", {})),
+                    "updated_at": time.time(),
+                }
+            elif data.get("rate_limited"):
+                state.setdefault("accounts", {})[n] = {
+                    "five_hour": {"used_percentage": 100, "resets_at": existing.get("five_hour", {}).get("resets_at", 0)},
+                    "seven_day": existing.get("seven_day", {"used_percentage": 0, "resets_at": 0}),
+                    "updated_at": time.time(),
+                }
+            elif data.get("available") and not existing:
+                state.setdefault("accounts", {})[n] = {
+                    "five_hour": {"used_percentage": 0, "resets_at": 0},
+                    "seven_day": {"used_percentage": 0, "resets_at": 0},
+                    "updated_at": time.time(),
+                }
+        save_quota_state(state)
+
+    print("\nDone.")
+
+
 # ─── Main ─────────────────────────────────────────────────
 
 def main():
@@ -695,6 +820,9 @@ def main():
 
     elif cmd == "statusline":
         print(statusline_quota())
+
+    elif cmd == "refresh":
+        refresh_all_accounts()
 
     elif cmd == "auto-rotate":
         pid = get_session_id()

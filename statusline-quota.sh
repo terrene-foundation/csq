@@ -50,8 +50,16 @@ except: pass
     local quota
     quota=$(python3 "$HOME/.claude/accounts/rotation-engine.py" statusline 2>/dev/null)
 
+    # Squad indicator: ⚡ = auto-rotate active, dim if no quota data yet
+    local squad=""
+    if [ -f "$HOME/.claude/accounts/rotation-engine.py" ] && [ -f "$HOME/.claude/accounts/credentials/1.json" ]; then
+        squad="⚡squad"
+    fi
+
     if [ -n "$quota" ]; then
-        echo "👤${account_info} ${quota}"
+        echo "👤${account_info} ${quota} ${squad}"
+    elif [ -n "$squad" ]; then
+        echo "👤${account_info} ${squad}"
     else
         echo "👤${account_info}"
     fi

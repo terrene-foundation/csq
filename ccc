@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# ccc — Claude Code multi-account launcher
+# Usage:
+#   ccc                  Launch with default (logged-in) account
+#   ccc mm               Launch with MiniMax provider
+#   ccc 1-7              Launch with specific Claude account
+#   ccc next             Rotate to next Claude account (round-robin)
+#   ccc status           Show all configured accounts
+#   ccc login <N>        Login to account N (interactive)
+#   ccc add <N> [email]  Add account N with optional email hint
+#   ccc current          Show which account is active for rotation
+#   ccc <any args>       Pass through to claude
+
+set -euo pipefail
+
+ACCOUNTS_DIR="$HOME/.claude/accounts"
+CURRENT_FILE="$ACCOUNTS_DIR/.current"
+PROFILES_FILE="$ACCOUNTS_DIR/profiles.json"
+
+# Ensure accounts directory exists
+mkdir -p "$ACCOUNTS_DIR"
+
+# ─── Helpers ───────────────────────────────────────────────
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Get the current round-robin index (1-based)
+get_current() {
+  if [[ -f "$CURRENT_FILE" ]]; then
+    cat "$CURRENT_FILE"
+  else
+    echo "1"
+  fi
+}
+
+# Get total number of configured Claude accounts
+get_max_account() {
+  local max=0
+  for f in "$ACCOUNTS_DIR"/{1,2,3,4,5,6,7}.json; do
+    [[ -f "$f" ]] && max=$(basename "$f" .json)
+  done
+  echo "$max"
+}
+
+# Get account metadata from profiles.json
+get_profile_field() {
+  local account="$1" field="$2"
+  if [[ -f "$PROFILES_FILE" ]]; then
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open('$PROFILES_FILE'))
+    print(d.get('accounts', {}).get('$account', {}).get('$field', ''))
+except: pass
+" 2>/dev/null
+  fi
+}
+
+# Launch claude with a specific settings overlay
+launch_with_settings() {
+  local settings_file="$1"
+  shift
+  if [[ ! -f "$settings_file" ]]; then
+    die "settings file not found: $settings_file"
+  fi
+  exec claude --settings "$settings_file" "$@"
+}
+
+# Launch claude with isolated config dir (for OAuth accounts)
+launch_with_config_dir() {
+  local config_dir="$1"
+  shift
+  if [[ ! -d "$config_dir" ]]; then
+    die "account not configured. Run: ccc login $(basename "$config_dir")"
+  fi
+  export CLAUDE_CONFIG_DIR="$config_dir"
+  exec claude "$@"
+}
+
+# Determine auth method for an account and launch accordingly
+launch_account() {
+  local n="$1"
+  shift
+
+  local settings_file="$ACCOUNTS_DIR/${n}.json"
+  local config_dir="$ACCOUNTS_DIR/${n}"
+
+  # Method 1: Settings overlay (has auth token or API key in env)
+  if [[ -f "$settings_file" ]]; then
+    launch_with_settings "$settings_file" "$@"
+  fi
+
+  # Method 2: Isolated config dir (OAuth)
+  if [[ -d "$config_dir" ]]; then
+    launch_with_config_dir "$config_dir" "$@"
+  fi
+
+  die "account $n not configured. Run: ccc add $n"
+}
+
+# ─── Commands ──────────────────────────────────────────────
+
+cmd_status() {
+  echo "Claude Code Accounts"
+  echo "━━━━━━━━━━━━━━━━━━━━"
+
+  local current
+  current=$(get_current)
+
+  # MiniMax
+  if [[ -f "$ACCOUNTS_DIR/mm.json" ]] || [[ -f "$HOME/.claude/settings-mm.json" ]]; then
+    local mm_model
+    mm_model=$(python3 -c "
+import json
+for f in ['$ACCOUNTS_DIR/mm.json', '$HOME/.claude/settings-mm.json']:
+    try:
+        d = json.load(open(f))
+        print(d.get('env', {}).get('ANTHROPIC_MODEL', 'unknown'))
+        break
+    except: pass
+" 2>/dev/null)
+    echo "  mm  MiniMax ($mm_model)"
+  fi
+
+  # Claude accounts 1-7
+  for n in 1 2 3 4 5 6 7; do
+    local settings_file="$ACCOUNTS_DIR/${n}.json"
+    local config_dir="$ACCOUNTS_DIR/${n}"
+    local marker=" "
+    [[ "$current" == "$n" ]] && marker="→"
+
+    if [[ -f "$settings_file" ]]; then
+      local email
+      email=$(get_profile_field "$n" "email")
+      local method
+      method=$(get_profile_field "$n" "method")
+      echo " $marker$n  ${email:-account $n} (${method:-token})"
+    elif [[ -d "$config_dir" ]]; then
+      local email
+      email=$(get_profile_field "$n" "email")
+      echo " $marker$n  ${email:-account $n} (oauth)"
+    else
+      echo "  $n  (not configured)"
+    fi
+  done
+
+  echo ""
+  echo "current rotation: $(get_current)"
+}
+
+cmd_login() {
+  local n="$1"
+  [[ "$n" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $n"
+
+  local config_dir="$ACCOUNTS_DIR/${n}"
+  mkdir -p "$config_dir"
+
+  # Symlink shared config into the isolated config dir
+  for shared in settings.json settings.local.json keybindings.json statusline-command.sh plugins; do
+    local src="$HOME/.claude/$shared"
+    local dst="$config_dir/$shared"
+    if [[ -e "$src" ]] && [[ ! -e "$dst" ]]; then
+      ln -sf "$src" "$dst"
+    fi
+  done
+
+  echo "Logging in to account $n..."
+  echo "A browser will open. Sign in with the account you want for slot $n."
+  echo ""
+
+  CLAUDE_CONFIG_DIR="$config_dir" claude auth login
+
+  # Get the email after login
+  local email
+  email=$(CLAUDE_CONFIG_DIR="$config_dir" claude auth status 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null || echo "unknown")
+
+  # Update profiles.json
+  _update_profile "$n" "$email" "oauth"
+
+  echo ""
+  echo "Account $n configured: $email"
+  echo "Launch with: ccc $n"
+}
+
+cmd_add() {
+  local n="$1"
+  local email="${2:-}"
+  [[ "$n" =~ ^[1-7]$|^mm$ ]] || die "account must be 1-7 or mm, got: $n"
+
+  if [[ "$n" == "mm" ]]; then
+    # MiniMax — just symlink existing settings-mm.json
+    if [[ -f "$HOME/.claude/settings-mm.json" ]]; then
+      ln -sf "$HOME/.claude/settings-mm.json" "$ACCOUNTS_DIR/mm.json"
+      echo "MiniMax linked from settings-mm.json"
+    else
+      die "~/.claude/settings-mm.json not found"
+    fi
+    return
+  fi
+
+  local settings_file="$ACCOUNTS_DIR/${n}.json"
+
+  echo "How do you want to authenticate account $n?"
+  echo "  1) OAuth login (browser) — for Claude.ai subscriptions"
+  echo "  2) Auth token            — paste a long-lived token"
+  echo "  3) API key               — paste a Console API key"
+  echo ""
+  read -rp "Choice [1/2/3]: " choice
+
+  case "$choice" in
+    1)
+      cmd_login "$n"
+      return
+      ;;
+    2)
+      read -rsp "Auth token for account $n: " token
+      echo ""
+      cat > "$settings_file" <<JSONEOF
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "$token"
+  }
+}
+JSONEOF
+      chmod 600 "$settings_file"
+      _update_profile "$n" "${email:-account $n}" "token"
+      echo "Account $n configured with auth token."
+      ;;
+    3)
+      read -rsp "API key for account $n: " key
+      echo ""
+      cat > "$settings_file" <<JSONEOF
+{
+  "env": {
+    "ANTHROPIC_API_KEY": "$key"
+  }
+}
+JSONEOF
+      chmod 600 "$settings_file"
+      _update_profile "$n" "${email:-account $n}" "api-key"
+      echo "Account $n configured with API key."
+      ;;
+    *)
+      die "invalid choice"
+      ;;
+  esac
+}
+
+cmd_next() {
+  local current max next
+  current=$(get_current)
+  max=$(get_max_account)
+
+  [[ "$max" -eq 0 ]] && die "no Claude accounts configured. Run: ccc add 1"
+
+  # Find next configured account (round-robin)
+  next=$current
+  for _ in 1 2 3 4 5 6 7; do
+    next=$(( (next % 7) + 1 ))
+    if [[ -f "$ACCOUNTS_DIR/${next}.json" ]] || [[ -d "$ACCOUNTS_DIR/${next}" ]]; then
+      break
+    fi
+  done
+
+  echo "$next" > "$CURRENT_FILE"
+
+  local email
+  email=$(get_profile_field "$next" "email")
+  echo "Switched to account $next (${email:-unknown})"
+  echo "Launching..."
+  echo ""
+
+  launch_account "$next" "$@"
+}
+
+cmd_current() {
+  local current
+  current=$(get_current)
+  local email
+  email=$(get_profile_field "$current" "email")
+  echo "Current: account $current (${email:-unknown})"
+}
+
+# ─── Profile Management ───────────────────────────────────
+
+_update_profile() {
+  local n="$1" email="$2" method="$3"
+  python3 -c "
+import json, os
+f = '$PROFILES_FILE'
+try:
+    d = json.load(open(f))
+except:
+    d = {'accounts': {}}
+d.setdefault('accounts', {})['$n'] = {'email': '$email', 'method': '$method'}
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" 2>/dev/null
+}
+
+# ─── Main ─────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    "")
+      # Default: launch with current logged-in account
+      exec claude
+      ;;
+    mm|minimax)
+      shift
+      # MiniMax: use settings-mm.json (original or symlinked)
+      local mm_settings="$ACCOUNTS_DIR/mm.json"
+      [[ -f "$mm_settings" ]] || mm_settings="$HOME/.claude/settings-mm.json"
+      [[ -f "$mm_settings" ]] || die "MiniMax not configured. Run: ccc add mm"
+      launch_with_settings "$mm_settings" "$@"
+      ;;
+    [1-7])
+      shift
+      launch_account "$cmd" "$@"
+      ;;
+    next|rotate)
+      shift
+      cmd_next "$@"
+      ;;
+    status|ls)
+      cmd_status
+      ;;
+    login)
+      shift
+      [[ $# -ge 1 ]] || die "usage: ccc login <1-7>"
+      cmd_login "$1"
+      ;;
+    add)
+      shift
+      [[ $# -ge 1 ]] || die "usage: ccc add <1-7|mm> [email]"
+      cmd_add "$@"
+      ;;
+    current)
+      cmd_current
+      ;;
+    extract)
+      shift
+      [[ $# -ge 1 ]] || die "usage: ccc extract <1-7>"
+      [[ "$1" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $1"
+      python3 "$HOME/.claude/accounts/rotation-engine.py" extract "$1"
+      ;;
+    swap)
+      shift
+      [[ $# -ge 1 ]] || die "usage: ccc swap <1-7>"
+      [[ "$1" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $1"
+      python3 "$HOME/.claude/accounts/rotation-engine.py" swap "$1"
+      ;;
+    quota)
+      python3 "$HOME/.claude/accounts/rotation-engine.py" status
+      ;;
+    help|-h|--help)
+      cat <<'HELP'
+ccc — Claude Code multi-account launcher
+
+PROVIDERS:
+  ccc                  Launch with default account
+  ccc mm               Launch with MiniMax
+  ccc 1-7              Launch with specific Claude account
+  ccc next             Rotate to next account (round-robin)
+
+MANAGEMENT:
+  ccc status           Show all configured accounts
+  ccc quota            Show quota state + rotation priority
+  ccc current          Show current rotation account
+  ccc add <N> [email]  Add/configure account N (1-7 or mm)
+  ccc login <N>        OAuth login for account N (1-7)
+  ccc extract <N>      Save current keychain creds as account N
+  ccc swap <N>         Swap keychain to account N (no browser)
+  ccc help             This message
+
+SETUP (one-time per account):
+  1. ccc login 1              OAuth login via browser
+  2. ccc extract 1            Save credentials to rotation pool
+  3. Repeat for accounts 2-7
+  4. ccc swap 2               Test: switch to account 2 (no browser)
+
+IN-SESSION (use /rotate command):
+  /rotate                     Auto-pick best account and swap
+HELP
+      ;;
+    *)
+      # Pass through to claude (e.g., cc -p "hello", cc auth status)
+      exec claude "$@"
+      ;;
+  esac
+}
+
+main "$@"

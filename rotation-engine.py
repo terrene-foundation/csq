@@ -89,22 +89,25 @@ def get_email(n):
     return load_profiles().get("accounts", {}).get(str(n), {}).get("email", "")
 
 def load_blocked():
-    """Load blocked accounts. An account is unblocked when its earliest
-    reset time (5h or 7d) has passed — not an arbitrary timer."""
+    """Load blocked accounts. Unblock when EITHER reset window has passed.
+    The 7d "all models" limit is the most common block reason, so we check
+    both 5h and 7d resets_at timestamps from quota.json (populated by the
+    statusline when the account was last active)."""
     data = _load(BLOCKED_FILE, {})
     now = time.time()
     state = load_state()
     active = {}
     for acct, blocked_at in data.items():
-        # Check if any reset has passed since blocking
         acct_data = state.get("accounts", {}).get(acct, {})
         five_reset = acct_data.get("five_hour", {}).get("resets_at", 0)
         seven_reset = acct_data.get("seven_day", {}).get("resets_at", 0)
-        # Unblock if 5h window has reset (most common recovery)
+        # Unblock if EITHER window has reset — the account may have recovered
         if five_reset and five_reset < now:
-            continue  # Reset passed — unblocked
-        # Fallback: 6h max in case we have no reset data
-        if now - blocked_at > 21600:
+            continue
+        if seven_reset and seven_reset < now:
+            continue
+        # Fallback: 8h max (covers one full 5h cycle + buffer)
+        if now - blocked_at > 28800:
             continue
         active[acct] = blocked_at
     return active
@@ -236,13 +239,14 @@ def read_keychain():
 # ─── Account Selection ───────────────────────────────────
 
 def pick_best(state, exclude=None):
-    """Pick account with most 5h headroom. Skips blocked + 5h-exhausted.
-    When multiple accounts are available, picks lowest usage.
-    When all known accounts are exhausted, picks the one whose reset is soonest."""
+    """Pick account with most 5h headroom. Skips blocked + exhausted.
+    Uses 7d data from statusline (when available) to avoid accounts
+    that will immediately hit the weekly wall.
+    When all exhausted, picks the one whose reset is soonest."""
     blocked = load_blocked()
     now = time.time()
     available = []   # (account, score) — accounts with quota
-    exhausted = []   # (account, resets_at) — accounts waiting for reset
+    exhausted = []   # (account, soonest_reset) — accounts waiting for reset
 
     for n in map(str, range(1, MAX_ACCOUNTS + 1)):
         if n == str(exclude):
@@ -253,16 +257,32 @@ def pick_best(state, exclude=None):
             continue
         acct = state.get("accounts", {}).get(n, {})
         five = acct.get("five_hour", {})
-        pct = five.get("used_percentage", 0)
-        resets_at = five.get("resets_at", 0)
+        seven = acct.get("seven_day", {})
+        five_pct = five.get("used_percentage", 0)
+        seven_pct = seven.get("used_percentage", 0)
+        five_reset = five.get("resets_at", 0)
+        seven_reset = seven.get("resets_at", 0)
         updated = acct.get("updated_at", 0)
         stale = (now - updated) > 1800 if updated else True
 
-        if not stale and pct >= 90:
-            exhausted.append((n, resets_at))
+        # Skip if 5h exhausted (fresh data only)
+        if not stale and five_pct >= 90:
+            exhausted.append((n, five_reset))
             continue
 
-        score = (100 - pct) if (not stale and pct > 0) else 50
+        # Skip if 7d at 100% (from statusline — only skip at hard limit)
+        if not stale and seven_pct >= 100:
+            exhausted.append((n, seven_reset))
+            continue
+
+        # Score: combine 5h headroom with 7d penalty
+        if not stale and five_pct > 0:
+            score = 100 - five_pct
+            # Penalize accounts with high 7d usage — they'll hit the wall sooner
+            if seven_pct >= 80:
+                score -= 20
+        else:
+            score = 50  # Unknown/stale — worth trying
         available.append((n, score))
 
     # Prefer available accounts (sorted by most headroom)
@@ -270,9 +290,8 @@ def pick_best(state, exclude=None):
         available.sort(key=lambda x: x[1], reverse=True)
         return available[0][0]
 
-    # All exhausted — pick the one whose 5h window resets soonest
+    # All exhausted — pick the one whose window resets soonest
     if exhausted:
-        # Filter to only those whose reset is in the future
         future = [(n, r) for n, r in exhausted if r > now]
         if future:
             future.sort(key=lambda x: x[1])

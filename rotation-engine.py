@@ -28,7 +28,6 @@ ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
 CREDS_DIR = ACCOUNTS_DIR / "credentials"
 QUOTA_FILE = ACCOUNTS_DIR / "quota.json"
 PROFILES_FILE = ACCOUNTS_DIR / "profiles.json"
-CREDS_TARGET = Path.home() / ".claude" / ".credentials.json"
 MAX_ACCOUNTS = 7
 
 
@@ -69,17 +68,42 @@ def configured_accounts():
 
 
 def which_account():
-    """Best-effort: which stored account matches ~/.claude/.credentials.json?"""
-    if not CREDS_TARGET.exists():
-        return None
+    """Which stored account is this terminal on?
+    Uses a per-parent-PID cache so we only call 'claude auth status' once."""
+    import os
+    import subprocess
+
+    ppid = os.getppid()
+    cache_file = ACCOUNTS_DIR / f".account.{ppid}"
+
+    # Check cache first
+    if cache_file.exists():
+        try:
+            return cache_file.read_text().strip() or None
+        except OSError:
+            pass
+
+    # Get email from claude auth status
     try:
-        current_creds = CREDS_TARGET.read_text().strip()
-    except OSError:
+        r = subprocess.run(
+            ["claude", "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        email = json.loads(r.stdout).get("email", "")
+    except Exception:
         return None
-    for n in configured_accounts():
-        stored = (CREDS_DIR / f"{n}.json").read_text().strip()
-        if stored == current_creds:
+
+    # Match email to stored account
+    profiles = _load(PROFILES_FILE, {}).get("accounts", {})
+    for n, info in profiles.items():
+        if info.get("email") == email:
+            cache_file.write_text(n)
             return n
+
     return None
 
 
@@ -130,8 +154,15 @@ def swap_to(target_account):
         print(f"error: no credentials for account {target_account}", file=sys.stderr)
         return False
 
-    CREDS_TARGET.write_text(source.read_text())
-    CREDS_TARGET.chmod(0o600)
+    creds_target = Path.home() / ".claude" / ".credentials.json"
+    creds_target.write_text(source.read_text())
+    creds_target.chmod(0o600)
+
+    # Invalidate account cache for this terminal
+    import os
+
+    cache_file = ACCOUNTS_DIR / f".account.{os.getppid()}"
+    cache_file.write_text(target_account)
 
     email = get_email(target_account)
     print(f"Swapped to account {target_account} ({email})")

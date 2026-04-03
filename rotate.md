@@ -1,22 +1,26 @@
 ---
 name: rotate
-description: "Intelligent account rotation — auto-pick best Claude account based on quota"
+description: "Intelligent account rotation — suggest best Claude account based on quota"
 ---
 
 # /rotate — Account Rotation
 
-When the user runs /rotate, force-rotate to the best available account.
+When the user runs /rotate, suggest which account to switch to.
 
 ## Steps
 
 1. Run:
 
    ```bash
-   python3 ~/.claude/accounts/rotation-engine.py auto-rotate --force
+   python3 ~/.claude/accounts/rotation-engine.py suggest
    ```
 
-2. If output contains `[auto-rotate]` — rotation succeeded. Say "Rotated." and resume your previous task.
-3. If output contains "All accounts exhausted" — say so and show the reset times.
-4. If output contains "CLAUDE_CONFIG_DIR not set" — tell the user to launch with `cc <N>`.
+2. Show the output to the user. It will say which account to /login to.
 
-**IMPORTANT**: On success, do NOT show status tables or quota details. Just continue working.
+3. If the user wants to switch, tell them: "Run /login and sign in as [email]"
+
+4. After they /login, save the new credentials:
+   ```bash
+   cc login [N]
+   ```
+   (where N is the account number shown in the suggestion)

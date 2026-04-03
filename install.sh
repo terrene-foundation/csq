@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Claude Squad installer — multi-account rotation for Claude Code
+# Claude Squad installer — quota tracking + rotation suggestions for Claude Code
 
 REPO_URL="https://raw.githubusercontent.com/terrene-foundation/claude-squad/main"
 ACCOUNTS_DIR="$HOME/.claude/accounts"
@@ -16,7 +16,7 @@ ok()   { echo -e "${GREEN}✓${NC} $*"; }
 warn() { echo -e "${YELLOW}!${NC} $*"; }
 err()  { echo -e "${RED}✗${NC} $*" >&2; }
 
-echo -e "\n${BOLD}Claude Squad — Multi-Account Rotation${NC}\n"
+echo -e "\n${BOLD}Claude Squad — Multi-Account Quota Tracker${NC}\n"
 
 command -v claude &>/dev/null || { err "Claude Code not found."; exit 1; }
 command -v python3 &>/dev/null || { err "Python 3 not found."; exit 1; }
@@ -43,7 +43,7 @@ chmod +x "$ACCOUNTS_DIR/rotation-engine.py" "$BIN_DIR/cc" \
          "$ACCOUNTS_DIR/auto-rotate-hook.sh" "$ACCOUNTS_DIR/statusline-quota.sh"
 ok "Files installed"
 
-# Patch settings.json
+# Patch settings.json (statusline + hook)
 SETTINGS_FILE="$HOME/.claude/settings.json"
 [[ -f "$SETTINGS_FILE" ]] || echo '{}' > "$SETTINGS_FILE"
 python3 -c "
@@ -70,12 +70,13 @@ if ! echo "$PATH" | grep -q "$BIN_DIR"; then
     warn "$BIN_DIR not in PATH. Add: export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
-echo -e "\n${BOLD}Done.${NC} Now add your accounts:\n"
-echo "  1. In any Claude terminal, /login to an account"
+echo -e "\n${BOLD}Done.${NC} Now save your accounts:\n"
+echo "  1. /login to an account in any Claude terminal"
 echo "  2. cc login 1    (saves it as slot 1)"
-echo "  3. /login to next account"
+echo "  3. /login to another account"
 echo "  4. cc login 2    (saves it as slot 2)"
-echo "  5. ...repeat for more accounts"
 echo ""
-echo "When rate limited, /rotate auto-switches."
+echo "The statusline shows your quota. When rate limited:"
+echo "  /rotate           (suggests which account to switch to)"
+echo "  cc suggest        (same, from terminal)"
 echo ""

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Claude Squad — Quota Tracker
+Claude Squad — Rotation Engine
 
-Tracks quota across accounts from statusline data.
-When rate limited, tells you which account to /login to.
+Tracks quota across accounts. Auto-rotates by refreshing OAuth tokens
+and writing to macOS keychain — CC picks up new creds seamlessly.
 
 State files (all in ~/.claude/accounts/):
-  credentials/N.json   Stored OAuth credentials per account (for identity only)
+  credentials/N.json   Stored OAuth credentials per account (1-7)
   profiles.json        Email→account mapping
   quota.json           Per-account quota from statusline
 
@@ -14,10 +14,15 @@ Commands:
   update              Update quota from statusline JSON (stdin)
   status              Show all accounts and quota
   statusline          Compact string for statusline display
-  suggest             Suggest which account to /login to
+  swap <N>            Refresh account N's token and write to keychain
+  auto-rotate         Check + swap if needed
+  auto-rotate --force Force-rotate (marks current exhausted)
 """
 
+import getpass
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -28,6 +33,11 @@ CREDS_DIR = ACCOUNTS_DIR / "credentials"
 QUOTA_FILE = ACCOUNTS_DIR / "quota.json"
 PROFILES_FILE = ACCOUNTS_DIR / "profiles.json"
 MAX_ACCOUNTS = 7
+
+# OAuth constants (from Claude Code source)
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 
 def _load(path, default):
@@ -67,8 +77,6 @@ def configured_accounts():
 
 def which_account():
     """Which account is this terminal on? Cached per parent PID."""
-    import os
-
     ppid = os.getppid()
     cache_file = ACCOUNTS_DIR / f".account.{ppid}"
 
@@ -100,12 +108,11 @@ def which_account():
     return None
 
 
-# ─── Suggest Best ────────────────────────────────────────
+# ─── Pick Best ───────────────────────────────────────────
 
 
-def suggest_best(state, exclude=None):
-    """Suggest the best account to /login to.
-    Picks lowest 5h usage. If all exhausted, picks soonest reset."""
+def pick_best(state, exclude=None):
+    """Pick the account with the most available quota."""
     now = time.time()
     available = []
     exhausted = []
@@ -136,11 +143,153 @@ def suggest_best(state, exclude=None):
     return None
 
 
+# ─── OAuth Token Refresh ────────────────────────────────
+
+
+def refresh_token(account_num):
+    """Refresh an account's OAuth token. Returns new token data or None."""
+    import urllib.request
+    import urllib.error
+
+    cred_file = CREDS_DIR / f"{account_num}.json"
+    if not cred_file.exists():
+        return None
+
+    creds = json.loads(cred_file.read_text())
+    refresh_tok = creds.get("claudeAiOauth", {}).get("refreshToken")
+    if not refresh_tok:
+        return None
+
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_tok,
+            "client_id": CLIENT_ID,
+            "scope": SCOPES,
+        }
+    ).encode()
+
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "claude-code/2.1.91",
+        },
+    )
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        err = json.loads(e.read().decode()) if e.code < 500 else {}
+        print(
+            f"  Token refresh failed: {err.get('error', {}).get('message', e.code)}",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as e:
+        print(f"  Token refresh error: {e}", file=sys.stderr)
+        return None
+
+    access_token = data.get("access_token")
+    new_refresh = data.get("refresh_token", refresh_tok)
+    expires_in = data.get("expires_in", 18000)
+
+    if not access_token:
+        return None
+
+    # Update stored credentials
+    new_creds = {
+        "claudeAiOauth": {
+            "accessToken": access_token,
+            "refreshToken": new_refresh,
+            "expiresAt": int(time.time() * 1000) + expires_in * 1000,
+            "scopes": SCOPES.split(),
+            "subscriptionType": creds.get("claudeAiOauth", {}).get("subscriptionType"),
+            "rateLimitTier": creds.get("claudeAiOauth", {}).get("rateLimitTier"),
+        }
+    }
+    cred_file.write_text(json.dumps(new_creds, indent=2))
+    cred_file.chmod(0o600)
+
+    return new_creds
+
+
+# ─── Keychain Write ──────────────────────────────────────
+
+
+def _keychain_service():
+    """Get keychain service name for the current config dir.
+    Default (no CLAUDE_CONFIG_DIR): 'Claude Code-credentials'
+    Custom: 'Claude Code-credentials-{sha256(dir)[:8]}'"""
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        h = hashlib.sha256(config_dir.encode()).hexdigest()[:8]
+        return f"Claude Code-credentials-{h}"
+    return "Claude Code-credentials"
+
+
+def write_keychain(creds):
+    """Write credentials to macOS keychain (hex-encoded, same as CC)."""
+    service = _keychain_service()
+    username = getpass.getuser()
+    json_str = json.dumps(creds)
+    hex_value = json_str.encode("utf-8").hex()
+
+    r = subprocess.run(
+        [
+            "security",
+            "add-generic-password",
+            "-U",
+            "-a",
+            username,
+            "-s",
+            service,
+            "-X",
+            hex_value,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
+
+
+# ─── Swap ────────────────────────────────────────────────
+
+
+def swap_to(target_account):
+    """Refresh target account's token and write to keychain.
+    CC picks up new creds on next API call."""
+    target_account = str(target_account)
+    email = get_email(target_account)
+
+    print(
+        f"Refreshing token for account {target_account} ({email})...", file=sys.stderr
+    )
+    new_creds = refresh_token(target_account)
+    if not new_creds:
+        print(f"  Failed to refresh token", file=sys.stderr)
+        return False
+
+    if not write_keychain(new_creds):
+        print(f"  Failed to write keychain", file=sys.stderr)
+        return False
+
+    # Invalidate PID cache
+    ppid = os.getppid()
+    cache_file = ACCOUNTS_DIR / f".account.{ppid}"
+    cache_file.write_text(target_account)
+
+    print(f"Swapped to account {target_account} ({email})", file=sys.stderr)
+    return True
+
+
 # ─── Quota Update ────────────────────────────────────────
 
 
 def update_quota(json_str):
-    """Called from statusline. Saves quota data for this terminal's account."""
+    """Called from statusline. Saves quota data, auto-rotates at 100%."""
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError:
@@ -161,6 +310,40 @@ def update_quota(json_str):
         "updated_at": time.time(),
     }
     _save(QUOTA_FILE, state)
+
+    # Auto-rotate at 100%
+    five_pct = rate_limits.get("five_hour", {}).get("used_percentage", 0)
+    if five_pct >= 100:
+        target = pick_best(state, exclude=current)
+        if target:
+            swap_to(target)
+
+
+# ─── Auto-Rotate ─────────────────────────────────────────
+
+
+def auto_rotate(force=False):
+    """Called from hook or /rotate."""
+    current = which_account()
+    state = load_state()
+
+    if force and current:
+        state.setdefault("accounts", {}).setdefault(current, {})["five_hour"] = {
+            "used_percentage": 100,
+            "resets_at": time.time() + 18000,
+        }
+        _save(QUOTA_FILE, state)
+
+    acct = state.get("accounts", {}).get(current or "", {})
+    five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
+
+    if five_pct >= 100 or force:
+        target = pick_best(state, exclude=current)
+        if target:
+            swap_to(target)
+        elif force:
+            show_status()
+            print("\nAll accounts exhausted.", file=sys.stderr)
 
 
 # ─── Status ──────────────────────────────────────────────
@@ -223,26 +406,6 @@ def statusline_str():
     return " ".join(parts)
 
 
-def show_suggest():
-    """Print which account to /login to."""
-    current = which_account()
-    state = load_state()
-    target = suggest_best(state, exclude=current)
-    if target:
-        email = get_email(target)
-        five_pct = (
-            state.get("accounts", {})
-            .get(target, {})
-            .get("five_hour", {})
-            .get("used_percentage", 0)
-        )
-        print(f"Suggest: account {target} ({email}) — 5h:{five_pct:.0f}%")
-        print(f"Run /login and sign in as {email}")
-    else:
-        print("No accounts with available quota.")
-        show_status()
-
-
 # ─── Main ────────────────────────────────────────────────
 
 
@@ -253,8 +416,14 @@ def main():
         show_status()
     elif cmd == "update":
         update_quota(sys.stdin.read())
-    elif cmd == "suggest":
-        show_suggest()
+    elif cmd == "swap":
+        if len(sys.argv) < 3:
+            print("usage: rotation-engine.py swap <N>", file=sys.stderr)
+            sys.exit(1)
+        if not swap_to(sys.argv[2]):
+            sys.exit(1)
+    elif cmd == "auto-rotate":
+        auto_rotate(force="--force" in sys.argv)
     elif cmd == "statusline":
         print(statusline_str())
     elif cmd == "check":
@@ -262,7 +431,13 @@ def main():
         state = load_state()
         acct = state.get("accounts", {}).get(current or "", {})
         five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
-        print(json.dumps({"exhausted": five_pct >= 100, "current": current}))
+        should = five_pct >= 100
+        target = pick_best(state, exclude=current) if should else None
+        print(
+            json.dumps(
+                {"should_rotate": should and target is not None, "target": target}
+            )
+        )
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)

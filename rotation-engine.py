@@ -233,8 +233,13 @@ def setup_config_dirs():
         target_cred.chmod(0o600)
 
         # Symlink shared state to global ~/.claude/
+        # - settings.json: hooks, permissions, statusline config
+        # - projects/: conversation history, project memory, CLAUDE.md context
+        # - plugins/: installed plugins (pyright-lsp, etc.)
         _symlink(GLOBAL_CLAUDE_DIR / "settings.json", cdir / "settings.json")
         _symlink(GLOBAL_CLAUDE_DIR / "projects", cdir / "projects")
+        if (GLOBAL_CLAUDE_DIR / "plugins").exists():
+            _symlink(GLOBAL_CLAUDE_DIR / "plugins", cdir / "plugins")
 
         email = get_email(n)
         print(f"  {n}  {email} → {cdir}")

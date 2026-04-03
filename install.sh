@@ -189,7 +189,13 @@ for i in $(seq 1 "$num_accounts"); do
     header "Account $i of $num_accounts"
     read -rp "Email for account $i: " email
 
-    # Save profile
+    # ccc login handles: config dir setup, browser login, credential copy, profile
+    "$BIN_DIR/ccc" login "$i" || {
+        warn "Login failed for $email — you can retry later with: ccc login $i"
+        continue
+    }
+
+    # Fix email in profile (ccc login gets it from auth status, but user knows best)
     python3 -c "
 import json
 f = '$ACCOUNTS_DIR/profiles.json'
@@ -200,31 +206,7 @@ except:
 d.setdefault('accounts', {})['$i'] = {'email': '$email', 'method': 'oauth'}
 with open(f, 'w') as fh:
     json.dump(d, fh, indent=2)
-"
-
-    echo ""
-    info "Logging in as $email..."
-    info "A browser will open. Sign in with: $email"
-    echo ""
-    read -rp "Press Enter to open browser login..."
-
-    claude auth login --email "$email" || {
-        warn "Login failed for $email — you can retry later with: ccc login $i"
-        continue
-    }
-
-    # Extract credentials
-    python3 "$ACCOUNTS_DIR/rotation-engine.py" extract "$i"
-
-    # Fix email in profile (extract may override with session email)
-    python3 -c "
-import json
-f = '$ACCOUNTS_DIR/profiles.json'
-d = json.load(open(f))
-d['accounts']['$i']['email'] = '$email'
-with open(f, 'w') as fh:
-    json.dump(d, fh, indent=2)
-"
+" 2>/dev/null
 
     ok "Account $i ($email) configured"
     echo ""

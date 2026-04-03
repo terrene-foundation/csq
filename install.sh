@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─── Claude Squad Installer ───────────────────────────────
-# Multi-account rotation for Claude Code
+# Claude Squad installer — multi-account rotation for Claude Code
 
 REPO_URL="https://raw.githubusercontent.com/terrene-foundation/claude-squad/main"
 ACCOUNTS_DIR="$HOME/.claude/accounts"
@@ -12,26 +11,17 @@ else
     BIN_DIR="$HOME/.local/bin"
 fi
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BOLD='\033[1m'
-NC='\033[0m'
-
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BOLD='\033[1m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}✓${NC} $*"; }
 warn() { echo -e "${YELLOW}!${NC} $*"; }
 err()  { echo -e "${RED}✗${NC} $*" >&2; }
 
-echo ""
-echo -e "${BOLD}Claude Squad — Multi-Account Rotation${NC}"
-echo ""
+echo -e "\n${BOLD}Claude Squad — Multi-Account Rotation${NC}\n"
 
-# Preflight
-command -v claude &>/dev/null || { err "Claude Code not found. Install from https://claude.ai/code"; exit 1; }
+command -v claude &>/dev/null || { err "Claude Code not found."; exit 1; }
 command -v python3 &>/dev/null || { err "Python 3 not found."; exit 1; }
-command -v jq &>/dev/null || { err "jq not found. Install: brew install jq"; exit 1; }
+command -v jq &>/dev/null || { err "jq not found. brew install jq"; exit 1; }
 
-# Install
 mkdir -p "$ACCOUNTS_DIR/credentials" "$BIN_DIR"
 
 if [[ -f "$(dirname "$0")/rotation-engine.py" ]]; then
@@ -49,51 +39,43 @@ else
     curl -sfL "$REPO_URL/rotate.md" -o "$HOME/.claude/commands/rotate.md" 2>/dev/null || true
 fi
 
-chmod +x "$ACCOUNTS_DIR/rotation-engine.py" "$BIN_DIR/cc" "$ACCOUNTS_DIR/auto-rotate-hook.sh" "$ACCOUNTS_DIR/statusline-quota.sh"
+chmod +x "$ACCOUNTS_DIR/rotation-engine.py" "$BIN_DIR/cc" \
+         "$ACCOUNTS_DIR/auto-rotate-hook.sh" "$ACCOUNTS_DIR/statusline-quota.sh"
 ok "Files installed"
 
 # Patch settings.json
 SETTINGS_FILE="$HOME/.claude/settings.json"
 [[ -f "$SETTINGS_FILE" ]] || echo '{}' > "$SETTINGS_FILE"
-
 python3 -c "
 import json
 f = '$SETTINGS_FILE'
-try:
-    s = json.load(open(f))
-except:
-    s = {}
+try: s = json.load(open(f))
+except: s = {}
 changed = False
-
-# Auto-rotate hook
 hook_cmd = 'bash ~/.claude/accounts/auto-rotate-hook.sh'
-hooks = s.setdefault('hooks', {})
-uph = hooks.setdefault('UserPromptSubmit', [])
-if not any(hook_cmd in h.get('command', '') for e in uph for h in e.get('hooks', [])):
-    uph.append({'matcher': '', 'hooks': [{'type': 'command', 'command': hook_cmd}]})
+uph = s.setdefault('hooks', {}).setdefault('UserPromptSubmit', [])
+if not any(hook_cmd in h.get('command','') for e in uph for h in e.get('hooks',[])):
+    uph.append({'matcher':'','hooks':[{'type':'command','command':hook_cmd}]})
     changed = True
-
-# Statusline
 sl = s.get('statusLine', {})
-if not sl or sl.get('command', '') == 'bash ~/.claude/statusline-command.sh':
-    s['statusLine'] = {'type': 'command', 'command': 'bash ~/.claude/accounts/statusline-quota.sh'}
+if not sl or sl.get('command','') == 'bash ~/.claude/statusline-command.sh':
+    s['statusLine'] = {'type':'command','command':'bash ~/.claude/accounts/statusline-quota.sh'}
     changed = True
-
 if changed:
-    with open(f, 'w') as fh:
-        json.dump(s, fh, indent=2)
+    with open(f,'w') as fh: json.dump(s, fh, indent=2)
 " 2>/dev/null
 ok "Settings configured"
 
-# PATH check
 if ! echo "$PATH" | grep -q "$BIN_DIR"; then
-    warn "$BIN_DIR is not in PATH. Add: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    warn "$BIN_DIR not in PATH. Add: export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
+echo -e "\n${BOLD}Done.${NC} Now add your accounts:\n"
+echo "  1. In any Claude terminal, /login to an account"
+echo "  2. cc login 1    (saves it as slot 1)"
+echo "  3. /login to next account"
+echo "  4. cc login 2    (saves it as slot 2)"
+echo "  5. ...repeat for more accounts"
 echo ""
-echo -e "${BOLD}Done.${NC} Add accounts:"
-echo ""
-echo "  cc login 1       # first account"
-echo "  cc login 2       # second account"
-echo "  cc 1             # launch with account 1"
+echo "When rate limited, /rotate auto-switches."
 echo ""

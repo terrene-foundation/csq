@@ -2,27 +2,24 @@
 """
 Claude Squad — Rotation Engine
 
-Tracks quota across accounts and rotates when one is exhausted.
-Claude Code handles credential refresh natively on 401 — we just
-write .credentials.json and let CC pick it up.
+Tracks quota across accounts. Swaps by writing ~/.claude/.credentials.json.
+Claude Code picks up new credentials on next 401 — no config dirs needed.
 
 State files (all in ~/.claude/accounts/):
-  quota.json           Per-account quota percentages + reset times
   credentials/N.json   Stored OAuth credentials per account (1-7)
-  config-N/            Per-account config dir (symlinked settings + own creds)
   profiles.json        Email→account mapping
+  quota.json           Per-account quota from statusline
 
 Commands:
   update              Update quota from statusline JSON (stdin)
   status              Show all accounts and quota
   statusline          Compact string for statusline display
-  swap <N>            Write account N's creds to this terminal's config dir
-  auto-rotate         Check quota + swap if needed (called from hook)
-  auto-rotate --force Mark current exhausted, then rotate
+  swap <N>            Write account N's creds to ~/.claude/.credentials.json
+  auto-rotate         Check + swap if needed
+  auto-rotate --force Force-rotate (marks current exhausted)
 """
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -31,11 +28,8 @@ ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
 CREDS_DIR = ACCOUNTS_DIR / "credentials"
 QUOTA_FILE = ACCOUNTS_DIR / "quota.json"
 PROFILES_FILE = ACCOUNTS_DIR / "profiles.json"
+CREDS_TARGET = Path.home() / ".claude" / ".credentials.json"
 MAX_ACCOUNTS = 7
-GLOBAL_CLAUDE_DIR = Path.home() / ".claude"
-
-
-# ─── State ───────────────────────────────────────────────
 
 
 def _load(path, default):
@@ -51,13 +45,15 @@ def _save(path, data):
 
 def load_state():
     state = _load(QUOTA_FILE, {"accounts": {}})
-    # Reset expired quotas
     now = time.time()
     for acct_data in state.get("accounts", {}).values():
         for window in ("five_hour", "seven_day"):
             w = acct_data.get(window, {})
-            resets_at = w.get("resets_at", 0)
-            if resets_at and resets_at < now and w.get("used_percentage", 0) > 0:
+            if (
+                w.get("resets_at", 0)
+                and w["resets_at"] < now
+                and w.get("used_percentage", 0) > 0
+            ):
                 w["used_percentage"] = 0
     return state
 
@@ -67,23 +63,23 @@ def get_email(n):
 
 
 def configured_accounts():
-    """List account numbers that have credentials."""
     return [
         str(n) for n in range(1, MAX_ACCOUNTS + 1) if (CREDS_DIR / f"{n}.json").exists()
     ]
 
 
-# ─── This Terminal ───────────────────────────────────────
-
-
-def this_account():
-    """Which account is this terminal on? Derived from CLAUDE_CONFIG_DIR name."""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    if not config_dir:
+def which_account():
+    """Best-effort: which stored account matches ~/.claude/.credentials.json?"""
+    if not CREDS_TARGET.exists():
         return None
-    name = Path(config_dir).name
-    if name.startswith("config-") and name[7:].isdigit():
-        return name[7:]
+    try:
+        current_creds = CREDS_TARGET.read_text().strip()
+    except OSError:
+        return None
+    for n in configured_accounts():
+        stored = (CREDS_DIR / f"{n}.json").read_text().strip()
+        if stored == current_creds:
+            return n
     return None
 
 
@@ -91,9 +87,7 @@ def this_account():
 
 
 def pick_best(state, exclude=None):
-    """Pick the account with the most available quota.
-    Prefers accounts with lower 5h usage. When all exhausted,
-    picks the one whose reset is soonest."""
+    """Pick the account with the most available quota."""
     now = time.time()
     available = []
     exhausted = []
@@ -102,11 +96,9 @@ def pick_best(state, exclude=None):
         if n == str(exclude):
             continue
         acct = state.get("accounts", {}).get(n, {})
-        five = acct.get("five_hour", {})
-        seven = acct.get("seven_day", {})
-        five_pct = five.get("used_percentage", 0)
-        seven_pct = seven.get("used_percentage", 0)
-        five_reset = five.get("resets_at", 0)
+        five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
+        seven_pct = acct.get("seven_day", {}).get("used_percentage", 0)
+        five_reset = acct.get("five_hour", {}).get("resets_at", 0)
 
         if five_pct >= 100 or seven_pct >= 100:
             exhausted.append((n, five_reset))
@@ -114,13 +106,13 @@ def pick_best(state, exclude=None):
         available.append((n, five_pct))
 
     if available:
-        available.sort(key=lambda x: x[1])  # lowest usage first
+        available.sort(key=lambda x: x[1])
         return available[0][0]
 
     if exhausted:
         future = [(n, r) for n, r in exhausted if r > now]
         if future:
-            future.sort(key=lambda x: x[1])  # soonest reset first
+            future.sort(key=lambda x: x[1])
             return future[0][0]
 
     return None
@@ -130,22 +122,16 @@ def pick_best(state, exclude=None):
 
 
 def swap_to(target_account):
-    """Write target account's credentials to this terminal's config dir.
-    Claude Code picks up new creds on next 401."""
+    """Write target account's credentials to ~/.claude/.credentials.json.
+    CC picks up new creds on next 401."""
     target_account = str(target_account)
-    source_cred = CREDS_DIR / f"{target_account}.json"
-    if not source_cred.exists():
+    source = CREDS_DIR / f"{target_account}.json"
+    if not source.exists():
         print(f"error: no credentials for account {target_account}", file=sys.stderr)
         return False
 
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    if not config_dir:
-        print("error: CLAUDE_CONFIG_DIR not set — launch via 'cc <N>'", file=sys.stderr)
-        return False
-
-    target_path = Path(config_dir) / ".credentials.json"
-    target_path.write_text(source_cred.read_text())
-    target_path.chmod(0o600)
+    CREDS_TARGET.write_text(source.read_text())
+    CREDS_TARGET.chmod(0o600)
 
     email = get_email(target_account)
     print(f"Swapped to account {target_account} ({email})")
@@ -156,8 +142,7 @@ def swap_to(target_account):
 
 
 def update_quota(json_str):
-    """Called from statusline. Updates quota for this terminal's account.
-    Auto-rotates at 100%."""
+    """Called from statusline. Saves quota data, auto-rotates at 100%."""
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError:
@@ -167,7 +152,7 @@ def update_quota(json_str):
     if not rate_limits:
         return
 
-    current = this_account()
+    current = which_account()
     if not current:
         return
 
@@ -190,26 +175,22 @@ def update_quota(json_str):
             )
 
 
-# ─── Auto-Rotate (hook) ─────────────────────────────────
+# ─── Auto-Rotate ─────────────────────────────────────────
 
 
 def auto_rotate(force=False):
-    """Called from UserPromptSubmit hook as backup.
-    Primary rotation happens in update_quota (statusline)."""
-    current = this_account()
-    if not current:
-        return
-
+    """Called from hook or /rotate."""
+    current = which_account()
     state = load_state()
 
-    if force:
+    if force and current:
         state.setdefault("accounts", {}).setdefault(current, {})["five_hour"] = {
             "used_percentage": 100,
             "resets_at": time.time() + 18000,
         }
         _save(QUOTA_FILE, state)
 
-    acct = state.get("accounts", {}).get(current, {})
+    acct = state.get("accounts", {}).get(current or "", {})
     five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
 
     if five_pct >= 100 or force:
@@ -240,13 +221,12 @@ def fmt_time(epoch):
 
 def show_status():
     state = load_state()
-    current = this_account()
+    current = which_account()
 
-    print(
-        f"Claude Squad — this terminal: account {current} ({get_email(current)})"
-        if current
-        else "Claude Squad — not launched via cc"
-    )
+    if current:
+        print(f"Active: account {current} ({get_email(current)})")
+    else:
+        print("Active: unknown (no matching credentials)")
     print("=" * 50)
 
     for n in configured_accounts():
@@ -270,7 +250,7 @@ def show_status():
 
 
 def statusline_str():
-    current = this_account()
+    current = which_account()
     if not current:
         return ""
     state = load_state()
@@ -307,12 +287,9 @@ def main():
     elif cmd == "statusline":
         print(statusline_str())
     elif cmd == "check":
-        current = this_account()
+        current = which_account()
         state = load_state()
-        if not current:
-            print(json.dumps({"should_rotate": False}))
-            sys.exit(0)
-        acct = state.get("accounts", {}).get(current, {})
+        acct = state.get("accounts", {}).get(current or "", {})
         five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
         should = five_pct >= 100
         target = pick_best(state, exclude=current) if should else None
@@ -321,12 +298,6 @@ def main():
                 {"should_rotate": should and target is not None, "target": target}
             )
         )
-    elif cmd == "which":
-        current = this_account()
-        if current:
-            print(f"account {current} ({get_email(current)})")
-        else:
-            print("not launched via cc (no CLAUDE_CONFIG_DIR)")
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)

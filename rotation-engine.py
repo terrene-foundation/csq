@@ -236,9 +236,14 @@ def read_keychain():
 # ─── Account Selection ───────────────────────────────────
 
 def pick_best(state, exclude=None):
-    """Pick account with most 5h headroom. Skips blocked + 5h-exhausted."""
+    """Pick account with most 5h headroom. Skips blocked + 5h-exhausted.
+    When multiple accounts are available, picks lowest usage.
+    When all known accounts are exhausted, picks the one whose reset is soonest."""
     blocked = load_blocked()
-    best, best_score = None, -1
+    now = time.time()
+    available = []   # (account, score) — accounts with quota
+    exhausted = []   # (account, resets_at) — accounts waiting for reset
+
     for n in map(str, range(1, MAX_ACCOUNTS + 1)):
         if n == str(exclude):
             continue
@@ -249,16 +254,31 @@ def pick_best(state, exclude=None):
         acct = state.get("accounts", {}).get(n, {})
         five = acct.get("five_hour", {})
         pct = five.get("used_percentage", 0)
+        resets_at = five.get("resets_at", 0)
         updated = acct.get("updated_at", 0)
-        stale = (time.time() - updated) > 1800 if updated else True
+        stale = (now - updated) > 1800 if updated else True
 
         if not stale and pct >= 90:
+            exhausted.append((n, resets_at))
             continue
 
         score = (100 - pct) if (not stale and pct > 0) else 50
-        if score > best_score:
-            best, best_score = n, score
-    return best
+        available.append((n, score))
+
+    # Prefer available accounts (sorted by most headroom)
+    if available:
+        available.sort(key=lambda x: x[1], reverse=True)
+        return available[0][0]
+
+    # All exhausted — pick the one whose 5h window resets soonest
+    if exhausted:
+        # Filter to only those whose reset is in the future
+        future = [(n, r) for n, r in exhausted if r > now]
+        if future:
+            future.sort(key=lambda x: x[1])
+            return future[0][0]
+
+    return None
 
 
 # ─── Swap (Mid-Session) ─────────────────────────────────
@@ -592,8 +612,11 @@ def _poll_account(n):
                         resets = rli.get("resetsAt", 0)
                         status = rli.get("status", "")
                         if rtype in ("five_hour", "seven_day"):
+                            # Poll only gets allowed/rejected, not exact %.
+                            # Use 0% for allowed (available) and 100% for rejected (exhausted).
+                            # resetsAt is always accurate — key for pick_best timing.
                             info[rtype] = {"used_percentage": 100 if status == "rejected" else 0,
-                                           "resets_at": resets}
+                                           "resets_at": resets / 1000 if resets > 1e12 else resets}
                 if info: return n, info
             return n, {"available": True}
         stderr = r.stderr.lower()

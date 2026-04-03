@@ -83,9 +83,21 @@ launch_account() {
   shift
 
   # Primary: per-account config dir (CLAUDE_CONFIG_DIR isolation)
+  # Auth is in keychain (modern) or .credentials.json (legacy) — check .claude.json as init marker
   local rotation_config_dir="$ACCOUNTS_DIR/config-${n}"
-  if [[ -d "$rotation_config_dir" ]] && [[ -f "$rotation_config_dir/.credentials.json" ]]; then
+  if [[ -d "$rotation_config_dir" ]] && { [[ -f "$rotation_config_dir/.claude.json" ]] || [[ -f "$rotation_config_dir/.credentials.json" ]]; }; then
     export CLAUDE_CONFIG_DIR="$rotation_config_dir"
+    # Ensure onboarding state is patched (prevents first-run flow)
+    _patch_onboarding_state "$rotation_config_dir"
+    # Write .credentials.json into config dir (per-directory, no keychain conflicts)
+    local cred_file="$ACCOUNTS_DIR/credentials/${n}.json"
+    if [[ -f "$cred_file" ]]; then
+      cp "$cred_file" "$rotation_config_dir/.credentials.json"
+      chmod 600 "$rotation_config_dir/.credentials.json"
+    fi
+    # Poll all accounts in background so pick_best has fresh data from the start
+    python3 "$HOME/.claude/accounts/rotation-engine.py" _poll_others \
+      $(for i in 1 2 3 4 5 6 7; do echo "$i"; done) &>/dev/null &
     exec claude "$@"
   fi
 
@@ -170,7 +182,8 @@ cmd_login() {
   mkdir -p "$config_dir"
 
   # Symlink shared state to global ~/.claude/
-  for item in settings.json projects plugins; do
+  # sessions/ is shared so /rename + /resume work across config dirs
+  for item in settings.json projects plugins sessions; do
     local target="$HOME/.claude/$item"
     local link="$config_dir/$item"
     if [[ -e "$target" ]] && [[ ! -L "$link" ]]; then
@@ -185,6 +198,12 @@ cmd_login() {
   echo "A browser will open. Sign in with the account you want for slot $n."
   echo ""
 
+  # Remove stale credentials so claude auth login forces a fresh browser login
+  rm -f "$config_dir/.credentials.json"
+
+  # Logout first to clear any cached auth state
+  CLAUDE_CONFIG_DIR="$config_dir" claude auth logout 2>/dev/null || true
+
   # Login INSIDE the config dir — this initializes interactive session state
   CLAUDE_CONFIG_DIR="$config_dir" claude auth login || die "login failed"
 
@@ -195,12 +214,41 @@ cmd_login() {
   # Update profile
   _update_profile "$n" "$email" "oauth"
 
-  # Copy credentials to credentials/N.json (for polling and backup)
-  if [[ -f "$config_dir/.credentials.json" ]]; then
-    mkdir -p "$ACCOUNTS_DIR/credentials"
+  # Extract credentials to credentials/N.json and config dir .credentials.json
+  # Modern Claude Code writes to macOS keychain (shared, single entry).
+  # We MUST extract immediately after login before the next login overwrites it.
+  mkdir -p "$ACCOUNTS_DIR/credentials"
+  local keychain_cred
+  # Claude Code stores credentials per config dir: Claude Code-credentials-{sha256(dir)[:8]}
+  local keychain_suffix
+  keychain_suffix=$(echo -n "$config_dir" | shasum -a 256 | cut -c1-8)
+  local keychain_service="Claude Code-credentials-${keychain_suffix}"
+  keychain_cred=$(security find-generic-password -s "$keychain_service" -w 2>/dev/null || true)
+  # Fallback to generic service name (older Claude Code versions, hex-encoded)
+  if [[ -z "$keychain_cred" ]]; then
+    local keychain_hex
+    keychain_hex=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)
+    if [[ -n "$keychain_hex" ]]; then
+      keychain_cred=$(echo "$keychain_hex" | xxd -r -p)
+    fi
+  fi
+  if [[ -n "$keychain_cred" ]]; then
+    echo "$keychain_cred" > "$ACCOUNTS_DIR/credentials/${n}.json"
+    chmod 600 "$ACCOUNTS_DIR/credentials/${n}.json"
+    # Also write to config dir so Claude Code can use it without keychain
+    echo "$keychain_cred" > "$config_dir/.credentials.json"
+    chmod 600 "$config_dir/.credentials.json"
+  elif [[ -f "$config_dir/.credentials.json" ]]; then
+    # Fallback: credential file written by older Claude Code
     cp "$config_dir/.credentials.json" "$ACCOUNTS_DIR/credentials/${n}.json"
     chmod 600 "$ACCOUNTS_DIR/credentials/${n}.json"
+  else
+    echo "error: no credentials found after login for account $n" >&2
   fi
+
+  # Patch config dir with onboarding state from ~/.claude.json
+  # (prevents first-run flow when launching with CLAUDE_CONFIG_DIR)
+  _patch_onboarding_state "$config_dir"
 
   # Reset quota for this account
   python3 -c "
@@ -322,6 +370,40 @@ cmd_current() {
   echo "Current: account $current (${email:-unknown})"
 }
 
+# ─── Config Dir Helpers ───────────────────────────────────
+
+_patch_onboarding_state() {
+  # Copy essential onboarding/migration flags from ~/.claude.json into a config dir's .claude.json.
+  # Without these, Claude Code shows the full first-run flow (mode select, login screen).
+  local config_dir="$1"
+  local config_json="$config_dir/.claude.json"
+  local home_json="$HOME/.claude.json"
+  [[ -f "$home_json" ]] || return 0
+  [[ -f "$config_json" ]] || return 0
+  python3 -c "
+import json, sys
+home = json.load(open('$home_json'))
+conf = json.load(open('$config_json'))
+KEYS = [
+    'hasCompletedOnboarding', 'lastOnboardingVersion', 'numStartups',
+    'migrationVersion', 'installMethod', 'hasAvailableSubscription',
+    'hasAvailableMaxSubscription', 'opusProMigrationComplete',
+    'sonnet1m45MigrationComplete', 'opus45MigrationComplete',
+    'sonnet45MigrationComplete', 'thinkingMigrationComplete',
+    'optionAsMetaKeyInstalled', 'shiftEnterKeyBindingInstalled',
+    'officialMarketplaceAutoInstallAttempted', 'officialMarketplaceAutoInstalled',
+]
+changed = False
+for k in KEYS:
+    if k in home and k not in conf:
+        conf[k] = home[k]
+        changed = True
+if changed:
+    with open('$config_json', 'w') as f:
+        json.dump(conf, f)
+" 2>/dev/null
+}
+
 # ─── Profile Management ───────────────────────────────────
 
 _update_profile() {
@@ -417,6 +499,42 @@ except: print('account $n')
 
       echo "Stored 1-year token for account $n ($email)"
       ;;
+    resume)
+      shift
+      [[ $# -ge 1 ]] || die "usage: ccc resume <name|uuid>"
+      local resume_target="$1"
+
+      # If not a UUID, look up in session name registry
+      if [[ ! "$resume_target" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        local sid
+        sid=$(python3 "$HOME/.claude/accounts/rotation-engine.py" find-name "$resume_target" 2>/dev/null)
+        if [[ -n "$sid" ]]; then
+          echo "Resolved '$resume_target' → $sid"
+          resume_target="$sid"
+        else
+          die "no session named '$resume_target'. Use 'ccc names' to list."
+        fi
+      fi
+
+      local current
+      current=$(get_current)
+      local rotation_config_dir="$ACCOUNTS_DIR/config-${current}"
+      if [[ -d "$rotation_config_dir" ]]; then
+        export CLAUDE_CONFIG_DIR="$rotation_config_dir"
+        _patch_onboarding_state "$rotation_config_dir"
+        exec claude --resume "$resume_target"
+      else
+        exec claude --resume "$resume_target"
+      fi
+      ;;
+    name)
+      shift
+      [[ $# -ge 2 ]] || die "usage: ccc name <name> <session-uuid>"
+      python3 "$HOME/.claude/accounts/rotation-engine.py" save-name "$1" "$2" "$(pwd)"
+      ;;
+    names)
+      python3 "$HOME/.claude/accounts/rotation-engine.py" list-names "$(pwd)"
+      ;;
     swap)
       shift
       [[ $# -ge 1 ]] || die "usage: ccc swap <1-7>"
@@ -450,6 +568,9 @@ MANAGEMENT:
   ccc status           Show all configured accounts
   ccc quota            Show quota state + rotation priority
   ccc current          Show current rotation account
+  ccc resume <name>    Resume a named session (from /rename or ccc name)
+  ccc name <n> <uuid>  Save a session name for later resume
+  ccc names            List saved session names for current dir
   ccc add <N> [email]  Add/configure account N (1-7 or mm)
   ccc login <N>        OAuth login for account N (1-7)
   ccc extract <N>      Save current keychain creds as account N

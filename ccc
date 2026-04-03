@@ -165,25 +165,53 @@ cmd_login() {
   local n="$1"
   [[ "$n" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $n"
 
+  # Ensure config dir exists
+  local config_dir="$ACCOUNTS_DIR/config-${n}"
+  mkdir -p "$config_dir"
+
+  # Symlink settings if not already done
+  local global_settings="$HOME/.claude/settings.json"
+  if [[ -f "$global_settings" ]] && [[ ! -L "$config_dir/settings.json" ]]; then
+    ln -sf "$global_settings" "$config_dir/settings.json"
+  fi
+
   echo "Logging in to account $n..."
   echo "A browser will open. Sign in with the account you want for slot $n."
   echo ""
 
-  claude auth login || die "login failed"
+  # Login INSIDE the config dir — this initializes interactive session state
+  CLAUDE_CONFIG_DIR="$config_dir" claude auth login || die "login failed"
 
   # Get the email
   local email
-  email=$(claude auth status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null || echo "unknown")
+  email=$(CLAUDE_CONFIG_DIR="$config_dir" claude auth status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null || echo "unknown")
 
   # Update profile
   _update_profile "$n" "$email" "oauth"
 
-  # Extract keychain credentials to credentials/N.json
-  python3 "$HOME/.claude/accounts/rotation-engine.py" extract "$n" 2>/dev/null
-  _update_profile "$n" "$email" "oauth"
+  # Copy credentials to credentials/N.json (for polling and backup)
+  if [[ -f "$config_dir/.credentials.json" ]]; then
+    mkdir -p "$ACCOUNTS_DIR/credentials"
+    cp "$config_dir/.credentials.json" "$ACCOUNTS_DIR/credentials/${n}.json"
+    chmod 600 "$ACCOUNTS_DIR/credentials/${n}.json"
+  fi
 
-  # Update config dir with fresh credentials
-  python3 "$HOME/.claude/accounts/rotation-engine.py" setup 2>/dev/null
+  # Reset quota for this account
+  python3 -c "
+import json, time
+f = '$ACCOUNTS_DIR/quota.json'
+try:
+    state = json.load(open(f))
+except:
+    state = {'accounts': {}}
+state.setdefault('accounts', {})['$n'] = {
+    'five_hour': {'used_percentage': 0, 'resets_at': 0},
+    'seven_day': {'used_percentage': 0, 'resets_at': 0},
+    'updated_at': time.time(),
+}
+with open(f, 'w') as fh:
+    json.dump(state, fh, indent=2)
+" 2>/dev/null
 
   echo ""
   echo "Account $n ($email) configured. Launch with: ccc $n"
@@ -317,10 +345,9 @@ main() {
       ;;
     mm|minimax)
       shift
-      # MiniMax: use settings-mm.json (original or symlinked)
       local mm_settings="$ACCOUNTS_DIR/mm.json"
       [[ -f "$mm_settings" ]] || mm_settings="$HOME/.claude/settings-mm.json"
-      [[ -f "$mm_settings" ]] || die "MiniMax not configured. Run: ccc add mm"
+      [[ -f "$mm_settings" ]] || die "MiniMax not configured."
       launch_with_settings "$mm_settings" "$@"
       ;;
     [1-7])

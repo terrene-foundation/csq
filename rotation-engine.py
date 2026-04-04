@@ -29,12 +29,14 @@ Commands:
   cleanup              Remove stale PID cache files
 """
 
+import fcntl
 import getpass
 import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -59,7 +61,11 @@ def _load(path, default):
 
 
 def _save(path, data):
-    path.write_text(json.dumps(data, indent=2))
+    """Atomic write: temp file + rename. Sets 600 permissions."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.chmod(0o600)
+    tmp.rename(path)
 
 
 def load_state():
@@ -182,6 +188,17 @@ def pick_best(state, exclude=None):
 # ─── OAuth Token Refresh ────────────────────────────────
 
 
+def _validate_account(n):
+    """Validate account number is 1-7. Prevents path traversal."""
+    s = str(n)
+    if not s.isdigit() or int(s) < 1 or int(s) > MAX_ACCOUNTS:
+        print(
+            f"Invalid account number: {n} (must be 1-{MAX_ACCOUNTS})", file=sys.stderr
+        )
+        sys.exit(1)
+    return s
+
+
 def refresh_token(account_num):
     """Refresh an account's OAuth token. Returns new token data or None."""
     import urllib.request
@@ -246,8 +263,11 @@ def refresh_token(account_num):
             "rateLimitTier": creds.get("claudeAiOauth", {}).get("rateLimitTier"),
         }
     }
-    cred_file.write_text(json.dumps(new_creds, indent=2))
-    cred_file.chmod(0o600)
+    # Atomic write to prevent credential corruption on crash
+    tmp = cred_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(new_creds, indent=2))
+    tmp.chmod(0o600)
+    tmp.rename(cred_file)
 
     return new_creds
 
@@ -370,15 +390,17 @@ def auto_rotate(force=False):
         return
 
     current = which_account()
-    state = load_state()
 
     if force and current:
-        state.setdefault("accounts", {}).setdefault(current, {})["five_hour"] = {
+        # Mark current account as exhausted on disk (load raw, don't reset)
+        raw = _load(QUOTA_FILE, {"accounts": {}})
+        raw.setdefault("accounts", {}).setdefault(current, {})["five_hour"] = {
             "used_percentage": 100,
             "resets_at": time.time() + 18000,
         }
-        _save(QUOTA_FILE, state)
+        _save(QUOTA_FILE, raw)
 
+    state = load_state()
     acct = state.get("accounts", {}).get(current or "", {})
     five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
 
@@ -395,7 +417,8 @@ def auto_rotate(force=False):
 
 
 def update_quota(json_str):
-    """Called from statusline. Saves quota data for the current account."""
+    """Called from statusline. Saves quota data for the current account.
+    Uses file locking to prevent concurrent terminals from clobbering each other."""
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError:
@@ -409,13 +432,24 @@ def update_quota(json_str):
     if not current:
         return
 
-    state = load_state()
-    state.setdefault("accounts", {})[current] = {
-        "five_hour": rate_limits.get("five_hour", {}),
-        "seven_day": rate_limits.get("seven_day", {}),
-        "updated_at": time.time(),
-    }
-    _save(QUOTA_FILE, state)
+    # Lock, load, modify, save, unlock — prevents concurrent terminal races
+    lock_file = QUOTA_FILE.with_suffix(".lock")
+    try:
+        lock_fd = open(lock_file, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = _load(QUOTA_FILE, {"accounts": {}})
+        state.setdefault("accounts", {})[current] = {
+            "five_hour": rate_limits.get("five_hour", {}),
+            "seven_day": rate_limits.get("seven_day", {}),
+            "updated_at": time.time(),
+        }
+        _save(QUOTA_FILE, state)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
 
     # Auto-rotate at 100% (only if config dir is set)
     if _config_dir():
@@ -539,6 +573,7 @@ def main():
         if len(sys.argv) < 3:
             print("usage: rotation-engine.py swap <N>", file=sys.stderr)
             sys.exit(1)
+        _validate_account(sys.argv[2])
         if not swap_to(sys.argv[2]):
             sys.exit(1)
     elif cmd == "auto-rotate":
@@ -563,10 +598,12 @@ def main():
         if len(sys.argv) < 3:
             print("usage: rotation-engine.py init-keychain <N>", file=sys.stderr)
             sys.exit(1)
+        _validate_account(sys.argv[2])
         if not init_keychain(sys.argv[2]):
             sys.exit(1)
     elif cmd == "email":
         if len(sys.argv) >= 3:
+            _validate_account(sys.argv[2])
             print(get_email(sys.argv[2]))
     elif cmd == "cleanup":
         cleanup()

@@ -35,15 +35,15 @@ cmd_login() {
     echo "warning: no .credentials.json found — credentials are in keychain only" >&2
   fi
 
-  # Save profile
-  python3 -c "
-import json
-f = '$ACCOUNTS_DIR/profiles.json'
+  # Save profile (pass values via env to avoid shell injection via email)
+  CSQ_ACCT="$n" CSQ_EMAIL="$email" CSQ_FILE="$ACCOUNTS_DIR/profiles.json" python3 -c "
+import json, os
+f = os.environ['CSQ_FILE']
 try:
     d = json.load(open(f))
-except:
+except (FileNotFoundError, json.JSONDecodeError, ValueError):
     d = {'accounts': {}}
-d.setdefault('accounts', {})['$n'] = {'email': '$email', 'method': 'oauth'}
+d.setdefault('accounts', {})[os.environ['CSQ_ACCT']] = {'email': os.environ['CSQ_EMAIL'], 'method': 'oauth'}
 with open(f, 'w') as fh:
     json.dump(d, fh, indent=2)
 " 2>/dev/null

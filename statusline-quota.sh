@@ -1,5 +1,7 @@
-
 #!/bin/bash
+# Statusline hook — shows account + quota, feeds data to rotation engine
+
+command -v jq >/dev/null 2>&1 || { echo ""; exit 0; }
 
 # Read JSON input from stdin
 input=$(cat)

@@ -24,6 +24,7 @@ command -v python3 &>/dev/null || { err "Python 3 not found."; exit 1; }
 command -v jq &>/dev/null || { err "jq not found. brew install jq"; exit 1; }
 
 mkdir -p "$ACCOUNTS_DIR/credentials" "$BIN_DIR"
+chmod 700 "$ACCOUNTS_DIR" "$ACCOUNTS_DIR/credentials"
 
 # Install files — from local repo if available, otherwise download
 if [[ -f "$(dirname "$0")/rotation-engine.py" ]]; then
@@ -62,8 +63,9 @@ SETTINGS_FILE="$HOME/.claude/settings.json"
 python3 -c "
 import json
 f = '$SETTINGS_FILE'
-try: s = json.load(open(f))
-except: s = {}
+try:
+    with open(f) as fh: s = json.load(fh)
+except (FileNotFoundError, json.JSONDecodeError, ValueError): s = {}
 changed = False
 
 # Statusline

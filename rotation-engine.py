@@ -3,20 +3,30 @@
 Claude Squad — Rotation Engine
 
 Tracks quota across accounts. Auto-rotates by refreshing OAuth tokens
-and writing to macOS keychain — CC picks up new creds seamlessly.
+and writing to the per-terminal macOS keychain entry.
+
+Each terminal runs CC with CLAUDE_CONFIG_DIR=~/.claude/accounts/config-N,
+giving it a unique keychain entry: Claude Code-credentials-<sha256(dir)[:8]>.
+Auto-rotate writes to THAT entry only — other terminals are unaffected.
 
 State files (all in ~/.claude/accounts/):
   credentials/N.json   Stored OAuth credentials per account (1-7)
   profiles.json        Email→account mapping
   quota.json           Per-account quota from statusline
+  config-N/            Per-account CC config dir (CLAUDE_CONFIG_DIR target)
+  config-N/.current-account   Which account's creds are in this keychain slot
 
 Commands:
-  update              Update quota from statusline JSON (stdin)
-  status              Show all accounts and quota
-  statusline          Compact string for statusline display
-  swap <N>            Refresh account N's token and write to keychain
-  auto-rotate         Check + swap if needed
-  auto-rotate --force Force-rotate (marks current exhausted)
+  update               Update quota from statusline JSON (stdin)
+  status               Show all accounts and quota
+  statusline           Compact string for statusline display
+  suggest              Suggest best account to switch to (JSON)
+  swap <N>             Refresh account N's token and write to this terminal's keychain
+  auto-rotate          Check + swap if current account is exhausted
+  auto-rotate --force  Force-rotate (marks current exhausted first)
+  check                JSON check: should this terminal rotate? (for hooks)
+  init-keychain <N>    Write stored creds for account N to this terminal's keychain
+  cleanup              Remove stale PID cache files
 """
 
 import getpass
@@ -26,6 +36,7 @@ import os
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
@@ -75,17 +86,43 @@ def configured_accounts():
     return sorted(profiles.keys(), key=int)
 
 
+# ─── Account Detection ──────────────────────────────────
+
+
+def _config_dir():
+    """Get CLAUDE_CONFIG_DIR if set."""
+    return os.environ.get("CLAUDE_CONFIG_DIR", "")
+
+
 def which_account():
-    """Which account is this terminal on? Cached per parent PID."""
-    ppid = os.getppid()
-    cache_file = ACCOUNTS_DIR / f".account.{ppid}"
+    """Which account is this terminal on?
 
-    if cache_file.exists():
-        try:
-            return cache_file.read_text().strip() or None
-        except OSError:
-            pass
+    Fast path: reads .current-account from CLAUDE_CONFIG_DIR.
+    Fallback: extracts from config dir name (config-N).
+    Last resort: claude auth status --json.
+    """
+    config_dir = _config_dir()
+    if config_dir:
+        # Check .current-account file (updated after swaps)
+        current_file = Path(config_dir) / ".current-account"
+        if current_file.exists():
+            try:
+                n = current_file.read_text().strip()
+                if n:
+                    return n
+            except OSError:
+                pass
+        # Initial state: extract from config dir name
+        basename = os.path.basename(config_dir.rstrip("/"))
+        if basename.startswith("config-") and basename[7:].isdigit():
+            n = basename[7:]
+            try:
+                current_file.write_text(n)
+            except OSError:
+                pass
+            return n
 
+    # Fallback: ask CC directly
     try:
         r = subprocess.run(
             ["claude", "auth", "status", "--json"],
@@ -102,7 +139,6 @@ def which_account():
     profiles = _load(PROFILES_FILE, {}).get("accounts", {})
     for n, info in profiles.items():
         if info.get("email") == email:
-            cache_file.write_text(n)
             return n
 
     return None
@@ -220,18 +256,21 @@ def refresh_token(account_num):
 
 
 def _keychain_service():
-    """Get keychain service name for the current config dir.
-    Default (no CLAUDE_CONFIG_DIR): 'Claude Code-credentials'
-    Custom: 'Claude Code-credentials-{sha256(dir)[:8]}'"""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    """Keychain service name for the current CLAUDE_CONFIG_DIR.
+    Default (no config dir): 'Claude Code-credentials'
+    With config dir: 'Claude Code-credentials-{sha256(dir)[:8]}'
+
+    Uses NFC normalization to match CC's behavior."""
+    config_dir = _config_dir()
     if config_dir:
-        h = hashlib.sha256(config_dir.encode()).hexdigest()[:8]
+        normalized = unicodedata.normalize("NFC", config_dir)
+        h = hashlib.sha256(normalized.encode()).hexdigest()[:8]
         return f"Claude Code-credentials-{h}"
     return "Claude Code-credentials"
 
 
 def write_keychain(creds):
-    """Write credentials to macOS keychain (hex-encoded, same as CC)."""
+    """Write credentials to macOS keychain for THIS terminal's config dir."""
     service = _keychain_service()
     username = getpass.getuser()
     json_str = json.dumps(creds)
@@ -259,8 +298,8 @@ def write_keychain(creds):
 
 
 def swap_to(target_account):
-    """Refresh target account's token and write to keychain.
-    CC picks up new creds on next API call."""
+    """Refresh target account's token and write to this terminal's keychain.
+    Only this terminal is affected — other terminals have their own keychain entries."""
     target_account = str(target_account)
     email = get_email(target_account)
 
@@ -269,27 +308,94 @@ def swap_to(target_account):
     )
     new_creds = refresh_token(target_account)
     if not new_creds:
-        print(f"  Failed to refresh token", file=sys.stderr)
+        print("  Failed to refresh token", file=sys.stderr)
         return False
 
     if not write_keychain(new_creds):
-        print(f"  Failed to write keychain", file=sys.stderr)
+        print("  Failed to write keychain", file=sys.stderr)
         return False
 
-    # Invalidate PID cache
-    ppid = os.getppid()
-    cache_file = ACCOUNTS_DIR / f".account.{ppid}"
-    cache_file.write_text(target_account)
+    # Update .current-account tracker
+    config_dir = _config_dir()
+    if config_dir:
+        try:
+            (Path(config_dir) / ".current-account").write_text(target_account)
+        except OSError:
+            pass
 
     print(f"Swapped to account {target_account} ({email})", file=sys.stderr)
     return True
+
+
+# ─── Suggest (fallback when no config dir) ───────────────
+
+
+def suggest():
+    """Suggest the best account to switch to. Outputs JSON."""
+    current = which_account()
+    state = load_state()
+    target = pick_best(state, exclude=current)
+
+    if not target:
+        show_status()
+        print("\nAll accounts exhausted.", file=sys.stderr)
+        print(json.dumps({"exhausted": True}))
+        return
+
+    email = get_email(target)
+    acct = state.get("accounts", {}).get(target, {})
+    five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
+
+    print(
+        json.dumps(
+            {
+                "account": target,
+                "email": email,
+                "five_hour_used": five_pct,
+                "current": current,
+            }
+        )
+    )
+
+
+# ─── Auto-Rotate ─────────────────────────────────────────
+
+
+def auto_rotate(force=False):
+    """Auto-rotate this terminal to the best available account.
+    Requires CLAUDE_CONFIG_DIR (per-terminal keychain isolation).
+    Without it, falls back to suggest."""
+    if not _config_dir():
+        suggest()
+        return
+
+    current = which_account()
+    state = load_state()
+
+    if force and current:
+        state.setdefault("accounts", {}).setdefault(current, {})["five_hour"] = {
+            "used_percentage": 100,
+            "resets_at": time.time() + 18000,
+        }
+        _save(QUOTA_FILE, state)
+
+    acct = state.get("accounts", {}).get(current or "", {})
+    five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
+
+    if five_pct >= 100 or force:
+        target = pick_best(state, exclude=current)
+        if target:
+            swap_to(target)
+        else:
+            show_status()
+            print("\nAll accounts exhausted.", file=sys.stderr)
 
 
 # ─── Quota Update ────────────────────────────────────────
 
 
 def update_quota(json_str):
-    """Called from statusline. Saves quota data, auto-rotates at 100%."""
+    """Called from statusline. Saves quota data for the current account."""
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError:
@@ -311,39 +417,13 @@ def update_quota(json_str):
     }
     _save(QUOTA_FILE, state)
 
-    # Auto-rotate at 100%
-    five_pct = rate_limits.get("five_hour", {}).get("used_percentage", 0)
-    if five_pct >= 100:
-        target = pick_best(state, exclude=current)
-        if target:
-            swap_to(target)
-
-
-# ─── Auto-Rotate ─────────────────────────────────────────
-
-
-def auto_rotate(force=False):
-    """Called from hook or /rotate."""
-    current = which_account()
-    state = load_state()
-
-    if force and current:
-        state.setdefault("accounts", {}).setdefault(current, {})["five_hour"] = {
-            "used_percentage": 100,
-            "resets_at": time.time() + 18000,
-        }
-        _save(QUOTA_FILE, state)
-
-    acct = state.get("accounts", {}).get(current or "", {})
-    five_pct = acct.get("five_hour", {}).get("used_percentage", 0)
-
-    if five_pct >= 100 or force:
-        target = pick_best(state, exclude=current)
-        if target:
-            swap_to(target)
-        elif force:
-            show_status()
-            print("\nAll accounts exhausted.", file=sys.stderr)
+    # Auto-rotate at 100% (only if config dir is set)
+    if _config_dir():
+        five_pct = rate_limits.get("five_hour", {}).get("used_percentage", 0)
+        if five_pct >= 100:
+            target = pick_best(state, exclude=current)
+            if target:
+                swap_to(target)
 
 
 # ─── Status ──────────────────────────────────────────────
@@ -406,6 +486,45 @@ def statusline_str():
     return " ".join(parts)
 
 
+# ─── Init Keychain ───────────────────────────────────────
+
+
+def init_keychain(account_num):
+    """Write stored creds for account N to this CLAUDE_CONFIG_DIR's keychain entry."""
+    cred_file = CREDS_DIR / f"{account_num}.json"
+    if not cred_file.exists():
+        print(f"No stored credentials for account {account_num}", file=sys.stderr)
+        return False
+    creds = json.loads(cred_file.read_text())
+    if write_keychain(creds):
+        print(f"Keychain entry written for account {account_num}", file=sys.stderr)
+        return True
+    print(f"Failed to write keychain for account {account_num}", file=sys.stderr)
+    return False
+
+
+# ─── Cleanup ─────────────────────────────────────────────
+
+
+def cleanup():
+    """Remove stale .account.* PID cache files."""
+    removed = 0
+    for f in ACCOUNTS_DIR.glob(".account.*"):
+        try:
+            pid = int(f.name.split(".")[-1])
+            os.kill(pid, 0)
+        except (ValueError, ProcessLookupError):
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+        except PermissionError:
+            pass
+    remaining = len(list(ACCOUNTS_DIR.glob(".account.*")))
+    print(f"Removed {removed} stale cache files. {remaining} remaining.")
+
+
 # ─── Main ────────────────────────────────────────────────
 
 
@@ -424,6 +543,8 @@ def main():
             sys.exit(1)
     elif cmd == "auto-rotate":
         auto_rotate(force="--force" in sys.argv)
+    elif cmd == "suggest":
+        suggest()
     elif cmd == "statusline":
         print(statusline_str())
     elif cmd == "check":
@@ -438,6 +559,17 @@ def main():
                 {"should_rotate": should and target is not None, "target": target}
             )
         )
+    elif cmd == "init-keychain":
+        if len(sys.argv) < 3:
+            print("usage: rotation-engine.py init-keychain <N>", file=sys.stderr)
+            sys.exit(1)
+        if not init_keychain(sys.argv[2]):
+            sys.exit(1)
+    elif cmd == "email":
+        if len(sys.argv) >= 3:
+            print(get_email(sys.argv[2]))
+    elif cmd == "cleanup":
+        cleanup()
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)

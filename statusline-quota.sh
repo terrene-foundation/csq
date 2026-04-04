@@ -14,14 +14,10 @@ total_in=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
 total_out=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0')
 session_cost=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 
-# Feed quota data to rotation engine (per-terminal, uses CLAUDE_CONFIG_DIR)
-# Run synchronously during polls (CLAUDE_SQUAD_POLL=1) so data writes before subprocess exits.
-# Background for interactive sessions to keep the statusline fast.
-if [ "${CLAUDE_SQUAD_POLL:-}" = "1" ]; then
-    echo "$input" | python3 "$HOME/.claude/accounts/rotation-engine.py" update 2>/dev/null
-else
-    echo "$input" | python3 "$HOME/.claude/accounts/rotation-engine.py" update 2>/dev/null &
-fi
+# Feed quota data to rotation engine.
+# CLAUDE_CONFIG_DIR is inherited from the CC process — the engine reads it
+# to determine which account this terminal is on (no PID cache needed).
+echo "$input" | python3 "$HOME/.claude/accounts/rotation-engine.py" update 2>/dev/null &
 
 # Change to the current directory for git operations
 cd "$current_dir" 2>/dev/null || cd ~

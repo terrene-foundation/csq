@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# csq — Claude Squad account manager
+# Usage:
+#   csq login <N>         Save current session's account as slot N
+#   csq run <N>           Start Claude Code on account N (isolated keychain)
+#   csq status            Show all accounts + quota
+#   csq suggest           Suggest which account to /login to
+#   csq cleanup           Remove stale PID cache files
+#   csq help              Show this help
+
+set -euo pipefail
+
+ACCOUNTS_DIR="$HOME/.claude/accounts"
+ENGINE="$ACCOUNTS_DIR/rotation-engine.py"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+cmd_login() {
+  local n="$1"
+  [[ "$n" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $n"
+
+  # Get current email from active session
+  local email
+  email=$(claude auth status --json 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null \
+    || echo "unknown")
+
+  # Save credentials
+  mkdir -p "$ACCOUNTS_DIR/credentials"
+  local cred_file="$HOME/.claude/.credentials.json"
+  if [[ -f "$cred_file" ]]; then
+    cp "$cred_file" "$ACCOUNTS_DIR/credentials/${n}.json"
+    chmod 600 "$ACCOUNTS_DIR/credentials/${n}.json"
+  else
+    echo "warning: no .credentials.json found — credentials are in keychain only" >&2
+  fi
+
+  # Save profile
+  python3 -c "
+import json
+f = '$ACCOUNTS_DIR/profiles.json'
+try:
+    d = json.load(open(f))
+except:
+    d = {'accounts': {}}
+d.setdefault('accounts', {})['$n'] = {'email': '$email', 'method': 'oauth'}
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" 2>/dev/null
+
+  # Create config dir and write to its keychain entry
+  local config_dir="$ACCOUNTS_DIR/config-$n"
+  mkdir -p "$config_dir"
+  echo "$n" > "$config_dir/.current-account"
+  CLAUDE_CONFIG_DIR="$config_dir" python3 "$ENGINE" init-keychain "$n" 2>/dev/null || true
+
+  echo "Account $n saved ($email)."
+}
+
+cmd_run() {
+  local n="$1"
+  [[ "$n" =~ ^[1-7]$ ]] || die "account must be 1-7, got: $n"
+
+  local config_dir="$ACCOUNTS_DIR/config-$n"
+  mkdir -p "$config_dir"
+
+  # Write initial .current-account if not exists
+  [[ -f "$config_dir/.current-account" ]] || echo "$n" > "$config_dir/.current-account"
+
+  local email
+  email=$(python3 "$ENGINE" email "$n" 2>/dev/null)
+  echo "Starting Claude Code on account $n${email:+ ($email)}"
+  exec env CLAUDE_CONFIG_DIR="$config_dir" claude
+}
+
+cmd_use() {
+  local profile="$1"
+  local settings_dir="$HOME/.claude"
+  local active="$settings_dir/settings.json"
+  local target="$settings_dir/settings-${profile}.json"
+
+  # "default" means the base settings (no suffix)
+  if [ "$profile" = "default" ]; then
+    target="$settings_dir/settings-default.json"
+  fi
+
+  [[ -f "$target" ]] || die "profile not found: $target"
+
+  # Save current settings as its profile name if not already saved
+  # Detect current profile by checking which settings-*.json matches
+  if [[ -f "$active" ]]; then
+    local current_profile="default"
+    for f in "$settings_dir"/settings-*.json; do
+      [[ -f "$f" ]] || continue
+      local name="${f##*/settings-}"
+      name="${name%.json}"
+      if diff -q "$active" "$f" >/dev/null 2>&1; then
+        current_profile="$name"
+        break
+      fi
+    done
+    # Always save current as its profile before switching
+    cp "$active" "$settings_dir/settings-${current_profile}.json"
+  fi
+
+  cp "$target" "$active"
+  echo "Switched to settings profile: $profile"
+}
+
+cmd_suggest() {
+  local result
+  result=$(python3 "$ENGINE" suggest 2>/dev/null) || die "engine failed"
+
+  local exhausted
+  exhausted=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('exhausted', False))" 2>/dev/null)
+
+  if [ "$exhausted" = "True" ]; then
+    echo "All accounts exhausted."
+    python3 "$ENGINE" status
+  else
+    local acct email pct
+    acct=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['account'])" 2>/dev/null)
+    email=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['email'])" 2>/dev/null)
+    pct=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['five_hour_used'])" 2>/dev/null)
+    echo "Switch to account $acct ($email) — 5h: ${pct}% used"
+    echo ""
+    echo "  In Claude Code, run:  /login $email"
+  fi
+}
+
+main() {
+  local cmd="${1:-help}"
+
+  case "$cmd" in
+    login)
+      shift
+      [[ $# -ge 1 ]] || die "usage: csq login <1-7>"
+      cmd_login "$1"
+      ;;
+    run|start)
+      shift
+      [[ $# -ge 1 ]] || die "usage: csq run <1-7>"
+      cmd_run "$1"
+      ;;
+    status|ls|quota)
+      python3 "$ENGINE" status
+      ;;
+    suggest)
+      cmd_suggest
+      ;;
+    use|settings)
+      shift
+      [[ $# -ge 1 ]] || die "usage: csq use <profile>  (e.g., mm, zai, default)"
+      cmd_use "$1"
+      ;;
+    cleanup)
+      python3 "$ENGINE" cleanup
+      ;;
+    help|-h|--help)
+      cat <<'HELP'
+csq — Claude Squad account manager
+
+  csq login <N>     Save current account as slot N (+ set up keychain)
+  csq run <N>       Start Claude Code on account N (isolated keychain)
+  csq status        Show all accounts + quota
+  csq suggest       Suggest which account to /login to
+  csq use <profile>  Switch settings (mm, zai, default)
+  csq cleanup       Remove stale PID cache files
+  csq help          This message
+
+Setup:
+  1. /login to an account in Claude
+  2. csq login 1    (saves it as slot 1)
+  3. Repeat for each account
+
+Daily use:
+  csq run 1         Start CC on account 1 (isolated keychain)
+  csq run 3         Start CC on account 3 (separate terminal)
+
+When rate limited, /rotate auto-switches (if started via csq run).
+Otherwise: csq suggest, then /login <email> manually.
+HELP
+      ;;
+    *)
+      die "unknown command: $cmd. Try: csq help"
+      ;;
+  esac
+}
+
+main "$@"

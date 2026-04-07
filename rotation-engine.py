@@ -65,7 +65,7 @@ def _save(path, data):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.chmod(0o600)
-    tmp.rename(path)
+    os.replace(tmp, path)
 
 
 def load_state():
@@ -307,7 +307,7 @@ def write_csq_account_marker(account_num):
     try:
         tmp = marker.with_suffix(".tmp")
         tmp.write_text(str(account_num))
-        tmp.rename(marker)
+        os.replace(tmp, marker)
         return True
     except OSError:
         return False
@@ -521,7 +521,7 @@ def refresh_token(account_num, quiet=False):
     tmp = cred_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(new_creds, indent=2))
     tmp.chmod(0o600)
-    tmp.rename(cred_file)
+    os.replace(tmp, cred_file)
 
     return new_creds
 
@@ -585,7 +585,7 @@ def write_credentials_file(creds):
         tmp = cred_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(creds, indent=2))
         tmp.chmod(0o600)
-        tmp.rename(cred_path)
+        os.replace(tmp, cred_path)
         return True
     except OSError:
         return False
@@ -710,7 +710,7 @@ def swap_to(target_account):
         live_account_file = Path(config_dir) / ".current-account"
         tmp = live_account_file.with_suffix(".tmp")
         tmp.write_text(target_account)
-        tmp.rename(live_account_file)
+        os.replace(tmp, live_account_file)
     except OSError as e:
         print(
             f"  WARNING: failed to update {config_dir}/.current-account: {e}",
@@ -937,15 +937,15 @@ def cleanup():
     for f in ACCOUNTS_DIR.glob(".account.*"):
         try:
             pid = int(f.name.split(".")[-1])
-            os.kill(pid, 0)
-        except (ValueError, ProcessLookupError):
+            if not _is_pid_alive(pid):
+                f.unlink(missing_ok=True)
+                removed += 1
+        except ValueError:
             try:
-                f.unlink()
+                f.unlink(missing_ok=True)
                 removed += 1
             except OSError:
                 pass
-        except PermissionError:
-            pass
     remaining = len(list(ACCOUNTS_DIR.glob(".account.*")))
     print(f"Removed {removed} stale cache files. {remaining} remaining.")
 

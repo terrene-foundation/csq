@@ -21,7 +21,14 @@ echo -e "\n${BOLD}Claude Squad — Multi-Account Rotation for Claude Code${NC}\n
 
 command -v claude &>/dev/null || { err "Claude Code not found."; exit 1; }
 command -v python3 &>/dev/null || { err "Python 3 not found."; exit 1; }
-command -v jq &>/dev/null || { err "jq not found. brew install jq"; exit 1; }
+if ! command -v jq &>/dev/null; then
+    hint="your package manager"
+    command -v brew &>/dev/null && hint="brew install jq"
+    command -v apt &>/dev/null && hint="sudo apt install jq"
+    command -v dnf &>/dev/null && hint="sudo dnf install jq"
+    command -v pacman &>/dev/null && hint="sudo pacman -S jq"
+    warn "jq not found — statusline will not show quota. Install with: $hint"
+fi
 
 mkdir -p "$ACCOUNTS_DIR/credentials" "$BIN_DIR"
 chmod 700 "$ACCOUNTS_DIR" "$ACCOUNTS_DIR/credentials"

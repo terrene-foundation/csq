@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 credentials/
 .account.*
+.DS_Store
+**/.DS_Store

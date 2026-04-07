@@ -383,6 +383,173 @@ cmd_suggest() {
   fi
 }
 
+cmd_setkey() {
+  local provider="${1:-}"
+  local key="${2:-}"
+  [[ -n "$provider" ]] || die "usage: csq setkey <provider> [key]
+  providers:
+    claude  Claude direct API (ANTHROPIC_API_KEY)
+    mm      MiniMax M2.7 (ANTHROPIC_AUTH_TOKEN for https://api.minimax.io/anthropic)
+    zai     Z.AI GLM-4.6 (ANTHROPIC_AUTH_TOKEN for https://api.z.ai/api/anthropic)
+
+  If [key] is omitted, csq reads it from stdin (keeps it out of shell history).
+  Use:  ! csq setkey mm < <(pbpaste)   # paste from clipboard without echo"
+
+  # Read key from stdin if not passed as argument
+  if [[ -z "$key" ]]; then
+    if [[ -t 0 ]]; then
+      # Interactive stdin — prompt
+      read -rsp "Paste key for $provider: " key
+      echo
+    else
+      # Piped stdin — read directly
+      read -r key
+    fi
+    [[ -n "$key" ]] || die "no key provided"
+  fi
+
+  # Hand off to Python to write the profile overlay, preserving existing fields
+  CSQ_PROVIDER="$provider" CSQ_KEY="$key" "$PY" -c "
+import json, os, sys
+from pathlib import Path
+
+provider = os.environ['CSQ_PROVIDER']
+key = os.environ['CSQ_KEY']
+
+# Provider defaults. These define the skeleton written when the overlay
+# file doesn't exist yet. If it DOES exist, we preserve all fields and
+# only update the key field(s).
+PROVIDERS = {
+    'claude': {
+        'key_fields': ['ANTHROPIC_API_KEY'],
+        'skeleton': {
+            'env': {
+                'ANTHROPIC_API_KEY': '',
+            }
+        },
+    },
+    'mm': {
+        'key_fields': ['ANTHROPIC_AUTH_TOKEN'],
+        'skeleton': {
+            'env': {
+                'ANTHROPIC_BASE_URL': 'https://api.minimax.io/anthropic',
+                'ANTHROPIC_AUTH_TOKEN': '',
+                'ANTHROPIC_MODEL': 'MiniMax-M2.7-highspeed',
+                'ANTHROPIC_SMALL_FAST_MODEL': 'MiniMax-M2.7-highspeed',
+                'ANTHROPIC_DEFAULT_SONNET_MODEL': 'MiniMax-M2.7-highspeed',
+                'ANTHROPIC_DEFAULT_OPUS_MODEL': 'MiniMax-M2.7-highspeed',
+                'ANTHROPIC_DEFAULT_HAIKU_MODEL': 'MiniMax-M2.7-highspeed',
+                'API_TIMEOUT_MS': '3000000',
+                'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
+            }
+        },
+    },
+    'zai': {
+        'key_fields': ['ANTHROPIC_AUTH_TOKEN'],
+        'skeleton': {
+            'env': {
+                'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic',
+                'ANTHROPIC_AUTH_TOKEN': '',
+                'ANTHROPIC_MODEL': 'glm-4.6',
+                'ANTHROPIC_SMALL_FAST_MODEL': 'glm-4.5-air',
+                'ANTHROPIC_DEFAULT_SONNET_MODEL': 'glm-4.6',
+                'ANTHROPIC_DEFAULT_OPUS_MODEL': 'glm-4.6',
+                'ANTHROPIC_DEFAULT_HAIKU_MODEL': 'glm-4.5-air',
+                'API_TIMEOUT_MS': '3000000',
+                'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
+            }
+        },
+    },
+}
+
+if provider not in PROVIDERS:
+    print(f'unknown provider: {provider} (must be one of {list(PROVIDERS.keys())})', file=sys.stderr)
+    sys.exit(1)
+
+config = PROVIDERS[provider]
+profile_path = Path.home() / f'.claude/settings-{provider}.json'
+
+# Load existing profile if it exists and is non-empty
+existing = None
+if profile_path.exists() and profile_path.stat().st_size > 0:
+    try:
+        existing = json.loads(profile_path.read_text())
+    except json.JSONDecodeError:
+        print(f'warning: {profile_path} is corrupted, replacing with defaults', file=sys.stderr)
+        existing = None
+
+if existing is None:
+    # Seed with skeleton
+    data = json.loads(json.dumps(config['skeleton']))  # deep copy
+else:
+    data = existing
+    # Ensure env section exists
+    data.setdefault('env', {})
+
+# Update the key fields. Other fields (model, base URL, etc.) are preserved
+# if already set by the user. If the profile didn't exist, the skeleton
+# defaults provide them.
+for key_field in config['key_fields']:
+    data['env'][key_field] = key
+
+# Atomic write
+tmp = profile_path.with_suffix('.json.tmp')
+tmp.write_text(json.dumps(data, indent=2))
+if os.name != 'nt':
+    os.chmod(tmp, 0o600)
+os.replace(str(tmp), str(profile_path))
+
+print(f'  Key set for profile \"{provider}\" → {profile_path}')
+print(f'  Start CC with: csq run N -p {provider}')
+" 2>&1
+}
+
+cmd_listkeys() {
+  # Show configured provider profiles with masked keys
+  "$PY" -c "
+import json, os
+from pathlib import Path
+
+home = Path.home() / '.claude'
+profiles = sorted(home.glob('settings-*.json'))
+if not profiles:
+    print('No provider profiles configured.')
+    print('Configure one with: csq setkey <provider> [key]')
+    exit()
+
+print(f'{\"Profile\":<12} {\"Key set?\":<10} {\"Fingerprint\":<20} File')
+print('-' * 75)
+for p in profiles:
+    name = p.stem.replace('settings-', '')
+    if p.stat().st_size == 0:
+        print(f'{name:<12} {\"empty\":<10} {\"\":<20} {p}')
+        continue
+    try:
+        d = json.loads(p.read_text())
+    except json.JSONDecodeError:
+        print(f'{name:<12} {\"corrupt\":<10} {\"\":<20} {p}')
+        continue
+    env = d.get('env', {})
+    key_val = env.get('ANTHROPIC_AUTH_TOKEN') or env.get('ANTHROPIC_API_KEY') or ''
+    if key_val:
+        fp = key_val[:8] + '…' + key_val[-6:] if len(key_val) > 20 else '<short>'
+        print(f'{name:<12} {\"yes\":<10} {fp:<20} {p}')
+    else:
+        print(f'{name:<12} {\"no\":<10} {\"\":<20} {p}')
+"
+}
+
+cmd_rmkey() {
+  local provider="${1:-}"
+  [[ -n "$provider" ]] || die "usage: csq rmkey <provider>"
+  local profile_path="$HOME/.claude/settings-${provider}.json"
+  if [[ ! -f "$profile_path" ]]; then
+    die "no profile for $provider at $profile_path"
+  fi
+  rm -f "$profile_path"
+  echo "Removed profile: $profile_path"
+}
+
 main() {
   # No args → default to `csq run` (which auto-resolves accounts).
   # First arg looks like a number or a flag → also treat as `csq run`.
@@ -423,6 +590,17 @@ main() {
     cleanup)
       "$PY" "$ENGINE" cleanup
       ;;
+    setkey)
+      shift
+      cmd_setkey "$@"
+      ;;
+    listkeys|keys)
+      cmd_listkeys
+      ;;
+    rmkey)
+      shift
+      cmd_rmkey "$@"
+      ;;
     help|-h|--help)
       cat <<'HELP'
 csq — Claude Squad account manager
@@ -437,6 +615,16 @@ csq — Claude Squad account manager
   csq status                     Show all accounts + quota
   csq suggest                    Suggest which account to /login to
   csq cleanup                    Remove stale PID cache files
+
+Provider profiles (API key management):
+  csq setkey <prov> [key]        Set/update API key for a provider profile
+                                 Providers: claude (direct API), mm, zai
+                                 If [key] omitted, reads from stdin (safer)
+  csq listkeys                   Show configured provider profiles (masked)
+  csq rmkey <prov>               Remove a provider profile
+
+  Then start CC with: csq run N -p <prov>
+
   csq help                       This message
 
 When CC hits a rate limit, type inside CC:

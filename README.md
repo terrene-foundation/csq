@@ -101,44 +101,66 @@ If you want to know which account to swap to, run `!csq suggest` first.
 csq status              # show all accounts with quota and reset times
 csq suggest             # suggest which account to /login to
 csq run 4               # start CC on account 4 (default settings)
-csq run 4 -p mm         # start CC on account 4 with mm profile overlay
+csq run 4 -p mm         # start CC on account 4 with MiniMax provider
 csq run 4 --resume      # resume the most recent conversation
 csq swap 3              # in-place swap THIS terminal to account 3
+csq setkey mm           # add/update MiniMax API key (interactive, hidden input)
+csq listkeys            # show configured providers with masked keys
 csq cleanup             # remove stale PID cache files
 csq help                # full command list
 ```
 
-## Profile overlays
+## Using other AI providers (MiniMax, Z.AI, direct API)
 
-Profiles are **overlays** at `~/.claude/settings-<name>.json` that get deep-merged onto the canonical `~/.claude/settings.json` at terminal start.
+csq can route Claude Code through different API providers using **profile overlays**. Each provider needs an API key set up once, then you start terminals with that provider.
 
-Each profile only needs to contain the diff. Most profiles only need an `env` block to switch API provider. Example `~/.claude/settings-mm.json`:
+### Step 1: Add your API key
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
-    "ANTHROPIC_AUTH_TOKEN": "sk-...",
-    "ANTHROPIC_MODEL": "MiniMax-M2.7-highspeed"
-  }
-}
+```bash
+csq setkey mm                    # MiniMax — prompts for your key (hidden input)
+csq setkey zai                   # Z.AI — same
+csq setkey claude                # Claude direct API key (bypasses OAuth)
 ```
+
+Or pass the key directly (shows in shell history):
+
+```bash
+csq setkey mm sk-your-key-here
+```
+
+You only need to do this once per provider. csq creates the profile file with all the right settings (API URL, model names, timeouts). To check what's configured:
+
+```bash
+csq listkeys                     # shows all profiles with masked key fingerprints
+csq rmkey zai                    # removes a profile entirely
+```
+
+### Step 2: Start a terminal with that provider
+
+```bash
+csq run 5 -p mm                  # terminal 5, routed through MiniMax
+csq run 3 -p zai                 # terminal 3, routed through Z.AI
+csq run 1                        # terminal 1, default Claude Max (OAuth)
+```
+
+Each terminal is isolated — one can use MiniMax while another uses Claude Max. The provider is set at terminal start and doesn't change during the session.
+
+### How it works (profile overlays)
+
+Profiles are JSON files at `~/.claude/settings-<name>.json` that get deep-merged onto your default `~/.claude/settings.json` at terminal start. `csq setkey` creates and manages these files for you. You can also edit them manually if you need to tweak model names, timeouts, or other settings.
 
 When you run `csq run 5 -p mm`, csq:
 
-1. Reads `~/.claude/settings.json` (full default — hooks, statusLine, plugins, etc.)
-2. Reads `~/.claude/settings-mm.json` (overlay)
-3. Deep-merges them (overlay keys override; nested dicts merge recursively)
-4. Writes the result to `config-5/settings.json` as a real file
-
-Result: the mm terminal has the mm API routing AND all the default hooks/statusline/plugins. No duplication, no need to keep multiple full settings files in sync.
+1. Reads `~/.claude/settings.json` (your full default — hooks, statusline, plugins, etc.)
+2. Reads `~/.claude/settings-mm.json` (the overlay `csq setkey mm` created)
+3. Deep-merges them (overlay keys win; your default hooks/statusline/plugins carry through)
+4. Writes the result to `config-5/settings.json` for that terminal only
 
 **Properties:**
 
-- **No global state.** csq never mutates `~/.claude/settings.json`. The default is the default.
-- **No "switch back".** Each `csq run` is fresh. To use mm again, just `csq run N -p mm` again.
-- **Stateless per run.** No `.profile` file, no memory between runs.
-- **Restart to change profile.** `env` vars are read at process startup, so you can't hot-swap providers.
+- **Your default settings are never modified.** csq only reads `~/.claude/settings.json`, never writes to it.
+- **Each terminal is a fresh start.** To switch providers, start a new terminal with a different `-p` flag.
+- **Providers can't be hot-swapped mid-session.** API routing is set at startup. If you need a different provider, open a new terminal.
 
 ## How it works
 

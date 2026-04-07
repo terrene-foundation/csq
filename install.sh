@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Claude Squad installer — multi-account rotation for Claude Code
+# macOS / Linux / WSL / Git Bash on Windows
 # Install: curl -sSL https://raw.githubusercontent.com/terrene-foundation/claude-squad/main/install.sh | bash
 
 REPO_URL="https://raw.githubusercontent.com/terrene-foundation/claude-squad/main"
@@ -17,23 +18,79 @@ ok()   { echo -e "${GREEN}✓${NC} $*"; }
 warn() { echo -e "${YELLOW}!${NC} $*"; }
 err()  { echo -e "${RED}✗${NC} $*" >&2; }
 
-echo -e "\n${BOLD}Claude Squad — Multi-Account Rotation for Claude Code${NC}\n"
+# ─── Platform detection ─────────────────────────────────
+detect_platform() {
+    case "$(uname -s)" in
+        Darwin) echo "macos" ;;
+        Linux)
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                echo "wsl"
+            else
+                echo "linux"
+            fi ;;
+        MINGW*|MSYS*|CYGWIN*) echo "git-bash" ;;
+        *) echo "unknown" ;;
+    esac
+}
+PLATFORM=$(detect_platform)
 
-command -v claude &>/dev/null || { err "Claude Code not found."; exit 1; }
-command -v python3 &>/dev/null || { err "Python 3 not found."; exit 1; }
+# ─── Python detection ───────────────────────────────────
+# Windows ships Python as `python` or `py -3`, not `python3`. Resolve once
+# and use the result everywhere (including writing the resolved name into
+# the deployed shell scripts so they don't have to detect on every render).
+find_python() {
+    for cmd in python3 python py; do
+        if command -v "$cmd" &>/dev/null; then
+            if "$cmd" --version 2>&1 | grep -q "Python 3"; then
+                echo "$cmd"
+                return
+            fi
+        fi
+    done
+    return 1
+}
+
+# ─── Package manager hint ───────────────────────────────
+suggest_install() {
+    local pkg="$1"
+    case "$PLATFORM" in
+        macos)
+            command -v brew &>/dev/null && echo "brew install $pkg" || echo "install $pkg via Homebrew" ;;
+        linux|wsl)
+            if command -v apt &>/dev/null; then echo "sudo apt install $pkg"
+            elif command -v dnf &>/dev/null; then echo "sudo dnf install $pkg"
+            elif command -v pacman &>/dev/null; then echo "sudo pacman -S $pkg"
+            elif command -v zypper &>/dev/null; then echo "sudo zypper install $pkg"
+            else echo "install $pkg via your package manager"
+            fi ;;
+        git-bash)
+            echo "install $pkg via Scoop, Chocolatey, or download from the project page" ;;
+        *)
+            echo "install $pkg via your package manager" ;;
+    esac
+}
+
+echo -e "\n${BOLD}Claude Squad — Multi-Account Rotation for Claude Code${NC}\n"
+echo -e "Platform: ${BOLD}${PLATFORM}${NC}\n"
+
+# ─── Prerequisites ──────────────────────────────────────
+command -v claude &>/dev/null || { err "Claude Code not found. Install: https://docs.anthropic.com/en/docs/claude-code"; exit 1; }
+
+PYTHON=$(find_python) || { err "Python 3 not found. $(suggest_install python3)"; exit 1; }
+ok "Python 3 found ($PYTHON)"
+
 if ! command -v jq &>/dev/null; then
-    hint="your package manager"
-    command -v brew &>/dev/null && hint="brew install jq"
-    command -v apt &>/dev/null && hint="sudo apt install jq"
-    command -v dnf &>/dev/null && hint="sudo dnf install jq"
-    command -v pacman &>/dev/null && hint="sudo pacman -S jq"
-    warn "jq not found — statusline will not show quota. Install with: $hint"
+    warn "jq not found — statusline will not show quota. $(suggest_install jq)"
 fi
 
 mkdir -p "$ACCOUNTS_DIR/credentials" "$BIN_DIR"
-chmod 700 "$ACCOUNTS_DIR" "$ACCOUNTS_DIR/credentials"
 
-# Install files — from local repo if available, otherwise download
+# chmod is a no-op on Windows (NTFS profile dirs are user-private already)
+if [[ "$PLATFORM" != "git-bash" ]]; then
+    chmod 700 "$ACCOUNTS_DIR" "$ACCOUNTS_DIR/credentials"
+fi
+
+# ─── Install files ──────────────────────────────────────
 if [[ -f "$(dirname "$0")/rotation-engine.py" ]]; then
     SRC="$(cd "$(dirname "$0")" && pwd)"
     cp "$SRC/rotation-engine.py" "$ACCOUNTS_DIR/rotation-engine.py"
@@ -47,26 +104,38 @@ else
     curl -sfL "$REPO_URL/statusline-quota.sh" -o "$ACCOUNTS_DIR/statusline-quota.sh"
 fi
 
+# Migrate old install: remove the stale statusline-command.sh that pre-2.x
+# installs deployed at the wrong location.
+rm -f "$HOME/.claude/statusline-command.sh" 2>/dev/null || true
+
 # Remove obsolete /rotate slash command from any prior install
 rm -f "$HOME/.claude/commands/rotate.md" 2>/dev/null || true
 
-chmod +x "$ACCOUNTS_DIR/rotation-engine.py" "$BIN_DIR/csq" \
-         "$ACCOUNTS_DIR/auto-rotate-hook.sh" "$ACCOUNTS_DIR/statusline-quota.sh"
+if [[ "$PLATFORM" != "git-bash" ]]; then
+    chmod +x "$ACCOUNTS_DIR/rotation-engine.py" "$BIN_DIR/csq" \
+             "$ACCOUNTS_DIR/auto-rotate-hook.sh" "$ACCOUNTS_DIR/statusline-quota.sh"
+fi
 ok "Files installed"
 
 # Remove old 'cc' binary if it exists (renamed to csq)
 rm -f "$BIN_DIR/cc" 2>/dev/null
 
-# Create config dirs (1-7)
+# ─── Config dirs ────────────────────────────────────────
 for n in 1 2 3 4 5 6 7; do
     mkdir -p "$ACCOUNTS_DIR/config-$n"
 done
 ok "Config dirs created"
 
-# Patch settings.json — statusline + auto-rotate hook
+case "$PLATFORM" in
+    macos) ok "Credential storage: macOS Keychain + file fallback" ;;
+    linux|wsl) ok "Credential storage: file-only (no keychain on Linux)" ;;
+    git-bash) ok "Credential storage: file-only (no keychain on Windows)" ;;
+esac
+
+# ─── Patch settings.json ────────────────────────────────
 SETTINGS_FILE="$HOME/.claude/settings.json"
 [[ -f "$SETTINGS_FILE" ]] || echo '{}' > "$SETTINGS_FILE"
-CSQ_SETTINGS="$SETTINGS_FILE" python3 -c "
+CSQ_SETTINGS="$SETTINGS_FILE" "$PYTHON" -c "
 import json, os
 f = os.environ['CSQ_SETTINGS']
 try:
@@ -82,7 +151,9 @@ if sl.get('command') != desired_sl_cmd:
     s['statusLine'] = {'type':'command','command':desired_sl_cmd}
     changed = True
 
-# Auto-rotate hook
+# Auto-rotate hook (the hook script itself is a no-op now, but we keep the
+# wiring in place so future re-enablement is a one-line change to the script
+# rather than re-running the installer).
 hook_cmd = 'bash ~/.claude/accounts/auto-rotate-hook.sh'
 uph = s.setdefault('hooks', {}).setdefault('UserPromptSubmit', [])
 if not any(hook_cmd in str(entry) for entry in uph):
@@ -92,7 +163,7 @@ if not any(hook_cmd in str(entry) for entry in uph):
 if changed:
     with open(f,'w') as fh: json.dump(s, fh, indent=2)
 " 2>/dev/null
-ok "Settings configured (statusline + auto-rotate hook)"
+ok "Settings configured (statusline)"
 
 if ! echo "$PATH" | grep -q "$BIN_DIR"; then
     warn "$BIN_DIR not in PATH. Add to your shell profile:"

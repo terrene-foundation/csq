@@ -152,7 +152,7 @@ def _save(path, data):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     _secure_file(tmp)
-    os.replace(tmp, path)
+    _atomic_replace(tmp, path)
 
 
 def load_state():
@@ -468,7 +468,7 @@ def write_csq_account_marker(account_num):
     try:
         tmp = marker.with_suffix(".tmp")
         tmp.write_text(str(account_num))
-        os.replace(tmp, marker)
+        _atomic_replace(tmp, marker)
         return True
     except OSError:
         return False
@@ -683,7 +683,7 @@ def refresh_token(account_num, quiet=False):
     tmp = cred_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(new_creds, indent=2))
     _secure_file(tmp)
-    os.replace(tmp, cred_file)
+    _atomic_replace(tmp, cred_file)
 
     return new_creds
 
@@ -748,7 +748,7 @@ def write_credentials_file(creds):
         tmp = cred_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(creds, indent=2))
         _secure_file(tmp)
-        os.replace(tmp, cred_path)
+        _atomic_replace(tmp, cred_path)
         return True
     except OSError:
         return False
@@ -880,7 +880,7 @@ def swap_to(target_account):
         live_account_file = Path(config_dir) / ".current-account"
         tmp = live_account_file.with_suffix(".tmp")
         tmp.write_text(target_account)
-        os.replace(tmp, live_account_file)
+        _atomic_replace(tmp, live_account_file)
     except OSError as e:
         print(
             f"  WARNING: failed to update {config_dir}/.current-account: {e}",
@@ -1040,7 +1040,7 @@ def update_quota(json_str):
         try:
             tmp = cursor_file.with_suffix(".tmp")
             tmp.write_text(cursor_value)
-            os.replace(tmp, cursor_file)
+            _atomic_replace(tmp, cursor_file)
         except OSError:
             pass
 
@@ -1225,7 +1225,7 @@ def backsync():
         tmp = target_canonical.with_suffix(".tmp")
         tmp.write_text(json.dumps(live_data, indent=2))
         _secure_file(tmp)
-        os.replace(tmp, target_canonical)
+        _atomic_replace(tmp, target_canonical)
     except OSError:
         pass
 

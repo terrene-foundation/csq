@@ -15,6 +15,37 @@ ENGINE="$ACCOUNTS_DIR/rotation-engine.py"
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# Resolve Python 3 command for this platform. Windows has python/py instead
+# of python3. Try in order, cache the result.
+_find_python() {
+  for cmd in python3 python py; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      if "$cmd" --version 2>&1 | grep -q "Python 3"; then
+        echo "$cmd"
+        return
+      fi
+    fi
+  done
+  die "Python 3 not found in PATH"
+}
+PY="$(_find_python)"
+
+# Detect platform once
+_detect_platform() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux)
+      if grep -qi microsoft /proc/version 2>/dev/null; then
+        echo "wsl"
+      else
+        echo "linux"
+      fi ;;
+    MINGW*|MSYS*|CYGWIN*) echo "git-bash" ;;
+    *) echo "unknown" ;;
+  esac
+}
+PLATFORM="$(_detect_platform)"
+
 cmd_login() {
   local n="$1"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "account must be a positive integer, got: $n"
@@ -32,48 +63,78 @@ cmd_login() {
   # After login, get email from the new session
   local email
   email=$(CLAUDE_CONFIG_DIR="$config_dir" claude auth status --json 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null \
+    | "$PY" -c "import json,sys; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null \
     || echo "unknown")
 
-  # Extract credentials from this config dir's keychain entry and save
-  CSQ_CONFIG_DIR="$config_dir" CSQ_ACCT="$n" CSQ_CREDS_DIR="$ACCOUNTS_DIR/credentials" python3 -c "
-import getpass, hashlib, json, os, subprocess, unicodedata
+  # Capture credentials. On macOS, CC stores them in the per-config-dir
+  # keychain entry. On Linux/WSL/Windows, CC writes them directly to
+  # $config_dir/.credentials.json. Try keychain first, then file.
+  CSQ_CONFIG_DIR="$config_dir" CSQ_ACCT="$n" CSQ_CREDS_DIR="$ACCOUNTS_DIR/credentials" CSQ_PLATFORM="$PLATFORM" "$PY" -c "
+import hashlib, json, os, subprocess, sys, unicodedata
 
 config_dir = os.environ['CSQ_CONFIG_DIR']
 n = os.environ['CSQ_ACCT']
 creds_dir = os.environ['CSQ_CREDS_DIR']
+platform = os.environ['CSQ_PLATFORM']
 
-# Read from this config dir's keychain entry
-normalized = unicodedata.normalize('NFC', config_dir)
-h = hashlib.sha256(normalized.encode()).hexdigest()[:8]
-service = f'Claude Code-credentials-{h}'
-import getpass as gp
-r = subprocess.run(['security', 'find-generic-password', '-a', gp.getuser(), '-s', service, '-w'],
-                    capture_output=True, text=True)
-if r.returncode == 0 and r.stdout.strip():
-    raw = r.stdout.strip()
+creds = None
+
+# Path 1: macOS keychain
+if platform == 'macos':
+    normalized = unicodedata.normalize('NFC', config_dir)
+    h = hashlib.sha256(normalized.encode()).hexdigest()[:8]
+    service = f'Claude Code-credentials-{h}'
+    import getpass
     try:
-        creds = json.loads(raw)
-    except json.JSONDecodeError:
-        creds = json.loads(bytes.fromhex(raw).decode('utf-8'))
-    cred_file = os.path.join(creds_dir, f'{n}.json')
-    with open(cred_file, 'w') as f:
-        json.dump(creds, f, indent=2)
-    os.chmod(cred_file, 0o600)
-    # Also write to config dir so CC interactive mode finds them
+        r = subprocess.run(
+            ['security', 'find-generic-password', '-a', getpass.getuser(), '-s', service, '-w'],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            raw = r.stdout.strip()
+            try:
+                creds = json.loads(raw)
+            except json.JSONDecodeError:
+                creds = json.loads(bytes.fromhex(raw).decode('utf-8'))
+    except Exception:
+        pass
+
+# Path 2: file fallback (always tried — works on all platforms; on macOS,
+# this is the secondary path if the keychain read failed)
+if creds is None:
     dot_creds = os.path.join(config_dir, '.credentials.json')
-    with open(dot_creds, 'w') as f:
-        json.dump(creds, f, indent=2)
+    if os.path.exists(dot_creds):
+        try:
+            with open(dot_creds) as f:
+                creds = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+if creds is None:
+    print('  warning: could not read credentials after login', file=sys.stderr)
+    sys.exit(0)
+
+# Save canonical copy
+cred_file = os.path.join(creds_dir, f'{n}.json')
+with open(cred_file, 'w') as f:
+    json.dump(creds, f, indent=2)
+if platform != 'git-bash':
+    os.chmod(cred_file, 0o600)
+
+# Mirror into config dir (CC reads it at startup)
+dot_creds = os.path.join(config_dir, '.credentials.json')
+with open(dot_creds, 'w') as f:
+    json.dump(creds, f, indent=2)
+if platform != 'git-bash':
     os.chmod(dot_creds, 0o600)
-    print(f'  Credentials saved to slot {n}')
-else:
-    print('  warning: could not read credentials from keychain')
-" 2>/dev/null
+
+print(f'  Credentials saved to slot {n}')
+" 2>&1
 
   echo "$n" > "$config_dir/.current-account"
 
   # Save profile
-  CSQ_ACCT="$n" CSQ_EMAIL="$email" CSQ_FILE="$ACCOUNTS_DIR/profiles.json" python3 -c "
+  CSQ_ACCT="$n" CSQ_EMAIL="$email" CSQ_FILE="$ACCOUNTS_DIR/profiles.json" "$PY" -c "
 import json, os
 f = os.environ['CSQ_FILE']
 try:
@@ -178,20 +239,29 @@ cmd_run() {
 
     local target="$config_dir/$base"
 
-    # Already a correct symlink — skip
-    if [[ -L "$target" ]] && [[ "$(readlink "$target")" == "$item" ]]; then
-      continue
+    # Already a correct link — skip. On Git Bash/Windows, junctions don't
+    # report via readlink, so we just check existence and re-create if older.
+    if [[ "$PLATFORM" != "git-bash" ]]; then
+      if [[ -L "$target" ]] && [[ "$(readlink "$target")" == "$item" ]]; then
+        continue
+      fi
+      if [[ -e "$target" ]] && [[ ! -L "$target" ]]; then
+        rm -rf "$target"
+      fi
+      [[ -L "$target" ]] && rm -f "$target"
+      ln -s "$item" "$target"
+    else
+      # Windows/Git Bash: directory junctions for dirs, copy for files.
+      # Junctions don't need admin like symlinks do.
+      [[ -e "$target" ]] && rm -rf "$target" 2>/dev/null
+      if [[ -d "$item" ]]; then
+        # mklink /J needs Windows-style paths
+        cmd //c "mklink /J \"$(cygpath -w "$target" 2>/dev/null || echo "$target")\" \"$(cygpath -w "$item" 2>/dev/null || echo "$item")\"" >/dev/null 2>&1 \
+          || cp -r "$item" "$target"
+      else
+        cp "$item" "$target" 2>/dev/null || true
+      fi
     fi
-
-    # Remove existing real file/dir in config-N (replaced by symlink)
-    if [[ -e "$target" ]] && [[ ! -L "$target" ]]; then
-      rm -rf "$target"
-    fi
-
-    # Remove stale symlink
-    [[ -L "$target" ]] && rm -f "$target"
-
-    ln -s "$item" "$target"
   done
 
   # --- Account-specific setup (per-config-dir, no global state) ---
@@ -200,10 +270,11 @@ cmd_run() {
   # so the canonical file stays current. Without this, csq run overwrites fresh
   # CC-refreshed tokens with stale ones → 401 on next startup.
   if [[ -f "$config_dir/.credentials.json" ]]; then
-    CSQ_CANONICAL="$cred_file" CSQ_LIVE="$config_dir/.credentials.json" python3 -c "
+    CSQ_CANONICAL="$cred_file" CSQ_LIVE="$config_dir/.credentials.json" CSQ_PLATFORM="$PLATFORM" "$PY" -c "
 import json, os, sys
 canonical = os.environ['CSQ_CANONICAL']
 live = os.environ['CSQ_LIVE']
+platform = os.environ['CSQ_PLATFORM']
 try:
     with open(canonical) as f: c = json.load(f)
     with open(live) as f: l = json.load(f)
@@ -213,11 +284,22 @@ try:
     c_rt = c.get('claudeAiOauth', {}).get('refreshToken', '')
     # If live has a newer token or different refresh token, back-sync
     if l_exp > c_exp or (l_rt and l_rt != c_rt):
-        import shutil, stat
+        import stat
         tmp = canonical + '.tmp'
         with open(tmp, 'w') as f: json.dump(l, f, indent=2)
-        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
-        os.replace(tmp, canonical)
+        if platform != 'git-bash':
+            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        # Atomic replace with retry for Windows file-in-use
+        import time
+        for attempt in range(5):
+            try:
+                os.replace(tmp, canonical)
+                break
+            except PermissionError:
+                if platform == 'git-bash' and attempt < 4:
+                    time.sleep(0.1)
+                    continue
+                raise
 except Exception:
     pass  # Non-fatal — proceed with whatever canonical has
 " 2>/dev/null
@@ -226,7 +308,9 @@ except Exception:
   # CC v2.1+ reads .credentials.json at startup. Copy from canonical so
   # swap_to() changes take effect on restart.
   cp "$cred_file" "$config_dir/.credentials.json"
-  chmod 600 "$config_dir/.credentials.json"
+  if [[ "$PLATFORM" != "git-bash" ]]; then
+    chmod 600 "$config_dir/.credentials.json"
+  fi
 
   # .csq-account marker — durable identity record. Snapshot reads this on
   # CC restart to populate .current-account. csq swap rewrites it. Per-dir,
@@ -249,7 +333,7 @@ except Exception:
   # if the file is missing — which it isn't, because we just wrote it.
 
   # Mark onboarding complete so CC doesn't show the setup wizard
-  CSQ_CONFIG="$config_dir/.claude.json" python3 -c "
+  CSQ_CONFIG="$config_dir/.claude.json" "$PY" -c "
 import json, os
 p = os.environ['CSQ_CONFIG']
 try:
@@ -268,7 +352,7 @@ if not d.get('hasCompletedOnboarding'):
   CSQ_DEFAULT="$default_dir/settings.json" \
   CSQ_OVERLAY="${profile:+$default_dir/settings-${profile}.json}" \
   CSQ_OUTPUT="$config_dir/settings.json" \
-  python3 -c "
+  "$PY" -c "
 import json, os, sys
 default_path = os.environ['CSQ_DEFAULT']
 overlay_path = os.environ.get('CSQ_OVERLAY') or ''
@@ -301,7 +385,7 @@ with open(output_path, 'w') as f:
 " || die "failed to build settings.json"
 
   local email
-  email=$(python3 "$ENGINE" email "$n" 2>/dev/null)
+  email=$("$PY" "$ENGINE" email "$n" 2>/dev/null)
   local profile_label=""
   [[ -n "$profile" ]] && profile_label=" [profile: $profile]"
   echo "Starting Claude Code on account $n${email:+ ($email)}${profile_label}"
@@ -310,19 +394,19 @@ with open(output_path, 'w') as f:
 
 cmd_suggest() {
   local result
-  result=$(python3 "$ENGINE" suggest 2>/dev/null) || die "engine failed"
+  result=$("$PY" "$ENGINE" suggest 2>/dev/null) || die "engine failed"
 
   local exhausted
-  exhausted=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('exhausted', False))" 2>/dev/null)
+  exhausted=$(echo "$result" | "$PY" -c "import json,sys; print(json.load(sys.stdin).get('exhausted', False))" 2>/dev/null)
 
   if [ "$exhausted" = "True" ]; then
     echo "All accounts exhausted."
-    python3 "$ENGINE" status
+    "$PY" "$ENGINE" status
   else
     local acct email pct
-    acct=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['account'])" 2>/dev/null)
-    email=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['email'])" 2>/dev/null)
-    pct=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['five_hour_used'])" 2>/dev/null)
+    acct=$(echo "$result" | "$PY" -c "import json,sys; print(json.load(sys.stdin)['account'])" 2>/dev/null)
+    email=$(echo "$result" | "$PY" -c "import json,sys; print(json.load(sys.stdin)['email'])" 2>/dev/null)
+    pct=$(echo "$result" | "$PY" -c "import json,sys; print(json.load(sys.stdin)['five_hour_used'])" 2>/dev/null)
     echo "Switch to account $acct ($email) — 5h: ${pct}% used"
     echo ""
     echo "  In Claude Code, run:  /login $email"
@@ -354,7 +438,7 @@ main() {
       cmd_run "$@"
       ;;
     status|ls|quota)
-      python3 "$ENGINE" status
+      "$PY" "$ENGINE" status
       ;;
     suggest)
       cmd_suggest
@@ -364,10 +448,10 @@ main() {
       [[ $# -ge 1 ]] || die "usage: csq swap <N>  (swap THIS terminal to account N)"
       [[ "$1" =~ ^[1-9][0-9]*$ ]] || die "account must be a positive integer, got: $1"
       [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] || die "csq swap only works in a csq terminal (CLAUDE_CONFIG_DIR not set — use 'csq run $1' instead)"
-      python3 "$ENGINE" swap "$1"
+      "$PY" "$ENGINE" swap "$1"
       ;;
     cleanup)
-      python3 "$ENGINE" cleanup
+      "$PY" "$ENGINE" cleanup
       ;;
     help|-h|--help)
       cat <<'HELP'

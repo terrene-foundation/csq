@@ -3,6 +3,16 @@
 
 command -v jq >/dev/null 2>&1 || { echo ""; exit 0; }
 
+# Resolve Python 3 once. Windows uses python/py instead of python3.
+PY=""
+for cmd in python3 python py; do
+    if command -v "$cmd" >/dev/null 2>&1 && "$cmd" --version 2>&1 | grep -q "Python 3"; then
+        PY="$cmd"
+        break
+    fi
+done
+[[ -n "$PY" ]] || { echo ""; exit 0; }
+
 # Read JSON input from stdin
 input=$(cat)
 
@@ -27,15 +37,15 @@ session_cost=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 # Cheap path: one os.kill probe and return.
 # MUST run synchronously and BEFORE `update`, so update_quota() attributes
 # the incoming rate_limits to the correct (live) account.
-python3 "$HOME/.claude/accounts/rotation-engine.py" snapshot 2>/dev/null
+"$PY" "$HOME/.claude/accounts/rotation-engine.py" snapshot 2>/dev/null
 
 # Back-sync: keep credentials/N.json fresh with whatever CC has refreshed.
 # CC rotates refresh tokens during sessions. Without this, credentials/N.json
 # goes stale and `csq swap N` from another terminal writes revoked tokens.
-python3 "$HOME/.claude/accounts/rotation-engine.py" backsync 2>/dev/null &
+"$PY" "$HOME/.claude/accounts/rotation-engine.py" backsync 2>/dev/null &
 
 # Feed quota data to rotation engine.
-echo "$input" | python3 "$HOME/.claude/accounts/rotation-engine.py" update 2>/dev/null &
+echo "$input" | "$PY" "$HOME/.claude/accounts/rotation-engine.py" update 2>/dev/null &
 
 # Change to the current directory for git operations
 cd "$current_dir" 2>/dev/null || cd ~
@@ -43,7 +53,7 @@ cd "$current_dir" 2>/dev/null || cd ~
 # Function to get account + quota info
 get_claude_account() {
     local quota
-    quota=$(python3 "$HOME/.claude/accounts/rotation-engine.py" statusline 2>/dev/null)
+    quota=$("$PY" "$HOME/.claude/accounts/rotation-engine.py" statusline 2>/dev/null)
 
     if [ -n "$quota" ]; then
         echo "${quota}"

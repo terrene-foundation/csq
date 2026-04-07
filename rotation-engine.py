@@ -3,34 +3,36 @@
 Claude Squad — Rotation Engine
 
 Tracks quota across accounts. Auto-rotates by refreshing OAuth tokens
-and writing to the per-terminal macOS keychain entry.
+and writing credentials for the current terminal.
 
 Each terminal runs CC with CLAUDE_CONFIG_DIR=~/.claude/accounts/config-N,
-giving it a unique keychain entry: Claude Code-credentials-<sha256(dir)[:8]>.
-Auto-rotate writes to THAT entry only — other terminals are unaffected.
+giving it isolated credentials. On macOS, each config dir also gets a
+unique keychain entry: Claude Code-credentials-<sha256(dir)[:8]>.
+On Linux/WSL/Windows, file-only credential storage is used.
 
 State files (all in ~/.claude/accounts/):
   credentials/N.json   Stored OAuth credentials per account (1-7)
   profiles.json        Email→account mapping
   quota.json           Per-account quota from statusline
   config-N/            Per-account CC config dir (CLAUDE_CONFIG_DIR target)
-  config-N/.current-account   Which account's creds are in this keychain slot
+  config-N/.current-account   Which account's creds are in this terminal
 
 Commands:
   update               Update quota from statusline JSON (stdin)
   status               Show all accounts and quota
   statusline           Compact string for statusline display
   suggest              Suggest best account to switch to (JSON)
-  swap <N>             Refresh account N's token and write to this terminal's keychain
+  swap <N>             Refresh account N's token and write to this terminal's creds
   auto-rotate          Check + swap if current account is exhausted
   auto-rotate --force  Force-rotate (marks current exhausted first)
   check                JSON check: should this terminal rotate? (for hooks)
-  init-keychain <N>    Write stored creds for account N to this terminal's keychain
-  snapshot             Refresh .current-account from keychain on CC restart (statusline hook)
+  init-keychain <N>    Write stored creds for account N to this terminal (macOS: keychain)
+  snapshot             Refresh .current-account on CC restart (statusline hook)
   cleanup              Remove stale PID cache files
+  python-cmd           Print the resolved Python 3 command for this platform
 """
 
-import fcntl
+import ctypes
 import getpass
 import hashlib
 import json
@@ -40,6 +42,91 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
+
+# ─── Platform Detection ─────────────────────────────────
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+# ─── File Locking ────────────────────────────────────────
+# POSIX: fcntl.flock() — advisory, whole-file, blocks indefinitely.
+# Windows: named mutex via kernel32 — cooperative, blocks indefinitely.
+# NOT msvcrt.locking() — wrong semantics (mandatory byte-range, 10s timeout).
+
+if IS_WINDOWS:
+    _kernel32 = ctypes.windll.kernel32
+
+    def _lock_file(lock_path):
+        """Acquire a named mutex derived from the lock file path."""
+        name = "csq_" + str(lock_path).replace("\\", "_").replace("/", "_").replace(
+            ":", "_"
+        )
+        handle = _kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return None
+        _kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)  # INFINITE
+        return handle
+
+    def _unlock_file(handle):
+        if handle:
+            _kernel32.ReleaseMutex(handle)
+            _kernel32.CloseHandle(handle)
+
+else:
+    import fcntl
+
+    def _lock_file(lock_path):
+        fd = open(lock_path, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def _unlock_file(fd):
+        if fd:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                fd.close()
+            except Exception:
+                pass
+
+
+def _secure_file(path):
+    """Set file permissions to owner-only. No-op on Windows."""
+    if not IS_WINDOWS:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def _atomic_replace(tmp_path, target_path):
+    """Atomic rename with retry for Windows file-in-use conflicts."""
+    for attempt in range(5):
+        try:
+            os.replace(str(tmp_path), str(target_path))
+            return
+        except PermissionError:
+            if IS_WINDOWS and attempt < 4:
+                time.sleep(0.1)
+                continue
+            raise
+
+
+def _python_cmd():
+    """Return the Python 3 command for this platform."""
+    if IS_WINDOWS:
+        for cmd in ["python3", "python", "py"]:
+            try:
+                r = subprocess.run(
+                    [cmd, "--version"], capture_output=True, text=True, timeout=3
+                )
+                if r.returncode == 0 and "Python 3" in r.stdout:
+                    return cmd
+            except FileNotFoundError:
+                continue
+        return "python"
+    return "python3"
+
 
 ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
 CREDS_DIR = ACCOUNTS_DIR / "credentials"
@@ -64,7 +151,7 @@ def _save(path, data):
     """Atomic write: temp file + rename. Sets 600 permissions."""
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
-    tmp.chmod(0o600)
+    _secure_file(tmp)
     os.replace(tmp, path)
 
 
@@ -165,8 +252,18 @@ def which_account():
 
 
 def _is_pid_alive(pid):
-    """Return True if the given PID exists. PermissionError means the
-    process exists but is owned by another user — still alive."""
+    """Return True if the given PID exists."""
+    if IS_WINDOWS:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+        )
+        if handle:
+            exit_code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return exit_code.value == 259  # STILL_ACTIVE
+        return False
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -178,6 +275,19 @@ def _is_pid_alive(pid):
     return True
 
 
+def _is_cc_command(cmd):
+    """Check if a command string looks like Claude Code CLI."""
+    cmd = cmd.lower()
+    return (
+        "claude" in cmd
+        and "claude-squad" not in cmd
+        and "rotation-engine" not in cmd
+        and "statusline" not in cmd
+        and "/csq" not in cmd
+        and " csq" not in cmd
+    )
+
+
 def _find_cc_pid():
     """Walk the parent process tree from this Python process upward,
     returning the PID of the first ancestor that looks like the Claude Code
@@ -186,8 +296,15 @@ def _find_cc_pid():
     Used by snapshot_account() to identify "the CC process that owns this
     statusline invocation" so its lifetime can act as the snapshot key.
     """
+    if IS_WINDOWS:
+        return _find_cc_pid_windows()
+    return _find_cc_pid_posix()
+
+
+def _find_cc_pid_posix():
+    """POSIX process tree walk using ps."""
     pid = os.getppid()
-    for _ in range(20):  # Bounded depth to avoid runaway loops
+    for _ in range(20):
         if pid <= 1:
             break
         try:
@@ -211,18 +328,62 @@ def _find_cc_pid():
             ppid = int(parts[0])
         except ValueError:
             return None
-        cmd = parts[1].lower()
-        # Match Claude Code CLI; exclude our own helper processes.
-        if (
-            "claude" in cmd
-            and "claude-squad" not in cmd
-            and "rotation-engine" not in cmd
-            and "statusline" not in cmd
-            and "/csq" not in cmd
-            and " csq" not in cmd
-        ):
+        if _is_cc_command(parts[1]):
             return pid
         pid = ppid
+    return None
+
+
+def _find_cc_pid_windows():
+    """Windows process tree walk using CreateToolhelp32Snapshot.
+
+    Single kernel call returns all processes. Walk parent chain from our PID
+    upward. Zero startup cost (no PowerShell/wmic subprocess).
+    """
+    TH32CS_SNAPPROCESS = 0x00000002
+    kernel32 = ctypes.windll.kernel32
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_ulong),
+            ("cntUsage", ctypes.c_ulong),
+            ("th32ProcessID", ctypes.c_ulong),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", ctypes.c_ulong),
+            ("cntThreads", ctypes.c_ulong),
+            ("th32ParentProcessID", ctypes.c_ulong),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_ulong),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        return None
+
+    # Build PID → (parent_pid, exe_name) map
+    procs = {}
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+        while True:
+            procs[entry.th32ProcessID] = (
+                entry.th32ParentProcessID,
+                entry.szExeFile,
+            )
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    kernel32.CloseHandle(snapshot)
+
+    # Walk parent chain
+    pid = os.getppid()
+    for _ in range(20):
+        if pid <= 1 or pid not in procs:
+            break
+        parent_pid, exe = procs[pid]
+        if _is_cc_command(exe):
+            return pid
+        pid = parent_pid
     return None
 
 
@@ -315,11 +476,12 @@ def write_csq_account_marker(account_num):
 
 def keychain_account():
     """Read the macOS keychain entry for this config dir and identify which
-    stored credential file holds a matching access token. Used as a fallback
-    by snapshot_account() when .credentials.json is missing — historically
-    csq used the keychain as the only credential store, and some older
-    setups may not have a .credentials.json yet.
+    stored credential file holds a matching access token. macOS only —
+    returns None on other platforms. Used as a fallback by snapshot_account()
+    when .credentials.json is missing.
     """
+    if not IS_MACOS:
+        return None
     service = _keychain_service()
     try:
         r = subprocess.run(
@@ -520,7 +682,7 @@ def refresh_token(account_num, quiet=False):
     # Atomic write to prevent credential corruption on crash
     tmp = cred_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(new_creds, indent=2))
-    tmp.chmod(0o600)
+    _secure_file(tmp)
     os.replace(tmp, cred_file)
 
     return new_creds
@@ -530,11 +692,9 @@ def refresh_token(account_num, quiet=False):
 
 
 def _keychain_service():
-    """Keychain service name for the current CLAUDE_CONFIG_DIR.
+    """Keychain service name for the current CLAUDE_CONFIG_DIR. macOS only.
     Default (no config dir): 'Claude Code-credentials'
-    With config dir: 'Claude Code-credentials-{sha256(dir)[:8]}'
-
-    Uses NFC normalization to match CC's behavior."""
+    With config dir: 'Claude Code-credentials-{sha256(dir)[:8]}'"""
     config_dir = _config_dir()
     if config_dir:
         normalized = unicodedata.normalize("NFC", config_dir)
@@ -544,7 +704,10 @@ def _keychain_service():
 
 
 def write_keychain(creds):
-    """Write credentials to macOS keychain for THIS terminal's config dir."""
+    """Write credentials to macOS keychain for THIS terminal's config dir.
+    No-op on non-macOS platforms (returns True for success)."""
+    if not IS_MACOS:
+        return True
     service = _keychain_service()
     username = getpass.getuser()
     json_str = json.dumps(creds)
@@ -584,7 +747,7 @@ def write_credentials_file(creds):
     try:
         tmp = cred_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(creds, indent=2))
-        tmp.chmod(0o600)
+        _secure_file(tmp)
         os.replace(tmp, cred_path)
         return True
     except OSError:
@@ -614,54 +777,53 @@ def swap_to(target_account):
     target_account = str(target_account)
     email = get_email(target_account)
 
-    # Try to reuse existing token if it's still valid (with a 1-minute safety
-    # buffer). The OAuth refresh endpoint is shared across all accounts on
-    # this client_id and gets aggressively throttled by Anthropic — only call
-    # it when truly needed.
+    # Write cached credentials directly — NEVER call the refresh endpoint.
+    # CC handles its own token refresh on 401 via its built-in retry path.
+    # If csq also refreshes, we double the load on the OAuth endpoint and
+    # trigger Anthropic's per-client-id throttle, which then blocks BOTH
+    # csq AND CC from refreshing — killing all terminals simultaneously.
+    #
+    # The cached creds in credentials/N.json always have a valid refresh_token
+    # (~1 year lifetime). Even if the access_token is expired, CC will exchange
+    # the refresh_token for a fresh access_token on its next API call.
     cred_file = CREDS_DIR / f"{target_account}.json"
-    new_creds = None
-    cached_creds = None  # Existing creds, used as fallback if refresh fails
-    if cred_file.exists():
-        try:
-            cached_creds = json.loads(cred_file.read_text())
-            oauth = cached_creds.get("claudeAiOauth", {})
-            expires_at = oauth.get("expiresAt", 0)
-            now_ms = int(time.time() * 1000)
-            buffer_ms = 60 * 1000  # 1 minute
-            if oauth.get("accessToken") and expires_at > now_ms + buffer_ms:
-                remaining_min = (expires_at - now_ms) / 60_000
-                print(
-                    f"Using cached token for account {target_account} ({email}) — valid {remaining_min:.0f}m",
-                    file=sys.stderr,
-                )
-                new_creds = cached_creds
-        except (OSError, json.JSONDecodeError):
-            pass
+    if not cred_file.exists():
+        print(
+            f"No credentials for account {target_account} — run: csq login {target_account}",
+            file=sys.stderr,
+        )
+        return False
 
-    if new_creds is None:
-        new_creds = refresh_token(target_account, quiet=True)
-        if new_creds:
-            print(
-                f"Refreshed token for account {target_account} ({email})",
-                file=sys.stderr,
-            )
-        elif cached_creds is not None and cached_creds.get("claudeAiOauth", {}).get(
-            "accessToken"
-        ):
-            # Refresh failed (typically Anthropic throttling the OAuth endpoint).
-            # Fall back to cached creds — CC will handle its own refresh via
-            # 401 retry when the token expires.
-            print(
-                f"Using cached token for account {target_account} ({email}) — OAuth refresh throttled, CC will refresh on next use",
-                file=sys.stderr,
-            )
-            new_creds = cached_creds
-        else:
-            print(
-                f"No valid credentials for account {target_account} — run: csq login {target_account}",
-                file=sys.stderr,
-            )
-            return False
+    try:
+        new_creds = json.loads(cred_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        print(
+            f"Corrupt credentials for account {target_account} — run: csq login {target_account}",
+            file=sys.stderr,
+        )
+        return False
+
+    if not new_creds.get("claudeAiOauth", {}).get("refreshToken"):
+        print(
+            f"No refresh token for account {target_account} — run: csq login {target_account}",
+            file=sys.stderr,
+        )
+        return False
+
+    oauth = new_creds.get("claudeAiOauth", {})
+    expires_at = oauth.get("expiresAt", 0)
+    now_ms = int(time.time() * 1000)
+    if expires_at > now_ms:
+        remaining_min = (expires_at - now_ms) / 60_000
+        print(
+            f"Swapping to account {target_account} ({email}) — token valid {remaining_min:.0f}m",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Swapping to account {target_account} ({email}) — token expired, CC will refresh on next use",
+            file=sys.stderr,
+        )
 
     config_dir = _config_dir()
     if not config_dir:
@@ -770,11 +932,10 @@ def auto_rotate(force=False):
 
     if force and current:
         # Mark current account as exhausted on disk (locked, load raw)
-        lock_file = QUOTA_FILE.with_suffix(".lock")
-        lock_fd = None
+        lock_path = QUOTA_FILE.with_suffix(".lock")
+        lock_handle = None
         try:
-            lock_fd = open(lock_file, "w")
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            lock_handle = _lock_file(lock_path)
             raw = _load(QUOTA_FILE, {"accounts": {}})
             raw.setdefault("accounts", {}).setdefault(current, {})["five_hour"] = {
                 "used_percentage": 100,
@@ -782,12 +943,7 @@ def auto_rotate(force=False):
             }
             _save(QUOTA_FILE, raw)
         finally:
-            if lock_fd is not None:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    lock_fd.close()
-                except Exception:
-                    pass
+            _unlock_file(lock_handle)
 
     state = load_state()
     acct = state.get("accounts", {}).get(current or "", {})
@@ -822,11 +978,10 @@ def update_quota(json_str):
         return
 
     # Lock, load, modify, save, unlock — prevents concurrent terminal races
-    lock_file = QUOTA_FILE.with_suffix(".lock")
-    lock_fd = None
+    lock_path = QUOTA_FILE.with_suffix(".lock")
+    lock_handle = None
     try:
-        lock_fd = open(lock_file, "w")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lock_handle = _lock_file(lock_path)
         state = _load(QUOTA_FILE, {"accounts": {}})
         state.setdefault("accounts", {})[current] = {
             "five_hour": rate_limits.get("five_hour", {}),
@@ -835,12 +990,7 @@ def update_quota(json_str):
         }
         _save(QUOTA_FILE, state)
     finally:
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                lock_fd.close()
-            except Exception:
-                pass
+        _unlock_file(lock_handle)
 
     # Auto-rotate at 100% (only if config dir is set)
     if _config_dir():
@@ -1000,6 +1150,8 @@ def main():
             print(get_email(sys.argv[2]))
     elif cmd == "cleanup":
         cleanup()
+    elif cmd == "python-cmd":
+        print(_python_cmd())
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)

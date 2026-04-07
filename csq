@@ -158,7 +158,7 @@ cmd_run() {
   # gets its own snapshot — global default changes don't affect running terminals.
   # Everything else (history, projects/memory, sessions, commands, skills, etc.)
   # is symlinked so csq terminals see the same state as default terminals.
-  local isolated=(".credentials.json" ".current-account" ".claude.json" "accounts" "settings.json")
+  local isolated=(".credentials.json" ".current-account" ".csq-account" ".live-pid" ".claude.json" "accounts" "settings.json")
   for item in "$default_dir"/* "$default_dir"/.*; do
     local base
     base="$(basename "$item")"
@@ -191,16 +191,33 @@ cmd_run() {
     ln -s "$item" "$target"
   done
 
-  # --- Account-specific setup ---
-  # Write initial .current-account if not exists
-  [[ -f "$config_dir/.current-account" ]] || echo "$n" > "$config_dir/.current-account"
-
-  # Ensure keychain has current credentials for this config dir
-  env CLAUDE_CONFIG_DIR="$config_dir" python3 "$ENGINE" init-keychain "$n" 2>/dev/null || true
-
-  # CC v2.1+ reads .credentials.json from config dir for interactive startup
+  # --- Account-specific setup (per-config-dir, no global state) ---
+  # CC v2.1+ reads .credentials.json at startup. This is the source of truth
+  # for CC's loaded account. Copy it freshly on every csq run so the next
+  # CC restart picks up the canonical credentials/N.json (which refresh_token
+  # keeps current).
   cp "$cred_file" "$config_dir/.credentials.json"
   chmod 600 "$config_dir/.credentials.json"
+
+  # .csq-account marker — durable identity record. Snapshot reads this on
+  # CC restart to populate .current-account. csq swap rewrites it. Per-dir,
+  # no contention with other csq terminals.
+  echo "$n" > "$config_dir/.csq-account"
+
+  # Initial .current-account so legacy code paths see *something* before the
+  # snapshot fires on first statusline. The snapshot will overwrite this on
+  # CC startup with the value from .csq-account.
+  echo "$n" > "$config_dir/.current-account"
+
+  # Stale .live-pid from a prior CC process in this config dir would block
+  # the snapshot's cheap path. Remove it so the new CC's first statusline
+  # call re-snapshots fresh.
+  rm -f "$config_dir/.live-pid"
+
+  # NOTE: We do NOT call init-keychain here. The macOS keychain is a global
+  # resource and contends under load (15+ concurrent csq terminals). CC
+  # reads .credentials.json at startup and only falls back to the keychain
+  # if the file is missing — which it isn't, because we just wrote it.
 
   # Mark onboarding complete so CC doesn't show the setup wizard
   CSQ_CONFIG="$config_dir/.claude.json" python3 -c "

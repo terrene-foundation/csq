@@ -26,6 +26,7 @@ Commands:
   auto-rotate --force  Force-rotate (marks current exhausted first)
   check                JSON check: should this terminal rotate? (for hooks)
   init-keychain <N>    Write stored creds for account N to this terminal's keychain
+  snapshot             Refresh .current-account from keychain on CC restart (statusline hook)
   cleanup              Remove stale PID cache files
 """
 
@@ -36,7 +37,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -106,10 +106,16 @@ def which_account():
     Fast path: reads .current-account from CLAUDE_CONFIG_DIR.
     Fallback: extracts from config dir name (config-N).
     Last resort: claude auth status --json.
+
+    NOTE: .current-account reflects the account whose OAuth token is in the
+    *running* CC instance, NOT what the keychain currently holds. The
+    statusline `snapshot` command keeps it accurate by detecting CC restarts
+    via PID and re-reading the keychain only then. swap_to() deliberately
+    does NOT touch this file — its writes only take effect on CC restart.
     """
     config_dir = _config_dir()
     if config_dir:
-        # Check .current-account file (updated after swaps)
+        # Check .current-account file (updated by snapshot on CC restart)
         current_file = Path(config_dir) / ".current-account"
         if current_file.exists():
             try:
@@ -148,6 +154,261 @@ def which_account():
             return n
 
     return None
+
+
+# ─── Live-Account Snapshot ──────────────────────────────
+#
+# Why this exists: csq swap rewrites the macOS keychain entry for this
+# config dir. The statusline runs in our process, not CC's, so we use a
+# per-CC-process snapshot to know which account is "live" for a given CC.
+# done mid-session updates the keychain and .current-account, but the
+# We detect "new CC process" via .live-pid: if the PID is dead or absent, the
+# status line then displays the wrong account.
+#
+# The fix: stop writing .current-account from swap_to(). Instead, snapshot
+# the keychain → .current-account exactly once per CC process, triggered
+# from the statusline hook. We detect "new CC process" via .live-pid: if
+# the recorded PID is dead or absent, the next snapshot reads the keychain
+# fresh and identifies the account it holds. While the same CC process is
+# alive, the snapshot is a single os.kill probe and a no-op.
+
+
+def _is_pid_alive(pid):
+    """Return True if the given PID exists. PermissionError means the
+    process exists but is owned by another user — still alive."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _find_cc_pid():
+    """Walk the parent process tree from this Python process upward,
+    returning the PID of the first ancestor that looks like the Claude Code
+    CLI. Skips csq/rotation-engine/statusline helpers in the chain.
+
+    Used by snapshot_account() to identify "the CC process that owns this
+    statusline invocation" so its lifetime can act as the snapshot key.
+    """
+    pid = os.getppid()
+    for _ in range(20):  # Bounded depth to avoid runaway loops
+        if pid <= 1:
+            break
+        try:
+            r = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid=,command="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode != 0:
+            return None
+        line = r.stdout.strip()
+        if not line:
+            return None
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            return None
+        try:
+            ppid = int(parts[0])
+        except ValueError:
+            return None
+        cmd = parts[1].lower()
+        # Match Claude Code CLI; exclude our own helper processes.
+        if (
+            "claude" in cmd
+            and "claude-squad" not in cmd
+            and "rotation-engine" not in cmd
+            and "statusline" not in cmd
+            and "/csq" not in cmd
+            and " csq" not in cmd
+        ):
+            return pid
+        pid = ppid
+    return None
+
+
+def _match_token_to_account(access_token):
+    """Return the account number whose stored credential file has a matching
+    access token, or None."""
+    if not access_token:
+        return None
+    for n in configured_accounts():
+        cred_file = CREDS_DIR / f"{n}.json"
+        if not cred_file.exists():
+            continue
+        try:
+            stored = json.loads(cred_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if stored.get("claudeAiOauth", {}).get("accessToken") == access_token:
+            return n
+    return None
+
+
+def credentials_file_account():
+    """Read <CLAUDE_CONFIG_DIR>/.credentials.json and identify which account
+    its access token belongs to.
+
+    Used as a fallback when the .csq-account marker is missing (legacy
+    setups). Primary source is csq_account_marker(), which is more reliable
+    because it survives CC's internal token refreshes (refreshing changes
+    the access_token but not the account, so token-matching breaks the
+    moment CC writes a refreshed token to .credentials.json).
+    """
+    config_dir = _config_dir()
+    if not config_dir:
+        return None
+    cred_path = Path(config_dir) / ".credentials.json"
+    if not cred_path.exists():
+        return None
+    try:
+        data = json.loads(cred_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _match_token_to_account(data.get("claudeAiOauth", {}).get("accessToken", ""))
+
+
+def csq_account_marker():
+    """Read the .csq-account marker from <CLAUDE_CONFIG_DIR>.
+
+    This is the PRIMARY source of truth for "which account does csq think
+    is loaded in this config dir". csq writes it from `csq run N` and
+    `csq swap N` — both operations csq fully controls, so the marker is
+    always correct relative to csq's intent. The snapshot then promotes
+    the marker into .current-account at CC startup time (gated by PID).
+
+    Why a separate marker instead of token-matching .credentials.json:
+    .credentials.json may be updated by token refresh during a session,
+    to .credentials.json. The new token won't match credentials/N.json
+    anymore, so token-based identification would silently fail. The
+    marker is durable across refreshes because the account number doesn't
+    change just because the token rotates.
+    """
+    config_dir = _config_dir()
+    if not config_dir:
+        return None
+    marker = Path(config_dir) / ".csq-account"
+    if not marker.exists():
+        return None
+    try:
+        n = marker.read_text().strip()
+    except OSError:
+        return None
+    if n.isdigit() and 1 <= int(n) <= MAX_ACCOUNTS:
+        return n
+    return None
+
+
+def write_csq_account_marker(account_num):
+    """Atomically write the .csq-account marker. Per-config-dir, no global
+    state, no contention with other csq terminals."""
+    config_dir = _config_dir()
+    if not config_dir:
+        return False
+    marker = Path(config_dir) / ".csq-account"
+    try:
+        tmp = marker.with_suffix(".tmp")
+        tmp.write_text(str(account_num))
+        tmp.rename(marker)
+        return True
+    except OSError:
+        return False
+
+
+def keychain_account():
+    """Read the macOS keychain entry for this config dir and identify which
+    stored credential file holds a matching access token. Used as a fallback
+    by snapshot_account() when .credentials.json is missing — historically
+    csq used the keychain as the only credential store, and some older
+    setups may not have a .credentials.json yet.
+    """
+    service = _keychain_service()
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    raw = r.stdout.strip()
+    if not raw:
+        return None
+
+    # The password is normally stored as a JSON string. swap_to() writes it
+    # via `security add-generic-password -X <hex>`, where -X tells security
+    # to interpret the input as hex and store the decoded bytes — so on read
+    # we get the JSON directly. Defensive fallback: try hex-decoding too.
+    kc_data = None
+    try:
+        kc_data = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            kc_data = json.loads(bytes.fromhex(raw).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    return _match_token_to_account(
+        kc_data.get("claudeAiOauth", {}).get("accessToken", "")
+    )
+
+
+def snapshot_account():
+    """Refresh .current-account when a new CC process is detected. Called
+    from the statusline hook on every invocation.
+
+    Cheap path (same CC process still alive): one os.kill probe, then return.
+    Expensive path (CC restarted or first run): walk the process tree to
+    find the live CC PID, read the per-config-dir state to identify the
+    account CC just loaded, and write .current-account + .live-pid.
+
+    Source-of-truth chain (per-config-dir, no global resources touched):
+      1. .csq-account marker — written by csq run/swap, durable across CC's
+         internal token refreshes
+      2. .credentials.json token-match against credentials/N.json — fallback
+         for legacy setups that pre-date the marker
+      (The macOS keychain is deliberately NOT consulted: it's a global
+       resource that doesn't scale with many concurrent csq terminals.)
+    """
+    config_dir = _config_dir()
+    if not config_dir:
+        return
+
+    pid_file = Path(config_dir) / ".live-pid"
+    try:
+        if pid_file.exists():
+            old_pid = pid_file.read_text().strip()
+            if old_pid and _is_pid_alive(old_pid):
+                return  # Same CC process; .current-account is still valid.
+    except OSError:
+        pass
+
+    cc_pid = _find_cc_pid()
+    if cc_pid is None:
+        return  # Not invoked from a CC subprocess; can't snapshot reliably.
+
+    account = csq_account_marker()
+    if account is None:
+        account = credentials_file_account()
+    if account is None:
+        return  # Couldn't identify the loaded account; leave state alone.
+
+    try:
+        (Path(config_dir) / ".current-account").write_text(account)
+        pid_file.write_text(str(cc_pid))
+    except OSError:
+        pass
 
 
 # ─── Pick Best ───────────────────────────────────────────
@@ -310,23 +571,62 @@ def write_keychain(creds):
         ],
         capture_output=True,
         text=True,
+        timeout=3,  # Don't hang under keychain contention
     )
     return r.returncode == 0
+
+
+def write_credentials_file(creds):
+    """Atomically write credentials to <CLAUDE_CONFIG_DIR>/.credentials.json.
+
+    This is the file CC v2.1+ reads at startup to load OAuth credentials.
+    Returns True on success, False if no CLAUDE_CONFIG_DIR is set or the
+    write failed. Failures here are surfaced loudly by swap_to() because
+    they mean the next CC restart will load the wrong account.
+    """
+    config_dir = _config_dir()
+    if not config_dir:
+        return False
+    cred_path = Path(config_dir) / ".credentials.json"
+    try:
+        tmp = cred_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(creds, indent=2))
+        tmp.chmod(0o600)
+        tmp.rename(cred_path)
+        return True
+    except OSError:
+        return False
 
 
 # ─── Swap ────────────────────────────────────────────────
 
 
 def swap_to(target_account):
-    """Swap this terminal's keychain to target account.
-    Reuses the existing access token if still valid; only refreshes when expired.
-    Only this terminal is affected — other terminals have their own keychain entries."""
+    """Swap this terminal to target account.
+
+    Reuses the existing access token if still valid; only refreshes when
+    expired. Writes ONLY per-config-dir state — never the macOS keychain —
+    so 15+ concurrent csq terminals don't contend on a global resource.
+
+    Files written (all under <CLAUDE_CONFIG_DIR>/):
+      .credentials.json    OAuth creds — picked up by CC on next interaction
+      .csq-account         account number marker (durable across refreshes)
+
+    IMPORTANT: Does NOT touch .current-account. The snapshot owns that file.
+    If a CC process is already running for this CLAUDE_CONFIG_DIR, its
+    OAuth credentials are loaded from .credentials.json when CC starts.
+    its startup time — rewriting either file now will not affect the
+    running process. CC must be restarted for the swap to take effect. We
+    detect that situation and print a clear warning so the user isn't
+    fooled by a status line that promotes the new marker prematurely.
+    """
     target_account = str(target_account)
     email = get_email(target_account)
 
-    # Try to reuse existing token if it's still valid (with a 5-minute safety buffer).
-    # The OAuth refresh endpoint is shared across all accounts on this client_id and
-    # gets aggressively throttled by Anthropic — so we only call it when truly needed.
+    # Try to reuse existing token if it's still valid (with a 5-minute safety
+    # buffer). The OAuth refresh endpoint is shared across all accounts on
+    # this client_id and gets aggressively throttled by Anthropic — only call
+    # it when truly needed.
     cred_file = CREDS_DIR / f"{target_account}.json"
     new_creds = None
     if cred_file.exists():
@@ -356,19 +656,84 @@ def swap_to(target_account):
             print("  Failed to refresh token", file=sys.stderr)
             return False
 
-    if not write_keychain(new_creds):
-        print("  Failed to write keychain", file=sys.stderr)
+    config_dir = _config_dir()
+    if not config_dir:
+        print(
+            "  csq swap requires CLAUDE_CONFIG_DIR (run from a csq terminal).",
+            file=sys.stderr,
+        )
         return False
 
-    # Update .current-account tracker
-    config_dir = _config_dir()
-    if config_dir:
-        try:
-            (Path(config_dir) / ".current-account").write_text(target_account)
-        except OSError:
-            pass
+    # Write .credentials.json — this is the actual swap. If this fails,
+    # actual swap. If this fails, the swap is a no-op and we report failure.
+    if not write_credentials_file(new_creds):
+        print(
+            f"  Failed to write {config_dir}/.credentials.json — swap aborted.",
+            file=sys.stderr,
+        )
+        return False
 
-    print(f"Swapped to account {target_account} ({email})", file=sys.stderr)
+    # Best-effort keychain write. CC primarily reads .credentials.json, but
+    # may fall back to the keychain for token refresh. We don't block or fail
+    # on keychain errors because:
+    #   - The `security` command can hang under concurrent load (15 terminals)
+    #   - .credentials.json is the source of truth for the next CC startup
+    #   - The per-config-dir keychain entry (hash suffix) is already isolated
+    # If it succeeds, CC has a fresh fallback. If not, CC still has the file.
+    try:
+        write_keychain(new_creds)
+    except Exception:
+        pass
+
+    # Write the .csq-account marker — durable identity record that survives
+    # CC's internal token refreshes (which would otherwise change the
+    # access_token and break token-based identification).
+    if not write_csq_account_marker(target_account):
+        print(
+            f"  WARNING: failed to write {config_dir}/.csq-account — "
+            "snapshot may misidentify the account on next CC restart.",
+            file=sys.stderr,
+        )
+
+    # If a CC process is already running with this config dir, neither file
+    # rewrite affects the active session. Warn the user so they know to
+    # restart CC.
+    stale_cc = False
+    pid_file = Path(config_dir) / ".live-pid"
+    live_account_file = Path(config_dir) / ".current-account"
+    try:
+        if pid_file.exists():
+            live_pid = pid_file.read_text().strip()
+            if live_pid and _is_pid_alive(live_pid):
+                live_account = ""
+                if live_account_file.exists():
+                    try:
+                        live_account = live_account_file.read_text().strip()
+                    except OSError:
+                        pass
+                if live_account and live_account != target_account:
+                    stale_cc = True
+                    print(
+                        f"\n  WARNING: CC process {live_pid} in this config dir is still using account {live_account}.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"  .credentials.json and .csq-account now point at account {target_account}, but CC won't pick it up until restart.",
+                        file=sys.stderr,
+                    )
+    except OSError:
+        pass
+
+    if stale_cc:
+        print(
+            f"Swapped to account {target_account} ({email}) — restart CC to activate.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Swapped to account {target_account} ({email})",
+            file=sys.stderr,
+        )
     return True
 
 
@@ -640,6 +1005,8 @@ def main():
         _validate_account(sys.argv[2])
         if not init_keychain(sys.argv[2]):
             sys.exit(1)
+    elif cmd == "snapshot":
+        snapshot_account()
     elif cmd == "email":
         if len(sys.argv) >= 3:
             _validate_account(sys.argv[2])

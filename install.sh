@@ -74,10 +74,12 @@ try:
 except (FileNotFoundError, json.JSONDecodeError, ValueError): s = {}
 changed = False
 
-# Statusline
+# Statusline — always force to canonical path. A previous install may have
+# pointed at ~/.claude/statusline-command.sh; that's a stale location.
+desired_sl_cmd = 'bash ~/.claude/accounts/statusline-quota.sh'
 sl = s.get('statusLine', {})
-if not sl or 'statusline' not in sl.get('command', ''):
-    s['statusLine'] = {'type':'command','command':'bash ~/.claude/accounts/statusline-quota.sh'}
+if sl.get('command') != desired_sl_cmd:
+    s['statusLine'] = {'type':'command','command':desired_sl_cmd}
     changed = True
 
 # Auto-rotate hook

@@ -1167,45 +1167,75 @@ def cleanup():
 # (the canonical store csq swap reads from) still has the old token.
 # If another terminal does `csq swap N`, it writes the revoked token → 401.
 #
-# Fix: on every statusline render, copy the live .credentials.json back to
-# credentials/N.json so the canonical store stays fresh.
+# Strategy: on every statusline render, look up which canonical credentials/N
+# file the LIVE token belongs to (by refresh token match — refresh tokens
+# survive access token rotation), and update that canonical file.
+#
+# CRITICAL: we identify the account by CONTENT MATCH, not by reading any
+# marker file. Marker files can be temporarily inconsistent during a swap_to()
+# call, leading to cross-account poisoning. Content match is race-proof: if
+# the live token matches credentials/N.json's refresh token, then by definition
+# this terminal is running account N right now, regardless of what any marker says.
 
 
 def backsync():
-    """Copy live credentials from this terminal's config dir back to the
-    canonical credentials/N.json. Called from statusline hook (background)."""
+    """Update the canonical credentials/N.json that matches this terminal's
+    live tokens. Called from statusline hook (background, on every render).
+
+    Uses refresh-token content matching to identify the correct N. This is
+    race-proof because refresh tokens are unique to each account and persist
+    across access token rotation."""
     config_dir = _config_dir()
     if not config_dir:
         return
 
-    # Which account is this terminal running?
-    acct = csq_account_marker() or which_account()
-    if not acct:
+    live_creds_file = Path(config_dir) / ".credentials.json"
+    if not live_creds_file.exists():
         return
 
-    live_creds = Path(config_dir) / ".credentials.json"
-    if not live_creds.exists():
-        return
-
-    canonical = CREDS_DIR / f"{acct}.json"
-
-    # Only sync if the live file is newer than the canonical one
     try:
-        live_mtime = live_creds.stat().st_mtime
-        canon_mtime = canonical.stat().st_mtime if canonical.exists() else 0
-        if live_mtime <= canon_mtime:
-            return  # canonical is already up to date
+        live_data = json.loads(live_creds_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
 
-        # Validate the live creds have a refresh token before overwriting
-        live_data = json.loads(live_creds.read_text())
-        if not live_data.get("claudeAiOauth", {}).get("refreshToken"):
-            return  # don't overwrite with garbage
+    live_oauth = live_data.get("claudeAiOauth", {})
+    live_refresh = live_oauth.get("refreshToken", "")
+    live_access = live_oauth.get("accessToken", "")
+    if not live_refresh or not live_access:
+        return  # don't trust empty creds
 
-        tmp = canonical.with_suffix(".tmp")
+    # Find which canonical file matches by refresh token. Prefer matching
+    # both refresh AND access (exact match → up to date). If only refresh
+    # matches, the access token has been rotated → update the canonical.
+    target_canonical = None
+    needs_update = False
+    for n in configured_accounts():
+        canonical = CREDS_DIR / f"{n}.json"
+        if not canonical.exists():
+            continue
+        try:
+            canon_data = json.loads(canonical.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        canon_oauth = canon_data.get("claudeAiOauth", {})
+        canon_refresh = canon_oauth.get("refreshToken", "")
+        if canon_refresh == live_refresh:
+            target_canonical = canonical
+            canon_access = canon_oauth.get("accessToken", "")
+            if canon_access != live_access:
+                needs_update = True
+            break
+
+    if target_canonical is None or not needs_update:
+        return  # no match (probably a fresh login not yet captured) or already in sync
+
+    # Update the canonical file with the rotated tokens
+    try:
+        tmp = target_canonical.with_suffix(".tmp")
         tmp.write_text(json.dumps(live_data, indent=2))
         _secure_file(tmp)
-        os.replace(tmp, canonical)
-    except (OSError, json.JSONDecodeError):
+        os.replace(tmp, target_canonical)
+    except OSError:
         pass
 
 

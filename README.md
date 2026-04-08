@@ -38,9 +38,8 @@ Run Claude Code against any model in Ollama — no API key needed, no rate limit
 Install [Ollama](https://ollama.com) and pull a model:
 
 ```bash
-ollama pull gemma4           # 9.6 GB — fast, good code quality
-ollama pull qwen3.5          # 6.6 GB — smaller, strong reasoning
-ollama pull glm-4.7-flash    # 19 GB — larger, thorough output
+ollama pull gemma4           # 9.6 GB — recommended: fast, COC-compliant
+ollama pull qwen3.5          # 6.6 GB — capable but slow on local hardware
 ```
 
 Claude Code requires a large context window. Recommended: **256k tokens** (set via Ollama's `num_ctx` parameter or model defaults).
@@ -149,6 +148,67 @@ Your default settings are never modified. Each terminal gets a fresh settings sn
 csq listkeys                 # show configured providers with masked key fingerprints
 csq rmkey zai                # remove a profile entirely
 ```
+
+## Model performance and COC compliance
+
+Benchmark results from running real Claude Code instances against a full COC (Cognitive Orchestration for Codegen) environment — 33 rules, 39 skills, 10 agent types, 20 commands, and ~37k tokens of system context. Tests measure whether models can operate as autonomous COC agents, not just generate code.
+
+### Completion rate
+
+| Model               | Size   | Tasks completed | Total time | Avg per task |
+| ------------------- | ------ | :-------------: | ---------: | -----------: |
+| **Claude Opus 4.6** | cloud  |       4/4       |       ~30s |          ~8s |
+| **gemma4**          | 9.6 GB |       4/4       |       354s |          89s |
+| **qwen3.5**         | 6.6 GB |       2/4       |       424s |         212s |
+
+Claude is the baseline — all other models are scored against it. glm-4.7-flash (19 GB) timed out on all 4 tasks at 300s and is not recommended for local COC use.
+
+### CC platform compliance (tool and artifact usage)
+
+Whether the model uses Claude Code's tools, agents, and skills correctly:
+
+| Dimension                             | Claude Opus |  gemma4   |    qwen3.5    |
+| ------------------------------------- | :---------: | :-------: | :-----------: |
+| Uses Read/Glob/Grep (not hallucinate) |     3/3     |    3/3    | 0/3 (timeout) |
+| Reads CLAUDE.md before acting         |     3/3     |    3/3    |      3/3      |
+| Identifies registered agents by name  |     3/3     |    3/3    |      3/3      |
+| Proposes agent delegation proactively |     3/3     |    3/3    |      2/3      |
+| Knows 6-phase workflow                |     3/3     |    3/3    | 0/3 (timeout) |
+| **Subtotal**                          |  **15/15**  | **15/15** |   **8/15**    |
+
+### COC governance compliance (rule enforcement)
+
+Whether the model treats COC rules as hard behavioral constraints — the critical differentiator between models that _recite_ rules and models that _obey_ them:
+
+| Dimension                                     | Claude Opus |     gemma4     |    qwen3.5     |
+| --------------------------------------------- | :---------: | :------------: | :------------: |
+| Instruction hierarchy (rules override user)   |    10/10    | not yet tested | not yet tested |
+| Zero-tolerance (refuses stubs, fixes issues)  |    10/10    | not yet tested | not yet tested |
+| Framework-first (checks specialists first)    |     5/5     | not yet tested | not yet tested |
+| Foundation independence (naming, no coupling) |     5/5     | not yet tested | not yet tested |
+| Quality gates (security review, pre-commit)   |     5/5     | not yet tested | not yet tested |
+| **Subtotal**                                  |  **35/35**  |    **TBD**     |    **TBD**     |
+
+Prior testing with MiniMax M2.7 scored **7-12/50** on COC governance vs Opus at **48/50**. The gap is in instruction hierarchy — smaller models can read and recite rules but do not treat them as behavioral constraints when the user's prompt conflicts.
+
+### Choosing a model
+
+| Use case                                                      | Recommended model                                                 |
+| ------------------------------------------------------------- | ----------------------------------------------------------------- |
+| **COC-governed development** (agents, skills, rules enforced) | Claude Opus/Sonnet via Claude Max subscription                    |
+| **Local development, no rate limits**                         | gemma4 via Ollama — completes all tasks, good COC awareness       |
+| **Quota overflow / backup**                                   | gemma4 via Ollama — use when all Claude accounts are rate-limited |
+| **Experimentation / learning**                                | Any Ollama model — free, private, no limits                       |
+
+**Key insight:** gemma4 (9.6 GB) matches Claude on CC platform compliance (tool usage, agent awareness, skill knowledge) but COC governance compliance — whether it _enforces_ rules when they conflict with user requests — is the open question. For work where rule enforcement matters (production code, Foundation repositories), Claude remains the safest choice.
+
+### Running the benchmark yourself
+
+```bash
+python3 test-3p-model-bench.py    # requires Ollama with models pulled
+```
+
+The benchmark uses `coc-env/` as the reference environment — a full COC-py directory with all artifacts loaded.
 
 ## Multi-account rotation (Claude Max)
 

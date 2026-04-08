@@ -273,19 +273,40 @@ cmd_run() {
   # render and uses refresh-token CONTENT MATCHING to identify the correct slot
   # — that's race-proof and account-safe. We rely on it instead.
 
+  # .csq-account marker — durable identity record. Snapshot reads this on
+  # CC restart to populate .current-account. csq swap rewrites it. Per-dir,
+  # no contention with other csq terminals.
+  #
+  # Written BEFORE the canonical copy so the synchronous broker call below
+  # has a marker to look up. Order: marker → broker → cred copy.
+  echo "$n" > "$config_dir/.csq-account"
+
+  # Synchronous broker refresh before copying canonical. This closes the
+  # "new terminal inherits a dead canonical" failure mode: if canonical's
+  # refresh token has been rotated out from under us by a past race, the
+  # broker's recovery path will try each live sibling's RT and heal
+  # canonical before we copy it. If both primary and recovery fail, the
+  # broker subcommand exits 2 and we abort here with a clear message
+  # instead of letting CC boot with a dead credential file and
+  # die 30 seconds later with a confusing 401.
+  #
+  # Common case cost: ~50 ms (broker reads canonical, sees the token is
+  # not within the refresh window, early-returns). Only pays the Anthropic
+  # round-trip (~1-2 s) when canonical actually needs a refresh.
+  if ! CLAUDE_CONFIG_DIR="$config_dir" "$PY" "$ENGINE" broker; then
+    die "account $n's refresh token is dead — run: csq login $n"
+  fi
+
   # CC v2.1+ reads .credentials.json at startup. Copy from canonical so
   # swap_to() changes take effect on restart. Atomic write (temp + mv) so
   # CC never sees a half-written credentials file if csq is killed mid-copy.
+  # Must run AFTER the broker call above so we pick up the freshly-refreshed
+  # canonical instead of a stale one.
   cp "$cred_file" "$config_dir/.credentials.json.tmp"
   mv "$config_dir/.credentials.json.tmp" "$config_dir/.credentials.json"
   if [[ "$PLATFORM" != "git-bash" ]]; then
     chmod 600 "$config_dir/.credentials.json"
   fi
-
-  # .csq-account marker — durable identity record. Snapshot reads this on
-  # CC restart to populate .current-account. csq swap rewrites it. Per-dir,
-  # no contention with other csq terminals.
-  echo "$n" > "$config_dir/.csq-account"
 
   # Initial .current-account so legacy code paths see *something* before the
   # snapshot fires on first statusline. The snapshot will overwrite this on

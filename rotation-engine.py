@@ -1269,7 +1269,18 @@ def statusline_str():
     if five_pct > 0 or seven_pct > 0:
         parts.append(f"5h:{five_pct:.0f}%")
         parts.append(f"7d:{seven_pct:.0f}%")
-    return " ".join(parts)
+    result = " ".join(parts)
+
+    # Broker-failure warning: when broker_check exhausted both the primary
+    # refresh and the live-sibling recovery, it touches credentials/N.broker-failed.
+    # Surface a visible, unmissable prefix so the user sees it in their
+    # statusline on the very next render — no need to check logs. The flag
+    # is cleared automatically on the next successful broker refresh.
+    flag_acct = csq_account_marker() or current
+    if flag_acct and _broker_failure_flag(flag_acct).exists():
+        result = f"⚠LOGIN-NEEDED {result}"
+
+    return result
 
 
 # ─── Init Keychain ───────────────────────────────────────
@@ -1503,8 +1514,20 @@ def backsync():
 #
 # These edge cases recover via CC's own 401 retry path, which re-reads
 # .credentials.json from disk — and the broker keeps that file fresh.
+#
+# Residual failure mode: if CC's own refresh path wins a race against the
+# broker and rotates Anthropic's refresh token, canonical is left holding
+# a dead RT. Subsequent broker_check calls then 401 on the dead RT and
+# silently return, leaving canonical stuck. _broker_recover_from_live()
+# below handles this by promoting a live sibling's rotated RT into
+# canonical and retrying the refresh.
 
-REFRESH_AHEAD_SECS = 600  # refresh when < 10 min remaining
+# Refresh window: 2 hours. Broker tries to refresh whenever the token has
+# less than this much life remaining. A wide window (vs. a tight 10-min
+# window) makes it near-certain that SOME rendering terminal fires the
+# broker before expiry, which is what keeps CC's own refresh path from
+# racing against us and rotating the RT out from under canonical.
+REFRESH_AHEAD_SECS = 7200
 
 
 def _scan_config_dirs_for_account(account_num):
@@ -1560,6 +1583,99 @@ def _fan_out_credentials(account_num, new_creds):
             pass  # tolerate per-file failures, broker will retry next render
 
 
+def _broker_failure_flag(account_num):
+    """Path to the per-account broker-failure flag.
+
+    Touched by broker_check when both the primary refresh and the live-sibling
+    recovery fail. Removed on any successful refresh. The statusline
+    subcommand surfaces a warning glyph while this flag exists, so a silent
+    broker failure can't go unnoticed.
+    """
+    return CREDS_DIR / f"{account_num}.broker-failed"
+
+
+def _broker_mark_failed(account_num):
+    try:
+        _broker_failure_flag(account_num).touch()
+    except OSError:
+        pass
+
+
+def _broker_mark_recovered(account_num):
+    try:
+        _broker_failure_flag(account_num).unlink()
+    except (OSError, FileNotFoundError):
+        pass
+
+
+def _broker_recover_from_live(account_num, dead_canonical_content):
+    """Revive a dead canonical by trying each live sibling's refresh token.
+
+    Called by broker_check when the primary refresh returns None (Anthropic
+    401'd the canonical RT, typically because CC's own refresh path won a
+    race and rotated the RT). At least one live config-X/.credentials.json
+    should hold the rotated RT, so we promote each candidate into canonical
+    in turn and retry the Anthropic refresh.
+
+    MUST be called with the per-account refresh-lock held by the caller.
+
+    Args:
+        account_num: the account whose canonical is dead
+        dead_canonical_content: the original canonical dict, kept so we can
+            roll canonical back if every recovery attempt also fails (so we
+            don't leave canonical holding whichever candidate was tried last)
+
+    Returns:
+        new_creds dict on success (canonical is freshly updated on disk by
+        refresh_token), or None if no live sibling could refresh successfully.
+    """
+    canonical = CREDS_DIR / f"{account_num}.json"
+    dead_rt = dead_canonical_content.get("claudeAiOauth", {}).get("refreshToken", "")
+    tried_rts = {dead_rt} if dead_rt else set()
+
+    for d in _scan_config_dirs_for_account(account_num):
+        live_file = d / ".credentials.json"
+        if not live_file.exists():
+            continue
+        try:
+            live_data = json.loads(live_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        live_rt = live_data.get("claudeAiOauth", {}).get("refreshToken", "")
+        if not live_rt or live_rt in tried_rts:
+            continue  # empty, or we already tried this RT from another dir
+        tried_rts.add(live_rt)
+
+        # Promote this live sibling's creds into canonical so refresh_token()
+        # picks up the candidate RT. Atomic write keeps canonical consistent
+        # even if the process dies mid-recovery.
+        try:
+            tmp = canonical.with_suffix(".tmp")
+            tmp.write_text(json.dumps(live_data, indent=2))
+            _secure_file(tmp)
+            _atomic_replace(tmp, canonical)
+        except OSError:
+            continue
+
+        new_creds = refresh_token(account_num, quiet=True)
+        if new_creds is not None:
+            return new_creds  # canonical now holds Anthropic's fresh response
+
+    # Every candidate failed. Restore the original dead canonical so the
+    # next broker_check has a predictable starting point instead of
+    # retrying whichever candidate we tried last (which may also be dead
+    # or belong to a logically-different OAuth session).
+    try:
+        tmp = canonical.with_suffix(".tmp")
+        tmp.write_text(json.dumps(dead_canonical_content, indent=2))
+        _secure_file(tmp)
+        _atomic_replace(tmp, canonical)
+    except OSError:
+        pass
+
+    return None
+
+
 def broker_check():
     """Check if the current account's token needs refresh, and refresh if so.
 
@@ -1568,41 +1684,49 @@ def broker_check():
     is non-blocking — if another terminal holds it, this caller skips and
     will retry on the next render.
 
-    The broker is what makes 5 concurrent terminals on the same account safe:
+    The broker is what makes N concurrent terminals on the same account safe:
     only ONE of them will actually call Anthropic's refresh endpoint.
+
+    Returns:
+        0 on success, no-op, or skipped (lock contention / token still fresh);
+        2 if a refresh was attempted but both the primary and the recovery
+        path failed, meaning canonical is genuinely stuck and the user must
+        `csq login N` to recover. Exit code is propagated only by the
+        `broker` subcommand; the `sync` subcommand (from statusline) ignores
+        it because the statusline backgrounds the call.
     """
     config_dir = _config_dir()
     if not config_dir:
-        return
+        return 0
     marker_acct = csq_account_marker()
     if not marker_acct:
-        return
+        return 0
 
     canonical = CREDS_DIR / f"{marker_acct}.json"
     if not canonical.exists():
-        return
+        return 0
 
     try:
         canon_data = json.loads(canonical.read_text())
     except (OSError, json.JSONDecodeError):
-        return
+        return 0
 
     expires_at = canon_data.get("claudeAiOauth", {}).get("expiresAt", 0)
     refresh_tok = canon_data.get("claudeAiOauth", {}).get("refreshToken", "")
     if not refresh_tok:
-        return
+        return 0
 
     now_ms = int(time.time() * 1000)
     seconds_remaining = (expires_at - now_ms) / 1000
     if seconds_remaining > REFRESH_AHEAD_SECS:
-        return  # token still has plenty of life — no refresh needed
+        return 0  # token still has plenty of life — no refresh needed
 
     # Try to acquire the refresh lock. Non-blocking: if another terminal
     # is already refreshing, skip this cycle.
     refresh_lock = canonical.with_suffix(".refresh-lock")
     lock_handle = _try_lock_file(refresh_lock)
     if lock_handle is None:
-        return  # another terminal is refreshing
+        return 0  # another terminal is refreshing
 
     try:
         # Re-read inside the lock to detect a concurrent refresh that
@@ -1613,23 +1737,37 @@ def broker_check():
             new_expires = canon_data.get("claudeAiOauth", {}).get("expiresAt", 0)
             new_seconds = (new_expires - now_ms) / 1000
             if new_seconds > REFRESH_AHEAD_SECS:
-                return  # someone else already refreshed
+                return 0  # someone else already refreshed
         except (OSError, json.JSONDecodeError):
             pass
 
-        # Refresh via Anthropic. refresh_token() writes the new tokens to
-        # the canonical for us.
+        # Primary: refresh via Anthropic using canonical's current RT.
+        # refresh_token() writes the new tokens to canonical on success.
         new_creds = refresh_token(marker_acct, quiet=True)
-        if new_creds is None:
-            # Refresh failed. Could be: network error, refresh token revoked,
-            # rate-limited. CC's own 401 path will recover if the issue is
-            # transient. Don't spam logs.
-            return
 
-        # Fan out the new credentials to every active config-X/.credentials.json
-        # where marker = this account. CC's mtime check picks them up on the
-        # next API call without triggering CC's own refresh.
+        # Recovery: canonical's RT is dead (likely rotated by CC's own
+        # refresh winning a race). Try each live sibling's RT in turn.
+        # Stays under the refresh-lock so nothing else races us.
+        if new_creds is None:
+            new_creds = _broker_recover_from_live(marker_acct, canon_data)
+
+        if new_creds is None:
+            # Both primary and recovery exhausted. Canonical is genuinely
+            # stuck — the user must `csq login N`. Touch the failure flag
+            # so the statusline surfaces a warning; caller (broker subcommand)
+            # returns exit 2 so `csq run` can abort with a clear message.
+            _broker_mark_failed(marker_acct)
+            return 2
+
+        # Success (primary or recovery). Clear any stale failure flag from
+        # a prior broken cycle.
+        _broker_mark_recovered(marker_acct)
+
+        # Fan out to every config-X/.credentials.json where marker=N.
+        # CC's mtime check picks them up on the next API call without
+        # triggering CC's own refresh.
         _fan_out_credentials(marker_acct, new_creds)
+        return 0
     finally:
         _unlock_file(lock_handle)
 
@@ -1763,7 +1901,13 @@ def main():
     elif cmd == "pullsync":
         pullsync()
     elif cmd == "broker":
-        broker_check()
+        # Synchronous broker invocation — e.g. from `csq run` before it
+        # copies canonical into .credentials.json. Exit code 2 signals that
+        # both the primary refresh and the live-sibling recovery failed, so
+        # `csq run` can abort with a clear "run csq login N" message instead
+        # of letting CC inherit a dead canonical.
+        rc = broker_check()
+        sys.exit(rc if rc else 0)
     elif cmd == "sync":
         # Full sync cycle for the statusline hook:
         #   1. broker_check: refresh proactively if token < 10 min from expiry

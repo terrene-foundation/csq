@@ -96,10 +96,14 @@ if [[ -f "$(dirname "$0")/rotation-engine.py" ]]; then
     cp "$SRC/rotation-engine.py" "$ACCOUNTS_DIR/rotation-engine.py"
     cp "$SRC/csq" "$BIN_DIR/csq"
     cp "$SRC/statusline-quota.sh" "$ACCOUNTS_DIR/statusline-quota.sh"
+    cp "$SRC/3p-model-primer.md" "$ACCOUNTS_DIR/3p-model-primer.md"
+    cp "$SRC/3p-model-primer-prepend.md" "$ACCOUNTS_DIR/3p-model-primer-prepend.md"
 else
     curl -sfL "$REPO_URL/rotation-engine.py" -o "$ACCOUNTS_DIR/rotation-engine.py"
     curl -sfL "$REPO_URL/csq" -o "$BIN_DIR/csq"
     curl -sfL "$REPO_URL/statusline-quota.sh" -o "$ACCOUNTS_DIR/statusline-quota.sh"
+    curl -sfL "$REPO_URL/3p-model-primer.md" -o "$ACCOUNTS_DIR/3p-model-primer.md"
+    curl -sfL "$REPO_URL/3p-model-primer-prepend.md" -o "$ACCOUNTS_DIR/3p-model-primer-prepend.md"
 fi
 
 # auto-rotate-hook.sh: write a no-op so any pre-existing UserPromptSubmit

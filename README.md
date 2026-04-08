@@ -1,20 +1,16 @@
 # Claude Squad
 
-Account rotation, quota tracking, and profile overlays for Claude Code. Pool multiple Claude Max subscriptions with automatic, quota-aware switching — or use it on a single account just for the statusline and profile overlays. Each terminal isolated, no cross-contamination.
+Multi-provider session manager for Claude Code. Run Claude Code against local models (Ollama), third-party APIs (MiniMax, Z.AI), or pool multiple Claude Max subscriptions — all with per-terminal isolation, shared history, and a statusline.
 
-## The problem
+## What it does
 
-Claude Max has rolling rate limits (5-hour and 7-day windows). Heavy users hit these regularly. Manually switching with `/login` interrupts flow and requires guessing which account has capacity.
-
-## What Claude Squad does
-
-- **In-place account swap** — `! csq swap N` from inside CC switches the current terminal to account N without restart, in the same conversation. CC picks up the new credentials on its next API call.
-- **Per-terminal isolation** — each terminal runs with its own `CLAUDE_CONFIG_DIR`, so swapping one terminal doesn't affect others. 15+ concurrent csq terminals work without contention.
-- **Shared history & memory** — conversations, projects, and auto-memory are symlinked from `~/.claude`, so `/resume` works across all accounts.
-- **Context & cost in statusline** — see `⚡csq #5:jack 5h:42% | ctx:241k 24% | $5.39` at a glance.
-- **Quota visibility** — `csq status` shows all accounts with 5h and 7d usage, so you can pick the one with most capacity.
-- **Unlimited accounts** — log in as many accounts as you have (1, 7, 20 — no cap).
-- **Profile overlays** — start a terminal with a different API provider via `csq run N -p mm` (overlays deep-merge onto the canonical default settings).
+- **Any model provider** — `csq run 1 -p ollama` runs CC against a local Qwen/Gemma/GLM model via Ollama. `csq run 2 -p mm` routes through MiniMax. `csq run 3` uses your Claude Max subscription. Each terminal can use a different provider.
+- **Per-terminal isolation** — each terminal gets its own `CLAUDE_CONFIG_DIR` and keychain slot. Swapping one terminal doesn't affect others. 15+ concurrent csq terminals work without contention.
+- **Shared history & memory** — conversations, projects, and auto-memory are symlinked from `~/.claude`, so `/resume` works across all accounts and providers.
+- **Context & cost in statusline** — see `csq #5:jack 5h:42% | ctx:241k 24% | $5.39` at a glance.
+- **In-place account swap** — `! csq swap N` from inside CC switches credentials without restarting the conversation.
+- **Quota visibility** — `csq status` shows all accounts with 5h and 7d usage, reset times, and capacity.
+- **Profile overlays** — providers deep-merge onto your default settings, preserving hooks, plugins, and statusline.
 - **Cross-platform** — macOS, Linux, WSL, and Windows (via Git Bash). Tested in CI on all three.
 
 ## Install
@@ -31,24 +27,138 @@ cd claude-squad
 bash install.sh
 ```
 
-The installer auto-detects your platform (macOS / Linux / WSL / Git Bash) and configures the right credential storage and package manager hints. Windows users run the same command from Git Bash (which Claude Code already requires).
+The installer auto-detects your platform (macOS / Linux / WSL / Git Bash) and configures credential storage.
 
-## Quick start
+## Using local models (Ollama)
 
-If you only have **one** Claude account, just run:
+Run Claude Code against any model in Ollama — no API key needed, no rate limits, fully local.
+
+### Prerequisites
+
+Install [Ollama](https://ollama.com) and pull a model:
 
 ```bash
-csq          # equivalent to vanilla `claude` — csq stays out of your way
-csq --resume # passes flags straight through
+ollama pull gemma4           # 9.6 GB — fast, good code quality
+ollama pull qwen3.5          # 6.6 GB — smaller, strong reasoning
+ollama pull glm-4.7-flash    # 19 GB — larger, thorough output
 ```
 
-With zero csq accounts configured, `csq` is invisible — it just execs `claude`.
+Claude Code requires a large context window. Recommended: **256k tokens** (set via Ollama's `num_ctx` parameter or model defaults).
 
-If you only have one csq account configured, `csq` runs on that account automatically. Once you log in a second account, csq starts asking which one you want.
+### Setup (one-time)
 
-## Setup (one-time per account)
+```bash
+csq setkey ollama            # creates the Ollama profile (no key needed)
+```
 
-Save each account's credentials to a numbered slot (any positive integer — 1, 2, 3, … 20, …):
+This creates `~/.claude/settings-ollama.json` with:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:11434",
+    "ANTHROPIC_AUTH_TOKEN": "ollama",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "qwen3:latest",
+    "ANTHROPIC_SMALL_FAST_MODEL": "qwen3:latest",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen3:latest",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "qwen3:latest",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3:latest",
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}
+```
+
+Edit `~/.claude/settings-ollama.json` to change the model — replace `qwen3:latest` with your preferred model name (e.g., `gemma4`, `glm-4.7-flash`, `qwen3.5`).
+
+### Run
+
+```bash
+csq run 1 -p ollama          # start CC on account 1, routed through Ollama
+```
+
+See [Ollama's Claude Code integration docs](https://docs.ollama.com/integrations/claude-code) for more options.
+
+## Using third-party APIs (MiniMax, Z.AI)
+
+### MiniMax (M2.7)
+
+```bash
+csq setkey mm                # prompts for your MiniMax API key (hidden input)
+```
+
+Creates `~/.claude/settings-mm.json` with:
+
+| Setting              | Value                              |
+| -------------------- | ---------------------------------- |
+| `ANTHROPIC_BASE_URL` | `https://api.minimax.io/anthropic` |
+| `ANTHROPIC_MODEL`    | `MiniMax-M2.7-highspeed`           |
+| All model aliases    | `MiniMax-M2.7-highspeed`           |
+
+```bash
+csq run 1 -p mm              # start CC routed through MiniMax
+```
+
+To change the model, edit `~/.claude/settings-mm.json` — replace `MiniMax-M2.7-highspeed` in all model fields.
+
+### Z.AI (GLM-4.7)
+
+```bash
+csq setkey zai               # prompts for your Z.AI API key (hidden input)
+```
+
+Creates `~/.claude/settings-zai.json` with:
+
+| Setting                      | Value                            |
+| ---------------------------- | -------------------------------- |
+| `ANTHROPIC_BASE_URL`         | `https://api.z.ai/api/anthropic` |
+| `ANTHROPIC_MODEL`            | `glm-4.7`                        |
+| `ANTHROPIC_SMALL_FAST_MODEL` | `glm-4.5-air`                    |
+| Other model aliases          | `glm-4.7`                        |
+
+```bash
+csq run 1 -p zai             # start CC routed through Z.AI
+```
+
+### Claude direct API key
+
+If you have a direct Anthropic API key (not OAuth/Max subscription):
+
+```bash
+csq setkey claude            # prompts for your API key
+csq run 1 -p claude          # uses ANTHROPIC_API_KEY auth instead of OAuth
+```
+
+### How profiles work
+
+Profiles are JSON files at `~/.claude/settings-<name>.json` that get deep-merged onto your default `~/.claude/settings.json` at terminal start. `csq setkey` creates and manages these files. You can edit them manually to change model names, timeouts, or add other settings.
+
+When you run `csq run 5 -p mm`, csq:
+
+1. Reads `~/.claude/settings.json` (your full default — hooks, statusline, plugins, etc.)
+2. Reads `~/.claude/settings-mm.json` (the overlay)
+3. Deep-merges them (overlay keys win; your default hooks/statusline/plugins carry through)
+4. Writes the result to `config-5/settings.json` for that terminal only
+
+Your default settings are never modified. Each terminal gets a fresh settings snapshot.
+
+### Managing profiles
+
+```bash
+csq listkeys                 # show configured providers with masked key fingerprints
+csq rmkey zai                # remove a profile entirely
+```
+
+## Multi-account rotation (Claude Max)
+
+Pool multiple Claude Max subscriptions for uninterrupted sessions. When one account hits a rate limit, swap to another.
+
+### The problem
+
+Claude Max has rolling rate limits (5-hour and 7-day windows). Heavy users hit these regularly. Manually switching with `/login` interrupts flow and requires guessing which account has capacity.
+
+### Setup (one-time per account)
 
 ```bash
 csq login 1   # opens browser, log in to account 1, saves creds
@@ -57,29 +167,25 @@ csq login 3
 # ...as many as you need
 ```
 
-You can also save the credentials of an already-logged-in CC session — just run `csq login N` from inside that CC instance and it captures the current keychain entry.
+You can also capture credentials from an already-logged-in CC session — run `csq login N` from inside that CC instance.
 
-## Daily use
-
-With multiple accounts, start each terminal on a specific one — each gets its own keychain slot:
+### Daily use
 
 ```bash
-csq run 1     # terminal 1 → account 1 (own keychain entry)
-csq run 3     # terminal 2 → account 3 (separate keychain entry)
-csq run 5     # terminal 3 → account 5 (separate keychain entry)
+csq run 1                    # terminal 1 on account 1
+csq run 3                    # terminal 2 on account 3
+csq run 5                    # terminal 3 on account 5
 ```
 
-If you have only one account configured, `csq` (no number) auto-resolves it. With zero accounts, `csq` is invisible — it just runs vanilla `claude`.
+If you have only one account, `csq` (no number) auto-resolves. With zero accounts, `csq` is invisible — just runs vanilla `claude`.
 
-Any extra arguments are passed straight through to `claude`:
+Any extra arguments pass through to `claude`:
 
 ```bash
-csq run 5 --resume          # resume the most recent conversation
-csq run 5 --resume <id>     # resume a specific session
-csq run 3 -p "summarize X"  # one-shot prompt
+csq run 5 --resume           # resume the most recent conversation
+csq run 5 --resume <id>      # resume a specific session
+csq run 3 -p "summarize X"   # one-shot prompt
 ```
-
-Each terminal survives reboots. The account assignment persists because the keychain entry is tied to the config directory, not the process. Conversation history, projects, and memory are shared across all accounts (symlinked from `~/.claude`), so `/resume` finds the same sessions regardless of which account you're on.
 
 ### When rate limited
 
@@ -89,78 +195,36 @@ Inside the rate-limited CC session, type:
 !csq swap 3       # swap THIS terminal to account 3
 ```
 
-The `!` prefix runs the command as a local shell op — no LLM call needed, so it works even when CC is rate-limited. The next message you send in CC will automatically use account 3's token, in the same conversation, no restart.
+The `!` prefix runs the command as a local shell op — works even when CC is rate-limited. The next message you send uses account 3's token, in the same conversation, no restart.
 
-This works because Claude Code picks up updates to `.credentials.json` on its next interaction. `swap_to()` updates the file and the per-config-dir keychain entry, so the swap takes effect right away. Verified empirically.
+If you want to know which account to swap to:
 
-If you want to know which account to swap to, run `!csq suggest` first.
-
-### From terminal
-
-```bash
-csq status              # show all accounts with quota and reset times
-csq suggest             # suggest which account to /login to
-csq run 4               # start CC on account 4 (default settings)
-csq run 4 -p mm         # start CC on account 4 with MiniMax provider
-csq run 4 --resume      # resume the most recent conversation
-csq swap 3              # in-place swap THIS terminal to account 3
-csq setkey mm           # add/update MiniMax API key (interactive, hidden input)
-csq listkeys            # show configured providers with masked keys
-csq cleanup             # remove stale PID cache files
-csq help                # full command list
+```
+!csq suggest      # shows the account with most capacity
 ```
 
-## Using other AI providers (MiniMax, Z.AI, direct API)
-
-csq can route Claude Code through different API providers using **profile overlays**. Each provider needs an API key set up once, then you start terminals with that provider.
-
-### Step 1: Add your API key
+### Quick start (single account)
 
 ```bash
-csq setkey mm                    # MiniMax — prompts for your key (hidden input)
-csq setkey zai                   # Z.AI — same
-csq setkey claude                # Claude direct API key (bypasses OAuth)
+csq              # equivalent to vanilla `claude` — csq stays out of your way
+csq --resume     # passes flags straight through
 ```
 
-Or pass the key directly (shows in shell history):
+## Command reference
 
 ```bash
-csq setkey mm sk-your-key-here
+csq run N [-p provider]      # start CC on account N, optional provider profile
+csq run N --resume           # resume most recent conversation on account N
+csq status                   # show all accounts with quota and reset times
+csq suggest                  # suggest which account to swap to
+csq swap N                   # in-place swap THIS terminal to account N
+csq login N                  # save account N's credentials (opens browser)
+csq setkey <provider> [key]  # add/update provider API key
+csq listkeys                 # show configured providers with masked keys
+csq rmkey <provider>         # remove a provider profile
+csq cleanup                  # remove stale PID cache files
+csq help                     # full command list
 ```
-
-You only need to do this once per provider. csq creates the profile file with all the right settings (API URL, model names, timeouts). To check what's configured:
-
-```bash
-csq listkeys                     # shows all profiles with masked key fingerprints
-csq rmkey zai                    # removes a profile entirely
-```
-
-### Step 2: Start a terminal with that provider
-
-```bash
-csq run 5 -p mm                  # terminal 5, routed through MiniMax
-csq run 3 -p zai                 # terminal 3, routed through Z.AI
-csq run 1                        # terminal 1, default Claude Max (OAuth)
-```
-
-Each terminal is isolated — one can use MiniMax while another uses Claude Max. The provider is set at terminal start and doesn't change during the session.
-
-### How it works (profile overlays)
-
-Profiles are JSON files at `~/.claude/settings-<name>.json` that get deep-merged onto your default `~/.claude/settings.json` at terminal start. `csq setkey` creates and manages these files for you. You can also edit them manually if you need to tweak model names, timeouts, or other settings.
-
-When you run `csq run 5 -p mm`, csq:
-
-1. Reads `~/.claude/settings.json` (your full default — hooks, statusline, plugins, etc.)
-2. Reads `~/.claude/settings-mm.json` (the overlay `csq setkey mm` created)
-3. Deep-merges them (overlay keys win; your default hooks/statusline/plugins carry through)
-4. Writes the result to `config-5/settings.json` for that terminal only
-
-**Properties:**
-
-- **Your default settings are never modified.** csq only reads `~/.claude/settings.json`, never writes to it.
-- **Each terminal is a fresh start.** To switch providers, start a new terminal with a different `-p` flag.
-- **Providers can't be hot-swapped mid-session.** API routing is set at startup. If you need a different provider, open a new terminal.
 
 ## How it works
 
@@ -177,7 +241,7 @@ csq run 3
 
 ### Shared artifacts
 
-Only credentials, account identity, and `settings.json` stay isolated. Everything else in `~/.claude` (projects, sessions, history, plugins, commands, agents, skills, memory) is symlinked into each `config-N/` on every `csq run`. So all terminals see the same conversations, the same `/resume` list, and the same auto-memory — only the account and (optionally) the profile change.
+Only credentials, account identity, and `settings.json` stay isolated. Everything else in `~/.claude` (projects, sessions, history, plugins, commands, agents, skills, memory) is symlinked into each `config-N/` on every `csq run`. So all terminals see the same conversations, the same `/resume` list, and the same auto-memory — only the account and profile change.
 
 Files that stay isolated per config dir:
 
@@ -247,8 +311,6 @@ call. This avoids hammering Anthropic's per-client-id refresh throttle.
 \*jq is optional — without it the statusline simply doesn't show quota; everything else works.
 
 Claude Code is required on every platform. On Windows, Git for Windows ships Git Bash, which CC already needs — no extra install.
-
-You also need one or more Claude accounts. Single-account mode is fully supported; multi-account swap needs ≥2.
 
 ## Use in VS Code
 

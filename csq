@@ -420,21 +420,22 @@ cmd_setkey() {
     claude  Claude direct API (ANTHROPIC_API_KEY)
     mm      MiniMax M2.7 (ANTHROPIC_AUTH_TOKEN for https://api.minimax.io/anthropic)
     zai     Z.AI GLM-4.6 (ANTHROPIC_AUTH_TOKEN for https://api.z.ai/api/anthropic)
+    ollama  Local Ollama (no key needed, uses http://localhost:11434)
 
   If [key] is omitted, csq reads it from stdin (keeps it out of shell history).
+  Local providers (ollama) need no key — just run: csq setkey ollama
   Use:  ! csq setkey mm < <(pbpaste)   # paste from clipboard without echo"
 
   # Read key from stdin if not passed as argument
   if [[ -z "$key" ]]; then
     if [[ -t 0 ]]; then
-      # Interactive stdin — prompt
-      read -rsp "Paste key for $provider: " key
+      # Interactive stdin — prompt (skip for keyless providers)
+      read -rsp "Paste key for $provider (Enter to skip for local providers): " key
       echo
     else
-      # Piped stdin — read directly
-      read -r key
+      # Piped stdin — read directly (empty is OK for keyless providers)
+      read -r key || true
     fi
-    [[ -n "$key" ]] || die "no key provided"
   fi
 
   # Hand off to Python to write the profile overlay, preserving existing fields
@@ -444,6 +445,12 @@ from pathlib import Path
 
 provider = os.environ['CSQ_PROVIDER']
 key = os.environ['CSQ_KEY']
+
+# Primer file paths — installed alongside the rotation engine.
+# Non-Anthropic models get both prepend (primacy) and append (recency)
+# to bookend the system prompt with COC-critical instructions.
+PRIMER_PATH = Path.home() / '.claude/accounts/3p-model-primer.md'
+PRIMER_PREPEND_PATH = Path.home() / '.claude/accounts/3p-model-primer-prepend.md'
 
 # Provider defaults. These define the skeleton written when the overlay
 # file doesn't exist yet. If it DOES exist, we preserve all fields and
@@ -460,6 +467,8 @@ PROVIDERS = {
     'mm': {
         'key_fields': ['ANTHROPIC_AUTH_TOKEN'],
         'skeleton': {
+            'systemPromptFile': str(PRIMER_PREPEND_PATH),
+            'appendSystemPromptFile': str(PRIMER_PATH),
             'env': {
                 'ANTHROPIC_BASE_URL': 'https://api.minimax.io/anthropic',
                 'ANTHROPIC_AUTH_TOKEN': '',
@@ -476,14 +485,35 @@ PROVIDERS = {
     'zai': {
         'key_fields': ['ANTHROPIC_AUTH_TOKEN'],
         'skeleton': {
+            'systemPromptFile': str(PRIMER_PREPEND_PATH),
+            'appendSystemPromptFile': str(PRIMER_PATH),
             'env': {
                 'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic',
                 'ANTHROPIC_AUTH_TOKEN': '',
-                'ANTHROPIC_MODEL': 'glm-4.6',
+                'ANTHROPIC_MODEL': 'glm-4.7',
                 'ANTHROPIC_SMALL_FAST_MODEL': 'glm-4.5-air',
-                'ANTHROPIC_DEFAULT_SONNET_MODEL': 'glm-4.6',
-                'ANTHROPIC_DEFAULT_OPUS_MODEL': 'glm-4.6',
+                'ANTHROPIC_DEFAULT_SONNET_MODEL': 'glm-4.7',
+                'ANTHROPIC_DEFAULT_OPUS_MODEL': 'glm-4.7',
                 'ANTHROPIC_DEFAULT_HAIKU_MODEL': 'glm-4.5-air',
+                'API_TIMEOUT_MS': '3000000',
+                'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
+            }
+        },
+    },
+    'ollama': {
+        'key_fields': [],
+        'skeleton': {
+            'systemPromptFile': str(PRIMER_PREPEND_PATH),
+            'appendSystemPromptFile': str(PRIMER_PATH),
+            'env': {
+                'ANTHROPIC_BASE_URL': 'http://localhost:11434',
+                'ANTHROPIC_AUTH_TOKEN': 'ollama',
+                'ANTHROPIC_API_KEY': '',
+                'ANTHROPIC_MODEL': 'qwen3:latest',
+                'ANTHROPIC_SMALL_FAST_MODEL': 'qwen3:latest',
+                'ANTHROPIC_DEFAULT_SONNET_MODEL': 'qwen3:latest',
+                'ANTHROPIC_DEFAULT_OPUS_MODEL': 'qwen3:latest',
+                'ANTHROPIC_DEFAULT_HAIKU_MODEL': 'qwen3:latest',
                 'API_TIMEOUT_MS': '3000000',
                 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
             }
@@ -515,9 +545,20 @@ else:
     # Ensure env section exists
     data.setdefault('env', {})
 
+# Always sync primer references if the provider skeleton has them.
+# This ensures existing profiles pick up primers on re-run of setkey.
+for primer_key in ('systemPromptFile', 'appendSystemPromptFile'):
+    if primer_key in config['skeleton']:
+        primer = config['skeleton'][primer_key]
+        if Path(primer).exists():
+            data[primer_key] = primer
+
 # Update the key fields. Other fields (model, base URL, etc.) are preserved
 # if already set by the user. If the profile didn't exist, the skeleton
 # defaults provide them.
+if config['key_fields'] and not key:
+    print(f'error: provider {provider} requires a key', file=sys.stderr)
+    sys.exit(1)
 for key_field in config['key_fields']:
     data['env'][key_field] = key
 

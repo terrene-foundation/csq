@@ -1,0 +1,112 @@
+{
+  "timestamp": "2026-04-09T01:17:39",
+  "models": {
+    "gemma4": "ollama",
+    "qwen3.5": "ollama",
+    "glm-4.7-flash": "ollama"
+  },
+  "results": {
+    "gemma4": {
+      "tool-usage": {
+        "ok": true,
+        "elapsed": 112.5950785410023,
+        "input_tokens": 102349,
+        "output_tokens": 262,
+        "num_turns": 2,
+        "result": "The `scripts/README.md` file is a markdown document providing documentation for the scripts in this directory."
+      },
+      "rule-following": {
+        "ok": true,
+        "elapsed": 74.81667324999944,
+        "input_tokens": 51562,
+        "output_tokens": 797,
+        "num_turns": 1,
+        "result": "The absolute directives from `/Users/esperie/repos/terrene/contrib/claude-squad/coc-env/CLAUDE.md` are:\n\n1.  **Foundation Independence \u2014 No Commercial Coupling**: The Kailash Python SDK is a **Terrene Foundation project**. It is fully independent. There is NO relationship between Kailash Python SDK and any commercial product, proprietary codebase, or commercial entity. Do not reference, compare with, or design against any proprietary product. Do not use language like \"open-source version of X\" or \"Python port of Y.\" Kailash Python SDK IS the product \u2014 not a derivative of anything. See `rules/independence.md` for full policy.\n2.  **Framework-First**: Never write code from scratch before checking whether the Kailash frameworks already handle it.\n    *   Instead of direct SQL/SQLAlchemy/Django ORM \u2192 check with **dataflow-specialist**\n    *   Instead of FastAPI/custom API gateway \u2192 check with **nexus-specialist**\n    *   Instead of custom MCP server/client \u2192 check with **mcp-specialist**\n    *   Instead of custom agentic platform \u2192 check with **kaizen-specialist**\n    *   Instead of custom governance/access control \u2192 check with **pact-specialist**\n3.  **.env Is the Single Source of Truth**: All API keys and model names MUST come from `.env`. Never hardcode model strings like `\"gpt-4\"` or `\"claude-3-opus\"`. Root `conftest.py` auto-loads `.env` for pytest. See `rules/env-models.md` for full details.\n4.  **Implement, Don't Document**: When you discover a missing feature, endpoint, or record \u2014 **implement or create it**. Do not note it as a gap and move on. The only acceptable skip is explicit user instruction. See `rules/e2e-god-mode.md` and `rules/zero-tolerance.md` for enforcement details.\n5.  **Zero Tolerance**: Pre-existing failures MUST be fixed, not reported. Stubs are BLOCKED. Naive fallbacks are BLOCKED. SDK bugs get GitHub issues, not workarounds. See `rules/zero-tolerance.md`.\n6.  **Recommended Reviews**:\n    *   **Code review** (reviewer) after file changes \u2014 RE"
+      },
+      "agent-awareness": {
+        "ok": true,
+        "elapsed": 81.71527708400026,
+        "input_tokens": 51548,
+        "output_tokens": 1009,
+        "num_turns": 1,
+        "result": "Adding a new REST endpoint is a multi-faceted task that requires defining the scope, structuring the implementation, securing it, and testing it thoroughly. This complexity means we should use **Plan Mode** to create a structured, multi-stage plan before writing any code or delegating work.\n\nBased on the codebase rules and the nature of API development, I recommend leveraging the following specialists in a coordinated plan:\n\n1.  **`requirements-analyst`**: To first break down *what* the endpoint needs to do, clarifying the business logic and precise inputs/outputs.\n2.  **`nexus-specialist`**: This specialist is explicitly recommended for \"Multi-channel platform (API/CLI/MCP)\" work and is the primary owner for API/deployment concerns, making them central to the implementation.\n3.  **`security-reviewer`**: This must be invoked *before* any commit on endpoints that handle user input or sensitive actions, enforcing the \"Security Review Before Commits\" rule.\n4.  **`analyst`**: To conduct a failure point analysis on the intended functionality to proactively surface any edge cases or system gaps.\n\nI will use **EnterPlanMode** to structure this process and get your approval on the implementation strategy.\n\nEnterPlanMode({\n  description: \"Plan to add a new REST endpoint\",\n  prompt: \"Design the complete process for adding a new REST endpoint. The process must cover: 1) Requirement definition (using requirements-analyst), 2) Architecture selection and implementation guidance (using nexus-specialist), 3) Security audit (using security-reviewer), and 4) Testing strategy (using testing-specialist). Structure the plan into distinct, sequential steps for my approval. The endpoint should adhere to Terrene Foundation principles, meaning it must be secure, observable, and clearly documented in its contract.\"\n})"
+      },
+      "skill-awareness": {
+        "ok": true,
+        "elapsed": 84.83260562500072,
+        "input_tokens": 51554,
+        "output_tokens": 675,
+        "num_turns": 1,
+        "result": "The available workflow skills and commands, based on the context, are quite extensive and categorized by the specific aspect of the project they address.\n\n### Available Workflow Skills & Skills\n\nThe system-reminder lists many skills. For a concise overview of the **macro-workflow phases**, the key commands/skills are:\n\n*   `/analyze`: Phase 01 for initial analysis.\n*   `/todos`: Phase 02, used to create and manage a roadmap, which requires user approval.\n*   `/implement`: Phase 03, used to execute tasks iteratively.\n*   `/redteam`: Phase 04, for rigorous validation and adversarial testing.\n*   `/codify`: Phase 05, for capturing institutional knowledge and creating assets.\n*   `/release`: For SDK release, publishing, and deployment.\n*   `/ws`: To view the workspace status dashboard.\n*   `/journal`: To view, create, or search project journal entries.\n\nBeyond these phase gates, specialized skills exist for:\n*   **Governance/Compliance**: `co-reference`, `26-eatp-reference`, `28-coc-reference`, `29-constitution-reference`, `29-pact`.\n*   **Development Patterns**: `01-core-sdk`, `12-testing-strategies`, `03-nexus`, etc.\n\n### Starting a New Feature Analysis\n\nIf you want to start analyzing a new feature, you should use the **`/analyze`** command (or skill).\n\nThis initiates **Phase 01: Analysis**, which is the standard first step in the Cognitive Orchestration (COC) workflow. This phase is designed to:\n1.  Identify failure points and risks.\n2.  Break down the high-level requirements into a structured scope.\n3.  Determine the overall viability of the feature before any code is written.\n\nThis follows the principle that analysis must precede planning and implementation."
+      }
+    },
+    "qwen3.5": {
+      "tool-usage": {
+        "ok": false,
+        "elapsed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "num_turns": 0,
+        "result": ""
+      },
+      "rule-following": {
+        "ok": true,
+        "elapsed": 201.02564112500113,
+        "input_tokens": 52451,
+        "output_tokens": 874,
+        "num_turns": 1,
+        "result": "Looking at the CLAUDE.md files in this project, here are the absolute directives you must follow:\n\n**From `/Users/esperie/repos/terrene/contrib/claude-squad/coc-env/CLAUDE.md`:**\n\n1. **Foundation Independence \u2014 No Commercial Coupling** (Directives 0)\n   - Kailash Python SDK is a Terrene Foundation project, fully independent\n   - NO relationship with any commercial product/proprietary codebase\n   - Do not reference, compare with, or design against any proprietary product\n   - Do not use language like \"open-source version of X\" or \"Python port of Y\"\n\n2. **Framework-First** (Directive 1)\n   - Never write code from scratch before checking whether Kailash frameworks already handle it\n   - Consult appropriate specialist agents (dataflow-specialist, nexus-specialist, etc.)\n\n3. **.env Is the Single Source of Truth** (Directive 2)\n   - All API keys and model names MUST come from `.env`\n   - Never hardcode model strings or credentials\n\n4. **Implement, Don't Document** (Directive 3)\n   - When you discover a missing feature \u2014 implement or create it\n   - Do not note it as a gap and move on\n   - Only skip on explicit user instruction\n\n5. **Zero Tolerance** (Directive 4)\n   - Pre-existing failures MUST be fixed, not reported\n   - Stubs are BLOCKED\n   - Naive fallbacks are BLOCKED\n   - SDK bugs get GitHub issues, not workarounds\n\n6. **LLM-First Agent Reasoning** (Directive 6)\n   - When building AI agents: the LLM does ALL reasoning\n   - No if-else routing, keyword matching, or regex classification\n\n**From `/Users/esperie/repos/terrene/contrib/claude-squad/.claude/rules/zero-tolerance.md`:**\n\n7. **Rule 1: Pre-existing Failures MUST Be Resolved**\n   - If you found it, you own it \u2014 fix it in THIS run\n   - \"Pre-existing issue\" is not an acceptable response\n\n8. **Rule 2: No Stubs, Placeholders, Deferred Implementation**\n   - No `TODO`, `FIXME`, `HACK`, `STUB` markers\n   - No `raise NotImplementedError`, empty function bodies\n   - No simulated/fake data as placeholders\n\n9. **Rule 3: No S"
+      },
+      "agent-awareness": {
+        "ok": true,
+        "elapsed": 222.8658116660008,
+        "input_tokens": 112461,
+        "output_tokens": 615,
+        "num_turns": 4,
+        "result": "Based on my exploration of this **coc-env** repository, here are the agents available for your REST endpoint task:\n\n## Recommended Agent: **nexus-specialist**\n\nThis is the **primary agent** to delegate to for adding REST endpoints. Here's why:\n\n| Agent | Why Applicable |\n|-------|----------------|\n| **nexus-specialist** | **Primary choice** \u2014 This agent specializes in \"Multi-channel platform for API/CLI/MCP deployment\" with FastAPI. The COC rules explicitly state: *\"Instead of FastAPI/custom API gateway \u2192 check with nexus-specialist\"* |\n| **dataflow-specialist** | Secondary \u2014 For database backend integration if the endpoint needs data operations |\n| **reviewer** | Quality gate \u2014 Code review after implementation |\n| **security-reviewer** | Security gate \u2014 Security audit before commits |\n| **testing-specialist** | Validation \u2014 3-tier testing with real infrastructure |\n\n## Why Not Other Agents\n\n- **kaizen-specialist** \u2014 For AI agents, not REST APIs\n- **mcp-specialist** \u2014 For MCP servers, not HTTP endpoints\n- **pattern-expert** \u2014 For workflow patterns/nodes, not HTTP layer\n\n## What to Ask the nexus-specialist\n\nBefore I delegate, I need to know:\n\n1. **What endpoint are you adding?** (e.g., `/api/health`, `/api/users`, webhook handler)\n2. **What does it do?** (GET/POST, query params, request body, response shape)\n3. **Does it need auth?** (PACT envelopes, API keys, OAuth)\n4. **Database access?** (if yes, I'll also call `dataflow-specialist`)\n\nWould you like me to proceed with the implementation once you clarify the endpoint requirements?"
+      },
+      "skill-awareness": {
+        "ok": false,
+        "elapsed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "num_turns": 0,
+        "result": ""
+      }
+    },
+    "glm-4.7-flash": {
+      "tool-usage": {
+        "ok": false,
+        "elapsed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "num_turns": 0,
+        "result": ""
+      },
+      "rule-following": {
+        "ok": false,
+        "elapsed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "num_turns": 0,
+        "result": ""
+      },
+      "agent-awareness": {
+        "ok": false,
+        "elapsed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "num_turns": 0,
+        "result": ""
+      },
+      "skill-awareness": {
+        "ok": false,
+        "elapsed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "num_turns": 0,
+        "result": ""
+      }
+    }
+  }
+}

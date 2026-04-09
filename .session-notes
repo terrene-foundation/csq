@@ -1,60 +1,41 @@
-## Session Notes [claude-squad] — updated 2026-04-08 (latest)
+## Session Notes [claude-squad] — updated 2026-04-09
 
 ### Read These Files First (in order)
 
-1. `journal/0019-DECISION-broker-defense-in-depth-for-dead-canonical.md` — the three-layer fix for the "residual race" that 0018 acknowledged but didn't close. READ THIS FIRST if the user reports any 401 issue.
-2. `journal/0018-DECISION-broker-for-multi-terminal-same-account.md` — original broker decision (Options A+C). Context for 0019.
-3. `journal/0017-DISCOVERY-backsync-marker-fallback-for-rotated-refresh-tokens.md` — Anthropic rotates refresh tokens. 0016 was wrong.
-4. `rotation-engine.py` — key functions after 0019: `broker_check()` ~line 1661 (now returns 0/2), `_broker_recover_from_live()` ~line 1600 (new), `_broker_failure_flag()` / `_broker_mark_failed()` / `_broker_mark_recovered()` ~line 1575 (new), `statusline_str()` ~line 1248 (now prepends `⚠LOGIN-NEEDED`).
-5. `csq` ~line 285 — `csq run` now writes `.csq-account` marker FIRST, then calls `python3 rotation-engine.py broker` synchronously, then copies canonical. Aborts with `account N's refresh token is dead — run: csq login N` on exit code 2.
-6. `test-broker-recovery.py` — run this before touching broker recovery. Three subprocess scenarios (success / failure / flag-clear).
+1. `csq` ~line 624 — `cmd_update()`: self-update command, downloads 5 files from GitHub main
+2. `csq` ~line 565 — API key validation block in `cmd_setkey()`: curl subprocess validates bearer keys before writing
+3. `csq` ~line 458 — PROVIDERS dict: now has `auth_type` field per provider (bearer/x-api-key/None)
+4. `install.sh` — reference for the 5 files that `csq update` mirrors
 
 ### Accomplished (this session)
 
-- **PR #5 shipped** (`feat/broker-defense-in-depth`, commit `f6d2a9d`) — three-layer defense against dead canonicals. Fully deployed to `~/.claude/accounts/rotation-engine.py` and `~/.local/bin/csq`. Awaiting admin merge.
-  - **Layer 1**: `REFRESH_AHEAD_SECS` 600 → 7200 (10 min → 2 hours). Broker refreshes during the last 2 hours of token life, so CC's own refresh almost never races.
-  - **Layer 4**: `broker_check()` recovers dead canonicals by promoting each live sibling's RT under the per-account lock and retrying. On total failure touches `credentials/N.broker-failed`, returns exit 2, rolls canonical back to original dead content. On any success, clears the flag.
-  - **Layer 2**: `csq run` reordered to write `.csq-account` marker → call broker synchronously → copy canonical. Aborts with clear message on exit 2. Measured happy-path cost: 116 ms.
-  - **Visibility**: `statusline_str()` prepends `⚠LOGIN-NEEDED ` while `credentials/N.broker-failed` exists.
-- **Diagnosed the "3rd terminal" symptom**: `credentials/7.json` mtime was stuck at 08:42 despite 8h of activity. `7.refresh-lock` from 17:05 proved broker fired, got the lock, but refresh_token() returned None (Anthropic 401'd the canonical RT because CC had rotated it). Canonical was deadlocked forever → any new `csq run 7` inherited the dead RT → 401 on first API call. Root cause is documented in 0019.
-- **Manual recovery**: Ran broker_check + forced fanout from config-5 to heal canonical 7.json before shipping. config-5 and config-7 are now in sync on a fresh 8-hour token.
-- **Journal entries**: 0018 (was uncommitted, now committed in PR #5) and 0019 (new).
-- **Tests**: `test-broker-recovery.py` added (3 scenarios, POSIX-only via fork). `test-broker-concurrent.py` unchanged, still green. `test-platform.sh` 20/20.
+- **API key validation on setkey** (PR #10, merged): `csq setkey mm <key>` now validates against the provider API via curl subprocess before writing to settings. Bad keys get `FAIL (HTTP 401)` and exit 1 — settings file is NOT modified. Only applies to bearer-token providers (mm, zai).
+- **Self-update command** (PR #11, merged): `csq update` downloads latest csq + rotation-engine + statusline + primers from GitHub main. Uses `command -v csq` to find install path (fixes bug where `~/bin` was chosen over `~/.local/bin`). Compares before writing; no-op if already current.
+- **Removed stale ~/bin/csq** — user had two copies; `which csq` resolved to `~/.local/bin` but install logic picked `~/bin`.
+- **GitHub raw CDN propagation confirmed** — both PRs live on `raw.githubusercontent.com`.
 
 ### Outstanding
 
-- [ ] **Admin-merge PR #5** — https://github.com/terrene-foundation/claude-squad/pull/5 — Awaiting user's `gh pr merge 5 --admin --merge --delete-branch`.
-- [ ] **User validates defense-in-depth in real life** — success criteria: zero `please run /login` 401s across 3+ concurrent terminals per account over 2–4 hours of normal work. If 401s recur, look for `⚠LOGIN-NEEDED` in the statusline — it should appear within one render of the broker exhausting recovery.
-- [ ] **0019 For Discussion #1**: recovery helper iterates live siblings in `Path.iterdir()` order (unsorted on macOS). If two siblings hold different valid RTs, whichever is iterated first wins. Consider sorting by `expiresAt` descending if this becomes a real issue.
-- [ ] **0019 For Discussion #3**: `REFRESH_AHEAD_SECS = 7200` assumes ~8h token lifetime. If Anthropic shortens token life, consider computing as a fraction of observed `expires_in`.
-- [ ] **kailash-py `csq run N --resume py` hang** — NOT csq's fault. kailash-py's `.claude/settings.json` has `SessionStart`/`SessionEnd`/`PreCompact` hooks with `timeout=NONE`. Pending user approval to edit that sibling project.
-- [ ] **Windows variant of test-broker-concurrent.py** — still POSIX-only (fork). Same applies to test-broker-recovery.py. Low priority until the first Windows user reports.
-- [ ] **All-terminals-idle edge case** (0018 For Discussion #1) — largely mitigated by Layer 1's 2-hour window. Worth watching but no longer a priority.
+- [ ] `~/.claude/settings-zai.json` is 0 bytes — run `csq setkey zai <key>` to regenerate
+- [ ] **Auto-scorer false positives**: env-hardcode fail pattern `['\"]gpt-4['\"]` triggers on refusal text quoting the rule
+- [ ] **secret-in-comment test contamination**: writes to `rotation-engine.py` in parent dir, not coc-env
+- [ ] **gemma4 score variance**: scored 31/50 adversarial previously, 10/50 another run. Consider multi-run averaging
+- [ ] **Benchmark script outputs**: `bench-results-100pt-ollama.json` gets overwritten per model. Should use model name in filename
 
 ### Oversight — Verify Before Starting
 
-- [ ] `git log --oneline -5` — should show `f6d2a9d` (defense-in-depth) near the top if PR #5 is merged, or as the branch tip if not
-- [ ] `bash test-platform.sh` — must show `PASS: 20  FAIL: 0`
-- [ ] `python3 test-broker-concurrent.py` — must show `ALL TESTS PASSED ✓` (original test, 2/5/10 subprocesses + pullsync)
-- [ ] `python3 test-broker-recovery.py` — must show `ALL TESTS PASSED ✓` (new test: success / failure / flag-clear)
-- [ ] `diff -q rotation-engine.py ~/.claude/accounts/rotation-engine.py` — engine in sync with deployed copy
-- [ ] `diff -q csq ~/.local/bin/csq` — csq binary in sync with source
-- [ ] `diff -q statusline-quota.sh ~/.claude/accounts/statusline-quota.sh` — statusline in sync
+- [ ] `git log --oneline -3` — should show `5519c9f` (csq update merge) at HEAD
+- [ ] `csq update` works end-to-end: run it, should say "Already up to date"
+- [ ] `csq setkey mm bad-key 2>&1` — should print FAIL and exit 1
+- [ ] `grep systemPromptFile ~/.claude/settings-mm.json` — should show prepend primer path
+- [ ] `diff -q csq ~/.local/bin/csq` — should be in sync (or run `csq update`)
 
 ### Oversight — Verify After Completing
 
-- [ ] All three smoke suites still green (`test-platform.sh` + `test-broker-concurrent.py` + `test-broker-recovery.py`)
-- [ ] `REFRESH_AHEAD_SECS = 7200` in `rotation-engine.py`
-- [ ] `_broker_recover_from_live`, `_broker_failure_flag`, `_broker_mark_failed`, `_broker_mark_recovered` all present
-- [ ] `broker_check` returns `0` or `2` (not bare `return`)
-- [ ] `main()` broker subcommand dispatch calls `sys.exit(rc if rc else 0)`
-- [ ] `csq` `run` function writes `.csq-account` BEFORE calling broker BEFORE copying canonical
-- [ ] `statusline_str()` checks `_broker_failure_flag` and prepends `⚠LOGIN-NEEDED`
+- [ ] No secrets in committed files: `grep -rl "sk-ant-\|sk-cp-" . --include="*.py" --include="*.md" --include="*.sh" | grep -v .venv | grep -v bench-results`
+- [ ] `rotation-engine.py` line 1 is shebang only, no token comments
+- [ ] README benchmark tables match bench-results-100pt-*.json data
 
 ### Blockers
 
-None. Defense-in-depth shipped, tested, deployed. Waiting on:
-1. User's admin-merge of PR #5
-2. User's real-world validation that the dead-canonical failure mode no longer reproduces
-
-If the `⚠LOGIN-NEEDED` marker appears in the statusline during normal use, capture: (a) which config dir + account, (b) timestamp, (c) contents of `credentials/N.broker-failed` and `credentials/N.json`. That's the exact trio needed to diagnose whether Layer 4 recovery exhausted genuinely (all siblings dead) or whether there's a new failure mode.
+None. All changes merged to main (5519c9f).

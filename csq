@@ -506,6 +506,9 @@ cmd_setkey() {
     fi
   fi
 
+  # Strip trailing \r — Windows/WSL clipboard paste adds carriage returns
+  key="${key%$'\r'}"
+
   # Hand off to Python to write the profile overlay, preserving existing fields
   CSQ_PROVIDER="$provider" CSQ_KEY="$key" "$PY" -c "
 import json, os, sys

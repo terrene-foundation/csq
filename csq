@@ -221,7 +221,42 @@ cmd_run() {
   local default_dir="$HOME/.claude"
   mkdir -p "$config_dir"
 
-  [[ -f "$cred_file" ]] || die "no credentials for account $n — run: csq login $n"
+  # Check if the profile overlay provides its own auth (third-party API key).
+  # If so, OAuth credentials for this account number are not required —
+  # the profile's ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY in the settings
+  # overlay is the sole auth source.
+  local profile_has_auth=false
+  if [[ -n "$profile" ]]; then
+    local overlay_file="$default_dir/settings-${profile}.json"
+    if [[ -f "$overlay_file" ]]; then
+      profile_has_auth=$("$PY" -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except json.JSONDecodeError:
+    text = open(sys.argv[1]).read().rstrip()
+    d = None
+    for n in range(1, 4):
+        try:
+            d = json.loads(text + chr(10) + (chr(125) + chr(10)) * n)
+            break
+        except json.JSONDecodeError:
+            continue
+    if d is None:
+        print('false')
+        sys.exit()
+env = d.get('env', {})
+if env.get('ANTHROPIC_AUTH_TOKEN') or env.get('ANTHROPIC_API_KEY'):
+    print('true')
+else:
+    print('false')
+" "$overlay_file" 2>/dev/null || echo "false")
+    fi
+  fi
+
+  if [[ "$profile_has_auth" != "true" ]]; then
+    [[ -f "$cred_file" ]] || die "no credentials for account $n — run: csq login $n"
+  fi
 
   # --- Symlink shared artifacts from ~/.claude ---
   # Only credentials, account identity, and settings.json stay isolated.
@@ -289,31 +324,36 @@ cmd_run() {
   # has a marker to look up. Order: marker → broker → cred copy.
   echo "$n" > "$config_dir/.csq-account"
 
-  # Synchronous broker refresh before copying canonical. This closes the
-  # "new terminal inherits a dead canonical" failure mode: if canonical's
-  # refresh token has been rotated out from under us by a past race, the
-  # broker's recovery path will try each live sibling's RT and heal
-  # canonical before we copy it. If both primary and recovery fail, the
-  # broker subcommand exits 2 and we abort here with a clear message
-  # instead of letting CC boot with a dead credential file and
-  # die 30 seconds later with a confusing 401.
-  #
-  # Common case cost: ~50 ms (broker reads canonical, sees the token is
-  # not within the refresh window, early-returns). Only pays the Anthropic
-  # round-trip (~1-2 s) when canonical actually needs a refresh.
-  if ! CLAUDE_CONFIG_DIR="$config_dir" "$PY" "$ENGINE" broker; then
-    die "account $n's refresh token is dead — run: csq login $n"
-  fi
+  # Broker refresh + credential copy only apply to OAuth accounts.
+  # Profile-based auth (ANTHROPIC_AUTH_TOKEN in settings overlay) doesn't
+  # use .credentials.json at all — the key is in settings.json env.
+  if [[ "$profile_has_auth" != "true" ]]; then
+    # Synchronous broker refresh before copying canonical. This closes the
+    # "new terminal inherits a dead canonical" failure mode: if canonical's
+    # refresh token has been rotated out from under us by a past race, the
+    # broker's recovery path will try each live sibling's RT and heal
+    # canonical before we copy it. If both primary and recovery fail, the
+    # broker subcommand exits 2 and we abort here with a clear message
+    # instead of letting CC boot with a dead credential file and
+    # die 30 seconds later with a confusing 401.
+    #
+    # Common case cost: ~50 ms (broker reads canonical, sees the token is
+    # not within the refresh window, early-returns). Only pays the Anthropic
+    # round-trip (~1-2 s) when canonical actually needs a refresh.
+    if ! CLAUDE_CONFIG_DIR="$config_dir" "$PY" "$ENGINE" broker; then
+      die "account $n's refresh token is dead — run: csq login $n"
+    fi
 
-  # CC v2.1+ reads .credentials.json at startup. Copy from canonical so
-  # swap_to() changes take effect on restart. Atomic write (temp + mv) so
-  # CC never sees a half-written credentials file if csq is killed mid-copy.
-  # Must run AFTER the broker call above so we pick up the freshly-refreshed
-  # canonical instead of a stale one.
-  cp "$cred_file" "$config_dir/.credentials.json.tmp"
-  mv "$config_dir/.credentials.json.tmp" "$config_dir/.credentials.json"
-  if [[ "$PLATFORM" != "git-bash" ]]; then
-    chmod 600 "$config_dir/.credentials.json"
+    # CC v2.1+ reads .credentials.json at startup. Copy from canonical so
+    # swap_to() changes take effect on restart. Atomic write (temp + mv) so
+    # CC never sees a half-written credentials file if csq is killed mid-copy.
+    # Must run AFTER the broker call above so we pick up the freshly-refreshed
+    # canonical instead of a stale one.
+    cp "$cred_file" "$config_dir/.credentials.json.tmp"
+    mv "$config_dir/.credentials.json.tmp" "$config_dir/.credentials.json"
+    if [[ "$PLATFORM" != "git-bash" ]]; then
+      chmod 600 "$config_dir/.credentials.json"
+    fi
   fi
 
   # Initial .current-account so legacy code paths see *something* before the
@@ -363,12 +403,33 @@ if not os.path.exists(default_path):
 with open(default_path) as f:
     merged = json.load(f)
 
+def _try_repair_json(text):
+    stripped = text.rstrip()
+    for n in range(1, 4):
+        try:
+            return json.loads(stripped + chr(10) + (chr(125) + chr(10)) * n)
+        except json.JSONDecodeError:
+            continue
+    return None
+
 if overlay_path:
     if not os.path.exists(overlay_path):
         print(f'profile not found: {overlay_path}', file=sys.stderr)
         sys.exit(1)
-    with open(overlay_path) as f:
-        overlay = json.load(f)
+    raw = open(overlay_path).read()
+    try:
+        overlay = json.loads(raw)
+    except json.JSONDecodeError:
+        overlay = _try_repair_json(raw)
+        if overlay is not None:
+            tmp_path = overlay_path + '.tmp'
+            with open(tmp_path, 'w') as tf:
+                json.dump(overlay, tf, indent=2)
+            os.replace(tmp_path, overlay_path)
+            print(f'warning: {overlay_path} was truncated, auto-repaired', file=sys.stderr)
+        else:
+            print(f'error: {overlay_path} is corrupted and cannot be repaired', file=sys.stderr)
+            sys.exit(1)
     def deep_merge(a, b):
         result = dict(a)
         for k, v in b.items():
@@ -539,14 +600,34 @@ if provider not in PROVIDERS:
 config = PROVIDERS[provider]
 profile_path = Path.home() / f'.claude/settings-{provider}.json'
 
+# Try to repair truncated JSON by appending missing closing braces.
+def _try_repair_json(text):
+    stripped = text.rstrip()
+    for n in range(1, 4):
+        try:
+            return json.loads(stripped + '\n' + '}\n' * n)
+        except json.JSONDecodeError:
+            continue
+    return None
+
 # Load existing profile if it exists and is non-empty
 existing = None
 if profile_path.exists() and profile_path.stat().st_size > 0:
+    raw = profile_path.read_text()
     try:
-        existing = json.loads(profile_path.read_text())
+        existing = json.loads(raw)
     except json.JSONDecodeError:
-        print(f'warning: {profile_path} is corrupted, replacing with defaults', file=sys.stderr)
-        existing = None
+        existing = _try_repair_json(raw)
+        if existing is not None:
+            # Write repaired file back atomically
+            tmp = profile_path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(existing, indent=2))
+            if os.name != 'nt':
+                os.chmod(tmp, 0o600)
+            os.replace(str(tmp), str(profile_path))
+            print(f'warning: {profile_path} was truncated, auto-repaired', file=sys.stderr)
+        else:
+            print(f'warning: {profile_path} is corrupted beyond repair, replacing with defaults', file=sys.stderr)
 
 if existing is None:
     # Seed with skeleton

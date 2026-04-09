@@ -458,6 +458,7 @@ PRIMER_PREPEND_PATH = Path.home() / '.claude/accounts/3p-model-primer-prepend.md
 PROVIDERS = {
     'claude': {
         'key_fields': ['ANTHROPIC_API_KEY'],
+        'auth_type': 'x-api-key',
         'skeleton': {
             'env': {
                 'ANTHROPIC_API_KEY': '',
@@ -466,6 +467,7 @@ PROVIDERS = {
     },
     'mm': {
         'key_fields': ['ANTHROPIC_AUTH_TOKEN'],
+        'auth_type': 'bearer',
         'skeleton': {
             'systemPromptFile': str(PRIMER_PREPEND_PATH),
             'appendSystemPromptFile': str(PRIMER_PATH),
@@ -484,6 +486,7 @@ PROVIDERS = {
     },
     'zai': {
         'key_fields': ['ANTHROPIC_AUTH_TOKEN'],
+        'auth_type': 'bearer',
         'skeleton': {
             'systemPromptFile': str(PRIMER_PREPEND_PATH),
             'appendSystemPromptFile': str(PRIMER_PATH),
@@ -502,6 +505,7 @@ PROVIDERS = {
     },
     'ollama': {
         'key_fields': [],
+        'auth_type': None,
         'skeleton': {
             'systemPromptFile': str(PRIMER_PREPEND_PATH),
             'appendSystemPromptFile': str(PRIMER_PATH),
@@ -553,12 +557,55 @@ for primer_key in ('systemPromptFile', 'appendSystemPromptFile'):
         if Path(primer).exists():
             data[primer_key] = primer
 
-# Update the key fields. Other fields (model, base URL, etc.) are preserved
-# if already set by the user. If the profile didn't exist, the skeleton
-# defaults provide them.
 if config['key_fields'] and not key:
     print(f'error: provider {provider} requires a key', file=sys.stderr)
     sys.exit(1)
+
+# Validate the API key BEFORE writing (non-Claude bearer-token providers).
+import subprocess as _sp
+base_url = config['skeleton'].get('env', {}).get('ANTHROPIC_BASE_URL', '')
+model = config['skeleton'].get('env', {}).get('ANTHROPIC_MODEL', '')
+key_ok = True
+if base_url and key and config.get('auth_type') == 'bearer':
+    sys.stdout.write(f'  Verifying key against {base_url} ...')
+    sys.stdout.flush()
+    curl_cmd = [
+        'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+        '-m', '15',
+        '-H', 'Content-Type: application/json',
+        '-H', f'Authorization: Bearer {key}',
+        '-H', 'anthropic-version: 2023-06-01',
+        '-d', json.dumps({
+            'model': model,
+            'max_tokens': 1,
+            'messages': [{'role': 'user', 'content': 'hi'}],
+        }),
+        f'{base_url}/v1/messages',
+    ]
+    try:
+        r = _sp.run(curl_cmd, capture_output=True, text=True, timeout=20)
+        code = r.stdout.strip()
+        if code == '200':
+            print(f' OK (HTTP {code})')
+        elif code in ('401', '403'):
+            key_ok = False
+            print(f' FAIL (HTTP {code})', file=sys.stderr)
+            print(f'  API key rejected. Check your key and try again.', file=sys.stderr)
+        elif code == '000':
+            print(f' unreachable', file=sys.stderr)
+            print(f'  Could not reach {base_url} — network issue or wrong URL.', file=sys.stderr)
+        else:
+            print(f' HTTP {code}', file=sys.stderr)
+            print(f'  Unexpected response. Key may be valid but endpoint returned an error.', file=sys.stderr)
+    except Exception as e:
+        print(f' error: {e}', file=sys.stderr)
+
+if not key_ok:
+    sys.exit(1)
+
+# Update the key fields. Other fields (model, base URL, etc.) are preserved
+# if already set by the user. If the profile didn't exist, the skeleton
+# defaults provide them.
 for key_field in config['key_fields']:
     data['env'][key_field] = key
 
@@ -569,7 +616,7 @@ if os.name != 'nt':
     os.chmod(tmp, 0o600)
 os.replace(str(tmp), str(profile_path))
 
-print(f'  Key set for profile \"{provider}\" → {profile_path}')
+print(f'  Key set for profile \"{provider}\" -> {profile_path}')
 print(f'  Start CC with: csq run N -p {provider}')
 " 2>&1
 }

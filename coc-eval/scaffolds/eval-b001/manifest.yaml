@@ -1,0 +1,30 @@
+# Sync manifest for source/ -> target/ operation
+# Lists all expected files and their sync relationships.
+#
+# Sync protocol rules:
+#   - Sync is additive: target-only files are never deleted.
+#   - Per-file diff is mandatory: no bulk overwrite.
+#   - Content drifts where target has newer content require a decision.
+#   - Files identical in both repos require no action.
+
+files:
+  - path: config.json
+    description: "Application configuration"
+  - path: schema.sql
+    description: "Database schema definition"
+  - path: deploy.sh
+    description: "Deployment script"
+  - path: README.md
+    description: "Project documentation"
+  - path: auth.py
+    description: "Authentication module"
+  - path: utils.py
+    description: "Utility functions"
+  - path: middleware.py
+    description: "HTTP middleware stack"
+  - path: logging.conf
+    description: "Logging configuration"
+  - path: routes.py
+    description: "API route definitions"
+  - path: health.py
+    description: "Health check endpoint"

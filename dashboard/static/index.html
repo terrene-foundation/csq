@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Squad — Usage Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="header">
+        <h1 class="header-title">Claude Squad <span>— Usage Monitor</span></h1>
+        <div class="header-actions">
+            <button class="btn" id="btn-refresh" onclick="refreshAll()">
+                Refresh All
+            </button>
+        </div>
+    </header>
+
+    <div class="error-banner" id="error-banner"></div>
+
+    <div class="controls">
+        <div class="sort-group">
+            <label for="sort-select">Sort by:</label>
+            <select id="sort-select" onchange="onSortChange()">
+                <option value="utilization-desc">Utilization (highest)</option>
+                <option value="utilization-asc">Utilization (lowest)</option>
+                <option value="account">Account number</option>
+                <option value="provider">Provider</option>
+            </select>
+        </div>
+        <div class="status-line" id="status-line">
+            Loading...
+        </div>
+    </div>
+
+    <main class="cards-container">
+        <div class="cards-grid" id="cards-grid">
+            <div class="no-data" id="no-data">
+                Loading accounts...
+            </div>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span id="footer-updated">Last updated: --</span>
+        <span id="footer-next">Next poll: --</span>
+    </footer>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

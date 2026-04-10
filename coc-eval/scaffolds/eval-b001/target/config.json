@@ -1,0 +1,17 @@
+{
+  "app_name": "governance-api",
+  "version": "2.3.0",
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "name": "governance"
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "json"
+  },
+  "features": {
+    "bridge_approval": true,
+    "vacancy_handling": true
+  }
+}

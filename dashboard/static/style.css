@@ -1,0 +1,444 @@
+/* Claude Squad — Usage Dashboard
+   Dark theme, monospace data, CSS Grid layout.
+   No frameworks, no build steps. */
+
+:root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-card: #1c2128;
+    --bg-card-hover: #242b35;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.1);
+    --yellow: #d29922;
+    --yellow-bg: rgba(210, 153, 34, 0.1);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.1);
+    --gray: #484f58;
+    --gray-bg: rgba(72, 79, 88, 0.15);
+    --bar-bg: #21262d;
+    --bar-height: 8px;
+    --radius: 8px;
+    --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--font-sans);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    line-height: 1.5;
+}
+
+/* ─── Header ─────────────────────────────────────────── */
+
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+}
+
+.header-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.header-title span {
+    color: var(--text-secondary);
+    font-weight: 400;
+}
+
+.header-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.btn:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--text-secondary);
+}
+
+.btn:active {
+    transform: scale(0.98);
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: var(--bg-primary);
+    border-color: var(--accent);
+}
+
+.btn-primary:hover {
+    opacity: 0.9;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ─── Sort controls ──────────────────────────────────── */
+
+.controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.sort-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.sort-group label {
+    color: var(--text-muted);
+}
+
+.sort-group select {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.status-line {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+/* ─── Cards grid ─────────────────────────────────────── */
+
+.cards-container {
+    padding: 24px;
+}
+
+.cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 16px;
+}
+
+/* ─── Individual card ────────────────────────────────── */
+
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, transform 0.1s;
+    position: relative;
+}
+
+.card:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--text-secondary);
+    transform: translateY(-1px);
+}
+
+.card.status-green {
+    border-left: 3px solid var(--green);
+}
+
+.card.status-yellow {
+    border-left: 3px solid var(--yellow);
+}
+
+.card.status-red {
+    border-left: 3px solid var(--red);
+}
+
+.card.status-gray {
+    border-left: 3px solid var(--gray);
+    opacity: 0.7;
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+
+.card-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+}
+
+.card-provider {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg-secondary);
+    padding: 2px 8px;
+    border-radius: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.card-status {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 500;
+}
+
+.card-status.active {
+    color: var(--green);
+    background: var(--green-bg);
+}
+
+.card-status.expired {
+    color: var(--red);
+    background: var(--red-bg);
+}
+
+.card-status.rate-limited {
+    color: var(--yellow);
+    background: var(--yellow-bg);
+}
+
+.card-status.error {
+    color: var(--gray);
+    background: var(--gray-bg);
+}
+
+/* ─── Usage bars ─────────────────────────────────────── */
+
+.usage-section {
+    margin-bottom: 10px;
+}
+
+.usage-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+}
+
+.usage-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+}
+
+.usage-value {
+    font-size: 13px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    min-width: 42px;
+    text-align: right;
+}
+
+.usage-bar {
+    width: 100%;
+    height: var(--bar-height);
+    background: var(--bar-bg);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 8px;
+}
+
+.usage-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease-out, background-color 0.3s;
+}
+
+.usage-bar-fill.green { background: var(--green); }
+.usage-bar-fill.yellow { background: var(--yellow); }
+.usage-bar-fill.red { background: var(--red); }
+.usage-bar-fill.gray { background: var(--gray); }
+
+/* ─── Reset timer ────────────────────────────────────── */
+
+.reset-timer {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.reset-timer .timer-value {
+    color: var(--text-secondary);
+}
+
+/* ─── Card detail (expanded) ─────────────────────────── */
+
+.card-detail {
+    display: none;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+}
+
+.card-detail.expanded {
+    display: block;
+}
+
+.detail-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+}
+
+.detail-label {
+    color: var(--text-muted);
+}
+
+.detail-value {
+    color: var(--text-primary);
+}
+
+/* ─── Rate limit display (3P) ────────────────────────── */
+
+.rate-limits {
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+}
+
+.rate-limits .rl-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 0;
+}
+
+.rate-limits .rl-key {
+    color: var(--text-muted);
+}
+
+.rate-limits .rl-value {
+    color: var(--text-primary);
+}
+
+/* ─── No data state ──────────────────────────────────── */
+
+.no-data {
+    text-align: center;
+    padding: 24px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+/* ─── Footer ─────────────────────────────────────────── */
+
+.footer {
+    padding: 12px 24px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+}
+
+/* ─── Responsive ─────────────────────────────────────── */
+
+@media (max-width: 768px) {
+    .header {
+        flex-direction: column;
+        gap: 10px;
+        text-align: center;
+    }
+
+    .cards-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .controls {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .footer {
+        flex-direction: column;
+        gap: 4px;
+        text-align: center;
+    }
+}
+
+@media (min-width: 1400px) {
+    .cards-grid {
+        grid-template-columns: repeat(4, 1fr);
+    }
+}
+
+/* ─── Loading spinner ────────────────────────────────── */
+
+.loading {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ─── Error banner ───────────────────────────────────── */
+
+.error-banner {
+    background: var(--red-bg);
+    border: 1px solid var(--red);
+    color: var(--red);
+    padding: 10px 24px;
+    font-size: 13px;
+    display: none;
+}
+
+.error-banner.visible {
+    display: block;
+}

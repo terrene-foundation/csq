@@ -7,15 +7,15 @@ model: sonnet
 
 # TDD Implementer
 
-Test-Driven Development specialist for Rust/Tauri desktop applications. Uses cargo test, #[test], #[tokio::test], and the Arrange-Act-Assert pattern.
+Test-Driven Development specialist for Rust. Uses cargo test, #[test], #[tokio::test], and the Arrange-Act-Assert pattern.
 
 ## When to Use
 
 Use this agent when:
 
-- Implementing a new Rust feature in src-tauri/
-- Writing a Tauri command handler with business logic
-- Building a state management component
+- Implementing a new Rust feature in `csq-core/` or `csq-cli/`
+- Writing a Tauri command handler in `csq-desktop/src-tauri/`
+- Building a daemon subsystem or background task
 - Adding an OAuth or API integration
 
 ## TDD Cycle
@@ -92,76 +92,43 @@ mod tests {
 
 ### Integration Tests (Tier 2)
 
-Place in `src-tauri/tests/`:
+Place in `csq-core/tests/`:
 
-- Test Tauri commands end-to-end
-- Use `#[tokio::test]` for async
-- Test state mutations through actual commands
+- Daemon round-trip tests use real axum server on temp Unix socket
+- Use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`
+- See `csq-core/tests/daemon_integration.rs` for the `with_server` pattern
 
-### Property-Based Testing (proptest)
+## csq-Specific: Injectable HTTP Transport
+
+csq does NOT use mockall or trait-based mocking. Instead, every HTTP-touching function takes an injectable closure:
 
 ```rust
-use proptest::prelude::*;
+// Type alias for the transport closure:
+pub type HttpPostFn = Arc<
+    dyn Fn(&str, &str) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+>;
 
-proptest! {
-    #[test]
-    fn test_account_name_rejects_empty_or_long(
-        name in "[a-zA-Z]{1,10}"
-    ) {
-        let result = validate_account_name(&name);
-        if name.is_empty() {
-            assert!(result.is_err());
-        }
-    }
-}
+// Production wires the real HTTP client:
+let http_post: HttpPostFn = Arc::new(|url, body| http::post_form(url, body));
+
+// Tests inject a mock:
+let http_post: HttpPostFn = Arc::new(|_url, _body| {
+    Ok(br#"{"access_token":"new","refresh_token":"new","expires_in":3600}"#.to_vec())
+});
 ```
 
-## Test Doubles with mockall
+This pattern applies to: `refresh_token`, `exchange_code`, `validate_key`, `poll_anthropic_usage`, `poll_3p_usage`
+
+## csq-Specific: Leaky-Body Regression Tests
+
+Every module touching secrets needs a test proving the error path doesn't leak:
 
 ```rust
-// Define a trait for the dependency
-trait HttpClient: Send + Sync {
-    fn post(&self, url: &str, body: &str) -> impl Future<Output = Result<String, HttpError>>;
-}
-
-// Mock it in tests
-#[cfg(test)]
-mod mocks {
-    use super::*;
-
-    mockall::mock! {
-        pub Http {
-            fn post(&self, url: &str, body: &str) -> impl Future<Output = Result<String, HttpError>> + Send;
-        }
-    }
-}
-
-#[cfg(test)]
-fn make_mock_client() -> MockHttp {
-    let mut mock = MockHttp::new();
-    mock.expect_post()
-        .returning(|_, _| Ok(r#"{"access_token":"test"}"#.to_string()));
-    mock
-}
-```
-
-## Tauri Command Testing
-
-```rust
-#[cfg(test)]
-mod command_tests {
-    use super::*;
-    use tauri::test::{mock, try_init};
-
-    #[tokio::test]
-    async fn test_list_accounts_command() {
-        let app = mock().await;
-        let window = app.get_webview_window("main").unwrap();
-
-        // Invoke the command directly
-        let result: Result<Vec<Account>, String> = invoke(&window, "list_accounts", ()).await;
-        assert!(result.is_ok());
-    }
+#[test]
+fn transport_error_does_not_leak_token() {
+    let result = refresh_token(&creds, &path, |_, _| Err("fail".into()));
+    let msg = result.unwrap_err().to_string();
+    assert!(!msg.contains("SECRET"), "error leaked: {msg}");
 }
 ```
 

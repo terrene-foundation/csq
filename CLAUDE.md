@@ -18,14 +18,14 @@ Pre-existing failures MUST be fixed, not reported. Stubs are BLOCKED. See `rules
 
 ## Tech Stack
 
-| Layer      | Technology                        |
-| ---------- | --------------------------------- |
-| Frontend   | Svelte 5 (runes, component props) |
-| Desktop    | Tauri 2.x (Rust backend, WebView) |
-| State      | Rust backend state + Svelte stores |
-| IPC        | Tauri commands (`invoke`)         |
-| Styling    | CSS (plain, no framework)         |
-| Build      | Cargo + Vite                     |
+| Layer    | Technology                         |
+| -------- | ---------------------------------- |
+| Frontend | Svelte 5 (runes, component props)  |
+| Desktop  | Tauri 2.x (Rust backend, WebView)  |
+| State    | Rust backend state + Svelte stores |
+| IPC      | Tauri commands (`invoke`)          |
+| Styling  | CSS (plain, no framework)          |
+| Build    | Cargo + Vite                       |
 
 ## Project Structure
 
@@ -47,41 +47,43 @@ src-tauri/                   — Rust backend
 
 ## Rules
 
-| Concern                  | Rule File                    |
-| ------------------------ | --------------------------- |
-| No stubs/placeholders     | `rules/no-stubs.md`         |
-| Security (secrets)        | `rules/security.md`         |
-| Git workflow              | `rules/git.md`             |
-| Zero tolerance            | `rules/zero-tolerance.md`  |
-| Testing                   | `rules/testing.md`         |
-| Svelte patterns           | `rules/svelte-patterns.md` |
-| Tauri patterns            | `rules/tauri-patterns.md`  |
-| Tauri commands            | `rules/tauri-commands.md`  |
+| Concern               | Rule File                  |
+| --------------------- | -------------------------- |
+| No stubs/placeholders | `rules/no-stubs.md`        |
+| Security (secrets)    | `rules/security.md`        |
+| Git workflow          | `rules/git.md`             |
+| Zero tolerance        | `rules/zero-tolerance.md`  |
+| Testing               | `rules/testing.md`         |
+| Svelte patterns       | `rules/svelte-patterns.md` |
+| Tauri patterns        | `rules/tauri-patterns.md`  |
+| Tauri commands        | `rules/tauri-commands.md`  |
 
 ## Agents
 
-| Agent                      | Role                                           |
-| ------------------------- | ---------------------------------------------- |
-| `claude-code-architect`   | CC artifact quality auditing                   |
-| `svelte-specialist`       | Svelte 5 runes, components, stores             |
-| `rust-specialist`        | Rust ownership, lifetimes, async, error handling |
-| `rust-desktop-specialist` | Tauri + Rust backend, command patterns         |
-| `tauri-platform-specialist` | Tauri IPC, windowing, system integration     |
-| `uiux-designer`           | Layout, hierarchy, accessibility               |
-| `gold-standards-validator` | Naming, licensing compliance                 |
-| `security-reviewer`       | Security audit, secrets management             |
-| `build-fix`               | Build errors, linking, FFI issues              |
-| `tdd-implementer`        | Rust TDD with cargo test, Arrange-Act-Assert  |
-| `requirements-analyst`   | Desktop app requirements, feature specs        |
-| `deep-analyst`            | Failure analysis, 5-Why, risk assessment       |
-| `intermediate-reviewer`   | Rust/Svelte code review, ownership, security   |
-| `testing-specialist`      | Rust + Svelte testing tiers, Tauri infra       |
+| Agent                       | Role                                             |
+| --------------------------- | ------------------------------------------------ |
+| `claude-code-architect`     | CC artifact quality auditing                     |
+| `svelte-specialist`         | Svelte 5 runes, components, stores               |
+| `rust-specialist`           | Rust ownership, lifetimes, async, error handling |
+| `rust-desktop-specialist`   | Tauri + Rust backend, command patterns           |
+| `tauri-platform-specialist` | Tauri IPC, windowing, system integration         |
+| `uiux-designer`             | Layout, hierarchy, accessibility                 |
+| `gold-standards-validator`  | Naming, licensing compliance                     |
+| `security-reviewer`         | Security audit, secrets management               |
+| `build-fix`                 | Build errors, linking, FFI issues                |
+| `tdd-implementer`           | Rust TDD with cargo test, Arrange-Act-Assert     |
+| `requirements-analyst`      | Desktop app requirements, feature specs          |
+| `deep-analyst`              | Failure analysis, 5-Why, risk assessment         |
+| `intermediate-reviewer`     | Rust/Svelte code review, ownership, security     |
+| `testing-specialist`        | Rust + Svelte testing tiers, Tauri infra         |
 
 ## Skills
 
-| Skill                      | Purpose                                      |
-| -------------------------- | -------------------------------------------- |
-| `svelte-reference`         | Svelte 5 runes, component patterns, stores   |
-| `tauri-reference`          | Tauri commands, IPC, state management        |
-| `uiux-principles`          | Layout, hierarchy, motion, typography        |
-| `ai-interaction`           | AI interaction patterns (desktop context)    |
+| Skill                  | Purpose                                          |
+| ---------------------- | ------------------------------------------------ |
+| `svelte-reference`     | Svelte 5 runes, component patterns, stores       |
+| `tauri-reference`      | Tauri commands, IPC, state management            |
+| `uiux-principles`      | Layout, hierarchy, motion, typography            |
+| `ai-interaction`       | AI interaction patterns (desktop context)        |
+| `daemon-architecture`  | Daemon subsystems, invariants, IPC security      |
+| `provider-integration` | 3P provider catalog, polling, rate-limit headers |

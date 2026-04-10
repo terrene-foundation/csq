@@ -7,251 +7,152 @@ model: sonnet
 
 # Testing Specialist
 
-Rust and Svelte testing — cargo test, integration tests, Tauri infrastructure tests, Svelte component tests.
+Rust testing for claude-squad — cargo test, integration tests, and the project-specific patterns that make the 460+ test suite work.
 
 ## When to Use
 
-Use this agent when:
-
-- Writing tests for a Rust feature
-- Setting up integration tests for Tauri commands
-- Writing Svelte component tests
+- Writing tests for a new Rust feature in `csq-core/` or `csq-cli/`
+- Setting up integration tests for daemon IPC
 - Debugging test failures
-- Choosing the right test tier for a feature
+- Choosing the right test pattern for a feature
+- Writing Svelte component tests for `csq-desktop/`
 
-## Three-Tier Testing Model
+## Three-Tier Model
 
-### Tier 1 — Unit Tests
+### Tier 1 — Unit Tests (460+ tests)
 
-**Purpose:** Test pure logic in isolation  
-**Location:** Same file as the code, `#[cfg(test)]` module  
-**Runtime:** Fast (< 1ms per test)  
-**Dependencies:** None
+**Location:** Same file, `#[cfg(test)]` module
+**Runtime:** < 1ms each
+**Dependencies:** `tempfile::TempDir` for filesystem tests, no network
 
-```rust
-fn validate_account_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("name must not be empty".into());
-    }
-    if name.len() > 256 {
-        return Err("name exceeds 256 characters".into());
-    }
-    Ok(())
-}
+### Tier 2 — Integration Tests (10 tests)
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+**Location:** `csq-core/tests/daemon_integration.rs`
+**Runtime:** < 100ms each (real axum server on temp Unix socket)
+**Dependencies:** Real axum server, tokio multi-thread runtime
 
-    #[test]
-    fn validate_account_name_rejects_empty() {
-        assert!(validate_account_name("").is_err());
-    }
+### Tier 3 — Svelte Component Tests (future)
 
-    #[test]
-    fn validate_account_name_accepts_valid() {
-        assert!(validate_account_name("Work Account").is_ok());
-    }
-}
-```
+**Location:** `csq-desktop/` with vitest
+**Runtime:** Sub-second
+**Dependencies:** Testing Library for Svelte
 
-### Tier 2 — Integration Tests
+## csq-Specific Test Patterns
 
-**Purpose:** Test the full command path with real Tauri infrastructure  
-**Location:** `src-tauri/tests/`  
-**Runtime:** Medium (1-100ms per test)  
-**Dependencies:** Tauri test harness
+### 1. Injectable HTTP Transport (most important pattern)
+
+Every network-touching function takes a closure instead of calling HTTP directly. Tests inject mocks — no HTTP server needed.
 
 ```rust
-// src-tauri/tests/account_commands.rs
+// Production signature:
+pub type HttpGetFn = Arc<
+    dyn Fn(&str, &str, &[(&str, &str)]) -> Result<(u16, Vec<u8>), String>
+        + Send + Sync + 'static,
+>;
 
-#[tokio::test]
-async fn test_swap_account_command() {
-    let app = tauri::test::mock().await;
-    let window = app.get_webview_window("main").unwrap();
-
-    // Add a test account
-    let accounts = vec![Account {
-        id: "acc_1".into(),
-        name: "Test".into(),
-        quota: Quota::default(),
-    }];
-    app.state::<AppState>().accounts.lock().unwrap().replace(accounts);
-
-    // Invoke command
-    let result: Result<(), String> = invoke(&window, "swap_account", 0).await;
-    assert!(result.is_ok());
+// Test mock:
+fn mock_usage_success(counter: Arc<AtomicU32>) -> HttpGetFn {
+    Arc::new(move |_url, _token, _headers| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok((200, br#"{"five_hour":{"utilization":0.42}}"#.to_vec()))
+    })
 }
+
+// Usage in test:
+let counter = Arc::new(AtomicU32::new(0));
+let http = mock_usage_success(Arc::clone(&counter));
+tick(dir.path(), &http, &cooldowns, &backoffs).await;
+assert_eq!(counter.load(Ordering::SeqCst), 1);
 ```
 
-### Tier 3 — E2E Tests
+**Used by:** `refresh_token`, `validate_key`, `exchange_code`, `poll_anthropic_usage`, `poll_3p_usage`
 
-**Purpose:** Test the full app from user perspective  
-**Location:** `e2e/` (Playwright)  
-**Runtime:** Slow (seconds per test)  
-**Scope:** Full app including UI, IPC, backend
+### 2. TempDir Filesystem Tests
 
-```typescript
-// e2e/accounts.spec.ts
-import { test, expect } from "@playwright/test";
-import { invite } from "@tauri-apps/api/http";
-
-test("account switch updates quota display", async ({ page }) => {
-  await page.goto("/");
-  await page.click('[data-testid="account-0"]');
-
-  const quota = page.locator('[data-testid="quota-display"]');
-  await expect(quota).toBeVisible();
-
-  await page.click('[data-testid="account-1"]');
-  await expect(quota).toBeVisible();
-});
-```
-
-## Rust Testing Patterns
-
-### Async Testing with tokio
+Almost every test creates a `TempDir` and installs test fixtures (credential files, settings files, marker files) to test against a real filesystem:
 
 ```rust
-#[tokio::test]
-async fn test_oauth_refresh() {
-    let mut token = OAuthToken::mock();
-    let result = token.refresh("client_id").await;
-    assert!(result.is_ok());
+fn install_account(base: &Path, account: u16) {
+    let num = AccountNum::try_from(account).unwrap();
+    let creds = CredentialFile { /* test fixture */ };
+    credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
+}
+
+#[test]
+fn pick_best_lowest_usage() {
+    let dir = TempDir::new().unwrap();
+    install_account(dir.path(), 1);
+    install_account(dir.path(), 2);
+    setup_quota(dir.path(), 1, 80.0, 9999999999);
+    setup_quota(dir.path(), 2, 20.0, 9999999999);
+    assert_eq!(pick_best(dir.path(), None), Some(AccountNum::try_from(2).unwrap()));
 }
 ```
 
-### Testing with Mockall
+### 3. Leaky-Body Regression Tests
+
+Every module touching secrets has a test that feeds a known secret substring and asserts the error message does NOT contain it:
 
 ```rust
-// Define the trait
-trait QuotaClient: Send + Sync {
-    async fn get_quota(&self, account_id: &str) -> Result<Quota, QuotaError>;
-}
-
-// Create mock
-mockall::mock! {
-    pub Quota {
-        async fn get_quota(&self, account_id: &str) -> Result<Quota, QuotaError>;
-    }
-}
-
-#[tokio::test]
-async fn test_quota_display() {
-    let mut mock = MockQuota::new();
-    mock.expect_get_quota()
-        .returning(|_| Ok(Quota { used: 100, total: 1000 }));
-
-    let quota = mock.get_quota("acc_1").await.unwrap();
-    assert_eq!(quota.used, 100);
+#[test]
+fn refresh_token_transport_error_does_not_leak_token() {
+    let result = refresh_token(&creds, &path, |_, _| Err("connection failed".into()));
+    let err_msg = result.unwrap_err().to_string();
+    assert!(!err_msg.contains("sk-ant-ort01-SECRET"));
 }
 ```
 
-### Property-Based Testing with Proptest
+**Required for:** Any new code in `credentials/`, `oauth/`, `daemon/` that formats errors
+
+### 4. Golden-Value Parity Tests
+
+Cross-version compatibility tests compute values the same way v1.x Python does:
 
 ```rust
-proptest! {
-    #[test]
-    fn test_account_name_validation_roundtrip(name in "[a-zA-Z0-9_-]{1,100}") {
-        let result = validate_account_name(&name);
-        if name.is_empty() {
-            assert!(result.is_err());
-        } else {
-            assert!(result.is_ok());
-        }
-    }
+#[test]
+fn service_name_format() {
+    // Must produce same hash as Python's _keychain_service()
+    let svc = service_name(Path::new("/Users/test/.claude/accounts/config-1"));
+    assert!(svc.starts_with("Claude Code-credentials-"));
+    assert_eq!(svc.len(), "Claude Code-credentials-".len() + 8);
 }
 ```
 
-## Svelte Component Testing
+### 5. Daemon Integration Round-Trip
 
-### Unit Tests for Components
+Real axum server on a temp Unix socket, real `http_get_unix` / `http_post_unix` client:
 
-```typescript
-// components/AccountCard.test.ts
-import { render } from "@testing-library/svelte";
-import AccountCard from "./AccountCard.svelte";
+```rust
+async fn with_server<F, Fut>(base: &Path, f: F) where F: FnOnce(PathBuf) -> Fut {
+    let sock = base.join("csq-test.sock");
+    let (handle, join) = serve(&sock, make_router_state(base)).await.unwrap();
+    f(sock.clone()).await;
+    handle.shutdown();
+}
 
-test("shows account name", () => {
-  const { getByText } = render(AccountCard, {
-    props: { name: "Work Account", used: 50, total: 100 },
-  });
-  expect(getByText("Work Account")).toBeInTheDocument();
-});
-
-test("shows correct quota percentage", () => {
-  const { getByTestId } = render(AccountCard, {
-    props: { name: "Test", used: 75, total: 100 },
-  });
-  expect(getByTestId("quota-bar")).toHaveAttribute("style", "width: 75%");
-});
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_health_round_trip() {
+    let dir = TempDir::new().unwrap();
+    with_server(dir.path(), |sock| async move {
+        let resp = http_get_unix(&sock, "/api/health").unwrap();
+        assert_eq!(resp.status, 200);
+    }).await;
+}
 ```
 
-### Testing Stores
+## What NOT to Use
 
-```typescript
-import { accountStore } from "./stores/accounts.svelte";
-
-test("account store starts empty", () => {
-  expect(accountStore.accounts).toEqual([]);
-});
-
-test("set accounts updates store", async () => {
-  await accountStore.setAccounts([mockAccount]);
-  expect(accountStore.accounts).toHaveLength(1);
-});
-```
-
-## Test Coverage
-
-Run coverage to find untested paths:
-
-```bash
-cargo tarpaulin --out Html
-```
-
-Minimum coverage targets:
-
-- **Tier 1:** 80% line coverage for pure logic
-- **Tier 2:** All command handlers covered
-- **Tier 3:** Critical user paths (login, account switch, quota view)
+The codebase does NOT use mockall, proptest, or Playwright. Do not introduce these. The injectable-closure pattern provides full testability without mock frameworks.
 
 ## MUST Rules
 
-1. **Every command handler has a Tier 2 test** — test the IPC contract
-2. **Error paths have explicit tests** — do not assume errors are unreachable
-3. **Async tests use `#[tokio::test]`** — not `#[test]` with `.wait()`
-4. **Svelte tests use Testing Library** — not internal component APIs
-5. **No test sleeps** — use `waitFor` with assertions instead
+1. **Every new function that touches HTTP gets an injectable closure** — not a hardcoded client call
+2. **Every new function that touches secrets gets a leaky-body regression test**
+3. **Async tests use `#[tokio::test]`** with appropriate flavor
+4. **No test sleeps** — use assertions on state, not timing
+5. **TempDir for all filesystem tests** — never write to the real `~/.claude/`
 
-## Anti-Patterns
+## Reference
 
-```rust
-// BAD — test without assertions
-#[test]
-fn test_something() {
-    let result = do_work();
-    println!("{:?}", result); // no assertion
-}
-
-// BAD — shared mutable state between tests
-static mut COUNTER: i32 = 0;
-#[test]
-fn test_1() { unsafe { COUNTER += 1; } }
-#[test]
-fn test_2() { unsafe { COUNTER += 1; } } // runs concurrently, flaky
-
-// BAD — sleeps instead of proper waiting
-#[tokio::test]
-async fn test_quota_loads() {
-    fetch_quota().await;
-    tokio::time::sleep(Duration::from_secs(2)).await; // race condition
-}
-
-// GOOD — wait for the actual condition
-#[tokio::test]
-async fn test_quota_loads() {
-    let quota = fetch_quota().await;
-    assert_eq!(quota.used, 50);
-}
-```
+- `skills/daemon-architecture/` — transport injection table, subsystem overview
+- `skills/provider-integration/` — 3P test fixture format (dual top-level + env keys)

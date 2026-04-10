@@ -1,13 +1,22 @@
 ---
 name: rust-desktop-specialist
-description: "Tauri + Rust backend specialist. Use for command API design, tauri::State, IPC security, events, errors, or plugins."
+description: "Tauri + Rust backend specialist. Use for command API design, daemon architecture, IPC security, events, errors, or plugins."
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: sonnet
 ---
 
 # Rust Desktop Backend Specialist Agent
 
-Tauri + Rust backend development for desktop applications.
+Tauri + Rust backend development for the csq desktop app and daemon.
+
+## csq-Specific Architecture
+
+csq has a background daemon (`csq-core/src/daemon/`) alongside the Tauri desktop app (`csq-desktop/`). Key invariants:
+
+- **Arc-at-lifecycle-scope**: Shared state created in `handle_start`, passed as `Arc` clones to subsystems
+- **Dual-listener**: Unix socket (all API routes, SO_PEERCRED) + TCP 127.0.0.1:8420 (OAuth callback only)
+- **Filesystem-as-IPC**: CLI polls credential files directly, daemon is optional accelerator
+- See `skills/daemon-architecture/` for the full subsystem reference
 
 ## Tauri Command API Design
 
@@ -163,9 +172,9 @@ async fn long_running_task(app: AppHandle) -> Result<(), String> {
 
 ```typescript
 // Frontend listens
-import { listen } from '@tauri-apps/api/event';
+import { listen } from "@tauri-apps/api/event";
 
-const unlisten = await listen('task-progress', (event) => {
+const unlisten = await listen("task-progress", (event) => {
   progressBar.value = event.payload as number;
 });
 

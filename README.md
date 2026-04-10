@@ -205,12 +205,9 @@ python3 test-coc-bench.py default "Claude Opus 4.6" --runs 5
 python3 test-coc-bench.py mm "MiniMax M2.7" --runs 5
 python3 test-coc-bench.py zai "Z.AI GLM-5.1" --runs 5
 python3 test-coc-bench.py ollama "gemma4" --model-override gemma4:latest
-
-# Implementation eval — COC vs bare comparison
-python3 coc-eval/runner.py default "Claude Opus 4.6" --mode full
 ```
 
-Both harnesses use `coc-env/` as the reference environment. The harness resets between tests and captures file artifacts to verify what was actually written to disk.
+The harness uses `coc-env/` as the reference environment, resets between tests, and captures file artifacts to verify what was actually written to disk.
 
 ## Multi-account rotation (Claude Max)
 

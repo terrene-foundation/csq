@@ -169,24 +169,38 @@ The model catalog updates automatically — csq auto-updates from GitHub on ever
 
 ## Model benchmarks
 
-csq ships two benchmark harnesses for testing how well models work with [COC](https://github.com/terrene-foundation/kailash-coc-claude-py) (Cognitive Orchestration for Codegen) artifacts. For the full COC framework and what these benchmarks measure, see the [kailash-coc-claude-py benchmark results](https://github.com/terrene-foundation/kailash-coc-claude-py#benchmarks).
+csq routes Claude Code to any provider — but which models actually work well? We ship two benchmark harnesses that test model performance under real [COC](https://github.com/terrene-foundation/kailash-coc-claude-py) (Cognitive Orchestration for Codegen) workloads.
 
-### COC governance leaderboard (100 pts, 5-run averaged)
+### Which model should I use?
 
-| Model               | Cooperative (/50) | Adversarial (/50) | Total (/100) |
-| ------------------- | :---------------: | :---------------: | :----------: |
-| **Claude Opus 4.6** |       50.0        |       43.0        |   **93.0**   |
-| **Z.AI GLM-5.1**    |       49.0        |       36.8        |   **85.8**   |
-| **MiniMax M2.7**    |       49.6        |       21.0        |   **70.6**   |
-| **gemma4** (local)  |       45          |       10          |    **55**    |
-| **qwen3.5** (local) |       25          |       26          |    **51**    |
+| Model               | Provider | Runs  |   Speed   | Cooperative (/50) | Adversarial (/50) | Total (/100) |
+| ------------------- | -------- | ----- | :-------: | :---------------: | :---------------: | :----------: |
+| **Claude Opus 4.6** | default  | 5-run | 13s/task  |       50.0        |       43.0        |   **93.0**   |
+| **Z.AI GLM-5.1**    | zai      | 5-run | 46s/task  |       49.0        |       36.8        |   **85.8**   |
+| **MiniMax M2.7**    | mm       | 5-run | 14s/task  |       49.6        |       21.0        |   **70.6**   |
+| **gemma4**          | ollama   | 1-run | 165s/task |        45         |        10         |    **55**    |
+| **qwen3.5**         | ollama   | 1-run | 175s/task |        25         |        26         |    **51**    |
 
-All cloud models are 5-run averaged. Local models (Ollama) are single-run. Full per-test breakdowns and analysis at [kailash-coc-claude-py](https://github.com/terrene-foundation/kailash-coc-claude-py#benchmarks).
+**What this means for choosing a provider:**
 
-### Running benchmarks
+- **Claude Opus** is the clear leader — near-perfect rule adherence and the only model that consistently refuses adversarial prompts. Use this when quality matters.
+- **GLM-5.1** is the strongest non-Claude model (85.8). It knows every rule but is inconsistent under adversarial pressure (±2.3 variance on key tests). Good for cost-sensitive workloads where you can review outputs.
+- **MiniMax M2.7** is fast (14s/task, comparable to Claude) but weak on adversarial tests (21/50). It knows the rules and violates them when pushed. Use for speed when you're actively supervising.
+- **gemma4** (local, free) completes everything but rarely enforces rules under pressure. Good for experimentation and offline work.
+- **qwen3.5** (local, free) is too slow for practical use on most hardware (175s/task, 50% timeout rate).
+
+**The cooperative/adversarial split matters.** All models score 49-50/50 cooperative — they all read the rules. The real question is adversarial: will the model obey under pressure? That's where Claude (43/50) pulls ahead of GLM-5.1 (36.8) and MiniMax (21).
+
+### Benchmark details
+
+The 100-point governance benchmark tests 10 cooperative scenarios (does the model know the rules?) and 10 adversarial scenarios (does the model enforce them under social pressure?). Each test runs in an isolated environment with full COC artifacts loaded. Scored 0-5 per test with artifact verification — the harness checks what was actually written to disk, not just what the model claims.
+
+Cloud models are 5-run averaged for statistical reliability. Per-test breakdowns and the full COC framework are documented at [kailash-coc-claude-py](https://github.com/terrene-foundation/kailash-coc-claude-py#benchmarks).
+
+### Running benchmarks yourself
 
 ```bash
-# 100-point governance benchmark (rule obedience)
+# Benchmark any provider csq supports
 python3 test-coc-bench.py default "Claude Opus 4.6" --runs 5
 python3 test-coc-bench.py mm "MiniMax M2.7" --runs 5
 python3 test-coc-bench.py zai "Z.AI GLM-5.1" --runs 5
@@ -194,7 +208,6 @@ python3 test-coc-bench.py ollama "gemma4" --model-override gemma4:latest
 
 # Implementation eval — COC vs bare comparison
 python3 coc-eval/runner.py default "Claude Opus 4.6" --mode full
-python3 coc-eval/runner.py default "Claude Opus" --tests EVAL-A004
 ```
 
 Both harnesses use `coc-env/` as the reference environment. The harness resets between tests and captures file artifacts to verify what was actually written to disk.

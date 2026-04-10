@@ -750,6 +750,7 @@ cmd_update() {
   curl -sfL "$repo_url/statusline-quota.sh" -o "$accounts_dir/statusline-quota.sh" || die "Failed to download statusline-quota.sh"
   curl -sfL "$repo_url/3p-model-primer.md" -o "$accounts_dir/3p-model-primer.md" || die "Failed to download 3p-model-primer.md"
   curl -sfL "$repo_url/3p-model-primer-prepend.md" -o "$accounts_dir/3p-model-primer-prepend.md" || die "Failed to download 3p-model-primer-prepend.md"
+  curl -sfL "$repo_url/model-catalog.json" -o "$accounts_dir/model-catalog.json" || die "Failed to download model-catalog.json"
 
   # Replace csq last (we're running from it)
   mv "$tmp_csq" "$self_path"
@@ -804,6 +805,154 @@ cmd_rmkey() {
   echo "Removed profile: $profile_path"
 }
 
+cmd_models() {
+  local provider="${1:-}"
+  local new_model="${2:-}"
+  local catalog_path="$HOME/.claude/accounts/model-catalog.json"
+
+  CSQ_PROVIDER="$provider" CSQ_MODEL="$new_model" CSQ_CATALOG="$catalog_path" "$PY" -c "
+import json, os, sys, subprocess
+from pathlib import Path
+
+provider = os.environ.get('CSQ_PROVIDER', '')
+new_model = os.environ.get('CSQ_MODEL', '')
+catalog_path = Path(os.environ['CSQ_CATALOG'])
+home = Path.home() / '.claude'
+
+MODEL_KEYS = [
+    'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+]
+
+# Load catalog (from installed copy, or repo copy as fallback)
+catalog = {}
+if catalog_path.exists():
+    try: catalog = json.loads(catalog_path.read_text())
+    except (json.JSONDecodeError, OSError): pass
+
+def get_current_model(prov):
+    p = home / f'settings-{prov}.json'
+    if not p.exists() or p.stat().st_size == 0:
+        return None
+    try:
+        d = json.loads(p.read_text())
+        return d.get('env', {}).get('ANTHROPIC_MODEL')
+    except (json.JSONDecodeError, OSError):
+        return None
+
+def get_ollama_models():
+    try:
+        r = subprocess.run(['ollama', 'list'], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            lines = r.stdout.strip().split('\n')[1:]  # skip header
+            return [line.split()[0] for line in lines if line.strip()]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+# --- Mode 1: list all profiles ---
+if not provider:
+    profiles = sorted(home.glob('settings-*.json'))
+    if not profiles:
+        print('No provider profiles configured.')
+        print('Configure one with: csq setkey <provider> [key]')
+        sys.exit()
+    print(f\"{'Profile':<12} {'Model':<30} Status\")
+    print('-' * 60)
+    for p in profiles:
+        name = p.stem.replace('settings-', '')
+        if name == 'default':
+            continue
+        model = get_current_model(name)
+        if not model:
+            print(f'{name:<12} {\"(not configured)\":<30}')
+            continue
+        cat = catalog.get(name, {})
+        latest = cat.get('latest')
+        if latest and model == latest:
+            status = '(latest)'
+        elif latest and model != latest:
+            status = f'(update: {latest})'
+        else:
+            status = ''
+        print(f'{name:<12} {model:<30} {status}')
+    sys.exit()
+
+# --- Mode 2: show available models for provider ---
+if not new_model:
+    current = get_current_model(provider)
+    cat = catalog.get(provider, {})
+
+    if provider == 'ollama':
+        models = get_ollama_models()
+        if models is None:
+            print('Ollama not found in PATH. Install from https://ollama.com')
+            sys.exit(1)
+        if not models:
+            print('No models installed. Run: ollama pull qwen3:latest')
+            sys.exit()
+        print(f'Installed ollama models:')
+        for m in models:
+            marker = ' (active)' if m == current else ''
+            print(f'  {m}{marker}')
+    else:
+        models = cat.get('models', [])
+        latest = cat.get('latest')
+        if not models:
+            print(f'No model catalog for {provider}.')
+            if not catalog:
+                print('Run: csq update   (downloads the model catalog)')
+            sys.exit(1)
+        print(f'Available models for {provider}:')
+        for m in models:
+            tags = []
+            if m == latest: tags.append('latest')
+            if m == current: tags.append('active')
+            tag_str = f'  ({', '.join(tags)})' if tags else ''
+            print(f'  {m}{tag_str}')
+
+    print(f'\nSwitch with: csq models {provider} <model>')
+    sys.exit()
+
+# --- Mode 3: switch model ---
+profile_path = home / f'settings-{provider}.json'
+if not profile_path.exists() or profile_path.stat().st_size == 0:
+    print(f'No profile for {provider}. Run: csq setkey {provider}', file=sys.stderr)
+    sys.exit(1)
+
+cat = catalog.get(provider, {})
+known_models = cat.get('models', [])
+if provider == 'ollama':
+    known_models = get_ollama_models() or []
+if known_models and new_model not in known_models:
+    print(f'Unknown model: {new_model}', file=sys.stderr)
+    print(f'Available: {', '.join(known_models)}', file=sys.stderr)
+    sys.exit(1)
+
+try:
+    data = json.loads(profile_path.read_text())
+except json.JSONDecodeError:
+    print(f'{profile_path} is corrupted', file=sys.stderr)
+    sys.exit(1)
+
+env = data.setdefault('env', {})
+old_model = env.get('ANTHROPIC_MODEL', '(not set)')
+
+for k in MODEL_KEYS:
+    env[k] = new_model
+
+tmp = profile_path.with_suffix('.json.tmp')
+tmp.write_text(json.dumps(data, indent=2))
+if os.name != 'nt':
+    os.chmod(tmp, 0o600)
+os.replace(str(tmp), str(profile_path))
+
+print(f'  Model switched: {old_model} -> {new_model}')
+print(f'  Restart your csq terminal to use the new model.')
+" 2>&1
+}
+
 main() {
   # No args → default to `csq run` (which auto-resolves accounts).
   # First arg looks like a number or a flag → also treat as `csq run`.
@@ -855,6 +1004,10 @@ main() {
       shift
       cmd_rmkey "$@"
       ;;
+    models|model)
+      shift
+      cmd_models "$@"
+      ;;
     update|upgrade)
       cmd_update
       ;;
@@ -882,7 +1035,12 @@ Provider profiles (API key management):
 
   Then start CC with: csq run N -p <prov>
 
-  csq update                     Update csq to latest version from GitHub
+Model management:
+  csq models                     Show all profiles + current models
+  csq models <prov>              List available models for a provider
+  csq models <prov> <model>      Switch to a different model
+
+  csq update                     Update csq + model catalog from GitHub
   csq help                       This message
 
 When CC hits a rate limit, type inside CC:

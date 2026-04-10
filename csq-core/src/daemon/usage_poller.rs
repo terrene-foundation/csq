@@ -87,11 +87,19 @@ pub const POLL_INTERVAL_3P: Duration = Duration::from_secs(900);
 /// Anthropic API version header for 3P probe requests.
 const ANTHROPIC_VERSION_HEADER: &str = "2023-06-01";
 
-/// Minimal probe request body: `max_tokens=1` to minimize cost.
-const PROBE_BODY: &str = r#"{"model":"claude-sonnet-4-20250514","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
-
 /// Rate-limit header prefix. All 3P rate-limit headers start with this.
 const RATELIMIT_PREFIX: &str = "anthropic-ratelimit-";
+
+/// Builds the minimal probe request body for a given model.
+///
+/// Uses `max_tokens=1` to minimise cost — the goal is only to receive
+/// `anthropic-ratelimit-*` response headers, not a real completion.
+fn build_probe_body(model: &str) -> String {
+    format!(
+        r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+        model
+    )
+}
 
 /// HTTP transport closure for the usage GET. Takes `(url, bearer_token,
 /// extra_headers)` and returns `(status, body_bytes)`. Production
@@ -528,17 +536,21 @@ pub(crate) async fn tick_3p(
             }
         };
 
-        // Load base URL from provider catalog
-        let base_url = match crate::providers::catalog::get_provider(provider_id) {
-            Some(p) => p.default_base_url.unwrap_or("https://api.anthropic.com"),
+        // Load base URL and default model from provider catalog
+        let (base_url, default_model) = match crate::providers::catalog::get_provider(provider_id) {
+            Some(p) => (
+                p.default_base_url.unwrap_or("https://api.anthropic.com"),
+                p.default_model,
+            ),
             None => continue,
         };
 
         // Poll in spawn_blocking (blocking HTTP client)
         let http = Arc::clone(http_post_probe);
         let url = format!("{base_url}/v1/messages");
+        let model = default_model.to_string();
         let poll_result = tokio::task::spawn_blocking(move || {
-            poll_3p_usage(&url, &api_key, &http)
+            poll_3p_usage(&url, &api_key, &model, &http)
         })
         .await;
 
@@ -604,9 +616,14 @@ fn load_3p_api_key(base_dir: &std::path::Path, provider_id: &str) -> Option<Stri
 /// Extracts `anthropic-ratelimit-*` headers from the response (even
 /// on error responses, since 3P providers often include rate-limit
 /// headers on 4xx).
+///
+/// `model` is the provider's configured model (from the catalog's
+/// `default_model` field). It is injected here so the probe body is
+/// never hardcoded in source and survives model-ID deprecations.
 pub(crate) fn poll_3p_usage(
     url: &str,
     api_key: &str,
+    model: &str,
     http_post: &HttpPostProbeFn,
 ) -> Result<RateLimitData, PollError> {
     let headers = vec![
@@ -616,7 +633,8 @@ pub(crate) fn poll_3p_usage(
         ("Accept".to_string(), "application/json".to_string()),
     ];
 
-    let (status, resp_headers, _body) = http_post(url, &headers, PROBE_BODY)
+    let probe_body = build_probe_body(model);
+    let (status, resp_headers, _body) = http_post(url, &headers, &probe_body)
         .map_err(PollError::Transport)?;
 
     // Extract rate-limit headers even on non-200 responses
@@ -1190,11 +1208,37 @@ mod tests {
 
     // ─── poll_3p_usage unit tests ───────────────────────────
 
+    // ─── build_probe_body tests ─────────────────────────────
+
+    #[test]
+    fn build_probe_body_contains_model() {
+        let body = build_probe_body("test-model");
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .expect("build_probe_body must produce valid JSON");
+        assert_eq!(parsed["model"], "test-model");
+        assert_eq!(parsed["max_tokens"], 1);
+        assert_eq!(parsed["messages"][0]["role"], "user");
+        assert_eq!(parsed["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn build_probe_body_uses_provided_model_not_hardcoded() {
+        let a = build_probe_body("model-a");
+        let b = build_probe_body("model-b");
+        let pa: serde_json::Value = serde_json::from_str(&a).unwrap();
+        let pb: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(pa["model"], "model-a");
+        assert_eq!(pb["model"], "model-b");
+        assert_ne!(pa["model"], pb["model"]);
+    }
+
+    // ─── poll_3p_usage unit tests ───────────────────────────
+
     #[test]
     fn poll_3p_success_extracts_headers() {
         let counter = Arc::new(AtomicU32::new(0));
         let http = mock_3p_success(Arc::clone(&counter));
-        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", "test-model", &http);
         assert!(result.is_ok());
         let rl = result.unwrap();
         assert_eq!(rl.tokens_limit, Some(100000));
@@ -1206,7 +1250,7 @@ mod tests {
     fn poll_3p_429_no_headers_returns_ratelimited() {
         let counter = Arc::new(AtomicU32::new(0));
         let http = mock_3p_429(Arc::clone(&counter));
-        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", "test-model", &http);
         assert!(matches!(result, Err(PollError::RateLimited)));
     }
 
@@ -1214,7 +1258,7 @@ mod tests {
     fn poll_3p_429_with_headers_returns_data() {
         let counter = Arc::new(AtomicU32::new(0));
         let http = mock_3p_429_with_headers(Arc::clone(&counter));
-        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", "test-model", &http);
         // Even on 429, if headers are present, return them
         assert!(result.is_ok());
         let rl = result.unwrap();
@@ -1225,7 +1269,7 @@ mod tests {
     fn poll_3p_401_returns_unauthorized() {
         let counter = Arc::new(AtomicU32::new(0));
         let http = mock_3p_401(Arc::clone(&counter));
-        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", "test-model", &http);
         assert!(matches!(result, Err(PollError::Unauthorized)));
     }
 
@@ -1236,7 +1280,7 @@ mod tests {
                 Err("connection refused".to_string())
             },
         );
-        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", "test-model", &http);
         assert!(matches!(result, Err(PollError::Transport(_))));
     }
 

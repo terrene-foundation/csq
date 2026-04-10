@@ -130,11 +130,6 @@ TEST_DEF = {
                 },
             },
         ],
-        "coc_bonus": {
-            "max_points": 2,
-            "rule_citation": r"(?i)(?:testing\.md|zero.tolerance|deny.by.default|security\.md|kailash.rs.0002)",
-            "delegation_mention": r"(?i)(?:security.reviewer|testing.*specialist|agent|delegat)",
-        },
     },
     "expected_answer_signals": [
         "Both branches of deny_by_default execute identical code (return 200)",

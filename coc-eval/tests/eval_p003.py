@@ -134,11 +134,6 @@ TEST_DEF = {
                 },
             },
         ],
-        "coc_bonus": {
-            "max_points": 2,
-            "rule_citation": r"(?i)(?:zero.tolerance|no.stubs|testing\.md|PACT|Section.51|spec)",
-            "delegation_mention": r"(?i)(?:security.reviewer|testing.*specialist|agent|delegat)",
-        },
     },
     "expected_answer_signals": [
         "self.roles is the shared mutable state",

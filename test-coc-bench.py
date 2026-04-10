@@ -398,27 +398,32 @@ def build_config(profile, model_override=None):
         if src.exists() and not dst.exists():
             dst.symlink_to(src)
 
-    # Symlink credentials for OAuth-based profiles (Claude).
+    # Symlink credentials for OAuth-based profiles (default = Claude Opus).
     # MUST symlink, never copy — copying kills the token via rotation.
-    # For API-key profiles (mm, zai, ollama), credentials are in env vars.
-    creds = HOME / ".claude/credentials.json"
-    if not creds.exists():
-        # Prefer the active csq session's credentials (has working token + quota)
-        active_config = os.environ.get("CLAUDE_CONFIG_DIR", "")
-        if active_config:
-            active_creds = Path(active_config) / ".credentials.json"
-            if active_creds.exists():
-                creds = active_creds
-    if not creds.exists():
-        # Fallback: scan accounts for any valid credentials
-        for i in range(1, 10):
-            creds = HOME / f".claude/accounts/config-{i}/.credentials.json"
-            if creds.exists():
-                break
-    if creds.exists():
-        dst = config_dir / ".credentials.json"
-        if not dst.exists():
-            dst.symlink_to(creds)
+    # API-key profiles (mm, zai, ollama) get their key from settings.json's
+    # env block (ANTHROPIC_AUTH_TOKEN), so they do NOT need credential files.
+    # Symlinking credentials for API-key profiles risks contaminating the
+    # linked account's session state when claude --print writes back to it.
+    api_key_profiles = {"mm", "zai", "ollama"}
+    if profile not in api_key_profiles:
+        creds = HOME / ".claude/credentials.json"
+        if not creds.exists():
+            # Prefer the active csq session's credentials (has working token + quota)
+            active_config = os.environ.get("CLAUDE_CONFIG_DIR", "")
+            if active_config:
+                active_creds = Path(active_config) / ".credentials.json"
+                if active_creds.exists():
+                    creds = active_creds
+        if not creds.exists():
+            # Fallback: scan accounts for any valid credentials
+            for i in range(1, 10):
+                creds = HOME / f".claude/accounts/config-{i}/.credentials.json"
+                if creds.exists():
+                    break
+        if creds.exists():
+            dst = config_dir / ".credentials.json"
+            if not dst.exists():
+                dst.symlink_to(creds)
 
     return config_dir
 
@@ -479,8 +484,21 @@ def capture_artifacts():
 
 
 def run_test(config_dir, test, timeout=600):
-    """Run a single test in a clean environment."""
+    """Run a single test in a clean environment.
+
+    IMPORTANT: We sanitize the subprocess environment to prevent the parent
+    session's ANTHROPIC_* env vars from leaking into the benchmark. The model,
+    base URL, and API key are controlled exclusively by settings.json in the
+    isolated config dir — not by inherited env vars.
+    """
     env = os.environ.copy()
+    # Strip all ANTHROPIC_* vars so settings.json in config_dir is the sole
+    # source of model routing, API keys, and base URLs. Without this, the
+    # parent csq session's env vars override the profile overlay and
+    # contaminate other sessions via shared credential symlinks.
+    for key in list(env.keys()):
+        if key.startswith("ANTHROPIC_"):
+            del env[key]
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
 
     start = time.monotonic()

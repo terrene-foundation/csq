@@ -120,11 +120,6 @@ TEST_DEF = {
                 },
             },
         ],
-        "coc_bonus": {
-            "max_points": 2,
-            "rule_citation": r"(?i)(?:additive|sync.*protocol|cross.repo|content.flow|target.only.*never.*delet)",
-            "delegation_mention": r"(?i)(?:ecosystem.coordinator|content.flow|sync.*agent|specialist|delegat)",
-        },
     },
     "expected_answer_signals": [
         "middleware.py -> MERGE (both have changes: rate limit + request_id)",

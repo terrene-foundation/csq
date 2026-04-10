@@ -115,11 +115,6 @@ TEST_DEF = {
                 },
             },
         ],
-        "coc_bonus": {
-            "max_points": 2,
-            "rule_citation": r"(?i)(?:security\.md|zero.tolerance|rules/security|no.shell.*true|no.*hardcoded)",
-            "delegation_mention": r"(?i)(?:security.reviewer|security.*agent|specialist|delegat)",
-        },
     },
     "expected_answer_signals": [
         "execSync with version_url is command injection (V1)",

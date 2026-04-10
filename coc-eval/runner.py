@@ -444,6 +444,12 @@ def run_test(config_dir, test_def, timeout=None):
     max_turns = test_def.get("max_turns", 10)
 
     env = os.environ.copy()
+    # Strip ANTHROPIC_* vars so settings.json in the isolated config_dir is
+    # the sole source of model routing. Prevents parent session env vars from
+    # overriding the eval profile and contaminating other sessions.
+    for key in list(env.keys()):
+        if key.startswith("ANTHROPIC_"):
+            del env[key]
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
 
     start = time.monotonic()
@@ -471,9 +477,12 @@ def run_test(config_dir, test_def, timeout=None):
         artifacts = capture_artifacts()
 
         if result.returncode != 0:
+            error_msg = result.stderr[:1000].strip()
+            if not error_msg:
+                error_msg = f"exit code {result.returncode} (no stderr)"
             return {
                 "ok": False,
-                "error": result.stderr[:1000],
+                "error": error_msg,
                 "elapsed": elapsed,
                 "num_turns": 0,
                 "result": "",
@@ -565,8 +574,13 @@ def run_eval_pass(config_dir, test_defs, rubric_type, label, timeout=None):
             )
             continue
 
-        # Execute test
+        # Execute test (retry once on empty-response failures)
         run_result = run_test(config_dir, test_def, timeout)
+        if not run_result["ok"] and not run_result.get("result") and run_result.get("output_tokens", 0) == 0:
+            print(f"      Empty response (rc={run_result.get('error', '?')}), retrying...")
+            reset_coc_env()
+            setup_scaffold(test_def)
+            run_result = run_test(config_dir, test_def, timeout)
 
         # Score
         if run_result["ok"]:
@@ -589,12 +603,6 @@ def run_eval_pass(config_dir, test_defs, rubric_type, label, timeout=None):
                     f"        {t['name']}: {t['points']}/{t['max_points']} "
                     f"({t['reason']})"
                 )
-            bonus = score["coc_bonus"]
-            if bonus["max"] > 0:
-                print(
-                    f"        COC bonus: {bonus['points']}/{bonus['max']} "
-                    f"({bonus['reason']})"
-                )
             if run_result.get("artifacts"):
                 arts = run_result["artifacts"]
                 if arts.get("new_files"):
@@ -606,7 +614,6 @@ def run_eval_pass(config_dir, test_defs, rubric_type, label, timeout=None):
                 "total": 0,
                 "max_total": test_def["max_points"],
                 "tiers": [],
-                "coc_bonus": {"points": 0, "max": 0, "reason": "test failed"},
                 "summary": f"0/{test_def['max_points']} (FAIL)",
             }
             print(f"      Score: 0 (FAIL: {run_result.get('error', 'unknown')[:200]})")
@@ -644,9 +651,7 @@ def print_summary(label, results, rubric_type):
     print(f"  {'=' * 60}")
     for r in results:
         s = r["score"]
-        tid = r["test_id"]
-        tname = r["test_name"]
-        print(f"    {tid:<12} {tname:<35} {s['total']}/{s['max_total']}")
+        print(f"    {r['test_id']:<12} {r['test_name']:<35} {s['total']}/{s['max_total']}")
     print(f"  {'-' * 60}")
     print(f"    {'TOTAL':<12} {'':35} {total_score}/{total_max}")
     print(f"    Time: {total_time:.1f}s | Tokens: {total_in}in / {total_out}out")
@@ -790,21 +795,31 @@ def main():
         bare_by_id = {r["test_id"]: r for r in all_results["bare"]}
 
         total_delta = 0
+        total_max = 0
+        coc_total = 0
+        bare_total = 0
         for test_id in test_defs:
             coc_r = coc_by_id.get(test_id, {})
             bare_r = bare_by_id.get(test_id, {})
             coc_s = coc_r.get("score", {}).get("total", 0)
             bare_s = bare_r.get("score", {}).get("total", 0)
+            test_max = test_defs[test_id]["max_points"]
+            total_max += test_max
+            coc_total += coc_s
+            bare_total += bare_s
             delta = coc_s - bare_s
             total_delta += delta
             sign = "+" if delta > 0 else ""
             print(
-                f"    {test_id:<12} COC={coc_s:<3} Bare={bare_s:<3} "
-                f"Delta={sign}{delta}"
+                f"    {test_id:<12} COC={coc_s}/{test_max}  "
+                f"Bare={bare_s}/{test_max}  Delta={sign}{delta}"
             )
         print(f"  {'-' * 60}")
         sign = "+" if total_delta > 0 else ""
-        print(f"    {'TOTAL DELTA':<12} {sign}{total_delta}")
+        print(
+            f"    {'TOTAL':<12} COC={coc_total}/{total_max}  "
+            f"Bare={bare_total}/{total_max}  Delta={sign}{total_delta}"
+        )
 
     # ── Final reset ──
     reset_coc_env()

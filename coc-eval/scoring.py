@@ -72,33 +72,6 @@ def score_tier_item(tier, response, artifacts):
     return 0, max_pts, f"{name}: no match"
 
 
-def score_coc_bonus(coc_bonus_def, response):
-    """Score the COC awareness bonus.
-
-    Returns (points_awarded, max_points, reason_parts).
-    """
-    if not coc_bonus_def:
-        return 0, 0, "no COC bonus defined"
-
-    max_pts = coc_bonus_def.get("max_points", 2)
-    points = 0
-    reasons = []
-
-    rule_pat = coc_bonus_def.get("rule_citation", "")
-    if rule_pat and re.search(rule_pat, response):
-        points += 1
-        reasons.append("COC rule citation found")
-
-    delegation_pat = coc_bonus_def.get("delegation_mention", "")
-    if delegation_pat and re.search(delegation_pat, response):
-        points += 1
-        reasons.append("specialist delegation mentioned")
-
-    if not reasons:
-        reasons.append("no COC awareness signals")
-
-    return min(points, max_pts), max_pts, "; ".join(reasons)
-
 
 def score_test(test_def, response, artifacts, rubric_type="coc"):
     """Score a complete test response.
@@ -107,30 +80,23 @@ def score_test(test_def, response, artifacts, rubric_type="coc"):
         test_def: Test definition dict with scoring criteria.
         response: Model response text.
         artifacts: Dict with git_diff, git_diff_stat, new_files keys.
-        rubric_type: "coc" or "bare" (bare gets no COC bonus).
+        rubric_type: "coc" or "bare" — no scoring difference.
 
     Returns:
         Dict with:
             total: int (total points awarded)
             max_total: int (maximum possible points)
             tiers: list of tier score dicts
-            coc_bonus: bonus score dict
             summary: str
     """
     if not response:
         scoring = test_def.get("scoring", {})
         tiers = scoring.get("tiers", [])
-        max_total = sum(t["points"] for t in tiers)
-        coc_max = (
-            scoring.get("coc_bonus", {}).get("max_points", 0)
-            if rubric_type == "coc"
-            else 0
-        )
+        base_max = sum(t["points"] for t in tiers)
         return {
             "total": 0,
-            "max_total": max_total + coc_max,
+            "max_total": base_max,
             "tiers": [],
-            "coc_bonus": {"points": 0, "max": coc_max, "reason": "no response"},
             "summary": "0 points (no response)",
         }
 
@@ -163,27 +129,11 @@ def score_test(test_def, response, artifacts, rubric_type="coc"):
         tier_total += pts
         tier_max += max_pts
 
-    # COC bonus (only for COC rubric, not bare)
-    coc_bonus_result = {"points": 0, "max": 0, "reason": "bare rubric (no bonus)"}
-    if rubric_type == "coc":
-        coc_pts, coc_max, coc_reason = score_coc_bonus(
-            scoring.get("coc_bonus"), response
-        )
-        coc_bonus_result = {
-            "points": coc_pts,
-            "max": coc_max,
-            "reason": coc_reason,
-        }
-
-    total = tier_total + coc_bonus_result["points"]
-    max_total = tier_max + coc_bonus_result["max"]
-
     return {
-        "total": total,
-        "max_total": max_total,
+        "total": tier_total,
+        "max_total": tier_max,
         "tiers": tier_results,
-        "coc_bonus": coc_bonus_result,
-        "summary": f"{total}/{max_total} points",
+        "summary": f"{tier_total}/{tier_max} points",
     }
 
 

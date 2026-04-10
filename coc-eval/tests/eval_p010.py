@@ -103,11 +103,6 @@ TEST_DEF = {
                 },
             },
         ],
-        "coc_bonus": {
-            "max_points": 2,
-            "rule_citation": r"(?i)(?:security\.md|constant.time|fail.closed|security.*rule|atomic)",
-            "delegation_mention": r"(?i)(?:security.reviewer|security.*agent|specialist|delegat)",
-        },
     },
     "expected_answer_signals": [
         "APIKeyValidator.validate_key uses == on hash strings (timing leak)",

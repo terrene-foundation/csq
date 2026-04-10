@@ -195,6 +195,16 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         shutdown.clone(),
                     );
 
+                    // Start the background auto-rotation loop. Scans
+                    // config-* directories every 30 seconds and swaps
+                    // accounts when 5-hour quota exceeds the configured
+                    // threshold. Disabled by default; enable via
+                    // {base_dir}/rotation.json.
+                    let auto_rotator = daemon::spawn_auto_rotate(
+                        base_dir_for_runtime.clone(),
+                        shutdown.clone(),
+                    );
+
                     // Block until SIGTERM/SIGINT arrives.
                     wait_for_shutdown().await;
 
@@ -229,6 +239,18 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         Ok(Ok(())) => tracing::info!("usage poller stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "usage poller task panicked"),
                         Err(_) => tracing::warn!("usage poller did not stop within 5s deadline"),
+                    }
+
+                    // Await the auto-rotation loop with a 5s deadline.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        auto_rotator.join,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => tracing::info!("auto-rotation loop stopped cleanly"),
+                        Ok(Err(e)) => tracing::warn!(error = %e, "auto-rotation task panicked"),
+                        Err(_) => tracing::warn!("auto-rotation did not stop within 5s deadline"),
                     }
 
                     // Give the accept loop up to 5s to exit.

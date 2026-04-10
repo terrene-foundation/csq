@@ -20,6 +20,8 @@
 //! full task breakdown.
 
 pub mod cache;
+#[cfg(unix)]
+pub mod client;
 pub mod detect;
 pub mod lifecycle;
 #[cfg(unix)]
@@ -38,6 +40,10 @@ pub use paths::{pid_file_path, socket_path};
 pub use pid::PidFile;
 pub use refresher::{spawn as spawn_refresher, HttpPostFn, RefreshStatus, RefresherHandle};
 
+#[cfg(unix)]
+pub use client::{
+    http_get_unix, http_get_unix_with_timeout, DaemonClientError, DaemonResponse, DEFAULT_TIMEOUT,
+};
 #[cfg(unix)]
 pub use oauth_callback::{serve as serve_oauth_callback, CallbackHandle, CallbackState};
 #[cfg(unix)]

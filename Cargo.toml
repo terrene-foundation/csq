@@ -20,3 +20,5 @@ hex = "0.4"
 sha2 = "0.10"
 unicode-normalization = "0.1"
 secrecy = { version = "0.10", features = ["serde"] }
+libc = "0.2"
+tempfile = "3"

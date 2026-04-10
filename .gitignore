@@ -6,6 +6,18 @@ credentials/
 .DS_Store
 **/.DS_Store
 
+# Credential and session state files (security: never commit)
+config-*/
+.credentials.json
+.csq-account
+.current-account
+.live-pid
+.quota-cursor
+
+# Rust build artifacts
+target/
+Cargo.lock
+
 # Local-only research and notes folders
 notes/
 research/

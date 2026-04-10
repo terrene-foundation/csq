@@ -82,6 +82,17 @@ pub struct RouterState {
     /// Refresh-status cache owned by the daemon lifecycle. The
     /// refresher writes; HTTP routes only read.
     pub cache: Arc<TtlCache<u16, RefreshStatus>>,
+    /// Short-TTL cache of the full discovered account list. Used
+    /// by `/api/accounts` and `/api/refresh-status` to avoid a
+    /// full filesystem scan on every request. Bounded to
+    /// [`DISCOVERY_CACHE_MAX_AGE`]. Single-entry — the key is
+    /// `()` because discovery is per-base-dir and the base dir
+    /// is constant for the life of the daemon.
+    ///
+    /// Addresses M8.5 security review MED #1 (full fs scan per
+    /// request is a DoS vector once the statusline starts
+    /// polling on a tight interval).
+    pub discovery_cache: Arc<TtlCache<(), Vec<AccountInfo>>>,
     /// csq base directory, passed through for account discovery.
     pub base_dir: Arc<PathBuf>,
     /// OAuth state store, shared with the callback listener
@@ -96,6 +107,29 @@ pub struct RouterState {
     /// Zero when `oauth_store` is `None`.
     pub oauth_port: u16,
 }
+
+/// Maximum staleness for the discovery cache: 5 seconds.
+///
+/// Chosen so that:
+///
+/// 1. A statusline polling every 1–2 seconds pays the fs-scan
+///    cost at most once per 5s window, not on every render.
+/// 2. A new account added via OAuth callback becomes visible to
+///    the rest of the API within 5s without any explicit
+///    invalidation wiring.
+/// 3. Stale reads are bounded — no user-visible "ghost account"
+///    lingers beyond the TTL even if the underlying credentials
+///    file is deleted out of band.
+///
+/// Dogpile race: two concurrent handlers may both miss the cache
+/// and both run discovery. This is acceptable at 5s TTL because
+/// the cost is exactly one extra fs scan per race, and the
+/// filesystem scan at realistic account counts (<= 100) is a
+/// few milliseconds. Adding single-flight coordination would
+/// require holding an async lock across spawn_blocking, which
+/// is strictly worse than the bounded dogpile.
+pub const DISCOVERY_CACHE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Maximum request body size accepted by the daemon HTTP router.
 /// M8.3 has no body-accepting routes, but the limit is set now so
@@ -145,27 +179,62 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
+/// Runs account discovery, hitting [`RouterState::discovery_cache`]
+/// first and only falling through to a real filesystem scan on
+/// cache miss or expiry.
+///
+/// Returns an empty `Vec` if the underlying spawn_blocking task
+/// panics — the error is logged with a fixed tag (no `%e` per
+/// RISK-0007) and the handler continues to serve an empty list
+/// rather than surfacing a 500. This matches the behavior of
+/// `refresh_status_all_handler` before the cache was added.
+async fn cached_discovery(
+    base_dir: Arc<PathBuf>,
+    cache: Arc<TtlCache<(), Vec<AccountInfo>>>,
+) -> Vec<AccountInfo> {
+    // Fast path: the cached entry is live.
+    if let Some(cached) = cache.get(&()) {
+        return cached;
+    }
+
+    // Cold path: run discovery on a blocking worker. Concurrent
+    // callers may both land here (bounded dogpile); see
+    // DISCOVERY_CACHE_MAX_AGE docstring.
+    let base_for_task = Arc::clone(&base_dir);
+    let accounts =
+        match tokio::task::spawn_blocking(move || discovery::discover_anthropic(&base_for_task))
+            .await
+        {
+            Ok(a) => a,
+            Err(_join_err) => {
+                // JoinError may include a panic payload — do NOT
+                // format it with `%` per RISK-0007. Log only the
+                // fixed tag.
+                tracing::warn!(
+                    error_kind = "discovery_task_panic",
+                    "accounts discovery task panicked"
+                );
+                Vec::new()
+            }
+        };
+
+    cache.set((), accounts.clone());
+    accounts
+}
+
 /// GET /api/accounts — returns the full discovered account list.
 ///
-/// Runs `discovery::discover_anthropic` inside `spawn_blocking`
-/// because the discovery code does synchronous file IO. The full
-/// list is serialized directly; for realistic account counts
-/// (<=100) the response size is well under the 1 MiB body cap.
-async fn accounts_handler(
-    State(state): State<RouterState>,
-) -> Result<Json<AccountsResponse>, (StatusCode, String)> {
-    let base_dir = Arc::clone(&state.base_dir);
-    let accounts = tokio::task::spawn_blocking(move || discovery::discover_anthropic(&base_dir))
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "accounts discovery task panicked");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "discovery task failed".to_string(),
-            )
-        })?;
-
-    Ok(Json(AccountsResponse { accounts }))
+/// Reads from [`RouterState::discovery_cache`] when warm; runs
+/// `discovery::discover_anthropic` inside `spawn_blocking` on
+/// cache miss. For realistic account counts (<= 100) the response
+/// size is well under the 1 MiB body cap.
+async fn accounts_handler(State(state): State<RouterState>) -> Json<AccountsResponse> {
+    let accounts = cached_discovery(
+        Arc::clone(&state.base_dir),
+        Arc::clone(&state.discovery_cache),
+    )
+    .await;
+    Json(AccountsResponse { accounts })
 }
 
 /// GET /api/refresh-status — returns every currently-cached
@@ -173,21 +242,22 @@ async fn accounts_handler(
 async fn refresh_status_all_handler(
     State(state): State<RouterState>,
 ) -> Json<RefreshStatusListResponse> {
-    // Walk known account IDs via discovery and look up each in the
-    // cache. We do NOT expose the cache's internal HashMap directly
+    // Walk known account IDs via the short-TTL discovery cache
+    // and look up each in the refresh-status cache. We do NOT
+    // expose the refresh-status cache's internal HashMap directly
     // because that couples the IPC schema to the cache's internal
-    // layout. A linear lookup over discovered accounts is fine for
-    // the realistic account count.
-    let base_dir = Arc::clone(&state.base_dir);
-    let accounts_future =
-        tokio::task::spawn_blocking(move || discovery::discover_anthropic(&base_dir));
+    // layout. A linear lookup over discovered accounts is fine
+    // for the realistic account count.
+    let accounts = cached_discovery(
+        Arc::clone(&state.base_dir),
+        Arc::clone(&state.discovery_cache),
+    )
+    .await;
 
     let mut entries = Vec::new();
-    if let Ok(accounts) = accounts_future.await {
-        for info in accounts {
-            if let Some(status) = state.cache.get(&info.id) {
-                entries.push(status);
-            }
+    for info in accounts {
+        if let Some(status) = state.cache.get(&info.id) {
+            entries.push(status);
         }
     }
 
@@ -614,14 +684,18 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Builds a minimal RouterState for tests. Cache starts empty;
-    /// base_dir points at the provided temp directory. The OAuth
-    /// store is present so the `/api/login/{id}` tests exercise
-    /// the success path; individual tests that want to exercise
-    /// the 503 path pass `oauth_store: None` via `test_state_no_oauth`.
+    /// Builds a minimal RouterState for tests. Both caches start
+    /// empty; base_dir points at the provided temp directory. The
+    /// OAuth store is present so the `/api/login/{id}` tests
+    /// exercise the success path; individual tests that want to
+    /// exercise the 503 path pass `oauth_store: None` via
+    /// `test_state_no_oauth`. The discovery cache uses the
+    /// production 5-second TTL — tests that need a shorter TTL
+    /// use `test_state_with_discovery_ttl`.
     fn test_state(base: &Path) -> RouterState {
         RouterState {
             cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             oauth_port: DEFAULT_REDIRECT_PORT,
@@ -633,9 +707,26 @@ mod tests {
     fn test_state_no_oauth(base: &Path) -> RouterState {
         RouterState {
             cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: None,
             oauth_port: 0,
+        }
+    }
+
+    /// Builds a RouterState with an explicit discovery-cache TTL.
+    /// Used by tests that verify expiry behavior without waiting
+    /// the full 5 seconds.
+    fn test_state_with_discovery_ttl(
+        base: &Path,
+        discovery_ttl: std::time::Duration,
+    ) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(discovery_ttl)),
+            base_dir: Arc::new(base.to_path_buf()),
+            oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            oauth_port: DEFAULT_REDIRECT_PORT,
         }
     }
 
@@ -1017,6 +1108,172 @@ mod tests {
         let (status, body) = http_get(&sock, "/api/login/1").await;
         assert!(status.contains("503"), "status: {status}");
         assert!(body.contains("oauth callback listener is not available"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_handler_uses_discovery_cache() {
+        // Verify the second GET /api/accounts hits the cache
+        // rather than doing a fresh filesystem scan. We do this
+        // by deleting the credentials file between calls — if
+        // discovery were re-running, the second call would see
+        // an empty list, but the cache should still return the
+        // pre-deletion state until the TTL elapses.
+        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        };
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // First call: runs discovery, finds account 1, caches.
+        let (status1, body1) = http_get(&sock, "/api/accounts").await;
+        assert!(status1.contains("200"), "status1: {status1}");
+        assert!(body1.contains(r#""id":1"#), "body1: {body1}");
+
+        // Delete the credentials file. Discovery would now return
+        // an empty list — but the cache should still serve the
+        // pre-deletion entry.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        // Second call: must hit the cache.
+        let (status2, body2) = http_get(&sock, "/api/accounts").await;
+        assert!(status2.contains("200"), "status2: {status2}");
+        assert!(
+            body2.contains(r#""id":1"#),
+            "second call must serve cached list, got: {body2}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_handler_cache_expires_after_ttl() {
+        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        };
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        // Very short TTL so the test doesn't wait 5 seconds.
+        let sock = dir.path().join("csq-test.sock");
+        let state =
+            test_state_with_discovery_ttl(dir.path(), std::time::Duration::from_millis(50));
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Populate the cache.
+        let (status1, _) = http_get(&sock, "/api/accounts").await;
+        assert!(status1.contains("200"));
+
+        // Delete the file so a fresh discovery would return empty.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        // Wait past the TTL.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Third call: cache expired → fresh discovery → empty list.
+        let (status3, body3) = http_get(&sock, "/api/accounts").await;
+        assert!(status3.contains("200"), "status3: {status3}");
+        assert!(
+            body3.contains(r#""accounts":[]"#),
+            "expired cache should fall through to fresh discovery, got: {body3}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_all_uses_cached_discovery() {
+        // Verify refresh_status_all_handler also uses the discovery
+        // cache — not just accounts_handler. Two calls in a row
+        // must hit the cache on the second even if the underlying
+        // filesystem changed.
+        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::daemon::refresher::RefreshStatus;
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        };
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        // Pre-populate the refresh-status cache so the aggregated
+        // response has something to return.
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "valid".to_string(),
+                expires_at_ms: 9_999_999_999_999,
+                checked_at_secs: 0,
+            },
+        );
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status1, body1) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status1.contains("200"), "status1: {status1}");
+        assert!(body1.contains(r#""account":1"#), "body1: {body1}");
+
+        // Delete the credential file — discovery on a miss would
+        // return empty, which would produce an empty statuses
+        // list. The cache must prevent that.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        let (status2, body2) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status2.contains("200"), "status2: {status2}");
+        assert!(
+            body2.contains(r#""account":1"#),
+            "refresh-status must serve cached discovery, got: {body2}"
+        );
 
         handle.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;

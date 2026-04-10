@@ -280,6 +280,9 @@ mod tests {
 
         let state = crate::daemon::server::RouterState {
             cache: std::sync::Arc::new(crate::daemon::TtlCache::with_default_age()),
+            discovery_cache: std::sync::Arc::new(crate::daemon::TtlCache::new(
+                crate::daemon::server::DISCOVERY_CACHE_MAX_AGE,
+            )),
             base_dir: std::sync::Arc::new(dir.path().to_path_buf()),
             oauth_store: None,
             oauth_port: 0,

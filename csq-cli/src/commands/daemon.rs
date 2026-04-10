@@ -73,6 +73,17 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
             let refresh_cache: Arc<daemon::TtlCache<u16, daemon::RefreshStatus>> =
                 Arc::new(daemon::TtlCache::with_default_age());
 
+            // Short-TTL discovery cache shared between the
+            // `/api/accounts` and `/api/refresh-status` routes.
+            // Bounds the filesystem scan rate so a statusline
+            // polling on a tight interval cannot DoS the daemon
+            // (M8.5 security review MED #1).
+            let discovery_cache: Arc<
+                daemon::TtlCache<(), Vec<csq_core::accounts::AccountInfo>>,
+            > = Arc::new(daemon::TtlCache::new(
+                daemon::server::DISCOVERY_CACHE_MAX_AGE,
+            ));
+
             // Create the shared OAuth state store. The /api/login/{N}
             // handler on the Unix socket writes to it, the
             // /oauth/callback handler on the TCP listener reads
@@ -135,10 +146,12 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     }
                 };
 
-            // Router state: cache + base_dir + OAuth handles.
-            // Arc'd so per-request State clones stay cheap.
+            // Router state: refresh cache + discovery cache +
+            // base_dir + OAuth handles. Arc'd so per-request
+            // State clones stay cheap.
             let router_state = daemon::server::RouterState {
                 cache: Arc::clone(&refresh_cache),
+                discovery_cache: Arc::clone(&discovery_cache),
                 base_dir: Arc::new(base_dir_for_runtime.clone()),
                 oauth_store: oauth_store_for_state,
                 oauth_port,

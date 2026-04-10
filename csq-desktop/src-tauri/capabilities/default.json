@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Main window capabilities",
   "windows": ["main"],
-  "permissions": ["core:default", "log:default", "core:tray:default"]
+  "permissions": [
+    "core:default",
+    "log:default",
+    "core:tray:default",
+    "updater:default"
+  ]
 }

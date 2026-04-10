@@ -24,6 +24,12 @@ pub fn run() {
                 )?;
             }
 
+            // ── Auto-updater ─────────────────────────────────
+            // Registers the updater plugin. Actual update checks require
+            // a signed update manifest at the configured endpoint.
+            // Signing keys and update server are configured in M11.
+            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+
             // ── System tray ──────────────────────────────────
             let open_dashboard = MenuItemBuilder::with_id("open", "Open Dashboard")
                 .build(app)?;

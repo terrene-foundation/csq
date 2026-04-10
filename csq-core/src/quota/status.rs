@@ -2,7 +2,7 @@
 
 use super::format::{account_label, fmt_time};
 use super::state;
-use crate::accounts::discovery;
+use crate::accounts::{discovery, AccountInfo};
 use crate::types::AccountNum;
 use std::path::Path;
 
@@ -62,8 +62,33 @@ impl AccountStatus {
 }
 
 /// Returns the status of all discovered accounts.
+///
+/// Convenience wrapper for the direct (non-daemon) path: runs
+/// [`discovery::discover_anthropic`] and hands the result to
+/// [`compose_status`]. The daemon-delegated path calls
+/// [`compose_status`] directly with accounts parsed from
+/// `/api/accounts`.
 pub fn show_status(base_dir: &Path, active: Option<AccountNum>) -> Vec<AccountStatus> {
     let accounts = discovery::discover_anthropic(base_dir);
+    compose_status(base_dir, accounts, active)
+}
+
+/// Composes status entries from a pre-discovered account list.
+///
+/// Joins the account list with the local quota file and produces
+/// the filtered, sorted [`AccountStatus`] entries the CLI displays.
+/// The quota file is a local read in both paths — the daemon does
+/// not currently expose quota over HTTP.
+///
+/// Used by both the direct path (via [`show_status`]) and the
+/// daemon-delegated path (`csq status` after parsing
+/// `/api/accounts`), so the two paths are guaranteed to produce
+/// identical output for the same `(accounts, quota)` pair.
+pub fn compose_status(
+    base_dir: &Path,
+    accounts: Vec<AccountInfo>,
+    active: Option<AccountNum>,
+) -> Vec<AccountStatus> {
     let quota = state::load_state(base_dir).unwrap_or_else(|_| super::QuotaFile::empty());
 
     let now_secs = std::time::SystemTime::now()
@@ -213,5 +238,84 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let status = show_status(dir.path(), None);
         assert!(status.is_empty());
+    }
+
+    /// `compose_status` is the composition step used by both the
+    /// direct path (via [`show_status`]) and the daemon-delegated
+    /// path (via `csq status` after parsing `/api/accounts`).
+    /// This test feeds it a synthetic account list mirroring the
+    /// shape the daemon route returns — validating that the CLI's
+    /// daemon path produces identical output to the direct path
+    /// for the same `(accounts, quota)` pair.
+    #[test]
+    fn compose_status_with_daemon_shaped_accounts() {
+        use crate::accounts::AccountSource;
+        let dir = TempDir::new().unwrap();
+        // Populate quota file + credentials so compose_status has
+        // something to join against.
+        setup(dir.path(), 1, 20.0);
+        setup(dir.path(), 2, 85.0);
+
+        // Synthetic AccountInfo list as if returned from
+        // `GET /api/accounts`. Label is already resolved (daemon
+        // hits profiles.json server-side), has_credentials=true.
+        let accounts = vec![
+            AccountInfo {
+                id: 1,
+                label: "alice@example.com".into(),
+                source: AccountSource::Anthropic,
+                method: "oauth".into(),
+                has_credentials: true,
+            },
+            AccountInfo {
+                id: 2,
+                label: "bob@example.com".into(),
+                source: AccountSource::Anthropic,
+                method: "oauth".into(),
+                has_credentials: true,
+            },
+        ];
+
+        let active = AccountNum::try_from(2u16).unwrap();
+        let status = compose_status(dir.path(), accounts, Some(active));
+
+        assert_eq!(status.len(), 2);
+        let first = status.iter().find(|s| s.id == 1).unwrap();
+        assert_eq!(first.label, "alice@example.com");
+        assert!(!first.is_active);
+        let second = status.iter().find(|s| s.id == 2).unwrap();
+        assert_eq!(second.label, "bob@example.com");
+        assert!(second.is_active);
+    }
+
+    /// `compose_status` must filter out accounts with
+    /// `has_credentials == false` — these are placeholders the
+    /// daemon may list (e.g., after a failed credential parse).
+    #[test]
+    fn compose_status_filters_accounts_without_credentials() {
+        use crate::accounts::AccountSource;
+        let dir = TempDir::new().unwrap();
+        setup(dir.path(), 1, 20.0);
+
+        let accounts = vec![
+            AccountInfo {
+                id: 1,
+                label: "real@example.com".into(),
+                source: AccountSource::Anthropic,
+                method: "oauth".into(),
+                has_credentials: true,
+            },
+            AccountInfo {
+                id: 7,
+                label: "broken@example.com".into(),
+                source: AccountSource::Anthropic,
+                method: "oauth".into(),
+                has_credentials: false,
+            },
+        ];
+
+        let status = compose_status(dir.path(), accounts, None);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].id, 1);
     }
 }

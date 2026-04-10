@@ -1,4 +1,5 @@
 use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 /// Maximum number of accounts supported.
@@ -88,6 +89,19 @@ impl fmt::Display for AccessToken {
     }
 }
 
+impl Serialize for AccessToken {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.expose_secret())
+    }
+}
+
+impl<'de> Deserialize<'de> for AccessToken {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(AccessToken::new(s))
+    }
+}
+
 /// OAuth refresh token with masked Display and zeroize-on-drop.
 pub struct RefreshToken(SecretString);
 
@@ -121,6 +135,19 @@ impl fmt::Display for RefreshToken {
         } else {
             write!(f, "****")
         }
+    }
+}
+
+impl Serialize for RefreshToken {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.expose_secret())
+    }
+}
+
+impl<'de> Deserialize<'de> for RefreshToken {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(RefreshToken::new(s))
     }
 }
 

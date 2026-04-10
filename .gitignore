@@ -1,7 +1,7 @@
 .env
 __pycache__/
 *.pyc
-credentials/
+/credentials/
 .account.*
 .DS_Store
 **/.DS_Store

@@ -46,6 +46,43 @@ _detect_platform() {
 }
 PLATFORM="$(_detect_platform)"
 
+# Auto-update: check remote version and update silently in the background.
+# Runs on every `csq run`. If no internet, silently skips (3s timeout).
+# Safe to run in background — bash has already read this script into memory,
+# and replaced files (engine, statusline, primers, catalog) are read at
+# startup, not mid-session.
+_auto_update_bg() {
+  local repo_url="https://raw.githubusercontent.com/terrene-foundation/claude-squad/main"
+  local accounts_dir="$HOME/.claude/accounts"
+  local self_path
+  self_path="$(command -v csq 2>/dev/null || echo "")"
+  [[ -n "$self_path" ]] || return
+
+  # Download remote csq with short timeout
+  local tmp_csq
+  tmp_csq=$(mktemp 2>/dev/null) || return
+  if ! curl -sfL -m 3 "$repo_url/csq" -o "$tmp_csq" 2>/dev/null; then
+    rm -f "$tmp_csq"
+    return
+  fi
+
+  # No change → done
+  if cmp -s "$tmp_csq" "$self_path" 2>/dev/null; then
+    rm -f "$tmp_csq"
+    return
+  fi
+
+  # Update all files (best-effort, don't fail on any single file)
+  curl -sfL -m 5 "$repo_url/rotation-engine.py" -o "$accounts_dir/rotation-engine.py" 2>/dev/null
+  curl -sfL -m 5 "$repo_url/statusline-quota.sh" -o "$accounts_dir/statusline-quota.sh" 2>/dev/null
+  curl -sfL -m 5 "$repo_url/3p-model-primer.md" -o "$accounts_dir/3p-model-primer.md" 2>/dev/null
+  curl -sfL -m 5 "$repo_url/3p-model-primer-prepend.md" -o "$accounts_dir/3p-model-primer-prepend.md" 2>/dev/null
+  curl -sfL -m 5 "$repo_url/model-catalog.json" -o "$accounts_dir/model-catalog.json" 2>/dev/null
+
+  mv "$tmp_csq" "$self_path" 2>/dev/null
+  chmod +x "$self_path" "$accounts_dir/rotation-engine.py" "$accounts_dir/statusline-quota.sh" 2>/dev/null
+}
+
 cmd_login() {
   local n="$1"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "account must be a positive integer, got: $n"
@@ -158,6 +195,9 @@ with open(f, 'w') as fh:
 }
 
 cmd_run() {
+  # Auto-update in background (non-blocking, silent, offline-safe)
+  _auto_update_bg &>/dev/null &
+
   # Parse args: optional <N>, optional -p <profile>, rest pass through to claude.
   # If <N> is omitted, auto-resolve based on number of configured accounts.
   local n=""

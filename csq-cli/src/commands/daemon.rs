@@ -1,19 +1,15 @@
 //! `csq daemon start/stop/status` — background daemon lifecycle.
 //!
-//! # M8.2 scope
+//! # M8.3 scope
 //!
-//! This slice implements the foreground-only daemon lifecycle. The
-//! daemon runs in the current terminal, writes its PID file, installs
-//! SIGTERM/SIGINT handlers, and blocks until a shutdown signal
-//! arrives. There is no background/detached mode yet — that will
-//! arrive in M8.6 when the daemon is hosted inside the Tauri tray
-//! app (see the roadmap in `workspaces/csq-v2/todos/active/`).
+//! The daemon now runs a Unix-socket HTTP server alongside the PID
+//! file. Clients can reach `GET /api/health` to verify the daemon
+//! is live. Background refresher and usage poller land in M8.4; the
+//! wider HTTP API (accounts, usage, refresh, OAuth callback) lands
+//! in M8.5; CLI delegation (status/statusline/swap) lands in M8.6.
 //!
-//! There is also no IPC server yet (M8.3), no background refresher
-//! (M8.4), no HTTP API routes (M8.5). The daemon currently does
-//! *nothing* except hold the PID file open. This is intentional: it
-//! gives us a clean, testable lifecycle primitive to build the
-//! subsystems on top of.
+//! Still foreground-only. Backgrounding will happen when the daemon
+//! is hosted inside the Tauri tray app (M8.6).
 
 use anyhow::{Context, Result};
 use csq_core::daemon::{self, DaemonStatus, PidFile};
@@ -22,9 +18,10 @@ use std::path::Path;
 /// Runs `csq daemon start` in the foreground.
 ///
 /// Acquires the PID file (failing if another daemon is already
-/// running), creates a minimal tokio runtime, installs signal
-/// handlers, and blocks until SIGTERM/SIGINT. On return, the PID
-/// file is automatically removed via `PidFile`'s Drop impl.
+/// running), starts the Unix-socket HTTP server, installs signal
+/// handlers, and blocks until SIGTERM/SIGINT. On return, the server
+/// is stopped (socket removed) and the PID file is removed via
+/// `PidFile`'s Drop impl.
 pub fn handle_start(base_dir: &Path) -> Result<()> {
     let pid_path = daemon::pid_file_path(base_dir);
 
@@ -33,25 +30,67 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
         format!("could not acquire PID file at {}", pid_path.display())
     })?;
 
+    let sock_path = daemon::socket_path(base_dir);
+
     eprintln!(
         "csq daemon started (PID {}, foreground mode)",
         pid_file.owned_pid()
     );
     eprintln!("  PID file: {}", pid_file.path().display());
-    eprintln!("  Socket:   {} (not active — M8.3)", daemon::socket_path(base_dir).display());
-    eprintln!("Send SIGTERM (kill {}) or Ctrl-C to stop.", pid_file.owned_pid());
+    eprintln!("  Socket:   {}", sock_path.display());
+    eprintln!(
+        "Send SIGTERM (kill {}) or Ctrl-C to stop.",
+        pid_file.owned_pid()
+    );
 
-    // Build a small current-thread tokio runtime for the signal
-    // wait. M8.3 will upgrade this to a multi-threaded runtime when
-    // the IPC server and background tasks arrive.
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Multi-threaded runtime so the accept loop and in-flight
+    // requests can make progress concurrently with signal handling.
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(2)
+        .thread_name("csq-daemon")
         .build()
         .context("failed to build tokio runtime for daemon")?;
 
-    rt.block_on(wait_for_shutdown());
+    rt.block_on(async move {
+        // Bind the Unix socket + axum router.
+        #[cfg(unix)]
+        {
+            match daemon::serve(&sock_path).await {
+                Ok((server, join)) => {
+                    tracing::info!("IPC server bound at {}", sock_path.display());
 
-    eprintln!("csq daemon stopping...");
+                    // Block until SIGTERM/SIGINT arrives.
+                    wait_for_shutdown().await;
+
+                    eprintln!("csq daemon stopping...");
+                    server.shutdown();
+
+                    // Give the accept loop up to 5s to exit.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+                }
+                Err(e) => {
+                    // Bind failure is fatal — the daemon can't do
+                    // anything useful without its IPC socket.
+                    eprintln!("error: failed to bind daemon socket at {}: {e}",
+                              sock_path.display());
+                    return Err::<(), anyhow::Error>(anyhow::anyhow!(
+                        "socket bind failed: {e}"
+                    ));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!(
+                "warning: Unix-socket IPC server not available on this platform — \
+                 Windows named-pipe support lands in M8.6"
+            );
+            wait_for_shutdown().await;
+        }
+        Ok(())
+    })?;
+
     // Explicit drop for clarity — PidFile::Drop removes the file if
     // it still contains our PID.
     drop(pid_file);
@@ -101,7 +140,7 @@ pub fn handle_status(base_dir: &Path) -> Result<()> {
             println!("running");
             eprintln!("  PID:      {pid}");
             eprintln!("  PID file: {}", pid_path.display());
-            eprintln!("  Socket:   {} (M8.3)", daemon::socket_path(base_dir).display());
+            eprintln!("  Socket:   {}", daemon::socket_path(base_dir).display());
             Ok(())
         }
         DaemonStatus::Stale { pid } => {

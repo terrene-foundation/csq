@@ -17,6 +17,11 @@ unicode-normalization.workspace = true
 secrecy.workspace = true
 urlencoding.workspace = true
 reqwest.workspace = true
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

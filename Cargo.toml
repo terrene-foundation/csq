@@ -26,3 +26,8 @@ urlencoding = "2"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "blocking"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["util"] }

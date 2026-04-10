@@ -19,10 +19,18 @@
 //! Read `workspaces/csq-v2/todos/active/M8-daemon-core.md` for the
 //! full task breakdown.
 
+pub mod detect;
 pub mod lifecycle;
 pub mod paths;
 pub mod pid;
 
+#[cfg(unix)]
+pub mod server;
+
+pub use detect::{detect_daemon, DetectResult};
 pub use lifecycle::{status_of, stop_daemon, DaemonStatus};
 pub use paths::{pid_file_path, socket_path};
 pub use pid::PidFile;
+
+#[cfg(unix)]
+pub use server::{router, serve, HealthResponse, ServerHandle};

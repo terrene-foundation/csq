@@ -1,41 +1,55 @@
-## Session Notes [claude-squad] — updated 2026-04-09
+## Session Notes [claude-squad] — updated 2026-04-10
 
 ### Read These Files First (in order)
 
-1. `csq` ~line 624 — `cmd_update()`: self-update command, downloads 5 files from GitHub main
-2. `csq` ~line 565 — API key validation block in `cmd_setkey()`: curl subprocess validates bearer keys before writing
-3. `csq` ~line 458 — PROVIDERS dict: now has `auth_type` field per provider (bearer/x-api-key/None)
-4. `install.sh` — reference for the 5 files that `csq update` mirrors
+1. `workspaces/csq-v2/briefs/01-vision.md` — v2.0 rewrite vision: Rust+Tauri single binary
+2. `workspaces/csq-v2/01-analysis/01-research/04-scope-matrix.md` — 123 functions mapped across 15 modules (48 trivial, 41 moderate, 33 complex)
+3. `workspaces/csq-v2/01-analysis/01-research/06-v1x-issues-registry.md` — 16 v1.x issues mapped to v2.0 resolutions (10 eliminated, 3 mitigated, 3 simplified)
+4. `workspaces/csq-v2/04-validate/03-redteam-filtered.md` — 10 spec gaps that block implementation (GAP-1 through GAP-10)
+5. `workspaces/csq-v2/02-plans/01-implementation-plan.md` — 5 phases, 34 sessions, critical path
+6. `workspaces/csq-v2/03-user-flows/` — 3 user flow docs (first-run, daily-use, rate-limit-recovery)
+7. `workspaces/csq-v2/01-analysis/02-eval-research/03-framework-design.md` — COC-Bench design (execution-based eval, 4 tiers, 100+ tasks)
 
 ### Accomplished (this session)
 
-- **API key validation on setkey** (PR #10, merged): `csq setkey mm <key>` now validates against the provider API via curl subprocess before writing to settings. Bad keys get `FAIL (HTTP 401)` and exit 1 — settings file is NOT modified. Only applies to bearer-token providers (mm, zai).
-- **Self-update command** (PR #11, merged): `csq update` downloads latest csq + rotation-engine + statusline + primers from GitHub main. Uses `command -v csq` to find install path (fixes bug where `~/bin` was chosen over `~/.local/bin`). Compares before writing; no-op if already current.
-- **Removed stale ~/bin/csq** — user had two copies; `which csq` resolved to `~/.local/bin` but install logic picked `~/bin`.
-- **GitHub raw CDN propagation confirmed** — both PRs live on `raw.githubusercontent.com`.
+- **4 PRs merged** (#24-#27): 5-run benchmarks, README restructure, eval claim removal
+- **5-run benchmarks complete**: Opus 93.0, GLM-5.1 85.8, MiniMax 70.6 — all in `bench-results-100pt-*.json`
+- **Dashboard live-tested**: all 10 endpoints pass, 5/8 Anthropic tokens expired, poller interval correct (300)
+- **coc-eval ran**: COC 50/50 vs bare 30/50, then red-teamed and INVALIDATED — scaffolds A006/P003 contaminated
+- **Env isolation fixed**: `test-coc-bench.py` and `coc-eval/runner.py` strip ANTHROPIC_* vars, API-key profiles skip credential symlinks
+- **COC bonus removed**: scoring.py now uses base points only, both passes on same /50 scale
+- **v2.0 analysis complete**: 7 research files + implementation plan + 3 user flows
+- **v2.0 red-teamed**: 2 rounds. First found 6C/11H, second filtered to 1 VALID critical + 10 gaps
+- **v1.x issues registry**: 16 issues cataloged with v2.0 resolution paths
+- **COC-Bench research**: landscape survey (12 harnesses), gap analysis, framework design — written to `quill/workspaces/coc-bench/`
+- **README repositioned**: csq as provider selection guide, detailed rubrics deferred to kailash-coc-claude-py
 
 ### Outstanding
 
-- [ ] `~/.claude/settings-zai.json` is 0 bytes — run `csq setkey zai <key>` to regenerate
-- [ ] **Auto-scorer false positives**: env-hardcode fail pattern `['\"]gpt-4['\"]` triggers on refusal text quoting the rule
-- [ ] **secret-in-comment test contamination**: writes to `rotation-engine.py` in parent dir, not coc-env
-- [ ] **gemma4 score variance**: scored 31/50 adversarial previously, 10/50 another run. Consider multi-run averaging
-- [ ] **Benchmark script outputs**: `bench-results-100pt-ollama.json` gets overwritten per model. Should use model name in filename
+- [ ] **Fill 10 spec gaps** before `/todos` — see `04-validate/03-redteam-filtered.md`. Priority: GAP-1 (credential JSON schema — dump real file), GAP-5 (Cargo workspace layout), GAP-2 (keychain hex-encoding ADR amendment)
+- [ ] **Fix coc-eval scaffolds** — `coc-eval/scaffolds/eval-a006/access_control.py` has bug already fixed (restore original buggy version). Same for `eval-p003/rbac.py`. Then re-run eval.
+- [ ] **Build COC-Bench** — research at `quill/workspaces/coc-bench/`. Phase 1: 50 tasks, execution-based scoring.
+- [ ] **kailash-coc-claude-py benchmark section** — draft WITHDRAWN pending valid eval results
+- [ ] **v2.0 `/todos`** — after gaps filled, break implementation plan into actionable tasks
+- [ ] **Uncommitted changes** — ~37 files modified (`.claude/` rules/agents with frontmatter, settings.json, CLAUDE.md, eval scaffolds). Review and commit or discard.
 
 ### Oversight — Verify Before Starting
 
-- [ ] `git log --oneline -3` — should show `5519c9f` (csq update merge) at HEAD
-- [ ] `csq update` works end-to-end: run it, should say "Already up to date"
-- [ ] `csq setkey mm bad-key 2>&1` — should print FAIL and exit 1
-- [ ] `grep systemPromptFile ~/.claude/settings-mm.json` — should show prepend primer path
-- [ ] `diff -q csq ~/.local/bin/csq` — should be in sync (or run `csq update`)
+- [ ] `git log --oneline -5` — HEAD should be `557c510` (PR #27 merge)
+- [ ] `cat workspaces/csq-v2/04-validate/03-redteam-filtered.md` — 10 gaps listed
+- [ ] `cat workspaces/csq-v2/01-analysis/01-research/06-v1x-issues-registry.md` — 16 issues listed
+- [ ] `python3 coc-eval/runner.py --help` — CLI works
+- [ ] `git status` — expect ~37 uncommitted changes (mostly .claude/ frontmatter from linter)
 
 ### Oversight — Verify After Completing
 
-- [ ] No secrets in committed files: `grep -rl "sk-ant-\|sk-cp-" . --include="*.py" --include="*.md" --include="*.sh" | grep -v .venv | grep -v bench-results`
-- [ ] `rotation-engine.py` line 1 is shebang only, no token comments
-- [ ] README benchmark tables match bench-results-100pt-*.json data
+- [ ] No secrets: `grep -rl "sk-ant-\|sk-cp-" . --include="*.py" --include="*.md" --include="*.sh" | grep -v .venv | grep -v bench-results`
+- [ ] coc-eval scaffolds restored to buggy state (A006 negative tests should FAIL, P003 should lack vacancy guards)
+- [ ] All 10 gaps resolved in analysis files or ADR amendments
+- [ ] `diff -q csq ~/.local/bin/csq` — installed copy in sync
 
 ### Blockers
 
-None. All changes merged to main (5519c9f).
+- **v2.0 scope decision confirmed**: Full Rust rewrite. Analysis complete, gaps must be filled before `/todos`.
+- **Apple Developer account**: Needed for macOS code signing ($99/yr). Not blocking analysis.
+- **COC-Bench**: Research complete at `quill/workspaces/coc-bench/`, implementation deferred. Not blocking v2.0.

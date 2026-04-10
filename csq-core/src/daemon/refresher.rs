@@ -139,6 +139,10 @@ pub type HttpPostFn =
 /// Handle to a running refresher task. Drop does NOT cancel —
 /// callers must explicitly cancel the `CancellationToken` passed
 /// into [`spawn`] and await the `JoinHandle`.
+///
+/// The `cache` Arc is the same one passed into `spawn`; returned
+/// here as a convenience so tests can read it without threading an
+/// extra reference.
 pub struct RefresherHandle {
     pub join: tokio::task::JoinHandle<()>,
     pub cache: Arc<TtlCache<u16, RefreshStatus>>,
@@ -149,21 +153,29 @@ pub struct RefresherHandle {
 /// # Arguments
 ///
 /// - `base_dir` — csq state directory (`~/.claude/accounts` by default).
+/// - `cache` — shared refresh-status cache. Owned by the daemon-
+///   start function so other subsystems (HTTP route handlers) can
+///   read from the same cache via their own Arc clone.
 /// - `http_post` — transport closure. Production callers pass
 ///   `Arc::new(|u, b| csq_core::http::post_form(u, b))`. Tests pass
 ///   a mock that returns canned responses.
 /// - `shutdown` — shared cancellation token. The task exits as soon
 ///   as the token is cancelled, regardless of where it is in the
 ///   refresh cycle.
-///
-/// Returns a [`RefresherHandle`] holding the join handle and the
-/// cache Arc (cloned for read access from HTTP routes).
 pub fn spawn(
     base_dir: PathBuf,
+    cache: Arc<TtlCache<u16, RefreshStatus>>,
     http_post: HttpPostFn,
     shutdown: CancellationToken,
 ) -> RefresherHandle {
-    spawn_with_config(base_dir, http_post, shutdown, REFRESH_INTERVAL, STARTUP_DELAY)
+    spawn_with_config(
+        base_dir,
+        cache,
+        http_post,
+        shutdown,
+        REFRESH_INTERVAL,
+        STARTUP_DELAY,
+    )
 }
 
 /// Like [`spawn`] but with explicit interval + startup delay for
@@ -171,12 +183,12 @@ pub fn spawn(
 /// full 5 minutes.
 pub fn spawn_with_config(
     base_dir: PathBuf,
+    cache: Arc<TtlCache<u16, RefreshStatus>>,
     http_post: HttpPostFn,
     shutdown: CancellationToken,
     interval: Duration,
     startup_delay: Duration,
 ) -> RefresherHandle {
-    let cache: Arc<TtlCache<u16, RefreshStatus>> = Arc::new(TtlCache::with_default_age());
     let cache_for_task = Arc::clone(&cache);
     let cooldowns: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -544,8 +556,10 @@ mod tests {
 
         install_account(dir.path(), 1, 0);
 
+        let cache = Arc::new(TtlCache::with_default_age());
         let handle = spawn_with_config(
             dir.path().to_path_buf(),
+            cache,
             http,
             shutdown.clone(),
             Duration::from_secs(1),
@@ -578,8 +592,10 @@ mod tests {
 
         install_account(dir.path(), 1, 0);
 
+        let cache = Arc::new(TtlCache::with_default_age());
         let handle = spawn_with_config(
             dir.path().to_path_buf(),
+            cache,
             http,
             shutdown.clone(),
             Duration::from_secs(60), // long interval so only the first tick runs

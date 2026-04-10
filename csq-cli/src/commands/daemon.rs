@@ -66,21 +66,36 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
         // Bind the Unix socket + axum router.
         #[cfg(unix)]
         {
-            match daemon::serve(&sock_path).await {
+            // Create the shared refresh-status cache at the daemon
+            // level so both the refresher (writer) and the HTTP
+            // routes (readers) see the same entries.
+            let refresh_cache: Arc<daemon::TtlCache<u16, daemon::RefreshStatus>> =
+                Arc::new(daemon::TtlCache::with_default_age());
+
+            // Router state: cache + base_dir, Arc'd so per-request
+            // State clones stay cheap.
+            let router_state = daemon::server::RouterState {
+                cache: Arc::clone(&refresh_cache),
+                base_dir: Arc::new(base_dir_for_runtime.clone()),
+            };
+
+            match daemon::serve(&sock_path, router_state).await {
                 Ok((server, server_join)) => {
                     tracing::info!("IPC server bound at {}", sock_path.display());
 
                     // Start the background refresher, sharing the
                     // server's shutdown token so both subsystems
-                    // exit on the same signal.
+                    // exit on the same signal. Passes the shared
+                    // cache so refresher writes are visible to the
+                    // HTTP routes.
                     let http_post: daemon::HttpPostFn =
                         Arc::new(|url: &str, body: &str| http::post_form(url, body));
                     let refresher = daemon::spawn_refresher(
                         base_dir_for_runtime.clone(),
+                        Arc::clone(&refresh_cache),
                         http_post,
                         server.shutdown_token(),
                     );
-                    let _refresh_cache = Arc::clone(&refresher.cache);
 
                     // Block until SIGTERM/SIGINT arrives.
                     wait_for_shutdown().await;

@@ -54,8 +54,17 @@
 
 #![cfg(unix)]
 
+use super::cache::TtlCache;
+use super::refresher::RefreshStatus;
+use crate::accounts::{discovery, AccountInfo};
 use crate::error::DaemonError;
-use axum::{extract::DefaultBodyLimit, routing::get, Json, Router};
+use crate::types::AccountNum;
+use axum::{
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    http::StatusCode,
+    routing::get,
+    Json, Router,
+};
 use serde::Serialize;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -63,6 +72,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
+
+/// Shared router state — cache + base_dir paths. Cloned cheaply
+/// (both fields are `Arc`/`PathBuf` inside) for each request via
+/// axum's `State` extractor.
+#[derive(Clone)]
+pub struct RouterState {
+    /// Refresh-status cache owned by the daemon lifecycle. The
+    /// refresher writes; HTTP routes only read.
+    pub cache: Arc<TtlCache<u16, RefreshStatus>>,
+    /// csq base directory, passed through for account discovery.
+    pub base_dir: Arc<PathBuf>,
+}
 
 /// Maximum request body size accepted by the daemon HTTP router.
 /// M8.3 has no body-accepting routes, but the limit is set now so
@@ -82,13 +103,23 @@ pub struct HealthResponse {
 
 /// Builds the axum router for the daemon HTTP API.
 ///
-/// M8.3 only mounts `GET /api/health`. M8.4+ will extend this with
-/// `/api/accounts`, `/api/account/:id/usage`, `/api/refresh`, etc.
+/// Routes mounted:
+/// - `GET /api/health` — liveness probe (M8.3)
+/// - `GET /api/accounts` — discovered accounts (M8.5)
+/// - `GET /api/refresh-status` — all refresh statuses from the cache (M8.5)
+/// - `GET /api/refresh-status/:id` — one account's refresh status (M8.5)
+///
 /// The [`DefaultBodyLimit`] layer is installed here so every future
-/// route inherits the 1 MiB cap without having to remember.
-pub fn router() -> Router {
+/// route inherits the 1 MiB cap without having to remember. State
+/// is shared via `with_state` so each handler gets a cheap clone
+/// of the [`RouterState`].
+pub fn router(state: RouterState) -> Router {
     Router::new()
         .route("/api/health", get(health_handler))
+        .route("/api/accounts", get(accounts_handler))
+        .route("/api/refresh-status", get(refresh_status_all_handler))
+        .route("/api/refresh-status/{id}", get(refresh_status_one_handler))
+        .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
 }
 
@@ -98,6 +129,97 @@ async fn health_handler() -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
     })
+}
+
+/// GET /api/accounts — returns the full discovered account list.
+///
+/// Runs `discovery::discover_anthropic` inside `spawn_blocking`
+/// because the discovery code does synchronous file IO. The full
+/// list is serialized directly; for realistic account counts
+/// (<=100) the response size is well under the 1 MiB body cap.
+async fn accounts_handler(
+    State(state): State<RouterState>,
+) -> Result<Json<AccountsResponse>, (StatusCode, String)> {
+    let base_dir = Arc::clone(&state.base_dir);
+    let accounts = tokio::task::spawn_blocking(move || discovery::discover_anthropic(&base_dir))
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "accounts discovery task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "discovery task failed".to_string(),
+            )
+        })?;
+
+    Ok(Json(AccountsResponse { accounts }))
+}
+
+/// GET /api/refresh-status — returns every currently-cached
+/// `RefreshStatus` entry as a map keyed by account ID.
+async fn refresh_status_all_handler(
+    State(state): State<RouterState>,
+) -> Json<RefreshStatusListResponse> {
+    // Walk known account IDs via discovery and look up each in the
+    // cache. We do NOT expose the cache's internal HashMap directly
+    // because that couples the IPC schema to the cache's internal
+    // layout. A linear lookup over discovered accounts is fine for
+    // the realistic account count.
+    let base_dir = Arc::clone(&state.base_dir);
+    let accounts_future =
+        tokio::task::spawn_blocking(move || discovery::discover_anthropic(&base_dir));
+
+    let mut entries = Vec::new();
+    if let Ok(accounts) = accounts_future.await {
+        for info in accounts {
+            if let Some(status) = state.cache.get(&info.id) {
+                entries.push(status);
+            }
+        }
+    }
+
+    Json(RefreshStatusListResponse { statuses: entries })
+}
+
+/// GET /api/refresh-status/:id — returns one account's cached
+/// refresh status, or 404 if no cached entry exists.
+///
+/// The path parameter `{id}` is validated via
+/// `AccountNum::try_from` — values outside 1..=999 are rejected
+/// with 400 so path-injection attempts like `/api/refresh-status/
+/// ../../etc` fail at deserialization (u16 parse) or the range
+/// guard before touching the cache.
+async fn refresh_status_one_handler(
+    State(state): State<RouterState>,
+    AxumPath(id): AxumPath<u16>,
+) -> Result<Json<RefreshStatus>, (StatusCode, String)> {
+    // Validate account number. This also defends against negative
+    // or out-of-range values that slipped past the u16 decode.
+    let account = AccountNum::try_from(id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid account id: {e}"),
+        )
+    })?;
+
+    match state.cache.get(&account.get()) {
+        Some(status) => Ok(Json(status)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("no cached refresh status for account {id}"),
+        )),
+    }
+}
+
+/// Response body for `GET /api/accounts`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountsResponse {
+    pub accounts: Vec<AccountInfo>,
+}
+
+/// Response body for `GET /api/refresh-status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshStatusListResponse {
+    pub statuses: Vec<RefreshStatus>,
 }
 
 /// Handle to a running daemon HTTP server. Dropping this handle
@@ -138,6 +260,10 @@ impl ServerHandle {
 /// Binds a Unix domain socket at `socket_path` and serves the daemon
 /// HTTP router on it until `shutdown` fires.
 ///
+/// `state` is the shared router state: cache + base_dir. The accept
+/// loop clones `state` per-connection so handlers get independent
+/// axum `State` extractor instances.
+///
 /// # Behavior
 ///
 /// 1. Removes any existing file at `socket_path` (cleanup of stale
@@ -160,6 +286,7 @@ impl ServerHandle {
 /// loop has exited.
 pub async fn serve(
     socket_path: &Path,
+    state: RouterState,
 ) -> Result<(ServerHandle, tokio::task::JoinHandle<()>), DaemonError> {
     // Cleanup stale socket file (previous crash).
     if socket_path.exists() {
@@ -224,7 +351,7 @@ pub async fn serve(
         shutdown: shutdown.clone(),
     };
 
-    let app = Arc::new(router());
+    let app = Arc::new(router(state));
     let sock_for_cleanup = socket_path.to_path_buf();
     let join = tokio::spawn(async move {
         accept_loop(listener, app, shutdown, sock_for_cleanup).await;
@@ -412,12 +539,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Builds a minimal RouterState for tests. Cache starts empty;
+    /// base_dir points at the provided temp directory.
+    fn test_state(base: &Path) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            base_dir: Arc::new(base.to_path_buf()),
+        }
+    }
+
     #[tokio::test]
     async fn serve_binds_and_sets_permissions() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("csq-test.sock");
 
-        let (handle, join) = serve(&sock).await.unwrap();
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
         assert!(sock.exists(), "socket file should be created");
 
         // Verify 0o600 permissions.
@@ -444,7 +580,7 @@ mod tests {
         std::fs::write(&sock, "stale").unwrap();
         assert!(sock.exists());
 
-        let (handle, join) = serve(&sock).await.unwrap();
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
         assert!(sock.exists());
 
         handle.shutdown();
@@ -462,7 +598,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("csq-test.sock");
 
-        let (handle, join) = serve(&sock).await.unwrap();
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         // Connect and send a minimal HTTP/1.1 GET.
         let mut stream = UnixStream::connect(&sock).await.unwrap();
@@ -511,7 +647,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("csq-test.sock");
 
-        let (handle, join) = serve(&sock).await.unwrap();
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         let mut stream = UnixStream::connect(&sock).await.unwrap();
         stream
@@ -552,5 +688,208 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"pid\":42"));
+    }
+
+    /// Sends a minimal HTTP/1.1 GET over a Unix socket and reads
+    /// the full response. Returns (status_line, body) where body
+    /// is everything after the blank CRLF-CRLF.
+    async fn http_get(sock: &std::path::Path, path: &str) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
+        // Find the blank line separating headers from body.
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    #[tokio::test]
+    async fn accounts_route_returns_empty_list_on_empty_base() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/accounts").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(
+            body.contains(r#""accounts":[]"#),
+            "body should have empty accounts array: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_route_lists_discovered_accounts() {
+        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+
+        // Install a valid credentials/1.json so discover_anthropic picks it up.
+        let creds = CredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        };
+        let num = AccountNum::try_from(1u16).unwrap();
+        credentials::save(&crate::credentials::file::canonical_path(dir.path(), num), &creds)
+            .unwrap();
+
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/accounts").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""id":1"#), "body: {body}");
+        assert!(body.contains(r#""source":"Anthropic""#), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_returns_404_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
+        assert!(status.contains("404"), "status: {status}");
+        assert!(body.contains("no cached refresh status"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_rejects_out_of_range_id() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        // 0 is out of the 1..=999 range so AccountNum::try_from rejects it.
+        let (status, body) = http_get(&sock, "/api/refresh-status/0").await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("invalid account id"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_returns_cached_entry() {
+        use crate::daemon::refresher::RefreshStatus;
+
+        let dir = TempDir::new().unwrap();
+        let state = test_state(dir.path());
+
+        // Pre-populate the cache with a known status.
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "refreshed".to_string(),
+                expires_at_ms: 1_234_567_890,
+                checked_at_secs: 42,
+            },
+        );
+
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""account":1"#), "body: {body}");
+        assert!(
+            body.contains(r#""last_result":"refreshed""#),
+            "body: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_all_returns_only_accounts_in_cache() {
+        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::daemon::refresher::RefreshStatus;
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+
+        // Install account 1 and account 2, but only populate the
+        // cache for account 1.
+        for id in [1u16, 2] {
+            let creds = CredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new("at".into()),
+                    refresh_token: RefreshToken::new("rt".into()),
+                    expires_at: 9_999_999_999_999,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            };
+            let num = AccountNum::try_from(id).unwrap();
+            credentials::save(
+                &crate::credentials::file::canonical_path(dir.path(), num),
+                &creds,
+            )
+            .unwrap();
+        }
+
+        let state = test_state(dir.path());
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "valid".to_string(),
+                expires_at_ms: 9_999_999_999_999,
+                checked_at_secs: 99,
+            },
+        );
+
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""account":1"#), "body: {body}");
+        // Account 2 is not in the cache, so it must not appear.
+        assert!(!body.contains(r#""account":2"#), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 }

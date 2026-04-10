@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod daemon;
 pub mod error;
 pub mod http;
+pub mod oauth;
 pub mod platform;
 pub mod providers;
 pub mod quota;

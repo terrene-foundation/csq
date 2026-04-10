@@ -142,6 +142,53 @@ pub fn post_form(url: &str, body: &str) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
+/// POSTs a JSON body. Returns the response body as bytes
+/// regardless of status — the caller decides how to handle non-2xx.
+///
+/// This signature matches [`post_form`] so callers that accept an
+/// `FnOnce(&str, &str) -> Result<Vec<u8>, String>` can inject
+/// either transport. The only differences are:
+///
+/// - `Content-Type: application/json` header
+/// - Expects the body to be pre-serialized JSON (the caller is
+///   responsible for `serde_json::to_string` or `to_vec`)
+///
+/// # Errors
+///
+/// Returns `Err(String)` on connection failure, timeout, HTTPS
+/// rejection, or redirect overflow. A 4xx/5xx response body is
+/// returned as `Ok(bytes)` so the caller can parse structured
+/// error responses.
+///
+/// # ⚠ CREDENTIAL-SAFETY WARNING
+///
+/// Same as [`post_form`]. If this function is used for an OAuth
+/// `authorization_code` exchange (M8.7), the Anthropic endpoint
+/// may echo parts of the submitted body back in error responses
+/// (observed: `400 {"error":"invalid_grant", ...}`). Callers MUST:
+///
+/// 1. Parse the body into a structured type and extract only the
+///    fields they need (never `Display`/`format!` the whole body).
+/// 2. Never log the raw bytes on error paths.
+/// 3. Never include the raw bytes in error messages returned to
+///    the user — treat them as sensitive by default.
+///
+/// [`crate::oauth::exchange::exchange_code`] follows this contract
+/// by parsing via `serde_json::from_slice::<TokenResponse>` and
+/// routing any error string through [`crate::error::redact_tokens`]
+/// before wrapping in [`crate::error::OAuthError::Exchange`].
+pub fn post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
+    let response = client()
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .map_err(sanitize_err)?;
+
+    let bytes = response.bytes().map_err(sanitize_err)?;
+    Ok(bytes.to_vec())
+}
+
 /// POSTs a JSON body with custom headers. Returns `(status, body)`.
 ///
 /// This signature matches `providers::validate::validate_key`'s
@@ -240,6 +287,50 @@ mod tests {
         assert!(
             msg.contains("connection") || msg.contains("timed out") || msg.contains("error"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn post_json_rejects_http_scheme() {
+        // https_only(true) applies to post_json too — proving the
+        // JSON path inherits the shared client configuration.
+        let result = post_json(
+            "http://example.invalid/v1/oauth/token",
+            r#"{"grant_type":"authorization_code"}"#,
+        );
+        assert!(result.is_err(), "http:// must be rejected by https_only");
+    }
+
+    #[test]
+    fn post_json_unreachable_host_errors_cleanly() {
+        // TEST-NET-1 (192.0.2.0/24) is reserved for documentation.
+        let result = post_json(
+            "https://192.0.2.1/v1/oauth/token",
+            r#"{"grant_type":"authorization_code","code":"abc"}"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("connection") || msg.contains("timed out") || msg.contains("error"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn post_json_error_does_not_leak_body() {
+        // Critical safety assertion: if post_json ever starts leaking
+        // the request body into error strings, OAuth `code` and
+        // `code_verifier` values would end up in logs. This test
+        // fails if that regression is introduced.
+        let result = post_json(
+            "https://192.0.2.1/v1/oauth/token",
+            r#"{"code":"SECRET_OAUTH_CODE_ABC123","client_id":"test"}"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            !msg.contains("SECRET_OAUTH_CODE_ABC123"),
+            "error message leaked the JSON body: {msg}"
         );
     }
 

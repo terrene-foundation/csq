@@ -1,78 +1,47 @@
+---
+name: git
+description: Git workflow rules — conventional commits, atomic commits, branch naming, PR descriptions, no secrets in history.
+---
+
 # Git Workflow Rules
 
-## Scope
-
-These rules apply to all git operations.
+Applies to all git operations in claude-squad.
 
 ## MUST Rules
 
 ### 1. Conventional Commits
 
-Commit messages MUST follow conventional commits format.
-
-**Format**:
-
-```
-type(scope): description
-
-[optional body]
-
-[optional footer]
-```
-
-**Types**:
-
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation
-- `style`: Formatting, no code change
-- `refactor`: Code restructure
-- `test`: Adding tests
-- `chore`: Maintenance
-
-**Examples**:
+Format: `type(scope): description` where type is one of `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`.
 
 ```
 feat(auth): add OAuth2 support
 fix(api): resolve rate limiting issue
-docs(readme): update installation guide
 refactor(workflow): simplify node connection logic
-test(rotation-engine): add concurrency tests for backsync
 ```
 
-**Enforced by**: Pre-commit hook (future)
-**Violation**: Commit message rejection
+**Why:** Non-conventional commits break automated changelog generation and make `git log --oneline` useless for release notes.
 
-### 2. Security Review Before Commit
+### 2. Atomic Commits
 
-> See `agents.md` Rule 2. Security review is strongly recommended before commits.
+One logical change per commit. Tests and implementation land together. Each commit builds and passes tests.
 
-**Enforced by**: agents.md, PreToolUse hook
-**Violation**: Potential security issues
+```
+❌ "WIP", "fix stuff", "update files"
+❌ Multiple unrelated changes in one commit
+✅ feat(rotation): add token refresh + unit tests
+```
+
+**Why:** Mixed commits are impossible to revert cleanly, and "WIP" commits that don't build poison `git bisect`.
 
 ### 3. Branch Naming
 
-Feature branches MUST follow naming convention.
+Format: `type/description` (e.g. `feat/add-auth`, `fix/api-timeout`).
 
-**Format**: `type/description`
-
-**Examples**:
-
-- `feat/add-auth`
-- `fix/api-timeout`
-- `docs/update-readme`
-- `refactor/workflow-builder`
-- `test/rotation-concurrency`
+**Why:** Consistent branch names let CI pattern-match against ref types and keep `git branch --list` readable.
 
 ### 4. PR Description
 
-Pull requests MUST include:
-
-- Summary of changes (what and why)
-- Test plan (how to verify)
-- Related issues (links)
-
-**Template**:
+Every PR MUST include: Summary (what and why), Test plan (how to verify), Related issues (links like `Fixes #123`).
 
 ```markdown
 ## Summary
@@ -90,107 +59,44 @@ Pull requests MUST include:
 Fixes #123
 ```
 
-### 5. Atomic Commits
-
-Each commit MUST be self-contained.
-
-**Correct**:
-
-- One commit per logical change
-- Tests and implementation together
-- Each commit builds and passes tests
-
-**Incorrect**:
-
-```
-❌ "WIP"
-❌ "fix stuff"
-❌ "update files"
-❌ Multiple unrelated changes
-```
+**Why:** Without issue links PRs disconnect from their motivation, breaking traceability and preventing automatic issue closure on merge.
 
 ## MUST NOT Rules
 
 ### 1. No Direct Push to Main
 
-MUST NOT push directly to main/master branch. All changes go through PRs.
+MUST NOT push directly to `main`. All changes go through PRs. Owner bypass is `gh pr merge <N> --admin --merge --delete-branch`, not direct push.
 
-**Enforced by**: GitHub branch protection (active on all 4 repos)
-**Consequence**: Push rejected by GitHub
-**Workflow**: See `rules/branch-protection.md` for the PR workflow
-**Admin bypass**: Owner can merge with `gh pr merge <N> --admin --merge --delete-branch`
+**Why:** Direct push bypasses CI checks and code review, allowing broken or unreviewed code to reach the release branch.
 
 ### 2. No Force Push to Main
 
-MUST NOT force push to main/master.
+MUST NOT force-push to `main`. Force push on a shared branch rewrites history everyone has already pulled.
 
-**Enforced by**: Branch protection
-**Consequence**: Team notification, potential rollback
+**Why:** Force pushes discard other contributors' work silently; once the reflog expires, the lost commits are unrecoverable.
 
 ### 3. No Secrets in Commits
 
-MUST NOT commit secrets, even in history.
+MUST NOT commit API keys, passwords, tokens, private keys, or `.env` files — not even in history. If a secret lands, the fix is key rotation plus history rewrite.
 
-**Detection**: Pre-commit secret scanning
-**Consequence**: History rewrite required
-
-**Check for**:
-
-- API keys
-- Passwords
-- Tokens
-- Private keys
-- .env files
+**Why:** Once committed, secrets persist in git history forever and are exposed to anyone with repo access, including future contributors who weren't around when the leak happened.
 
 ### 4. No Large Binaries
 
-MUST NOT commit large binary files.
+Single file >10MB or total repo >1GB is BLOCKED. Use Git LFS or external storage.
 
-**Limits**:
-
-- Single file: <10MB
-- Total repo: <1GB
-
-**Alternatives**:
-
-- Git LFS for large files
-- External storage for assets
+**Why:** Git never forgets — a 100MB file committed once permanently bloats every clone forever, even after deletion.
 
 ## Pre-Commit Checklist
 
 Before every commit:
 
-- [ ] Code review completed (intermediate-reviewer)
-- [ ] Security review completed (security-reviewer)
-- [ ] Tests pass
-- [ ] Linting passes
-- [ ] No secrets in changes
-- [ ] Commit message follows convention
-
-## Branching Strategy
-
-### Main
-
-- Always deployable
-- Protected branch
-- Requires PR with reviews
-
-### Feature Branches
-
-- Branch from main
-- PR back to main
-- Delete after merge
-
-### Hotfix Branches
-
-- Branch from main
-- Fix critical issues
-- Fast-track review process
+- Code review (intermediate-reviewer)
+- Security review (security-reviewer) — see `agents.md` Rule 2
+- Tests pass, linting passes
+- No secrets in diff
+- Commit message follows convention
 
 ## Exceptions
 
-Git exceptions require:
-
-1. Explicit user approval
-2. Documentation in PR
-3. Team notification for force operations
+Require explicit user approval, PR documentation, and team notification for force operations.

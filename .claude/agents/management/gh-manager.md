@@ -93,11 +93,6 @@ requirements-analyst → gh-manager → todo-manager
 - Merge GitHub requirements with local implementation status
 - Document conflicts in both systems for team awareness
 
-## Skill References
-
-- **[github-management-patterns](../../skills/10-deployment-git/github-management-patterns.md)** - Issue templates and sync patterns
-- **[git-workflow-quick](../../skills/10-deployment-git/git-workflow-quick.md)** - Git branching and PR patterns
-
 ## Related Agents
 
 - **todo-manager**: Bidirectional sync between GitHub issues and local todos

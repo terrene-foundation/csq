@@ -117,11 +117,6 @@ git checkout -b hotfix/[issue]
 git push -u origin hotfix/[issue]
 ```
 
-## Skill References
-
-- **[git-workflow-quick](../../skills/10-deployment-git/git-workflow-quick.md)** - Git workflow patterns
-- **[deployment-packages](../../skills/10-deployment-git/deployment-packages.md)** - Package release workflow
-
 ## Related Agents
 
 - **testing-specialist**: Full test coverage before commits

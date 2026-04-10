@@ -13,13 +13,15 @@ These rules apply to ALL production code (non-test files).
 
 ### 1. No Stubs or Placeholders
 
-Production code SHOULD NOT contain:
+Production code MUST NOT contain:
 
 - `TODO`, `FIXME`, `HACK`, `STUB`, `XXX` markers
 - `raise NotImplementedError` (implement the method)
 - `pass # placeholder` or `pass # stub`
 - `return None # not implemented`
 - Empty function/method bodies that should have logic
+
+**Why:** Stubs present a working-looking surface with broken internals, causing users to trust outputs that are silently incomplete and to waste cycles debugging "why the feature doesn't behave as documented."
 
 ### 2. No Simulated or Fake Data
 
@@ -49,6 +51,8 @@ Production code MUST NOT silently swallow errors:
 
 **Acceptable**: `except: pass` in hooks/cleanup code where failure is expected.
 
+**Why:** Silent error swallowing hides bugs until they cascade into data corruption or production outages with no stack trace to diagnose — by the time symptoms surface, the root cause is invisible.
+
 ### 4. Avoid Deferred Implementation
 
 When implementing a feature:
@@ -57,6 +61,8 @@ When implementing a feature:
 - If an endpoint exists, it must return real data
 - If a service is referenced, it must be functional
 - Never leave "will implement later" comments
+
+**Why:** Half-implemented features present a working UI with broken backend, causing users to trust outputs that are silently incomplete or wrong — worse than a broken UI because the break is invisible.
 
 ## Enforcement
 

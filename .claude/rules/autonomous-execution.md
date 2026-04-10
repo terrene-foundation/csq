@@ -1,3 +1,8 @@
+---
+name: autonomous-execution
+description: Autonomous execution rules — frame deliberation and effort estimates for AI agent systems, not human teams.
+---
+
 # Autonomous Execution Model
 
 ## Scope
@@ -32,12 +37,16 @@ When agents deliberate (during /analyze, /redteam, or any planning), they MUST N
 - Assume sequential execution where parallel autonomous execution is possible
 - Frame trade-offs in terms of "developer experience" or "cognitive load on the team"
 
+**Why:** Human-team framing causes the agent to recommend suboptimal approaches (phasing, sequencing, simplifying) that waste autonomous execution capacity and inflate effort estimates 10x.
+
 Instead, agents MUST:
 
 - Estimate effort in **autonomous execution cycles** (sessions, not days)
 - Recommend the **technically optimal approach** unconstrained by human resource limits
 - Default to **maximum parallelization** across agent specializations
 - Frame trade-offs in terms of **system complexity**, **validation rigor**, and **institutional knowledge capture**
+
+**Why:** Without autonomous framing, plans are artificially sequenced to fit human-team constraints that don't exist, turning a 1-session task into a multi-session bottleneck.
 
 ## The 10x Throughput Multiplier
 

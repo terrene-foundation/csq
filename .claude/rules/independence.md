@@ -1,3 +1,8 @@
+---
+name: independence
+description: Foundation independence rules — no commercial references, no proprietary awareness, Terrene Foundation ownership.
+---
+
 # Foundation Independence Rules
 
 ## Scope
@@ -48,6 +53,8 @@ MUST NOT describe claude-squad as "the open-source version of [anything]" or "th
 **Correct**: "claude-squad is a Terrene Foundation tool for Claude Code multi-account rotation."
 **Incorrect**: "claude-squad is the open-source version of [product name]."
 
+**Why:** "Open-source version of X" framing positions claude-squad as derivative of a commercial product and creates an implicit trademark entanglement that does not legally exist.
+
 ### 5. Design for csq Users
 
 All feature decisions, architectural choices, and roadmap priorities must be driven by:
@@ -57,6 +64,8 @@ All feature decisions, architectural choices, and roadmap priorities must be dri
 - What the open-source community contributes
 
 Never by what any commercial product does, doesn't do, or plans to do.
+
+**Why:** Designing for a hypothetical commercial consumer biases the API surface away from the actual csq user base, making the tool awkward for the people who actually depend on it.
 
 ## MUST NOT Rules
 
@@ -79,6 +88,8 @@ MUST NOT discuss in any file:
 - Commercial licensing considerations
 - Market competition or positioning
 
+**Why:** Commercial strategy content drifts the tool's design into "what would a buyer want" territory, distorting feature priority away from the user base the Foundation actually serves.
+
 ### 3. No Cross-Codebase Coupling
 
 MUST NOT:
@@ -86,6 +97,8 @@ MUST NOT:
 - Share code, interfaces, or protocols designed for a specific proprietary product
 - Create abstractions whose primary purpose is proprietary product compatibility
 - Design extension points that assume a specific proprietary implementation
+
+**Why:** Every proprietary-shaped abstraction constrains future architecture decisions and ties claude-squad's evolution to a product it has no agreement with.
 
 ## Clarification
 

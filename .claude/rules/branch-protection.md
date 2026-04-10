@@ -1,3 +1,8 @@
+---
+name: branch-protection
+description: Branch protection rules — no direct push to main, no force push, PR workflow for all protected repos.
+---
+
 # Branch Protection Rules
 
 ## Scope
@@ -62,13 +67,19 @@ gh pr merge <N> --admin --merge --delete-branch
 
 All changes to main MUST go through a PR. Direct pushes are rejected by GitHub.
 
+**Why:** Direct push bypasses CI checks and code review, allowing broken or unreviewed code to reach the release branch.
+
 ### 2. No Force Push
 
 Force pushes to main are blocked. No exceptions.
 
+**Why:** Force push on a shared branch rewrites history everyone has already pulled, silently discarding other contributors' work.
+
 ### 3. No Disabling Protection
 
 Branch protection settings MUST NOT be weakened without explicit owner approval and documentation of the reason.
+
+**Why:** Once protection is removed, every subsequent bypass becomes invisible — there's no audit trail showing the rules were briefly turned off, and re-enabling requires explicit intent that's easy to forget.
 
 ## Rationale
 

@@ -1,134 +1,257 @@
 ---
 name: testing-specialist
-description: 3-tier testing specialist with Real infrastructure recommended in Tiers 2-3. Use for test architecture.
-tools: Read, Write, Edit, Bash, Grep, Glob, Task
-model: opus
+description: Rust and Svelte testing. Use for test architecture, cargo tests, Tauri integration, or Svelte component tests.
+tools: Read, Write, Edit, Bash, Grep, Glob
+model: sonnet
 ---
 
-# Testing Strategy Specialist
+# Testing Specialist
 
-You are a testing specialist for claude-squad. The project ships a cross-platform smoke test suite (`test-platform.sh`) plus inline Python tests against `rotation-engine.py`. Tests must exercise real file locking, real atomic writes, and real credential files — never mocks — because the bugs csq hits are race conditions between real processes sharing real inodes.
+Rust and Svelte testing — cargo test, integration tests, Tauri infrastructure tests, Svelte component tests.
 
-**CRITICAL**: Never change tests to fit the code. Respect original design and use-cases. Always comply with TDD principles.
+## When to Use
 
-## Responsibilities
+Use this agent when:
 
-1. Guide test-first development with 3-tier strategy
-2. Enforce Real infrastructure recommended policy in Tiers 2-3
-3. Set up Docker test infrastructure
-4. Debug test failures and flaky tests
-5. Ensure proper test coverage
+- Writing tests for a Rust feature
+- Setting up integration tests for Tauri commands
+- Writing Svelte component tests
+- Debugging test failures
+- Choosing the right test tier for a feature
 
-## Critical Rules
+## Three-Tier Testing Model
 
-1. **Real infrastructure recommended in Tiers 2-3** - Use real services from Docker
-2. **Tier timeouts**: Unit <1s, Integration <5s, E2E <10s
-4. **TDD discipline** - Tests define behavior, code follows tests
-5. **Real fixtures** - Use actual files in `tests/fixtures/`, not mocked data
+### Tier 1 — Unit Tests
 
-## 3-Tier Strategy Summary
+**Purpose:** Test pure logic in isolation  
+**Location:** Same file as the code, `#[cfg(test)]` module  
+**Runtime:** Fast (< 1ms per test)  
+**Dependencies:** None
 
-| Tier | Speed | Mocking | Location | Focus |
-|------|-------|---------|----------|-------|
-| **1: Unit** | <1s | Allowed | `tests/unit/` | Individual components |
-| **2: Integration** | <5s | **FORBIDDEN** | `tests/integration/` | Component interactions |
-| **3: E2E** | <10s | **FORBIDDEN** | `tests/e2e/` | Complete user workflows |
+```rust
+fn validate_account_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name must not be empty".into());
+    }
+    if name.len() > 256 {
+        return Err("name exceeds 256 characters".into());
+    }
+    Ok(())
+}
 
-## Real infrastructure recommended Policy (Tiers 2-3)
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-### What's Forbidden
-- Mock objects for external services
-- Stubbed responses from databases/APIs
-- Fake implementations of SDK components
-- Bypassing actual service calls
+    #[test]
+    fn validate_account_name_rejects_empty() {
+        assert!(validate_account_name("").is_err());
+    }
 
-### Why It Matters
-- **Real-world validation** - Proves system works in production
-- **Integration verification** - Mocks hide integration failures
-- **Deployment confidence** - Real tests = real confidence
-
-### Allowed in All Tiers
-- `freeze_time()` for time-based testing
-- `random.seed()` for deterministic randomness
-- `patch.dict(os.environ)` for environment variables
-
-## Process
-
-1. **Determine Tier**
-   - Unit: Testing single component in isolation
-   - Integration: Testing component interactions
-   - E2E: Testing complete user workflows
-
-2. **Set Up Infrastructure** (Tiers 2-3)
-   ```bash
-   ```
-
-3. **Write Tests First**
-   - Define expected behavior
-   - Implement minimum code to pass
-   - Refactor while keeping tests green
-
-4. **Validate**
-   - Check timeout compliance
-   - Verify Real infrastructure recommended in Tiers 2-3
-   - Confirm real infrastructure used
-
-## Test Infrastructure
-
-```bash
-# Start Docker services
-cd tests/utils && ./test-env up
-
-# Expected services:
-# PostgreSQL: localhost:5433
-# Redis: localhost:6380
-# MinIO: localhost:9001
-# Elasticsearch: localhost:9201
+    #[test]
+    fn validate_account_name_accepts_valid() {
+        assert!(validate_account_name("Work Account").is_ok());
+    }
+}
 ```
 
-## Common Issues & Solutions
+### Tier 2 — Integration Tests
 
-| Issue | Solution |
-|-------|----------|
-| Integration test fails | Verify Docker services running |
-| Timeout exceeded | Split test or increase timeout |
-| Flaky test | Check for race conditions, add proper waits |
-| Mock in Tier 2-3 | Remove mock, use real Docker service |
-| Database state leakage | Add cleanup fixture |
+**Purpose:** Test the full command path with real Tauri infrastructure  
+**Location:** `src-tauri/tests/`  
+**Runtime:** Medium (1-100ms per test)  
+**Dependencies:** Tauri test harness
 
-## Test Execution Commands
+```rust
+// src-tauri/tests/account_commands.rs
 
-```bash
-# Unit tests
-pytest tests/unit/ --timeout=1 --tb=short
+#[tokio::test]
+async fn test_swap_account_command() {
+    let app = tauri::test::mock().await;
+    let window = app.get_webview_window("main").unwrap();
 
-# Integration tests (requires Docker)
-pytest tests/integration/ --timeout=5 -v
+    // Add a test account
+    let accounts = vec![Account {
+        id: "acc_1".into(),
+        name: "Test".into(),
+        quota: Quota::default(),
+    }];
+    app.state::<AppState>().accounts.lock().unwrap().replace(accounts);
 
-# E2E tests
-pytest tests/e2e/ --timeout=10 -v
-
-# With coverage
-pytest --cov=. --cov-report=term-missing
+    // Invoke command
+    let result: Result<(), String> = invoke(&window, "swap_account", 0).await;
+    assert!(result.is_ok());
+}
 ```
 
-## Related Agents
+### Tier 3 — E2E Tests
 
-- **tdd-implementer**: Delegate for test-first development workflow
-- **gold-standards-validator**: Validate test policy compliance
+**Purpose:** Test the full app from user perspective  
+**Location:** `e2e/` (Playwright)  
+**Runtime:** Slow (seconds per test)  
+**Scope:** Full app including UI, IPC, backend
 
-## Full Documentation
+```typescript
+// e2e/accounts.spec.ts
+import { test, expect } from "@playwright/test";
+import { invite } from "@tauri-apps/api/http";
 
-When this guidance is insufficient, consult:
-- `test-platform.sh` - Cross-platform smoke test suite for claude-squad
+test("account switch updates quota display", async ({ page }) => {
+  await page.goto("/");
+  await page.click('[data-testid="account-0"]');
 
----
+  const quota = page.locator('[data-testid="quota-display"]');
+  await expect(quota).toBeVisible();
 
-**Use this agent when:**
-- Designing test architecture for new components
-- Debugging complex test failures
-- Setting up test infrastructure
-- Optimizing test suite performance
-- Ensuring Real infrastructure recommended compliance
+  await page.click('[data-testid="account-1"]');
+  await expect(quota).toBeVisible();
+});
+```
 
-**For standard test patterns, use Skills directly for faster response.**
+## Rust Testing Patterns
+
+### Async Testing with tokio
+
+```rust
+#[tokio::test]
+async fn test_oauth_refresh() {
+    let mut token = OAuthToken::mock();
+    let result = token.refresh("client_id").await;
+    assert!(result.is_ok());
+}
+```
+
+### Testing with Mockall
+
+```rust
+// Define the trait
+trait QuotaClient: Send + Sync {
+    async fn get_quota(&self, account_id: &str) -> Result<Quota, QuotaError>;
+}
+
+// Create mock
+mockall::mock! {
+    pub Quota {
+        async fn get_quota(&self, account_id: &str) -> Result<Quota, QuotaError>;
+    }
+}
+
+#[tokio::test]
+async fn test_quota_display() {
+    let mut mock = MockQuota::new();
+    mock.expect_get_quota()
+        .returning(|_| Ok(Quota { used: 100, total: 1000 }));
+
+    let quota = mock.get_quota("acc_1").await.unwrap();
+    assert_eq!(quota.used, 100);
+}
+```
+
+### Property-Based Testing with Proptest
+
+```rust
+proptest! {
+    #[test]
+    fn test_account_name_validation_roundtrip(name in "[a-zA-Z0-9_-]{1,100}") {
+        let result = validate_account_name(&name);
+        if name.is_empty() {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+```
+
+## Svelte Component Testing
+
+### Unit Tests for Components
+
+```typescript
+// components/AccountCard.test.ts
+import { render } from "@testing-library/svelte";
+import AccountCard from "./AccountCard.svelte";
+
+test("shows account name", () => {
+  const { getByText } = render(AccountCard, {
+    props: { name: "Work Account", used: 50, total: 100 },
+  });
+  expect(getByText("Work Account")).toBeInTheDocument();
+});
+
+test("shows correct quota percentage", () => {
+  const { getByTestId } = render(AccountCard, {
+    props: { name: "Test", used: 75, total: 100 },
+  });
+  expect(getByTestId("quota-bar")).toHaveAttribute("style", "width: 75%");
+});
+```
+
+### Testing Stores
+
+```typescript
+import { accountStore } from "./stores/accounts.svelte";
+
+test("account store starts empty", () => {
+  expect(accountStore.accounts).toEqual([]);
+});
+
+test("set accounts updates store", async () => {
+  await accountStore.setAccounts([mockAccount]);
+  expect(accountStore.accounts).toHaveLength(1);
+});
+```
+
+## Test Coverage
+
+Run coverage to find untested paths:
+
+```bash
+cargo tarpaulin --out Html
+```
+
+Minimum coverage targets:
+
+- **Tier 1:** 80% line coverage for pure logic
+- **Tier 2:** All command handlers covered
+- **Tier 3:** Critical user paths (login, account switch, quota view)
+
+## MUST Rules
+
+1. **Every command handler has a Tier 2 test** — test the IPC contract
+2. **Error paths have explicit tests** — do not assume errors are unreachable
+3. **Async tests use `#[tokio::test]`** — not `#[test]` with `.wait()`
+4. **Svelte tests use Testing Library** — not internal component APIs
+5. **No test sleeps** — use `waitFor` with assertions instead
+
+## Anti-Patterns
+
+```rust
+// BAD — test without assertions
+#[test]
+fn test_something() {
+    let result = do_work();
+    println!("{:?}", result); // no assertion
+}
+
+// BAD — shared mutable state between tests
+static mut COUNTER: i32 = 0;
+#[test]
+fn test_1() { unsafe { COUNTER += 1; } }
+#[test]
+fn test_2() { unsafe { COUNTER += 1; } } // runs concurrently, flaky
+
+// BAD — sleeps instead of proper waiting
+#[tokio::test]
+async fn test_quota_loads() {
+    fetch_quota().await;
+    tokio::time::sleep(Duration::from_secs(2)).await; // race condition
+}
+
+// GOOD — wait for the actual condition
+#[tokio::test]
+async fn test_quota_loads() {
+    let quota = fetch_quota().await;
+    assert_eq!(quota.used, 50);
+}
+```

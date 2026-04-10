@@ -1,12 +1,12 @@
-# Claude Squad — Account Rotation & Session Management
+# Claude Squad — Desktop Account Rotation & Session Management
 
-Python tooling for Claude Code multi-account rotation, quota monitoring, and session management.
+Tauri desktop app with Svelte frontend and Rust backend. Multi-account Claude Code quota monitoring, OAuth rotation, and session management.
 
 ## Absolute Directives
 
 ### 1. .env Is the Single Source of Truth
 
-All API keys and model names MUST come from `.env`. Never hardcode credentials. See `rules/env-models.md`.
+All API keys and OAuth tokens MUST come from `.env` via Tauri's env-backed config system. Never hardcode credentials. See `rules/security.md`.
 
 ### 2. Implement, Don't Document
 
@@ -16,41 +16,72 @@ When you discover a missing feature — implement it. Do not note it as a gap. S
 
 Pre-existing failures MUST be fixed, not reported. Stubs are BLOCKED. See `rules/zero-tolerance.md`.
 
+## Tech Stack
+
+| Layer      | Technology                        |
+| ---------- | --------------------------------- |
+| Frontend   | Svelte 5 (runes, component props) |
+| Desktop    | Tauri 2.x (Rust backend, WebView) |
+| State      | Rust backend state + Svelte stores |
+| IPC        | Tauri commands (`invoke`)         |
+| Styling    | CSS (plain, no framework)         |
+| Build      | Cargo + Vite                     |
+
 ## Project Structure
 
 ```
-rotation-engine.py       — Core engine: quota tracking, OAuth token refresh, in-place swap_to(), auto-rotate
-statusline-quota.sh      — Statusline hook: feeds quota to engine, shows account + %; primary auto-rotate trigger
-csq                      — CLI: login/run/status/suggest/swap/cleanup; `! csq swap N` for in-CC rate-limit recovery
-auto-rotate-hook.sh      — UserPromptSubmit hook: backup auto-rotate trigger (requires CLAUDE_CONFIG_DIR)
-install.sh               — One-time installer
+src/                          — Svelte frontend source
+  lib/
+    components/              — Reusable UI components
+    stores/                  — Svelte stores (runes-based)
+    utils/                   — Frontend utilities
+src-tauri/                   — Rust backend
+  src/
+    commands/               — Tauri command handlers
+    state/                  — App state management
+    oauth/                  — OAuth token rotation logic
+    models/                 — Rust data structures
+  Cargo.toml
+  tauri.conf.json
 ```
-
-In-place rotation works because Claude Code picks up updates to `.credentials.json`
-on its next interaction. `swap_to()` updates the file and Claude
-Code picks up the new token — no restart needed. Verified empirically with
-live swap tests.
-
-## Workspace Commands
-
-| Command      | Phase | Purpose                                            |
-| ------------ | ----- | -------------------------------------------------- |
-| `/analyze`   | 01    | Load analysis phase for current workspace          |
-| `/todos`     | 02    | Load todos phase; stops for human approval         |
-| `/implement` | 03    | Load implementation phase; repeat until todos done |
-| `/redteam`   | 04    | Load validation phase; red team testing            |
-| `/codify`    | 05    | Load codification phase; create agents & skills    |
-| `/ws`        | --    | Read-only workspace status dashboard               |
-| `/wrapup`    | --    | Write session notes before ending                  |
 
 ## Rules
 
-All COC rules apply. Key rules for this project:
+| Concern                  | Rule File                    |
+| ------------------------ | --------------------------- |
+| No stubs/placeholders     | `rules/no-stubs.md`         |
+| Security (secrets)        | `rules/security.md`         |
+| Git workflow              | `rules/git.md`             |
+| Zero tolerance            | `rules/zero-tolerance.md`  |
+| Testing                   | `rules/testing.md`         |
+| Svelte patterns           | `rules/svelte-patterns.md` |
+| Tauri patterns            | `rules/tauri-patterns.md`  |
+| Tauri commands            | `rules/tauri-commands.md`  |
 
-| Concern               | Rule File                 |
-| --------------------- | ------------------------- |
-| No stubs/placeholders | `rules/no-stubs.md`       |
-| Security (secrets)    | `rules/security.md`       |
-| Git workflow          | `rules/git.md`            |
-| Zero tolerance        | `rules/zero-tolerance.md` |
-| Testing               | `rules/testing.md`        |
+## Agents
+
+| Agent                      | Role                                           |
+| ------------------------- | ---------------------------------------------- |
+| `claude-code-architect`   | CC artifact quality auditing                   |
+| `svelte-specialist`       | Svelte 5 runes, components, stores             |
+| `rust-specialist`        | Rust ownership, lifetimes, async, error handling |
+| `rust-desktop-specialist` | Tauri + Rust backend, command patterns         |
+| `tauri-platform-specialist` | Tauri IPC, windowing, system integration     |
+| `uiux-designer`           | Layout, hierarchy, accessibility               |
+| `gold-standards-validator` | Naming, licensing compliance                 |
+| `security-reviewer`       | Security audit, secrets management             |
+| `build-fix`               | Build errors, linking, FFI issues              |
+| `tdd-implementer`        | Rust TDD with cargo test, Arrange-Act-Assert  |
+| `requirements-analyst`   | Desktop app requirements, feature specs        |
+| `deep-analyst`            | Failure analysis, 5-Why, risk assessment       |
+| `intermediate-reviewer`   | Rust/Svelte code review, ownership, security   |
+| `testing-specialist`      | Rust + Svelte testing tiers, Tauri infra       |
+
+## Skills
+
+| Skill                      | Purpose                                      |
+| -------------------------- | -------------------------------------------- |
+| `svelte-reference`         | Svelte 5 runes, component patterns, stores   |
+| `tauri-reference`          | Tauri commands, IPC, state management        |
+| `uiux-principles`          | Layout, hierarchy, motion, typography        |
+| `ai-interaction`           | AI interaction patterns (desktop context)    |

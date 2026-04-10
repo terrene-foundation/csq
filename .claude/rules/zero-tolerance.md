@@ -1,47 +1,48 @@
+---
+name: zero-tolerance
+description: Zero-tolerance rules — pre-existing failures must be fixed in-session, no stubs, no silent fallbacks.
+---
+
 # Zero-Tolerance Enforcement Rules
 
-## Scope
+Applies to ALL sessions, ALL agents, ALL code. ABSOLUTE and non-negotiable.
 
-These rules apply to ALL sessions, ALL agents, ALL code changes. They are
-ABSOLUTE. NO flexibility.
+## Rule 1: Pre-Existing Failures MUST Be Resolved
 
-## RULE 1: Pre-Existing Failures MUST Be Resolved
+When tests, validation, or analysis reveal a pre-existing failure: **you own it**. Diagnose root cause → implement fix → write regression test → verify → commit. All in this session.
 
-When tests, validation, or analysis reveals a pre-existing failure:
-**YOU MUST FIX IT.** "Not introduced in this session" is not an acceptable
-response. If you found it, you own it.
-
-**Required**: diagnose root cause → implement fix → write regression test
-→ verify → commit.
-
-**BLOCKED responses**:
+**BLOCKED responses:**
 
 - "Pre-existing issue, out of scope"
 - "Noting as a known issue for future resolution"
 - Any acknowledgment without a fix
 
-**Exception**: User explicitly says "skip" or "ignore."
+**Why:** Deferring broken code creates a ratchet where every session inherits more failures, and the codebase degrades faster than any single session can fix.
 
-## RULE 2: No Stubs, Placeholders, Deferred Implementation
+**Exception:** User explicitly says "skip" or "ignore."
 
-Stubs are BLOCKED. See `no-stubs.md` for detection patterns and enforcement.
-`validate-workflow.js` exits with code 2 on detection.
+## Rule 2: No Stubs, Placeholders, or Deferred Implementation
 
-## RULE 3: No Naive Fallbacks or Error Hiding
+`TODO`, `FIXME`, `HACK`, `STUB`, `raise NotImplementedError`, `pass  # placeholder`, `return None  # not implemented` — all BLOCKED in production code. See `no-stubs.md` for the detector patterns; `validate-workflow.js` exits with code 2 on detection.
 
-`except: pass`, `return None` without logging, silent discards — BLOCKED.
-See `no-stubs.md` Section 3.
+**Why:** Stubs present a working-looking surface with broken internals, causing users to trust outputs that are silently incomplete.
 
-## RULE 4: No Workarounds for Upstream Bugs
+## Rule 3: No Silent Fallbacks or Error Hiding
 
-When you hit a bug in an upstream dependency (Claude Code CLI, Anthropic
-OAuth endpoint, macOS `security` tool): reproduce it, document it, and
-file an upstream issue. Do NOT re-implement the upstream's job yourself.
+`except: pass`, empty catch blocks, `return None` without logging, silent discards — BLOCKED.
 
-**BLOCKED**: naive re-implementations, post-processing to "fix" upstream
-output, downgrading to avoid bugs.
+**Why:** Silent error swallowing hides bugs until they cascade into data corruption or production outages with no stack trace to diagnose.
+
+**Acceptable:** `except: pass` in cleanup / teardown where failure is expected.
+
+## Rule 4: No Workarounds for Upstream Bugs
+
+When you hit a bug in an upstream dependency (Claude Code CLI, OAuth endpoint, macOS `security` tool): reproduce, document, file an upstream issue. Do NOT re-implement the upstream's job yourself.
+
+**BLOCKED:** naive re-implementations, post-processing to "fix" upstream output, downgrading to avoid bugs.
+
+**Why:** Workarounds create a parallel implementation that diverges from the upstream, doubling maintenance cost and masking the root bug from being fixed.
 
 ## Language
 
-Every "MUST" means MUST. Every "BLOCKED" means the operation does not
-proceed. Every "NO" means NO.
+Every "MUST" means MUST. Every "BLOCKED" means the operation does not proceed. Every "NO" means NO.

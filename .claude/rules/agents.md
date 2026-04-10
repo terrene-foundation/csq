@@ -1,46 +1,68 @@
+---
+name: agents
+description: Agent orchestration rules for claude-squad. MUST delegation requirements, analysis chains, parallel execution, and structural gates.
+---
+
 # Agent Orchestration Rules
 
-## Scope
+## MUST Delegation
 
-These rules govern when and how specialized agents are used in claude-squad.
+When working with specific domains, consult the relevant specialist:
 
-## Recommended Delegations
+| Domain | Agent | When |
+|--------|-------|------|
+| Svelte 5 components | `svelte-specialist` | Rune patterns, stores, TypeScript, desktop UI |
+| Tauri command API | `rust-desktop-specialist` | Command design, state, IPC |
+| Platform/distribution | `tauri-platform-specialist` | App signing, system tray, permissions |
+| Core Rust language | `rust-specialist` | Ownership, lifetimes, async, errors |
+| Security-sensitive changes | `security-reviewer` | OAuth, keychain, credential handling |
+| Tauri command design | `tauri-commands` rule | Naming, validation, error mapping |
 
-### Code Review After Changes
+**Why:** Specialists encode hard-won domain patterns that generalist agents miss.
 
-After file modifications (Edit, Write), delegating to a code-review agent
-is recommended when the change is non-trivial. Users may skip for trivial
-edits or when explicitly told to.
+## MUST NOT
 
-### Security Review Before Commits
+- Delegate security-sensitive changes without `security-reviewer` before commit
 
-Before `git commit` on security-sensitive changes (OAuth flow, keychain
-writes, atomic file handling), a security review is strongly recommended.
+```
+DO NOT: Commit OAuth flow changes without a security review
+DO NOT: Ship keychain write code without checking against security-reviewer
+```
 
-### Parallel Execution for Independent Operations
+**Why:** Credential handling mistakes in Rust are unrecoverable — no runtime recovery, raw bytes in memory.
 
-When multiple independent operations are needed, launch them in parallel
-(e.g., reading several unrelated files, running multiple searches).
+- Skip structural gates to save time
 
-### Analysis Chain for Complex Features
+```
+DO NOT: "Skipping review to save time"
+DO NOT: "The changes are straightforward, no review needed"
+```
+
+**Why:** Every gate skipped is a risk compounding into the next session.
+
+## Analysis Chain (Complex Features)
 
 For features with unclear requirements or multiple valid approaches:
 
-1. Identify failure points (deep analysis)
-2. Break down requirements
-3. Choose an approach
-4. Implement
+1. **deep-analyst** → Identify failure points
+2. **requirements-analyst** → Break down requirements
+3. Decide approach (design vs implement)
+4. **tdd-implementer** → Implement with tests
 
-## MUST Rules
+## Parallel Execution
 
-### Zero-Tolerance Enforcement
+When multiple independent operations are needed, launch them in parallel. MUST NOT run sequentially when parallel is possible.
 
-Pre-existing failures, stubs, naive fallbacks, and error-hiding are BLOCKED.
-See `zero-tolerance.md` and `no-stubs.md`. If you find it, you fix it.
+```
+DO: Agent(prompt="task A...") + Agent(prompt="task B...") in parallel
+DO NOT: Run task A, then task B sequentially
+```
+
+**Why:** Sequential execution wastes the autonomous execution multiplier.
 
 ## Cross-References
 
-- `zero-tolerance.md` — what MUST be fixed (not reported)
+- `zero-tolerance.md` — failures must be fixed, not reported
 - `no-stubs.md` — stub detection and enforcement
 - `security.md` — security review checklist
 - `git.md` — commit and branch workflow

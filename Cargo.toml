@@ -33,3 +33,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
 getrandom = "0.2"
+security-framework = "3"

@@ -1,6 +1,6 @@
 //! Keychain integration — service name derivation, read, and write.
 //!
-//! macOS: hex-encoded JSON via `security` CLI (CC compatibility).
+//! macOS: hex-encoded JSON via `security-framework` native API (CC compatibility).
 //! Linux/Windows: direct JSON via `keyring` crate (CC doesn't read
 //! keychain on these platforms).
 
@@ -65,97 +65,41 @@ pub fn read(config_dir: &Path) -> Option<CredentialFile> {
 }
 
 // ── macOS implementation ──────────────────────────────────────────────
-
-/// Keychain operation timeout in seconds (matches v1.x `subprocess.run(..., timeout=3)`).
-#[cfg(target_os = "macos")]
-const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Runs a `security` CLI command with a 3-second timeout.
-/// Returns stdout on success, PlatformError on failure or timeout.
-#[cfg(target_os = "macos")]
-fn run_security_command(args: &[&str]) -> Result<Vec<u8>, PlatformError> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("security")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| PlatformError::Keychain(format!("security command: {e}")))?;
-
-    // Poll with 100ms intervals up to the timeout
-    let poll_interval = std::time::Duration::from_millis(100);
-    let deadline = std::time::Instant::now() + KEYCHAIN_TIMEOUT;
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Child exited — read its output
-                let mut stdout = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if status.success() {
-                    return Ok(stdout);
-                } else {
-                    let mut stderr = String::new();
-                    if let Some(mut err) = child.stderr.take() {
-                        let _ = err.read_to_string(&mut stderr);
-                    }
-                    return Err(PlatformError::Keychain(format!(
-                        "security command failed: {stderr}"
-                    )));
-                }
-            }
-            Ok(None) => {
-                // Still running
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(PlatformError::Keychain(
-                        "keychain operation timed out (3s)".into(),
-                    ));
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => return Err(PlatformError::Keychain(format!("wait failed: {e}"))),
-        }
-    }
-}
+//
+// Uses the `security-framework` crate for native Keychain API access,
+// avoiding subprocess invocation and the C2 credential-exposure risk
+// (hex payload visible in `ps aux` when passed as a CLI argument).
 
 #[cfg(target_os = "macos")]
 fn write_impl(service: &str, creds: &CredentialFile) -> Result<(), PlatformError> {
+    use security_framework::passwords::{delete_generic_password, set_generic_password};
+
     let json = serde_json::to_string(creds)
         .map_err(|e| PlatformError::Keychain(format!("serialize: {e}")))?;
+    // Hex-encode for CC compatibility — CC reads hex-encoded JSON from the keychain.
     let hex_payload = hex::encode(json.as_bytes());
 
-    run_security_command(&[
-        "add-generic-password",
-        "-U",
-        "-s",
-        service,
-        "-a",
-        KEYCHAIN_ACCOUNT,
-        "-w",
-        &hex_payload,
-    ])?;
+    // Delete first to handle the "already exists" case (equivalent to `security -U`).
+    // Ignore the error: if the entry doesn't exist, the delete is a no-op.
+    let _ = delete_generic_password(service, KEYCHAIN_ACCOUNT);
+
+    set_generic_password(service, KEYCHAIN_ACCOUNT, hex_payload.as_bytes())
+        .map_err(|e| PlatformError::Keychain(format!("keychain write: {e}")))?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn read_impl(service: &str) -> Result<CredentialFile, PlatformError> {
-    let stdout = run_security_command(&[
-        "find-generic-password",
-        "-s",
-        service,
-        "-a",
-        KEYCHAIN_ACCOUNT,
-        "-w",
-    ])?;
+    use security_framework::passwords::get_generic_password;
 
-    let hex_payload = String::from_utf8_lossy(&stdout).trim().to_string();
-    let bytes = hex::decode(&hex_payload)
+    let password_bytes = get_generic_password(service, KEYCHAIN_ACCOUNT)
+        .map_err(|e| PlatformError::Keychain(format!("keychain read: {e}")))?;
+
+    let hex_payload = String::from_utf8(password_bytes)
+        .map_err(|e| PlatformError::Keychain(format!("utf8: {e}")))?;
+    let hex_payload = hex_payload.trim();
+
+    let bytes = hex::decode(hex_payload)
         .map_err(|e| PlatformError::Keychain(format!("hex decode: {e}")))?;
     let json = String::from_utf8(bytes)
         .map_err(|e| PlatformError::Keychain(format!("utf8: {e}")))?;

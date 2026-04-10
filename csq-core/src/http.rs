@@ -228,6 +228,50 @@ pub fn post_json_probe(
     Ok((status, text))
 }
 
+/// POSTs a JSON body with custom headers. Returns `(status, response_headers, body)`.
+///
+/// Like [`post_json_probe`] but also captures response headers. This
+/// is the transport behind the 3P usage poller: `POST /v1/messages`
+/// with `max_tokens=1` to extract `anthropic-ratelimit-*` headers.
+///
+/// Response headers are returned as a `HashMap<String, String>` with
+/// **lowercased** keys so callers can do case-insensitive lookup.
+///
+/// # Security
+///
+/// Same trust contract as [`post_json_probe`]: header name/value
+/// pairs MUST come from trusted sources. The API key is sent via
+/// `x-api-key` header, not in the URL — it does not appear in
+/// error strings. Response bodies may echo sensitive request data
+/// on error paths; callers should parse into typed structs and not
+/// log raw content.
+///
+/// # Errors
+///
+/// Returns `Err(String)` on connection failure, timeout, HTTPS
+/// rejection, or redirect overflow. A 4xx/5xx response is returned
+/// as `Ok(...)` so the caller can inspect both headers and status.
+pub fn post_json_with_headers(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<(u16, std::collections::HashMap<String, String>, String), String> {
+    let mut req = client().post(url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let response = req.body(body.to_string()).send().map_err(sanitize_err)?;
+
+    let status = response.status().as_u16();
+    let resp_headers: std::collections::HashMap<String, String> = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let text = response.text().map_err(sanitize_err)?;
+    Ok((status, resp_headers, text))
+}
+
 /// GETs a URL with a Bearer token and optional extra headers.
 /// Returns `(status_code, body_bytes)` on any HTTP response.
 ///

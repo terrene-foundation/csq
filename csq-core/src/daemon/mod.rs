@@ -40,7 +40,7 @@ pub use lifecycle::{status_of, stop_daemon, DaemonStatus};
 pub use paths::{pid_file_path, socket_path};
 pub use pid::PidFile;
 pub use refresher::{spawn as spawn_refresher, HttpPostFn, RefreshStatus, RefresherHandle};
-pub use usage_poller::{spawn as spawn_usage_poller, HttpGetFn, PollerHandle};
+pub use usage_poller::{spawn as spawn_usage_poller, HttpGetFn, HttpPostProbeFn, PollerHandle};
 
 #[cfg(unix)]
 pub use client::{

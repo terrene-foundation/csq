@@ -184,9 +184,14 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
                             http::get_bearer(url, token, headers)
                         });
+                    let http_post_probe: daemon::HttpPostProbeFn =
+                        Arc::new(|url: &str, headers: &[(String, String)], body: &str| {
+                            http::post_json_with_headers(url, headers, body)
+                        });
                     let usage_poller = daemon::spawn_usage_poller(
                         base_dir_for_runtime.clone(),
                         http_get,
+                        http_post_probe,
                         shutdown.clone(),
                     );
 

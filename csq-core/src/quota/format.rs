@@ -198,6 +198,7 @@ mod tests {
                 used_percentage: 15.0,
                 resets_at: 9999999999,
             }),
+            rate_limits: None,
             updated_at: 0.0,
         };
         let s = statusline_str(
@@ -218,6 +219,7 @@ mod tests {
                 resets_at: 9999999999,
             }),
             seven_day: None,
+            rate_limits: None,
             updated_at: 0.0,
         };
         let s = statusline_str(

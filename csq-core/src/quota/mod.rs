@@ -36,7 +36,62 @@ impl QuotaFile {
 pub struct AccountQuota {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
+    /// Rate-limit data from 3P providers (extracted from response headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<RateLimitData>,
     pub updated_at: f64,
+}
+
+/// Rate-limit data extracted from `anthropic-ratelimit-*` response headers.
+///
+/// 3P providers (Z.AI, MiniMax) return these headers on every API call.
+/// We poll with a minimal `max_tokens=1` request to capture them without
+/// consuming real quota.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitData {
+    pub requests_limit: Option<u64>,
+    pub requests_remaining: Option<u64>,
+    pub tokens_limit: Option<u64>,
+    pub tokens_remaining: Option<u64>,
+    pub input_tokens_limit: Option<u64>,
+    pub output_tokens_limit: Option<u64>,
+}
+
+impl RateLimitData {
+    /// Returns `true` if at least one rate-limit field was populated.
+    pub fn has_data(&self) -> bool {
+        self.requests_limit.is_some()
+            || self.requests_remaining.is_some()
+            || self.tokens_limit.is_some()
+            || self.tokens_remaining.is_some()
+            || self.input_tokens_limit.is_some()
+            || self.output_tokens_limit.is_some()
+    }
+
+    /// Computes token usage as a percentage (0.0–100.0).
+    ///
+    /// Uses `(limit - remaining) / limit * 100`. Returns `None` if
+    /// both `tokens_limit` and `tokens_remaining` are missing.
+    pub fn token_usage_pct(&self) -> Option<f64> {
+        match (self.tokens_limit, self.tokens_remaining) {
+            (Some(limit), Some(remaining)) if limit > 0 => {
+                let used = limit.saturating_sub(remaining);
+                Some(used as f64 / limit as f64 * 100.0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Computes request usage as a percentage (0.0–100.0).
+    pub fn request_usage_pct(&self) -> Option<f64> {
+        match (self.requests_limit, self.requests_remaining) {
+            (Some(limit), Some(remaining)) if limit > 0 => {
+                let used = limit.saturating_sub(remaining);
+                Some(used as f64 / limit as f64 * 100.0)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl AccountQuota {
@@ -87,6 +142,7 @@ mod tests {
                 used_percentage: 50.0,
                 resets_at: 2000,
             }),
+            rate_limits: None,
             updated_at: 500.0,
         };
 
@@ -109,6 +165,7 @@ mod tests {
                 used_percentage: 50.0,
                 resets_at: 10000,
             }),
+            rate_limits: None,
             updated_at: 500.0,
         };
 
@@ -125,6 +182,7 @@ mod tests {
                 resets_at: 5000,
             }),
             seven_day: None,
+            rate_limits: None,
             updated_at: 0.0,
         };
 
@@ -142,6 +200,7 @@ mod tests {
             AccountQuota {
                 five_hour: None,
                 seven_day: None,
+                rate_limits: None,
                 updated_at: 123.0,
             },
         );

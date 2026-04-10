@@ -141,6 +141,7 @@ mod tests {
                     resets_at,
                 }),
                 seven_day: None,
+                rate_limits: None,
                 updated_at: 0.0,
             },
         );

@@ -146,6 +146,7 @@ pub fn update_quota(
         AccountQuota {
             five_hour,
             seven_day,
+            rate_limits: None,
             updated_at: now,
         },
     );
@@ -194,6 +195,7 @@ mod tests {
                     resets_at: 9999999999,
                 }),
                 seven_day: None,
+                rate_limits: None,
                 updated_at: 100.0,
             },
         );
@@ -217,6 +219,7 @@ mod tests {
                     resets_at: 1000,
                 }),
                 seven_day: None,
+                rate_limits: None,
                 updated_at: 0.0,
             },
         );

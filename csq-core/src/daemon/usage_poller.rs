@@ -52,7 +52,8 @@
 
 use crate::accounts::{discovery, AccountSource};
 use crate::credentials::{self, file as cred_file};
-use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+use crate::providers::settings::load_settings;
+use crate::quota::{state as quota_state, AccountQuota, QuotaFile, RateLimitData, UsageWindow};
 use crate::types::AccountNum;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -80,11 +81,34 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Beta header value required for the usage endpoint.
 const ANTHROPIC_BETA_HEADER: &str = "oauth-2025-04-20";
 
+/// Default interval between 3P poller ticks: 15 minutes.
+pub const POLL_INTERVAL_3P: Duration = Duration::from_secs(900);
+
+/// Anthropic API version header for 3P probe requests.
+const ANTHROPIC_VERSION_HEADER: &str = "2023-06-01";
+
+/// Minimal probe request body: `max_tokens=1` to minimize cost.
+const PROBE_BODY: &str = r#"{"model":"claude-sonnet-4-20250514","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+
+/// Rate-limit header prefix. All 3P rate-limit headers start with this.
+const RATELIMIT_PREFIX: &str = "anthropic-ratelimit-";
+
 /// HTTP transport closure for the usage GET. Takes `(url, bearer_token,
 /// extra_headers)` and returns `(status, body_bytes)`. Production
 /// callers pass `http::get_bearer`; tests pass a mock.
 pub type HttpGetFn = Arc<
     dyn Fn(&str, &str, &[(&str, &str)]) -> Result<(u16, Vec<u8>), String> + Send + Sync + 'static,
+>;
+
+/// HTTP transport closure for the 3P usage probe POST. Takes
+/// `(url, headers, body)` and returns `(status, response_headers, body)`.
+/// Production callers pass `http::post_json_with_headers`; tests pass
+/// a mock. Response headers have lowercase keys.
+pub type HttpPostProbeFn = Arc<
+    dyn Fn(&str, &[(String, String)], &str) -> Result<(u16, HashMap<String, String>, String), String>
+        + Send
+        + Sync
+        + 'static,
 >;
 
 /// Handle to a running usage poller task.
@@ -93,69 +117,103 @@ pub struct PollerHandle {
 }
 
 /// Spawns the usage poller task on the current tokio runtime.
+///
+/// Polls Anthropic accounts every 5 minutes and 3P accounts every
+/// 15 minutes, using separate transport closures for each.
 pub fn spawn(
     base_dir: PathBuf,
     http_get: HttpGetFn,
+    http_post_probe: HttpPostProbeFn,
     shutdown: CancellationToken,
 ) -> PollerHandle {
-    spawn_with_config(base_dir, http_get, shutdown, POLL_INTERVAL, STARTUP_DELAY)
+    spawn_with_config(
+        base_dir,
+        http_get,
+        http_post_probe,
+        shutdown,
+        POLL_INTERVAL,
+        POLL_INTERVAL_3P,
+        STARTUP_DELAY,
+    )
 }
 
-/// Like [`spawn`] but with explicit interval + startup delay for testing.
+/// Like [`spawn`] but with explicit intervals + startup delay for testing.
 pub fn spawn_with_config(
     base_dir: PathBuf,
     http_get: HttpGetFn,
+    http_post_probe: HttpPostProbeFn,
     shutdown: CancellationToken,
     interval: Duration,
+    interval_3p: Duration,
     startup_delay: Duration,
 ) -> PollerHandle {
     let cooldowns: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let backoffs: Arc<Mutex<HashMap<u16, u32>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let join = tokio::spawn(async move {
-        run_loop(
+        run_loop(RunLoopConfig {
             base_dir,
             http_get,
+            http_post_probe,
             cooldowns,
             backoffs,
             shutdown,
             interval,
+            interval_3p,
             startup_delay,
-        )
+        })
         .await;
     });
 
     PollerHandle { join }
 }
 
-async fn run_loop(
+/// All state needed by the poller run loop.
+struct RunLoopConfig {
     base_dir: PathBuf,
     http_get: HttpGetFn,
+    http_post_probe: HttpPostProbeFn,
     cooldowns: Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs: Arc<Mutex<HashMap<u16, u32>>>,
     shutdown: CancellationToken,
     interval: Duration,
+    interval_3p: Duration,
     startup_delay: Duration,
-) {
-    info!(interval_secs = interval.as_secs(), "usage poller starting");
+}
+
+async fn run_loop(cfg: RunLoopConfig) {
+    info!(
+        anthropic_secs = cfg.interval.as_secs(),
+        thirdparty_secs = cfg.interval_3p.as_secs(),
+        "usage poller starting"
+    );
 
     tokio::select! {
-        _ = shutdown.cancelled() => {
+        _ = cfg.shutdown.cancelled() => {
             info!("usage poller cancelled during startup delay");
             return;
         }
-        _ = tokio::time::sleep(startup_delay) => {}
+        _ = tokio::time::sleep(cfg.startup_delay) => {}
     }
 
+    // Track when the 3P tick last ran so we can use the Anthropic
+    // interval as the main loop cadence.
+    let mut last_3p_tick = Instant::now() - cfg.interval_3p; // triggers on first loop
+
     loop {
-        tick(&base_dir, &http_get, &cooldowns, &backoffs).await;
+        tick(&cfg.base_dir, &cfg.http_get, &cfg.cooldowns, &cfg.backoffs).await;
+
+        if last_3p_tick.elapsed() >= cfg.interval_3p {
+            tick_3p(&cfg.base_dir, &cfg.http_post_probe, &cfg.cooldowns, &cfg.backoffs).await;
+            last_3p_tick = Instant::now();
+        }
 
         tokio::select! {
-            _ = shutdown.cancelled() => {
+            _ = cfg.shutdown.cancelled() => {
                 info!("usage poller cancelled, exiting loop");
                 return;
             }
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(cfg.interval) => {}
         }
     }
 }
@@ -403,12 +461,226 @@ fn write_usage_to_quota(
         AccountQuota {
             five_hour: usage.five_hour.clone(),
             seven_day: usage.seven_day.clone(),
+            rate_limits: None,
             updated_at: now,
         },
     );
 
     quota_state::save_state(base_dir, &quota)?;
     debug!(account = account.get(), "usage poller: quota file updated");
+    Ok(())
+}
+
+// ─── 3P (third-party) polling ─────────────────────────────
+
+/// Runs a single 3P usage poller tick.
+///
+/// Discovers 3P accounts (Z.AI, MiniMax), reads their API keys from
+/// settings files, sends a minimal `max_tokens=1` probe, and extracts
+/// `anthropic-ratelimit-*` headers from the response.
+pub(crate) async fn tick_3p(
+    base_dir: &std::path::Path,
+    http_post_probe: &HttpPostProbeFn,
+    cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
+) {
+    debug!("3P usage poller tick starting");
+
+    let accounts = discovery::discover_third_party(base_dir);
+
+    let mut polled = 0usize;
+    let mut skipped = 0usize;
+
+    for info in accounts {
+        let provider_id = match &info.source {
+            AccountSource::ThirdParty { provider } => provider_id_from_label(provider),
+            _ => continue,
+        };
+
+        let provider_id = match provider_id {
+            Some(id) => id,
+            None => continue,
+        };
+
+        // Cooldown check
+        if in_cooldown(cooldowns, info.id) {
+            skipped += 1;
+            continue;
+        }
+
+        // Load API key from settings file
+        let api_key = match load_3p_api_key(base_dir, provider_id) {
+            Some(key) => key,
+            None => {
+                debug!(account = info.id, provider = provider_id, "3P poller: no API key found");
+                continue;
+            }
+        };
+
+        // Load base URL from provider catalog
+        let base_url = match crate::providers::catalog::get_provider(provider_id) {
+            Some(p) => p.default_base_url.unwrap_or("https://api.anthropic.com"),
+            None => continue,
+        };
+
+        // Poll in spawn_blocking (blocking HTTP client)
+        let http = Arc::clone(http_post_probe);
+        let url = format!("{base_url}/v1/messages");
+        let poll_result = tokio::task::spawn_blocking(move || {
+            poll_3p_usage(&url, &api_key, &http)
+        })
+        .await;
+
+        match poll_result {
+            Ok(Ok(rate_limits)) => {
+                let base = base_dir.to_path_buf();
+                if let Err(e) = write_3p_usage_to_quota(&base, info.id, &rate_limits) {
+                    warn!(account = info.id, "3P poller: failed to write quota");
+                    let _ = e;
+                }
+                clear_cooldown(cooldowns, info.id);
+                clear_backoff(backoffs, info.id);
+                polled += 1;
+            }
+            Ok(Err(PollError::RateLimited)) => {
+                warn!(account = info.id, "3P poller: 429 rate limited");
+                increase_backoff(backoffs, info.id);
+                set_cooldown_with_backoff(cooldowns, backoffs, info.id);
+            }
+            Ok(Err(PollError::Unauthorized)) => {
+                warn!(account = info.id, "3P poller: 401 unauthorized");
+                set_cooldown(cooldowns, info.id);
+            }
+            Ok(Err(PollError::Transport(_))) => {
+                debug!(account = info.id, "3P poller: transport error");
+                set_cooldown(cooldowns, info.id);
+            }
+            Ok(Err(PollError::Parse(_))) => {
+                debug!(account = info.id, "3P poller: parse error");
+                set_cooldown(cooldowns, info.id);
+            }
+            Ok(Err(PollError::HttpError(status))) => {
+                debug!(account = info.id, status, "3P poller: non-200 response");
+                set_cooldown(cooldowns, info.id);
+            }
+            Err(_join_err) => {
+                warn!(account = info.id, "3P poller: task panicked");
+                set_cooldown(cooldowns, info.id);
+            }
+        }
+    }
+
+    debug!(polled, skipped, "3P usage poller tick complete");
+}
+
+/// Maps a 3P provider display label to its catalog ID.
+fn provider_id_from_label(label: &str) -> Option<&'static str> {
+    match label {
+        "Z.AI" => Some("zai"),
+        "MiniMax" => Some("mm"),
+        _ => None,
+    }
+}
+
+/// Loads the API key for a 3P provider from its settings file.
+fn load_3p_api_key(base_dir: &std::path::Path, provider_id: &str) -> Option<String> {
+    let settings = load_settings(base_dir, provider_id).ok()?;
+    settings.get_api_key().map(|s| s.to_string())
+}
+
+/// Polls a 3P provider by sending a minimal `max_tokens=1` request.
+///
+/// Extracts `anthropic-ratelimit-*` headers from the response (even
+/// on error responses, since 3P providers often include rate-limit
+/// headers on 4xx).
+pub(crate) fn poll_3p_usage(
+    url: &str,
+    api_key: &str,
+    http_post: &HttpPostProbeFn,
+) -> Result<RateLimitData, PollError> {
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("x-api-key".to_string(), api_key.to_string()),
+        ("anthropic-version".to_string(), ANTHROPIC_VERSION_HEADER.to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+    ];
+
+    let (status, resp_headers, _body) = http_post(url, &headers, PROBE_BODY)
+        .map_err(PollError::Transport)?;
+
+    // Extract rate-limit headers even on non-200 responses
+    let rate_limits = extract_rate_limit_headers(&resp_headers);
+
+    // If we got rate-limit data, return it regardless of status
+    if rate_limits.has_data() {
+        return Ok(rate_limits);
+    }
+
+    // No rate-limit headers — classify by status
+    match status {
+        200..=299 => Ok(rate_limits), // empty but successful
+        429 => Err(PollError::RateLimited),
+        401 => Err(PollError::Unauthorized),
+        other => Err(PollError::HttpError(other)),
+    }
+}
+
+/// Extracts `anthropic-ratelimit-*` headers into a [`RateLimitData`].
+///
+/// Header keys must be lowercase (as returned by `http::post_json_with_headers`).
+pub(crate) fn extract_rate_limit_headers(headers: &HashMap<String, String>) -> RateLimitData {
+    let get_u64 = |suffix: &str| -> Option<u64> {
+        headers
+            .get(&format!("{RATELIMIT_PREFIX}{suffix}"))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+
+    RateLimitData {
+        requests_limit: get_u64("requests-limit"),
+        requests_remaining: get_u64("requests-remaining"),
+        tokens_limit: get_u64("tokens-limit"),
+        tokens_remaining: get_u64("tokens-remaining"),
+        input_tokens_limit: get_u64("input-tokens-limit"),
+        output_tokens_limit: get_u64("output-tokens-limit"),
+    }
+}
+
+/// Writes 3P rate-limit data into the local `quota.json`.
+fn write_3p_usage_to_quota(
+    base_dir: &std::path::Path,
+    account_id: u16,
+    rate_limits: &RateLimitData,
+) -> Result<(), crate::error::CsqError> {
+    let mut quota = quota_state::load_state(base_dir)
+        .unwrap_or_else(|_| QuotaFile::empty());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    // Compute token usage percentage for the five_hour display slot
+    // so that existing statusline formatting works for 3P accounts.
+    // Use far-future resets_at so clear_expired() never removes it;
+    // the poller refreshes every 15 min so stale data is replaced
+    // naturally.
+    let five_hour = rate_limits.token_usage_pct().map(|pct| UsageWindow {
+        used_percentage: pct,
+        resets_at: 4_102_444_800, // 2100-01-01T00:00:00Z
+    });
+
+    quota.set(
+        account_id,
+        AccountQuota {
+            five_hour,
+            seven_day: None,
+            rate_limits: Some(rate_limits.clone()),
+            updated_at: now,
+        },
+    );
+
+    quota_state::save_state(base_dir, &quota)?;
+    debug!(account = account_id, "3P poller: quota file updated");
     Ok(())
 }
 
@@ -704,5 +976,378 @@ mod tests {
         tick(dir.path(), &http, &cooldowns, &backoffs).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(!in_cooldown(&cooldowns, 1));
+    }
+
+    // ─── 3P polling tests ───────────────────────────────────
+
+    fn install_3p_account(base: &std::path::Path, provider: &str, key: &str) {
+        let filename = match provider {
+            "zai" => "settings-zai.json",
+            "mm" => "settings-mm.json",
+            _ => panic!("unknown provider"),
+        };
+        // Discovery checks for top-level ANTHROPIC_AUTH_TOKEN.
+        // ProviderSettings::get_api_key() reads from env.ANTHROPIC_AUTH_TOKEN.
+        // Write both locations so discovery finds the account AND the
+        // API key is loadable.
+        let content = format!(
+            r#"{{"ANTHROPIC_AUTH_TOKEN":"{}","ANTHROPIC_BASE_URL":"https://api.example.com","env":{{"ANTHROPIC_AUTH_TOKEN":"{}","ANTHROPIC_BASE_URL":"https://api.example.com"}}}}"#,
+            key, key
+        );
+        std::fs::write(base.join(filename), content).unwrap();
+    }
+
+    fn mock_3p_success(counter: Arc<AtomicU32>) -> HttpPostProbeFn {
+        Arc::new(
+            move |_url: &str, _headers: &[(String, String)], _body: &str| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut headers = HashMap::new();
+                headers.insert(
+                    "anthropic-ratelimit-requests-limit".to_string(),
+                    "1000".to_string(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-requests-remaining".to_string(),
+                    "800".to_string(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-tokens-limit".to_string(),
+                    "100000".to_string(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-tokens-remaining".to_string(),
+                    "60000".to_string(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-input-tokens-limit".to_string(),
+                    "50000".to_string(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-output-tokens-limit".to_string(),
+                    "50000".to_string(),
+                );
+                Ok((200, headers, r#"{"id":"msg_test"}"#.to_string()))
+            },
+        )
+    }
+
+    fn mock_3p_429(counter: Arc<AtomicU32>) -> HttpPostProbeFn {
+        Arc::new(
+            move |_url: &str, _headers: &[(String, String)], _body: &str| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // 429 with no rate-limit headers
+                Ok((429, HashMap::new(), "rate limited".to_string()))
+            },
+        )
+    }
+
+    fn mock_3p_401(counter: Arc<AtomicU32>) -> HttpPostProbeFn {
+        Arc::new(
+            move |_url: &str, _headers: &[(String, String)], _body: &str| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok((401, HashMap::new(), "unauthorized".to_string()))
+            },
+        )
+    }
+
+    fn mock_3p_429_with_headers(counter: Arc<AtomicU32>) -> HttpPostProbeFn {
+        Arc::new(
+            move |_url: &str, _headers: &[(String, String)], _body: &str| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut headers = HashMap::new();
+                headers.insert(
+                    "anthropic-ratelimit-tokens-limit".to_string(),
+                    "100000".to_string(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-tokens-remaining".to_string(),
+                    "0".to_string(),
+                );
+                Ok((429, headers, "rate limited".to_string()))
+            },
+        )
+    }
+
+    // ─── extract_rate_limit_headers tests ────────────────────
+
+    #[test]
+    fn extract_full_rate_limit_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-ratelimit-requests-limit".into(), "1000".into());
+        headers.insert("anthropic-ratelimit-requests-remaining".into(), "800".into());
+        headers.insert("anthropic-ratelimit-tokens-limit".into(), "100000".into());
+        headers.insert("anthropic-ratelimit-tokens-remaining".into(), "60000".into());
+        headers.insert("anthropic-ratelimit-input-tokens-limit".into(), "50000".into());
+        headers.insert("anthropic-ratelimit-output-tokens-limit".into(), "50000".into());
+
+        let rl = extract_rate_limit_headers(&headers);
+        assert_eq!(rl.requests_limit, Some(1000));
+        assert_eq!(rl.requests_remaining, Some(800));
+        assert_eq!(rl.tokens_limit, Some(100000));
+        assert_eq!(rl.tokens_remaining, Some(60000));
+        assert_eq!(rl.input_tokens_limit, Some(50000));
+        assert_eq!(rl.output_tokens_limit, Some(50000));
+        assert!(rl.has_data());
+    }
+
+    #[test]
+    fn extract_partial_rate_limit_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-ratelimit-tokens-limit".into(), "100000".into());
+        headers.insert("anthropic-ratelimit-tokens-remaining".into(), "75000".into());
+
+        let rl = extract_rate_limit_headers(&headers);
+        assert_eq!(rl.tokens_limit, Some(100000));
+        assert_eq!(rl.tokens_remaining, Some(75000));
+        assert!(rl.requests_limit.is_none());
+        assert!(rl.has_data());
+    }
+
+    #[test]
+    fn extract_empty_headers() {
+        let headers = HashMap::new();
+        let rl = extract_rate_limit_headers(&headers);
+        assert!(!rl.has_data());
+    }
+
+    #[test]
+    fn extract_ignores_non_numeric() {
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-ratelimit-tokens-limit".into(), "not_a_number".into());
+
+        let rl = extract_rate_limit_headers(&headers);
+        assert!(rl.tokens_limit.is_none());
+        assert!(!rl.has_data());
+    }
+
+    // ─── RateLimitData helper tests ─────────────────────────
+
+    #[test]
+    fn token_usage_pct_computes_correctly() {
+        let rl = RateLimitData {
+            requests_limit: None,
+            requests_remaining: None,
+            tokens_limit: Some(100000),
+            tokens_remaining: Some(60000),
+            input_tokens_limit: None,
+            output_tokens_limit: None,
+        };
+        let pct = rl.token_usage_pct().unwrap();
+        assert!((pct - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn token_usage_pct_fully_used() {
+        let rl = RateLimitData {
+            requests_limit: None,
+            requests_remaining: None,
+            tokens_limit: Some(100000),
+            tokens_remaining: Some(0),
+            input_tokens_limit: None,
+            output_tokens_limit: None,
+        };
+        let pct = rl.token_usage_pct().unwrap();
+        assert!((pct - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn token_usage_pct_none_when_missing() {
+        let rl = RateLimitData {
+            requests_limit: Some(1000),
+            requests_remaining: Some(800),
+            tokens_limit: None,
+            tokens_remaining: None,
+            input_tokens_limit: None,
+            output_tokens_limit: None,
+        };
+        assert!(rl.token_usage_pct().is_none());
+    }
+
+    #[test]
+    fn request_usage_pct_computes_correctly() {
+        let rl = RateLimitData {
+            requests_limit: Some(1000),
+            requests_remaining: Some(800),
+            tokens_limit: None,
+            tokens_remaining: None,
+            input_tokens_limit: None,
+            output_tokens_limit: None,
+        };
+        let pct = rl.request_usage_pct().unwrap();
+        assert!((pct - 20.0).abs() < 0.01);
+    }
+
+    // ─── poll_3p_usage unit tests ───────────────────────────
+
+    #[test]
+    fn poll_3p_success_extracts_headers() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_success(Arc::clone(&counter));
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        assert!(result.is_ok());
+        let rl = result.unwrap();
+        assert_eq!(rl.tokens_limit, Some(100000));
+        assert_eq!(rl.tokens_remaining, Some(60000));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poll_3p_429_no_headers_returns_ratelimited() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_429(Arc::clone(&counter));
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        assert!(matches!(result, Err(PollError::RateLimited)));
+    }
+
+    #[test]
+    fn poll_3p_429_with_headers_returns_data() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_429_with_headers(Arc::clone(&counter));
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        // Even on 429, if headers are present, return them
+        assert!(result.is_ok());
+        let rl = result.unwrap();
+        assert_eq!(rl.tokens_remaining, Some(0));
+    }
+
+    #[test]
+    fn poll_3p_401_returns_unauthorized() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_401(Arc::clone(&counter));
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        assert!(matches!(result, Err(PollError::Unauthorized)));
+    }
+
+    #[test]
+    fn poll_3p_transport_error() {
+        let http: HttpPostProbeFn = Arc::new(
+            |_url: &str, _headers: &[(String, String)], _body: &str| {
+                Err("connection refused".to_string())
+            },
+        );
+        let result = poll_3p_usage("https://api.example.com/v1/messages", "test-key", &http);
+        assert!(matches!(result, Err(PollError::Transport(_))));
+    }
+
+    // ─── tick_3p integration tests ──────────────────────────
+
+    #[tokio::test]
+    async fn tick_3p_polls_and_writes_quota() {
+        let dir = TempDir::new().unwrap();
+        install_3p_account(dir.path(), "zai", "test-api-key");
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_success(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick_3p(dir.path(), &http, &cooldowns, &backoffs).await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "exactly one HTTP POST");
+
+        // Verify quota was written
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        let q = quota.get(901).expect("Z.AI account 901 should have quota");
+        // tokens: 100000 limit, 60000 remaining → 40% used
+        assert!((q.five_hour_pct() - 40.0).abs() < 0.01);
+        assert!(q.rate_limits.is_some());
+        let rl = q.rate_limits.as_ref().unwrap();
+        assert_eq!(rl.tokens_limit, Some(100000));
+    }
+
+    #[tokio::test]
+    async fn tick_3p_429_enters_cooldown() {
+        let dir = TempDir::new().unwrap();
+        install_3p_account(dir.path(), "zai", "test-api-key");
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_429(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick_3p(dir.path(), &http, &cooldowns, &backoffs).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(in_cooldown(&cooldowns, 901));
+
+        // Second tick: cooldown blocks the poll
+        tick_3p(dir.path(), &http, &cooldowns, &backoffs).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "cooldown should suppress");
+    }
+
+    #[tokio::test]
+    async fn tick_3p_no_accounts_does_nothing() {
+        let dir = TempDir::new().unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_success(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick_3p(dir.path(), &http, &cooldowns, &backoffs).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn tick_3p_multiple_providers() {
+        let dir = TempDir::new().unwrap();
+        install_3p_account(dir.path(), "zai", "zai-key");
+        install_3p_account(dir.path(), "mm", "mm-key");
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_3p_success(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick_3p(dir.path(), &http, &cooldowns, &backoffs).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "both providers polled");
+
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        assert!(quota.get(901).is_some(), "Z.AI should have quota");
+        assert!(quota.get(902).is_some(), "MiniMax should have quota");
+    }
+
+    // ─── quota round-trip with rate_limits field ────────────
+
+    #[test]
+    fn quota_rate_limits_serialization_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let mut qf = QuotaFile::empty();
+        qf.set(
+            901,
+            AccountQuota {
+                five_hour: Some(UsageWindow {
+                    used_percentage: 40.0,
+                    resets_at: 4_102_444_800,
+                }),
+                seven_day: None,
+                rate_limits: Some(RateLimitData {
+                    requests_limit: Some(1000),
+                    requests_remaining: Some(800),
+                    tokens_limit: Some(100000),
+                    tokens_remaining: Some(60000),
+                    input_tokens_limit: Some(50000),
+                    output_tokens_limit: Some(50000),
+                }),
+                updated_at: 100.0,
+            },
+        );
+
+        quota_state::save_state(dir.path(), &qf).unwrap();
+        let loaded = quota_state::load_state(dir.path()).unwrap();
+
+        let q = loaded.get(901).expect("account 901 should exist");
+        let rl = q.rate_limits.as_ref().expect("rate_limits should exist");
+        assert_eq!(rl.tokens_limit, Some(100000));
+        assert_eq!(rl.tokens_remaining, Some(60000));
+        assert!((q.five_hour_pct() - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn quota_without_rate_limits_deserializes() {
+        // Backward compat: old quota.json without rate_limits field
+        let json = r#"{"accounts":{"1":{"five_hour":{"used_percentage":42.0,"resets_at":9999999999},"seven_day":null,"updated_at":100.0}}}"#;
+        let qf: QuotaFile = serde_json::from_str(json).unwrap();
+        let q = qf.get(1).unwrap();
+        assert!(q.rate_limits.is_none());
+        assert!((q.five_hour_pct() - 42.0).abs() < 0.01);
     }
 }

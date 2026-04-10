@@ -162,6 +162,7 @@ mod tests {
                     resets_at: 9999999999,
                 }),
                 seven_day: None,
+                rate_limits: None,
                 updated_at: 0.0,
             },
         );

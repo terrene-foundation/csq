@@ -69,7 +69,7 @@ This creates `~/.claude/settings-ollama.json` with:
 }
 ```
 
-Edit `~/.claude/settings-ollama.json` to change the model — replace `qwen3:latest` with your preferred model name (e.g., `gemma4`, `glm-4.7-flash`, `qwen3.5`).
+To change the model: `csq models ollama <model-name>` (or edit `~/.claude/settings-ollama.json` manually).
 
 ### Run
 
@@ -99,9 +99,9 @@ Creates `~/.claude/settings-mm.json` with:
 csq run 1 -p mm              # start CC routed through MiniMax
 ```
 
-To change the model, edit `~/.claude/settings-mm.json` — replace `MiniMax-M2.7-highspeed` in all model fields.
+To change the model: `csq models mm <model-name>` (or edit `~/.claude/settings-mm.json` manually).
 
-### Z.AI (GLM-4.7)
+### Z.AI (GLM-5.1)
 
 ```bash
 csq setkey zai               # prompts for your Z.AI API key (hidden input)
@@ -109,12 +109,11 @@ csq setkey zai               # prompts for your Z.AI API key (hidden input)
 
 Creates `~/.claude/settings-zai.json` with:
 
-| Setting                      | Value                            |
-| ---------------------------- | -------------------------------- |
-| `ANTHROPIC_BASE_URL`         | `https://api.z.ai/api/anthropic` |
-| `ANTHROPIC_MODEL`            | `glm-4.7`                        |
-| `ANTHROPIC_SMALL_FAST_MODEL` | `glm-4.5-air`                    |
-| Other model aliases          | `glm-4.7`                        |
+| Setting              | Value                            |
+| -------------------- | -------------------------------- |
+| `ANTHROPIC_BASE_URL` | `https://api.z.ai/api/anthropic` |
+| `ANTHROPIC_MODEL`    | `glm-5.1`                        |
+| All model aliases    | `glm-5.1`                        |
 
 ```bash
 csq run 1 -p zai             # start CC routed through Z.AI
@@ -148,6 +147,25 @@ Your default settings are never modified. Each terminal gets a fresh settings sn
 csq listkeys                 # show configured providers with masked key fingerprints
 csq rmkey zai                # remove a profile entirely
 ```
+
+### Model management
+
+```bash
+csq models                   # show all profiles + current models
+csq models zai               # list available models for Z.AI
+csq models zai glm-4.7       # switch zai to a different model
+csq models ollama            # list locally installed ollama models
+```
+
+When a newer model is available, `csq models` shows an update indicator:
+
+```
+Profile      Model                          Status
+zai          glm-4.7                        (update: glm-5.1)
+mm           MiniMax-M2.7-highspeed         (latest)
+```
+
+The model catalog updates automatically — csq auto-updates from GitHub on every `csq run` (silently, in the background, with a 3s timeout for offline safety).
 
 ## Model performance and COC compliance
 
@@ -231,12 +249,19 @@ Deliberately asks the model to violate a rule. The critical differentiator betwe
 ### Running the benchmark yourself
 
 ```bash
+# 100-point governance benchmark (rule obedience)
 python3 test-coc-bench.py mm "MiniMax M2.7"                        # both rubrics
-python3 test-coc-bench.py mm "MiniMax M2.7" --rubric adversarial   # adversarial only
+python3 test-coc-bench.py zai "Z.AI GLM-5.1"                       # Z.AI
 python3 test-coc-bench.py ollama "gemma4" --model-override gemma4:latest
+
+# 200-point implementation eval (coding capability under COC)
+python3 coc-eval/runner.py default "Claude Opus 4.6" --mode full    # COC + bare comparison
+python3 coc-eval/runner.py zai "Z.AI GLM-5.1" --mode coc-only      # COC-only
+python3 coc-eval/runner.py default "Claude Opus" --tests EVAL-A004  # specific test
+python3 coc-eval/runner.py default "Claude Opus" --mode ablation --ablation-group no-rules
 ```
 
-The benchmark uses `coc-env/` as the reference environment — a full COC-py directory with all artifacts loaded. The harness resets the environment between tests and captures file artifacts to verify what was actually written.
+Both benchmarks use `coc-env/` as the reference environment. The harness resets between tests and captures file artifacts to verify what was actually written. The implementation eval (`coc-eval/`) tests 5 real-world scenarios: hook security audit, cross-feature interaction bugs, deny-by-default RBAC, sync merge classification, and timing side-channel detection.
 
 ## Multi-account rotation (Claude Max)
 

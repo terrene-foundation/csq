@@ -13,7 +13,13 @@ fn sanitize_body(body: &str) -> String {
 }
 
 /// Replaces token-like strings (sk-ant-oat01-... / sk-ant-ort01-...) with [REDACTED].
-fn redact_tokens(s: &str) -> String {
+///
+/// Exposed `pub` so modules outside this file can redact user-facing
+/// error strings before they reach tracing, the IPC cache, or error
+/// messages. Used by `credentials::refresh` to scrub serde_json parse
+/// errors that may echo a fragment of the OAuth form body on
+/// malformed response bodies.
+pub fn redact_tokens(s: &str) -> String {
     let mut result = s.to_string();
     for prefix in ["sk-ant-oat01-", "sk-ant-ort01-"] {
         while let Some(start) = result.find(prefix) {

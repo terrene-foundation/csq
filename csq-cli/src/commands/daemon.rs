@@ -1,19 +1,28 @@
 //! `csq daemon start/stop/status` — background daemon lifecycle.
 //!
-//! # M8.3 scope
+//! # M8.4 scope
 //!
-//! The daemon now runs a Unix-socket HTTP server alongside the PID
-//! file. Clients can reach `GET /api/health` to verify the daemon
-//! is live. Background refresher and usage poller land in M8.4; the
-//! wider HTTP API (accounts, usage, refresh, OAuth callback) lands
-//! in M8.5; CLI delegation (status/statusline/swap) lands in M8.6.
+//! The daemon now runs three subsystems:
+//!
+//! 1. **Unix-socket IPC server** serving `GET /api/health` (M8.3).
+//! 2. **Background token refresher** that wakes every 5 minutes,
+//!    discovers Anthropic accounts, and refreshes any whose access
+//!    token expires within 2 hours (this slice). Updates a shared
+//!    `RefreshStatus` cache that M8.5 routes will read from.
+//! 3. **Future HTTP API routes** reading from the cache (M8.5).
+//!
+//! All three share a single `CancellationToken` — on SIGTERM the
+//! daemon cancels, the refresher exits its loop, the server drains,
+//! and the PID file is cleaned up via `PidFile::Drop`.
 //!
 //! Still foreground-only. Backgrounding will happen when the daemon
 //! is hosted inside the Tauri tray app (M8.6).
 
 use anyhow::{Context, Result};
 use csq_core::daemon::{self, DaemonStatus, PidFile};
+use csq_core::http;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Runs `csq daemon start` in the foreground.
 ///
@@ -52,13 +61,26 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
         .build()
         .context("failed to build tokio runtime for daemon")?;
 
+    let base_dir_for_runtime = base_dir.to_path_buf();
     rt.block_on(async move {
         // Bind the Unix socket + axum router.
         #[cfg(unix)]
         {
             match daemon::serve(&sock_path).await {
-                Ok((server, join)) => {
+                Ok((server, server_join)) => {
                     tracing::info!("IPC server bound at {}", sock_path.display());
+
+                    // Start the background refresher, sharing the
+                    // server's shutdown token so both subsystems
+                    // exit on the same signal.
+                    let http_post: daemon::HttpPostFn =
+                        Arc::new(|url: &str, body: &str| http::post_form(url, body));
+                    let refresher = daemon::spawn_refresher(
+                        base_dir_for_runtime.clone(),
+                        http_post,
+                        server.shutdown_token(),
+                    );
+                    let _refresh_cache = Arc::clone(&refresher.cache);
 
                     // Block until SIGTERM/SIGINT arrives.
                     wait_for_shutdown().await;
@@ -66,8 +88,25 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     eprintln!("csq daemon stopping...");
                     server.shutdown();
 
+                    // Await the refresher with a 5s deadline so a
+                    // stuck HTTP call can't block shutdown.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        refresher.join,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => tracing::info!("refresher stopped cleanly"),
+                        Ok(Err(e)) => tracing::warn!(error = %e, "refresher task panicked"),
+                        Err(_) => tracing::warn!("refresher did not stop within 5s deadline"),
+                    }
+
                     // Give the accept loop up to 5s to exit.
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        server_join,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     // Bind failure is fatal — the daemon can't do
@@ -86,6 +125,7 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                 "warning: Unix-socket IPC server not available on this platform — \
                  Windows named-pipe support lands in M8.6"
             );
+            let _ = base_dir_for_runtime;
             wait_for_shutdown().await;
         }
         Ok(())

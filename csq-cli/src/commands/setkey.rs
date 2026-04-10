@@ -4,7 +4,7 @@
 //! shell history).
 
 use anyhow::{anyhow, Result};
-use csq_core::providers;
+use csq_core::{http, providers};
 use std::io::Read;
 use std::path::Path;
 
@@ -60,20 +60,19 @@ pub fn handle(base_dir: &Path, provider_id: &str, key_arg: Option<&str>) -> Resu
     Ok(())
 }
 
-/// Sends a validation probe using the standard library (no reqwest).
-/// Uses a minimal TCP + TLS handshake via `ureq`-like logic — for now
-/// this is a placeholder that returns `Unreachable` until the HTTP
-/// client is wired in M8. The probe infrastructure exists and is tested;
-/// only the transport is deferred.
+/// Sends a validation probe via the shared blocking HTTP client.
+///
+/// Delegates to `providers::validate::validate_key` with a closure that
+/// wraps `csq_core::http::post_json_probe`. The probe logic (endpoint
+/// selection, header construction, response classification) is pure
+/// and already unit-tested; this function is the thin IO wrapper.
 fn validate_key(
-    _provider: &providers::Provider,
-    _key: &str,
+    provider: &providers::Provider,
+    key: &str,
 ) -> providers::validate::ValidationResult {
-    // TODO (M8): implement via ureq or reqwest. Until then, skip validation
-    // silently so setkey still works for local settings storage.
-    providers::validate::ValidationResult::Unreachable(
-        "HTTP validation will be enabled in M8".into(),
-    )
+    providers::validate::validate_key(provider, key, |url, headers, body| {
+        http::post_json_probe(url, headers, body)
+    })
 }
 
 /// Reads an API key from stdin with a hard size limit.

@@ -118,11 +118,11 @@ def _start_mock_server():
 # ─── Tier 1: Polling interval constants ──────────────────
 
 
-def test_anthropic_poll_interval_is_at_least_600():
-    """Anthropic polling must be at least 600s (10 min) to avoid 429s."""
+def test_anthropic_poll_interval_is_at_least_300():
+    """Anthropic polling must be at least 300s (5 min) to match claude.ai."""
     assert (
-        ANTHROPIC_POLL_INTERVAL >= 600
-    ), f"Anthropic poll interval {ANTHROPIC_POLL_INTERVAL}s is too aggressive, must be >= 600s"
+        ANTHROPIC_POLL_INTERVAL >= 300
+    ), f"Anthropic poll interval {ANTHROPIC_POLL_INTERVAL}s is too aggressive, must be >= 300s"
 
 
 def test_3p_poll_interval_is_at_least_900():

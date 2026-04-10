@@ -7,10 +7,14 @@ Serves the dashboard UI and API endpoints using stdlib http.server.
 Endpoints:
     GET  /                          → static/index.html
     GET  /static/{file}             → static files (css, js)
-    GET  /api/accounts              → list all accounts with usage
+    GET  /api/accounts              → list all accounts with usage + token health
     GET  /api/account/{id}/usage    → detailed usage for one account
     GET  /api/refresh               → force refresh all accounts
+    GET  /api/tokens                → token health for all accounts
+    GET  /api/login/{N}             → start OAuth login flow for account N
+    GET  /oauth/callback            → OAuth redirect handler
     POST /api/accounts              → add a manual account
+    POST /api/refresh-token/{id}    → manually trigger token refresh
 
 Binds to 127.0.0.1 only (local access). No authentication required
 since it runs locally on the developer's machine.
@@ -30,7 +34,9 @@ from urllib.parse import urlparse
 
 from .accounts import AccountInfo, discover_all_accounts, save_manual_account
 from .cache import UsageCache
+from .oauth import OAuthLogin
 from .poller import UsagePoller
+from .refresher import TokenRefresher
 
 # Static files directory
 STATIC_DIR = Path(__file__).parent / "static"
@@ -73,6 +79,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_404()
         elif path == "/api/refresh":
             self._handle_api_refresh()
+        elif path == "/api/tokens":
+            self._handle_api_tokens()
+        elif path.startswith("/api/login/"):
+            # Extract account number from /api/login/{N}
+            account_num_str = path[len("/api/login/") :]
+            self._handle_api_login(account_num_str)
+        elif path == "/oauth/callback":
+            self._handle_oauth_callback(parsed)
         else:
             self._send_404()
 
@@ -82,16 +96,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/accounts":
             self._handle_post_account()
+        elif path.startswith("/api/refresh-token/"):
+            account_id = path[len("/api/refresh-token/") :]
+            self._handle_api_refresh_token(account_id)
         else:
             self._send_404()
 
     # ─── API handlers ────────────────────────────────────
 
     def _handle_api_accounts(self):
-        """GET /api/accounts — list all accounts with current usage."""
+        """GET /api/accounts — list all accounts with current usage and token health."""
         server = self.server
         accounts = getattr(server, "dashboard_accounts", [])
         cache = getattr(server, "dashboard_cache", UsageCache())
+        refresher = getattr(server, "dashboard_refresher", None)
 
         result = []
         for acct in accounts:
@@ -105,6 +123,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 acct_dict["usage"] = None
             ts = cache.get_timestamp(acct.id)
             acct_dict["last_updated"] = ts
+
+            # Include token health if refresher is available
+            if refresher is not None:
+                acct_dict["token_health"] = refresher.get_token_status(acct.id)
             result.append(acct_dict)
 
         self._send_json(200, {"accounts": result})
@@ -191,6 +213,121 @@ class DashboardHandler(BaseHTTPRequestHandler):
             poller.add_account(new_acct)
 
         self._send_json(200, {"id": new_acct.id, "label": new_acct.label})
+
+    def _handle_api_tokens(self):
+        """GET /api/tokens — token health for all accounts."""
+        server = self.server
+        refresher = getattr(server, "dashboard_refresher", None)
+
+        if refresher is None:
+            self._send_json(
+                200,
+                {
+                    "tokens": {},
+                    "auto_refresh": False,
+                    "message": "Token refresher not running",
+                },
+            )
+            return
+
+        statuses = refresher.get_all_token_statuses()
+        self._send_json(
+            200,
+            {
+                "tokens": statuses,
+                "auto_refresh": refresher.is_running(),
+            },
+        )
+
+    def _handle_api_refresh_token(self, account_id):
+        """POST /api/refresh-token/{id} — manually trigger token refresh."""
+        server = self.server
+        refresher = getattr(server, "dashboard_refresher", None)
+
+        if refresher is None:
+            self._send_json(
+                200,
+                {
+                    "success": False,
+                    "reason": "Token refresher not configured",
+                    "account_id": account_id,
+                },
+            )
+            return
+
+        result = refresher.refresh_account(account_id)
+        self._send_json(200, result)
+
+    def _handle_api_login(self, account_num_str):
+        """GET /api/login/{N} — start OAuth login flow for account N."""
+        server = self.server
+        oauth = getattr(server, "dashboard_oauth", None)
+
+        if oauth is None:
+            self._send_json(500, {"error": "OAuth login not configured"})
+            return
+
+        # Validate account number
+        if not account_num_str.isdigit():
+            self._send_json(
+                400,
+                {
+                    "error": f"Invalid account number: {account_num_str!r} (must be numeric)"
+                },
+            )
+            return
+
+        account_num = int(account_num_str)
+        if account_num < 1:
+            self._send_json(
+                400, {"error": f"Invalid account number: {account_num} (must be >= 1)"}
+            )
+            return
+
+        try:
+            result = oauth.start_login(account_num=account_num)
+            self._send_json(200, result)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+
+    def _handle_oauth_callback(self, parsed):
+        """GET /oauth/callback — OAuth redirect handler."""
+        from urllib.parse import parse_qs
+
+        server = self.server
+        oauth = getattr(server, "dashboard_oauth", None)
+
+        if oauth is None:
+            self._send_json(500, {"error": "OAuth login not configured"})
+            return
+
+        params = parse_qs(parsed.query)
+        code = params.get("code", [None])[0]
+        state = params.get("state", [None])[0]
+
+        if not code or not state:
+            self._send_json(400, {"error": "Missing code or state parameter"})
+            return
+
+        result = oauth.handle_callback(code=code, state=state)
+
+        if result.get("success"):
+            # Return a simple HTML page indicating success
+            html = (
+                "<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                "<h2>Login successful</h2>"
+                f"<p>Account {result.get('account_num')} has been configured.</p>"
+                "<p>You can close this tab and return to the dashboard.</p>"
+                "</body></html>"
+            )
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self._send_json(400, result)
 
     # ─── Static file serving ─────────────────────────────
 
@@ -285,11 +422,16 @@ def create_server(
         else:
             print("[dashboard] WARNING: No accounts discovered", file=sys.stderr)
 
+    credentials_dir = str(Path(accounts_dir) / "credentials")
+
     server = HTTPServer((host, port), DashboardHandler)
     server.dashboard_cache = cache
     server.dashboard_accounts = accounts
     server.accounts_dir = accounts_dir
+    server.credentials_dir = credentials_dir
     server.dashboard_poller = None
+    server.dashboard_refresher = None
+    server.dashboard_oauth = None
 
     if start_poller and accounts:
         poller = UsagePoller(accounts=accounts, cache=cache)
@@ -299,6 +441,27 @@ def create_server(
             f"[dashboard] Background poller started for {len(accounts)} account(s)",
             file=sys.stderr,
         )
+
+    # Start the proactive token refresher for Anthropic accounts
+    if accounts:
+        refresher = TokenRefresher(
+            accounts=accounts,
+            credentials_dir=credentials_dir,
+        )
+        refresher.start()
+        server.dashboard_refresher = refresher
+        print(
+            f"[dashboard] Token refresher started (checks every 5 min, "
+            f"refreshes 30 min before expiry)",
+            file=sys.stderr,
+        )
+
+    # Set up OAuth login handler
+    oauth = OAuthLogin(
+        credentials_dir=credentials_dir,
+        redirect_port=port,
+    )
+    server.dashboard_oauth = oauth
 
     return server
 
@@ -335,6 +498,8 @@ def main():
         print("\n[dashboard] Shutting down...", file=sys.stderr)
         if server.dashboard_poller:
             server.dashboard_poller.stop()
+        if server.dashboard_refresher:
+            server.dashboard_refresher.stop()
         server.shutdown()
 
 

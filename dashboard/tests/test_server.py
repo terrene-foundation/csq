@@ -404,6 +404,227 @@ def test_e2e_last_updated_timestamp():
         server.shutdown()
 
 
+# ─── Tier 2: Token status endpoints ────────────────────
+
+
+def test_api_tokens_returns_token_status():
+    """GET /api/tokens returns token health for all accounts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        accounts_dir = os.path.join(tmp, "accounts")
+        creds_dir = os.path.join(accounts_dir, "credentials")
+        os.makedirs(creds_dir, exist_ok=True)
+
+        # Create a credential file with token expiring in 2 hours
+        import time as _time
+
+        expires_at = int((_time.time() + 7200) * 1000)
+        cred_data = {
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-test-token",
+                "refreshToken": "rt-test",
+                "expiresAt": expires_at,
+                "scopes": ["user:profile"],
+            }
+        }
+        with open(os.path.join(creds_dir, "1.json"), "w") as f:
+            json.dump(cred_data, f)
+
+        acct = _make_account(id="anthropic-1", label="Account 1")
+        cache = UsageCache()
+        server, _, base = _start_test_server(cache=cache, accounts=[acct])
+        server.accounts_dir = accounts_dir
+        server.credentials_dir = creds_dir
+        # Attach a refresher to the server
+        from dashboard.refresher import TokenRefresher
+
+        refresher = TokenRefresher(accounts=[acct], credentials_dir=creds_dir)
+        server.dashboard_refresher = refresher
+
+        try:
+            status, headers, body = _get(f"{base}/api/tokens")
+            assert status == 200, f"Expected 200, got {status}"
+            data = json.loads(body)
+            assert "tokens" in data, f"Missing 'tokens' key in response: {data.keys()}"
+            assert (
+                "anthropic-1" in data["tokens"]
+            ), f"Missing anthropic-1 in tokens: {data['tokens'].keys()}"
+            token_info = data["tokens"]["anthropic-1"]
+            assert (
+                "is_healthy" in token_info
+            ), f"Missing is_healthy in token info: {token_info}"
+            assert "expires_in_seconds" in token_info
+        finally:
+            server.shutdown()
+
+
+def test_api_refresh_token_single_account():
+    """POST /api/refresh-token/{id} triggers refresh for one account."""
+    acct = _make_account(id="anthropic-1", label="Account 1")
+    cache = UsageCache()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        creds_dir = os.path.join(tmp, "credentials")
+        os.makedirs(creds_dir, exist_ok=True)
+
+        # Create a credential file
+        import time as _time
+
+        expires_at = int((_time.time() + 600) * 1000)
+        cred_data = {
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-test",
+                "refreshToken": "rt-test",
+                "expiresAt": expires_at,
+                "scopes": ["user:profile"],
+            }
+        }
+        with open(os.path.join(creds_dir, "1.json"), "w") as f:
+            json.dump(cred_data, f)
+
+        server, _, base = _start_test_server(cache=cache, accounts=[acct])
+        from dashboard.refresher import TokenRefresher
+
+        refresher = TokenRefresher(accounts=[acct], credentials_dir=creds_dir)
+        server.dashboard_refresher = refresher
+        server.credentials_dir = creds_dir
+
+        try:
+            # The refresh will fail because there is no real token endpoint,
+            # but the endpoint should still return a response (not 404/500)
+            status, _, body = _post(f"{base}/api/refresh-token/anthropic-1")
+            assert status == 200, f"Expected 200, got {status}"
+            data = json.loads(body)
+            assert "account_id" in data, f"Missing account_id in response: {data}"
+        finally:
+            server.shutdown()
+
+
+def test_api_refresh_token_404_for_unknown():
+    """POST /api/refresh-token/nonexistent returns error for unknown account."""
+    cache = UsageCache()
+    server, _, base = _start_test_server(cache=cache, accounts=[])
+    from dashboard.refresher import TokenRefresher
+
+    with tempfile.TemporaryDirectory() as tmp:
+        creds_dir = os.path.join(tmp, "credentials")
+        os.makedirs(creds_dir, exist_ok=True)
+        refresher = TokenRefresher(accounts=[], credentials_dir=creds_dir)
+        server.dashboard_refresher = refresher
+    try:
+        status, _, body = _post(f"{base}/api/refresh-token/nonexistent-99")
+        data = json.loads(body)
+        assert (
+            data.get("success") is False
+        ), f"Should report failure for unknown account, got {data}"
+    finally:
+        server.shutdown()
+
+
+def test_api_login_returns_auth_url():
+    """GET /api/login/{N} returns an OAuth authorization URL."""
+    cache = UsageCache()
+    server, _, base = _start_test_server(cache=cache, accounts=[])
+    with tempfile.TemporaryDirectory() as tmp:
+        creds_dir = os.path.join(tmp, "credentials")
+        os.makedirs(creds_dir, exist_ok=True)
+        from dashboard.oauth import OAuthLogin
+
+        oauth = OAuthLogin(credentials_dir=creds_dir)
+        server.dashboard_oauth = oauth
+    try:
+        status, _, body = _get(f"{base}/api/login/3")
+        assert status == 200, f"Expected 200, got {status}"
+        data = json.loads(body)
+        assert "auth_url" in data, f"Missing auth_url in response: {data}"
+        assert "state" in data, f"Missing state in response: {data}"
+        assert (
+            "code_challenge" in data["auth_url"]
+        ), "Auth URL should contain PKCE challenge"
+    finally:
+        server.shutdown()
+
+
+def test_api_login_rejects_invalid_account_num():
+    """GET /api/login/0 rejects invalid account numbers."""
+    cache = UsageCache()
+    server, _, base = _start_test_server(cache=cache, accounts=[])
+    with tempfile.TemporaryDirectory() as tmp:
+        creds_dir = os.path.join(tmp, "credentials")
+        os.makedirs(creds_dir, exist_ok=True)
+        from dashboard.oauth import OAuthLogin
+
+        oauth = OAuthLogin(credentials_dir=creds_dir)
+        server.dashboard_oauth = oauth
+    try:
+        status, _, body = _get(f"{base}/api/login/0")
+        assert status == 400, f"Expected 400 for invalid account, got {status}"
+    finally:
+        server.shutdown()
+
+
+def test_api_login_rejects_non_numeric():
+    """GET /api/login/abc rejects non-numeric account identifiers."""
+    cache = UsageCache()
+    server, _, base = _start_test_server(cache=cache, accounts=[])
+    with tempfile.TemporaryDirectory() as tmp:
+        creds_dir = os.path.join(tmp, "credentials")
+        os.makedirs(creds_dir, exist_ok=True)
+        from dashboard.oauth import OAuthLogin
+
+        oauth = OAuthLogin(credentials_dir=creds_dir)
+        server.dashboard_oauth = oauth
+    try:
+        status, _, _ = _get(f"{base}/api/login/abc")
+        assert status == 400, f"Expected 400 for non-numeric, got {status}"
+    finally:
+        server.shutdown()
+
+
+# ─── Tier 3: E2E token management flow ────────────────
+
+
+def test_e2e_accounts_include_token_expiry():
+    """E2E: GET /api/accounts includes token_expires_in for Anthropic accounts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        accounts_dir = os.path.join(tmp, "accounts")
+        creds_dir = os.path.join(accounts_dir, "credentials")
+        os.makedirs(creds_dir, exist_ok=True)
+
+        import time as _time
+
+        expires_at = int((_time.time() + 7200) * 1000)
+        cred_data = {
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-e2e-token",
+                "refreshToken": "rt-e2e",
+                "expiresAt": expires_at,
+                "scopes": ["user:profile"],
+            }
+        }
+        with open(os.path.join(creds_dir, "1.json"), "w") as f:
+            json.dump(cred_data, f)
+
+        acct = _make_account(id="anthropic-1", label="Account 1")
+        cache = UsageCache()
+        server, _, base = _start_test_server(cache=cache, accounts=[acct])
+        from dashboard.refresher import TokenRefresher
+
+        refresher = TokenRefresher(accounts=[acct], credentials_dir=creds_dir)
+        server.dashboard_refresher = refresher
+
+        try:
+            status, _, body = _get(f"{base}/api/accounts")
+            data = json.loads(body)
+            acct_data = data["accounts"][0]
+            assert (
+                "token_health" in acct_data
+            ), f"Missing token_health in account data: {acct_data.keys()}"
+            assert "is_healthy" in acct_data["token_health"]
+            assert "expires_in_seconds" in acct_data["token_health"]
+        finally:
+            server.shutdown()
+
+
 # ─── Runner ──────────────────────────────────────────────
 
 if __name__ == "__main__":

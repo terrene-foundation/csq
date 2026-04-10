@@ -442,3 +442,67 @@ body {
 .error-banner.visible {
     display: block;
 }
+
+/* ─── Token status badge ────────────────────────────── */
+
+.token-status-badge {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    font-family: var(--font-mono);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.token-status-badge.healthy {
+    color: var(--green);
+    background: var(--green-bg);
+}
+
+.token-status-badge.warning {
+    color: var(--yellow);
+    background: var(--yellow-bg);
+}
+
+.token-status-badge.error {
+    color: var(--red);
+    background: var(--red-bg);
+}
+
+/* ─── Refresh token button (in card detail) ─────────── */
+
+.btn-refresh-token {
+    margin-top: 10px;
+    width: 100%;
+    justify-content: center;
+    font-size: 12px;
+    padding: 5px 10px;
+}
+
+/* ─── Add Account button ────────────────────────────── */
+
+#btn-add-account {
+    background: var(--accent);
+    color: var(--bg-primary);
+    border-color: var(--accent);
+}
+
+#btn-add-account:hover {
+    opacity: 0.9;
+}
+
+/* ─── Auto-refresh indicator ────────────────────────── */
+
+.auto-refresh-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.auto-refresh-indicator.active {
+    color: var(--green);
+}
+
+.auto-refresh-indicator.inactive {
+    color: var(--text-muted);
+}

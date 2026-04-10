@@ -33,7 +33,9 @@ from .accounts import AccountInfo
 # ─── Polling interval constants ──────────────────────────
 # These are minimums. Backoff can increase them per-account.
 
-ANTHROPIC_POLL_INTERVAL = 600  # 10 minutes — aggressive rate limiting on usage endpoint
+ANTHROPIC_POLL_INTERVAL = (
+    300  # 5 min — matches claude.ai/settings/usage, keeps session alive
+)
 THREEP_POLL_INTERVAL = 900  # 15 minutes — minimize API costs for probes
 
 # Maximum backoff: 1 hour

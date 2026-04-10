@@ -10,6 +10,9 @@
     <header class="header">
         <h1 class="header-title">Claude Squad <span>— Usage Monitor</span></h1>
         <div class="header-actions">
+            <button class="btn" id="btn-add-account" onclick="addAccount()">
+                + Add Account
+            </button>
             <button class="btn" id="btn-refresh" onclick="refreshAll()">
                 Refresh All
             </button>
@@ -43,6 +46,7 @@
 
     <footer class="footer">
         <span id="footer-updated">Last updated: --</span>
+        <span id="footer-autorefresh" class="auto-refresh-indicator">Auto-refresh: --</span>
         <span id="footer-next">Next poll: --</span>
     </footer>
 

@@ -8,16 +8,21 @@
   // ─── State ──────────────────────────────────────────
 
   var accounts = [];
+  var tokenStatuses = {}; // account_id -> {is_healthy, expires_in_seconds, last_refresh}
+  var autoRefreshActive = false;
   var sortMode = "utilization-desc";
   var refreshIntervalId = null;
   var REFRESH_INTERVAL_MS = 30000; // 30 seconds (reads cache, doesn't trigger API calls)
+  var TOKEN_STATUS_INTERVAL_MS = 30000; // 30 seconds for token countdown updates
   var expandedCards = {}; // account_id -> true/false
 
   // ─── Init ───────────────────────────────────────────
 
   function init() {
     fetchAccounts();
+    fetchTokenStatuses();
     refreshIntervalId = setInterval(fetchAccounts, REFRESH_INTERVAL_MS);
+    setInterval(fetchTokenStatuses, TOKEN_STATUS_INTERVAL_MS);
 
     // Start countdown timer updates every second
     setInterval(updateTimers, 1000);
@@ -63,6 +68,68 @@
         showError("Refresh failed: " + err.message);
         btn.disabled = false;
         btn.textContent = "Refresh All";
+      });
+  }
+
+  function fetchTokenStatuses() {
+    fetch("/api/tokens")
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.json();
+      })
+      .then(function (data) {
+        tokenStatuses = data.tokens || {};
+        autoRefreshActive = data.auto_refresh || false;
+        updateAutoRefreshIndicator();
+        renderCards(); // re-render to update token badges
+      })
+      .catch(function () {
+        // Token status is optional -- don't show error
+      });
+  }
+
+  function refreshToken(accountId) {
+    fetch("/api/refresh-token/" + accountId, { method: "POST" })
+      .then(function (resp) {
+        return resp.json();
+      })
+      .then(function (data) {
+        if (data.success) {
+          fetchTokenStatuses();
+          fetchAccounts();
+        } else {
+          showError(
+            "Token refresh failed: " + (data.reason || "unknown error"),
+          );
+        }
+      })
+      .catch(function (err) {
+        showError("Token refresh error: " + err.message);
+      });
+  }
+
+  function addAccount() {
+    var accountNum = prompt("Enter account number (1-8) for the new account:");
+    if (!accountNum) return;
+    var num = parseInt(accountNum, 10);
+    if (isNaN(num) || num < 1 || num > 8) {
+      showError("Invalid account number. Must be 1-8.");
+      return;
+    }
+
+    fetch("/api/login/" + num)
+      .then(function (resp) {
+        return resp.json();
+      })
+      .then(function (data) {
+        if (data.auth_url) {
+          window.open(data.auth_url, "_blank");
+        } else if (data.error) {
+          showError("Login failed: " + data.error);
+        }
+      })
+      .catch(function (err) {
+        showError("Login error: " + err.message);
       });
   }
 
@@ -163,6 +230,31 @@
 
     badges.appendChild(provider);
     badges.appendChild(status);
+
+    // Token health badge
+    var tokenInfo = tokenStatuses[acct.id];
+    if (
+      tokenInfo &&
+      tokenInfo.expires_in_seconds !== undefined &&
+      tokenInfo.expires_in_seconds !== null
+    ) {
+      var tokenBadge = document.createElement("span");
+      tokenBadge.className = "token-status-badge";
+      if (tokenInfo.is_healthy) {
+        tokenBadge.classList.add("healthy");
+        tokenBadge.textContent =
+          "Token: " + formatTokenExpiry(tokenInfo.expires_in_seconds);
+      } else if (tokenInfo.error) {
+        tokenBadge.classList.add("error");
+        tokenBadge.textContent = "Token: error";
+      } else {
+        tokenBadge.classList.add("warning");
+        tokenBadge.textContent =
+          "Token: " + formatTokenExpiry(tokenInfo.expires_in_seconds);
+      }
+      badges.appendChild(tokenBadge);
+    }
+
     header.appendChild(label);
     header.appendChild(badges);
     card.appendChild(header);
@@ -201,6 +293,18 @@
         formatTime(acct.last_updated),
       );
       detail.appendChild(updatedRow);
+    }
+
+    // Refresh Token button for Anthropic accounts
+    if (acct.provider === "anthropic") {
+      var refreshBtn = document.createElement("button");
+      refreshBtn.className = "btn btn-refresh-token";
+      refreshBtn.textContent = "Refresh Token";
+      refreshBtn.onclick = function (e) {
+        e.stopPropagation();
+        refreshToken(acct.id);
+      };
+      detail.appendChild(refreshBtn);
     }
 
     card.appendChild(detail);
@@ -434,6 +538,15 @@
     return d.toLocaleTimeString();
   }
 
+  function formatTokenExpiry(seconds) {
+    if (seconds === null || seconds === undefined) return "--";
+    if (seconds <= 0) return "expired";
+    var hours = Math.floor(seconds / 3600);
+    var minutes = Math.floor((seconds % 3600) / 60);
+    if (hours > 0) return hours + "h" + (minutes > 0 ? minutes + "m" : "");
+    return minutes + "m";
+  }
+
   function formatCountdown(isoOrEpoch) {
     if (!isoOrEpoch) return "--";
     var target;
@@ -492,6 +605,21 @@
       new Date(now.getTime() + REFRESH_INTERVAL_MS).toLocaleTimeString();
   }
 
+  function updateAutoRefreshIndicator() {
+    var el = document.getElementById("footer-autorefresh");
+    if (el) {
+      if (autoRefreshActive) {
+        el.textContent = "Auto-refresh: ON";
+        el.classList.add("active");
+        el.classList.remove("inactive");
+      } else {
+        el.textContent = "Auto-refresh: OFF";
+        el.classList.remove("active");
+        el.classList.add("inactive");
+      }
+    }
+  }
+
   // ─── Error display ──────────────────────────────────
 
   function showError(msg) {
@@ -509,6 +637,8 @@
 
   window.refreshAll = refreshAll;
   window.onSortChange = onSortChange;
+  window.addAccount = addAccount;
+  window.refreshToken = refreshToken;
 
   // ─── Start ──────────────────────────────────────────
 

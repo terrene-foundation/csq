@@ -426,7 +426,7 @@ cmd_setkey() {
   providers:
     claude  Claude direct API (ANTHROPIC_API_KEY)
     mm      MiniMax M2.7 (ANTHROPIC_AUTH_TOKEN for https://api.minimax.io/anthropic)
-    zai     Z.AI GLM-4.6 (ANTHROPIC_AUTH_TOKEN for https://api.z.ai/api/anthropic)
+    zai     Z.AI GLM-5.1 (ANTHROPIC_AUTH_TOKEN for https://api.z.ai/api/anthropic)
     ollama  Local Ollama (no key needed, uses http://localhost:11434)
 
   If [key] is omitted, csq reads it from stdin (keeps it out of shell history).
@@ -500,11 +500,11 @@ PROVIDERS = {
             'env': {
                 'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic',
                 'ANTHROPIC_AUTH_TOKEN': '',
-                'ANTHROPIC_MODEL': 'glm-4.7',
-                'ANTHROPIC_SMALL_FAST_MODEL': 'glm-4.5-air',
-                'ANTHROPIC_DEFAULT_SONNET_MODEL': 'glm-4.7',
-                'ANTHROPIC_DEFAULT_OPUS_MODEL': 'glm-4.7',
-                'ANTHROPIC_DEFAULT_HAIKU_MODEL': 'glm-4.5-air',
+                'ANTHROPIC_MODEL': 'glm-5.1',
+                'ANTHROPIC_SMALL_FAST_MODEL': 'glm-5.1',
+                'ANTHROPIC_DEFAULT_SONNET_MODEL': 'glm-5.1',
+                'ANTHROPIC_DEFAULT_OPUS_MODEL': 'glm-5.1',
+                'ANTHROPIC_DEFAULT_HAIKU_MODEL': 'glm-5.1',
                 'API_TIMEOUT_MS': '3000000',
                 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
             }

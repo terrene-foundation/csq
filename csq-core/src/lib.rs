@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod broker;
 pub mod credentials;
 pub mod error;
+pub mod http;
 pub mod platform;
 pub mod providers;
 pub mod quota;

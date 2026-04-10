@@ -397,11 +397,23 @@ mod tests {
             }
         }
 
-        // At most a few refreshes (ideally 1, but timing can cause 2-3)
+        // With the re-read-inside-lock logic (C6 fix), the first thread
+        // that acquires the lock performs the single refresh. Every
+        // subsequent thread either:
+        //   (a) sees the lock held and returns Skipped without touching
+        //       http_post, or
+        //   (b) waits for the lock, re-reads canonical, finds it no
+        //       longer near-expiry, and returns Valid without touching
+        //       http_post.
+        //
+        // Either way, exactly one thread ever calls the http_post
+        // closure. Any number >1 means the lock is not coordinating
+        // correctly and must be investigated — not hidden with a
+        // looser bound.
         let total_calls = refresh_count.load(Ordering::SeqCst);
-        assert!(
-            total_calls <= 3,
-            "expected <=3 refresh calls with lock coordination, got {total_calls}"
+        assert_eq!(
+            total_calls, 1,
+            "expected exactly 1 refresh call with lock coordination, got {total_calls}"
         );
     }
 }

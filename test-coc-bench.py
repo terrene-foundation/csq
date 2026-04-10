@@ -403,7 +403,14 @@ def build_config(profile, model_override=None):
     # For API-key profiles (mm, zai, ollama), credentials are in env vars.
     creds = HOME / ".claude/credentials.json"
     if not creds.exists():
-        # Try the active account's credentials
+        # Prefer the active csq session's credentials (has working token + quota)
+        active_config = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        if active_config:
+            active_creds = Path(active_config) / ".credentials.json"
+            if active_creds.exists():
+                creds = active_creds
+    if not creds.exists():
+        # Fallback: scan accounts for any valid credentials
         for i in range(1, 10):
             creds = HOME / f".claude/accounts/config-{i}/.credentials.json"
             if creds.exists():
@@ -642,6 +649,12 @@ def main():
         default="both",
         help="Which rubric to run",
     )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of runs for averaging (default: 1)",
+    )
     args = parser.parse_args()
 
     print(f"COC Governance Benchmark (100 pts)")
@@ -649,6 +662,8 @@ def main():
     print(f"Environment: {COC_ENV}")
     print(f"Timeout: {args.timeout}s/test")
     print(f"Rubric: {args.rubric}")
+    if args.runs > 1:
+        print(f"Runs: {args.runs} (averaging)")
     print(f"{'=' * 70}\n")
 
     # Build config
@@ -666,78 +681,143 @@ def main():
     print(f"  ANTHROPIC_MODEL: {model}")
     print()
 
-    results = {"cooperative": {}, "adversarial": {}}
-    scores = {"cooperative": {}, "adversarial": {}}
-
     rubrics_to_run = []
     if args.rubric in ("both", "cooperative"):
         rubrics_to_run.append(("cooperative", COOPERATIVE))
     if args.rubric in ("both", "adversarial"):
         rubrics_to_run.append(("adversarial", ADVERSARIAL))
 
-    for rubric_type, tests in rubrics_to_run:
-        print(f"\n{'─' * 70}")
-        print(
-            f"  {rubric_type.upper()} RUBRIC ({len(tests)} tests, {len(tests)*5} pts)"
-        )
-        print(f"{'─' * 70}")
+    # Multi-run: collect scores across N runs, then average
+    all_runs = []  # list of {cooperative: {}, adversarial: {}} per run
+    all_run_results = []  # raw results per run (for saving)
 
-        for i, test in enumerate(tests, 1):
-            # Clean environment before each test
-            reset_coc_env()
+    for run_idx in range(args.runs):
+        if args.runs > 1:
+            print(f"\n{'=' * 70}")
+            print(f"  RUN {run_idx + 1}/{args.runs}")
+            print(f"{'=' * 70}")
 
-            print(f"\n  [{i}/{len(tests)}] {test['name']} ({test['dimension']})...")
-            r = run_test(config_dir, test, args.timeout)
-            results[rubric_type][test["name"]] = r
+        results = {"cooperative": {}, "adversarial": {}}
+        scores = {"cooperative": {}, "adversarial": {}}
 
-            if r["ok"]:
-                score, reason = auto_score(
-                    test, r["result"], rubric_type, r.get("artifacts")
-                )
-                scores[rubric_type][test["name"]] = {"score": score, "reason": reason}
-                preview = r["result"][:150].replace("\n", " ")
-                print(f"      Score: {score}/5 ({reason})")
+        for rubric_type, tests in rubrics_to_run:
+            print(f"\n{'─' * 70}")
+            print(
+                f"  {rubric_type.upper()} RUBRIC ({len(tests)} tests, {len(tests)*5} pts)"
+            )
+            print(f"{'─' * 70}")
+
+            for i, test in enumerate(tests, 1):
+                reset_coc_env()
+
+                run_label = f"R{run_idx+1} " if args.runs > 1 else ""
                 print(
-                    f"      {r['elapsed']:.1f}s, {r['num_turns']} turns: {preview}..."
+                    f"\n  {run_label}[{i}/{len(tests)}] {test['name']} ({test['dimension']})..."
                 )
-                if r.get("artifacts"):
-                    arts = r["artifacts"]
-                    if arts.get("new_files"):
-                        print(f"      Artifacts: {list(arts['new_files'].keys())}")
-                    if arts.get("git_diff_stat"):
-                        print(f"      Changes: {arts['git_diff_stat'][:100]}")
-            else:
-                scores[rubric_type][test["name"]] = {
-                    "score": 0,
-                    "reason": r.get("error", "failed"),
-                }
-                print(f"      Score: 0/5 (FAIL: {r.get('error', 'unknown')[:100]})")
+                r = run_test(config_dir, test, args.timeout)
+                results[rubric_type][test["name"]] = r
+
+                if r["ok"]:
+                    score, reason = auto_score(
+                        test, r["result"], rubric_type, r.get("artifacts")
+                    )
+                    scores[rubric_type][test["name"]] = {
+                        "score": score,
+                        "reason": reason,
+                    }
+                    preview = r["result"][:150].replace("\n", " ")
+                    print(f"      Score: {score}/5 ({reason})")
+                    print(
+                        f"      {r['elapsed']:.1f}s, {r['num_turns']} turns: {preview}..."
+                    )
+                    if r.get("artifacts"):
+                        arts = r["artifacts"]
+                        if arts.get("new_files"):
+                            print(f"      Artifacts: {list(arts['new_files'].keys())}")
+                        if arts.get("git_diff_stat"):
+                            print(f"      Changes: {arts['git_diff_stat'][:100]}")
+                else:
+                    scores[rubric_type][test["name"]] = {
+                        "score": 0,
+                        "reason": r.get("error", "failed"),
+                    }
+                    print(f"      Score: 0/5 (FAIL: {r.get('error', 'unknown')[:100]})")
+
+        all_runs.append(scores)
+        all_run_results.append(results)
+
+        # Print per-run total
+        run_grand = sum(
+            s["score"] for rscores in scores.values() for s in rscores.values()
+        )
+        if args.runs > 1:
+            print(f"\n  Run {run_idx + 1} total: {run_grand}/100")
 
     # Final reset
     reset_coc_env()
 
-    # Summary
+    # ── Summary (with averaging if multi-run) ──
     print(f"\n\n{'=' * 70}")
-    print(f"  RESULTS: {args.label}")
+    print(
+        f"  RESULTS: {args.label}"
+        + (f" ({args.runs} runs, averaged)" if args.runs > 1 else "")
+    )
     print(f"{'=' * 70}")
 
+    # Compute per-test averages across runs
+    avg_scores = {"cooperative": {}, "adversarial": {}}
     for rubric_type in ("cooperative", "adversarial"):
-        if rubric_type not in scores or not scores[rubric_type]:
-            continue
         tests = COOPERATIVE if rubric_type == "cooperative" else ADVERSARIAL
-        total = sum(s["score"] for s in scores[rubric_type].values())
-        max_pts = len(tests) * 5
-        print(f"\n  {rubric_type.upper()}: {total}/{max_pts}")
-        print(f"  {'─' * 50}")
         for test in tests:
             name = test["name"]
-            s = scores[rubric_type].get(name, {"score": 0, "reason": "not run"})
-            dim = test["dimension"]
-            print(f"    {name:<25} {s['score']}/5  ({dim}: {s['reason']})")
+            run_scores = [
+                run.get(rubric_type, {}).get(name, {}).get("score", 0)
+                for run in all_runs
+            ]
+            mean = sum(run_scores) / len(run_scores)
+            # Standard deviation
+            variance = sum((s - mean) ** 2 for s in run_scores) / len(run_scores)
+            std = variance**0.5
+            avg_scores[rubric_type][name] = {
+                "mean": mean,
+                "std": std,
+                "scores": run_scores,
+                "reason": all_runs[-1]
+                .get(rubric_type, {})
+                .get(name, {})
+                .get("reason", ""),
+            }
 
-    grand = sum(s["score"] for rscores in scores.values() for s in rscores.values())
+    for rubric_type in ("cooperative", "adversarial"):
+        if rubric_type not in avg_scores or not avg_scores[rubric_type]:
+            continue
+        tests = COOPERATIVE if rubric_type == "cooperative" else ADVERSARIAL
+        total = sum(s["mean"] for s in avg_scores[rubric_type].values())
+        max_pts = len(tests) * 5
+        print(f"\n  {rubric_type.upper()}: {total:.1f}/{max_pts}")
+        print(f"  {'─' * 60}")
+        for test in tests:
+            name = test["name"]
+            s = avg_scores[rubric_type].get(name, {"mean": 0, "std": 0, "scores": []})
+            dim = test["dimension"]
+            if args.runs > 1:
+                print(
+                    f"    {name:<25} {s['mean']:.1f}/5 ±{s['std']:.1f}  runs={s['scores']}"
+                )
+            else:
+                score = int(s["mean"])
+                print(f"    {name:<25} {score}/5  ({dim}: {s['reason']})")
+
+    grand = sum(s["mean"] for rscores in avg_scores.values() for s in rscores.values())
     max_grand = sum(len(tests) * 5 for _, tests in rubrics_to_run)
-    print(f"\n  GRAND TOTAL: {grand}/{max_grand}")
+    if args.runs > 1:
+        run_totals = [
+            sum(s["score"] for rscores in run.values() for s in rscores.values())
+            for run in all_runs
+        ]
+        print(f"\n  GRAND TOTAL: {grand:.1f}/{max_grand} (avg of {run_totals})")
+    else:
+        print(f"\n  GRAND TOTAL: {int(grand)}/{max_grand}")
 
     # Save results
     output = {
@@ -746,14 +826,22 @@ def main():
         "profile": args.profile,
         "model_id": model,
         "timeout": args.timeout,
+        "runs": args.runs,
         "cooperative_tests": [
             {k: v for k, v in t.items() if k != "auto_score"} for t in COOPERATIVE
         ],
         "adversarial_tests": [
             {k: v for k, v in t.items() if k != "auto_score"} for t in ADVERSARIAL
         ],
-        "results": results,
-        "scores": scores,
+        "avg_scores": {
+            rt: {
+                name: {"mean": s["mean"], "std": s["std"], "scores": s["scores"]}
+                for name, s in tests.items()
+            }
+            for rt, tests in avg_scores.items()
+        },
+        "results": all_run_results[-1] if all_run_results else {},
+        "scores": all_runs[-1] if all_runs else {},
     }
 
     # Include model in filename to prevent overwrites when running multiple

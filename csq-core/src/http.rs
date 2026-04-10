@@ -228,6 +228,49 @@ pub fn post_json_probe(
     Ok((status, text))
 }
 
+/// GETs a URL with a Bearer token and optional extra headers.
+/// Returns `(status_code, body_bytes)` on any HTTP response.
+///
+/// This is the transport behind the M8.6 usage poller: `GET
+/// /api/oauth/usage` with the access token as Bearer auth.
+///
+/// # Security
+///
+/// - HTTPS only (inherited from the shared client).
+/// - The bearer token is sent in the `Authorization` header, not
+///   the URL — it does not appear in error strings (reqwest logs
+///   URLs, not headers).
+/// - The returned body may contain sensitive data (usage quotas
+///   tied to a user's account). Callers should parse into a typed
+///   struct and not log the raw bytes.
+/// - Extra headers MUST come from trusted constants (e.g.,
+///   `Anthropic-Beta`). This function does NOT sanitize header
+///   values — reqwest rejects CRLF injection, but callers should
+///   never pass user-controlled strings.
+///
+/// # Errors
+///
+/// Returns `Err(String)` on connection failure, timeout, HTTPS
+/// rejection, or redirect overflow. A 4xx/5xx response is
+/// returned as `Ok((status, bytes))` so the caller can classify.
+pub fn get_bearer(
+    url: &str,
+    token: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, Vec<u8>), String> {
+    let mut req = client()
+        .get(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json");
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let response = req.send().map_err(sanitize_err)?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes().map_err(sanitize_err)?;
+    Ok((status, bytes.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +356,27 @@ mod tests {
         assert!(
             msg.contains("connection") || msg.contains("timed out") || msg.contains("error"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn get_bearer_rejects_http_scheme() {
+        let result = get_bearer("http://example.invalid/api/oauth/usage", "tok", &[]);
+        assert!(result.is_err(), "http:// must be rejected by https_only");
+    }
+
+    #[test]
+    fn get_bearer_error_does_not_leak_token() {
+        let result = get_bearer(
+            "https://192.0.2.1/api/oauth/usage",
+            "sk-ant-oat01-SECRET-TOKEN",
+            &[("Anthropic-Beta", "oauth-2025-04-20")],
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            !msg.contains("SECRET-TOKEN"),
+            "error message leaked the bearer token: {msg}"
         );
     }
 

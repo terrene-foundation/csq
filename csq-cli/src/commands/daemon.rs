@@ -175,6 +175,21 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         shutdown.clone(),
                     );
 
+                    // Start the background usage poller, sharing the
+                    // same shutdown token. Polls GET /api/oauth/usage
+                    // for each Anthropic account every 5 min and writes
+                    // quota data to the local quota.json file so
+                    // `csq status` shows real percentages.
+                    let http_get: daemon::HttpGetFn =
+                        Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+                            http::get_bearer(url, token, headers)
+                        });
+                    let usage_poller = daemon::spawn_usage_poller(
+                        base_dir_for_runtime.clone(),
+                        http_get,
+                        shutdown.clone(),
+                    );
+
                     // Block until SIGTERM/SIGINT arrives.
                     wait_for_shutdown().await;
 
@@ -197,6 +212,18 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         Ok(Ok(())) => tracing::info!("refresher stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "refresher task panicked"),
                         Err(_) => tracing::warn!("refresher did not stop within 5s deadline"),
+                    }
+
+                    // Await the usage poller with a 5s deadline.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        usage_poller.join,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => tracing::info!("usage poller stopped cleanly"),
+                        Ok(Err(e)) => tracing::warn!(error = %e, "usage poller task panicked"),
+                        Err(_) => tracing::warn!("usage poller did not stop within 5s deadline"),
                     }
 
                     // Give the accept loop up to 5s to exit.

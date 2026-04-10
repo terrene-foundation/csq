@@ -19,18 +19,22 @@
 //! Read `workspaces/csq-v2/todos/active/M8-daemon-core.md` for the
 //! full task breakdown.
 
+pub mod cache;
 pub mod detect;
 pub mod lifecycle;
 pub mod paths;
 pub mod pid;
+pub mod refresher;
 
 #[cfg(unix)]
 pub mod server;
 
+pub use cache::{TtlCache, DEFAULT_MAX_AGE};
 pub use detect::{detect_daemon, DetectResult};
 pub use lifecycle::{status_of, stop_daemon, DaemonStatus};
 pub use paths::{pid_file_path, socket_path};
 pub use pid::PidFile;
+pub use refresher::{spawn as spawn_refresher, HttpPostFn, RefreshStatus, RefresherHandle};
 
 #[cfg(unix)]
 pub use server::{router, serve, HealthResponse, ServerHandle};

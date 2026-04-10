@@ -121,6 +121,14 @@ impl ServerHandle {
         let _ = std::fs::remove_file(&self.socket_path);
     }
 
+    /// Returns a clone of the shutdown token so sibling subsystems
+    /// (refresher, poller, future HTTP handlers) can cancel on the
+    /// same signal. Cloning a `CancellationToken` is cheap — it's
+    /// just an Arc bump.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
     /// Returns the socket path the server is bound to.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path

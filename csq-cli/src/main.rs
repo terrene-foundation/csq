@@ -7,6 +7,7 @@ mod commands;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use csq_core::types::AccountNum;
 use tracing_subscriber::EnvFilter;
 
@@ -17,6 +18,10 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Output results as JSON (for scripting/automation)
+    #[arg(long, global = true)]
+    json: bool,
 
     /// Positional account number — shorthand for `csq run <N>`
     #[arg(value_name = "ACCOUNT")]
@@ -84,10 +89,19 @@ enum Command {
     /// Install csq into ~/.claude (creates dirs, patches settings.json)
     Install,
 
+    /// Run diagnostics and report system health
+    Doctor,
+
     /// Background daemon lifecycle (start/stop/status)
     Daemon {
         #[command(subcommand)]
         action: DaemonCmd,
+    },
+
+    /// Generate shell completions for bash, zsh, fish, or powershell
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
     },
 }
 
@@ -154,6 +168,7 @@ fn main() -> Result<()> {
         rest: cli.rest,
     });
 
+    let json = cli.json;
     let base_dir = commands::base_dir()?;
 
     match command {
@@ -172,7 +187,7 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
             commands::swap::handle(&base_dir, account_num)
         }
-        Command::Status => commands::status::handle(&base_dir),
+        Command::Status => commands::status::handle(&base_dir, json),
         Command::Suggest => commands::suggest::handle(&base_dir),
         Command::Statusline => commands::statusline::handle(&base_dir),
         Command::Login { account } => {
@@ -188,24 +203,29 @@ fn main() -> Result<()> {
             };
             commands::setkey::handle(&base_dir, provider, key.as_deref())
         }
-        Command::Listkeys => commands::listkeys::handle(&base_dir),
+        Command::Listkeys => commands::listkeys::handle(&base_dir, json),
         Command::Rmkey { provider } => commands::rmkey::handle(&base_dir, &provider),
         Command::Models { action } => {
             let action = action.unwrap_or(ModelsCmd::List {
                 provider: "all".to_string(),
             });
             match action {
-                ModelsCmd::List { provider } => commands::models::handle_list(&base_dir, &provider),
+                ModelsCmd::List { provider } => commands::models::handle_list(&base_dir, &provider, json),
                 ModelsCmd::Switch { provider, model } => {
                     commands::models::handle_switch(&base_dir, &provider, &model)
                 }
             }
         }
         Command::Install => commands::install::handle(),
+        Command::Doctor => commands::doctor::handle(&base_dir, json),
         Command::Daemon { action } => match action {
             DaemonCmd::Start => commands::daemon::handle_start(&base_dir),
             DaemonCmd::Stop => commands::daemon::handle_stop(&base_dir),
             DaemonCmd::Status => commands::daemon::handle_status(&base_dir),
         },
+        Command::Completions { shell } => {
+            commands::completions::handle(shell);
+            Ok(())
+        }
     }
 }

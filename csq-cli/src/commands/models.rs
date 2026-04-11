@@ -2,10 +2,54 @@
 
 use anyhow::{anyhow, Result};
 use csq_core::providers::{self, ModelCatalog};
+use serde::Serialize;
 use std::path::Path;
 
-pub fn handle_list(_base_dir: &Path, provider_filter: &str) -> Result<()> {
+#[derive(Serialize)]
+struct ModelEntry {
+    provider_id: String,
+    provider_name: String,
+    model_id: String,
+    model_name: String,
+}
+
+pub fn handle_list(_base_dir: &Path, provider_filter: &str, json: bool) -> Result<()> {
     let catalog = ModelCatalog::default_catalog();
+
+    if json {
+        let mut entries = Vec::new();
+        let providers_list: Vec<_> = if provider_filter == "all" {
+            providers::PROVIDERS.iter().collect()
+        } else {
+            let p = providers::get_provider(provider_filter)
+                .ok_or_else(|| anyhow!("unknown provider: {provider_filter}"))?;
+            vec![p]
+        };
+
+        for provider in providers_list {
+            for m in catalog.by_provider(provider.id) {
+                entries.push(ModelEntry {
+                    provider_id: provider.id.to_string(),
+                    provider_name: provider.name.to_string(),
+                    model_id: m.id.to_string(),
+                    model_name: m.name.to_string(),
+                });
+            }
+            if provider.id == "ollama" {
+                for name in providers::ollama::get_ollama_models() {
+                    entries.push(ModelEntry {
+                        provider_id: "ollama".into(),
+                        provider_name: "Ollama".into(),
+                        model_id: name.clone(),
+                        model_name: name,
+                    });
+                }
+            }
+        }
+
+        println!("{}", serde_json::to_string(&entries)?);
+        return Ok(());
+    }
 
     println!();
 
@@ -88,5 +132,5 @@ pub fn handle_switch(base_dir: &Path, provider_id: &str, model_query: &str) -> R
 // Kept for backward compat with the old single-arg CLI entry
 #[allow(dead_code)]
 pub fn handle(base_dir: &Path, provider_filter: &str) -> Result<()> {
-    handle_list(base_dir, provider_filter)
+    handle_list(base_dir, provider_filter, false)
 }

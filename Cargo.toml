@@ -24,6 +24,7 @@ libc = "0.2"
 tempfile = "3"
 urlencoding = "2"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "blocking"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }

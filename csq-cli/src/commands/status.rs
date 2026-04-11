@@ -28,13 +28,18 @@ use std::path::Path;
 #[cfg(unix)]
 use csq_core::daemon::{self, DetectResult};
 
-pub fn handle(base_dir: &Path) -> Result<()> {
+pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     // Try to resolve active account from current config dir marker
     let active = super::current_config_dir()
         .as_deref()
         .and_then(markers::read_current_account);
 
     let accounts = resolve_accounts(base_dir, active);
+
+    if json {
+        println!("{}", serde_json::to_string(&accounts)?);
+        return Ok(());
+    }
 
     if accounts.is_empty() {
         println!("No accounts configured.");

@@ -4,12 +4,19 @@ use super::catalog::{get_provider, Provider};
 use crate::error::ConfigError;
 use crate::platform::fs::{atomic_replace, secure_file};
 use crate::session::merge::{repair_truncated_json, set_model};
+use crate::types::ApiKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
 /// Wrapper around a settings JSON Value with provider metadata.
+///
+/// **SAFETY**: `settings` contains raw API keys inside
+/// `env.ANTHROPIC_AUTH_TOKEN`. This struct MUST NOT be returned
+/// over IPC or serialized to logs. Use [`get_api_key`] (which
+/// returns [`ApiKey`]) for any access that crosses a trust boundary.
+/// The `Serialize` derive exists solely for [`save_settings`] (disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub provider_id: String,
@@ -17,14 +24,16 @@ pub struct ProviderSettings {
 }
 
 impl ProviderSettings {
-    /// Returns the API key stored in this settings file, or None.
-    pub fn get_api_key(&self) -> Option<&str> {
+    /// Returns the API key stored in this settings file, wrapped in
+    /// [`ApiKey`] for zeroize-on-drop and masked Display/Debug.
+    pub fn get_api_key(&self) -> Option<ApiKey> {
         let provider = get_provider(&self.provider_id)?;
         let env_var = provider.key_env_var?;
         self.settings
             .get("env")
             .and_then(|env| env.get(env_var))
             .and_then(|v| v.as_str())
+            .map(|s| ApiKey::new(s.to_string()))
     }
 
     /// Returns the model configured in this settings file.
@@ -73,13 +82,12 @@ impl ProviderSettings {
     }
 
     /// Returns a masked fingerprint of the API key: "prefix6...suffix4".
-    /// Keys under 20 chars display as "(short)" to avoid revealing too
-    /// much of the key space.
+    /// Delegates to [`ApiKey::fingerprint`] so the raw value is never
+    /// handled as a plain string.
     pub fn key_fingerprint(&self) -> String {
         match self.get_api_key() {
             None => "(none)".into(),
-            Some(k) if k.len() < 20 => "(short)".into(),
-            Some(k) => format!("{}...{}", &k[..6], &k[k.len() - 4..]),
+            Some(k) => k.fingerprint(),
         }
     }
 }
@@ -283,7 +291,7 @@ mod tests {
         save_settings(dir.path(), &s).unwrap();
 
         let loaded = load_settings(dir.path(), "mm").unwrap();
-        assert_eq!(loaded.get_api_key(), Some("test-key-123"));
+        assert_eq!(loaded.get_api_key().unwrap().expose_secret(), "test-key-123");
     }
 
     #[test]
@@ -293,7 +301,7 @@ mod tests {
         std::fs::write(&path, r#"{"env": {"ANTHROPIC_AUTH_TOKEN": "key""#).unwrap();
 
         let loaded = load_settings(dir.path(), "mm").unwrap();
-        assert_eq!(loaded.get_api_key(), Some("key"));
+        assert_eq!(loaded.get_api_key().unwrap().expose_secret(), "key");
     }
 
     #[test]

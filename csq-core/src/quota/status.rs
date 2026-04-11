@@ -4,10 +4,11 @@ use super::format::{account_label, fmt_time};
 use super::state;
 use crate::accounts::{discovery, AccountInfo};
 use crate::types::AccountNum;
+use serde::Serialize;
 use std::path::Path;
 
 /// Status entry for a single account.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AccountStatus {
     pub id: u16,
     pub label: String,

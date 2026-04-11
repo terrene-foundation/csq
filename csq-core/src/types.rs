@@ -102,6 +102,58 @@ impl<'de> Deserialize<'de> for AccessToken {
     }
 }
 
+/// 3P provider API key with masked Display and zeroize-on-drop.
+///
+/// Wraps API keys from `ProviderSettings` so every raw-value access
+/// is auditable via `expose_secret()`. On-disk format remains plain
+/// JSON; protection is in-memory only.
+pub struct ApiKey(SecretString);
+
+impl ApiKey {
+    pub fn new(value: String) -> Self {
+        Self(SecretString::from(value))
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+
+    /// Returns a masked fingerprint: `prefix6...suffix4`.
+    /// Keys under 20 chars display as `(short)` to avoid revealing
+    /// too much of the key space.
+    pub fn fingerprint(&self) -> String {
+        let s = self.0.expose_secret();
+        if s.len() < 20 {
+            "(short)".into()
+        } else {
+            format!("{}...{}", &s[..6], &s[s.len() - 4..])
+        }
+    }
+}
+
+impl Clone for ApiKey {
+    fn clone(&self) -> Self {
+        Self::new(self.expose_secret().to_string())
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ApiKey({})", self)
+    }
+}
+
+impl fmt::Display for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0.expose_secret();
+        if s.len() > 12 {
+            write!(f, "{}...{}", &s[..6], &s[s.len() - 4..])
+        } else {
+            write!(f, "****")
+        }
+    }
+}
+
 /// OAuth refresh token with masked Display and zeroize-on-drop.
 pub struct RefreshToken(SecretString);
 
@@ -198,5 +250,42 @@ mod tests {
         let raw = "sk-ant-oat01-full-value";
         let token = AccessToken::new(raw.to_string());
         assert_eq!(token.expose_secret(), raw);
+    }
+
+    #[test]
+    fn api_key_masked_display() {
+        let key = ApiKey::new("sk-mm-abcdefghijklmnopqrstuv".to_string());
+        let display = format!("{key}");
+        assert!(display.starts_with("sk-mm-"));
+        assert!(display.ends_with("stuv"));
+        assert!(display.contains("..."));
+        assert!(!display.contains("abcdefghijklmnopqrstuv"));
+    }
+
+    #[test]
+    fn api_key_expose_secret() {
+        let raw = "sk-mm-test-key-value-12345";
+        let key = ApiKey::new(raw.to_string());
+        assert_eq!(key.expose_secret(), raw);
+    }
+
+    #[test]
+    fn api_key_fingerprint() {
+        let key = ApiKey::new("abcdef012345678901234xyz".to_string());
+        assert_eq!(key.fingerprint(), "abcdef...4xyz");
+    }
+
+    #[test]
+    fn api_key_fingerprint_short() {
+        let key = ApiKey::new("abcdef01234567890xy".to_string());
+        assert_eq!(key.fingerprint(), "(short)");
+    }
+
+    #[test]
+    fn api_key_debug_masked() {
+        let key = ApiKey::new("sk-mm-abcdefghijklmnopqrstuv".to_string());
+        let debug = format!("{key:?}");
+        assert!(debug.starts_with("ApiKey("));
+        assert!(!debug.contains("abcdefghijklmnopqrstuv"));
     }
 }

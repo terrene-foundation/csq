@@ -545,12 +545,15 @@ pub(crate) async fn tick_3p(
             None => continue,
         };
 
-        // Poll in spawn_blocking (blocking HTTP client)
+        // Poll in spawn_blocking (blocking HTTP client).
+        // expose_secret() at the HTTP boundary — raw key lives only
+        // for the duration of the blocking probe.
         let http = Arc::clone(http_post_probe);
         let url = format!("{base_url}/v1/messages");
         let model = default_model.to_string();
+        let raw_key = api_key.expose_secret().to_string();
         let poll_result = tokio::task::spawn_blocking(move || {
-            poll_3p_usage(&url, &api_key, &model, &http)
+            poll_3p_usage(&url, &raw_key, &model, &http)
         })
         .await;
 
@@ -606,9 +609,13 @@ fn provider_id_from_label(label: &str) -> Option<&'static str> {
 }
 
 /// Loads the API key for a 3P provider from its settings file.
-fn load_3p_api_key(base_dir: &std::path::Path, provider_id: &str) -> Option<String> {
+///
+/// Returns the key wrapped in [`ApiKey`] so the raw value is never
+/// held as a plain `String`. Callers expose at the HTTP boundary
+/// via [`ApiKey::expose_secret`].
+fn load_3p_api_key(base_dir: &std::path::Path, provider_id: &str) -> Option<crate::types::ApiKey> {
     let settings = load_settings(base_dir, provider_id).ok()?;
-    settings.get_api_key().map(|s| s.to_string())
+    settings.get_api_key()
 }
 
 /// Polls a 3P provider by sending a minimal `max_tokens=1` request.

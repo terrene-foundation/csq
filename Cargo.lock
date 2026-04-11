@@ -746,6 +746,7 @@ name = "csq-desktop"
 version = "2.0.0-alpha.1"
 dependencies = [
  "csq-core",
+ "dirs 5.0.1",
  "log",
  "serde",
  "serde_json",
@@ -753,6 +754,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
  "tauri-plugin-updater",
+ "tokio",
 ]
 
 [[package]]

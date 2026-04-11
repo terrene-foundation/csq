@@ -333,7 +333,11 @@ mod tests {
             "unexpected name: {decoded}"
         );
         let hash_part = &decoded["csq-lock-".len()..];
-        assert_eq!(hash_part.len(), 16, "expected 16-char hash, got: {hash_part}");
+        assert_eq!(
+            hash_part.len(),
+            16,
+            "expected 16-char hash, got: {hash_part}"
+        );
         assert!(
             hash_part.chars().all(|c| c.is_ascii_hexdigit()),
             "hash contains non-hex chars: {hash_part}"

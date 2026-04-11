@@ -367,7 +367,12 @@ mod tests {
         assert!(guard.is_some());
     }
 
+    /// On Unix, `lock_file` creates an actual `.lock` file via
+    /// `OpenOptions::create(true)`. On Windows, the "lock" is a
+    /// named kernel mutex — no file is created by the locking
+    /// primitive itself, so this assertion is Unix-only.
     #[test]
+    #[cfg(unix)]
     fn lock_creates_file_if_missing() {
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join("new.lock");

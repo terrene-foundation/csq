@@ -1,4 +1,8 @@
-import { defineConfig } from "vite";
+// Imported from `vitest/config` (not `vite`) so the `test` block is
+// recognized by the TS type-checker. `defineConfig` from vitest is a
+// superset of Vite's and returns a compatible config object. The
+// `tsc -p tsconfig.node.json` step checks this file.
+import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 // https://vite.dev/config/

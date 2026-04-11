@@ -25,8 +25,6 @@ pub mod cache;
 pub mod client;
 pub mod detect;
 pub mod lifecycle;
-#[cfg(unix)]
-pub mod oauth_callback;
 pub mod paths;
 pub mod pid;
 pub mod refresher;
@@ -49,7 +47,5 @@ pub use client::{
     http_get_unix, http_get_unix_with_timeout, http_post_unix, DaemonClientError, DaemonResponse,
     DEFAULT_TIMEOUT,
 };
-#[cfg(unix)]
-pub use oauth_callback::{serve as serve_oauth_callback, CallbackHandle, CallbackState};
 #[cfg(unix)]
 pub use server::{router, serve, HealthResponse, ServerHandle};

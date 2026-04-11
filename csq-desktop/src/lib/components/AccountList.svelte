@@ -1,8 +1,9 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { homeDir } from '@tauri-apps/api/path';
+  import { homeDir, join } from '@tauri-apps/api/path';
   import UsageBar from './UsageBar.svelte';
   import TokenBadge from './TokenBadge.svelte';
+  import AddAccountModal from './AddAccountModal.svelte';
 
   interface AccountView {
     id: number;
@@ -19,11 +20,16 @@
   let accounts = $state<AccountView[]>([]);
   let error = $state<string | null>(null);
   let loading = $state(true);
-  let loginMessage = $state<string | null>(null);
+  let modalOpen = $state(false);
 
   async function getBaseDir(): Promise<string> {
+    // Use `join` so the platform's path separator is honored.
+    // Tauri 2.10's `homeDir()` returns the home path without a
+    // trailing separator (`/Users/esperie`, not `/Users/esperie/`),
+    // so naive string concatenation produces an invalid path like
+    // `/Users/esperie.claude/accounts`.
     const home = await homeDir();
-    return home + '.claude/accounts';
+    return await join(home, '.claude', 'accounts');
   }
 
   async function fetchAccounts() {
@@ -38,15 +44,15 @@
     }
   }
 
-  async function handleAddAccount() {
-    const nextId = accounts.length > 0
-      ? Math.max(...accounts.map(a => a.id)) + 1
-      : 1;
-    try {
-      loginMessage = await invoke<string>('start_login', { account: nextId });
-    } catch (e) {
-      loginMessage = String(e);
+  // The next free slot is the smallest 1..=999 integer not already
+  // taken by an existing account. Using `length + 1` would skip
+  // past gaps (e.g. after the user deletes account 3 from five).
+  function nextAccountId(): number {
+    const taken = new Set(accounts.map((a) => a.id));
+    for (let i = 1; i <= 999; i++) {
+      if (!taken.has(i)) return i;
     }
+    return accounts.length + 1;
   }
 
   async function handleSwap(accountId: number) {
@@ -95,16 +101,16 @@
   </div>
 {/if}
 
-{#if loginMessage}
-  <div class="login-prompt">
-    <p>{loginMessage}</p>
-    <button class="dismiss" onclick={() => loginMessage = null}>Dismiss</button>
-  </div>
-{/if}
-
 <div class="actions">
-  <button class="add-account" onclick={handleAddAccount}>+ Add Account</button>
+  <button class="add-account" onclick={() => (modalOpen = true)}>+ Add Account</button>
 </div>
+
+<AddAccountModal
+  isOpen={modalOpen}
+  nextAccountId={nextAccountId()}
+  onClose={() => (modalOpen = false)}
+  onAccountAdded={() => fetchAccounts()}
+/>
 
 <style>
   .account-list { display: flex; flex-direction: column; gap: 0.5rem; }
@@ -151,23 +157,4 @@
     transition: border-color 0.15s, color 0.15s;
   }
   .add-account:hover { border-color: var(--accent); color: var(--accent); }
-  .login-prompt {
-    margin-top: 0.75rem;
-    padding: 0.75rem;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    font-size: 0.85rem;
-  }
-  .dismiss {
-    margin-top: 0.5rem;
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-secondary);
-    padding: 0.3rem 0.6rem;
-    cursor: pointer;
-    font: inherit;
-    font-size: 0.8rem;
-  }
 </style>

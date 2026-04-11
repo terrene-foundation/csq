@@ -59,8 +59,8 @@ pub mod pkce;
 pub mod state_store;
 
 pub use constants::{
-    redirect_uri, scopes_joined, DEFAULT_REDIRECT_PORT, OAUTH_AUTHORIZE_URL, OAUTH_CLIENT_ID,
-    OAUTH_SCOPES, OAUTH_TOKEN_URL,
+    scopes_joined, OAUTH_AUTHORIZE_URL, OAUTH_CLIENT_ID, OAUTH_SCOPES, OAUTH_TOKEN_URL,
+    PASTE_CODE_REDIRECT_URI,
 };
 pub use exchange::exchange_code;
 pub use login::{start_login, start_login_default_port, LoginRequest};

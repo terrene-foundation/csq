@@ -11,7 +11,8 @@ Quick reference for the background daemon's subsystem design, invariants, and se
 | 3P poller        | `daemon/usage_poller.rs` tick_3p() | 15 min     | `quota.json` (with `RateLimitData`)      |
 | Auto-rotator     | `daemon/auto_rotate.rs`            | 30s        | Atomic swap via `rotation::swap_to`      |
 | HTTP server      | `daemon/server.rs`                 | on-request | JSON over Unix socket                    |
-| OAuth callback   | `daemon/oauth_callback.rs`         | on-request | TCP 127.0.0.1:8420                       |
+
+**Removed 2026-04-11** (see journal 0020): `daemon/oauth_callback.rs` was a TCP listener on `127.0.0.1:8420` serving `/oauth/callback` for the v1 loopback OAuth flow. Anthropic retired loopback for this client_id — the module and its ~1000 LOC are gone. OAuth now uses the paste-code flow via `/api/login/{N}` + `POST /api/oauth/exchange` on the Unix socket.
 
 ## Key Invariants
 
@@ -27,14 +28,15 @@ handle_start creates: cache, discovery_cache, shutdown_token, oauth_store
     └── server receives: Arc<cache>, Arc<discovery_cache>, Arc<oauth_store>
 ```
 
-### 2. Dual-Listener Security Boundary (journal 0011)
+### 2. Single-Listener Security Boundary (as of journal 0020)
 
-| Listener           | Transport | Auth                   | Routes                 |
-| ------------------ | --------- | ---------------------- | ---------------------- |
-| Unix socket        | HTTP/1.1  | SO_PEERCRED (same UID) | All API routes         |
-| TCP 127.0.0.1:8420 | HTTP/1.1  | CSPRNG state token     | `/oauth/callback` only |
+| Listener    | Transport | Auth                   | Routes         |
+| ----------- | --------- | ---------------------- | -------------- |
+| Unix socket | HTTP/1.1  | SO_PEERCRED (same UID) | All API routes |
 
-New credential-handling routes MUST live on the Unix socket. The TCP listener is exclusively for the browser OAuth redirect.
+The TCP listener on `127.0.0.1:8420` was retired when Anthropic moved to paste-code OAuth (journal 0020). All credential-handling routes — including the two OAuth routes `GET /api/login/{N}` and `POST /api/oauth/exchange` — live on the Unix socket and are protected by SO_PEERCRED + 0o600 permissions.
+
+**Historical context**: journal 0011 documented the original dual-listener architecture. That design was correct for the v1 loopback OAuth flow where Anthropic redirected a browser to `http://127.0.0.1:8420/oauth/callback`. With paste-code OAuth the user pastes the code directly into the client app (csq-desktop or a CLI wrapper), so there's no browser-initiated callback and no need for TCP at all.
 
 ### 3. Filesystem-as-IPC (journal 0012)
 

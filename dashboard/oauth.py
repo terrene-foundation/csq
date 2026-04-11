@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
 """
-Dashboard — OAuth PKCE Login Flow
+Dashboard — OAuth PKCE Login Flow (LEGACY — DO NOT USE)
+
+⚠️  LEGACY CODE. This module is retained only so the Python
+dashboard's `/api/login/{N}` route does not 404. The OAuth endpoints
+in the constants below (`platform.claude.com/v1/oauth/authorize`,
+`platform.claude.com/v1/oauth/token`) and the scope list are all
+obsolete — Anthropic migrated the Claude Code client to
+`claude.com/cai/oauth/authorize` with scope `org:create_api_key`
+in early 2026. Any sign-in attempt through this file will fail at
+the token exchange step.
+
+The canonical OAuth flow for csq v2 is the paste-code flow in
+`csq-core::oauth::login` + `csq-desktop/src-tauri/src/commands.rs
+::submit_oauth_code`. See journal 0019 (endpoint migration) and
+journal 0020 (paste-code architecture).
+
+A future contributor who stumbles on this file: do not "fix" the
+URLs — the loopback redirect_uri pattern this file implements is
+also unreachable on the new endpoint. The correct replacement
+lives in the Rust desktop app. Delete this file once the Python
+dashboard is retired.
 
 Implements the OAuth 2.0 Authorization Code flow with PKCE for adding
 new Anthropic accounts via the dashboard.

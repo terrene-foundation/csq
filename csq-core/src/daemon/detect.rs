@@ -315,7 +315,6 @@ mod tests {
             )),
             base_dir: std::sync::Arc::new(dir.path().to_path_buf()),
             oauth_store: None,
-            oauth_port: 0,
         };
         let (handle, join) = match server::serve(&sock_path, state).await {
             Ok(r) => r,

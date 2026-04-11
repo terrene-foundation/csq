@@ -237,10 +237,113 @@ The settings window cannot invoke commands outside its granted permissions — m
 
 ## CRITICAL Gotchas
 
-| Rule                                              | Why                                                     |
-| ------------------------------------------------- | ------------------------------------------------------- |
-| Return `Result<T, String>` from all commands      | `String` maps to JS `Error`; custom types need Serialize |
-| Use `State<T>` for shared mutable state           | Plain static globals don't work with Tauri's lifecycle |
-| Mark `async` commands with `.await` in Rust       | Deadlocks if you `.lock()` inside async                 |
-| Set `devtools: true` in tauri.conf.json build    | Required for `/analyze` hooks in dev                   |
-| Handle token expiration before every API call      | Desktop app runs long sessions; tokens expire            |
+| Rule                                          | Why                                                      |
+| --------------------------------------------- | -------------------------------------------------------- |
+| Return `Result<T, String>` from all commands  | `String` maps to JS `Error`; custom types need Serialize |
+| Use `State<T>` for shared mutable state       | Plain static globals don't work with Tauri's lifecycle   |
+| Mark `async` commands with `.await` in Rust   | Deadlocks if you `.lock()` inside async                  |
+| Set `devtools: true` in tauri.conf.json build | Required for `/analyze` hooks in dev                     |
+| Handle token expiration before every API call | Desktop app runs long sessions; tokens expire            |
+
+## Tauri 2.10 Runtime Traps (CI-green, app-broken)
+
+These three traps are invisible to `cargo test`, `cargo clippy`, `svelte-check`, and `npm run build`. They only surface on `npm run tauri dev` or a real bundle run. See `workspaces/csq-v2/journal/0021-DISCOVERY-tauri-2-10-runtime-gotchas.md` for full postmortems.
+
+### 1. `tauri-plugin-updater` needs `plugins.updater` config or it panics the app at startup
+
+**Symptom**: `Failed to setup app: failed to initialize plugin 'updater': invalid type: null, expected struct Config` → non-unwinding panic inside `did_finish_launching` on macOS. App never draws a window.
+
+**Cause**: 2.10 rejects a missing `plugins.updater` block; earlier 2.x versions accepted it.
+
+**Fix**: either add a real `plugins.updater` block to `tauri.conf.json` with `endpoints` + `pubkey`, or don't register the plugin until you have those. Registering `tauri_plugin_updater::Builder::new().build()` with an empty `tauri.conf.json` is broken.
+
+**Catchable by**: a boot-smoke test. CI that doesn't launch the binary will never see it.
+
+### 2. `@tauri-apps/api/path::homeDir()` has no trailing separator in 2.10 — always use `join`
+
+**Symptom**: `base directory does not exist: /Users/esperie.claude/accounts` — the home dir and `.claude` fused together.
+
+**Cause**:
+
+```ts
+// ❌ BROKEN in 2.10
+const home = await homeDir(); // "/Users/esperie" (no trailing /)
+const baseDir = home + ".claude/accounts"; // "/Users/esperie.claude/accounts"
+```
+
+Earlier Tauri versions returned `homeDir` with a trailing slash. 2.10 drops it.
+
+**Fix**: always use `join`:
+
+```ts
+import { homeDir, join } from "@tauri-apps/api/path";
+const baseDir = await join(await homeDir(), ".claude", "accounts");
+```
+
+`join` uses the platform path separator and is separator-agnostic for the inputs.
+
+**Catchable by**: a runtime test or a lint for `homeDir() + ` in `.svelte`/`.ts` files.
+
+### 3. `<plugin>:allow-<verb>` permissions need a scope — use `<plugin>:default` when unsure
+
+**Symptom**: `openUrl` silently fails. No browser opens. No visible error (the JS throws but `try/catch` may swallow).
+
+**Cause**: `opener:allow-open-url` grants the command but doesn't specify which URLs are whitelisted. Without a scope, the call is denied.
+
+**Fix**: use `opener:default` which ships with a sensible URL scope (any `http`/`https`):
+
+```json
+"permissions": [
+  "opener:default"
+]
+```
+
+General rule: for plugins with security-sensitive verbs (opener, fs, shell), prefer `<plugin>:default` until you understand the scope config. Granular `allow-*` permissions typically require a companion scope declaration.
+
+**Catchable by**: surface the exception from `openUrl` to the UI instead of `console.warn`.
+
+## Desktop OAuth: paste-code flow (M8.7b+)
+
+Anthropic's Claude Code OAuth flow uses **paste-code**, not loopback, for this client_id. Full rationale in `workspaces/csq-v2/journal/0019-DISCOVERY-anthropic-oauth-endpoint-migration.md` and `0020-DECISION-paste-code-oauth-as-canonical-flow.md`.
+
+| Constant / function                                         | Value / signature                                        |
+| ----------------------------------------------------------- | -------------------------------------------------------- |
+| `OAUTH_AUTHORIZE_URL`                                       | `https://claude.com/cai/oauth/authorize`                 |
+| `PASTE_CODE_REDIRECT_URI`                                   | `https://platform.claude.com/oauth/code/callback`        |
+| `OAUTH_TOKEN_URL`                                           | `https://platform.claude.com/v1/oauth/token` (unchanged) |
+| `OAUTH_SCOPES[0]`                                           | `org:create_api_key` (required by Claude Code)           |
+| `oauth::start_login(store, account) -> LoginRequest`        | Builds paste-code URL with `code=true` param             |
+| `oauth::exchange_code(code, verifier, redirect, http_post)` | Swaps code for token pair                                |
+
+### Desktop flow shape
+
+```
++ Add Account → Claude
+  → start_claude_login(account: nextId)            [Tauri command]
+    → store.insert(verifier, account) -> state
+    → return { auth_url, state, account, expires_in_secs }
+  → openUrl(auth_url)                              [tauri-plugin-opener]
+  → user authorizes in browser
+  → Anthropic shows code on paste-code callback page
+  → user pastes code into modal
+  → submit_oauth_code({ baseDir, state, code })     [Tauri command]
+    → store.consume(state) -> (verifier, account)
+    → exchange_code(code, verifier, PASTE_CODE_REDIRECT_URI, http::post_json)
+    → credentials::save_canonical(base, account, creds)
+    → return account: u16
+  → modal shows "Account N added"
+```
+
+### No TCP callback listener
+
+Unlike the v1 loopback flow, csq v2's desktop OAuth does **not** bind port 8420 at startup. The `OAuthStateStore` is the only OAuth state. `csq daemon` and `csq-desktop` can run simultaneously without port conflicts.
+
+### Daemon HTTP API (Unix socket)
+
+Same flow via `/api/login/{N}` + `POST /api/oauth/exchange`. Body for the exchange route:
+
+```json
+{ "state": "<state token>", "code": "<paste-code>" }
+```
+
+Returns `{ "account": N }` on success. State is consumed on any outcome (success, mismatch, expired) — single-use.

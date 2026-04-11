@@ -32,7 +32,6 @@ fn make_router_state(base: &Path) -> RouterState {
         discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
         base_dir: Arc::new(base.to_path_buf()),
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
-        oauth_port: csq_core::oauth::DEFAULT_REDIRECT_PORT,
     }
 }
 

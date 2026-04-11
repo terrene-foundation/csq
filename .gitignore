@@ -33,4 +33,5 @@ journal/*-data/
 
 # Runtime learning state — auto-appended on every session start.
 # Tracking it produces churn on every commit and never carries useful diffs.
-.claude/learning/observations.jsonl
+# Matches at any depth (csq-desktop/.claude/learning/ too) via the **/ prefix.
+**/.claude/learning/

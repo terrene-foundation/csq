@@ -1,24 +1,31 @@
 //! Login initiation — builds the Anthropic authorize URL and
-//! records the pending PKCE state.
+//! records the pending PKCE state for the paste-code OAuth flow.
 //!
 //! # Flow
 //!
 //! 1. Caller invokes [`start_login`] with a reference to the
-//!    daemon's [`OAuthStateStore`], the target account number, and
-//!    the redirect port (usually [`DEFAULT_REDIRECT_PORT`]).
+//!    [`OAuthStateStore`] and the target account number.
 //! 2. `start_login` generates a fresh [`CodeVerifier`], computes
 //!    its [`CodeChallenge`], stores the verifier + account in the
 //!    state store (keyed by a random state token), and returns a
-//!    [`LoginRequest`] containing the authorize URL the caller
-//!    should open in a browser plus the state token for debugging.
-//! 3. The caller (the M8.7b `GET /api/login/{N}` handler) returns
-//!    the URL to the frontend / dashboard, which opens it in the
-//!    user's browser.
-//! 4. After authorization, Anthropic redirects to
-//!    `http://127.0.0.1:{port}/oauth/callback?code=X&state=Y`. The
-//!    M8.7b callback listener calls
-//!    [`crate::oauth::exchange_code`] with the `code` and the
-//!    verifier retrieved via [`OAuthStateStore::consume`].
+//!    [`LoginRequest`] containing the Anthropic authorize URL the
+//!    caller should open in a browser.
+//! 3. The user authorizes on Anthropic's page. Anthropic then
+//!    displays an authorization code on its paste-code callback
+//!    page at `https://platform.claude.com/oauth/code/callback`.
+//! 4. The user copies the displayed code and pastes it back into
+//!    the calling app. The app looks up the verifier in the state
+//!    store (via [`OAuthStateStore::consume`] keyed by the state
+//!    token returned from step 2) and calls
+//!    [`crate::oauth::exchange_code`] with the paste-code redirect
+//!    URI to swap the code for an access/refresh token pair.
+//!
+//! # Why paste-code instead of loopback
+//!
+//! Anthropic retired loopback OAuth (`http://127.0.0.1:8420/...`)
+//! for this client_id. The current `claude` CLI and the csq
+//! desktop app both use the paste-code redirect that Anthropic's
+//! authorize endpoint serves at `claude.com/cai/oauth/authorize`.
 //!
 //! # Security notes
 //!
@@ -26,15 +33,14 @@
 //!   Only the challenge (one-way SHA256) is sent. Even if the URL
 //!   ends up in a log or browser history, the verifier is safe.
 //! - The state token is single-use (enforced by the store). Replay
-//!   attacks on the callback are prevented.
-//! - The returned [`LoginRequest`] includes the state token so
-//!   *optional* frontend code can correlate a login-initiation
-//!   response to its eventual callback. The frontend does not need
-//!   to hold the verifier — only the daemon does.
+//!   attacks on the paste-code exchange are prevented.
+//! - The returned [`LoginRequest`] includes the state token so the
+//!   caller can correlate the initiation response with the
+//!   eventual paste-code submission.
 
 use crate::error::{CredentialError, CsqError};
 use crate::oauth::constants::{
-    redirect_uri, scopes_joined, DEFAULT_REDIRECT_PORT, OAUTH_AUTHORIZE_URL, OAUTH_CLIENT_ID,
+    scopes_joined, OAUTH_AUTHORIZE_URL, OAUTH_CLIENT_ID, PASTE_CODE_REDIRECT_URI,
 };
 use crate::oauth::pkce::{challenge_from_verifier, generate_verifier};
 use crate::oauth::state_store::OAuthStateStore;
@@ -62,11 +68,21 @@ pub struct LoginRequest {
     pub expires_in_secs: u64,
 }
 
-/// Initiates an OAuth login for `account`.
+/// Initiates an OAuth paste-code login for `account`.
 ///
 /// Generates PKCE + state, records them in the store, and builds
-/// the authorize URL. The returned [`LoginRequest`] is ready to be
-/// serialized to the frontend.
+/// the authorize URL using Anthropic's current paste-code flow:
+///
+/// - `redirect_uri` is [`PASTE_CODE_REDIRECT_URI`] (Anthropic's own
+///   callback page), **not** a loopback URL
+/// - an extra `code=true` parameter signals paste-code mode to the
+///   authorize endpoint
+///
+/// After the user authorizes, Anthropic shows a code on-screen.
+/// The caller is expected to collect that code from the user and
+/// pass it to [`crate::oauth::exchange_code`] with the same
+/// verifier (retrieved via [`OAuthStateStore::consume`]) and the
+/// exact same `redirect_uri` byte-for-byte.
 ///
 /// # Errors
 ///
@@ -75,11 +91,7 @@ pub struct LoginRequest {
 /// out of range. PKCE and state generation are infallible on
 /// supported platforms (they panic only if the OS CSPRNG is
 /// unavailable, which cannot happen on macOS/Linux/Windows).
-pub fn start_login(
-    store: &OAuthStateStore,
-    account: AccountNum,
-    port: u16,
-) -> Result<LoginRequest, CsqError> {
+pub fn start_login(store: &OAuthStateStore, account: AccountNum) -> Result<LoginRequest, CsqError> {
     // AccountNum already guarantees 1..=999, but we defensively
     // re-check so a future widening of AccountNum's range doesn't
     // silently allow 0 here.
@@ -92,8 +104,6 @@ pub fn start_login(
     let verifier = generate_verifier();
     let challenge = challenge_from_verifier(&verifier);
     let state = store.insert(verifier, account);
-
-    let redirect = redirect_uri(port);
 
     // urlencoding::encode performs application/x-www-form-urlencoded
     // percent-encoding, which matches the query-string encoding
@@ -110,10 +120,17 @@ pub fn start_login(
     // key, percent-encode both sides of the `=` sign. Grepping
     // this file for `urlencoding::encode` should show both the
     // key and value being encoded once that invariant weakens.
+    //
+    // Parameter order matches `claude auth login`'s live output as
+    // observed on 2026-04-11: `code=true` appears first, then the
+    // standard OAuth params. Anthropic's authorize endpoint is not
+    // documented to be order-sensitive, but matching the reference
+    // client keeps any server-side quirks from surprising us.
     let params = [
+        ("code", "true".to_string()),
         ("client_id", OAUTH_CLIENT_ID.to_string()),
         ("response_type", "code".to_string()),
-        ("redirect_uri", redirect),
+        ("redirect_uri", PASTE_CODE_REDIRECT_URI.to_string()),
         ("scope", scopes_joined()),
         ("code_challenge", challenge.as_str().to_string()),
         ("code_challenge_method", "S256".to_string()),
@@ -136,14 +153,16 @@ pub fn start_login(
     })
 }
 
-/// Convenience wrapper: builds a login request against the default
-/// redirect port. Kept so the M8.7b route handler does not need to
-/// import [`DEFAULT_REDIRECT_PORT`] itself.
+/// Convenience wrapper: builds a paste-code login request.
+///
+/// Previously wrapped [`start_login`] with a default port for the
+/// loopback flow. With paste-code, there's no port, so this is a
+/// thin alias kept for callers that were using the name.
 pub fn start_login_default_port(
     store: &OAuthStateStore,
     account: AccountNum,
 ) -> Result<LoginRequest, CsqError> {
-    start_login(store, account, DEFAULT_REDIRECT_PORT)
+    start_login(store, account)
 }
 
 #[cfg(test)]
@@ -183,7 +202,7 @@ mod tests {
     #[test]
     fn start_login_returns_login_request() {
         let store = OAuthStateStore::new();
-        let req = start_login(&store, acct(3), 8420).unwrap();
+        let req = start_login(&store, acct(3)).unwrap();
         assert_eq!(req.account, 3);
         assert!(!req.state.is_empty());
         assert!(req.auth_url.starts_with("https://"));
@@ -193,15 +212,16 @@ mod tests {
     #[test]
     fn authorize_url_contains_all_required_params() {
         let store = OAuthStateStore::new();
-        let req = start_login(&store, acct(1), 8420).unwrap();
+        let req = start_login(&store, acct(1)).unwrap();
         let params = parse_query(&req.auth_url);
 
         assert_eq!(param(&params, "client_id"), Some(OAUTH_CLIENT_ID));
         assert_eq!(param(&params, "response_type"), Some("code"));
         assert_eq!(
             param(&params, "redirect_uri"),
-            Some("http://127.0.0.1:8420/oauth/callback")
+            Some(PASTE_CODE_REDIRECT_URI)
         );
+        assert_eq!(param(&params, "code"), Some("true"));
         assert_eq!(param(&params, "code_challenge_method"), Some("S256"));
         // state should round-trip intact
         assert_eq!(param(&params, "state"), Some(req.state.as_str()));
@@ -221,12 +241,29 @@ mod tests {
     #[test]
     fn authorize_url_uses_correct_base_url() {
         let store = OAuthStateStore::new();
-        let req = start_login(&store, acct(1), 8420).unwrap();
+        let req = start_login(&store, acct(1)).unwrap();
         assert!(
             req.auth_url
-                .starts_with("https://platform.claude.com/v1/oauth/authorize?"),
+                .starts_with("https://claude.com/cai/oauth/authorize?"),
             "auth_url should start with Anthropic authorize endpoint: {}",
             req.auth_url
+        );
+    }
+
+    #[test]
+    fn authorize_url_includes_org_create_api_key_scope() {
+        // Regression: Anthropic's current Claude Code login includes
+        // `org:create_api_key` as the first scope. Verified against
+        // live `claude auth login` output on 2026-04-11. If this
+        // scope is missing, the credential can't be used for the
+        // full Claude Code surface.
+        let store = OAuthStateStore::new();
+        let req = start_login(&store, acct(1)).unwrap();
+        let params = parse_query(&req.auth_url);
+        let scope = param(&params, "scope").expect("scope present");
+        assert!(
+            scope.contains("org:create_api_key"),
+            "scope must include org:create_api_key, got: {scope}"
         );
     }
 
@@ -234,14 +271,14 @@ mod tests {
     fn start_login_records_pending_state() {
         let store = OAuthStateStore::new();
         assert_eq!(store.len(), 0);
-        let _req = start_login(&store, acct(2), 8420).unwrap();
+        let _req = start_login(&store, acct(2)).unwrap();
         assert_eq!(store.len(), 1);
     }
 
     #[test]
     fn state_token_can_be_consumed_after_start_login() {
         let store = OAuthStateStore::new();
-        let req = start_login(&store, acct(5), 8420).unwrap();
+        let req = start_login(&store, acct(5)).unwrap();
 
         let pending = store.consume(&req.state).expect("consume");
         assert_eq!(pending.account, acct(5));
@@ -254,30 +291,23 @@ mod tests {
     #[test]
     fn parallel_logins_get_distinct_states() {
         let store = OAuthStateStore::new();
-        let r1 = start_login(&store, acct(1), 8420).unwrap();
-        let r2 = start_login(&store, acct(2), 8420).unwrap();
+        let r1 = start_login(&store, acct(1)).unwrap();
+        let r2 = start_login(&store, acct(2)).unwrap();
         assert_ne!(r1.state, r2.state);
         assert_eq!(store.len(), 2);
     }
 
     #[test]
-    fn default_port_wrapper_uses_8420() {
+    fn paste_code_redirect_is_fixed_anthropic_endpoint() {
+        // The paste-code redirect is a constant — it doesn't change
+        // per-login or per-port. Lock that in so a future rewrite
+        // doesn't accidentally re-introduce a port parameter.
         let store = OAuthStateStore::new();
-        let req = start_login_default_port(&store, acct(1)).unwrap();
+        let req = start_login(&store, acct(1)).unwrap();
         let params = parse_query(&req.auth_url);
         assert_eq!(
             param(&params, "redirect_uri"),
-            Some("http://127.0.0.1:8420/oauth/callback")
+            Some("https://platform.claude.com/oauth/code/callback")
         );
-    }
-
-    #[test]
-    fn different_ports_produce_different_redirect_uris() {
-        let store = OAuthStateStore::new();
-        let r1 = start_login(&store, acct(1), 8420).unwrap();
-        let r2 = start_login(&store, acct(1), 9999).unwrap();
-        let p1 = parse_query(&r1.auth_url);
-        let p2 = parse_query(&r2.auth_url);
-        assert_ne!(param(&p1, "redirect_uri"), param(&p2, "redirect_uri"));
     }
 }

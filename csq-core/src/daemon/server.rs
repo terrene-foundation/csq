@@ -57,8 +57,11 @@
 use super::cache::TtlCache;
 use super::refresher::RefreshStatus;
 use crate::accounts::{discovery, AccountInfo};
-use crate::error::DaemonError;
-use crate::oauth::{start_login, LoginRequest, OAuthStateStore, DEFAULT_REDIRECT_PORT};
+use crate::credentials;
+use crate::error::{DaemonError, OAuthError};
+use crate::oauth::{
+    exchange_code, start_login, LoginRequest, OAuthStateStore, PASTE_CODE_REDIRECT_URI,
+};
 use crate::types::AccountNum;
 use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, State},
@@ -66,7 +69,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -95,17 +98,16 @@ pub struct RouterState {
     pub discovery_cache: Arc<TtlCache<(), Vec<AccountInfo>>>,
     /// csq base directory, passed through for account discovery.
     pub base_dir: Arc<PathBuf>,
-    /// OAuth state store, shared with the callback listener
-    /// (`daemon::oauth_callback`). `None` when the callback
-    /// listener failed to bind its TCP port at startup — in that
-    /// case `/api/login/{N}` returns 503.
+    /// OAuth state store for pending paste-code logins. The daemon
+    /// keeps this in memory — `start_login` inserts an entry keyed
+    /// by a random state token, and the subsequent
+    /// `/api/oauth/exchange` call consumes it when the user submits
+    /// their copied authorization code.
+    ///
+    /// `None` when the daemon was started without OAuth support
+    /// (tests, custom builds). In that case both `/api/login/{N}`
+    /// and `/api/oauth/exchange` return 503.
     pub oauth_store: Option<Arc<OAuthStateStore>>,
-    /// Port the OAuth callback TCP listener is bound to. Embedded
-    /// in the authorize URL as part of the `redirect_uri` query
-    /// parameter — must be byte-identical to what the callback
-    /// listener binds, otherwise Anthropic rejects the exchange.
-    /// Zero when `oauth_store` is `None`.
-    pub oauth_port: u16,
 }
 
 /// Maximum staleness for the discovery cache: 5 seconds.
@@ -153,7 +155,8 @@ pub struct HealthResponse {
 /// - `GET /api/accounts` — discovered accounts (M8.5)
 /// - `GET /api/refresh-status` — all refresh statuses from the cache (M8.5)
 /// - `GET /api/refresh-status/:id` — one account's refresh status (M8.5)
-/// - `GET /api/login/:id` — initiate an OAuth login flow (M8.7b)
+/// - `GET /api/login/:id` — initiate a paste-code OAuth flow
+/// - `POST /api/oauth/exchange` — submit the paste-code and exchange it
 /// - `POST /api/invalidate-cache` — clear all caches (M8-10c)
 ///
 /// The [`DefaultBodyLimit`] layer is installed here so every future
@@ -167,6 +170,7 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/refresh-status", get(refresh_status_all_handler))
         .route("/api/refresh-status/{id}", get(refresh_status_one_handler))
         .route("/api/login/{id}", get(login_handler))
+        .route("/api/oauth/exchange", post(oauth_exchange_handler))
         .route("/api/invalidate-cache", post(invalidate_cache_handler))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -291,22 +295,22 @@ async fn refresh_status_one_handler(
     }
 }
 
-/// GET /api/login/:id — initiates an OAuth PKCE login for the
-/// given account slot.
+/// GET /api/login/:id — initiates a paste-code OAuth login for
+/// the given account slot.
 ///
-/// Returns a JSON [`LoginRequest`] containing the Anthropic
-/// authorize URL the caller should open in a browser. The state
-/// store entry is created synchronously; the browser redirect
-/// back to the callback listener will consume it.
+/// Generates a fresh PKCE verifier + state token, records them in
+/// the shared [`OAuthStateStore`], and returns a [`LoginRequest`]
+/// containing the authorize URL the caller should open in a
+/// browser. After the user authorizes, Anthropic displays an
+/// authorization code on its callback page; the caller then POSTs
+/// that code to `/api/oauth/exchange` to complete the login.
 ///
 /// # Errors
 ///
 /// - **400 Bad Request** — account id is outside 1..=999.
-/// - **503 Service Unavailable** — the daemon failed to bind the
-///   OAuth callback TCP listener at startup (usually because the
-///   port 8420 is in use). The rest of the daemon still functions;
-///   the user needs to free the port and restart the daemon to
-///   log in new accounts.
+/// - **503 Service Unavailable** — the daemon was started without
+///   an OAuth state store (`oauth_store: None`). Tests and custom
+///   builds can disable OAuth; real daemons always enable it.
 /// - **500 Internal Server Error** — unexpected failure in
 ///   `start_login` (impossible on supported platforms — it only
 ///   fails if the OS CSPRNG is unavailable).
@@ -320,23 +324,11 @@ async fn login_handler(
     let Some(store) = state.oauth_store.as_ref() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "oauth callback listener is not available; \
-             check that port 8420 is free and restart the daemon"
-                .to_string(),
+            "oauth support is not available on this daemon".to_string(),
         ));
     };
 
-    // `oauth_port` defaults to DEFAULT_REDIRECT_PORT when the
-    // listener was not started with a custom port. Zero means
-    // "no listener" and we should have already returned 503 above,
-    // so this is a defensive fallback.
-    let port = if state.oauth_port == 0 {
-        DEFAULT_REDIRECT_PORT
-    } else {
-        state.oauth_port
-    };
-
-    start_login(store, account, port).map(Json).map_err(|e| {
+    start_login(store, account).map(Json).map_err(|e| {
         // start_login is effectively infallible for valid
         // AccountNum on supported platforms; if it ever errors we
         // map to 500 without echoing internal details.
@@ -346,6 +338,201 @@ async fn login_handler(
             "oauth login initiation failed".to_string(),
         )
     })
+}
+
+/// Request body for `POST /api/oauth/exchange`.
+#[derive(Debug, Deserialize)]
+pub struct OAuthExchangeRequest {
+    /// State token returned by the preceding `GET /api/login/{N}`.
+    pub state: String,
+    /// Authorization code displayed by Anthropic on its callback
+    /// page after the user authorizes.
+    pub code: String,
+}
+
+/// Response body for `POST /api/oauth/exchange`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OAuthExchangeResponse {
+    /// The account slot that was authenticated — echoes
+    /// [`crate::oauth::PendingState::account`] so callers can
+    /// confirm without re-parsing the state token.
+    pub account: u16,
+}
+
+/// POST /api/oauth/exchange — submits the paste-code from the
+/// browser and exchanges it for a credential file.
+///
+/// Flow:
+///
+/// 1. Looks up the pending PKCE state keyed by `state` in the
+///    [`OAuthStateStore`] — this is the authentication boundary.
+///    Missing, expired, or already-consumed tokens map to 400.
+/// 2. Calls [`exchange_code`] against the Anthropic token endpoint
+///    with the recovered verifier and the paste-code redirect URI
+///    (must be byte-identical to what the authorize URL advertised).
+/// 3. Writes the resulting credential file to `credentials/N.json`
+///    with `0o600` via [`credentials::save_canonical`].
+/// 4. Returns the validated account number.
+///
+/// # Errors
+///
+/// - **400 Bad Request** — empty code, or state token not found /
+///   expired / already consumed.
+/// - **502 Bad Gateway** — Anthropic rejected the code or returned
+///   a malformed token response.
+/// - **500 Internal Server Error** — disk write failed.
+/// - **503 Service Unavailable** — daemon started without OAuth
+///   support.
+///
+/// All error messages are redacted by `OAuthError` / `CsqError`
+/// before surfacing — the upstream response body (which may echo
+/// the submitted code) is never included.
+async fn oauth_exchange_handler(
+    State(state): State<RouterState>,
+    Json(body): Json<OAuthExchangeRequest>,
+) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
+    let Some(store) = state.oauth_store.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth support is not available on this daemon".to_string(),
+        ));
+    };
+
+    // Clean the code: strip surrounding whitespace / CRs a shell
+    // caller may have included.
+    let code = body.code.trim().trim_end_matches('\r').to_string();
+    if code.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "code must not be empty".to_string(),
+        ));
+    }
+
+    // Consume the pending entry — single-use.
+    let pending = store.consume(&body.state).map_err(|e| match e {
+        OAuthError::StateMismatch => (
+            StatusCode::BAD_REQUEST,
+            "state token not recognized".to_string(),
+        ),
+        OAuthError::StateExpired { .. } => {
+            (StatusCode::BAD_REQUEST, "state token expired".to_string())
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state lookup failed".to_string(),
+        ),
+    })?;
+
+    // The exchange is a synchronous HTTP round-trip via blocking
+    // reqwest. Run it on a spawn_blocking worker so we don't stall
+    // the tokio runtime.
+    let verifier = pending.code_verifier.clone();
+    let account = pending.account;
+    let exchange_result = tokio::task::spawn_blocking(move || {
+        exchange_code(
+            &code,
+            &verifier,
+            PASTE_CODE_REDIRECT_URI,
+            crate::http::post_json,
+        )
+    })
+    .await;
+
+    let credential = match exchange_result {
+        Ok(Ok(c)) => c,
+        Ok(Err(OAuthError::Exchange(_))) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "exchange",
+                "oauth exchange failed"
+            );
+            return Err((StatusCode::BAD_GATEWAY, "code exchange failed".to_string()));
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = e.kind(),
+                "oauth exchange unexpected error"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal oauth error".to_string(),
+            ));
+        }
+        Err(_join_err) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "join_err",
+                "oauth exchange task panicked"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal oauth error".to_string(),
+            ));
+        }
+    };
+
+    // Persist to `credentials/N.json` on a blocking worker too —
+    // file IO plus atomic_replace plus chmod.
+    let base_dir = Arc::clone(&state.base_dir);
+    let save_result = tokio::task::spawn_blocking(move || {
+        credentials::save_canonical(&base_dir, account, &credential)
+    })
+    .await;
+
+    match save_result {
+        Ok(Ok(())) => {
+            // Invalidate caches so the next /api/accounts call
+            // shows the new row without waiting for the TTL.
+            state.discovery_cache.clear();
+            state.cache.clear();
+            tracing::info!(account = account.get(), "oauth login complete");
+            Ok(Json(OAuthExchangeResponse {
+                account: account.get(),
+            }))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "credential_save",
+                "credential write failed: {e}"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential write failed".to_string(),
+            ))
+        }
+        Err(_join_err) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "join_err",
+                "credential save task panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal save error".to_string(),
+            ))
+        }
+    }
+}
+
+/// Helper trait — keeps `error_kind = ...` tags small so the
+/// exchange handler can classify errors for structured logging
+/// without leaking details into the tag string.
+trait OAuthErrorKind {
+    fn kind(&self) -> &'static str;
+}
+
+impl OAuthErrorKind for OAuthError {
+    fn kind(&self) -> &'static str {
+        match self {
+            OAuthError::Http { .. } => "http",
+            OAuthError::StateExpired { .. } => "state_expired",
+            OAuthError::StateMismatch => "state_mismatch",
+            OAuthError::PkceVerification => "pkce_verification",
+            OAuthError::Exchange(_) => "exchange",
+        }
+    }
 }
 
 /// POST /api/invalidate-cache — clears all daemon caches.
@@ -712,7 +899,6 @@ mod tests {
             discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
-            oauth_port: DEFAULT_REDIRECT_PORT,
         }
     }
 
@@ -724,7 +910,6 @@ mod tests {
             discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: None,
-            oauth_port: 0,
         }
     }
 
@@ -740,7 +925,6 @@ mod tests {
             discovery_cache: Arc::new(TtlCache::new(discovery_ttl)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
-            oauth_port: DEFAULT_REDIRECT_PORT,
         }
     }
 
@@ -910,6 +1094,43 @@ mod tests {
         let text = String::from_utf8_lossy(&buf).into_owned();
         let status_line = text.lines().next().unwrap_or("").to_string();
         // Find the blank line separating headers from body.
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    /// Issues a raw HTTP POST with a JSON body against the daemon's
+    /// Unix socket and returns (status_line, body).
+    async fn http_post_json(sock: &std::path::Path, path: &str, body: &str) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\r\n{body}",
+            len = body.len(),
+            body = body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
         let body = text
             .find("\r\n\r\n")
             .map(|i| text[i + 4..].to_string())
@@ -1101,9 +1322,16 @@ mod tests {
 
         let (status, body) = http_get(&sock, "/api/login/3").await;
         assert!(status.contains("200"), "status: {status}");
+        // Paste-code flow: authorize URL is the current Anthropic
+        // endpoint and the redirect_uri embedded in it is the
+        // paste-code callback page, not a loopback URL.
         assert!(
-            body.contains(r#""auth_url":"https://platform.claude.com"#),
+            body.contains(r#""auth_url":"https://claude.com/cai/oauth/authorize"#),
             "body: {body}"
+        );
+        assert!(
+            body.contains("platform.claude.com%2Foauth%2Fcode%2Fcallback"),
+            "redirect_uri must be the paste-code callback, body: {body}"
         );
         assert!(body.contains(r#""account":3"#), "body: {body}");
         assert!(body.contains(r#""state":""#));
@@ -1122,7 +1350,103 @@ mod tests {
 
         let (status, body) = http_get(&sock, "/api/login/1").await;
         assert!(status.contains("503"), "status: {status}");
-        assert!(body.contains("oauth callback listener is not available"));
+        assert!(body.contains("oauth support is not available"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_empty_code() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let req_body = r#"{"state":"anything","code":"   "}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("code must not be empty"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_unknown_state() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        // Send a state token that was never issued — the consume
+        // step must reject it as state_mismatch and return 400.
+        let req_body = r#"{"state":"never-issued-this-token","code":"some-code"}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("state token"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_returns_503_when_oauth_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state_no_oauth(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let req_body = r#"{"state":"any","code":"any"}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("503"), "status: {status}");
+        assert!(body.contains("oauth support is not available"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_route_consumes_state_on_success_path_shape() {
+        // The exchange handler pulls the pending state from the
+        // store *before* making the HTTP round-trip. This test
+        // verifies that the state_mismatch branch drops the entry
+        // so a subsequent retry with the same token fails the
+        // same way — i.e. state is single-use even on failure.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        let store = Arc::clone(state.oauth_store.as_ref().unwrap());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Seed one pending entry so we have a valid state token.
+        let account = AccountNum::try_from(1u16).unwrap();
+        let verifier = crate::oauth::CodeVerifier::new("test-verifier".into());
+        let state_token = store.insert(verifier, account);
+        assert_eq!(store.len(), 1);
+
+        // First call with a wrong state token — should 400 and
+        // leave the pending entry alone.
+        let req_body = r#"{"state":"not-the-real-one","code":"dummy"}"#;
+        let (status, _body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"));
+        assert_eq!(
+            store.len(),
+            1,
+            "wrong state token must not consume the legitimate entry"
+        );
+
+        // Second call with the real state token and a dummy code:
+        // the state gets consumed even though the HTTP exchange
+        // will fail (no real token endpoint reachable). We only
+        // verify the store length here — the actual exchange
+        // failure mode is covered by the csq_core::oauth::exchange
+        // unit tests.
+        let real_body = format!(r#"{{"state":"{state_token}","code":"some-code"}}"#);
+        let _ = http_post_json(&sock, "/api/oauth/exchange", &real_body).await;
+        assert_eq!(
+            store.len(),
+            0,
+            "successful state lookup must consume the entry"
+        );
 
         handle.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;

@@ -13,6 +13,42 @@ Source: `csq-core/src/providers/catalog.rs`
 | `zai`    | Z.AI    | Bearer | `api.z.ai/api/anthropic`     | `settings-zai.json`    | 901          |
 | `ollama` | Ollama  | None   | `localhost:11434`            | `settings-ollama.json` | —            |
 
+## Anthropic OAuth Endpoints (2026-04-11)
+
+Anthropic migrated the Claude Code OAuth authorize endpoint **without notice**. csq v1.x `dashboard/oauth.py` and csq v2 `csq-core/src/oauth/constants.rs` both had stale URLs until this session. Refresh paths kept working because the token endpoint is unchanged. See `workspaces/csq-v2/journal/0019-DISCOVERY-anthropic-oauth-endpoint-migration.md`.
+
+| Purpose             | URL                                               | Status      |
+| ------------------- | ------------------------------------------------- | ----------- |
+| Authorize           | `https://claude.com/cai/oauth/authorize`          | **Current** |
+| ~~Authorize (v1)~~  | ~~`platform.claude.com/v1/oauth/authorize`~~      | 404 (dead)  |
+| Paste-code redirect | `https://platform.claude.com/oauth/code/callback` | Current     |
+| Token exchange      | `https://platform.claude.com/v1/oauth/token`      | Unchanged   |
+| `client_id`         | `9d1c250a-e61b-44d9-88ed-5944d1962f5e`            | Unchanged   |
+
+### Claude Code OAuth flow is paste-code, not loopback
+
+Anthropic no longer accepts `http://127.0.0.1:8420/oauth/callback` as a `redirect_uri` for this client_id. The current flow:
+
+1. Caller generates PKCE verifier + state, builds URL with `code=true` + `redirect_uri=https://platform.claude.com/oauth/code/callback`
+2. User authorizes in a browser (system browser or webview — `claude auth login` uses system browser)
+3. Anthropic shows an authorization code on its callback page
+4. User copies the code, pastes it back into the calling app
+5. App looks up the verifier by state token, exchanges at the token endpoint with the **same** paste-code redirect URI
+
+The `csq` bash wrapper shells out to `claude auth login` for this flow — it does not drive the OAuth handshake itself. csq-core's `oauth::start_login` + `oauth::exchange_code` reimplement the same flow for the desktop app and daemon HTTP API.
+
+### Required scopes
+
+```
+org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload
+```
+
+`org:create_api_key` is **new** vs. v1.x csq — Claude Code added it. If you see "unauthorized" errors after a fresh login, check this scope first.
+
+### Don't try to "fix" loopback
+
+Both csq v1.x and csq v2 had loopback OAuth flows. Both are now dead. Don't reintroduce a loopback callback listener — Anthropic's client_id registration rejects it. Delegate to `claude auth login` or use paste-code.
+
 ## Settings File Structure
 
 3P settings files have two key locations (both must be checked):

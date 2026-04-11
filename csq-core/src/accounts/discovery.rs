@@ -1,18 +1,28 @@
 //! Account discovery — finds all configured accounts from multiple sources.
 //!
-//! Sources: Anthropic credentials, third-party settings, manual accounts.
+//! Sources: Anthropic credentials, per-slot third-party bindings, global
+//! third-party settings, manual accounts.
 
 use super::profiles;
 use super::{AccountInfo, AccountSource};
 use crate::credentials;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::warn;
 
 /// Discovers all configured accounts from all sources, deduplicating by ID.
 ///
-/// Sources are checked in priority order: Anthropic → 3P → Manual.
-/// First source wins on duplicate IDs.
+/// Sources checked in priority order:
+/// 1. Anthropic OAuth (`credentials/N.json`)
+/// 2. Per-slot third-party bindings (`config-N/settings.json` with a 3P
+///    `ANTHROPIC_BASE_URL`) — these take numbered slots (9, 10, …)
+///    alongside OAuth accounts so users see one unified list.
+/// 3. Global third-party bindings (`settings-mm.json` / `settings-zai.json`
+///    at the base dir level, synthetic slots 901/902) — suppressed if the
+///    same provider is already bound to a numbered slot above.
+/// 4. Manual accounts (`dashboard-accounts.json`)
+///
+/// First source wins on duplicate slot IDs.
 pub fn discover_all(base_dir: &Path) -> Vec<AccountInfo> {
     let mut seen: HashMap<u16, ()> = HashMap::new();
     let mut accounts = Vec::new();
@@ -24,20 +34,163 @@ pub fn discover_all(base_dir: &Path) -> Vec<AccountInfo> {
         }
     }
 
-    // Priority 2: Third-party provider accounts
-    for info in discover_third_party(base_dir) {
+    // Priority 2: Per-slot third-party bindings. These occupy real
+    // numbered slots (e.g. 9 = MiniMax, 10 = Z.AI) and should appear
+    // in the dashboard alongside OAuth accounts 1-8.
+    let mut per_slot_providers: HashSet<String> = HashSet::new();
+    for info in discover_per_slot_third_party(base_dir) {
+        if let AccountSource::ThirdParty { provider } = &info.source {
+            per_slot_providers.insert(provider.clone());
+        }
         if seen.insert(info.id, ()).is_none() {
             accounts.push(info);
         }
     }
 
-    // Priority 3: Manual accounts
+    // Priority 3: Global third-party bindings at synthetic 9xx slots.
+    // Suppress entries whose provider already appears as a per-slot
+    // binding — otherwise the user sees both "9 MiniMax" and "902
+    // MiniMax" for the same underlying setup.
+    for info in discover_third_party(base_dir) {
+        if let AccountSource::ThirdParty { provider } = &info.source {
+            if per_slot_providers.contains(provider) {
+                continue;
+            }
+        }
+        if seen.insert(info.id, ()).is_none() {
+            accounts.push(info);
+        }
+    }
+
+    // Priority 4: Manual accounts
     for info in discover_manual(base_dir) {
         if seen.insert(info.id, ()).is_none() {
             accounts.push(info);
         }
     }
 
+    accounts
+}
+
+/// Classifies an `ANTHROPIC_BASE_URL` into a known provider name.
+///
+/// Returns `None` for `api.anthropic.com` (native Anthropic is handled
+/// via OAuth discovery, not 3P) and for any URL that doesn't match a
+/// known host. Returns a display name like `"MiniMax"` / `"Z.AI"` /
+/// `"Ollama"` otherwise.
+///
+/// The match is host-substring-based so variant hostnames like
+/// `api.minimax.io` (vs. the catalog default `api.minimax.chat`)
+/// still classify correctly.
+pub(crate) fn provider_from_base_url(base_url: &str) -> Option<&'static str> {
+    let lower = base_url.to_ascii_lowercase();
+    // Native Anthropic is not a 3P account — skip it.
+    if lower.contains("api.anthropic.com") {
+        return None;
+    }
+    if lower.contains("minimax") {
+        return Some("MiniMax");
+    }
+    if lower.contains("z.ai") {
+        return Some("Z.AI");
+    }
+    if lower.contains("localhost") || lower.contains("127.0.0.1") {
+        return Some("Ollama");
+    }
+    None
+}
+
+/// Walks `base_dir/config-N/settings.json` files and emits one
+/// `AccountInfo` per slot that has a 3P provider binding.
+///
+/// A "3P binding" means the slot's `settings.json` has
+/// `env.ANTHROPIC_BASE_URL` pointing at a host other than
+/// `api.anthropic.com`. The provider name is derived from the URL
+/// via `provider_from_base_url`. `has_credentials` reflects whether
+/// `env.ANTHROPIC_AUTH_TOKEN` is present (required for bearer-auth
+/// providers).
+///
+/// Slot IDs are taken from the `config-<N>` dir name, 1..=999.
+/// Symlinks are rejected to prevent traversal outside base_dir.
+pub fn discover_per_slot_third_party(base_dir: &Path) -> Vec<AccountInfo> {
+    let entries = match std::fs::read_dir(base_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut accounts = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // Reject symlinks — a config-N symlinked outside base_dir
+        // would let IPC-side account listing escape the boundary.
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        let Some(num_str) = name.strip_prefix("config-") else {
+            continue;
+        };
+        let id: u16 = match num_str.parse() {
+            Ok(n) if (1..=999).contains(&n) => n,
+            _ => continue,
+        };
+
+        let settings_path = entry.path().join("settings.json");
+        let content = match std::fs::read_to_string(&settings_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    path = %settings_path.display(),
+                    error = %e,
+                    "skipping per-slot settings.json with invalid JSON"
+                );
+                continue;
+            }
+        };
+
+        // Extract env.ANTHROPIC_BASE_URL. `ANTHROPIC_BASE_URL` at the
+        // top level is also accepted for forward-compat, but the
+        // canonical location is under `env.`.
+        let env = json.get("env");
+        let base_url = env
+            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+            .or_else(|| json.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str());
+        let Some(base_url) = base_url else { continue };
+
+        let Some(provider_name) = provider_from_base_url(base_url) else {
+            continue;
+        };
+
+        let has_token = env
+            .and_then(|e| e.get("ANTHROPIC_AUTH_TOKEN"))
+            .or_else(|| json.get("ANTHROPIC_AUTH_TOKEN"))
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+        accounts.push(AccountInfo {
+            id,
+            label: provider_name.to_string(),
+            source: AccountSource::ThirdParty {
+                provider: provider_name.to_string(),
+            },
+            method: "api_key".into(),
+            has_credentials: has_token,
+        });
+    }
+
+    // Deterministic ordering by slot id for dashboard stability.
+    accounts.sort_by_key(|a| a.id);
     accounts
 }
 
@@ -369,5 +522,235 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let accounts = discover_all(dir.path());
         assert!(accounts.is_empty());
+    }
+
+    // ── provider_from_base_url ─────────────────────────────
+
+    #[test]
+    fn provider_from_url_detects_minimax_on_any_host() {
+        assert_eq!(
+            provider_from_base_url("https://api.minimax.chat/anthropic"),
+            Some("MiniMax")
+        );
+        assert_eq!(
+            provider_from_base_url("https://api.minimax.io/anthropic"),
+            Some("MiniMax")
+        );
+    }
+
+    #[test]
+    fn provider_from_url_detects_zai() {
+        assert_eq!(
+            provider_from_base_url("https://api.z.ai/api/anthropic"),
+            Some("Z.AI")
+        );
+    }
+
+    #[test]
+    fn provider_from_url_detects_ollama() {
+        assert_eq!(
+            provider_from_base_url("http://localhost:11434"),
+            Some("Ollama")
+        );
+        assert_eq!(
+            provider_from_base_url("http://127.0.0.1:11434"),
+            Some("Ollama")
+        );
+    }
+
+    #[test]
+    fn provider_from_url_skips_native_anthropic() {
+        // Native Anthropic is OAuth — not a 3P binding.
+        assert_eq!(provider_from_base_url("https://api.anthropic.com"), None);
+    }
+
+    #[test]
+    fn provider_from_url_unknown_host_returns_none() {
+        assert_eq!(provider_from_base_url("https://example.com/api"), None);
+    }
+
+    // ── discover_per_slot_third_party ──────────────────────
+
+    /// Writes a `{base}/config-N/settings.json` with the given base
+    /// URL and auth token.
+    fn write_slot_settings(base: &Path, slot: u16, base_url: &str, token: &str) {
+        let dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"{base_url}","ANTHROPIC_AUTH_TOKEN":"{token}"}}}}"#
+        );
+        std::fs::write(dir.join("settings.json"), json).unwrap();
+    }
+
+    #[test]
+    fn per_slot_discovers_minimax_and_zai_as_numbered_slots() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 9, "https://api.minimax.io/anthropic", "tok-mm");
+        write_slot_settings(dir.path(), 10, "https://api.z.ai/api/anthropic", "tok-zai");
+
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].id, 9);
+        assert_eq!(accounts[0].label, "MiniMax");
+        assert!(accounts[0].has_credentials);
+        assert_eq!(accounts[1].id, 10);
+        assert_eq!(accounts[1].label, "Z.AI");
+    }
+
+    #[test]
+    fn per_slot_ignores_slots_without_settings_json() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("config-5")).unwrap();
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn per_slot_ignores_slots_bound_to_native_anthropic() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 3, "https://api.anthropic.com", "tok");
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert!(
+            accounts.is_empty(),
+            "native Anthropic slot must not appear as a 3P account"
+        );
+    }
+
+    #[test]
+    fn per_slot_ignores_unknown_base_urls() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 7, "https://my.custom.proxy/anthropic", "tok");
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn per_slot_marks_empty_token_as_missing_credentials() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 9, "https://api.minimax.io/anthropic", "");
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert_eq!(accounts.len(), 1);
+        assert!(!accounts[0].has_credentials);
+    }
+
+    #[test]
+    fn per_slot_rejects_out_of_range_slot_numbers() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 0, "https://api.minimax.io/anthropic", "tok");
+        // Manual dir creation for 1000 since write_slot_settings uses u16.
+        std::fs::create_dir_all(dir.path().join("config-1000")).unwrap();
+        std::fs::write(
+            dir.path().join("config-1000").join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"tok"}}"#,
+        )
+        .unwrap();
+
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert!(
+            accounts.is_empty(),
+            "out-of-range slot numbers must be rejected"
+        );
+    }
+
+    #[test]
+    fn per_slot_rejects_non_config_dirs() {
+        let dir = TempDir::new().unwrap();
+        // `other-9/settings.json` with a valid 3P binding.
+        let other = dir.path().join("other-9");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.minimax.io","ANTHROPIC_AUTH_TOKEN":"tok"}}"#,
+        )
+        .unwrap();
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn per_slot_returns_deterministic_order() {
+        let dir = TempDir::new().unwrap();
+        // Insert in non-sorted order; expect ascending output.
+        write_slot_settings(dir.path(), 10, "https://api.z.ai/api/anthropic", "tok");
+        write_slot_settings(dir.path(), 9, "https://api.minimax.io/anthropic", "tok");
+
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert_eq!(
+            accounts.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![9, 10]
+        );
+    }
+
+    // ── discover_all with per-slot 3P suppression ──────────
+
+    #[test]
+    fn discover_all_per_slot_3p_suppresses_global_duplicate() {
+        // User has BOTH a per-slot binding (config-9 → MiniMax) AND
+        // a legacy global settings-mm.json. The per-slot entry wins
+        // and the global 902 is dropped so the dashboard shows one
+        // MiniMax row, not two.
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 9, "https://api.minimax.io/anthropic", "tok");
+        std::fs::write(
+            dir.path().join("settings-mm.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"legacy","ANTHROPIC_BASE_URL":"https://api.mm.com"}}"#,
+        )
+        .unwrap();
+
+        let accounts = discover_all(dir.path());
+        let minimax: Vec<_> = accounts
+            .iter()
+            .filter(|a| matches!(&a.source, AccountSource::ThirdParty { provider } if provider == "MiniMax"))
+            .collect();
+        assert_eq!(
+            minimax.len(),
+            1,
+            "global 3P entry must be suppressed when per-slot binding exists"
+        );
+        assert_eq!(minimax[0].id, 9);
+    }
+
+    #[test]
+    fn discover_all_global_3p_preserved_when_no_per_slot() {
+        // Only the global settings-zai.json — no per-slot binding.
+        // Should still emit the synthetic 901 entry for backward compat.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("settings-zai.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"tok","ANTHROPIC_BASE_URL":"https://api.z.ai"}}"#,
+        )
+        .unwrap();
+
+        let accounts = discover_all(dir.path());
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, 901);
+        assert_eq!(accounts[0].label, "Z.AI");
+    }
+
+    #[test]
+    fn discover_all_mixed_oauth_and_per_slot_3p() {
+        // Canonical happy path: OAuth slots 1-3, per-slot 3P slots 9-10.
+        let dir = TempDir::new().unwrap();
+        write_cred(dir.path(), 1);
+        write_cred(dir.path(), 2);
+        write_cred(dir.path(), 3);
+        write_slot_settings(dir.path(), 9, "https://api.minimax.io/anthropic", "tok-mm");
+        write_slot_settings(dir.path(), 10, "https://api.z.ai/api/anthropic", "tok-zai");
+
+        let accounts = discover_all(dir.path());
+        let ids: Vec<u16> = accounts.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 9, 10]);
+        let providers: Vec<_> = accounts
+            .iter()
+            .map(|a| match &a.source {
+                AccountSource::Anthropic => "Anthropic",
+                AccountSource::ThirdParty { provider } => provider.as_str(),
+                AccountSource::Manual => "Manual",
+            })
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["Anthropic", "Anthropic", "Anthropic", "MiniMax", "Z.AI"]
+        );
     }
 }

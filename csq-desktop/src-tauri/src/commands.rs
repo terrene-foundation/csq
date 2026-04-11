@@ -282,6 +282,36 @@ pub fn swap_session(base_dir: String, config_dir: String, target: u16) -> Result
         return Err(format!("config_dir number out of range: {n}"));
     }
 
+    // Reject 3P slots on either side of the swap.
+    //
+    // `rotation::swap_to` copies `credentials/{target}.json` into
+    // `config_dir/.credentials.json`, which is only meaningful for
+    // OAuth accounts. If `target` is a 3P slot (e.g. MiniMax) the
+    // copy fails with NotFound. If the **source** config dir is
+    // itself a 3P slot (e.g. config-9 with MiniMax settings.json)
+    // then even a successful OAuth copy would corrupt the slot's
+    // 3P binding by shoving an OAuth credential file alongside its
+    // settings.json. Reject both cases up-front with a clear error
+    // message that points the user at the right workflow.
+    let all_accounts = discovery::discover_all(&base_canon);
+    let target_is_third_party = all_accounts
+        .iter()
+        .any(|a| a.id == target && matches!(a.source, AccountSource::ThirdParty { .. }));
+    if target_is_third_party {
+        return Err(format!(
+            "account {target} is a third-party provider slot; swap it from the Accounts tab instead"
+        ));
+    }
+    let source_is_third_party = all_accounts
+        .iter()
+        .any(|a| a.id == n && matches!(a.source, AccountSource::ThirdParty { .. }));
+    if source_is_third_party {
+        return Err(format!(
+            "{name} is bound to a third-party provider; \
+             unbind it from settings.json before rotating to an OAuth account"
+        ));
+    }
+
     let account = AccountNum::try_from(target).map_err(|e| format!("invalid account: {e}"))?;
     rotation::swap_to(&base_canon, &config_canon, account)
         .map(|r| format!("Swapped {} to account {}", name, r.account))

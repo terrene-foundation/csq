@@ -220,14 +220,33 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
     if let Some(base) = base_dir() {
         if base.is_dir() {
-            let accounts = discovery::discover_anthropic(&base);
+            // `discover_all` — OAuth slots + per-slot 3P bindings
+            // (e.g. slot 9 MiniMax, slot 10 Z.AI). The user sees the
+            // same unified account list in the tray that the
+            // dashboard shows, so glancing at the tray doesn't make
+            // half their accounts silently disappear. Click-side
+            // routing in `handle_tray_event` short-circuits 3P
+            // clicks because rotation::swap_to only knows how to
+            // copy OAuth credential files, not 3P settings blobs.
+            let accounts = discovery::discover_all(&base);
             let mut had_any = false;
             for a in &accounts {
                 if !a.has_credentials {
                     continue;
                 }
                 had_any = true;
-                let label = format!("#{} {}", a.id, sanitize_label(&a.label));
+                // 3P rows get a "(dashboard)" suffix so the user
+                // knows the tray click won't quick-swap — that
+                // workflow lives in the Sessions view.
+                let is_third_party = matches!(
+                    a.source,
+                    csq_core::accounts::AccountSource::ThirdParty { .. }
+                );
+                let label = if is_third_party {
+                    format!("#{} {} (dashboard)", a.id, sanitize_label(&a.label))
+                } else {
+                    format!("#{} {}", a.id, sanitize_label(&a.label))
+                };
                 let id = format!("acct:{}", a.id);
                 let item = MenuItemBuilder::with_id(id, label).build(app)?;
                 builder = builder.item(&item);
@@ -394,6 +413,22 @@ fn compute_tray_status(base: &Path) -> TrayStatus {
     TrayStatus { total, health }
 }
 
+/// Returns true if the given slot number resolves to a third-party
+/// provider binding under `base`. Reads the live discovery so the
+/// tray click handler's routing decision always matches the
+/// dashboard view — a slot that was OAuth at boot but got rebound
+/// to a 3P provider mid-session is correctly routed.
+fn is_third_party_slot(base: &Path, slot: u16) -> bool {
+    let accounts = discovery::discover_all(base);
+    accounts.iter().any(|a| {
+        a.id == slot
+            && matches!(
+                a.source,
+                csq_core::accounts::AccountSource::ThirdParty { .. }
+            )
+    })
+}
+
 /// Outcome of a tray swap click emitted as `tray-swap-complete`.
 #[derive(serde::Serialize, Clone)]
 struct TraySwapResult {
@@ -420,6 +455,26 @@ struct TraySwapResult {
 /// dir approximates "the session the user is actively using" and
 /// matches the intent of a tray quick-switch.
 fn perform_tray_swap(base: &Path, account: AccountNum) -> TraySwapResult {
+    // 3P slots (e.g. MiniMax, Z.AI) use settings.json for provider
+    // config, not OAuth credential files. `rotation::swap_to` only
+    // knows how to copy `credentials/N.json` into `.credentials.json`
+    // — calling it on a 3P slot fails with NotFound at best and
+    // corrupts the target config dir at worst. Short-circuit with
+    // a dashboard-directing error toast instead.
+    //
+    // This check runs against a fresh `discover_all` read so the
+    // routing logic always reflects the current slot → provider
+    // binding, even if the user just added a new 3P slot between
+    // menu builds.
+    if is_third_party_slot(base, account.get()) {
+        return TraySwapResult {
+            account: account.get(),
+            config_dir: None,
+            ok: false,
+            error: Some("3P slots can only be swapped from the dashboard Sessions tab".into()),
+        };
+    }
+
     let target_dir = match most_recent_config_dir(base) {
         Some(d) => d,
         None => {
@@ -1068,6 +1123,38 @@ mod tests {
         assert!(TrayIconKind::Normal.is_template());
         assert!(!TrayIconKind::Warn.is_template());
         assert!(!TrayIconKind::Error.is_template());
+    }
+
+    // ── is_third_party_slot ────────────────────────────────
+
+    fn write_slot_settings(base: &Path, slot: u16, base_url: &str, token: &str) {
+        let dir = base.join(format!("config-{slot}"));
+        fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"{base_url}","ANTHROPIC_AUTH_TOKEN":"{token}"}}}}"#
+        );
+        fs::write(dir.join("settings.json"), json).unwrap();
+    }
+
+    #[test]
+    fn is_third_party_slot_detects_minimax_per_slot_binding() {
+        let base = TempDir::new().unwrap();
+        write_slot_settings(base.path(), 9, "https://api.minimax.io/anthropic", "tok");
+        assert!(is_third_party_slot(base.path(), 9));
+    }
+
+    #[test]
+    fn is_third_party_slot_false_for_oauth_slot() {
+        let base = TempDir::new().unwrap();
+        // OAuth slot 1 with a credentials file.
+        write_credential(base.path(), 1, 86_400);
+        assert!(!is_third_party_slot(base.path(), 1));
+    }
+
+    #[test]
+    fn is_third_party_slot_false_for_unknown_slot() {
+        let base = TempDir::new().unwrap();
+        assert!(!is_third_party_slot(base.path(), 42));
     }
 
     #[test]

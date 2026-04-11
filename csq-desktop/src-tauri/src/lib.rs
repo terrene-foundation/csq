@@ -1,8 +1,8 @@
 mod commands;
 
-use tauri::Manager;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -28,13 +28,12 @@ pub fn run() {
             // Registers the updater plugin. Actual update checks require
             // a signed update manifest at the configured endpoint.
             // Signing keys and update server are configured in M11.
-            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
 
             // ── System tray ──────────────────────────────────
-            let open_dashboard = MenuItemBuilder::with_id("open", "Open Dashboard")
-                .build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit Claude Squad")
-                .build(app)?;
+            let open_dashboard = MenuItemBuilder::with_id("open", "Open Dashboard").build(app)?;
+            let quit = MenuItemBuilder::with_id("quit", "Quit Claude Squad").build(app)?;
             let sep = PredefinedMenuItem::separator(app)?;
 
             let menu = MenuBuilder::new(app)
@@ -46,19 +45,17 @@ pub fn run() {
             TrayIconBuilder::new()
                 .menu(&menu)
                 .tooltip("Claude Squad")
-                .on_menu_event(move |app, event| {
-                    match event.id().as_ref() {
-                        "open" => {
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
+                .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "open" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
                         }
-                        "quit" => {
-                            app.exit(0);
-                        }
-                        _ => {}
                     }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
                 })
                 .build(app)?;
 

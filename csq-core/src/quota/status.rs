@@ -112,13 +112,17 @@ pub fn compose_status(
                 id: a.id,
                 label,
                 is_active: active.map(|c| c.get() == a.id).unwrap_or(false),
-                five_hour_pct: q.map(|q| q.five_hour_pct()).filter(|p| *p > 0.0 || q.is_some_and(|q| q.five_hour.is_some())),
+                five_hour_pct: q
+                    .map(|q| q.five_hour_pct())
+                    .filter(|p| *p > 0.0 || q.is_some_and(|q| q.five_hour.is_some())),
                 five_hour_resets_in: q.and_then(|q| {
                     q.five_hour
                         .as_ref()
                         .map(|w| w.resets_at.saturating_sub(now_secs))
                 }),
-                seven_day_pct: q.map(|q| q.seven_day_pct()).filter(|p| *p > 0.0 || q.is_some_and(|q| q.seven_day.is_some())),
+                seven_day_pct: q
+                    .map(|q| q.seven_day_pct())
+                    .filter(|p| *p > 0.0 || q.is_some_and(|q| q.seven_day.is_some())),
                 seven_day_resets_in: q.and_then(|q| {
                     q.seven_day
                         .as_ref()

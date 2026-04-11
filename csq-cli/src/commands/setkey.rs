@@ -32,11 +32,7 @@ pub fn handle(base_dir: &Path, provider_id: &str, key_arg: Option<&str>) -> Resu
     settings.set_api_key(&key)?;
     providers::settings::save_settings(base_dir, &settings)?;
 
-    println!(
-        "Set {} key: {}",
-        provider_id,
-        settings.key_fingerprint()
-    );
+    println!("Set {} key: {}", provider_id, settings.key_fingerprint());
 
     // Best-effort validation probe — report status but never fail the save
     if provider.validation_endpoint.is_some() {
@@ -85,10 +81,7 @@ fn read_key_from_stdin() -> Result<String> {
         .take(MAX_KEY_LEN)
         .read_to_string(&mut buf)?;
     if buf.len() as u64 >= MAX_KEY_LEN {
-        return Err(anyhow!(
-            "key input too large (limit {} bytes)",
-            MAX_KEY_LEN
-        ));
+        return Err(anyhow!("key input too large (limit {} bytes)", MAX_KEY_LEN));
     }
     Ok(buf.trim().to_string())
 }

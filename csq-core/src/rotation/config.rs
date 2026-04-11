@@ -81,11 +81,9 @@ pub fn load(base_dir: &Path) -> Result<RotationConfig, ConfigError> {
     let path = config_path(base_dir);
     match std::fs::read_to_string(&path) {
         Ok(content) if !content.trim().is_empty() => {
-            serde_json::from_str::<RotationConfig>(&content).map_err(|e| {
-                ConfigError::InvalidJson {
-                    path,
-                    reason: e.to_string(),
-                }
+            serde_json::from_str::<RotationConfig>(&content).map_err(|e| ConfigError::InvalidJson {
+                path,
+                reason: e.to_string(),
             })
         }
         // Missing or empty — return defaults (not an error).
@@ -156,11 +154,7 @@ mod tests {
     fn partial_json_uses_defaults_for_missing_fields() {
         let dir = TempDir::new().unwrap();
         // Only set `enabled` — rest should use defaults.
-        std::fs::write(
-            config_path(dir.path()),
-            r#"{"enabled": true}"#,
-        )
-        .unwrap();
+        std::fs::write(config_path(dir.path()), r#"{"enabled": true}"#).unwrap();
 
         let cfg = load(dir.path()).unwrap();
         assert!(cfg.enabled);

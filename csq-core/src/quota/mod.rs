@@ -111,12 +111,18 @@ impl AccountQuota {
 
     /// Returns the 5-hour usage percentage (0-100), or 0 if no data.
     pub fn five_hour_pct(&self) -> f64 {
-        self.five_hour.as_ref().map(|w| w.used_percentage).unwrap_or(0.0)
+        self.five_hour
+            .as_ref()
+            .map(|w| w.used_percentage)
+            .unwrap_or(0.0)
     }
 
     /// Returns the 7-day usage percentage (0-100), or 0 if no data.
     pub fn seven_day_pct(&self) -> f64 {
-        self.seven_day.as_ref().map(|w| w.used_percentage).unwrap_or(0.0)
+        self.seven_day
+            .as_ref()
+            .map(|w| w.used_percentage)
+            .unwrap_or(0.0)
     }
 }
 

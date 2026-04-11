@@ -8,4 +8,4 @@ pub mod validate;
 
 pub use catalog::{get_provider, Provider, PROVIDERS};
 pub use models::{ModelCatalog, ModelInfo};
-pub use settings::{ProviderSettings, load_settings, save_settings};
+pub use settings::{load_settings, save_settings, ProviderSettings};

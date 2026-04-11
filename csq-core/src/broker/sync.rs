@@ -137,7 +137,12 @@ mod tests {
         }
     }
 
-    fn setup_backsync(base: &Path, account: u16, canonical_expires: u64, live_expires: u64) -> PathBuf {
+    fn setup_backsync(
+        base: &Path,
+        account: u16,
+        canonical_expires: u64,
+        live_expires: u64,
+    ) -> PathBuf {
         let config = base.join(format!("config-{account}"));
         std::fs::create_dir_all(&config).unwrap();
 
@@ -210,7 +215,10 @@ mod tests {
         assert!(synced);
 
         let updated = credentials::load(&config.join(".credentials.json")).unwrap();
-        assert_eq!(updated.claude_ai_oauth.access_token.expose_secret(), "at-new");
+        assert_eq!(
+            updated.claude_ai_oauth.access_token.expose_secret(),
+            "at-new"
+        );
     }
 
     #[test]

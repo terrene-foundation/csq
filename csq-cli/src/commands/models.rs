@@ -113,7 +113,9 @@ pub fn handle_switch(base_dir: &Path, provider_id: &str, model_query: &str) -> R
     if model.provider != provider_id {
         return Err(anyhow!(
             "model {} belongs to provider {}, not {}",
-            model.id, model.provider, provider_id
+            model.id,
+            model.provider,
+            provider_id
         ));
     }
 

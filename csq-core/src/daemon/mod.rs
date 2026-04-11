@@ -35,12 +35,12 @@ pub mod usage_poller;
 #[cfg(unix)]
 pub mod server;
 
+pub use auto_rotate::{spawn as spawn_auto_rotate, AutoRotateHandle};
 pub use cache::{TtlCache, DEFAULT_MAX_AGE};
 pub use detect::{detect_daemon, DetectResult};
 pub use lifecycle::{status_of, stop_daemon, DaemonStatus};
 pub use paths::{pid_file_path, socket_path};
 pub use pid::PidFile;
-pub use auto_rotate::{spawn as spawn_auto_rotate, AutoRotateHandle};
 pub use refresher::{spawn as spawn_refresher, HttpPostFn, RefreshStatus, RefresherHandle};
 pub use usage_poller::{spawn as spawn_usage_poller, HttpGetFn, HttpPostProbeFn, PollerHandle};
 

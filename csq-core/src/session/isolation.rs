@@ -10,15 +10,7 @@ use tracing::{debug, warn};
 
 /// Items that are **shared** across all terminals — symlinked back to `~/.claude`.
 pub const SHARED_ITEMS: &[&str] = &[
-    "history",
-    "sessions",
-    "commands",
-    "skills",
-    "agents",
-    "rules",
-    "mcp",
-    "plugins",
-    "snippets",
+    "history", "sessions", "commands", "skills", "agents", "rules", "mcp", "plugins", "snippets",
     "todos",
 ];
 

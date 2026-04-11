@@ -133,8 +133,7 @@ fn now_secs() -> u64 {
 /// contract. Defined as a `dyn` trait object so the refresher can
 /// be constructed with either the real `csq_core::http::post_form`
 /// or a test mock.
-pub type HttpPostFn =
-    Arc<dyn Fn(&str, &str) -> Result<Vec<u8>, String> + Send + Sync + 'static>;
+pub type HttpPostFn = Arc<dyn Fn(&str, &str) -> Result<Vec<u8>, String> + Send + Sync + 'static>;
 
 /// Handle to a running refresher task. Drop does NOT cancel —
 /// callers must explicitly cancel the `CancellationToken` passed
@@ -360,10 +359,7 @@ pub(crate) async fn tick(
         }
     }
 
-    debug!(
-        processed,
-        skipped_cooldown, "refresher tick complete"
-    );
+    debug!(processed, skipped_cooldown, "refresher tick complete");
 }
 
 /// Returns a short, fixed-cardinality tag for a `CsqError` variant.
@@ -435,7 +431,10 @@ mod tests {
     fn counting_success(counter: Arc<AtomicU32>) -> HttpPostFn {
         Arc::new(move |_url: &str, _body: &str| {
             counter.fetch_add(1, Ordering::SeqCst);
-            Ok(br#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":18000}"#.to_vec())
+            Ok(
+                br#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":18000}"#
+                    .to_vec(),
+            )
         })
     }
 
@@ -474,7 +473,11 @@ mod tests {
 
         tick(dir.path(), &http, &cache, &cooldowns).await;
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "exactly one HTTP refresh");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "exactly one HTTP refresh"
+        );
         let status = cache.get(&1).unwrap();
         assert_eq!(status.account, 1);
         assert_eq!(status.last_result, "refreshed");
@@ -511,8 +514,14 @@ mod tests {
         tick(dir.path(), &http, &cache, &cooldowns).await;
         let first_calls = counter.load(Ordering::SeqCst);
         // broker_check tries refresh once, then recovery once — so 2 http calls.
-        assert!(first_calls >= 1, "expected at least 1 HTTP call, got {first_calls}");
-        assert!(in_cooldown(&cooldowns, 1), "failed account must be in cooldown");
+        assert!(
+            first_calls >= 1,
+            "expected at least 1 HTTP call, got {first_calls}"
+        );
+        assert!(
+            in_cooldown(&cooldowns, 1),
+            "failed account must be in cooldown"
+        );
         let status = cache.get(&1).unwrap();
         assert_eq!(status.last_result, "failed");
 
@@ -536,15 +545,18 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
 
         // Prime a cooldown that has already elapsed (simulate past failure).
-        cooldowns
-            .lock()
-            .unwrap()
-            .insert(1, Instant::now() - FAILURE_COOLDOWN - Duration::from_secs(1));
+        cooldowns.lock().unwrap().insert(
+            1,
+            Instant::now() - FAILURE_COOLDOWN - Duration::from_secs(1),
+        );
 
         tick(dir.path(), &http, &cache, &cooldowns).await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
-        assert!(!in_cooldown(&cooldowns, 1), "expired cooldown should not block");
+        assert!(
+            !in_cooldown(&cooldowns, 1),
+            "expired cooldown should not block"
+        );
     }
 
     #[tokio::test]

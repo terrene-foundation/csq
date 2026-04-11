@@ -78,7 +78,9 @@ pub fn repair_truncated_json(input: &str) -> Option<String> {
     // Append missing closing braces
     let mut repaired = trimmed.to_string();
     // Remove trailing comma if present before appending braces
-    repaired = repaired.trim_end_matches(|c: char| c == ',' || c.is_whitespace()).to_string();
+    repaired = repaired
+        .trim_end_matches(|c: char| c == ',' || c.is_whitespace())
+        .to_string();
     for _ in 0..depth {
         repaired.push('}');
     }

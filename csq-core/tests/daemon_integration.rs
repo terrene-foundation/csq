@@ -64,9 +64,7 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let sock = base.join("csq-test.sock");
-    let (handle, join) = serve(&sock, make_router_state(base))
-        .await
-        .unwrap();
+    let (handle, join) = serve(&sock, make_router_state(base)).await.unwrap();
 
     f(sock.clone()).await;
 
@@ -222,9 +220,7 @@ async fn client_connect_fails_after_shutdown() {
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("csq-test.sock");
 
-    let (handle, join) = serve(&sock, make_router_state(dir.path()))
-        .await
-        .unwrap();
+    let (handle, join) = serve(&sock, make_router_state(dir.path())).await.unwrap();
 
     // Verify it works first
     let resp = http_get_unix(&sock, "/api/health").unwrap();

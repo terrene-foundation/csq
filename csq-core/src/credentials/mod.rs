@@ -129,10 +129,7 @@ mod tests {
         );
         assert_eq!(cf.claude_ai_oauth.expires_at, 1775726524877);
         assert_eq!(cf.claude_ai_oauth.scopes.len(), 2);
-        assert_eq!(
-            cf.claude_ai_oauth.subscription_type.as_deref(),
-            Some("max")
-        );
+        assert_eq!(cf.claude_ai_oauth.subscription_type.as_deref(), Some("max"));
     }
 
     #[test]
@@ -155,10 +152,7 @@ mod tests {
         let reparsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(reparsed["topLevelExtra"], true);
-        assert_eq!(
-            reparsed["claudeAiOauth"]["newField"],
-            "should survive"
-        );
+        assert_eq!(reparsed["claudeAiOauth"]["newField"], "should survive");
     }
 
     #[test]

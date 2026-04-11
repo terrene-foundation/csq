@@ -285,7 +285,10 @@ async fn callback_handler(
     Query(params): Query<CallbackParams>,
 ) -> impl IntoResponse {
     let Some(state_token) = params.state else {
-        return (StatusCode::BAD_REQUEST, failure_html(FailureReason::MissingState))
+        return (
+            StatusCode::BAD_REQUEST,
+            failure_html(FailureReason::MissingState),
+        )
             .into_response();
     };
 
@@ -331,7 +334,10 @@ async fn callback_handler(
                 .into_response();
         }
         Err(e) => {
-            warn!(error_kind = e.kind(), "oauth callback: unexpected state error");
+            warn!(
+                error_kind = e.kind(),
+                "oauth callback: unexpected state error"
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 failure_html(FailureReason::Internal),
@@ -342,16 +348,18 @@ async fn callback_handler(
 
     // Anthropic error redirect (user denied, scope invalid, etc).
     if params.error.is_some() {
-        info!(account = pending.account.get(), "oauth callback: user denied or upstream error");
-        return (
-            StatusCode::OK,
-            failure_html(FailureReason::UserDenied),
-        )
-            .into_response();
+        info!(
+            account = pending.account.get(),
+            "oauth callback: user denied or upstream error"
+        );
+        return (StatusCode::OK, failure_html(FailureReason::UserDenied)).into_response();
     }
 
     let Some(code) = params.code else {
-        warn!(account = pending.account.get(), "oauth callback: missing code");
+        warn!(
+            account = pending.account.get(),
+            "oauth callback: missing code"
+        );
         return (
             StatusCode::BAD_REQUEST,
             failure_html(FailureReason::MissingCode),
@@ -399,7 +407,10 @@ async fn callback_handler(
             }
         },
         Ok(Err(OAuthError::Exchange(_))) => {
-            warn!(account = account.get(), "oauth callback: code exchange failed");
+            warn!(
+                account = account.get(),
+                "oauth callback: code exchange failed"
+            );
             (
                 StatusCode::BAD_GATEWAY,
                 failure_html(FailureReason::ExchangeFailed),
@@ -407,7 +418,11 @@ async fn callback_handler(
                 .into_response()
         }
         Ok(Err(e)) => {
-            warn!(account = account.get(), error_kind = e.kind(), "oauth callback: unexpected exchange error");
+            warn!(
+                account = account.get(),
+                error_kind = e.kind(),
+                "oauth callback: unexpected exchange error"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 failure_html(FailureReason::Internal),
@@ -494,9 +509,7 @@ impl FailureReason {
                 "The login succeeded but the credential file could not be written to disk. \
                  Check that claude-squad has write permission on its config directory."
             }
-            Self::Internal => {
-                "An internal error occurred. Return to claude-squad and try again."
-            }
+            Self::Internal => "An internal error occurred. Return to claude-squad and try again.",
         }
     }
 
@@ -620,10 +633,13 @@ mod tests {
         stream.flush().await.unwrap();
 
         let mut buf = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(3), stream.read_to_end(&mut buf))
-            .await
-            .expect("response within timeout")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
 
         let text = String::from_utf8_lossy(&buf).into_owned();
         let status_line = text.lines().next().unwrap_or("");
@@ -689,7 +705,10 @@ mod tests {
         assert_eq!(status, 400);
         assert!(body.contains("Login failed"), "body: {body}");
         // Must NOT leak the code back to the browser
-        assert!(!body.contains("abc"), "body should not echo the code: {body}");
+        assert!(
+            !body.contains("abc"),
+            "body should not echo the code: {body}"
+        );
 
         shutdown.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
@@ -749,7 +768,10 @@ mod tests {
 
         // Credentials file must exist.
         let cred_path = credentials::file::canonical_path(dir.path(), account);
-        assert!(cred_path.exists(), "canonical credential file must be written");
+        assert!(
+            cred_path.exists(),
+            "canonical credential file must be written"
+        );
         let loaded = credentials::load(&cred_path).unwrap();
         assert_eq!(
             loaded.claude_ai_oauth.access_token.expose_secret(),
@@ -767,10 +789,9 @@ mod tests {
         let http = success_http(Arc::clone(&counter));
         let state = test_state(dir.path(), http, 0);
         let account = AccountNum::try_from(1u16).unwrap();
-        let state_token = state.store.insert(
-            CodeVerifier::new("v".to_string()),
-            account,
-        );
+        let state_token = state
+            .store
+            .insert(CodeVerifier::new("v".to_string()), account);
 
         let shutdown = CancellationToken::new();
         let (handle, join) = serve(0, state, shutdown.clone()).await.unwrap();
@@ -805,10 +826,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = test_state(dir.path(), failing_http(), 0);
         let account = AccountNum::try_from(2u16).unwrap();
-        let state_token = state.store.insert(
-            CodeVerifier::new("v".to_string()),
-            account,
-        );
+        let state_token = state
+            .store
+            .insert(CodeVerifier::new("v".to_string()), account);
 
         let shutdown = CancellationToken::new();
         let (handle, join) = serve(0, state, shutdown.clone()).await.unwrap();
@@ -823,7 +843,10 @@ mod tests {
 
         // No credentials written.
         let cred_path = credentials::file::canonical_path(dir.path(), account);
-        assert!(!cred_path.exists(), "no credentials should be written on failure");
+        assert!(
+            !cred_path.exists(),
+            "no credentials should be written on failure"
+        );
 
         shutdown.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
@@ -874,7 +897,9 @@ mod tests {
         // POST /oauth/callback — only GET is registered.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
-        let mut stream = TcpStream::connect(("127.0.0.1", handle.port)).await.unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
         stream
             .write_all(
                 b"POST /oauth/callback HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -916,21 +941,15 @@ mod tests {
         let state = test_state(dir.path(), success_http(Arc::new(AtomicU32::new(0))), 0);
         let account = AccountNum::try_from(1u16).unwrap();
         let store = Arc::clone(&state.store);
-        let state_token = store.insert(
-            CodeVerifier::new("v".to_string()),
-            account,
-        );
+        let state_token = store.insert(CodeVerifier::new("v".to_string()), account);
         assert_eq!(store.len(), 1, "precondition: one pending entry");
 
         let shutdown = CancellationToken::new();
         let (handle, join) = serve(0, state, shutdown.clone()).await.unwrap();
 
         // Request with state only — no code, no error.
-        let (status, body) = http_get(
-            handle.port,
-            &format!("/oauth/callback?state={state_token}"),
-        )
-        .await;
+        let (status, body) =
+            http_get(handle.port, &format!("/oauth/callback?state={state_token}")).await;
         assert_eq!(status, 400);
         assert!(
             body.contains("Login failed"),
@@ -951,7 +970,10 @@ mod tests {
             &format!("/oauth/callback?code=legit-code&state={state_token}"),
         )
         .await;
-        assert_eq!(status2, 200, "legitimate callback must still succeed: {body2}");
+        assert_eq!(
+            status2, 200,
+            "legitimate callback must still succeed: {body2}"
+        );
         assert_eq!(store.len(), 0, "legitimate callback consumes the entry");
 
         shutdown.cancel();
@@ -970,7 +992,10 @@ mod tests {
             StdDuration::from_millis(5),
             100,
         ));
-        let _ = store.insert(CodeVerifier::new("v".into()), AccountNum::try_from(1u16).unwrap());
+        let _ = store.insert(
+            CodeVerifier::new("v".into()),
+            AccountNum::try_from(1u16).unwrap(),
+        );
         assert_eq!(store.len(), 1);
 
         tokio::time::sleep(StdDuration::from_millis(20)).await;

@@ -140,7 +140,10 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
 
         let base = Path::new("/tmp/test-base");
-        assert_eq!(pid_file_path(base), PathBuf::from("/run/user/1000/csq-daemon.pid"));
+        assert_eq!(
+            pid_file_path(base),
+            PathBuf::from("/run/user/1000/csq-daemon.pid")
+        );
         assert_eq!(socket_path(base), PathBuf::from("/run/user/1000/csq.sock"));
 
         match saved {

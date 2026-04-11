@@ -51,7 +51,8 @@ impl PidFile {
                 fs::create_dir_all(parent).map_err(|e| {
                     DaemonError::SocketConnect {
                         path: parent.to_path_buf(),
-                    }.with_source(e)
+                    }
+                    .with_source(e)
                 })?;
             }
         }
@@ -128,15 +129,12 @@ fn write_pid_atomic(path: &Path, pid: u32) -> Result<(), DaemonError> {
     let tmp = platform_fs::unique_tmp_path(path);
 
     {
-        let mut f = fs::File::create(&tmp).map_err(|e| {
-            DaemonError::SocketConnect { path: tmp.clone() }.with_source(e)
-        })?;
-        writeln!(f, "{pid}").map_err(|e| {
-            DaemonError::SocketConnect { path: tmp.clone() }.with_source(e)
-        })?;
-        f.sync_all().map_err(|e| {
-            DaemonError::SocketConnect { path: tmp.clone() }.with_source(e)
-        })?;
+        let mut f = fs::File::create(&tmp)
+            .map_err(|e| DaemonError::SocketConnect { path: tmp.clone() }.with_source(e))?;
+        writeln!(f, "{pid}")
+            .map_err(|e| DaemonError::SocketConnect { path: tmp.clone() }.with_source(e))?;
+        f.sync_all()
+            .map_err(|e| DaemonError::SocketConnect { path: tmp.clone() }.with_source(e))?;
     }
 
     // 0o600 on Unix before the rename so the final file always has
@@ -147,7 +145,8 @@ fn write_pid_atomic(path: &Path, pid: u32) -> Result<(), DaemonError> {
         // Map platform error to daemon error.
         DaemonError::SocketConnect {
             path: path.to_path_buf(),
-        }.with_source_platform(e)
+        }
+        .with_source_platform(e)
     })?;
 
     Ok(())

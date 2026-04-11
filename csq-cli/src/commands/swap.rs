@@ -10,13 +10,11 @@ pub fn handle(base_dir: &Path, target: AccountNum) -> Result<()> {
 
     let result = rotation::swap_to(base_dir, &config_dir, target)?;
 
-    let expires_in_min = (result.expires_at_ms / 1000)
-        .saturating_sub(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-        )
-        / 60;
+    let expires_in_min = (result.expires_at_ms / 1000).saturating_sub(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    ) / 60;
 
     // Notify the daemon to clear its caches so that /api/accounts
     // and /api/refresh-status reflect the new active account

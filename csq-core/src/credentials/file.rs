@@ -40,11 +40,10 @@ pub fn load(path: &Path) -> Result<CredentialFile, CredentialError> {
 
 /// Saves a credential file to disk with atomic write + secure permissions.
 pub fn save(path: &Path, creds: &CredentialFile) -> Result<(), CredentialError> {
-    let json =
-        serde_json::to_string_pretty(creds).map_err(|e| CredentialError::Corrupt {
-            path: path.to_path_buf(),
-            reason: format!("serialization failed: {e}"),
-        })?;
+    let json = serde_json::to_string_pretty(creds).map_err(|e| CredentialError::Corrupt {
+        path: path.to_path_buf(),
+        reason: format!("serialization failed: {e}"),
+    })?;
 
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -106,7 +105,9 @@ pub fn save_canonical(
 
 /// Returns the canonical credential file path: `{base_dir}/credentials/{N}.json`
 pub fn canonical_path(base_dir: &Path, account: AccountNum) -> PathBuf {
-    base_dir.join("credentials").join(format!("{}.json", account))
+    base_dir
+        .join("credentials")
+        .join(format!("{}.json", account))
 }
 
 /// Returns the live credential file path: `{base_dir}/config-{N}/.credentials.json`

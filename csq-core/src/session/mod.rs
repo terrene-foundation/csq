@@ -10,4 +10,4 @@ pub mod setup;
 
 pub use isolation::isolate_config_dir;
 pub use merge::merge_settings;
-pub use setup::{mark_onboarding_complete, cleanup_stale_pid};
+pub use setup::{cleanup_stale_pid, mark_onboarding_complete};

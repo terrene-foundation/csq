@@ -45,9 +45,7 @@ pub struct DaemonStatusView {
 pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
     let base = PathBuf::from(&base_dir);
     if !base.is_dir() {
-        return Err(format!(
-            "base directory does not exist: {base_dir}"
-        ));
+        return Err(format!("base directory does not exist: {base_dir}"));
     }
 
     let accounts = discovery::discover_all(&base);
@@ -115,8 +113,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
 pub fn swap_account(base_dir: String, target: u16) -> Result<String, String> {
     let base = PathBuf::from(&base_dir);
 
-    let account = AccountNum::try_from(target)
-        .map_err(|e| format!("invalid account: {e}"))?;
+    let account = AccountNum::try_from(target).map_err(|e| format!("invalid account: {e}"))?;
 
     let config_dirs = fanout::scan_config_dirs(&base, account);
     let config_dir = config_dirs
@@ -153,10 +150,14 @@ pub fn get_daemon_status(base_dir: String) -> Result<DaemonStatusView, String> {
     let pid_path = csq_core::daemon::pid_file_path(&base);
     let status = csq_core::daemon::status_of(&pid_path);
     Ok(match status {
-        csq_core::daemon::DaemonStatus::Running { pid } => {
-            DaemonStatusView { running: true, pid: Some(pid) }
-        }
-        _ => DaemonStatusView { running: false, pid: None },
+        csq_core::daemon::DaemonStatus::Running { pid } => DaemonStatusView {
+            running: true,
+            pid: Some(pid),
+        },
+        _ => DaemonStatusView {
+            running: false,
+            pid: None,
+        },
     })
 }
 

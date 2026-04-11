@@ -51,7 +51,8 @@ pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
     };
 
     let profiles_path = profiles::profiles_path(base_dir);
-    let profiles = profiles::load(&profiles_path).unwrap_or_else(|_| profiles::ProfilesFile::empty());
+    let profiles =
+        profiles::load(&profiles_path).unwrap_or_else(|_| profiles::ProfilesFile::empty());
 
     let mut accounts = Vec::new();
 
@@ -79,10 +80,7 @@ pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
             }
         };
 
-        let email = profiles
-            .get_email(id)
-            .unwrap_or("unknown")
-            .to_string();
+        let email = profiles.get_email(id).unwrap_or("unknown").to_string();
 
         accounts.push(AccountInfo {
             id,
@@ -151,7 +149,10 @@ pub fn discover_manual(base_dir: &Path) -> Vec<AccountInfo> {
 }
 
 /// Saves a manual account to `dashboard-accounts.json`.
-pub fn save_manual_account(base_dir: &Path, info: AccountInfo) -> Result<(), crate::error::ConfigError> {
+pub fn save_manual_account(
+    base_dir: &Path,
+    info: AccountInfo,
+) -> Result<(), crate::error::ConfigError> {
     let path = base_dir.join("dashboard-accounts.json");
     let mut accounts = discover_manual(base_dir);
 
@@ -222,7 +223,9 @@ mod tests {
         assert_eq!(accounts[0].id, 1);
         assert_eq!(accounts[1].id, 3);
         assert_eq!(accounts[2].id, 7);
-        assert!(accounts.iter().all(|a| a.source == AccountSource::Anthropic));
+        assert!(accounts
+            .iter()
+            .all(|a| a.source == AccountSource::Anthropic));
     }
 
     #[test]

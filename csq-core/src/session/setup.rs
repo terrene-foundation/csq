@@ -136,11 +136,7 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
 
         // Truncated file
-        std::fs::write(
-            config.join(".claude.json"),
-            r#"{"existingField": "value""#,
-        )
-        .unwrap();
+        std::fs::write(config.join(".claude.json"), r#"{"existingField": "value""#).unwrap();
 
         mark_onboarding_complete(&config).unwrap();
 

@@ -54,10 +54,7 @@ where
     };
 
     // Check if token needs refresh
-    if !creds
-        .claude_ai_oauth
-        .is_expired_within(REFRESH_WINDOW_SECS)
-    {
+    if !creds.claude_ai_oauth.is_expired_within(REFRESH_WINDOW_SECS) {
         return Ok(BrokerResult::Valid);
     }
 
@@ -84,10 +81,7 @@ where
             return Err(CsqError::Credential(e));
         }
     };
-    if !creds
-        .claude_ai_oauth
-        .is_expired_within(REFRESH_WINDOW_SECS)
-    {
+    if !creds.claude_ai_oauth.is_expired_within(REFRESH_WINDOW_SECS) {
         debug!(account = %account, "another process refreshed already, returning Valid");
         drop(guard);
         return Ok(BrokerResult::Valid);
@@ -160,7 +154,11 @@ where
 {
     let canonical_path = file::canonical_path(base_dir, account);
     let original = credentials::load(&canonical_path)?;
-    let original_rt = original.claude_ai_oauth.refresh_token.expose_secret().to_string();
+    let original_rt = original
+        .claude_ai_oauth
+        .refresh_token
+        .expose_secret()
+        .to_string();
 
     let dirs = fanout::scan_config_dirs(base_dir, account);
     let mut tried = 0;
@@ -221,9 +219,7 @@ where
 fn restore_if_not_downgraded(canonical_path: &Path, original: &CredentialFile) {
     if let Ok(current) = credentials::load(canonical_path) {
         if current.claude_ai_oauth.expires_at > original.claude_ai_oauth.expires_at {
-            debug!(
-                "skipping recovery restore: canonical is newer than original snapshot"
-            );
+            debug!("skipping recovery restore: canonical is newer than original snapshot");
             return;
         }
     }
@@ -257,8 +253,10 @@ mod tests {
     }
 
     fn mock_refresh_success(_url: &str, _body: &str) -> Result<Vec<u8>, String> {
-        Ok(br#"{"access_token":"at-refreshed","refresh_token":"rt-refreshed","expires_in":18000}"#
-            .to_vec())
+        Ok(
+            br#"{"access_token":"at-refreshed","refresh_token":"rt-refreshed","expires_in":18000}"#
+                .to_vec(),
+        )
     }
 
     fn mock_refresh_failure(_url: &str, _body: &str) -> Result<Vec<u8>, String> {
@@ -354,8 +352,14 @@ mod tests {
         // Both config dirs should have the new token
         let a = credentials::load(&config_a.join(".credentials.json")).unwrap();
         let b = credentials::load(&config_b.join(".credentials.json")).unwrap();
-        assert_eq!(a.claude_ai_oauth.access_token.expose_secret(), "at-refreshed");
-        assert_eq!(b.claude_ai_oauth.access_token.expose_secret(), "at-refreshed");
+        assert_eq!(
+            a.claude_ai_oauth.access_token.expose_secret(),
+            "at-refreshed"
+        );
+        assert_eq!(
+            b.claude_ai_oauth.access_token.expose_secret(),
+            "at-refreshed"
+        );
     }
 
     #[test]
@@ -390,9 +394,7 @@ mod tests {
 
         for h in handles {
             match h.join().unwrap() {
-                BrokerResult::Refreshed
-                | BrokerResult::Skipped
-                | BrokerResult::Valid => {}
+                BrokerResult::Refreshed | BrokerResult::Skipped | BrokerResult::Valid => {}
                 other => panic!("unexpected: {other:?}"),
             }
         }

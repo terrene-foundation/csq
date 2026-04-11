@@ -70,7 +70,10 @@ fn atomic_replace_windows(tmp_path: &Path, target: &Path) -> Result<(), Platform
     }
 
     fn to_wide(s: &Path) -> Vec<u16> {
-        s.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        s.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     let src = to_wide(tmp_path);
@@ -157,10 +160,16 @@ mod tests {
 
         // Start with permissive mode
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_ne!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         secure_file(&path).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

@@ -25,7 +25,10 @@ pub fn handle(base_dir: &Path) -> Result<()> {
         .read_to_string(&mut stdin_json);
 
     // Determine active account
-    let account: AccountNum = match config_dir.as_deref().and_then(markers::read_current_account) {
+    let account: AccountNum = match config_dir
+        .as_deref()
+        .and_then(markers::read_current_account)
+    {
         Some(a) => a,
         None => {
             println!("csq: no active account");
@@ -46,8 +49,7 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     }
 
     // Load state after (possibly) updating
-    let quota =
-        state::load_state(base_dir).unwrap_or_else(|_| csq_core::quota::QuotaFile::empty());
+    let quota = state::load_state(base_dir).unwrap_or_else(|_| csq_core::quota::QuotaFile::empty());
     let account_quota = quota.get(account.get());
 
     let label = account_label(base_dir, account);

@@ -39,20 +39,15 @@ impl fmt::Debug for RefreshResponse {
 /// Updates access_token, refresh_token, and expires_at. Preserves
 /// subscription_type, rate_limit_tier, scopes, and all extra fields
 /// (the refresh endpoint does not return these).
-pub fn merge_refresh(
-    existing: &CredentialFile,
-    response: &RefreshResponse,
-) -> CredentialFile {
+pub fn merge_refresh(existing: &CredentialFile, response: &RefreshResponse) -> CredentialFile {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
     let mut merged = existing.clone();
-    merged.claude_ai_oauth.access_token =
-        AccessToken::new(response.access_token.clone());
-    merged.claude_ai_oauth.refresh_token =
-        RefreshToken::new(response.refresh_token.clone());
+    merged.claude_ai_oauth.access_token = AccessToken::new(response.access_token.clone());
+    merged.claude_ai_oauth.refresh_token = RefreshToken::new(response.refresh_token.clone());
     merged.claude_ai_oauth.expires_at = now_ms + (response.expires_in * 1000);
     // scopes, subscription_type, rate_limit_tier, extra: preserved from existing
     merged
@@ -86,9 +81,7 @@ pub fn refresh_token<F>(
 where
     F: FnOnce(&str, &str) -> Result<Vec<u8>, String>,
 {
-    let body = build_refresh_body(
-        existing.claude_ai_oauth.refresh_token.expose_secret(),
-    );
+    let body = build_refresh_body(existing.claude_ai_oauth.refresh_token.expose_secret());
 
     let response_bytes = http_post(TOKEN_ENDPOINT, &body)
         .map_err(|e| OAuthError::Exchange(crate::error::redact_tokens(&e)))?;
@@ -216,9 +209,7 @@ mod tests {
     fn refresh_token_http_failure() {
         let existing = sample_creds();
 
-        let result = refresh_token(&existing, |_url, _body| {
-            Err("connection refused".into())
-        });
+        let result = refresh_token(&existing, |_url, _body| Err("connection refused".into()));
 
         match result {
             Err(OAuthError::Exchange(msg)) => {
@@ -232,9 +223,7 @@ mod tests {
     fn refresh_token_invalid_json_response() {
         let existing = sample_creds();
 
-        let result = refresh_token(&existing, |_url, _body| {
-            Ok(b"not json".to_vec())
-        });
+        let result = refresh_token(&existing, |_url, _body| Ok(b"not json".to_vec()));
 
         match result {
             Err(OAuthError::Exchange(msg)) => {
@@ -264,7 +253,8 @@ mod tests {
         // Craft a body that is malformed JSON AND contains a
         // real-looking Anthropic refresh token prefix. serde_json
         // may include this substring in its error message.
-        let leaky_body = br#"{"refresh_token":"sk-ant-ort01-LEAKED-SECRET-TOKEN","error":"invalid_grant"#;
+        let leaky_body =
+            br#"{"refresh_token":"sk-ant-ort01-LEAKED-SECRET-TOKEN","error":"invalid_grant"#;
 
         let result = refresh_token(&existing, |_url, _body| Ok(leaky_body.to_vec()));
 

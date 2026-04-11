@@ -271,14 +271,10 @@ pub(crate) fn parse_response(buf: &[u8]) -> Result<DaemonResponse, DaemonClientE
         )));
     }
     let status_str = parts.next().ok_or_else(|| {
-        DaemonClientError::MalformedResponse(format!(
-            "status line missing code: {status_line}"
-        ))
+        DaemonClientError::MalformedResponse(format!("status line missing code: {status_line}"))
     })?;
     let status: u16 = status_str.parse().map_err(|_| {
-        DaemonClientError::MalformedResponse(format!(
-            "status code not a number: {status_str}"
-        ))
+        DaemonClientError::MalformedResponse(format!("status code not a number: {status_str}"))
     })?;
 
     let body = text[header_end + 4..].to_string();

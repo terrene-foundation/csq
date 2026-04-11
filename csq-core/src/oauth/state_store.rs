@@ -234,10 +234,7 @@ impl OAuthStateStore {
     /// Returns the number of currently-pending entries. Primarily
     /// for tests and diagnostics — not on any hot path.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("state store lock poisoned")
-            .len()
+        self.inner.lock().expect("state store lock poisoned").len()
     }
 
     /// Returns true if the store has no pending entries.

@@ -185,23 +185,11 @@ mod imp {
             bInheritHandle: i32,
             dwProcessId: u32,
         ) -> *mut std::ffi::c_void;
-        fn GetExitCodeProcess(
-            hProcess: *mut std::ffi::c_void,
-            lpExitCode: *mut u32,
-        ) -> i32;
+        fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-        fn CreateToolhelp32Snapshot(
-            dwFlags: u32,
-            th32ProcessID: u32,
-        ) -> *mut std::ffi::c_void;
-        fn Process32FirstW(
-            hSnapshot: *mut std::ffi::c_void,
-            lppe: *mut ProcessEntry32W,
-        ) -> i32;
-        fn Process32NextW(
-            hSnapshot: *mut std::ffi::c_void,
-            lppe: *mut ProcessEntry32W,
-        ) -> i32;
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
+        fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
     }
 
     pub fn is_pid_alive(pid: u32) -> bool {
@@ -238,10 +226,7 @@ mod imp {
                         .position(|&c| c == 0)
                         .unwrap_or(260)],
                 );
-                entries.insert(
-                    entry.th32_process_id,
-                    (entry.th32_parent_process_id, exe),
-                );
+                entries.insert(entry.th32_process_id, (entry.th32_parent_process_id, exe));
 
                 entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
                 if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
@@ -293,8 +278,12 @@ mod tests {
         assert!(is_cc_command("/usr/local/bin/claude"));
         assert!(is_cc_command("C:\\Program Files\\claude.exe"));
         assert!(is_cc_command("node /usr/local/bin/claude"));
-        assert!(is_cc_command("node /home/user/.nvm/versions/node/v20/bin/claude"));
-        assert!(is_cc_command("node /path/to/@anthropic-ai/claude-code/cli.js"));
+        assert!(is_cc_command(
+            "node /home/user/.nvm/versions/node/v20/bin/claude"
+        ));
+        assert!(is_cc_command(
+            "node /path/to/@anthropic-ai/claude-code/cli.js"
+        ));
     }
 
     #[test]

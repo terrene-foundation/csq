@@ -164,8 +164,8 @@ where
         OAuthError::Exchange(redact_tokens(&format!("failed to serialize request: {e}")))
     })?;
 
-    let response_bytes = http_post(OAUTH_TOKEN_URL, &body)
-        .map_err(|e| OAuthError::Exchange(redact_tokens(&e)))?;
+    let response_bytes =
+        http_post(OAUTH_TOKEN_URL, &body).map_err(|e| OAuthError::Exchange(redact_tokens(&e)))?;
 
     // serde_json::from_slice error Display may include a fragment
     // of the response body when parsing fails partway. If Anthropic
@@ -276,7 +276,10 @@ mod tests {
             parsed["code_verifier"],
             "test-verifier-value-for-exchange-tests-only"
         );
-        assert_eq!(parsed["redirect_uri"], "http://127.0.0.1:8420/oauth/callback");
+        assert_eq!(
+            parsed["redirect_uri"],
+            "http://127.0.0.1:8420/oauth/callback"
+        );
     }
 
     #[test]
@@ -475,6 +478,9 @@ mod tests {
 
         let body = captured_body.borrow().clone().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["redirect_uri"], "http://127.0.0.1:8420/oauth/callback");
+        assert_eq!(
+            parsed["redirect_uri"],
+            "http://127.0.0.1:8420/oauth/callback"
+        );
     }
 }

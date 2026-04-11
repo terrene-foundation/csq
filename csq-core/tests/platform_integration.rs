@@ -87,7 +87,10 @@ fn try_lock_returns_none_when_held_cross_process() {
 
     // Now try_lock_file should return None since the child holds the lock
     let result = try_lock_file(&lock_path).unwrap();
-    assert!(result.is_none(), "try_lock_file should return None when lock is held by another process");
+    assert!(
+        result.is_none(),
+        "try_lock_file should return None when lock is held by another process"
+    );
 
     // Clean up
     child.kill().unwrap();
@@ -184,10 +187,7 @@ fn spawn_detect_kill_verify() {
     use std::process::Command;
 
     // Spawn a long-running process
-    let mut child = Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
+    let mut child = Command::new("sleep").arg("60").spawn().unwrap();
 
     let pid = child.id();
     assert!(is_pid_alive(pid), "spawned process should be alive");
@@ -231,7 +231,7 @@ fn cc_command_detection_exhaustive() {
         "node server.js",
         "node index.js",
         "",
-        "claudette",  // different tool
+        "claudette", // different tool
     ];
     for cmd in &negatives {
         assert!(!is_cc_command(cmd), "should not match: {cmd}");

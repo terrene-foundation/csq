@@ -23,7 +23,10 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
             let provider = providers::get_provider(&s.provider_id);
             KeyEntry {
                 provider_id: s.provider_id.clone(),
-                name: provider.map(|p| p.name).unwrap_or(&s.provider_id).to_string(),
+                name: provider
+                    .map(|p| p.name)
+                    .unwrap_or(&s.provider_id)
+                    .to_string(),
                 fingerprint: s.key_fingerprint(),
                 model: s.get_model().unwrap_or("(default)").to_string(),
                 file: providers::settings::settings_path(base_dir, &s.provider_id)

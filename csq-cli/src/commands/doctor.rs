@@ -85,9 +85,7 @@ fn check_platform() -> PlatformInfo {
 fn check_claude_code() -> ClaudeCodeInfo {
     // Find claude binary (which on Unix, where.exe on Windows)
     #[cfg(unix)]
-    let output = std::process::Command::new("which")
-        .arg("claude")
-        .output();
+    let output = std::process::Command::new("which").arg("claude").output();
     #[cfg(windows)]
     let output = std::process::Command::new("where.exe")
         .arg("claude")
@@ -125,25 +123,21 @@ fn check_settings() -> SettingsInfo {
     let settings_path = claude_home.as_ref().map(|h| h.join("settings.json"));
 
     let (exists, statusline_configured, statusline_command) = match settings_path {
-        Some(ref path) if path.exists() => {
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(val) => {
-                            let cmd = val
-                                .get("statusLine")
-                                .and_then(|sl| sl.get("command"))
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.to_string());
-                            let configured = cmd.as_ref().is_some_and(|c| c.contains("csq"));
-                            (true, configured, cmd)
-                        }
-                        Err(_) => (true, false, None),
-                    }
+        Some(ref path) if path.exists() => match std::fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(val) => {
+                    let cmd = val
+                        .get("statusLine")
+                        .and_then(|sl| sl.get("command"))
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string());
+                    let configured = cmd.as_ref().is_some_and(|c| c.contains("csq"));
+                    (true, configured, cmd)
                 }
                 Err(_) => (true, false, None),
-            }
-        }
+            },
+            Err(_) => (true, false, None),
+        },
         _ => (false, false, None),
     };
 
@@ -200,9 +194,7 @@ fn check_accounts(base_dir: &Path) -> AccountsInfo {
         if !a.has_credentials {
             continue;
         }
-        let cred_path = base_dir
-            .join("credentials")
-            .join(format!("{}.json", a.id));
+        let cred_path = base_dir.join("credentials").join(format!("{}.json", a.id));
         if let Ok(content) = std::fs::read_to_string(&cred_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(exp) = val

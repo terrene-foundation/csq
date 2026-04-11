@@ -105,9 +105,7 @@ pub fn get_provider(id: &str) -> Option<&'static Provider> {
 
 /// Returns all providers that require an API key.
 pub fn providers_with_keys() -> impl Iterator<Item = &'static Provider> {
-    PROVIDERS
-        .iter()
-        .filter(|p| p.auth_type != AuthType::None)
+    PROVIDERS.iter().filter(|p| p.auth_type != AuthType::None)
 }
 
 #[cfg(test)]
@@ -174,6 +172,10 @@ mod tests {
         let mut names: Vec<&str> = PROVIDERS.iter().map(|p| p.settings_filename).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), PROVIDERS.len(), "settings filenames must be unique");
+        assert_eq!(
+            names.len(),
+            PROVIDERS.len(),
+            "settings filenames must be unique"
+        );
     }
 }

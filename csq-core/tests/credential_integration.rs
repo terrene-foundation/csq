@@ -5,7 +5,9 @@
 
 use csq_core::credentials::file::{canonical_path, live_path, load, save, save_canonical};
 use csq_core::credentials::keychain::service_name;
-use csq_core::credentials::refresh::{merge_refresh, refresh_token, RefreshResponse, TOKEN_ENDPOINT};
+use csq_core::credentials::refresh::{
+    merge_refresh, refresh_token, RefreshResponse, TOKEN_ENDPOINT,
+};
 use csq_core::credentials::{CredentialFile, OAuthPayload};
 use csq_core::types::{AccessToken, AccountNum, RefreshToken};
 use std::collections::HashMap;
@@ -40,11 +42,26 @@ fn keychain_service_name_known_paths() {
     //   hashlib.sha256(unicodedata.normalize('NFC', path).encode()).hexdigest()[:8]
     // This is the single most critical parity test for credential migration.
     let expected = [
-        ("/Users/test/.claude/accounts/config-1", "Claude Code-credentials-cfdcc24b"),
-        ("/Users/test/.claude/accounts/config-2", "Claude Code-credentials-550a6ea2"),
-        ("/Users/test/.claude/accounts/config-3", "Claude Code-credentials-d705092c"),
-        ("/home/user/.claude/accounts/config-1", "Claude Code-credentials-abf1dc4a"),
-        ("/tmp/.claude/accounts/config-1", "Claude Code-credentials-dbea6435"),
+        (
+            "/Users/test/.claude/accounts/config-1",
+            "Claude Code-credentials-cfdcc24b",
+        ),
+        (
+            "/Users/test/.claude/accounts/config-2",
+            "Claude Code-credentials-550a6ea2",
+        ),
+        (
+            "/Users/test/.claude/accounts/config-3",
+            "Claude Code-credentials-d705092c",
+        ),
+        (
+            "/home/user/.claude/accounts/config-1",
+            "Claude Code-credentials-abf1dc4a",
+        ),
+        (
+            "/tmp/.claude/accounts/config-1",
+            "Claude Code-credentials-dbea6435",
+        ),
     ];
 
     for (path, expected_name) in &expected {
@@ -316,7 +333,10 @@ fn save_canonical_succeeds_when_live_dir_unwritable() {
 
     // save_canonical should succeed — canonical write works, live fails silently
     let result = save_canonical(dir.path(), account, &sample_creds());
-    assert!(result.is_ok(), "canonical save should succeed even when live dir is unwritable");
+    assert!(
+        result.is_ok(),
+        "canonical save should succeed even when live dir is unwritable"
+    );
 
     // Canonical file should exist
     assert!(canonical_path(dir.path(), account).exists());
@@ -344,8 +364,14 @@ fn refresh_token_passes_correct_url_and_body() {
     assert_eq!(*captured_url.borrow(), TOKEN_ENDPOINT);
 
     let body = captured_body.borrow();
-    assert!(body.starts_with("grant_type=refresh_token&refresh_token="), "body: {body}");
-    assert!(body.contains("sk-ant-ort01-integration-test"), "body should contain the refresh token");
+    assert!(
+        body.starts_with("grant_type=refresh_token&refresh_token="),
+        "body: {body}"
+    );
+    assert!(
+        body.contains("sk-ant-ort01-integration-test"),
+        "body should contain the refresh token"
+    );
 }
 
 // ── IPC error string mapping ──────────────────────────────────────────
@@ -372,9 +398,7 @@ fn csq_error_ipc_mapping_coverage() {
     assert!(s.starts_with("CSRF_ERROR:"), "got: {s}");
 
     // Other -> INTERNAL_ERROR
-    let err = CsqError::Platform(PlatformError::Io(
-        std::io::Error::other("test"),
-    ));
+    let err = CsqError::Platform(PlatformError::Io(std::io::Error::other("test")));
     let s: String = err.into();
     assert!(s.starts_with("INTERNAL_ERROR:"), "got: {s}");
 }
@@ -390,7 +414,16 @@ fn oauth_error_http_redacts_tokens_in_body() {
         body: "invalid token: sk-ant-oat01-leaked-value and sk-ant-ort01-leaked-refresh".into(),
     };
     let display = format!("{err}");
-    assert!(!display.contains("leaked-value"), "access token should be redacted: {display}");
-    assert!(!display.contains("leaked-refresh"), "refresh token should be redacted: {display}");
-    assert!(display.contains("[REDACTED]"), "should contain redaction marker: {display}");
+    assert!(
+        !display.contains("leaked-value"),
+        "access token should be redacted: {display}"
+    );
+    assert!(
+        !display.contains("leaked-refresh"),
+        "refresh token should be redacted: {display}"
+    );
+    assert!(
+        display.contains("[REDACTED]"),
+        "should contain redaction marker: {display}"
+    );
 }

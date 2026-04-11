@@ -52,7 +52,9 @@ pub fn pick_best(base_dir: &Path, exclude: Option<AccountNum>) -> Option<Account
             .min_by(|(_, a), (_, b)| {
                 let a_pct = a.map(|q| q.five_hour_pct()).unwrap_or(0.0);
                 let b_pct = b.map(|q| q.five_hour_pct()).unwrap_or(0.0);
-                a_pct.partial_cmp(&b_pct).unwrap_or(std::cmp::Ordering::Equal)
+                a_pct
+                    .partial_cmp(&b_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(num, _)| *num);
     }
@@ -81,7 +83,8 @@ pub struct Suggestion {
 /// Returns a JSON-serializable suggestion.
 pub fn suggest(base_dir: &Path, current: Option<AccountNum>) -> Suggestion {
     let best = pick_best(base_dir, current);
-    let quota = quota_state::load_state(base_dir).unwrap_or_else(|_| crate::quota::QuotaFile::empty());
+    let quota =
+        quota_state::load_state(base_dir).unwrap_or_else(|_| crate::quota::QuotaFile::empty());
 
     let all_exhausted = discovery::discover_anthropic(base_dir)
         .iter()
@@ -124,11 +127,7 @@ mod tests {
             },
             extra: HashMap::new(),
         };
-        credentials::save(
-            &credentials::file::canonical_path(base, target),
-            &creds,
-        )
-        .unwrap();
+        credentials::save(&credentials::file::canonical_path(base, target), &creds).unwrap();
     }
 
     fn setup_quota(base: &Path, account: u16, five_hour_pct: f64, resets_at: u64) {

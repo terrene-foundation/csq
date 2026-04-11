@@ -172,11 +172,14 @@ fn main() -> Result<()> {
     let base_dir = commands::base_dir()?;
 
     match command {
-        Command::Run { account, profile, rest } => {
+        Command::Run {
+            account,
+            profile,
+            rest,
+        } => {
             let account_num = match account {
                 Some(n) => Some(
-                    AccountNum::try_from(n)
-                        .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?,
+                    AccountNum::try_from(n).map_err(|e| anyhow::anyhow!("invalid account: {e}"))?,
                 ),
                 None => None,
             };
@@ -210,7 +213,9 @@ fn main() -> Result<()> {
                 provider: "all".to_string(),
             });
             match action {
-                ModelsCmd::List { provider } => commands::models::handle_list(&base_dir, &provider, json),
+                ModelsCmd::List { provider } => {
+                    commands::models::handle_list(&base_dir, &provider, json)
+                }
                 ModelsCmd::Switch { provider, model } => {
                     commands::models::handle_switch(&base_dir, &provider, &model)
                 }

@@ -54,8 +54,9 @@ pub fn current_config_dir() -> Option<PathBuf> {
 /// Returns an error if `CLAUDE_CONFIG_DIR` is missing, malformed, or
 /// escapes the base directory.
 pub fn validated_config_dir(base_dir: &Path) -> Result<PathBuf> {
-    let raw = std::env::var("CLAUDE_CONFIG_DIR")
-        .map_err(|_| anyhow!("CLAUDE_CONFIG_DIR not set — this command must run inside a csq-managed session"))?;
+    let raw = std::env::var("CLAUDE_CONFIG_DIR").map_err(|_| {
+        anyhow!("CLAUDE_CONFIG_DIR not set — this command must run inside a csq-managed session")
+    })?;
 
     validate_config_dir(base_dir, Path::new(&raw))
 }

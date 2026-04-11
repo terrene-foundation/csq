@@ -112,9 +112,7 @@ fn try_daemon_path(base_dir: &Path, account: AccountNum) -> DaemonPathOutcome {
     let resp = match daemon::http_get_unix(&socket_path, &path_and_query) {
         Ok(r) => r,
         Err(DaemonClientError::Connect(_)) => {
-            return DaemonPathOutcome::Fallback(
-                "lost connection to daemon socket".to_string(),
-            );
+            return DaemonPathOutcome::Fallback("lost connection to daemon socket".to_string());
         }
         Err(e) => {
             return DaemonPathOutcome::Failed(anyhow!("daemon login call failed: {e}"));
@@ -132,8 +130,7 @@ fn try_daemon_path(base_dir: &Path, account: AccountNum) -> DaemonPathOutcome {
         }
         503 => {
             return DaemonPathOutcome::Fallback(
-                "daemon OAuth callback listener is not available (port 8420 in use?)"
-                    .to_string(),
+                "daemon OAuth callback listener is not available (port 8420 in use?)".to_string(),
             );
         }
         other => {
@@ -159,7 +156,10 @@ fn try_daemon_path(base_dir: &Path, account: AccountNum) -> DaemonPathOutcome {
     };
 
     // Step 4: open the authorize URL in the user's browser.
-    println!("Starting OAuth login for account {} via csq daemon...", account);
+    println!(
+        "Starting OAuth login for account {} via csq daemon...",
+        account
+    );
     println!("Opening your browser to complete authorization.");
     println!();
     println!("If the browser does not open, paste this URL manually:");
@@ -396,7 +396,9 @@ mod tests {
             "expires_in_secs": 300
         }"#;
         let parsed = parse_login_response(body).unwrap();
-        assert!(parsed.auth_url.starts_with("https://claude.ai/oauth/authorize"));
+        assert!(parsed
+            .auth_url
+            .starts_with("https://claude.ai/oauth/authorize"));
         assert!(parsed.auth_url.contains("state=xyz"));
     }
 

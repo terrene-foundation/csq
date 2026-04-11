@@ -36,9 +36,8 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
     let pid_path = daemon::pid_file_path(base_dir);
 
     // Acquire PID file; errors if another daemon is already running.
-    let pid_file = PidFile::acquire(&pid_path).with_context(|| {
-        format!("could not acquire PID file at {}", pid_path.display())
-    })?;
+    let pid_file = PidFile::acquire(&pid_path)
+        .with_context(|| format!("could not acquire PID file at {}", pid_path.display()))?;
 
     let sock_path = daemon::socket_path(base_dir);
 
@@ -78,11 +77,10 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
             // Bounds the filesystem scan rate so a statusline
             // polling on a tight interval cannot DoS the daemon
             // (M8.5 security review MED #1).
-            let discovery_cache: Arc<
-                daemon::TtlCache<(), Vec<csq_core::accounts::AccountInfo>>,
-            > = Arc::new(daemon::TtlCache::new(
-                daemon::server::DISCOVERY_CACHE_MAX_AGE,
-            ));
+            let discovery_cache: Arc<daemon::TtlCache<(), Vec<csq_core::accounts::AccountInfo>>> =
+                Arc::new(daemon::TtlCache::new(
+                    daemon::server::DISCOVERY_CACHE_MAX_AGE,
+                ));
 
             // Create the shared OAuth state store. The /api/login/{N}
             // handler on the Unix socket writes to it, the
@@ -122,10 +120,7 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                             "  OAuth:    http://127.0.0.1:{}/oauth/callback",
                             handle.port
                         );
-                        tracing::info!(
-                            port = handle.port,
-                            "oauth callback listener bound"
-                        );
+                        tracing::info!(port = handle.port, "oauth callback listener bound");
                         (Some(Arc::clone(&oauth_store)), handle.port, Some(join))
                     }
                     Err(e) => {
@@ -200,10 +195,8 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     // accounts when 5-hour quota exceeds the configured
                     // threshold. Disabled by default; enable via
                     // {base_dir}/rotation.json.
-                    let auto_rotator = daemon::spawn_auto_rotate(
-                        base_dir_for_runtime.clone(),
-                        shutdown.clone(),
-                    );
+                    let auto_rotator =
+                        daemon::spawn_auto_rotate(base_dir_for_runtime.clone(), shutdown.clone());
 
                     // Block until SIGTERM/SIGINT arrives.
                     wait_for_shutdown().await;
@@ -218,11 +211,8 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
 
                     // Await the refresher with a 5s deadline so a
                     // stuck HTTP call can't block shutdown.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        refresher.join,
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), refresher.join)
+                        .await
                     {
                         Ok(Ok(())) => tracing::info!("refresher stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "refresher task panicked"),
@@ -230,11 +220,8 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     }
 
                     // Await the usage poller with a 5s deadline.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        usage_poller.join,
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), usage_poller.join)
+                        .await
                     {
                         Ok(Ok(())) => tracing::info!("usage poller stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "usage poller task panicked"),
@@ -242,11 +229,8 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     }
 
                     // Await the auto-rotation loop with a 5s deadline.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        auto_rotator.join,
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), auto_rotator.join)
+                        .await
                     {
                         Ok(Ok(())) => tracing::info!("auto-rotation loop stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "auto-rotation task panicked"),
@@ -254,30 +238,23 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     }
 
                     // Give the accept loop up to 5s to exit.
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        server_join,
-                    )
-                    .await;
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), server_join).await;
 
                     // Give the OAuth callback listener up to 5s to
                     // finish any in-flight exchange and exit.
                     if let Some(join) = oauth_callback_join {
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            join,
-                        )
-                        .await;
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
                     }
                 }
                 Err(e) => {
                     // Bind failure is fatal — the daemon can't do
                     // anything useful without its IPC socket.
-                    eprintln!("error: failed to bind daemon socket at {}: {e}",
-                              sock_path.display());
-                    return Err::<(), anyhow::Error>(anyhow::anyhow!(
-                        "socket bind failed: {e}"
-                    ));
+                    eprintln!(
+                        "error: failed to bind daemon socket at {}: {e}",
+                        sock_path.display()
+                    );
+                    return Err::<(), anyhow::Error>(anyhow::anyhow!("socket bind failed: {e}"));
                 }
             }
         }
@@ -347,7 +324,10 @@ pub fn handle_status(base_dir: &Path) -> Result<()> {
         }
         DaemonStatus::Stale { pid } => {
             println!("stale");
-            eprintln!("  PID file references dead PID {pid} at {}", pid_path.display());
+            eprintln!(
+                "  PID file references dead PID {pid} at {}",
+                pid_path.display()
+            );
             eprintln!("  Run `csq daemon start` to clean up and restart.");
             std::process::exit(1);
         }
@@ -366,10 +346,8 @@ async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt())
-            .expect("failed to install SIGINT handler");
+        let mut term = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
         tokio::select! {
             _ = term.recv() => tracing::info!("SIGTERM received"),
             _ = int.recv() => tracing::info!("SIGINT received"),

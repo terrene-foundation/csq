@@ -53,11 +53,7 @@ pub fn scan_config_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
 /// Writes atomically to each dir's `.credentials.json`. Skips dirs where
 /// the access token already matches (already in sync). A failure on one
 /// dir does not stop fanout to others.
-pub fn fan_out_credentials(
-    base_dir: &Path,
-    account: AccountNum,
-    creds: &CredentialFile,
-) -> usize {
+pub fn fan_out_credentials(base_dir: &Path, account: AccountNum, creds: &CredentialFile) -> usize {
     let dirs = scan_config_dirs(base_dir, account);
     let new_token = creds.claude_ai_oauth.access_token.expose_secret();
     let mut updated = 0;
@@ -107,10 +103,7 @@ pub fn set_broker_failed(base_dir: &Path, account: AccountNum) -> Result<(), Cre
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(&path, b"").map_err(|e| CredentialError::Io {
-        path,
-        source: e,
-    })
+    std::fs::write(&path, b"").map_err(|e| CredentialError::Io { path, source: e })
 }
 
 /// Clears the broker-failed flag (on successful refresh or login).
@@ -199,7 +192,10 @@ mod tests {
 
         assert_eq!(updated, 1);
         let live = credentials::load(&config.join(".credentials.json")).unwrap();
-        assert_eq!(live.claude_ai_oauth.access_token.expose_secret(), "new-access");
+        assert_eq!(
+            live.claude_ai_oauth.access_token.expose_secret(),
+            "new-access"
+        );
     }
 
     #[test]

@@ -266,7 +266,12 @@ pub fn post_json_with_headers(
     let resp_headers: std::collections::HashMap<String, String> = response
         .headers()
         .iter()
-        .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+        .map(|(k, v)| {
+            (
+                k.as_str().to_lowercase(),
+                v.to_str().unwrap_or("").to_string(),
+            )
+        })
         .collect();
     let text = response.text().map_err(sanitize_err)?;
     Ok((status, resp_headers, text))
@@ -331,7 +336,10 @@ mod tests {
         // https_only(true) should cause any http:// URL to fail at
         // request time. We don't need a live server for this; the
         // error surfaces synchronously.
-        let result = post_form("http://example.invalid/oauth/token", "grant_type=refresh_token");
+        let result = post_form(
+            "http://example.invalid/oauth/token",
+            "grant_type=refresh_token",
+        );
         assert!(result.is_err(), "http:// must be rejected by https_only");
     }
 

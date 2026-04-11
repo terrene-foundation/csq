@@ -165,8 +165,9 @@ fn unix_health_check(pid: u32, sock_path: &Path) -> DetectResult {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 return DetectResult::Unhealthy {
                     reason: format!("health read: {e}"),
@@ -249,8 +250,10 @@ mod tests {
 
         match detect_daemon(dir.path()) {
             DetectResult::Stale { reason } => {
-                assert!(reason.contains("socket") && reason.contains("missing"),
-                        "reason: {reason}");
+                assert!(
+                    reason.contains("socket") && reason.contains("missing"),
+                    "reason: {reason}"
+                );
             }
             other => panic!("expected Stale, got {other:?}"),
         }

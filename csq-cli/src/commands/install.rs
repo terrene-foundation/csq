@@ -12,8 +12,7 @@ pub fn handle() -> Result<()> {
 
     // Create directories
     let credentials_dir = base_dir.join("credentials");
-    std::fs::create_dir_all(&credentials_dir)
-        .context("creating credentials directory")?;
+    std::fs::create_dir_all(&credentials_dir).context("creating credentials directory")?;
 
     #[cfg(unix)]
     {
@@ -78,9 +77,9 @@ fn patch_settings_json(claude_home: &Path) -> Result<()> {
     };
 
     // Ensure top-level is an object.
-    let obj = value.as_object_mut().ok_or_else(|| {
-        anyhow!("{} is not a JSON object", path.display())
-    })?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
 
     // Insert the statusLine using CC's expected NESTED schema:
     //   { "statusLine": { "type": "command", "command": "csq statusline" } }
@@ -129,11 +128,7 @@ fn cleanup_v1_artifacts(claude_home: &Path) -> Vec<String> {
     let accounts_dir = claude_home.join("accounts");
 
     // v1.x artifacts in ~/.claude/
-    let claude_home_artifacts = [
-        "statusline-command.sh",
-        "rotate.md",
-        "auto-rotate-hook.sh",
-    ];
+    let claude_home_artifacts = ["statusline-command.sh", "rotate.md", "auto-rotate-hook.sh"];
 
     // v1.x artifacts in ~/.claude/accounts/
     let accounts_artifacts = [
@@ -169,10 +164,7 @@ fn backup_artifact(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let bak_ext = if ext.is_empty() {
         "bak".to_string()
     } else {

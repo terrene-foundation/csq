@@ -128,8 +128,7 @@ pub struct RouterState {
 /// few milliseconds. Adding single-flight coordination would
 /// require holding an async lock across spawn_blocking, which
 /// is strictly worse than the bounded dogpile.
-pub const DISCOVERY_CACHE_MAX_AGE: std::time::Duration =
-    std::time::Duration::from_secs(5);
+pub const DISCOVERY_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum request body size accepted by the daemon HTTP router.
 /// M8.3 has no body-accepting routes, but the limit is set now so
@@ -280,12 +279,8 @@ async fn refresh_status_one_handler(
 ) -> Result<Json<RefreshStatus>, (StatusCode, String)> {
     // Validate account number. This also defends against negative
     // or out-of-range values that slipped past the u16 decode.
-    let account = AccountNum::try_from(id).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid account id: {e}"),
-        )
-    })?;
+    let account = AccountNum::try_from(id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
 
     match state.cache.get(&account.get()) {
         Some(status) => Ok(Json(status)),
@@ -319,12 +314,8 @@ async fn login_handler(
     State(state): State<RouterState>,
     AxumPath(id): AxumPath<u16>,
 ) -> Result<Json<LoginRequest>, (StatusCode, String)> {
-    let account = AccountNum::try_from(id).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid account id: {e}"),
-        )
-    })?;
+    let account = AccountNum::try_from(id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
 
     let Some(store) = state.oauth_store.as_ref() else {
         return Err((
@@ -506,14 +497,12 @@ pub async fn serve(
     // Defense-in-depth: explicit set_permissions even after the
     // umask-controlled bind. If the filesystem or kernel behaved
     // unexpectedly (NFS, container layer), this catches it.
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
-        |e| {
-            tracing::debug!(error = %e, "chmod socket 0o600 failed");
-            DaemonError::SocketConnect {
-                path: socket_path.to_path_buf(),
-            }
-        },
-    )?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        tracing::debug!(error = %e, "chmod socket 0o600 failed");
+        DaemonError::SocketConnect {
+            path: socket_path.to_path_buf(),
+        }
+    })?;
 
     let shutdown = CancellationToken::new();
     let handle = ServerHandle {
@@ -905,9 +894,7 @@ mod tests {
         use tokio::net::UnixStream;
 
         let mut stream = UnixStream::connect(sock).await.unwrap();
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        );
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
 
@@ -968,8 +955,11 @@ mod tests {
             extra: Default::default(),
         };
         let num = AccountNum::try_from(1u16).unwrap();
-        credentials::save(&crate::credentials::file::canonical_path(dir.path(), num), &creds)
-            .unwrap();
+        credentials::save(
+            &crate::credentials::file::canonical_path(dir.path(), num),
+            &creds,
+        )
+        .unwrap();
 
         let sock = dir.path().join("csq-test.sock");
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
@@ -1216,8 +1206,7 @@ mod tests {
 
         // Very short TTL so the test doesn't wait 5 seconds.
         let sock = dir.path().join("csq-test.sock");
-        let state =
-            test_state_with_discovery_ttl(dir.path(), std::time::Duration::from_millis(50));
+        let state = test_state_with_discovery_ttl(dir.path(), std::time::Duration::from_millis(50));
         let (handle, join) = serve(&sock, state).await.unwrap();
 
         // Populate the cache.

@@ -46,17 +46,16 @@ impl ProviderSettings {
 
     /// Sets the API key in this settings file.
     pub fn set_api_key(&mut self, key: &str) -> Result<(), ConfigError> {
-        let provider = get_provider(&self.provider_id).ok_or_else(|| {
-            ConfigError::ProfileNotFound {
+        let provider =
+            get_provider(&self.provider_id).ok_or_else(|| ConfigError::ProfileNotFound {
                 name: self.provider_id.clone(),
-            }
-        })?;
+            })?;
 
-        let env_var = provider.key_env_var.ok_or_else(|| {
-            ConfigError::MergeConflict {
+        let env_var = provider
+            .key_env_var
+            .ok_or_else(|| ConfigError::MergeConflict {
                 key: "keyless provider has no env var".into(),
-            }
-        })?;
+            })?;
 
         let obj = self
             .settings
@@ -128,10 +127,7 @@ pub fn default_settings(provider: &Provider) -> Value {
 ///
 /// Returns the default settings if the file doesn't exist. Attempts
 /// JSON auto-repair if the file is truncated.
-pub fn load_settings(
-    base_dir: &Path,
-    provider_id: &str,
-) -> Result<ProviderSettings, ConfigError> {
+pub fn load_settings(base_dir: &Path, provider_id: &str) -> Result<ProviderSettings, ConfigError> {
     let provider = get_provider(provider_id).ok_or_else(|| ConfigError::ProfileNotFound {
         name: provider_id.to_string(),
     })?;
@@ -146,11 +142,9 @@ pub fn load_settings(
                     // Try repair
                     warn!(path = %path.display(), "settings file corrupt, attempting repair");
                     if let Some(repaired) = repair_truncated_json(&content) {
-                        serde_json::from_str(&repaired).map_err(|e| {
-                            ConfigError::InvalidJson {
-                                path: path.clone(),
-                                reason: format!("repair failed: {e}"),
-                            }
+                        serde_json::from_str(&repaired).map_err(|e| ConfigError::InvalidJson {
+                            path: path.clone(),
+                            reason: format!("repair failed: {e}"),
                         })?
                     } else {
                         return Err(ConfigError::InvalidJson {
@@ -171,24 +165,19 @@ pub fn load_settings(
 }
 
 /// Saves provider settings to disk with atomic write and 0o600 permissions.
-pub fn save_settings(
-    base_dir: &Path,
-    settings: &ProviderSettings,
-) -> Result<(), ConfigError> {
-    let provider = get_provider(&settings.provider_id).ok_or_else(|| {
-        ConfigError::ProfileNotFound {
+pub fn save_settings(base_dir: &Path, settings: &ProviderSettings) -> Result<(), ConfigError> {
+    let provider =
+        get_provider(&settings.provider_id).ok_or_else(|| ConfigError::ProfileNotFound {
             name: settings.provider_id.clone(),
-        }
-    })?;
+        })?;
 
     let path = base_dir.join(provider.settings_filename);
 
-    let json = serde_json::to_string_pretty(&settings.settings).map_err(|e| {
-        ConfigError::InvalidJson {
+    let json =
+        serde_json::to_string_pretty(&settings.settings).map_err(|e| ConfigError::InvalidJson {
             path: path.clone(),
             reason: format!("serialize: {e}"),
-        }
-    })?;
+        })?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -231,11 +220,10 @@ pub fn list_configured(base_dir: &Path) -> Vec<ProviderSettings> {
 
 /// Removes a provider settings file.
 pub fn remove_settings(base_dir: &Path, provider_id: &str) -> Result<bool, ConfigError> {
-    let path = settings_path(base_dir, provider_id).ok_or_else(|| {
-        ConfigError::ProfileNotFound {
+    let path =
+        settings_path(base_dir, provider_id).ok_or_else(|| ConfigError::ProfileNotFound {
             name: provider_id.to_string(),
-        }
-    })?;
+        })?;
 
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| ConfigError::InvalidJson {
@@ -268,10 +256,7 @@ mod tests {
         let s = default_settings(p);
         let env = s.get("env").unwrap();
         for key in crate::session::merge::MODEL_KEYS {
-            assert_eq!(
-                env.get(*key).unwrap().as_str().unwrap(),
-                "MiniMax-M2"
-            );
+            assert_eq!(env.get(*key).unwrap().as_str().unwrap(), "MiniMax-M2");
         }
     }
 
@@ -291,7 +276,10 @@ mod tests {
         save_settings(dir.path(), &s).unwrap();
 
         let loaded = load_settings(dir.path(), "mm").unwrap();
-        assert_eq!(loaded.get_api_key().unwrap().expose_secret(), "test-key-123");
+        assert_eq!(
+            loaded.get_api_key().unwrap().expose_secret(),
+            "test-key-123"
+        );
     }
 
     #[test]

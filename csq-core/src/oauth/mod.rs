@@ -62,7 +62,7 @@ pub use constants::{
     redirect_uri, scopes_joined, DEFAULT_REDIRECT_PORT, OAUTH_AUTHORIZE_URL, OAUTH_CLIENT_ID,
     OAUTH_SCOPES, OAUTH_TOKEN_URL,
 };
-pub use pkce::{challenge_from_verifier, generate_verifier, CodeChallenge, CodeVerifier};
 pub use exchange::exchange_code;
 pub use login::{start_login, start_login_default_port, LoginRequest};
+pub use pkce::{challenge_from_verifier, generate_verifier, CodeChallenge, CodeVerifier};
 pub use state_store::{OAuthStateStore, PendingState, MAX_PENDING, STATE_TTL};

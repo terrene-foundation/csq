@@ -73,9 +73,9 @@ impl ModelCatalog {
     /// Finds a model by ID or alias.
     pub fn find(&self, query: &str) -> Option<&ModelInfo> {
         let q = query.to_lowercase();
-        self.models.iter().find(|m| {
-            m.id.to_lowercase() == q || m.aliases.iter().any(|a| a.to_lowercase() == q)
-        })
+        self.models
+            .iter()
+            .find(|m| m.id.to_lowercase() == q || m.aliases.iter().any(|a| a.to_lowercase() == q))
     }
 
     /// Returns all models for a specific provider.
@@ -89,20 +89,18 @@ impl ModelCatalog {
     /// Suggests the closest match for a model query (Levenshtein-ish).
     pub fn suggest(&self, query: &str) -> Option<&ModelInfo> {
         let q = query.to_lowercase();
-        self.models
-            .iter()
-            .min_by_key(|m| {
-                // Simple scoring: prefer prefix matches, then substring matches
-                if m.id.to_lowercase().starts_with(&q) {
-                    0
-                } else if m.id.to_lowercase().contains(&q) {
-                    1
-                } else if m.aliases.iter().any(|a| a.to_lowercase().contains(&q)) {
-                    2
-                } else {
-                    3
-                }
-            })
+        self.models.iter().min_by_key(|m| {
+            // Simple scoring: prefer prefix matches, then substring matches
+            if m.id.to_lowercase().starts_with(&q) {
+                0
+            } else if m.id.to_lowercase().contains(&q) {
+                1
+            } else if m.aliases.iter().any(|a| a.to_lowercase().contains(&q)) {
+                2
+            } else {
+                3
+            }
+        })
     }
 }
 

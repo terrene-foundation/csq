@@ -41,10 +41,7 @@ pub fn build_probe_headers(provider: &Provider, api_key: &str) -> Vec<(String, S
                 headers.push(("x-api-key".to_string(), api_key.to_string()));
                 headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
             } else {
-                headers.push((
-                    "Authorization".to_string(),
-                    format!("Bearer {api_key}"),
-                ));
+                headers.push(("Authorization".to_string(), format!("Bearer {api_key}")));
             }
         }
         super::catalog::AuthType::None => {}
@@ -74,11 +71,7 @@ pub fn classify_response(status: u16, body: &str) -> ValidationResult {
 /// The `http_post` function receives `(url, headers, body)` and returns
 /// either `Ok((status, body))` on HTTP success, or `Err(message)` on
 /// connection failure.
-pub fn validate_key<F>(
-    provider: &Provider,
-    api_key: &str,
-    http_post: F,
-) -> ValidationResult
+pub fn validate_key<F>(provider: &Provider, api_key: &str, http_post: F) -> ValidationResult
 where
     F: FnOnce(&str, &[(String, String)], &str) -> Result<(u16, String), String>,
 {
@@ -98,8 +91,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::catalog::get_provider;
+    use super::*;
 
     #[test]
     fn classify_200_is_valid() {
@@ -144,7 +137,9 @@ mod tests {
         let p = get_provider("claude").unwrap();
         let headers = build_probe_headers(p, "sk-test-key");
 
-        assert!(headers.iter().any(|(k, v)| k == "x-api-key" && v == "sk-test-key"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "x-api-key" && v == "sk-test-key"));
         assert!(headers.iter().any(|(k, _)| k == "anthropic-version"));
     }
 
@@ -153,7 +148,9 @@ mod tests {
         let p = get_provider("mm").unwrap();
         let headers = build_probe_headers(p, "mm-key");
 
-        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer mm-key"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer mm-key"));
     }
 
     #[test]

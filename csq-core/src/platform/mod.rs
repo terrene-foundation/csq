@@ -73,10 +73,16 @@ mod tests {
     fn compile_time_constants_match_platform() {
         // These are compile-time constants, so we verify them via const assertion.
         #[cfg(target_os = "macos")]
-        const { assert!(IS_MACOS && !IS_LINUX && !IS_WINDOWS) }
+        const {
+            assert!(IS_MACOS && !IS_LINUX && !IS_WINDOWS)
+        }
         #[cfg(target_os = "linux")]
-        const { assert!(!IS_MACOS && IS_LINUX && !IS_WINDOWS) }
+        const {
+            assert!(!IS_MACOS && IS_LINUX && !IS_WINDOWS)
+        }
         #[cfg(target_os = "windows")]
-        const { assert!(!IS_MACOS && !IS_LINUX && IS_WINDOWS) }
+        const {
+            assert!(!IS_MACOS && !IS_LINUX && IS_WINDOWS)
+        }
     }
 }

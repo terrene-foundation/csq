@@ -101,11 +101,10 @@ fn read_impl(service: &str) -> Result<CredentialFile, PlatformError> {
 
     let bytes = hex::decode(hex_payload)
         .map_err(|e| PlatformError::Keychain(format!("hex decode: {e}")))?;
-    let json = String::from_utf8(bytes)
-        .map_err(|e| PlatformError::Keychain(format!("utf8: {e}")))?;
+    let json =
+        String::from_utf8(bytes).map_err(|e| PlatformError::Keychain(format!("utf8: {e}")))?;
 
-    serde_json::from_str(&json)
-        .map_err(|e| PlatformError::Keychain(format!("json parse: {e}")))
+    serde_json::from_str(&json).map_err(|e| PlatformError::Keychain(format!("json parse: {e}")))
 }
 
 // ── Linux/Windows stub (keyring crate integration deferred) ───────────
@@ -157,7 +156,10 @@ mod tests {
         // NFC normalization: é as single codepoint vs e + combining accent
         let composed = service_name(Path::new("/tmp/caf\u{00e9}"));
         let decomposed = service_name(Path::new("/tmp/caf\u{0065}\u{0301}"));
-        assert_eq!(composed, decomposed, "NFC normalization should produce same hash");
+        assert_eq!(
+            composed, decomposed,
+            "NFC normalization should produce same hash"
+        );
     }
 
     #[test]
@@ -165,7 +167,9 @@ mod tests {
         let svc = service_name(Path::new("/tmp/test"));
         let hash_part = &svc["Claude Code-credentials-".len()..];
         assert!(
-            hash_part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            hash_part
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "hash should be lowercase hex: {hash_part}"
         );
     }

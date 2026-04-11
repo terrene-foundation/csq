@@ -53,7 +53,8 @@ pub fn handle(
     if is_broker_failed(base_dir, account) {
         return Err(anyhow!(
             "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
-            account, account
+            account,
+            account
         ));
     }
 
@@ -111,10 +112,7 @@ pub fn handle(
     }
 }
 
-fn resolve_account(
-    base_dir: &Path,
-    explicit: Option<AccountNum>,
-) -> Result<Option<AccountNum>> {
+fn resolve_account(base_dir: &Path, explicit: Option<AccountNum>) -> Result<Option<AccountNum>> {
     if let Some(a) = explicit {
         return Ok(Some(a));
     }

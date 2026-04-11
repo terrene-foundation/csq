@@ -329,9 +329,7 @@ fn find_target(
     if !non_exhausted.is_empty() {
         return non_exhausted
             .iter()
-            .min_by(|(_, a, _), (_, b, _)| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(num, _, _)| *num);
     }
 
@@ -372,10 +370,7 @@ mod tests {
 
     fn setup_account(base: &Path, account: u16) {
         let target = AccountNum::try_from(account).unwrap();
-        let creds = make_creds(
-            &format!("at-{account}"),
-            &format!("rt-{account}"),
-        );
+        let creds = make_creds(&format!("at-{account}"), &format!("rt-{account}"));
         credentials::save(&cred_file::canonical_path(base, target), &creds).unwrap();
     }
 
@@ -520,7 +515,7 @@ mod tests {
         // Simulate account 2 also going over threshold — would want to rotate back
         setup_quota(dir.path(), 2, 98.0);
         setup_quota(dir.path(), 1, 10.0); // account 1 recovered
-        // Put account marker back to simulate it was on account 2
+                                          // Put account marker back to simulate it was on account 2
         let target2 = AccountNum::try_from(2u16).unwrap();
         markers::write_csq_account(&config_dir, target2).unwrap();
 

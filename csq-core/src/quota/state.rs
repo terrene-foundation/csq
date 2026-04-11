@@ -295,10 +295,12 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
         let account = AccountNum::try_from(3u16).unwrap();
 
-        let payload1 = serde_json::json!({"five_hour": {"used_percentage": 10.0, "resets_at": 9999999999u64}});
+        let payload1 =
+            serde_json::json!({"five_hour": {"used_percentage": 10.0, "resets_at": 9999999999u64}});
         update_quota(dir.path(), &config, account, &payload1).unwrap();
 
-        let payload2 = serde_json::json!({"five_hour": {"used_percentage": 20.0, "resets_at": 9999999999u64}});
+        let payload2 =
+            serde_json::json!({"five_hour": {"used_percentage": 20.0, "resets_at": 9999999999u64}});
         let updated = update_quota(dir.path(), &config, account, &payload2).unwrap();
         assert!(updated);
 

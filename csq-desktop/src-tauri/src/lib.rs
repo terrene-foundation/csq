@@ -49,19 +49,31 @@ fn sanitize_label(s: &str) -> String {
     }
 }
 
-/// Returns the most recently modified `config-N` directory under
-/// `base_dir`, where `N` is a valid account number (1..=999).
+/// Returns the config-N directory whose `.credentials.json` was
+/// most recently modified, where `N` is a valid account number
+/// (1..=999).
+///
+/// **Why `.credentials.json` mtime, not dir mtime**: directory
+/// mtime changes only on child entry creation/deletion/rename. A
+/// user actively using `config-5` (reading the file, modifying
+/// in-place state) would NOT bump the dir's mtime, so a dir-mtime
+/// heuristic picks whichever dir had a credential rotated last in
+/// an auto-refresh sweep — not the dir the user's terminal is on.
+/// The `.credentials.json` file itself is rewritten via
+/// `atomic_replace` on every token refresh and login, and those
+/// writes happen against the specific active dir.
 ///
 /// Tray quick-swap targets only ONE config dir — retargeting every
-/// live session at once is destructive and silent. By picking the
-/// most-recently-modified dir we approximate "the user's current
-/// session" without needing `CLAUDE_CONFIG_DIR` (which GUI-launched
-/// apps don't inherit).
+/// live session at once is destructive and silent. Picking the
+/// most-recently-rewritten credential approximates "the session
+/// the user is actively using" without needing `CLAUDE_CONFIG_DIR`
+/// (which GUI-launched apps don't inherit).
 ///
 /// Rejects:
 /// * Non-directories
 /// * Symlinks (could redirect writes outside base_dir)
 /// * Names not matching `config-<1..=999>`
+/// * Directories with no readable `.credentials.json`
 fn most_recent_config_dir(base: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(base).ok()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -89,13 +101,20 @@ fn most_recent_config_dir(base: &Path) -> Option<PathBuf> {
             continue;
         }
 
-        // Take the most recently modified one.
-        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
-        let Some(mtime) = mtime else { continue };
+        // Signal: mtime of `{dir}/.credentials.json`, which is
+        // rewritten via atomic_replace on every refresh/login.
+        // Dirs without a credentials file are skipped entirely —
+        // they're not live sessions.
+        let path = entry.path();
+        let cred_path = path.join(".credentials.json");
+        let Ok(meta) = std::fs::metadata(&cred_path) else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else { continue };
 
         match best.as_ref() {
-            None => best = Some((mtime, entry.path())),
-            Some((t, _)) if mtime > *t => best = Some((mtime, entry.path())),
+            None => best = Some((mtime, path)),
+            Some((t, _)) if mtime > *t => best = Some((mtime, path)),
             _ => {}
         }
     }
@@ -330,12 +349,34 @@ pub fn run() {
         ])
         .setup(|app| {
             // ── Logging ────────────────────────────────────────
-            // tauri-plugin-log installs a `log` facade sink. We
-            // enable it in BOTH debug and release so tray-click
-            // errors (H1) and Windows mutex fallback warnings (H4)
-            // are observable. In release mode the plugin defaults
-            // to logging to the OS-appropriate app-data dir
-            // (Library/Logs/csq-desktop on macOS, etc.).
+            //
+            // Two independent logging facades are wired up:
+            //
+            // 1. **tracing** — csq-core emits via `tracing::warn!`
+            //    etc. We install a global `tracing_subscriber::fmt`
+            //    subscriber with an env filter so those events
+            //    reach stderr (captured by the launcher) and — in
+            //    release — a rotating file under the user's app-
+            //    data dir.
+            //
+            // 2. **log** — this crate and `tauri-plugin-log`
+            //    itself use the `log` facade for webview and
+            //    Tauri-lifecycle messages. `tauri-plugin-log`
+            //    installs the `log` sink in both debug and
+            //    release so tray-click errors (H1) are observable.
+            //
+            // We do NOT try to bridge tracing→log: `tracing_log`
+            // bridges the opposite direction (log→tracing) and a
+            // correct tracing→log adapter is more trouble than a
+            // second subscriber. Both systems coexist and write to
+            // their own sinks.
+            let filter = tracing_subscriber::EnvFilter::try_from_env("CSQ_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .try_init();
+
             let log_level = if cfg!(debug_assertions) {
                 log::LevelFilter::Debug
             } else {
@@ -346,15 +387,6 @@ pub fn run() {
                     .level(log_level)
                     .build(),
             )?;
-
-            // Bridge `tracing` events from csq-core into the `log`
-            // facade so warnings emitted by the lock, daemon, and
-            // oauth modules also land in the desktop log sink. The
-            // LogTracer must be installed after the log facade has
-            // a sink, otherwise the bridge forwards to nothing.
-            if let Err(e) = tracing_log::LogTracer::init() {
-                log::warn!("failed to install tracing→log bridge: {e}");
-            }
 
             // ── Auto-updater ─────────────────────────────────
             // Registers the updater plugin. Actual update checks require

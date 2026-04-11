@@ -208,13 +208,21 @@ mod imp {
     static GLOBAL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
     /// Probes whether the current process can create Global\ named
-    /// mutexes. Uses a fixed probe name so repeated probes are
-    /// idempotent and don't pollute the namespace.
+    /// mutexes.
+    ///
+    /// Uses a probe name suffixed with the current PID so each
+    /// process tests creation of a fresh kernel object, not
+    /// observation of an existing one. If the name were fixed
+    /// across processes, an elevated sibling could create the
+    /// object and a later unelevated csq process would get a
+    /// valid handle to that existing object — a false positive —
+    /// and subsequent per-path Global\ mutex attempts would then
+    /// fail permanently because this process can't create new
+    /// Global objects, only open existing ones.
     fn probe_global_availability() -> bool {
-        let probe_name: Vec<u16> = "Global\\csq-probe-0000000000000000"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let pid = std::process::id();
+        let probe_str = format!("Global\\csq-probe-{pid}");
+        let probe_name: Vec<u16> = probe_str.encode_utf16().chain(std::iter::once(0)).collect();
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, probe_name.as_ptr()) };
         if handle.is_null() {
             let err = unsafe { GetLastError() };
@@ -230,7 +238,8 @@ mod imp {
             warn!("Global\\ probe failed with unexpected error {err}; using Local namespace");
             return false;
         }
-        // Probe succeeded — close it immediately and remember.
+        // Probe succeeded — close it immediately; the per-PID name
+        // guarantees no namespace pollution.
         unsafe { CloseHandle(handle) };
         true
     }

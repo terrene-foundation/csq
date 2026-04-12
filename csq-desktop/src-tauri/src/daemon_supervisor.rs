@@ -32,17 +32,24 @@
 //! same token and drain gracefully. The `PidFile` drops last,
 //! cleaning up the `.csq-daemon.pid` file.
 
-use csq_core::accounts::AccountInfo;
-use csq_core::daemon::{
-    self, detect_daemon, server as daemon_server, DetectResult, HttpGetFn, HttpPostFn,
-    HttpPostProbeFn, PidFile, TtlCache,
-};
-use csq_core::http;
-use csq_core::oauth::OAuthStateStore;
+use csq_core::daemon::{self, detect_daemon, DetectResult, PidFile};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+// Unix-only imports for run_daemon (server, refresher subsystems).
+// On Windows, the supervisor loop still detects external daemons and
+// acquires the PidFile, but run_daemon is a no-op stub (M8.6).
+#[cfg(unix)]
+use csq_core::accounts::AccountInfo;
+#[cfg(unix)]
+use csq_core::daemon::{server as daemon_server, HttpGetFn, HttpPostFn, HttpPostProbeFn, TtlCache};
+#[cfg(unix)]
+use csq_core::http;
+#[cfg(unix)]
+use csq_core::oauth::OAuthStateStore;
+#[cfg(unix)]
+use std::sync::Arc;
 
 /// Minimum wait between failed takeover attempts. Short enough
 /// that a crashing external daemon doesn't starve csq for minutes
@@ -219,10 +226,10 @@ async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
 
         // ── 4. Run one daemon instance until it exits ────────────
         //
-        // `run_daemon` binds the socket, spawns subsystems, waits
-        // for either cancellation or a subsystem failure, then
-        // cleans up. The PidFile drops at the end of this scope so
-        // a subsequent loop iteration can re-acquire it.
+        // On Unix: binds the socket, spawns subsystems, waits for
+        // either cancellation or a subsystem failure, then cleans up.
+        // On Windows: M8.6 — no daemon subsystems yet; hold the
+        // PidFile and wait for cancellation.
         if let Err(e) = run_daemon(&base_dir, cancel.clone()).await {
             log::warn!("in-process daemon exited with error: {e}");
         } else {

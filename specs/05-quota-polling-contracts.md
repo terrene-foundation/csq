@@ -1,6 +1,6 @@
 # 05 Quota Polling Contracts
 
-Spec version: 1.0.0 | Status: DRAFT (endpoint details pending Playwright investigation) | Governs: Anthropic and third-party usage polling
+Spec version: 1.1.0 | Status: VERIFIED | Governs: Anthropic and third-party usage polling
 
 ---
 
@@ -8,7 +8,7 @@ Spec version: 1.0.0 | Status: DRAFT (endpoint details pending Playwright investi
 
 This spec defines the daemon's contract with Anthropic's OAuth usage endpoint and third-party providers (MiniMax, Z.AI). It specifies the request shape, parse rules, and write invariants for `quota.json`.
 
-**Status note:** sections 5.2 (claude.ai dashboard endpoint) and 5.3 (MiniMax), 5.4 (Z.AI) are DRAFT pending live Playwright investigation — the current assumptions predate direct inspection of the web dashboards' network traffic and may be wrong in the same way journal 0028's "utilization as fraction" was wrong. Results land in a revision bump once Playwright MCP is loaded and the investigations complete.
+**Status note:** sections 5.3 (MiniMax) and 5.4 (Z.AI) have been VERIFIED via live API testing (journal 0032). Section 5.2 (claude.ai dashboard endpoint) remains observational — csq uses the OAuth usage endpoint (5.1) instead.
 
 ## 5.1 Anthropic `/api/oauth/usage`
 
@@ -82,32 +82,24 @@ Transport constraints (journal 0028 Discovery, load-bearing):
 
 **Decision:** csq stays on `/api/oauth/usage` (bearer-authenticated). The data is equivalent for the fields csq needs. The web endpoint gives richer breakdown data that csq could expose later if cookie auth becomes viable.
 
-## 5.3 MiniMax (RESOLVED — 3 bugs found)
+## 5.3 MiniMax (RESOLVED — fixed in PR #79)
 
-**Investigated 2026-04-12 via Playwright MCP.** The endpoint works and returns authoritative data. csq was calling it wrong.
+**Investigated 2026-04-12 via Playwright MCP, corrected 2026-04-12 via direct API testing (journal 0032).**
 
-**Working endpoint (from browser):**
+**Working endpoint:**
 
 ```
-GET https://platform.minimax.io/v1/api/openplatform/coding_plan/remains?GroupId=<group-id>
+GET https://platform.minimax.io/v1/api/openplatform/coding_plan/remains
 Authorization: Bearer <API_KEY>
 Accept: application/json
 ```
 
-**csq's current call (broken — `usage_poller.rs:849`):**
+**Notes:**
 
-```
-GET https://www.minimax.io/v1/api/openplatform/coding_plan/remains
-Authorization: Bearer <API_KEY>
-```
+- **Host:** `platform.minimax.io` (NOT `www.minimax.io` which returns 403 via Cloudflare, and NOT `api.minimax.chat` which is for message traffic only).
+- **GroupId:** Optional. The `?GroupId=<group-id>` parameter was initially believed required per browser capture, but direct API testing (journal 0032 Finding 2) confirmed the endpoint works without it, returning all models.
 
-**Three bugs:**
-
-1. **Wrong host.** csq uses `www.minimax.io`. The working host is `platform.minimax.io`. The `www` host returns 403 via Cloudflare. The catalog also has a third host `api.minimax.chat` for the Anthropic-compatible endpoint — that's correct for message traffic but wrong for the quota endpoint.
-
-2. **Missing `GroupId` query parameter.** The endpoint requires `?GroupId=<group-id>` (e.g. `2024475421608780062`). Without it, MiniMax returns an error. The GroupId is the user's MiniMax organization ID, visible on the platform dashboard. csq must store this as a per-slot configuration value alongside the API key.
-
-3. **Wrong response parser.** csq's `poll_minimax_quota` (line 861-887) expects `data.remaining` / `data.total`. The actual response is:
+**Response shape:**
 
 ```json
 {
@@ -115,7 +107,7 @@ Authorization: Bearer <API_KEY>
     {
       "model_name": "MiniMax-M*",
       "current_interval_total_count": 30000,
-      "current_interval_usage_count": 29850,
+      "current_interval_usage_count": 29957,
       "current_weekly_total_count": 300000,
       "current_weekly_usage_count": 289423,
       "start_time": 1775988000000,
@@ -126,26 +118,25 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
-The parser must: (a) iterate `model_remains[]`, (b) find the entry matching the user's configured model (or `MiniMax-M*` for the coding plan), (c) compute usage percentage as `current_interval_usage_count / current_interval_total_count * 100`.
+**CRITICAL — `usage_count` is REMAINING, not consumed.** The endpoint name is `/coding_plan/remains`. `current_interval_usage_count` = remaining usable count. To compute consumed: `used = total - usage_count`. Example: `total=30000, usage_count=29957` → 43 consumed, 0.14% used (journal 0032 Finding 3).
 
-**Fix plan:**
+**Parser:** Iterate `model_remains[]`, find entry matching configured model (or `MiniMax-M*` for coding plan), compute 5h percentage as `(total - usage_count) / total * 100`, 7d from `current_weekly_*` fields with same formula.
 
-- Change host to `platform.minimax.io` in `poll_minimax_quota`.
-- Add `GroupId` to per-slot settings (`config-<N>/settings.json` env block or a new field). User provides it during account setup.
-- Rewrite the response parser for the actual `model_remains[]` shape.
-- Add a `current_weekly_*` breakdown for the 7-day equivalent display.
+**Status:** Fixed in PR #79 — correct host, correct parser, correct remaining-vs-consumed semantics.
 
-## 5.4 Z.AI (RESOLVED — auth barrier)
+## 5.4 Z.AI (RESOLVED — API key works, fixed in PR #80)
 
-**Investigated 2026-04-12 via Playwright MCP.** Z.AI has a direct quota API. The problem is authentication.
+**Investigated 2026-04-12 via Playwright MCP, corrected 2026-04-12 via direct API testing (journal 0032).**
 
-**Working endpoint (from browser):**
+**Working endpoint:**
 
 ```
 GET https://api.z.ai/api/monitor/usage/quota/limit
-Authorization: Bearer <JWT_SESSION_TOKEN>
+Authorization: Bearer <API_KEY>
 Accept: application/json
 ```
+
+**CRITICAL correction:** The spec originally claimed a JWT session token was required and the API key was insufficient. Journal 0032 Finding 1 proved this wrong — the same API key stored in per-slot `settings.json` (`ANTHROPIC_AUTH_TOKEN`) works for the quota endpoint. The browser captured both cookies AND the Authorization header; the spec attributed auth to the JWT cookie, but the header alone is sufficient.
 
 **Response:**
 
@@ -155,31 +146,17 @@ Accept: application/json
   "data": {
     "limits": [
       {
-        "type": "TIME_LIMIT",
-        "unit": 5,
-        "number": 1,
-        "usage": 4000,
-        "currentValue": 264,
-        "remaining": 3736,
-        "percentage": 6,
-        "nextResetTime": 1778376833998,
-        "usageDetails": [
-          { "modelCode": "search-prime", "usage": 264 },
-          { "modelCode": "web-reader", "usage": 0 }
-        ]
-      },
-      {
         "type": "TOKENS_LIMIT",
         "unit": 3,
         "number": 5,
-        "percentage": 11,
+        "percentage": 6,
         "nextResetTime": 1776007017081
       },
       {
         "type": "TOKENS_LIMIT",
         "unit": 6,
         "number": 1,
-        "percentage": 9,
+        "percentage": 11,
         "nextResetTime": 1776389633997
       }
     ],
@@ -188,19 +165,9 @@ Accept: application/json
 }
 ```
 
-Subscription confirmed via `GET api.z.ai/api/biz/subscription/list`: **GLM Coding Max** ($216/quarter, auto-renew).
+**Unit mapping:** `unit: 3` = 5-hour window, `unit: 6` = 7-day window. `percentage` is already 0-100 (no multiplication needed). Filter by `type: "TOKENS_LIMIT"` to get the coding quota entries.
 
-**Auth barrier:** The JWT session token (`z-ai-open-platform-token-production` in browser localStorage) is NOT the API key csq stores. It's obtained via Z.AI's OAuth login callback flow (`z.ai/login/callback?code=<authcode>&redirect=...`). The API key (stored in csq per-slot `settings.json` as `ANTHROPIC_AUTH_TOKEN`) is for the Anthropic-compatible message endpoint, not for Z.AI's internal billing APIs.
-
-**Options (in order of preference):**
-
-1. **Implement Z.AI OAuth login in csq.** When user configures a Z.AI slot, csq opens a browser to `z.ai/login/callback`, captures the JWT, stores it alongside the API key. Daemon uses the JWT for quota polling. JWT refresh needs investigation (expiry unknown, possibly long-lived).
-
-2. **Ask user to paste JWT from browser.** `csq login --zai-token <jwt>` — one-time manual step. Stored securely in per-slot settings. Simpler than full OAuth but worse UX.
-
-3. **Show dashboard link instead of live data.** Display "View usage on z.ai" in the dashboard Accounts tab for Z.AI slots. No quota numbers, but no auth complexity. The `max_tokens=1` probe stays as a 429 detector (knows when blocked, just can't show percentage).
-
-**Recommendation:** Option 3 for now (ship something), option 1 as follow-up. Z.AI's quota API is well-structured and the JWT auth is standard — implementing it is a bounded task, just not critical-path for the handle-dir model.
+**Status:** Fixed in PR #80 — daemon polls both 5h and 7d windows with API key auth. The JWT OAuth flow (options 1-3 from the original spec) is no longer needed.
 
 ## 5.5 Write invariants
 
@@ -235,3 +202,4 @@ These fixes live in the implementation scope of the upgrade that lands specs 01-
 ## Revisions
 
 - 2026-04-12 — 1.0.0 — Initial draft. Sections 5.2-5.4 pending Playwright investigation. Section 5.6 documents the 2026-04-12 poller hang and mandates supervisor + per-call timeout fixes.
+- 2026-04-13 — 1.1.0 — Sections 5.3 and 5.4 corrected per journal 0032: MiniMax GroupId is optional, Z.AI API key works (JWT not required), MiniMax usage_count = remaining not consumed. Both fixes shipped in PRs #79 and #80.

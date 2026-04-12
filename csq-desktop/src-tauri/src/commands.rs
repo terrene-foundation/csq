@@ -459,19 +459,17 @@ pub fn list_providers() -> Result<Vec<ProviderView>, String> {
         .collect())
 }
 
-/// Result of [`start_claude_login`]. Safe to send over IPC — contains
+/// Result of [`begin_claude_login`]. Safe to send over IPC — contains
 /// the authorize URL, the CSRF state token, and the target account,
 /// but no tokens, verifier, or authorization code.
 #[derive(Serialize)]
-#[allow(dead_code)] // scaffolding for loopback OAuth — will be wired when desktop login is in-process
 pub struct ClaudeLoginView {
-    /// Full Anthropic authorize URL the frontend should open (either
-    /// in a child WebviewWindow or as a fallback in the system
-    /// browser).
+    /// Full Anthropic authorize URL the frontend should open in the
+    /// system browser via `tauri-plugin-opener`'s `openUrl`.
     pub auth_url: String,
-    /// CSRF state token. The frontend carries this so it can route
-    /// the `oauth-login-complete` / `oauth-login-failed` event back
-    /// to the correct waiting UI when multiple logins are in flight.
+    /// CSRF state token. The frontend carries this through the
+    /// paste-code step so it can route the submission back to the
+    /// correct pending PKCE state when multiple logins are in flight.
     pub state: String,
     /// Account slot being authorized, echoed back for correlation.
     pub account: u16,
@@ -492,18 +490,56 @@ impl From<LoginRequest> for ClaudeLoginView {
     }
 }
 
-/// Runs `claude auth login` for the given account slot.
+/// Begins an in-process PKCE OAuth login for the given account slot.
 ///
-/// This delegates the entire OAuth flow to Claude Code's binary —
-/// the same flow that CC's `/login` uses. CC handles browser open,
-/// callback capture, token exchange, and credential storage.
+/// This is step 1 of the paste-code OAuth flow:
+/// 1. Generates a fresh PKCE verifier + challenge
+/// 2. Records them in the shared [`OAuthStateStore`] keyed by a
+///    random state token (CSRF protection + single-use)
+/// 3. Builds the Anthropic authorize URL and returns it to the
+///    frontend as a [`ClaudeLoginView`]
 ///
-/// After CC completes, we read credentials from the keychain and
-/// save them to canonical `credentials/N.json`.
+/// After calling this command the frontend should:
+/// - Open `auth_url` in the system browser (via `openUrl`)
+/// - Show a code-paste input field to the user
+/// - Call [`submit_oauth_code`] with the `state_token` returned here
+///   and the code the user copies from Anthropic's callback page
+///
+/// To cancel an in-flight login (e.g. user closes the modal),
+/// call [`cancel_login`] with the same `state_token`.
+///
+/// # Errors
+///
+/// - `"invalid account: ..."` — account out of range 1..=999
+/// - `"login store full"` — MAX_PENDING simultaneous logins active
+///   (unlikely in practice but possible under rapid re-opens)
+#[tauri::command]
+pub fn begin_claude_login(
+    state: State<'_, AppState>,
+    account: u16,
+) -> Result<ClaudeLoginView, String> {
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+    csq_core::oauth::login::start_login(&state.oauth_store, account_num)
+        .map(ClaudeLoginView::from)
+        .map_err(|e| e.to_string())
+}
+
+/// (LEGACY) Runs `claude auth login` subprocess for the given account slot.
+///
+/// This shells out to the `claude` binary and delegates the full
+/// OAuth flow to Claude Code's own process — browser open, callback
+/// capture, token exchange, and credential storage.
+///
+/// **Deprecated in favour of [`begin_claude_login`] + [`submit_oauth_code`]**,
+/// which run the entire exchange in-process without requiring `claude`
+/// to be installed on PATH and without spawning a subprocess.
+///
+/// Retained as a fallback escape hatch; not wired to the main UI.
 ///
 /// This is a BLOCKING command — runs in a spawned thread so it
 /// doesn't freeze the UI. The frontend should show a spinner.
 #[tauri::command]
+#[allow(dead_code)] // LEGACY: retained as escape hatch; prefer begin_claude_login + submit_oauth_code
 pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
     let base = std::path::PathBuf::from(&base_dir);

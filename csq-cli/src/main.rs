@@ -129,6 +129,9 @@ enum UpdateCmd {
     /// Query GitHub Releases and compare to the current version.
     /// Prints a one-line notice if a newer release is available.
     Check,
+    /// Download, verify (SHA256 + Ed25519), and atomically replace the
+    /// current binary with the latest GitHub Release for this platform.
+    Install,
 }
 
 #[derive(Subcommand, Debug)]
@@ -197,6 +200,15 @@ fn main() -> Result<()> {
     let json = cli.json;
     let base_dir = commands::base_dir()?;
 
+    // Spawn a background thread to check for updates on every command run
+    // except `csq update` itself. The thread checks at most once per 24 hours
+    // (cached) and prints a one-line notice if a newer version is available.
+    // It never blocks or delays the main command.
+    match &command {
+        Command::Update { .. } => {} // skip: user is already in the update flow
+        _ => csq_core::update::auto_update_bg(base_dir.clone()),
+    }
+
     match command {
         Command::Run {
             account,
@@ -256,6 +268,7 @@ fn main() -> Result<()> {
         },
         Command::Update { action } => match action {
             UpdateCmd::Check => commands::update::check(),
+            UpdateCmd::Install => commands::update::install(),
         },
         Command::RepairCredentials { apply } => {
             commands::repair_credentials::handle(&base_dir, apply)

@@ -1,31 +1,18 @@
-//! `csq update check` — check GitHub Releases for a newer version.
+//! `csq update` — check and install newer csq releases from GitHub.
 //!
-//! Scope for this session: **check only**, no install path. The
-//! install path is deliberately left unwired until the release
-//! signing pipeline exists (journal 0027). Without signing, an
-//! auto-installer would be a supply-chain foot-gun — an attacker
-//! who compromises GitHub Releases could push a malicious binary
-//! that csq would happily swap in.
+//! ### Subcommands
 //!
-//! The check path is useful today: it tells the user when a new
-//! release is out and they can `brew upgrade csq` or download the
-//! tarball manually. It also exercises the GitHub Releases API
-//! client that the install path will eventually reuse.
+//! - `csq update check` — check GitHub Releases for a newer version and
+//!   print a notice. No changes made to the binary.
 //!
-//! ### Flow
-//!
-//! 1. Fetch `GET https://api.github.com/repos/terrene-foundation/csq/releases/latest`
-//! 2. Parse the JSON for `tag_name` and `html_url`.
-//! 3. Compare `tag_name` (minus any leading `v`) to
-//!    `env!("CARGO_PKG_VERSION")`.
-//! 4. If strictly greater, print a one-line notice with the URL.
-//! 5. If equal or older, print "already up to date" and exit 0.
+//! - `csq update install` — check for a newer version, download it,
+//!   verify SHA256 checksum and Ed25519 signature, and atomically
+//!   replace the current binary. Only proceeds if both verification
+//!   steps pass.
 //!
 //! ### Version comparison
 //!
-//! Uses semver's lexicographic-prefix comparison (`1.2.0 < 1.10.0`)
-//! via the `semver` crate... actually we don't want a new dep.
-//! Roll a minimal comparator that handles `MAJOR.MINOR.PATCH[-tag]`
+//! Rolls a minimal comparator that handles `MAJOR.MINOR.PATCH[-tag]`
 //! by splitting on `.` and parsing each component as u32. Pre-
 //! release tags (`2.0.0-alpha.1`) are compared lexicographically
 //! after the numeric components, matching semver spec closely
@@ -68,13 +55,10 @@ pub fn check() -> Result<()> {
                 }
             }
             println!();
-            println!("Install options:");
-            println!("  • brew upgrade csq         (if installed via Homebrew)");
-            println!("  • Download manually: {}", release.html_url);
-            println!();
-            println!("Note: `csq update install` is not yet available — the");
-            println!("release signing pipeline is blocked on M11-01 (Apple");
-            println!("Developer Program cert). Until then, update manually.");
+            println!("To upgrade:");
+            println!("  csq update install   (downloads, verifies, and replaces this binary)");
+            println!("  brew upgrade csq     (if installed via Homebrew)");
+            println!("  Download manually:   {}", release.html_url);
         }
         std::cmp::Ordering::Equal => {
             println!("csq {} is up to date.", CURRENT_VERSION);
@@ -88,6 +72,62 @@ pub fn check() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Runs `csq update install`.
+///
+/// 1. Checks GitHub Releases for a newer version.
+/// 2. If none exists, reports "already up to date" and exits.
+/// 3. If a newer version exists, downloads the binary, verifies the
+///    SHA256 checksum and Ed25519 signature, and atomically replaces
+///    the current binary.
+/// 4. Prompts the user for confirmation before replacing.
+///
+/// # Security
+///
+/// The update is refused unless both the SHA256 checksum and the
+/// Ed25519 signature (against the pinned Foundation release key) pass.
+/// See `csq_core::update::verify` for the verification logic.
+pub fn install() -> Result<()> {
+    eprintln!("Checking for csq updates…");
+
+    let info = csq_core::update::check_for_update().context("failed to check for updates")?;
+
+    let info = match info {
+        None => {
+            println!("csq {} is already up to date.", CURRENT_VERSION);
+            return Ok(());
+        }
+        Some(i) => i,
+    };
+
+    println!(
+        "csq {} is available (current: {}).",
+        info.version, CURRENT_VERSION
+    );
+    println!("Release notes: {}", info.html_url);
+    println!();
+    print!("Download and install? [y/N] ");
+    // Flush stdout before waiting for input.
+    use std::io::Write;
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+
+    let mut response = String::new();
+    std::io::stdin()
+        .read_line(&mut response)
+        .context("failed to read user input")?;
+
+    if !response.trim().eq_ignore_ascii_case("y") {
+        println!("Update cancelled.");
+        return Ok(());
+    }
+
+    csq_core::update::download_and_apply(&info).context("update failed")?;
+
+    println!("Restart csq to use v{}.", info.version);
     Ok(())
 }
 

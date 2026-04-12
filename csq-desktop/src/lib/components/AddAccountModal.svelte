@@ -34,12 +34,27 @@
 
   // ── Local state ───────────────────────────────────────────
   //
-  // Login flow: for Anthropic accounts, we run `claude auth login`
-  // which handles the full OAuth flow (browser, callback, exchange).
-  // The modal shows a spinner while it runs.
+  // Login flow for Anthropic accounts (PKCE paste-code):
+  //   1. `picker`       — user picks a provider
+  //   2. `paste-code`   — browser opened; user pastes the code
+  //                       Anthropic shows on the callback page
+  //   3. `submitting`   — exchanging code for tokens
+  //   4. `success`      — account added
+  //   5. `error`        — something failed; user can retry
+  //
+  // Bearer-key flow (MiniMax, Z.AI):
+  //   1. `picker`       — user picks a provider
+  //   2. `bearer-form`  — user pastes an API key
+  //   3. `success` / `error`
   type Step =
     | { kind: 'picker' }
-    | { kind: 'logging-in'; account: number }
+    | {
+        kind: 'paste-code';
+        login: ClaudeLoginView;
+        code: string;
+        submitting: boolean;
+        error: string | null;
+      }
     | {
         kind: 'bearer-form';
         provider: ProviderView;
@@ -54,8 +69,6 @@
   let providers = $state<ProviderView[]>([]);
   let providersError = $state<string | null>(null);
 
-  // No longer needed — login is a single blocking command.
-
   // ── Provider fetch ────────────────────────────────────────
   async function loadProviders() {
     try {
@@ -66,8 +79,9 @@
     }
   }
 
-  // Reset to picker whenever the modal re-opens. Clean up any
-  // pending login when it closes.
+  // Reset to picker whenever the modal re-opens. Cancel any
+  // in-flight PKCE state when the modal closes mid-flow so the
+  // state store doesn't fill with abandoned entries.
   $effect(() => {
     if (isOpen) {
       step = { kind: 'picker' };
@@ -98,14 +112,49 @@
     }
   }
 
-  // ── Claude OAuth (via `claude auth login`) ─────────────────
+  // ── Claude OAuth (in-process PKCE paste-code flow) ────────
+  //
+  // Step 1: call `begin_claude_login` to generate PKCE state and
+  // get the authorize URL, then open it in the system browser.
+  // Step 2: user authorizes on Anthropic's page and copies the
+  // code shown there.
+  // Step 3: user pastes the code here; `submitOAuthCode` exchanges
+  // it for tokens.
   async function startClaudeOAuth() {
-    step = { kind: 'logging-in', account: nextAccountId };
+    try {
+      const login = await invoke<ClaudeLoginView>('begin_claude_login', {
+        account: nextAccountId,
+      });
+      // Open Anthropic's authorize page in the system browser.
+      await openUrl(login.auth_url);
+      step = {
+        kind: 'paste-code',
+        login,
+        code: '',
+        submitting: false,
+        error: null,
+      };
+    } catch (e) {
+      step = { kind: 'error', message: String(e) };
+    }
+  }
+
+  async function submitOAuthCode() {
+    if (step.kind !== 'paste-code') return;
+    const pasteStep = step;
+    const trimmedCode = pasteStep.code.trim();
+    if (!trimmedCode) {
+      step = { ...pasteStep, error: 'Paste the code from the Anthropic page first.' };
+      return;
+    }
+
+    step = { ...pasteStep, submitting: true, error: null };
     try {
       const baseDir = await getBaseDir();
-      const account = await invoke<number>('start_claude_login', {
+      const account = await invoke<number>('submit_oauth_code', {
         baseDir,
-        account: nextAccountId,
+        stateToken: pasteStep.login.state,
+        code: trimmedCode,
       });
       onAccountAdded();
       step = {
@@ -113,7 +162,23 @@
         message: `Account ${account} added successfully.`,
       };
     } catch (e) {
-      step = { kind: 'error', message: String(e) };
+      step = { ...pasteStep, submitting: false, error: String(e) };
+    }
+  }
+
+  async function cancelOAuthAndGoBack() {
+    if (step.kind !== 'paste-code') {
+      step = { kind: 'picker' };
+      return;
+    }
+    const token = step.login.state;
+    step = { kind: 'picker' };
+    // Best-effort cancel: frees the state store slot. Errors
+    // are harmless — TTL eviction handles abandoned entries.
+    try {
+      await invoke('cancel_login', { stateToken: token });
+    } catch {
+      // ignore
     }
   }
 
@@ -146,6 +211,16 @@
 
   // ── Close behavior ────────────────────────────────────────
   async function handleClose() {
+    // If the user closes mid-PKCE flow, cancel the pending state so
+    // the store slot is freed immediately rather than waiting for TTL.
+    if (step.kind === 'paste-code') {
+      const token = step.login.state;
+      try {
+        await invoke('cancel_login', { stateToken: token });
+      } catch {
+        // ignore — TTL will evict the entry
+      }
+    }
     onClose();
   }
 </script>
@@ -193,14 +268,36 @@
               </button>
             {/each}
           </div>
-        {:else if step.kind === 'logging-in'}
+        {:else if step.kind === 'paste-code'}
           <p class="lede">
-            Signing in to account #{step.account}. Your browser should open — complete
-            the authorization there. This dialog will update automatically.
+            Your browser opened Anthropic's authorization page for account
+            #{step.login.account}. Complete the sign-in there, then copy the
+            code shown on the page and paste it below.
           </p>
-          <div class="spinner-container">
-            <div class="spinner"></div>
-            <p class="hint">Waiting for browser authorization...</p>
+          <label class="field">
+            <span>Authorization code</span>
+            <input
+              type="text"
+              bind:value={step.code}
+              placeholder="Paste the code from Anthropic here…"
+              disabled={step.submitting}
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck={false}
+              onkeydown={(e) => { if (e.key === 'Enter') submitOAuthCode(); }}
+            />
+          </label>
+          {#if step.error}
+            <div class="error-banner">{step.error}</div>
+          {/if}
+          <div class="actions">
+            <button class="secondary" onclick={cancelOAuthAndGoBack} disabled={step.submitting}>
+              Back
+            </button>
+            <button class="primary" onclick={submitOAuthCode} disabled={step.submitting || !step.code.trim()}>
+              {step.submitting ? 'Signing in…' : 'Sign in'}
+            </button>
           </div>
         {:else if step.kind === 'bearer-form'}
           <p class="lede">Paste your {step.provider.name} API key.</p>

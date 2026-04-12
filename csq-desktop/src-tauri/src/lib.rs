@@ -279,14 +279,14 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 }
 
 /// Coarse health of the full account set, rolled up for the tray
-/// tooltip.
+/// tooltip and icon variant.
 ///
-/// The tray icon itself stays on the default art this session — a
-/// colored warning variant requires design work and new PNG files —
-/// but the tooltip is cheap and updates live every 30s with the
-/// `refresh_tray_menu` ticker. A user with 8 accounts can hover the
-/// tray once to know whether any of them need attention without
-/// opening the dashboard.
+/// The tray icon updates every 30s via `refresh_tray_menu` along with
+/// the tooltip. Three icon variants are available: normal (white
+/// template), warn (amber), and error (red). `TrayStatus::icon_kind`
+/// maps health to the correct variant, and `apply_tray_icon` sets the
+/// icon on the tray handle. A user with 8 accounts can see at a glance
+/// whether any account needs attention without opening the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TrayHealth {
     /// No accounts with credentials, or no `credentials/` dir.
@@ -686,7 +686,7 @@ pub fn run() {
             commands::set_rotation_enabled,
             commands::get_daemon_status,
             commands::list_providers,
-            commands::start_claude_login,
+            commands::begin_claude_login,
             commands::submit_oauth_code,
             commands::cancel_login,
             commands::set_provider_key,

@@ -41,3 +41,4 @@ tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
 getrandom = "0.2"
 security-framework = "3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }

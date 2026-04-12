@@ -12,3 +12,4 @@ pub mod rotation;
 pub mod session;
 pub mod sessions;
 pub mod types;
+pub mod update;

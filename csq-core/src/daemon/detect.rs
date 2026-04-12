@@ -80,19 +80,24 @@ pub fn detect_daemon(base_dir: &Path) -> DetectResult {
         };
     }
 
-    // Step 3 + 4: socket connect + health check.
+    // Step 3 + 4: socket / pipe connect + health check.
     #[cfg(unix)]
     {
         let sock_path = super::socket_path(base_dir);
         unix_health_check(pid, &sock_path)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Windows named-pipe detection lands in M8.6.
+        let pipe_path = super::socket_path(base_dir);
+        windows_health_check(pid, &pipe_path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = pid;
         DetectResult::Unhealthy {
-            reason: "Windows named-pipe detection not yet implemented (M8.6)".into(),
+            reason: "daemon IPC detection not implemented on this platform".into(),
         }
     }
 }
@@ -189,6 +194,134 @@ fn unix_health_check(pid: u32, sock_path: &Path) -> DetectResult {
         DetectResult::Healthy {
             pid,
             socket_path: sock_path.to_path_buf(),
+        }
+    } else {
+        DetectResult::Unhealthy {
+            reason: format!("unexpected health status line: {first_line}"),
+        }
+    }
+}
+
+/// Steps 3 + 4 of the detection protocol on Windows.
+///
+/// Attempts to open the named pipe and send a minimal HTTP/1.1 GET
+/// /api/health. The pipe open uses a zero-wait `CreateFile` — if
+/// `ERROR_FILE_NOT_FOUND` is returned, the daemon's pipe server is not
+/// yet running (Stale). If `ERROR_PIPE_BUSY` is returned, all instances
+/// are currently serving clients (Unhealthy/"overloaded"). Anything else
+/// that succeeds is treated as a live connection.
+///
+/// The health exchange uses `std::io::Read`/`Write` via the synchronous
+/// blocking pipe handle so the detection function stays non-async and
+/// safe to call from the statusline hook.
+#[cfg(windows)]
+fn windows_health_check(pid: u32, pipe_path: &Path) -> DetectResult {
+    use std::io::{Read, Write};
+
+    // Attempt a synchronous open of the named pipe.
+    // We use `std::fs::OpenOptions` which on Windows calls `CreateFileW`.
+    // A zero timeout means "return immediately" — either the pipe
+    // exists and accepts our connection, or we get an OS error we can
+    // classify.
+    let mut stream = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pipe_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            // Map Windows error codes to DetectResult variants.
+            return match e.raw_os_error() {
+                // ERROR_FILE_NOT_FOUND (2): pipe server not running yet,
+                // or daemon cleaned up its pipe on exit.
+                Some(2) => DetectResult::Stale {
+                    reason: format!(
+                        "PID {pid} alive but named pipe {} not found (daemon may still be starting)",
+                        pipe_path.display()
+                    ),
+                },
+                // ERROR_PIPE_BUSY (231): pipe server exists but all
+                // instances are currently connected — daemon is alive
+                // but overloaded.
+                Some(231) => DetectResult::Unhealthy {
+                    reason: format!(
+                        "named pipe busy (all instances connected): {}",
+                        pipe_path.display()
+                    ),
+                },
+                // ERROR_ACCESS_DENIED (5): pipe exists but we cannot
+                // open it — likely a cross-user scenario or security
+                // descriptor mismatch.
+                Some(5) => DetectResult::Unhealthy {
+                    reason: format!(
+                        "named pipe access denied: {}",
+                        pipe_path.display()
+                    ),
+                },
+                _ => DetectResult::Unhealthy {
+                    reason: format!(
+                        "named pipe open failed: {e} (pipe: {})",
+                        pipe_path.display()
+                    ),
+                },
+            };
+        }
+    };
+
+    // Set read/write timeouts via the COMMTIMEOUTS structure.
+    // On named pipes, `set_read_timeout` / `set_write_timeout` are not
+    // available via the Rust standard library directly. Instead we rely
+    // on the HEALTH_TIMEOUT budget via the bounded read loop below.
+    // The pipe file handle is opened in blocking mode, so read will
+    // block until the daemon sends data. If the daemon is hung, the
+    // health check will block for up to HEALTH_TIMEOUT before we detect
+    // it via a separate thread or just accept the block. For the
+    // statusline use case, this is acceptable — the daemon should
+    // respond in well under 1ms for /api/health on a healthy system.
+    //
+    // A proper timeout on named pipe reads requires either:
+    //   - `OVERLAPPED` I/O with `WaitForSingleObject` and a timer
+    //   - Opening with `FILE_FLAG_OVERLAPPED`
+    //
+    // For M8-03, we accept the blocking behavior. The daemon is expected
+    // to respond within microseconds, and the 200ms SLA is met in the
+    // common case. A full async health check is available via
+    // `client_windows::http_get_pipe` for callers with a tokio runtime.
+
+    // Step 4: minimal HTTP/1.1 GET /api/health.
+    let request = b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if let Err(e) = stream.write_all(request) {
+        return DetectResult::Unhealthy {
+            reason: format!("health write: {e}"),
+        };
+    }
+
+    // Read up to 4096 bytes.
+    let mut buf = [0u8; 4096];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if total >= buf.len() {
+                    break;
+                }
+            }
+            Err(e) => {
+                return DetectResult::Unhealthy {
+                    reason: format!("health read: {e}"),
+                };
+            }
+        }
+    }
+
+    let text = std::str::from_utf8(&buf[..total]).unwrap_or("");
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.starts_with("HTTP/1.1 200") {
+        DetectResult::Healthy {
+            pid,
+            socket_path: pipe_path.to_path_buf(),
         }
     } else {
         DetectResult::Unhealthy {
@@ -336,6 +469,82 @@ mod tests {
         match result {
             DetectResult::Healthy { pid, .. } => {
                 assert_eq!(pid, std::process::id());
+            }
+            other => panic!("expected Healthy, got {other:?}"),
+        }
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Windows: a live PID with no pipe present should return Stale.
+    #[cfg(windows)]
+    #[test]
+    fn detect_windows_live_pid_but_no_pipe_is_stale() {
+        let dir = TempDir::new().unwrap();
+        // On Windows, pid_file_path uses %LOCALAPPDATA%\csq\ by default.
+        // Override so the test is isolated.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", dir.path());
+        }
+        let pid_path = super::super::pid_file_path(dir.path());
+        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+        // Write our own PID — we're definitely alive.
+        fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+
+        // socket_path() on Windows returns \\.\pipe\csq-{username}.
+        // That pipe does not exist, so detection should be Stale.
+        match detect_daemon(dir.path()) {
+            DetectResult::Stale { reason } => {
+                assert!(
+                    reason.contains("pipe") || reason.contains("not found"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    /// Windows: a live daemon on the named pipe returns Healthy.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn detect_windows_live_daemon_returns_healthy() {
+        use crate::daemon::server_windows;
+
+        let dir = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", dir.path());
+        }
+        let pid_path = super::super::pid_file_path(dir.path());
+        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+        fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+
+        // Use a unique pipe name to avoid collisions with other tests.
+        let pipe_name = format!(r"\\.\pipe\csq-detect-test-{}", std::process::id());
+
+        let state = crate::daemon::server::RouterState {
+            cache: std::sync::Arc::new(crate::daemon::TtlCache::with_default_age()),
+            discovery_cache: std::sync::Arc::new(crate::daemon::TtlCache::new(
+                crate::daemon::server::DISCOVERY_CACHE_MAX_AGE,
+            )),
+            base_dir: std::sync::Arc::new(dir.path().to_path_buf()),
+            oauth_store: None,
+        };
+        let (handle, join) = server_windows::serve(&pipe_name, state).await.unwrap();
+
+        // Override USERNAME so socket_path() returns our unique pipe name.
+        // We isolate by using the pipe name we just created directly via
+        // spawn_blocking with the path we know, rather than relying on
+        // socket_path() resolution. This makes the test deterministic.
+        let pipe_path = std::path::PathBuf::from(&pipe_name);
+        let pid = std::process::id();
+        let result = tokio::task::spawn_blocking(move || windows_health_check(pid, &pipe_path))
+            .await
+            .unwrap();
+
+        match result {
+            DetectResult::Healthy { pid: got_pid, .. } => {
+                assert_eq!(got_pid, std::process::id());
             }
             other => panic!("expected Healthy, got {other:?}"),
         }

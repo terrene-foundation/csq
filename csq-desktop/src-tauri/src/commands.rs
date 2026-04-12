@@ -293,9 +293,16 @@ pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
             .unwrap_or(0.0);
 
         // Detect stale sessions: if the marker file was modified
-        // after the CC process started, a swap happened while it was
-        // running. CC caches credentials in memory, so the process
-        // is still using the OLD account's tokens.
+        // well after the CC process started, a swap happened while
+        // it was running. CC caches credentials in memory, so the
+        // process is still using the OLD account's tokens.
+        //
+        // Grace period: `csq run N` writes the marker BEFORE
+        // spawning claude, so a freshly launched session always has
+        // marker_mtime >= process_start. A 5-second buffer avoids
+        // false "restart needed" badges on new sessions while still
+        // catching genuine post-launch swaps.
+        const RESTART_GRACE_SECS: u64 = 5;
         let needs_restart = s.started_at.is_some_and(|proc_start| {
             let marker_path = s.config_dir.join(".csq-account");
             std::fs::metadata(&marker_path)
@@ -307,7 +314,9 @@ pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
                         .ok()
                         .map(|d| d.as_secs())
                 })
-                .is_some_and(|marker_secs| marker_secs > proc_start)
+                .is_some_and(|marker_secs| {
+                    marker_secs > proc_start + RESTART_GRACE_SECS
+                })
         });
 
         out.push(SessionView {

@@ -16,12 +16,18 @@ use tracing::{debug, info, warn};
 
 /// Items in the handle dir that are symlinks to `config-N/<item>`.
 /// These get repointed on swap.
+///
+/// `.claude.json` is intentionally EXCLUDED — CC writes per-project state
+/// (the `projects` map) into it, and symlinking to config-N's copy leaks
+/// project history from every directory that account was ever used in.
+/// This causes `--resume` to show sessions from all projects instead of
+/// filtering to the current CWD. Letting CC create a fresh `.claude.json`
+/// per handle dir restores correct project-scoped behavior.
 const ACCOUNT_BOUND_ITEMS: &[&str] = &[
     ".credentials.json",
     ".csq-account",
     ".current-account",
     "settings.json",
-    ".claude.json",
     ".quota-cursor",
 ];
 
@@ -56,11 +62,36 @@ pub fn create_handle_dir(
 
     let handle_dir = base_dir.join(format!("term-{}", pid));
 
-    // Detect orphan from prior crash with same PID
+    // Detect orphan from prior crash with same PID.
+    //
+    // SAFETY: Before removing, read `.live-pid` and verify the recorded
+    // PID is dead. Without this check, PID recycling could make us wipe
+    // out a live terminal's handle dir. We only remove dirs whose PID
+    // is definitely dead OR whose `.live-pid` is missing/unreadable
+    // (corrupt orphan from our own earlier crash).
     if handle_dir.exists() {
+        let live_pid_path = handle_dir.join(".live-pid");
+        let recorded_pid: Option<u32> = std::fs::read_to_string(&live_pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+
+        if let Some(recorded) = recorded_pid {
+            if is_pid_alive(recorded) {
+                return Err(CredentialError::Corrupt {
+                    path: handle_dir.clone(),
+                    reason: format!(
+                        "handle dir term-{pid} is in use by live PID {recorded}. \
+                         Refusing to remove. If you believe this is stale, stop \
+                         the process and rerun."
+                    ),
+                });
+            }
+        }
+
         warn!(
             pid,
-            "handle dir already exists — removing orphan from prior crash"
+            recorded = ?recorded_pid,
+            "handle dir already exists with dead or missing PID — removing orphan"
         );
         std::fs::remove_dir_all(&handle_dir).map_err(|e| CredentialError::Io {
             path: handle_dir.clone(),
@@ -110,6 +141,9 @@ pub fn create_handle_dir(
             debug!(item, "linked shared item");
         }
     }
+
+    // Copy .claude.json from config-N, scoping `projects` to CWD.
+    copy_claude_json_stripped(&config_dir, &handle_dir);
 
     // Write .live-pid with the csq CLI PID
     markers::write_live_pid(&handle_dir, pid)?;
@@ -191,6 +225,56 @@ pub fn repoint_handle_dir(
 
     info!(account = %target, handle = %handle_dir.display(), "handle dir repointed");
     Ok(())
+}
+
+/// Copies `.claude.json` from `config_dir` into `handle_dir`, scoping
+/// the `projects` map to only the current working directory.
+///
+/// CC uses `projects` in `.claude.json` to track per-project settings
+/// AND to enumerate resumable sessions. If we copy the full map, `--resume`
+/// shows sessions from every directory this account was ever used in.
+/// If we strip it entirely, CC thinks there are no projects and `/resume`
+/// says "No conversations found". The fix: keep only entries whose key
+/// matches the current CWD or is a subdirectory of it.
+///
+/// This works together with `scope_projects_to_cwd` — `.claude.json`
+/// tells CC which projects exist, `projects/` provides the session data.
+fn copy_claude_json_stripped(config_dir: &Path, handle_dir: &Path) {
+    let src = config_dir.join(".claude.json");
+    let dst = handle_dir.join(".claude.json");
+
+    let content = match std::fs::read_to_string(&src) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let mut json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Scope the `projects` map to the current CWD and its subdirs.
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_str = cwd.to_string_lossy().to_string();
+        if let Some(obj) = json.as_object_mut() {
+            if let Some(projects) = obj.get("projects").cloned() {
+                if let Some(proj_map) = projects.as_object() {
+                    let mut scoped = serde_json::Map::new();
+                    for (key, val) in proj_map {
+                        if key == &cwd_str || key.starts_with(&format!("{cwd_str}/")) {
+                            scoped.insert(key.clone(), val.clone());
+                        }
+                    }
+                    obj.insert("projects".to_string(), serde_json::Value::Object(scoped));
+                }
+            }
+        }
+    }
+
+    if let Ok(out) = serde_json::to_string_pretty(&json) {
+        let _ = std::fs::write(&dst, out);
+        debug!("copied .claude.json (scoped projects to CWD)");
+    }
 }
 
 /// Sweeps orphaned `term-*` handle directories under `base_dir`.

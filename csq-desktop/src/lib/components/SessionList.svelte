@@ -343,10 +343,10 @@
                 </span>
               {/if}
               <span class="quota-badge {quotaClass(session.five_hour_pct)}">
-                5h:{Math.round(session.five_hour_pct)}%
+                5h:{session.five_hour_pct > 0 && session.five_hour_pct < 1 ? '<1' : Math.round(session.five_hour_pct)}%
               </span>
               <span class="quota-badge {quotaClass(session.seven_day_pct)}">
-                7d:{Math.round(session.seven_day_pct)}%
+                7d:{session.seven_day_pct > 0 && session.seven_day_pct < 1 ? '<1' : Math.round(session.seven_day_pct)}%
               </span>
             </div>
           </div>

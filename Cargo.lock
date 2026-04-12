@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "csq-cli"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "csq-core"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "csq-desktop"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "csq-core",
  "dirs 5.0.1",

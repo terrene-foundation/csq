@@ -689,6 +689,7 @@ pub fn run() {
             commands::begin_claude_login,
             commands::submit_oauth_code,
             commands::cancel_login,
+            commands::start_claude_login,
             commands::set_provider_key,
             commands::list_sessions,
             commands::swap_session,

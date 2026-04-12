@@ -539,7 +539,6 @@ pub fn begin_claude_login(
 /// This is a BLOCKING command — runs in a spawned thread so it
 /// doesn't freeze the UI. The frontend should show a spinner.
 #[tauri::command]
-#[allow(dead_code)] // LEGACY: retained as escape hatch; prefer begin_claude_login + submit_oauth_code
 pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
     let base = std::path::PathBuf::from(&base_dir);

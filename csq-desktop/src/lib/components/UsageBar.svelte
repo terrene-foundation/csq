@@ -13,7 +13,7 @@
   <div class="bar-track">
     <div class="bar-fill" style="width: {Math.min(pct, 100)}%; background: {color}"></div>
   </div>
-  <span class="pct">{Math.round(pct)}%</span>
+  <span class="pct">{pct > 0 && pct < 1 ? '<1' : Math.round(pct)}%</span>
 </div>
 
 <style>

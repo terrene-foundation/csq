@@ -9,9 +9,50 @@ use std::path::Path;
 use tracing::{debug, warn};
 
 /// Items that are **shared** across all terminals — symlinked back to `~/.claude`.
+///
+/// This list must cover everything CC reads/writes under `CLAUDE_CONFIG_DIR`
+/// that is NOT account-specific. Missing items here = broken features in
+/// handle-dir terminals (e.g. missing `projects` = can't `--resume`).
 pub const SHARED_ITEMS: &[&str] = &[
-    "history", "sessions", "commands", "skills", "agents", "rules", "mcp", "plugins", "snippets",
+    // Conversation + session data
+    "projects",
+    "sessions",
+    "history",
+    "history.jsonl",
+    // User customization
+    "commands",
+    "skills",
+    "agents",
+    "rules",
+    "snippets",
+    // Infrastructure
+    "mcp",
+    "plugins",
     "todos",
+    "tasks",
+    "plans",
+    "teams",
+    // CC internals that must be shared
+    "statsig",
+    "telemetry",
+    "cache",
+    "checkpoints",
+    "ide",
+    "chrome",
+    "usage-data",
+    "paste-cache",
+    "shell-snapshots",
+    "file-history",
+    "downloads",
+    "backups",
+    "debug",
+    "session-env",
+    "keybindings.json",
+    "settings.local.json",
+    "settings-default.json",
+    "__store.db",
+    "stats-cache.json",
+    "kailash-learning",
 ];
 
 /// Items that are **isolated** per terminal — never linked, per-config copies.

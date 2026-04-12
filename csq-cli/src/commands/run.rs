@@ -74,11 +74,13 @@ pub fn handle(
     }
 
     // Create ephemeral handle dir: term-<pid> with symlinks to config-N
+    // for credentials and ~/.claude for shared items. CC checks CWD
+    // (not CLAUDE_CONFIG_DIR) for session identity, so handle dirs
+    // are compatible with --resume as long as the CWD matches.
     let pid = std::process::id();
     let handle_dir = session::create_handle_dir(base_dir, &claude_home, account, pid)
         .context("failed to create handle dir")?;
 
-    // Convert to absolute path (spec 03 requires it)
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
 
     println!("Launching claude for account {} (term-{})...", account, pid);
@@ -101,7 +103,6 @@ pub fn handle(
     #[cfg(not(unix))]
     {
         let status = cmd.status();
-        // Always clean up handle dir on Windows (we wait for claude to exit)
         let _ = std::fs::remove_dir_all(&handle_dir);
         match status {
             Ok(s) if !s.success() => std::process::exit(s.code().unwrap_or(1)),

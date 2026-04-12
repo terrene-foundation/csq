@@ -108,6 +108,23 @@ fn local_app_data() -> Option<PathBuf> {
     }
 }
 
+/// Returns the Windows named-pipe name for the daemon.
+///
+/// This is a typed alias for [`socket_path`] that makes Windows-specific
+/// call sites self-documenting. On Windows, `socket_path` already returns
+/// a named-pipe path; this function makes the intent explicit.
+///
+/// # Example
+///
+/// ```ignore
+/// let name = pipe_name(base_dir).to_string_lossy().into_owned();
+/// // name == r"\\.\pipe\csq-alice"
+/// ```
+#[cfg(target_os = "windows")]
+pub fn pipe_name(base_dir: &Path) -> PathBuf {
+    socket_path(base_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +171,34 @@ mod tests {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_pipe_name_format() {
+        let base = Path::new(r"C:\Users\testuser\AppData\Local\csq");
+        // Override USERNAME so the test is deterministic.
+        std::env::set_var("USERNAME", "testuser");
+        let p = pipe_name(base);
+        let s = p.to_string_lossy();
+        assert!(s.starts_with(r"\\.\pipe\csq-"), "unexpected pipe name: {s}");
+        assert!(
+            s.contains("testuser"),
+            "pipe name should contain username: {s}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_socket_path_is_pipe() {
+        let base = Path::new(r"C:\Users\testuser\AppData\Local\csq");
+        std::env::set_var("USERNAME", "winuser");
+        let p = socket_path(base);
+        let s = p.to_string_lossy();
+        assert!(
+            s.starts_with(r"\\.\pipe\"),
+            "Windows socket_path should be a named pipe: {s}"
+        );
     }
 
     #[cfg(target_os = "linux")]

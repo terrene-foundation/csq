@@ -23,39 +23,55 @@ Multi-provider session manager for Claude Code. Run Claude Code against local mo
 
 ## Install
 
-### From source (recommended for developers)
+csq is currently distributed **source-only** — there are no signed binaries yet. The Terrene Foundation has not provisioned code-signing certificates (Apple Developer ID for macOS, Authenticode for Windows) because the recurring cost is not yet justified for an alpha release. Build from source takes 2–5 minutes on a modern machine.
+
+Prebuilt signed releases will ship when signing is funded. Track progress at [GitHub Releases](https://github.com/terrene-foundation/csq/releases).
+
+### Prerequisites
+
+- **Rust** 1.89+ — install via [rustup.rs](https://rustup.rs)
+- **Claude Code** — install via [docs.anthropic.com/en/docs/claude-code](https://docs.anthropic.com/en/docs/claude-code)
+- **Node.js** 18+ — only required if building the desktop app
+
+### CLI
 
 ```bash
 git clone https://github.com/terrene-foundation/csq.git
 cd csq
-cargo install --path csq-cli
+cargo build --release -p csq-cli
+cp target/release/csq ~/.local/bin/csq    # or anywhere on your $PATH
 ```
 
-### Shell installer (non-developers)
+Verify the install:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
+csq --version    # should print: csq 2.0.0-alpha.2
+csq doctor       # runs diagnostics
 ```
-
-Or clone and run locally:
-
-```bash
-git clone https://github.com/terrene-foundation/csq.git
-cd csq
-bash install.sh
-```
-
-The installer auto-detects your platform (macOS / Linux / WSL / Git Bash) and configures credential storage.
 
 ### Desktop app
 
 ```bash
-cd csq-desktop
+git clone https://github.com/terrene-foundation/csq.git    # skip if already cloned
+cd csq/csq-desktop
 npm install
-npm run tauri build
+npx @tauri-apps/cli build
 ```
 
-The built app is in `csq-desktop/src-tauri/target/release/bundle/`. For development: `npm run tauri dev`.
+The built app lands at `target/release/bundle/<platform>/Code Session Quota.app` (macOS) / `.AppImage` (Linux) / `.msi` (Windows).
+
+**macOS first launch:** the app is unsigned, so Gatekeeper will block it. Right-click the `.app` in Finder, choose "Open", then click "Open" in the warning dialog. After the first run macOS remembers your choice.
+
+**Windows first launch:** SmartScreen will show "Windows protected your PC". Click "More info" → "Run anyway". SmartScreen remembers after the first run.
+
+**Linux:** no warnings; the AppImage runs as-is.
+
+### Development mode
+
+```bash
+cd csq-desktop && npx @tauri-apps/cli dev    # hot-reload desktop
+cargo run -p csq-cli -- run 1                # run CLI from source without install
+```
 
 ## Using local models (Ollama)
 
@@ -449,7 +465,7 @@ rm -rf ~/.claude/accounts
 ## Development
 
 ```bash
-cargo test --workspace              # 594 Rust tests
+cargo test --workspace              # 646 Rust tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cd csq-desktop && npm run tauri dev # desktop dev mode

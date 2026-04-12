@@ -362,23 +362,12 @@ pub(crate) async fn tick(
     debug!(processed, skipped_cooldown, "refresher tick complete");
 }
 
-/// Returns a short, fixed-cardinality tag for a `CsqError` variant.
-/// Used in place of `%e` in warn logs so error messages from
-/// upstream (serde_json parse errors, reqwest error chains) cannot
-/// leak token fragments through the log pipeline. The tag is stable
-/// across variant additions — new variants default to "other".
-fn error_kind_tag(e: &crate::error::CsqError) -> &'static str {
-    use crate::error::CsqError;
-    match e {
-        CsqError::Credential(_) => "credential",
-        CsqError::Platform(_) => "platform",
-        CsqError::Broker(_) => "broker",
-        CsqError::OAuth(_) => "oauth",
-        CsqError::Daemon(_) => "daemon",
-        CsqError::Config(_) => "config",
-        CsqError::Other(_) => "other",
-    }
-}
+/// Re-export of the shared `error_kind_tag` so the refresher's
+/// warn-log call site keeps its local name. The function itself
+/// lives in `crate::error` so every subsystem uses the same
+/// vocabulary (logs, broker-failed flag files, dashboard error
+/// column all agree on what "broker_token_invalid" means).
+use crate::error::error_kind_tag;
 
 fn in_cooldown(cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>, account: u16) -> bool {
     let guard = cooldowns.lock().expect("cooldown lock poisoned");

@@ -44,12 +44,56 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// How often the supervisor wakes up to re-check the daemon state
-/// when another daemon owns the PID file. 60s matches the cadence
-/// of the tray menu refresh and is far below the 5-minute refresh
-/// interval, so a takeover never delays a refresh tick by more than
-/// one cycle.
-const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Minimum wait between failed takeover attempts. Short enough
+/// that a crashing external daemon doesn't starve csq for minutes
+/// before our supervisor catches the gap.
+const BACKOFF_MIN: Duration = Duration::from_secs(1);
+
+/// Maximum wait between failed takeover attempts. 60s keeps the
+/// loop from hot-spinning under pathological contention (e.g. two
+/// csq apps racing each other to own the same PidFile) while also
+/// being well below the 5-minute refresh interval.
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Supervisor backoff state. Starts at [`BACKOFF_MIN`], doubles on
+/// each failed attempt, caps at [`BACKOFF_MAX`], resets to
+/// `BACKOFF_MIN` whenever the supervisor successfully takes over.
+///
+/// Addresses journal 0026 design question 1: the fixed 60s poll
+/// burns a full minute of refresh downtime every time an external
+/// daemon crashes, and hot-loops under pathological contention.
+/// Exponential backoff gives instant recovery in the common case
+/// (1s) while bounding the worst case (60s).
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    current: Duration,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self {
+            current: BACKOFF_MIN,
+        }
+    }
+
+    fn current(&self) -> Duration {
+        self.current
+    }
+
+    /// Doubles the wait up to [`BACKOFF_MAX`]. Call after a failed
+    /// attempt before the next retry.
+    fn bump(&mut self) {
+        let next = self.current.saturating_mul(2);
+        self.current = std::cmp::min(next, BACKOFF_MAX);
+    }
+
+    /// Resets to [`BACKOFF_MIN`]. Call whenever the supervisor
+    /// successfully owns the daemon (so the next failure recovers
+    /// instantly instead of inheriting the previous backoff).
+    fn reset(&mut self) {
+        self.current = BACKOFF_MIN;
+    }
+}
 
 /// Top-level handle returned to the Tauri setup() hook. Owns the
 /// shutdown token; dropping it does **not** stop the daemon — call
@@ -89,8 +133,19 @@ pub fn start(base_dir: PathBuf) -> SupervisorHandle {
 
 /// Supervisor main loop. Owns the lifetime of the in-process daemon
 /// across crashes and external-daemon contention.
+///
+/// Backoff semantics:
+/// - Cold start: `BACKOFF_MIN` (1s)
+/// - On each failed takeover attempt: double the wait, cap at
+///   `BACKOFF_MAX` (60s)
+/// - On each successful takeover (PidFile acquired, subsystems
+///   spawned): reset to `BACKOFF_MIN` so the next failure recovers
+///   instantly
+/// - On clean daemon exit (we owned it, cancellation not fired):
+///   stay at the reset value and retry after 5s
 async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
     log::info!("daemon supervisor starting");
+    let mut backoff = Backoff::new();
     loop {
         // ── 1. Detect current state ──────────────────────────────
         //
@@ -100,19 +155,27 @@ async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
         // struggling; back off so we don't race it).
         match detect_daemon(&base_dir) {
             DetectResult::Healthy { pid, .. } => {
-                log::debug!("external daemon already running (PID {pid}); deferring");
+                log::debug!(
+                    "external daemon already running (PID {pid}); deferring {:?}",
+                    backoff.current()
+                );
                 // Wait and re-poll. If the external daemon dies, the
                 // next detect returns NotRunning/Stale and we take over.
-                if wait_or_cancelled(&cancel, SUPERVISOR_POLL_INTERVAL).await {
+                if wait_or_cancelled(&cancel, backoff.current()).await {
                     return;
                 }
+                backoff.bump();
                 continue;
             }
             DetectResult::Unhealthy { reason } => {
-                log::warn!("existing daemon is unhealthy ({reason}); deferring");
-                if wait_or_cancelled(&cancel, SUPERVISOR_POLL_INTERVAL).await {
+                log::warn!(
+                    "existing daemon is unhealthy ({reason}); deferring {:?}",
+                    backoff.current()
+                );
+                if wait_or_cancelled(&cancel, backoff.current()).await {
                     return;
                 }
+                backoff.bump();
                 continue;
             }
             DetectResult::Stale { reason } => {
@@ -131,18 +194,30 @@ async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
             Ok(f) => f,
             Err(e) => {
                 // Race: another process grabbed the PidFile between
-                // our detect call and our acquire call. Back off and
-                // let the supervisor loop observe it on the next
-                // iteration.
-                log::debug!("PidFile::acquire failed ({e}); another daemon raced us");
-                if wait_or_cancelled(&cancel, SUPERVISOR_POLL_INTERVAL).await {
+                // our detect call and our acquire call. Back off
+                // exponentially and let the loop observe next
+                // iteration. Protects against hot-loops when two
+                // csq apps fight over the same account dir.
+                log::debug!(
+                    "PidFile::acquire failed ({e}); another daemon raced us; backing off {:?}",
+                    backoff.current()
+                );
+                if wait_or_cancelled(&cancel, backoff.current()).await {
                     return;
                 }
+                backoff.bump();
                 continue;
             }
         };
 
-        // ── 3. Run one daemon instance until it exits ────────────
+        // ── 3. Successfully owning the daemon — reset backoff ────
+        //
+        // Any future failure (subsystem crash, next takeover
+        // attempt) starts from BACKOFF_MIN again so we recover
+        // instantly in the common case.
+        backoff.reset();
+
+        // ── 4. Run one daemon instance until it exits ────────────
         //
         // `run_daemon` binds the socket, spawns subsystems, waits
         // for either cancellation or a subsystem failure, then
@@ -158,10 +233,14 @@ async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
         // If the outer cancel fired during run_daemon, exit the
         // supervisor loop. Otherwise, the daemon exited for some
         // internal reason and we should retry after a short wait.
+        // `BACKOFF_MIN` is the right delay here — we just cleanly
+        // released the lock, so the next iteration should try
+        // again almost immediately rather than inherit a stale
+        // exponential wait from before the takeover.
         if cancel.is_cancelled() {
             return;
         }
-        if wait_or_cancelled(&cancel, Duration::from_secs(5)).await {
+        if wait_or_cancelled(&cancel, BACKOFF_MIN).await {
             return;
         }
     }
@@ -261,8 +340,8 @@ async fn run_daemon(
 }
 
 /// Windows stub — the csq daemon has no named-pipe backend yet
-/// (M8-03). The supervisor loop will just sit on
-/// `SUPERVISOR_POLL_INTERVAL` waiting for cancellation.
+/// (M8-03). The supervisor loop will just sit on the backoff wait
+/// until cancellation fires.
 #[cfg(not(unix))]
 async fn run_daemon(
     _base_dir: &std::path::Path,
@@ -271,4 +350,61 @@ async fn run_daemon(
     log::warn!("in-process daemon not supported on this platform (M8-03 Windows IPC pending)");
     outer_cancel.cancelled().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_starts_at_min() {
+        let b = Backoff::new();
+        assert_eq!(b.current(), BACKOFF_MIN);
+    }
+
+    #[test]
+    fn backoff_doubles_on_bump() {
+        let mut b = Backoff::new();
+        assert_eq!(b.current(), Duration::from_secs(1));
+        b.bump();
+        assert_eq!(b.current(), Duration::from_secs(2));
+        b.bump();
+        assert_eq!(b.current(), Duration::from_secs(4));
+        b.bump();
+        assert_eq!(b.current(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        let mut b = Backoff::new();
+        // Hammer it 20 times — way past the cap.
+        for _ in 0..20 {
+            b.bump();
+        }
+        assert_eq!(b.current(), BACKOFF_MAX);
+    }
+
+    #[test]
+    fn backoff_reset_drops_to_min() {
+        let mut b = Backoff::new();
+        b.bump();
+        b.bump();
+        b.bump();
+        assert!(b.current() > BACKOFF_MIN);
+        b.reset();
+        assert_eq!(b.current(), BACKOFF_MIN);
+    }
+
+    #[test]
+    fn backoff_saturates_on_overflow() {
+        // Guard against u128 overflow in Duration multiplication.
+        // Doubling a 60s Duration once is 120s; capping to 60s means
+        // we never get near overflow in practice — the saturating
+        // mul is defense in depth.
+        let mut b = Backoff::new();
+        for _ in 0..100 {
+            b.bump();
+        }
+        assert_eq!(b.current(), BACKOFF_MAX);
+    }
 }

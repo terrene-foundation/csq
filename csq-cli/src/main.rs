@@ -98,11 +98,37 @@ enum Command {
         action: DaemonCmd,
     },
 
+    /// Check for newer csq releases on GitHub
+    Update {
+        #[command(subcommand)]
+        action: UpdateCmd,
+    },
+
+    /// Repair cross-slot credential contamination
+    ///
+    /// Detects when multiple OAuth slots share the same refresh
+    /// token (happens after a fanout/rotation bug) and reports the
+    /// affected slots. Does not modify files — use the output to
+    /// decide which slots to re-authenticate.
+    RepairCredentials {
+        /// Actually delete the contaminated canonical files,
+        /// forcing re-login on next use. Off by default (dry run).
+        #[arg(long)]
+        apply: bool,
+    },
+
     /// Generate shell completions for bash, zsh, fish, or powershell
     Completions {
         /// Shell to generate completions for
         shell: Shell,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum UpdateCmd {
+    /// Query GitHub Releases and compare to the current version.
+    /// Prints a one-line notice if a newer release is available.
+    Check,
 }
 
 #[derive(Subcommand, Debug)]
@@ -228,6 +254,12 @@ fn main() -> Result<()> {
             DaemonCmd::Stop => commands::daemon::handle_stop(&base_dir),
             DaemonCmd::Status => commands::daemon::handle_status(&base_dir),
         },
+        Command::Update { action } => match action {
+            UpdateCmd::Check => commands::update::check(),
+        },
+        Command::RepairCredentials { apply } => {
+            commands::repair_credentials::handle(&base_dir, apply)
+        }
         Command::Completions { shell } => {
             commands::completions::handle(shell);
             Ok(())

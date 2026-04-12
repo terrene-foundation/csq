@@ -275,7 +275,7 @@ mod tests {
     fn should_report_broker_failed_fresh_flag() {
         let dir = tempfile::TempDir::new().unwrap();
         let account = AccountNum::try_from(2u16).unwrap();
-        crate::broker::fanout::set_broker_failed(dir.path(), account).unwrap();
+        crate::broker::fanout::set_broker_failed(dir.path(), account, "test").unwrap();
         // Fresh flag should be reported
         assert!(should_report_broker_failed(dir.path(), account));
     }

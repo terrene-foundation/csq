@@ -97,13 +97,54 @@ pub fn is_broker_failed(base_dir: &Path, account: AccountNum) -> bool {
     broker_failed_path(base_dir, account).exists()
 }
 
-/// Sets the broker-failed flag for the given account.
-pub fn set_broker_failed(base_dir: &Path, account: AccountNum) -> Result<(), CredentialError> {
+/// Sets the broker-failed flag for the given account with a short
+/// failure reason tag (e.g. `"invalid_grant"`, `"network"`,
+/// `"rate_limit"`). The reason is stored as the file contents so
+/// the dashboard and `csq status` can surface WHY a refresh failed.
+///
+/// ### Why the reason is stored as file contents
+///
+/// The pre-v2.1 behavior was to write an empty file — broker_check
+/// knew something went wrong but couldn't tell users what. That
+/// produced the "why does it say Expired?" UX dead-end that
+/// prompted this change. Adding a small string payload means
+/// `credentials/N.broker-failed` still exists as a flag file (the
+/// existence check stays the same) but now carries enough signal
+/// to diagnose without log archaeology.
+///
+/// ### Security
+///
+/// The `reason` argument is caller-controlled and MUST be a
+/// fixed-vocabulary tag that never contains raw error messages —
+/// token leakage risk. See `error::error_kind_tag` in csq-core for
+/// the canonical enum of safe reason strings.
+pub fn set_broker_failed(
+    base_dir: &Path,
+    account: AccountNum,
+    reason: &str,
+) -> Result<(), CredentialError> {
     let path = broker_failed_path(base_dir, account);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(&path, b"").map_err(|e| CredentialError::Io { path, source: e })
+    // Cap at 256 bytes so a stray bug that shoves a full error
+    // string in here can never bloat the flag file.
+    let payload: String = reason.chars().take(256).collect();
+    std::fs::write(&path, payload.as_bytes()).map_err(|e| CredentialError::Io { path, source: e })
+}
+
+/// Reads the broker-failed reason tag, or `None` if the flag is
+/// not set or the file is unreadable. Used by `commands::
+/// get_accounts` to surface the reason in the dashboard.
+///
+/// Empty-file markers from the pre-v2.1 format are mapped to
+/// `Some("")` so callers can still detect the flag but know the
+/// reason is unknown.
+pub fn read_broker_failed_reason(base_dir: &Path, account: AccountNum) -> Option<String> {
+    let path = broker_failed_path(base_dir, account);
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Clears the broker-failed flag (on successful refresh or login).
@@ -219,10 +260,46 @@ mod tests {
 
         assert!(!is_broker_failed(dir.path(), account));
 
-        set_broker_failed(dir.path(), account).unwrap();
+        set_broker_failed(dir.path(), account, "network").unwrap();
         assert!(is_broker_failed(dir.path(), account));
+        assert_eq!(
+            read_broker_failed_reason(dir.path(), account).as_deref(),
+            Some("network")
+        );
 
         clear_broker_failed(dir.path(), account);
         assert!(!is_broker_failed(dir.path(), account));
+        assert_eq!(read_broker_failed_reason(dir.path(), account), None);
+    }
+
+    #[test]
+    fn broker_failed_reason_is_truncated_at_256_bytes() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(5u16).unwrap();
+        let huge = "a".repeat(10_000);
+        set_broker_failed(dir.path(), account, &huge).unwrap();
+        let read = read_broker_failed_reason(dir.path(), account).unwrap();
+        assert!(
+            read.len() <= 256,
+            "reason must cap at 256 bytes to protect the flag file size"
+        );
+    }
+
+    #[test]
+    fn broker_failed_empty_file_reads_as_empty_reason() {
+        // Pre-v2.1 broker-failed files were zero-byte markers.
+        // `read_broker_failed_reason` should treat them as
+        // `Some("")` so the flag-existence check stays the same
+        // but the reason is just "unknown".
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(6u16).unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("6.broker-failed"), b"").unwrap();
+        assert_eq!(
+            read_broker_failed_reason(dir.path(), account).as_deref(),
+            Some("")
+        );
+        assert!(is_broker_failed(dir.path(), account));
     }
 }

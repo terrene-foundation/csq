@@ -173,8 +173,19 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::list as list_impl;
 
+// The pure Windows env-block parser compiles everywhere so its
+// unit tests run on macOS/Linux CI. The `windows.rs` syscall
+// wrapper that feeds this parser is Windows-only because it
+// depends on `windows-sys` FFI types.
+//
+// `#[allow(dead_code)]` on non-Windows targets because the
+// functions are only called from the syscall wrapper, which is
+// cfg-gated out. Their tests still exercise them on every
+// platform, which is the whole point of splitting them out.
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod windows_parse;
 #[cfg(target_os = "windows")]
 pub use windows::list as list_impl;
 

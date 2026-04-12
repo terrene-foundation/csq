@@ -320,6 +320,29 @@ pub fn get_bearer(
     Ok((status, bytes.to_vec()))
 }
 
+/// GETs a URL with custom headers and returns the response body.
+///
+/// Unlike [`get_bearer`], this does not set an `Authorization`
+/// header — callers that need an API key bearer use `get_bearer`.
+/// Use this for unauthenticated GETs (GitHub Releases API,
+/// provider status pages) that still need a `User-Agent` or
+/// `Accept` header.
+///
+/// The shared `client()` already sets `User-Agent: csq/<version>`
+/// on every request, but callers may override via `headers`.
+///
+/// Returns `Ok(body)` on any HTTP response (including 4xx/5xx).
+/// Returns `Err(String)` only on transport failure.
+pub fn get_with_headers(url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, String> {
+    let mut req = client().get(url);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let response = req.send().map_err(sanitize_err)?;
+    let bytes = response.bytes().map_err(sanitize_err)?;
+    Ok(bytes.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

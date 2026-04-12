@@ -15,6 +15,38 @@
     updated_at: number;
     token_status: string;
     expires_in_secs: number | null;
+    /// Fixed-vocabulary tag from the most recent refresh failure,
+    /// or null if the last refresh succeeded / no flag is set.
+    /// Rendered next to the token status so "Expired" grows a
+    /// "— invalid token" suffix when the refresh token is dead.
+    last_refresh_error: string | null;
+  }
+
+  /// Maps the backend's fixed-vocabulary error tag to human text.
+  /// Keeps the vocabulary stable on the backend while letting the
+  /// UI phrase things idiomatically.
+  function formatRefreshError(tag: string | null): string {
+    if (!tag) return '';
+    switch (tag) {
+      case 'broker_token_invalid':
+        return 'invalid token — re-login needed';
+      case 'broker_refresh_failed':
+        return 'refresh failed — check network or re-login';
+      case 'broker_other':
+        return 'broker error';
+      case 'credential':
+        return 'credential file error';
+      case 'platform':
+        return 'platform error';
+      case 'oauth':
+        return 'oauth error';
+      case 'daemon':
+        return 'daemon error';
+      case 'config':
+        return 'config error';
+      default:
+        return tag; // pass through unknown tags
+    }
   }
 
   let accounts = $state<AccountView[]>([]);
@@ -118,6 +150,11 @@
           <span class="account-label">{account.label}</span>
           <TokenBadge status={account.token_status} expiresSecs={account.expires_in_secs} />
         </div>
+        {#if account.last_refresh_error}
+          <div class="refresh-error" title="Most recent refresh failure tag from the daemon">
+            ⚠ {formatRefreshError(account.last_refresh_error)}
+          </div>
+        {/if}
         <div class="usage-bars">
           <UsageBar label="5h" pct={account.five_hour_pct} />
           <UsageBar label="7d" pct={account.seven_day_pct} />
@@ -164,6 +201,12 @@
   }
   .account-id { font-weight: 700; font-size: 0.85rem; color: var(--text-secondary); }
   .account-label { flex: 1; font-weight: 500; }
+  .refresh-error {
+    font-size: 0.72rem;
+    color: var(--red);
+    font-family: ui-monospace, monospace;
+    margin-top: -0.15rem;
+  }
   .usage-bars { display: flex; gap: 1rem; }
   .loading, .error, .empty { padding: 2rem; text-align: center; }
   .error { color: var(--red); }

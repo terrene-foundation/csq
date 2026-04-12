@@ -187,6 +187,41 @@ impl From<CsqError> for String {
     }
 }
 
+/// Returns a short, fixed-cardinality tag describing a `CsqError`.
+///
+/// Callers use this instead of `Display` for logs, broker-failed
+/// flag files, and dashboard error surfaces — the raw `Display`
+/// chain can contain response-body fragments that may echo tokens
+/// back from upstream (see journal 0010). The tag vocabulary is
+/// stable: adding a new `CsqError` variant defaults to `"other"`
+/// so existing consumers never break.
+///
+/// Returned values (sorted):
+/// - `"broker_refresh_failed"` — canonical refresh + sibling
+///   recovery both failed for a slot
+/// - `"broker_token_invalid"` — upstream rejected the refresh
+///   token (`invalid_grant`), needs re-login
+/// - `"broker_other"` — broker error that isn't the above
+/// - `"config"` — local config file error
+/// - `"credential"` — reading/writing credential file on disk
+/// - `"daemon"` — daemon lifecycle error
+/// - `"oauth"` — OAuth flow error (typically re-login)
+/// - `"other"` — unclassified / anyhow-wrapped
+/// - `"platform"` — platform-specific syscall error
+pub fn error_kind_tag(e: &CsqError) -> &'static str {
+    match e {
+        CsqError::Credential(_) => "credential",
+        CsqError::Platform(_) => "platform",
+        CsqError::Broker(BrokerError::RefreshTokenInvalid { .. }) => "broker_token_invalid",
+        CsqError::Broker(BrokerError::RefreshFailed { .. }) => "broker_refresh_failed",
+        CsqError::Broker(_) => "broker_other",
+        CsqError::OAuth(_) => "oauth",
+        CsqError::Daemon(_) => "daemon",
+        CsqError::Config(_) => "config",
+        CsqError::Other(_) => "other",
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum CredentialError {
     #[error("credential file not found: {path}")]

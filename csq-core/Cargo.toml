@@ -31,5 +31,19 @@ libc.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true
 
+# Windows-only: low-level syscalls for session discovery (PEB
+# walking via NtQueryInformationProcess + ReadProcessMemory). The
+# `windows-sys` crate is a thin set of FFI bindings and is the same
+# dependency `tauri` and `tokio` already pull in on Windows, so no
+# new transitive graph.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true

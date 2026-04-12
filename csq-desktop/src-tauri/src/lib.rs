@@ -20,19 +20,31 @@ use daemon_supervisor::SupervisorHandle;
 // ── Tray icon assets ──────────────────────────────────────
 //
 // Compile-time embed of the three tray icon variants generated
-// from the Terrene Foundation TF monogram favicon. Retina (@2x)
-// variants are embedded alongside the 1x variants; Tauri's
-// `set_icon` picks one or the other based on the current display.
+// from the Terrene Foundation TF monogram favicon. We ship the
+// **@2x (64x64) PNGs** as the canonical tray icon and let macOS
+// AppKit downscale to the menu bar height with its high-quality
+// filter. Sampling 22 logical points from a 64-pixel source
+// produces a visibly crisper result on retina displays than
+// starting from a 32-pixel source — the downscale path preserves
+// more edge detail than the upscale path does.
+//
+// Tauri's `Image::from_bytes` decodes RGBA at the encoded pixel
+// dimensions and reports that as the logical size. AppKit's
+// NSImage then scales it to the tray slot. If Tauri ever exposes
+// an NSImage representation-list API (multiple `NSBitmapImageRep`
+// instances sharing a single NSImage), we can pass both the 32
+// and 64 PNGs and AppKit will pick the best fit per display —
+// for now, 64-source-with-downscale is the best we can do with
+// the single-Image API.
 //
 // Normal is a white/near-white glyph with transparency — loaded as
 // a template image on macOS so the OS auto-inverts for dark vs
 // light menu bars. Warn and error are full-color (amber / red) and
 // are NOT template images, because the whole point is that the
 // color communicates the state.
-const TRAY_NORMAL_PNG: &[u8] = include_bytes!("../icons/tray-normal.png");
-const TRAY_NORMAL_PNG_2X: &[u8] = include_bytes!("../icons/tray-normal@2x.png");
-const TRAY_WARN_PNG: &[u8] = include_bytes!("../icons/tray-warn.png");
-const TRAY_ERROR_PNG: &[u8] = include_bytes!("../icons/tray-error.png");
+const TRAY_NORMAL_PNG: &[u8] = include_bytes!("../icons/tray-normal@2x.png");
+const TRAY_WARN_PNG: &[u8] = include_bytes!("../icons/tray-warn@2x.png");
+const TRAY_ERROR_PNG: &[u8] = include_bytes!("../icons/tray-error@2x.png");
 
 /// Which tray icon to show for a given `TrayHealth` rollup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,11 +58,8 @@ enum TrayIconKind {
 }
 
 impl TrayIconKind {
-    /// Returns the packed PNG bytes for this variant. We always
-    /// ship the 1x bytes to Tauri — the compiled-in `@2x` variant is
-    /// reserved for the upcoming macOS NSImage double-representation
-    /// wiring (currently embedded but unused to keep the surface
-    /// minimal; see the TODO in `apply_tray_icon`).
+    /// Returns the packed PNG bytes for this variant (64x64
+    /// source, for retina-friendly downscaling).
     fn bytes(self) -> &'static [u8] {
         match self {
             TrayIconKind::Normal => TRAY_NORMAL_PNG,
@@ -66,13 +75,6 @@ impl TrayIconKind {
         matches!(self, TrayIconKind::Normal)
     }
 }
-
-// Suppress dead-code on the retina variant until it's wired into
-// a macOS NSImage double-rep (open question: whether Tauri's
-// TrayIcon will accept a pre-scaled 2x bitmap or whether we'd need
-// to drop through to the raw `NSImage` via `objc2`).
-#[allow(dead_code)]
-const _: &[u8] = TRAY_NORMAL_PNG_2X;
 
 /// State shared with Tauri commands.
 ///

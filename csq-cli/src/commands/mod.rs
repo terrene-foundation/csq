@@ -7,6 +7,7 @@ pub mod install;
 pub mod listkeys;
 pub mod login;
 pub mod models;
+pub mod repair_credentials;
 pub mod rmkey;
 pub mod run;
 pub mod setkey;
@@ -14,6 +15,7 @@ pub mod status;
 pub mod statusline;
 pub mod suggest;
 pub mod swap;
+pub mod update;
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};

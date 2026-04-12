@@ -15,6 +15,8 @@ use super::{parse_term_session_id, SessionInfo};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Returns the list of live CC sessions for the current user.
 pub fn list() -> Vec<SessionInfo> {
@@ -27,21 +29,75 @@ pub fn list() -> Vec<SessionInfo> {
     };
     let text = String::from_utf8_lossy(&output);
 
-    // Resolve iTerm2 tab titles keyed by TTY once per `list()` call.
-    // `osascript` is ~50ms so we pay it once and join by TTY below.
-    // An empty map is fine — the title column just shows blank.
-    let tab_titles = read_iterm_tab_titles_by_tty();
+    // Resolve iTerm2 window + session titles keyed by TTY. Uses a
+    // 10s cache so consecutive polls don't each pay the osascript
+    // cost. Empty map when iTerm isn't running — the title column
+    // falls through to window/tab indices or TTY.
+    let titles = read_iterm_titles_by_tty();
 
     let mut out = Vec::new();
     for line in text.lines() {
         if let Some(mut info) = parse_ps_line(line) {
             if let Some(ref tty) = info.tty {
-                info.terminal_title = tab_titles.get(tty).cloned();
+                if let Some((window_name, session_name)) = titles.get(tty) {
+                    info.terminal_title = Some(format_terminal_title(window_name, session_name));
+                }
             }
             out.push(info);
         }
     }
     out
+}
+
+/// Combines iTerm's window name and session name into a single
+/// display string. Examples:
+///
+/// - `("✳ terrene", "✳ arbor (claude)")` → `"terrene · arbor"`
+/// - `("✳ Claude Code", "✳ Claude Code (claude)")` → `"Claude Code"`
+///   (collapsed — when window and session are the same, show once)
+/// - `("", "✳ arbor (claude)")` → `"arbor"`
+/// - `("✳ terrene", "")` → `"terrene"`
+///
+/// iTerm prefixes titles with status icons like `✳` (active) or
+/// `⠂` (idle) and appends the current command in parens like
+/// `(claude)`. Both are stripped so the display stays clean.
+pub(crate) fn format_terminal_title(window_name: &str, session_name: &str) -> String {
+    let w = strip_iterm_decorations(window_name);
+    let s = strip_iterm_decorations(session_name);
+    match (w.is_empty(), s.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => w,
+        (true, false) => s,
+        (false, false) if w == s => w,
+        (false, false) => format!("{w} · {s}"),
+    }
+}
+
+/// Strips iTerm2's status-icon prefix (`✳ `, `⠂ `, similar) and the
+/// trailing `(command)` annotation from a title string. Returns
+/// the whitespace-trimmed core.
+fn strip_iterm_decorations(raw: &str) -> String {
+    // Leading status icon: a non-ASCII char followed by a space.
+    // iTerm uses `✳` (U+2733) for active and `⠂` (U+2802 braille)
+    // for idle. We match by "not ASCII letter/digit" as the first
+    // char, then one space.
+    let mut s = raw.trim();
+    let mut chars = s.chars();
+    if let Some(first) = chars.next() {
+        if !first.is_ascii_alphanumeric() {
+            // Check that the next char is a space.
+            if chars.next() == Some(' ') {
+                s = &s[first.len_utf8() + 1..];
+            }
+        }
+    }
+    // Trailing `(foo)` annotation — drop it entirely.
+    if let Some(paren_idx) = s.rfind(" (") {
+        if s.ends_with(')') {
+            s = &s[..paren_idx];
+        }
+    }
+    s.trim().to_string()
 }
 
 /// Parses a single `pid command ENV=...` line.
@@ -133,71 +189,134 @@ fn read_tty(pid: u32) -> Option<String> {
     }
 }
 
-/// Queries iTerm2 via AppleScript for `{TTY → tab title}` pairs.
+/// How long a cached osascript result stays fresh.
 ///
-/// This is a best-effort lookup — if iTerm2 is not running, the
-/// user denies automation permission, or the AppleScript fails for
-/// any reason, we return an empty map and the sessions view just
-/// omits the terminal title column for those rows. The user still
-/// gets TTY + window/tab indices from the env vars.
+/// `list_sessions` polls every 5s from the desktop app, so a 10s
+/// TTL means osascript runs at most every other poll — one
+/// subprocess call per ~10s instead of every 5s. Tab titles and
+/// window names update within that window on the next poll; that's
+/// fast enough for a UX where the user changes tabs and glances
+/// at the dashboard.
 ///
-/// The AppleScript walks every window → tab → session and joins
-/// each session's `tty` to its tab's `name`. Sessions inside the
-/// same tab all get the same title (tabs, not panes, are the unit
-/// users label).
+/// Design question 2 from journal 0026: decided to cache instead
+/// of calling per-poll because `osascript` is ~120ms and doing it
+/// at every list tick burns CPU for stale data.
+const ITERM_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// A resolved `{tty → (window_name, session_name)}` tuple from
+/// the last osascript walk. The outer Option is None on first
+/// call, Some afterwards.
+type IntermediateCache = (HashMap<String, (String, String)>, Instant);
+static ITERM_CACHE: OnceLock<Mutex<Option<IntermediateCache>>> = OnceLock::new();
+
+fn iterm_cache() -> &'static Mutex<Option<IntermediateCache>> {
+    ITERM_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Queries iTerm2 via AppleScript for `{TTY → (window_name,
+/// session_name)}` tuples.
 ///
-/// 1-second timeout on the osascript call so a hung iTerm2 process
-/// can't wedge `list_sessions`.
-fn read_iterm_tab_titles_by_tty() -> HashMap<String, String> {
-    // Cheap process-existence check before shelling out — if
-    // iTerm2 isn't running, the osascript call would produce a
-    // "Can't get application" error and slow down the whole path.
-    let iterm_running = Command::new("pgrep")
-        .args(["-x", "iTerm2"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !iterm_running {
-        return HashMap::new();
+/// Returns the window title (stable per iTerm window) **and** the
+/// session title (changes per-tab, often derived from the running
+/// command). The caller combines them as `"window · session"` for
+/// display so users see e.g. `"terrene · arbor"`.
+///
+/// This is a best-effort lookup. If iTerm2 isn't running, the
+/// user denied automation permission, or AppleScript fails, we
+/// return an empty map and the sessions view falls through to the
+/// env-based tags (`Window N • Tab M`, TTY, etc.).
+///
+/// ### iTerm2 AppleScript gotchas
+///
+/// - `tabs` do NOT have a `name` property directly — querying it
+///   returns `Can't get name of item 1 of every tab (-1728)`. You
+///   must walk into `sessions of tab` and read `name of session`.
+/// - `windows` DO have a `name` property — that's the title you
+///   set in iTerm preferences (or iTerm derives from the active
+///   tab). That's what the user means by "window name".
+///
+/// ### Cache
+///
+/// Each call returns a clone of the cached result if it's under
+/// [`ITERM_CACHE_TTL`] old, otherwise re-runs the osascript and
+/// refreshes the cache. Thread-safe via a mutex; the osascript
+/// invocation happens inside the lock so concurrent callers
+/// coalesce on a single subprocess.
+fn read_iterm_titles_by_tty() -> HashMap<String, (String, String)> {
+    // Serve from cache if fresh.
+    {
+        let guard = iterm_cache().lock().expect("iterm cache lock poisoned");
+        if let Some((map, when)) = guard.as_ref() {
+            if when.elapsed() < ITERM_CACHE_TTL {
+                return map.clone();
+            }
+        }
     }
 
+    // Cache miss — query iTerm2. Note: NO `pgrep` short-circuit
+    // because iTerm2 doesn't run as a process literally named
+    // `iTerm2` (the actual binary name varies by install path),
+    // so `pgrep -x iTerm2` finds nothing even when iTerm is
+    // running. We rely on osascript failing fast (~70ms) when
+    // iTerm isn't running.
+    //
+    // Tabs don't have a `name` property in iTerm's AppleScript
+    // dictionary — querying it errors with `-1728`. We read
+    // `name of session` (tab title) instead, and `name of w`
+    // for the window title.
     const SCRIPT: &str = r#"
         set out to ""
-        tell application "iTerm2"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    set tabName to name of t
-                    repeat with s in sessions of t
-                        set out to out & (tty of s) & "|" & tabName & linefeed
+        try
+            tell application "iTerm2"
+                repeat with w in windows
+                    set winName to name of w
+                    repeat with t in tabs of w
+                        repeat with s in sessions of t
+                            set out to out & (tty of s) & "|" & winName & "|" & (name of s) & linefeed
+                        end repeat
                     end repeat
                 end repeat
-            end repeat
-        end tell
+            end tell
+        on error
+            return ""
+        end try
         return out
     "#;
 
-    // `-e` runs the script inline; two-arg form avoids any shell
-    // metachar concerns.
     let output = Command::new("osascript").args(["-e", SCRIPT]).output();
-
     let output = match output {
         Ok(o) if o.status.success() => o,
-        _ => return HashMap::new(),
+        _ => {
+            // Update cache with empty result so we don't hammer
+            // osascript every poll when iTerm isn't running.
+            let mut guard = iterm_cache().lock().expect("iterm cache lock poisoned");
+            *guard = Some((HashMap::new(), Instant::now()));
+            return HashMap::new();
+        }
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut map = HashMap::new();
     for line in stdout.lines() {
-        // Each line is `<tty>|<tab name>`. iTerm's `tty of session`
-        // returns `/dev/ttys003` — strip the prefix to match `ps
-        // -o tty=` which returns just `ttys003`.
-        if let Some((tty_raw, title)) = line.split_once('|') {
-            let tty = tty_raw.trim().trim_start_matches("/dev/").to_string();
-            let title = title.trim().to_string();
-            if !tty.is_empty() && !title.is_empty() {
-                map.insert(tty, title);
-            }
+        // Each line is `<tty>|<window_name>|<session_name>`.
+        // iTerm returns `/dev/ttys003` for the TTY; strip the
+        // `/dev/` prefix to match `ps -o tty=` output.
+        let parts: Vec<&str> = line.splitn(3, '|').collect();
+        if parts.len() != 3 {
+            continue;
         }
+        let tty = parts[0].trim().trim_start_matches("/dev/").to_string();
+        let window_name = parts[1].trim().to_string();
+        let session_name = parts[2].trim().to_string();
+        if !tty.is_empty() {
+            map.insert(tty, (window_name, session_name));
+        }
+    }
+
+    // Store in cache for the next call.
+    {
+        let mut guard = iterm_cache().lock().expect("iterm cache lock poisoned");
+        *guard = Some((map.clone(), Instant::now()));
     }
     map
 }
@@ -465,5 +584,63 @@ mod tests {
         assert_eq!(info.term_tab, None);
         assert_eq!(info.term_pane, None);
         assert_eq!(info.iterm_profile, None);
+    }
+
+    // ── format_terminal_title + decorations ────────────────
+
+    #[test]
+    fn strip_iterm_decorations_removes_status_icon() {
+        assert_eq!(strip_iterm_decorations("✳ terrene"), "terrene");
+        assert_eq!(strip_iterm_decorations("⠂ Claude Code"), "Claude Code");
+    }
+
+    #[test]
+    fn strip_iterm_decorations_removes_trailing_command() {
+        assert_eq!(strip_iterm_decorations("✳ arbor (claude)"), "arbor");
+        assert_eq!(
+            strip_iterm_decorations("✳ Claude Code (node)"),
+            "Claude Code"
+        );
+    }
+
+    #[test]
+    fn strip_iterm_decorations_leaves_plain_titles_intact() {
+        assert_eq!(strip_iterm_decorations("Plain title"), "Plain title");
+    }
+
+    #[test]
+    fn strip_iterm_decorations_handles_empty() {
+        assert_eq!(strip_iterm_decorations(""), "");
+        assert_eq!(strip_iterm_decorations("   "), "");
+    }
+
+    #[test]
+    fn format_terminal_title_window_and_session() {
+        // User's canonical case: window "terrene", session "arbor".
+        let out = format_terminal_title("✳ terrene", "✳ arbor (claude)");
+        assert_eq!(out, "terrene · arbor");
+    }
+
+    #[test]
+    fn format_terminal_title_collapses_when_identical() {
+        // iTerm often propagates the tab title up to the window
+        // title. When both are the same we show once, not twice.
+        let out = format_terminal_title("✳ Claude Code", "✳ Claude Code (claude)");
+        assert_eq!(out, "Claude Code");
+    }
+
+    #[test]
+    fn format_terminal_title_window_only() {
+        assert_eq!(format_terminal_title("✳ terrene", ""), "terrene");
+    }
+
+    #[test]
+    fn format_terminal_title_session_only() {
+        assert_eq!(format_terminal_title("", "✳ arbor (claude)"), "arbor");
+    }
+
+    #[test]
+    fn format_terminal_title_both_empty() {
+        assert_eq!(format_terminal_title("", ""), "");
     }
 }

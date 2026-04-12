@@ -94,7 +94,7 @@ where
             drop(guard);
             Ok(BrokerResult::Refreshed)
         }
-        Err(_) => {
+        Err(primary_err) => {
             // Primary refresh failed — attempt recovery from live siblings
             info!(account = %account, "primary refresh failed, attempting recovery");
             match recover_from_siblings(base_dir, account, http_post) {
@@ -103,13 +103,32 @@ where
                     drop(guard);
                     Ok(BrokerResult::Recovered)
                 }
-                Err(e) => {
-                    warn!(account = %account, error = %e, "broker recovery failed");
-                    let _ = fanout::set_broker_failed(base_dir, account);
+                Err(recovery_err) => {
+                    // Log the recovery-error kind so ops can see
+                    // why both paths failed. The raw `e.to_string()`
+                    // of the recovery error still flows into
+                    // BrokerResult::Failed for the HTTP API
+                    // (redacted at the command boundary), but the
+                    // flag file gets a fixed-vocabulary tag so the
+                    // dashboard can render "Expired — <tag>"
+                    // without any risk of token leakage.
+                    let reason_tag = crate::error::error_kind_tag(&recovery_err);
+                    warn!(
+                        account = %account,
+                        error_kind = reason_tag,
+                        "broker recovery failed"
+                    );
+                    let _ = fanout::set_broker_failed(base_dir, account, reason_tag);
                     drop(guard);
+                    // Keep the `reason` field of RefreshFailed as
+                    // the string form of the recovery error — the
+                    // refresher logs this via error_kind_tag too,
+                    // not via Display, so the tight-vocabulary
+                    // contract holds end-to-end.
+                    let _ = primary_err; // not currently surfaced
                     Ok(BrokerResult::Failed(BrokerError::RefreshFailed {
                         account: account.get(),
-                        reason: e.to_string(),
+                        reason: recovery_err.to_string(),
                     }))
                 }
             }
@@ -318,8 +337,12 @@ mod tests {
         credentials::save(&file::canonical_path(dir.path(), account), &creds).unwrap();
 
         // Set flag first
-        fanout::set_broker_failed(dir.path(), account).unwrap();
+        fanout::set_broker_failed(dir.path(), account, "test_reason").unwrap();
         assert!(fanout::is_broker_failed(dir.path(), account));
+        assert_eq!(
+            fanout::read_broker_failed_reason(dir.path(), account).as_deref(),
+            Some("test_reason")
+        );
 
         // Successful refresh clears it
         let result = broker_check(dir.path(), account, mock_refresh_success).unwrap();

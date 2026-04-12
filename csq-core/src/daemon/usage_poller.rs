@@ -585,11 +585,14 @@ pub(crate) async fn tick_3p(
         };
 
         // Load base URL and default model from the provider catalog
-        // as a fallback, then override the base URL with the
-        // per-slot binding's `env.ANTHROPIC_BASE_URL` if set. The
-        // user may be hitting a non-default host (e.g. the
-        // `api.minimax.io` regional shard vs the catalog's
-        // `api.minimax.chat`), and we must respect that.
+        // as a fallback, then override BOTH the base URL and the
+        // model with the per-slot binding's env.* values if set.
+        // The user may be hitting a non-default host (e.g.
+        // `api.minimax.io` vs catalog's `api.minimax.chat`) AND a
+        // non-default model (e.g. `MiniMax-M2.7-highspeed` vs
+        // catalog's `MiniMax-M2`). Both overrides are needed —
+        // probing the catalog model on a retired alias 404s and
+        // leaves the user with no quota data.
         let (catalog_base_url, default_model) =
             match crate::providers::catalog::get_provider(provider_id) {
                 Some(p) => (
@@ -598,11 +601,15 @@ pub(crate) async fn tick_3p(
                 ),
                 None => continue,
             };
-        let base_url_owned = if info.id < 900 {
-            load_3p_base_url_for_slot(base_dir, info.id)
-                .unwrap_or_else(|| catalog_base_url.to_string())
+        let (base_url_owned, model_owned) = if info.id < 900 {
+            (
+                load_3p_base_url_for_slot(base_dir, info.id)
+                    .unwrap_or_else(|| catalog_base_url.to_string()),
+                load_3p_model_for_slot(base_dir, info.id)
+                    .unwrap_or_else(|| default_model.to_string()),
+            )
         } else {
-            catalog_base_url.to_string()
+            (catalog_base_url.to_string(), default_model.to_string())
         };
 
         // Poll in spawn_blocking (blocking HTTP client).
@@ -610,7 +617,7 @@ pub(crate) async fn tick_3p(
         // for the duration of the blocking probe.
         let http = Arc::clone(http_post_probe);
         let url = format!("{}/v1/messages", base_url_owned);
-        let model = default_model.to_string();
+        let model = model_owned;
         let raw_key = api_key.expose_secret().to_string();
         let poll_result =
             tokio::task::spawn_blocking(move || poll_3p_usage(&url, &raw_key, &model, &http)).await;
@@ -712,14 +719,47 @@ fn load_3p_api_key_for_slot(
 /// missing or the field is not set, letting the caller fall back
 /// to the provider catalog default.
 fn load_3p_base_url_for_slot(base_dir: &std::path::Path, slot: u16) -> Option<String> {
+    load_3p_env_string_for_slot(base_dir, slot, "ANTHROPIC_BASE_URL")
+}
+
+/// Reads the `env.ANTHROPIC_MODEL` override from a per-slot
+/// `config-<slot>/settings.json`. Returns `None` when missing.
+///
+/// ### Why the probe model must match the user's configured model
+///
+/// Journal 0026 design question 3: the catalog default is
+/// `MiniMax-M2`, but the user's actual `config-9/settings.json`
+/// says `ANTHROPIC_MODEL=MiniMax-M2.7-highspeed`. If the poller
+/// probes with the catalog default, the probe either:
+///
+/// 1. Succeeds against a model the user doesn't actually use,
+///    producing rate-limit headers that reflect the wrong tier
+///    (e.g. M2 has different quotas than M2.7), or
+/// 2. Fails with 404 when MiniMax retires M2 (already likely
+///    given the M2.7 rollout), leaving the user with no quota
+///    data at all.
+///
+/// Reading `ANTHROPIC_MODEL` from the same settings.json the user
+/// configured means the probe always matches what the user's
+/// actual terminal session runs — and when the user upgrades to a
+/// new model in iTerm, the poller follows automatically on the
+/// next tick without a csq code change.
+fn load_3p_model_for_slot(base_dir: &std::path::Path, slot: u16) -> Option<String> {
+    load_3p_env_string_for_slot(base_dir, slot, "ANTHROPIC_MODEL")
+}
+
+/// Generic helper: reads a single string value from
+/// `env.<key>` in a per-slot `config-<slot>/settings.json`.
+/// Accepts the top-level `<key>` as a legacy fallback.
+fn load_3p_env_string_for_slot(base_dir: &std::path::Path, slot: u16, key: &str) -> Option<String> {
     let path = base_dir
         .join(format!("config-{slot}"))
         .join("settings.json");
     let content = std::fs::read_to_string(&path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     json.get("env")
-        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
-        .or_else(|| json.get("ANTHROPIC_BASE_URL"))
+        .and_then(|e| e.get(key))
+        .or_else(|| json.get(key))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
@@ -1635,5 +1675,48 @@ mod tests {
             load_3p_base_url_for_slot(tmp.path(), 9).unwrap(),
             "https://api.minimax.io/anthropic"
         );
+    }
+
+    // ── load_3p_model_for_slot (design Q3) ─────────────────
+
+    /// Writes a per-slot settings.json with a custom ANTHROPIC_MODEL.
+    fn write_slot_settings_with_model(base: &std::path::Path, slot: u16, model: &str) {
+        let dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"https://api.minimax.io/anthropic","ANTHROPIC_AUTH_TOKEN":"tok","ANTHROPIC_MODEL":"{model}"}}}}"#
+        );
+        std::fs::write(dir.join("settings.json"), json).unwrap();
+    }
+
+    #[test]
+    fn load_3p_model_for_slot_reads_per_slot_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_slot_settings_with_model(tmp.path(), 9, "MiniMax-M2.7-highspeed");
+        assert_eq!(
+            load_3p_model_for_slot(tmp.path(), 9).unwrap(),
+            "MiniMax-M2.7-highspeed"
+        );
+    }
+
+    #[test]
+    fn load_3p_model_for_slot_returns_none_when_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Settings with no ANTHROPIC_MODEL field.
+        write_slot_settings(tmp.path(), 10, "https://api.z.ai/api/anthropic", "tok");
+        assert!(load_3p_model_for_slot(tmp.path(), 10).is_none());
+    }
+
+    #[test]
+    fn load_3p_model_for_slot_returns_none_on_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(load_3p_model_for_slot(tmp.path(), 7).is_none());
+    }
+
+    #[test]
+    fn load_3p_model_for_slot_handles_glm_model_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_slot_settings_with_model(tmp.path(), 10, "glm-5.1");
+        assert_eq!(load_3p_model_for_slot(tmp.path(), 10).unwrap(), "glm-5.1");
     }
 }

@@ -36,6 +36,15 @@ pub struct AccountView {
     pub token_status: String,
     /// Seconds until token expires. Negative = expired N seconds ago.
     pub expires_in_secs: Option<i64>,
+    /// Fixed-vocabulary tag for the most recent refresh failure,
+    /// or null if the last refresh succeeded / there's no flag.
+    /// Possible values: "broker_token_invalid" (needs re-login),
+    /// "broker_refresh_failed" (refresh + sibling recovery both
+    /// failed), "credential" / "config" / "platform" / "other".
+    /// The dashboard joins this to the status to render e.g.
+    /// "Expired — invalid token" so users know WHY a slot is
+    /// stuck, not just that it is.
+    pub last_refresh_error: Option<String>,
 }
 
 /// Daemon status, safe to send over IPC.
@@ -69,28 +78,34 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
         .map(|a| {
             let q = quota.get(a.id);
 
-            // Token health: load credential file and check expiry
-            let (token_status, expires_in_secs) = match AccountNum::try_from(a.id) {
-                Ok(num) => {
-                    let canonical = cred_file::canonical_path(&base, num);
-                    match credentials::load(&canonical) {
-                        Ok(creds) => {
-                            let exp_ms = creds.claude_ai_oauth.expires_at;
-                            let secs = (exp_ms as i64 - now_ms as i64) / 1000;
-                            let status = if secs <= 0 {
-                                "expired"
-                            } else if creds.claude_ai_oauth.is_expired_within(7200) {
-                                "expiring"
-                            } else {
-                                "healthy"
-                            };
-                            (status.to_string(), Some(secs))
+            // Token health: load credential file and check expiry.
+            // Also read the broker-failed flag file for the reason
+            // tag so the dashboard can render "Expired — <tag>".
+            let (token_status, expires_in_secs, last_refresh_error) =
+                match AccountNum::try_from(a.id) {
+                    Ok(num) => {
+                        let canonical = cred_file::canonical_path(&base, num);
+                        let reason =
+                            csq_core::broker::fanout::read_broker_failed_reason(&base, num)
+                                .filter(|s| !s.is_empty());
+                        match credentials::load(&canonical) {
+                            Ok(creds) => {
+                                let exp_ms = creds.claude_ai_oauth.expires_at;
+                                let secs = (exp_ms as i64 - now_ms as i64) / 1000;
+                                let status = if secs <= 0 {
+                                    "expired"
+                                } else if creds.claude_ai_oauth.is_expired_within(7200) {
+                                    "expiring"
+                                } else {
+                                    "healthy"
+                                };
+                                (status.to_string(), Some(secs), reason)
+                            }
+                            Err(_) => ("missing".to_string(), None, reason),
                         }
-                        Err(_) => ("missing".to_string(), None),
                     }
-                }
-                Err(_) => ("missing".to_string(), None),
-            };
+                    Err(_) => ("missing".to_string(), None, None),
+                };
 
             AccountView {
                 id: a.id,
@@ -106,6 +121,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 updated_at: q.map(|q| q.updated_at).unwrap_or(0.0),
                 token_status,
                 expires_in_secs,
+                last_refresh_error,
             }
         })
         .collect();

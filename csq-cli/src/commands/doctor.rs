@@ -8,7 +8,9 @@
 
 use anyhow::Result;
 use csq_core::accounts::discovery;
+use csq_core::credentials::file as cred_file;
 use csq_core::platform::process::is_pid_alive;
+use csq_core::types::AccountNum;
 use serde::Serialize;
 use std::path::Path;
 
@@ -213,7 +215,10 @@ fn check_accounts(base_dir: &Path) -> AccountsInfo {
         if !a.has_credentials {
             continue;
         }
-        let cred_path = base_dir.join("credentials").join(format!("{}.json", a.id));
+        let Ok(num) = AccountNum::try_from(a.id) else {
+            continue;
+        };
+        let cred_path = cred_file::canonical_path(base_dir, num);
         if let Ok(content) = std::fs::read_to_string(&cred_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(exp) = val

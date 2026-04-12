@@ -85,7 +85,11 @@
   $effect(() => {
     if (isOpen) {
       step = { kind: 'picker' };
-      loadProviders();
+      let cancelled = false;
+      (async () => {
+        if (!cancelled) await loadProviders();
+      })();
+      return () => { cancelled = true; };
     }
   });
 
@@ -438,24 +442,6 @@
     font-size: 0.75rem;
     color: var(--text-secondary);
     font-family: ui-monospace, monospace;
-  }
-  .spinner-container {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 1.5rem 0;
-  }
-  .spinner {
-    width: 32px;
-    height: 32px;
-    border: 3px solid var(--border);
-    border-top-color: var(--accent, #7c6ef0);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-  @keyframes spin {
-    to { transform: rotate(360deg); }
   }
   .field {
     display: flex;

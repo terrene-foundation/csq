@@ -614,7 +614,7 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
 /// `redact_tokens`, so it is safe to surface the message to the
 /// frontend and the log.
 #[tauri::command]
-pub fn submit_oauth_code(
+pub async fn submit_oauth_code(
     state: State<'_, AppState>,
     base_dir: String,
     state_token: String,
@@ -637,26 +637,32 @@ pub fn submit_oauth_code(
         .consume(&state_token)
         .map_err(|e| format!("no matching login: {e}"))?;
 
-    // Run the token exchange using reqwest's built-in form encoding.
-    let credential = exchange_code(
-        &code,
-        &pending.code_verifier,
-        PASTE_CODE_REDIRECT_URI,
-        csq_core::http::post_form_params,
-    )
-    .map_err(|e| format!("exchange failed: {e}"))?;
+    // Run the blocking token exchange on a worker thread so we don't
+    // freeze the Tauri event loop during the HTTP call + retries.
+    let base_dir_clone = base_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let credential = exchange_code(
+            &code,
+            &pending.code_verifier,
+            PASTE_CODE_REDIRECT_URI,
+            csq_core::http::post_form_params,
+        )
+        .map_err(|e| format!("exchange failed: {e}"))?;
 
-    // Persist to `credentials/N.json` via the canonical helper
-    // which handles atomic replace + 0o600 permissions.
-    let base = PathBuf::from(&base_dir);
-    if !base.is_dir() {
-        return Err(format!("base directory does not exist: {base_dir}"));
-    }
+        // Persist to `credentials/N.json` via the canonical helper
+        // which handles atomic replace + 0o600 permissions.
+        let base = PathBuf::from(&base_dir_clone);
+        if !base.is_dir() {
+            return Err(format!("base directory does not exist: {base_dir_clone}"));
+        }
 
-    credentials::save_canonical(&base, pending.account, &credential)
-        .map_err(|e| format!("credential write failed: {e}"))?;
+        credentials::save_canonical(&base, pending.account, &credential)
+            .map_err(|e| format!("credential write failed: {e}"))?;
 
-    Ok(pending.account.get())
+        Ok(pending.account.get())
+    })
+    .await
+    .map_err(|e| format!("exchange task failed: {e}"))?
 }
 
 /// Cancels a pending login by consuming its state token from the

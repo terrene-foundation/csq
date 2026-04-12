@@ -63,6 +63,22 @@ pub const RELEASE_PUBLIC_KEY_BYTES: [u8; 32] = [
     0xca, 0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b, 0xf3, 0x74, 0x88, 0x01, 0xb4, 0x0f, 0x6f, 0x5c,
 ];
 
+/// Returns `true` if `RELEASE_PUBLIC_KEY_BYTES` is still the placeholder
+/// test key derived from seed `[1u8; 32]`. When this returns true, binary
+/// verification would accept signatures from anyone who reads the source
+/// code, so `csq update install` MUST refuse to proceed.
+pub fn is_placeholder_key() -> bool {
+    // The placeholder key's first 4 bytes are 0x8a88e3dd. A real
+    // Foundation key will have different bytes. We compare the full
+    // 32 bytes against the known placeholder to be future-proof.
+    const PLACEHOLDER: [u8; 32] = [
+        0x8a, 0x88, 0xe3, 0xdd, 0x74, 0x09, 0xf1, 0x95, 0xfd, 0x52, 0xdb, 0x2d, 0x3c, 0xba, 0x5d,
+        0x72, 0xca, 0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b, 0xf3, 0x74, 0x88, 0x01, 0xb4, 0x0f,
+        0x6f, 0x5c,
+    ];
+    RELEASE_PUBLIC_KEY_BYTES == PLACEHOLDER
+}
+
 /// Verifies an Ed25519 signature over `binary_bytes`.
 ///
 /// `sig_bytes` must be 64 bytes (the serialized Ed25519 signature produced
@@ -93,7 +109,9 @@ pub fn verify_signature(binary_bytes: &[u8], sig_bytes: &[u8]) -> Result<()> {
             sig_bytes.len()
         ));
     }
-    let sig_array: [u8; 64] = sig_bytes.try_into().expect("just checked length == 64");
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("signature byte conversion failed after length check"))?;
     let signature = Signature::from_bytes(&sig_array);
 
     verifying_key

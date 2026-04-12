@@ -8,6 +8,8 @@
   }
 
   let daemonRunning = $state(false);
+  let autostartEnabled = $state(false);
+  let autostartBusy = $state(false);
 
   async function fetchDaemonStatus() {
     try {
@@ -24,8 +26,38 @@
     }
   }
 
+  // ── Launch-on-login toggle ───────────────────────────────
+  //
+  // Reflects whether the csq app is registered to start at OS
+  // login via `tauri-plugin-autostart`. The plugin handles all
+  // three platforms: LaunchAgent on macOS, Run key on Windows,
+  // .desktop file on Linux.
+  async function fetchAutostart() {
+    try {
+      autostartEnabled = await invoke<boolean>('get_autostart_enabled');
+    } catch {
+      autostartEnabled = false;
+    }
+  }
+
+  async function toggleAutostart() {
+    if (autostartBusy) return;
+    autostartBusy = true;
+    const next = !autostartEnabled;
+    try {
+      await invoke('set_autostart_enabled', { enabled: next });
+      autostartEnabled = next;
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('autostart toggle failed:', e);
+    } finally {
+      autostartBusy = false;
+    }
+  }
+
   $effect(() => {
     fetchDaemonStatus();
+    fetchAutostart();
     const interval = setInterval(fetchDaemonStatus, 10000);
     return () => clearInterval(interval);
   });
@@ -36,9 +68,20 @@
     <h1>Claude Squad</h1>
     <span class="version">v2.0.0-alpha</span>
   </div>
-  <div class="status">
-    <span class="dot" class:running={daemonRunning}></span>
-    <span class="label">{daemonRunning ? 'Daemon running' : 'Daemon stopped'}</span>
+  <div class="right">
+    <label class="autostart" title="Start Claude Squad automatically when you log in">
+      <input
+        type="checkbox"
+        checked={autostartEnabled}
+        disabled={autostartBusy}
+        onchange={toggleAutostart}
+      />
+      <span>Launch on login</span>
+    </label>
+    <div class="status">
+      <span class="dot" class:running={daemonRunning}></span>
+      <span class="label">{daemonRunning ? 'Daemon running' : 'Daemon stopped'}</span>
+    </div>
   </div>
 </header>
 
@@ -55,11 +98,32 @@
   .left { display: flex; align-items: center; gap: 0.5rem; }
   h1 { font-size: 0.9rem; font-weight: 600; margin: 0; }
   .version { font-size: 0.75rem; color: var(--text-secondary); }
+  .right {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    -webkit-app-region: no-drag;
+  }
+  .autostart {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+  }
+  .autostart input {
+    cursor: pointer;
+    margin: 0;
+  }
+  .autostart input:disabled {
+    cursor: wait;
+  }
   .status {
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    -webkit-app-region: no-drag;
   }
   .dot {
     width: 7px;

@@ -508,6 +508,17 @@ fn write_usage_to_quota(
 /// Discovers 3P accounts (Z.AI, MiniMax), reads their API keys from
 /// settings files, sends a minimal `max_tokens=1` probe, and extracts
 /// `anthropic-ratelimit-*` headers from the response.
+///
+/// Handles **both** discovery sources:
+/// 1. **Per-slot bindings** — `config-N/settings.json` pointing at a
+///    3P provider. Slot N is the displayed account number (e.g.
+///    slot 9 = MiniMax). API key is read from the same per-slot
+///    file. Quota is written to `quota.json` keyed on slot N so the
+///    dashboard Accounts tab sees it without further plumbing.
+/// 2. **Legacy global** — `settings-mm.json` / `settings-zai.json`
+///    at the base dir level, synthetic slots 901/902. Still
+///    supported for backward compat but suppressed by `discover_all`
+///    when a per-slot binding exists for the same provider.
 pub(crate) async fn tick_3p(
     base_dir: &std::path::Path,
     http_post_probe: &HttpPostProbeFn,
@@ -516,7 +527,12 @@ pub(crate) async fn tick_3p(
 ) {
     debug!("3P usage poller tick starting");
 
-    let accounts = discovery::discover_third_party(base_dir);
+    // `discover_all` returns OAuth + per-slot 3P + legacy global 3P
+    // with de-duplication. We filter to just the 3P rows here.
+    let accounts: Vec<_> = discovery::discover_all(base_dir)
+        .into_iter()
+        .filter(|a| matches!(a.source, AccountSource::ThirdParty { .. }))
+        .collect();
 
     let mut polled = 0usize;
     let mut skipped = 0usize;
@@ -538,33 +554,62 @@ pub(crate) async fn tick_3p(
             continue;
         }
 
-        // Load API key from settings file
-        let api_key = match load_3p_api_key(base_dir, provider_id) {
-            Some(key) => key,
-            None => {
-                debug!(
-                    account = info.id,
-                    provider = provider_id,
-                    "3P poller: no API key found"
-                );
-                continue;
+        // Load API key. For per-slot bindings (info.id < 900) the
+        // canonical source is `config-<info.id>/settings.json`.
+        // For legacy global bindings (info.id >= 900 i.e. 901/902)
+        // fall back to the base-dir-level `settings-{mm,zai}.json`.
+        let api_key = if info.id < 900 {
+            match load_3p_api_key_for_slot(base_dir, info.id, provider_id) {
+                Some(key) => key,
+                None => {
+                    debug!(
+                        account = info.id,
+                        provider = provider_id,
+                        "3P poller: per-slot API key not found"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            match load_3p_api_key(base_dir, provider_id) {
+                Some(key) => key,
+                None => {
+                    debug!(
+                        account = info.id,
+                        provider = provider_id,
+                        "3P poller: global API key not found"
+                    );
+                    continue;
+                }
             }
         };
 
-        // Load base URL and default model from provider catalog
-        let (base_url, default_model) = match crate::providers::catalog::get_provider(provider_id) {
-            Some(p) => (
-                p.default_base_url.unwrap_or("https://api.anthropic.com"),
-                p.default_model,
-            ),
-            None => continue,
+        // Load base URL and default model from the provider catalog
+        // as a fallback, then override the base URL with the
+        // per-slot binding's `env.ANTHROPIC_BASE_URL` if set. The
+        // user may be hitting a non-default host (e.g. the
+        // `api.minimax.io` regional shard vs the catalog's
+        // `api.minimax.chat`), and we must respect that.
+        let (catalog_base_url, default_model) =
+            match crate::providers::catalog::get_provider(provider_id) {
+                Some(p) => (
+                    p.default_base_url.unwrap_or("https://api.anthropic.com"),
+                    p.default_model,
+                ),
+                None => continue,
+            };
+        let base_url_owned = if info.id < 900 {
+            load_3p_base_url_for_slot(base_dir, info.id)
+                .unwrap_or_else(|| catalog_base_url.to_string())
+        } else {
+            catalog_base_url.to_string()
         };
 
         // Poll in spawn_blocking (blocking HTTP client).
         // expose_secret() at the HTTP boundary — raw key lives only
         // for the duration of the blocking probe.
         let http = Arc::clone(http_post_probe);
-        let url = format!("{base_url}/v1/messages");
+        let url = format!("{}/v1/messages", base_url_owned);
         let model = default_model.to_string();
         let raw_key = api_key.expose_secret().to_string();
         let poll_result =
@@ -621,7 +666,8 @@ fn provider_id_from_label(label: &str) -> Option<&'static str> {
     }
 }
 
-/// Loads the API key for a 3P provider from its settings file.
+/// Loads the API key for a 3P provider from its global settings
+/// file (`{base}/settings-{mm,zai}.json`).
 ///
 /// Returns the key wrapped in [`ApiKey`] so the raw value is never
 /// held as a plain `String`. Callers expose at the HTTP boundary
@@ -629,6 +675,53 @@ fn provider_id_from_label(label: &str) -> Option<&'static str> {
 fn load_3p_api_key(base_dir: &std::path::Path, provider_id: &str) -> Option<crate::types::ApiKey> {
     let settings = load_settings(base_dir, provider_id).ok()?;
     settings.get_api_key()
+}
+
+/// Loads the API key for a per-slot 3P provider binding from
+/// `{base}/config-<slot>/settings.json`.
+///
+/// Returns `None` if the file is missing, malformed, or does not
+/// contain `env.ANTHROPIC_AUTH_TOKEN`. The key env var is shared
+/// between MiniMax and Z.AI (both use the same bearer-in-env-var
+/// convention) so the caller's `provider_id` is used only to
+/// validate that the caller's intent matches the catalog — not to
+/// pick a different env var.
+fn load_3p_api_key_for_slot(
+    base_dir: &std::path::Path,
+    slot: u16,
+    _provider_id: &str,
+) -> Option<crate::types::ApiKey> {
+    let path = base_dir
+        .join(format!("config-{slot}"))
+        .join("settings.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // Canonical location is `env.ANTHROPIC_AUTH_TOKEN`; top-level
+    // `ANTHROPIC_AUTH_TOKEN` is a fallback for hand-edited files.
+    let token = json
+        .get("env")
+        .and_then(|e| e.get("ANTHROPIC_AUTH_TOKEN"))
+        .or_else(|| json.get("ANTHROPIC_AUTH_TOKEN"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some(crate::types::ApiKey::new(token.to_string()))
+}
+
+/// Reads the `env.ANTHROPIC_BASE_URL` override from a per-slot
+/// `config-<slot>/settings.json`. Returns `None` when the file is
+/// missing or the field is not set, letting the caller fall back
+/// to the provider catalog default.
+fn load_3p_base_url_for_slot(base_dir: &std::path::Path, slot: u16) -> Option<String> {
+    let path = base_dir
+        .join(format!("config-{slot}"))
+        .join("settings.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .or_else(|| json.get("ANTHROPIC_BASE_URL"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Polls a 3P provider by sending a minimal `max_tokens=1` request.
@@ -1476,5 +1569,71 @@ mod tests {
         let q = qf.get(1).unwrap();
         assert!(q.rate_limits.is_none());
         assert!((q.five_hour_pct() - 42.0).abs() < 0.01);
+    }
+
+    // ── per-slot 3P key / base-url loaders ─────────────────
+
+    fn write_slot_settings(base: &std::path::Path, slot: u16, base_url: &str, token: &str) {
+        let dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"{base_url}","ANTHROPIC_AUTH_TOKEN":"{token}"}}}}"#
+        );
+        std::fs::write(dir.join("settings.json"), json).unwrap();
+    }
+
+    #[test]
+    fn load_3p_api_key_for_slot_reads_per_slot_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_slot_settings(
+            tmp.path(),
+            9,
+            "https://api.minimax.io/anthropic",
+            "tok-mm-9",
+        );
+        let key = load_3p_api_key_for_slot(tmp.path(), 9, "mm").unwrap();
+        assert_eq!(key.expose_secret(), "tok-mm-9");
+    }
+
+    #[test]
+    fn load_3p_api_key_for_slot_returns_none_on_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(load_3p_api_key_for_slot(tmp.path(), 9, "mm").is_none());
+    }
+
+    #[test]
+    fn load_3p_api_key_for_slot_returns_none_on_empty_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Empty string is treated as "not set" — otherwise the
+        // poller would emit 401 for every tick on a stub slot.
+        write_slot_settings(tmp.path(), 9, "https://api.minimax.io/anthropic", "");
+        assert!(load_3p_api_key_for_slot(tmp.path(), 9, "mm").is_none());
+    }
+
+    #[test]
+    fn load_3p_base_url_for_slot_reads_per_slot_url() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_slot_settings(tmp.path(), 10, "https://api.z.ai/api/anthropic", "tok");
+        let url = load_3p_base_url_for_slot(tmp.path(), 10).unwrap();
+        assert_eq!(url, "https://api.z.ai/api/anthropic");
+    }
+
+    #[test]
+    fn load_3p_base_url_for_slot_returns_none_on_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(load_3p_base_url_for_slot(tmp.path(), 7).is_none());
+    }
+
+    #[test]
+    fn load_3p_base_url_for_slot_accepts_non_default_host() {
+        // The user's real setup uses `api.minimax.io`, not the
+        // catalog's `api.minimax.chat`. The loader must not second-
+        // guess the URL — whatever's in settings.json wins.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_slot_settings(tmp.path(), 9, "https://api.minimax.io/anthropic", "tok");
+        assert_eq!(
+            load_3p_base_url_for_slot(tmp.path(), 9).unwrap(),
+            "https://api.minimax.io/anthropic"
+        );
     }
 }

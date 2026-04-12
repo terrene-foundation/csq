@@ -16,6 +16,12 @@
     account_label: string | null;
     five_hour_pct: number;
     started_at: number | null;
+    tty: string | null;
+    term_window: number | null;
+    term_tab: number | null;
+    term_pane: number | null;
+    iterm_profile: string | null;
+    terminal_title: string | null;
   }
 
   interface AccountView {
@@ -116,6 +122,31 @@
     return "quota-ok";
   }
 
+  /// Human-readable terminal identity: prefers the iTerm2 tab title
+  /// resolved via osascript, falls back to "Window N Tab M" from
+  /// TERM_SESSION_ID, then to the iTerm profile, then to the TTY
+  /// device, then to a dash. At least one of these is populated
+  /// for any iTerm-launched terminal on macOS.
+  function formatTerminal(session: SessionView): string {
+    if (session.terminal_title) return session.terminal_title;
+    if (session.term_window != null && session.term_tab != null) {
+      return `Window ${session.term_window} • Tab ${session.term_tab}`;
+    }
+    if (session.iterm_profile) return session.iterm_profile;
+    if (session.tty) return session.tty;
+    return "—";
+  }
+
+  /// Pane subscript suffix so multi-pane tabs are still
+  /// distinguishable. Blank when pane is 0 (the default) or
+  /// missing.
+  function formatPaneSuffix(session: SessionView): string {
+    if (session.term_pane != null && session.term_pane > 0) {
+      return ` · pane ${session.term_pane}`;
+    }
+    return "";
+  }
+
   // Poll every 5s so rotation / new terminals show up quickly.
   $effect(() => {
     fetchSessions();
@@ -143,6 +174,14 @@
           <div class="session-primary">
             <span class="pid" title="Process ID">PID {session.pid}</span>
             <span class="cwd" title={session.cwd}>{formatCwd(session.cwd)}</span>
+            <span
+              class="terminal"
+              title={session.tty
+                ? `TTY ${session.tty} · ${session.terminal_title ?? "iTerm tab title unavailable"}`
+                : "No TTY detected"}
+            >
+              {formatTerminal(session)}{formatPaneSuffix(session)}
+            </span>
           </div>
           <div class="session-meta">
             <span class="config-dir">{formatConfigDir(session.config_dir)}</span>
@@ -222,6 +261,15 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .terminal {
+    font-size: 0.72rem;
+    color: var(--accent);
+    font-family: ui-monospace, monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-top: 0.1rem;
   }
   .session-meta {
     display: flex;

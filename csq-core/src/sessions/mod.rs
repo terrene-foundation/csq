@@ -83,6 +83,26 @@ pub struct SessionInfo {
     /// Unix seconds since epoch when the process started. `None`
     /// if the platform couldn't report it.
     pub started_at: Option<u64>,
+    /// Controlling TTY device, e.g. `"ttys003"`. `None` if the
+    /// process is not attached to a terminal (unlikely for a
+    /// top-level `claude` invocation but defended for safety).
+    pub tty: Option<String>,
+    /// Parsed iTerm2 window index from `TERM_SESSION_ID`.
+    /// `TERM_SESSION_ID=w3t2p0:UUID` yields `term_window=3`,
+    /// `term_tab=2`, `term_pane=0`. `None` outside iTerm2.
+    pub term_window: Option<u8>,
+    /// Parsed iTerm2 tab index. See `term_window`.
+    pub term_tab: Option<u8>,
+    /// Parsed iTerm2 pane index. See `term_window`.
+    pub term_pane: Option<u8>,
+    /// iTerm2 profile name from `ITERM_PROFILE` env var.
+    /// Useful when the user has multiple named profiles
+    /// (e.g. "Work", "Personal", "Terrene").
+    pub iterm_profile: Option<String>,
+    /// Human-readable terminal tab title resolved via
+    /// `osascript` against iTerm2 (macOS only, best-effort).
+    /// `None` outside iTerm2 or when the osascript query fails.
+    pub terminal_title: Option<String>,
 }
 
 impl SessionInfo {
@@ -98,6 +118,49 @@ impl SessionInfo {
             None
         }
     }
+}
+
+/// Parses `TERM_SESSION_ID` (iTerm2 format) into `(window, tab, pane)`.
+///
+/// The format is `w<N>t<M>p<K>:<uuid>` where each of N, M, K is a
+/// 1-3 digit integer. Anything else returns `None, None, None`.
+///
+/// Example: `"w3t2p0:3B8385EC-9D2C-4E26-A416-2E04BCA60DA3"` →
+/// `(Some(3), Some(2), Some(0))`.
+pub(crate) fn parse_term_session_id(raw: &str) -> (Option<u8>, Option<u8>, Option<u8>) {
+    let prefix = match raw.split(':').next() {
+        Some(p) => p,
+        None => return (None, None, None),
+    };
+    // Walk the prefix character by character: `w` then digits, `t`
+    // then digits, `p` then digits. Anything unexpected bails out.
+    let mut chars = prefix.chars().peekable();
+    let take_num = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| -> Option<u8> {
+        let mut digits = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                digits.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        digits.parse().ok()
+    };
+
+    if chars.next() != Some('w') {
+        return (None, None, None);
+    }
+    let window = take_num(&mut chars);
+    if chars.next() != Some('t') {
+        return (window, None, None);
+    }
+    let tab = take_num(&mut chars);
+    if chars.next() != Some('p') {
+        return (window, tab, None);
+    }
+    let pane = take_num(&mut chars);
+    (window, tab, pane)
 }
 
 #[cfg(target_os = "macos")]
@@ -189,5 +252,58 @@ mod tests {
         // backend encounters unexpected state (permission errors,
         // short-lived child processes, missing /proc entries).
         let _ = list();
+    }
+
+    // ── parse_term_session_id ──────────────────────────────
+
+    #[test]
+    fn parse_term_session_id_full_iterm_format() {
+        let (w, t, p) = parse_term_session_id("w3t2p0:3B8385EC-9D2C-4E26-A416-2E04BCA60DA3");
+        assert_eq!(w, Some(3));
+        assert_eq!(t, Some(2));
+        assert_eq!(p, Some(0));
+    }
+
+    #[test]
+    fn parse_term_session_id_multi_digit_indices() {
+        // Users with 10+ tabs are a thing.
+        let (w, t, p) = parse_term_session_id("w12t45p3:abc");
+        assert_eq!(w, Some(12));
+        assert_eq!(t, Some(45));
+        assert_eq!(p, Some(3));
+    }
+
+    #[test]
+    fn parse_term_session_id_missing_prefix_returns_none() {
+        assert_eq!(
+            parse_term_session_id("not-iterm-format"),
+            (None, None, None)
+        );
+        assert_eq!(parse_term_session_id(""), (None, None, None));
+    }
+
+    #[test]
+    fn parse_term_session_id_partial_prefix() {
+        // Window only — still useful, return what we have.
+        let (w, t, p) = parse_term_session_id("w3:abc");
+        assert_eq!(w, Some(3));
+        assert_eq!(t, None);
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn parse_term_session_id_no_uuid_part() {
+        // Valid prefix but no colon/uuid — still parses the prefix.
+        let (w, t, p) = parse_term_session_id("w1t1p0");
+        assert_eq!(w, Some(1));
+        assert_eq!(t, Some(1));
+        assert_eq!(p, Some(0));
+    }
+
+    #[test]
+    fn parse_term_session_id_rejects_huge_numbers() {
+        // u8 overflow — takes what fits and stops.
+        let (w, _, _) = parse_term_session_id("w99999t1p1:abc");
+        assert_eq!(w, None); // 99999 > u8::MAX
     }
 }

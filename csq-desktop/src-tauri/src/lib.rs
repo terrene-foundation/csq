@@ -1,4 +1,5 @@
 mod commands;
+mod daemon_supervisor;
 
 use csq_core::accounts::discovery;
 use csq_core::credentials::{self, file as cred_file};
@@ -7,11 +8,14 @@ use csq_core::quota::{state as quota_state, QuotaFile};
 use csq_core::rotation;
 use csq_core::types::AccountNum;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tauri_plugin_autostart::MacosLauncher;
+
+use daemon_supervisor::SupervisorHandle;
 
 // ── Tray icon assets ──────────────────────────────────────
 //
@@ -80,8 +84,14 @@ const _: &[u8] = TRAY_NORMAL_PNG_2X;
 /// command returns a paste-code URL the frontend opens, and
 /// `submit_oauth_code` consumes the pending state + verifier from
 /// this store to exchange the code for a token pair.
+///
+/// Also holds the in-process daemon supervisor handle so the exit
+/// hook can shut it down cleanly. The handle is wrapped in a Mutex
+/// because we need interior mutability (to `take` it on the single
+/// RunEvent::Exit) from inside an immutable `tauri::State` borrow.
 pub struct AppState {
     pub oauth_store: Arc<OAuthStateStore>,
+    pub daemon_supervisor: Mutex<Option<SupervisorHandle>>,
 }
 
 /// Maximum length of an account label shown in the tray.
@@ -658,8 +668,24 @@ fn refresh_tray_menu(app: &AppHandle, tray: &TrayIcon) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // `tauri-plugin-autostart` registers the app with the OS login
+    // service on each target platform. The `MacosLauncher::LaunchAgent`
+    // variant is the right choice for a menu-bar app: it installs a
+    // `~/Library/LaunchAgents/<bundle-id>.plist` that launches the
+    // app at user login. Windows uses a `HKCU\...\Run` registry key;
+    // Linux uses `~/.config/autostart/<bundle-id>.desktop`. All of
+    // those are unified behind the plugin's get/enable/disable API.
+    //
+    // The initial `args` slice is empty because launch-on-login
+    // should NOT open the main window automatically — the tray keeps
+    // the app alive silently, and the user clicks the tray icon to
+    // open the dashboard when they need it.
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::get_accounts,
             commands::swap_account,
@@ -673,6 +699,8 @@ pub fn run() {
             commands::set_provider_key,
             commands::list_sessions,
             commands::swap_session,
+            commands::get_autostart_enabled,
+            commands::set_autostart_enabled,
         ])
         .setup(|app| {
             // ── Logging ────────────────────────────────────────
@@ -730,7 +758,33 @@ pub fn run() {
             // performs the exchange).
             let oauth_store = Arc::new(OAuthStateStore::new());
 
-            app.manage(AppState { oauth_store });
+            // ── In-process daemon supervisor ─────────────────
+            //
+            // Starts the csq daemon (refresher + usage poller +
+            // auto-rotate + IPC server) inside the Tauri process so
+            // tokens stay refreshed for as long as the desktop app
+            // is running. Without this, the user's only option is
+            // `csq daemon start` in a terminal — and journal 0026
+            // shows what happens when they forget (every OAuth
+            // account expired for 6–80 hours).
+            //
+            // The supervisor cohabits with an existing external
+            // daemon gracefully: if a `csq daemon start` is already
+            // running, the supervisor's PidFile::acquire fails and
+            // it falls back to observing. It takes over only when
+            // the external daemon exits.
+            let supervisor = base_dir().map(daemon_supervisor::start);
+            if supervisor.is_none() {
+                log::warn!(
+                    "base_dir not available — in-process daemon \
+                     supervisor skipped; tokens will not auto-refresh"
+                );
+            }
+
+            app.manage(AppState {
+                oauth_store,
+                daemon_supervisor: Mutex::new(supervisor),
+            });
 
             // ── System tray ──────────────────────────────────
             //
@@ -794,8 +848,29 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // On app exit, shut down the in-process daemon
+            // supervisor. The subsystem cancellation tokens propagate
+            // through the refresher, usage poller, and auto-rotator,
+            // each of which has a 5s drain deadline in run_daemon.
+            //
+            // We `take()` the handle out of the Mutex so a stray
+            // second Exit event (shouldn't happen, but Tauri doesn't
+            // promise single-delivery across all platforms) doesn't
+            // double-cancel an already-dropped token.
+            if let RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    if let Ok(mut guard) = state.daemon_supervisor.lock() {
+                        if let Some(handle) = guard.take() {
+                            log::info!("app exiting — cancelling in-process daemon");
+                            handle.shutdown();
+                        }
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]

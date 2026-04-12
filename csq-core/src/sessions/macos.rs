@@ -11,7 +11,8 @@
 //! returns a single-line `nPATH` record, more reliable than
 //! `ps -o cwd=` (which macOS omits for non-Console sessions).
 
-use super::SessionInfo;
+use super::{parse_term_session_id, SessionInfo};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -26,9 +27,17 @@ pub fn list() -> Vec<SessionInfo> {
     };
     let text = String::from_utf8_lossy(&output);
 
+    // Resolve iTerm2 tab titles keyed by TTY once per `list()` call.
+    // `osascript` is ~50ms so we pay it once and join by TTY below.
+    // An empty map is fine — the title column just shows blank.
+    let tab_titles = read_iterm_tab_titles_by_tty();
+
     let mut out = Vec::new();
     for line in text.lines() {
-        if let Some(info) = parse_ps_line(line) {
+        if let Some(mut info) = parse_ps_line(line) {
+            if let Some(ref tty) = info.tty {
+                info.terminal_title = tab_titles.get(tty).cloned();
+            }
             out.push(info);
         }
     }
@@ -67,11 +76,27 @@ fn parse_ps_line(line: &str) -> Option<SessionInfo> {
     let config_dir = PathBuf::from(config_dir);
     let account_id = SessionInfo::extract_account_id(&config_dir);
 
+    // Terminal identity env vars — iTerm sets these unconditionally.
+    let term_session_id = parse_env_var(env_str, "TERM_SESSION_ID");
+    let (term_window, term_tab, term_pane) = term_session_id
+        .map(parse_term_session_id)
+        .unwrap_or((None, None, None));
+    let iterm_profile = parse_env_var(env_str, "ITERM_PROFILE").map(|s| s.to_string());
+
     // cwd via `lsof -a -p <pid> -d cwd -Fn`.
     let cwd = read_cwd_via_lsof(pid).unwrap_or_else(|| PathBuf::from(""));
 
-    // Start time via `ps -o lstart=` for the same PID.
+    // Start time via `ps -o etimes=` for the same PID.
     let started_at = read_start_time(pid);
+
+    // Controlling TTY via `ps -o tty=`. Normalized to the basename
+    // (`ttys003`) so osascript lookups against iTerm's `tty of
+    // session` (which returns `/dev/ttys003`) can join cleanly.
+    let tty = read_tty(pid).map(|t| {
+        t.trim_start_matches("/dev/")
+            .trim_start_matches('/')
+            .to_string()
+    });
 
     Some(SessionInfo {
         pid,
@@ -79,7 +104,102 @@ fn parse_ps_line(line: &str) -> Option<SessionInfo> {
         config_dir,
         account_id,
         started_at,
+        tty,
+        term_window,
+        term_tab,
+        term_pane,
+        iterm_profile,
+        terminal_title: None, // filled in by caller after osascript
     })
+}
+
+/// Reads the controlling TTY for a process via `ps -o tty=`.
+///
+/// Returns `None` if the process is detached (TTY = `"??"`) or
+/// the ps call fails.
+fn read_tty(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "tty="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() || s == "??" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Queries iTerm2 via AppleScript for `{TTY → tab title}` pairs.
+///
+/// This is a best-effort lookup — if iTerm2 is not running, the
+/// user denies automation permission, or the AppleScript fails for
+/// any reason, we return an empty map and the sessions view just
+/// omits the terminal title column for those rows. The user still
+/// gets TTY + window/tab indices from the env vars.
+///
+/// The AppleScript walks every window → tab → session and joins
+/// each session's `tty` to its tab's `name`. Sessions inside the
+/// same tab all get the same title (tabs, not panes, are the unit
+/// users label).
+///
+/// 1-second timeout on the osascript call so a hung iTerm2 process
+/// can't wedge `list_sessions`.
+fn read_iterm_tab_titles_by_tty() -> HashMap<String, String> {
+    // Cheap process-existence check before shelling out — if
+    // iTerm2 isn't running, the osascript call would produce a
+    // "Can't get application" error and slow down the whole path.
+    let iterm_running = Command::new("pgrep")
+        .args(["-x", "iTerm2"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !iterm_running {
+        return HashMap::new();
+    }
+
+    const SCRIPT: &str = r#"
+        set out to ""
+        tell application "iTerm2"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set tabName to name of t
+                    repeat with s in sessions of t
+                        set out to out & (tty of s) & "|" & tabName & linefeed
+                    end repeat
+                end repeat
+            end repeat
+        end tell
+        return out
+    "#;
+
+    // `-e` runs the script inline; two-arg form avoids any shell
+    // metachar concerns.
+    let output = Command::new("osascript").args(["-e", SCRIPT]).output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut map = HashMap::new();
+    for line in stdout.lines() {
+        // Each line is `<tty>|<tab name>`. iTerm's `tty of session`
+        // returns `/dev/ttys003` — strip the prefix to match `ps
+        // -o tty=` which returns just `ttys003`.
+        if let Some((tty_raw, title)) = line.split_once('|') {
+            let tty = tty_raw.trim().trim_start_matches("/dev/").to_string();
+            let title = title.trim().to_string();
+            if !tty.is_empty() && !title.is_empty() {
+                map.insert(tty, title);
+            }
+        }
+    }
+    map
 }
 
 /// Splits a `ps -E` command+env string into (command, env) halves.
@@ -315,5 +435,35 @@ mod tests {
         let info = parse_ps_line(line).unwrap();
         assert_eq!(info.pid, 111);
         assert_eq!(info.account_id, Some(2));
+    }
+
+    // ── Terminal identity (iTerm2) ──────────────────────────
+
+    #[test]
+    fn parse_ps_line_extracts_iterm_identity() {
+        let line = "37459 claude --resume csq \
+            PATH=/bin \
+            TERM_SESSION_ID=w3t2p0:3B8385EC-9D2C-4E26-A416-2E04BCA60DA3 \
+            ITERM_PROFILE=Default \
+            CLAUDE_CONFIG_DIR=/Users/esperie/.claude/accounts/config-8 \
+            HOME=/Users/esperie";
+        let info = parse_ps_line(line).unwrap();
+        assert_eq!(info.term_window, Some(3));
+        assert_eq!(info.term_tab, Some(2));
+        assert_eq!(info.term_pane, Some(0));
+        assert_eq!(info.iterm_profile.as_deref(), Some("Default"));
+    }
+
+    #[test]
+    fn parse_ps_line_no_iterm_env_leaves_fields_none() {
+        // Non-iTerm terminal (e.g. plain tmux) has no TERM_SESSION_ID
+        // or ITERM_PROFILE — those fields should come out as None,
+        // not cause parsing to fail.
+        let line = "50000 claude CLAUDE_CONFIG_DIR=/x/config-5";
+        let info = parse_ps_line(line).unwrap();
+        assert_eq!(info.term_window, None);
+        assert_eq!(info.term_tab, None);
+        assert_eq!(info.term_pane, None);
+        assert_eq!(info.iterm_profile, None);
     }
 }

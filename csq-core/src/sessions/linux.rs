@@ -14,7 +14,7 @@
 //! All file reads are best-effort — a process that exits between
 //! enumeration and inspection is silently skipped.
 
-use super::SessionInfo;
+use super::{parse_term_session_id, SessionInfo};
 use std::fs;
 use std::path::PathBuf;
 
@@ -63,12 +63,41 @@ fn read_process(pid: u32) -> Option<SessionInfo> {
 
     let started_at = read_start_time(&proc_dir);
 
+    // Terminal identity env vars — populated by iTerm2 clones like
+    // WezTerm, by iTerm2 itself when run on Linux (rare but real),
+    // or empty for plain `xterm`. Linux users with tmux get
+    // TMUX instead — not parsed here.
+    let term_session_id = parse_environ(&environ, "TERM_SESSION_ID");
+    let (term_window, term_tab, term_pane) = term_session_id
+        .as_deref()
+        .map(parse_term_session_id)
+        .unwrap_or((None, None, None));
+    let iterm_profile = parse_environ(&environ, "ITERM_PROFILE");
+
+    // Controlling TTY — field 7 of /proc/<pid>/stat is `tty_nr`
+    // (a packed major/minor device number). Rather than decode it,
+    // read the /proc/<pid>/fd/0 symlink which resolves to the
+    // controlling terminal's device path (e.g. `/dev/pts/3`).
+    let tty = fs::read_link(proc_dir.join("fd/0"))
+        .ok()
+        .and_then(|p| {
+            p.to_str()
+                .map(|s| s.trim_start_matches("/dev/").to_string())
+        })
+        .filter(|s| !s.is_empty() && !s.contains("null") && !s.contains("socket"));
+
     Some(SessionInfo {
         pid,
         cwd,
         config_dir,
         account_id,
         started_at,
+        tty,
+        term_window,
+        term_tab,
+        term_pane,
+        iterm_profile,
+        terminal_title: None, // osascript is macOS-only; no Linux equivalent yet
     })
 }
 

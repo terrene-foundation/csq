@@ -16,7 +16,8 @@ use csq_core::sessions;
 use csq_core::types::AccountNum;
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_autostart::ManagerExt;
 
 /// Public view of a single account, safe to send over IPC.
 ///
@@ -156,6 +157,10 @@ pub fn set_rotation_enabled(base_dir: String, enabled: bool) -> Result<(), Strin
 /// 5-hour usage percentage so the dashboard can render a "terminal
 /// #5 → account #3 at 87%" row without the frontend making a
 /// second IPC call.
+///
+/// Also exposes terminal identity fields (tty, iTerm window/tab/pane,
+/// profile, resolved tab title) so the user can match the dashboard
+/// row to the terminal window they're looking at.
 #[derive(Serialize)]
 pub struct SessionView {
     /// OS process ID.
@@ -174,6 +179,18 @@ pub struct SessionView {
     /// Unix seconds since the process started, or null if the
     /// platform could not report it.
     pub started_at: Option<u64>,
+    /// Controlling TTY basename (e.g. `"ttys003"`). Users can run
+    /// `tty` in their terminal to match a row.
+    pub tty: Option<String>,
+    /// iTerm2 window/tab/pane indices parsed from `TERM_SESSION_ID`.
+    pub term_window: Option<u8>,
+    pub term_tab: Option<u8>,
+    pub term_pane: Option<u8>,
+    /// iTerm2 profile name from `ITERM_PROFILE`.
+    pub iterm_profile: Option<String>,
+    /// Human-readable iTerm2 tab title resolved via osascript.
+    /// Most specific identifier when available.
+    pub terminal_title: Option<String>,
 }
 
 /// Returns the list of live Claude Code sessions under the current
@@ -225,6 +242,12 @@ pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
             account_label,
             five_hour_pct,
             started_at: s.started_at,
+            tty: s.tty,
+            term_window: s.term_window,
+            term_tab: s.term_tab,
+            term_pane: s.term_pane,
+            iterm_profile: s.iterm_profile,
+            terminal_title: s.terminal_title,
         });
     }
 
@@ -614,4 +637,46 @@ pub fn set_provider_key(
         .map_err(|e| format!("save settings: {e}"))?;
 
     Ok(settings.key_fingerprint())
+}
+
+// ── Launch-on-login (tauri-plugin-autostart) ──────────────────
+
+/// Returns whether the csq desktop app is registered to auto-start
+/// at OS login.
+///
+/// Reads the platform-native registration state:
+/// - **macOS**: `~/Library/LaunchAgents/<bundle-id>.plist`
+/// - **Windows**: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\<bundle-id>`
+/// - **Linux**: `~/.config/autostart/<bundle-id>.desktop`
+///
+/// All three paths are abstracted by `tauri-plugin-autostart`.
+/// Returns `false` on any read error so the UI defaults to "off"
+/// rather than displaying stale information.
+#[tauri::command]
+pub fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| format!("failed to read autostart state: {e}"))
+}
+
+/// Enables or disables launch-on-login for the csq desktop app.
+///
+/// Writes the platform-native registration as described in
+/// `get_autostart_enabled`. Takes effect on the next login (no
+/// need to log out and back in now — the change persists).
+///
+/// Idempotent: enabling when already enabled, or disabling when
+/// already disabled, is a no-op on all three platforms.
+#[tauri::command]
+pub fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch
+            .enable()
+            .map_err(|e| format!("failed to enable autostart: {e}"))
+    } else {
+        autolaunch
+            .disable()
+            .map_err(|e| format!("failed to disable autostart: {e}"))
+    }
 }

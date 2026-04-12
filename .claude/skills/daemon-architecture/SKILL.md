@@ -16,6 +16,23 @@ Quick reference for the background daemon's subsystem design, invariants, and se
 
 ## Key Invariants
 
+### 0. Account/Terminal Separation (journal 0028)
+
+**Accounts** are independent entities that authenticate, auto-refresh tokens, and poll Anthropic for usage. **Terminals** are CC instances that borrow credentials and display data.
+
+- Only the daemon writes `quota.json` (via usage poller polling `/api/oauth/usage` per account)
+- Terminals (`csq statusline`) read and display quota — they NEVER write it
+- CC's per-terminal `rate_limits` JSON is NOT used for account quota (terminal-scoped, not account-scoped)
+- After login, accounts auto-refresh with no manual action
+
+See `rules/account-terminal-separation.md` for full spec.
+
+**Identity derivation (journal 0029):** `config-N` directory numbers are slot identifiers, NOT account numbers. After any swap or rename, slot and account diverge. All account identity lookups MUST use `.csq-account` marker, not the directory suffix.
+
+**Subscription metadata (journal 0029):** Token endpoint does not return `subscription_type`. CC backfills it at runtime. Swap and fanout operations MUST preserve existing subscription metadata from live credentials when the canonical lacks it. See guards in `rotation/swap.rs` and `broker/fanout.rs`.
+
+**Stale session detection (journal 0029):** CC caches credentials in memory at startup. After a swap, compare `.csq-account` marker mtime with process `started_at` — if marker is newer, session needs restart. See `commands.rs` `needs_restart` field in `SessionView`.
+
 ### 1. Arc-at-Lifecycle-Scope Ownership (journal 0008)
 
 All shared daemon state is created in `handle_start` (`csq-cli/src/commands/daemon.rs`) and passed as `Arc` clones to subsystems. No subsystem owns shared state internally — they receive it via constructor args.

@@ -197,6 +197,17 @@ Validate the requester's permissions, not just data format.
 
 **Why:** Format-only validation passes malicious but well-formed requests; the permission check is the actual security boundary.
 
+### 6. Named error variants MUST map to specific UI text
+
+Every `BrokerError`, `CsqError`, or domain error variant surfaced to the frontend MUST have a specific, actionable UI message. Generic fallback tags (`broker_other`, `unknown_error`) are only acceptable for genuinely unclassifiable errors.
+
+```
+DO:  BrokerError::RecoveryFailed → "recovery failed — re-login needed"
+DO NOT: BrokerError::RecoveryFailed → "broker error" (generic, no action)
+```
+
+**Why:** Users seeing "broker error" cannot self-diagnose. "recovery failed — re-login needed" tells them exactly what to do. Every named variant exists because its failure mode is distinct — the UI text must reflect that distinction.
+
 ## Anti-Patterns
 
 ```rust

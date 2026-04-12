@@ -45,6 +45,22 @@ org:create_api_key user:profile user:inference user:sessions:claude_code user:mc
 
 `org:create_api_key` is **new** vs. v1.x csq — Claude Code added it. If you see "unauthorized" errors after a fresh login, check this scope first.
 
+### Token endpoint does NOT return subscription metadata
+
+The token endpoint (`/v1/oauth/token`) returns `access_token`, `refresh_token`, `expires_in`, and optionally `scope`. It does NOT return `subscriptionType` or `rateLimitTier`. CC populates these fields in `.credentials.json` on first API call at runtime.
+
+**Consequence:** After `exchange_code` (login), the canonical `credentials/N.json` has `subscription_type: None`. Any swap or fanout that copies this to a live config dir before CC has backfilled will cause CC to lose its Max tier and default to Sonnet.
+
+**Guard:** `rotation/swap.rs` and `broker/fanout.rs` both check for missing `subscription_type` and preserve the value from existing live credentials. See `rules/account-terminal-separation.md` rule 6.
+
+### GrowthBook feature flags (external, diagnostic only)
+
+CC caches server-side A/B test flags from Anthropic's GrowthBook service in each config dir's `.claude.json` under `cachedGrowthBookFeatures`. These flags are assigned per-user-ID and can silently override CC behavior.
+
+**Known model-override flag:** `tengu_auto_mode_config` — when set to `{"enabled": "opt-in", "model": "claude-sonnet-4-6[1m]"}`, CC uses Sonnet regardless of subscription. csq has no control over this.
+
+**Diagnostic:** When investigating "wrong model" reports, diff `cachedGrowthBookFeatures` between a working and broken config dir BEFORE diving into credential/subscription debugging. This saves hours.
+
 ### Don't try to "fix" loopback
 
 Both csq v1.x and csq v2 had loopback OAuth flows. Both are now dead. Don't reintroduce a loopback callback listener — Anthropic's client_id registration rejects it. Delegate to `claude auth login` or use paste-code.

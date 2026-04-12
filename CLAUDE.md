@@ -47,16 +47,17 @@ src-tauri/                   — Rust backend
 
 ## Rules
 
-| Concern               | Rule File                  |
-| --------------------- | -------------------------- |
-| No stubs/placeholders | `rules/no-stubs.md`        |
-| Security (secrets)    | `rules/security.md`        |
-| Git workflow          | `rules/git.md`             |
-| Zero tolerance        | `rules/zero-tolerance.md`  |
-| Testing               | `rules/testing.md`         |
-| Svelte patterns       | `rules/svelte-patterns.md` |
-| Tauri patterns        | `rules/tauri-patterns.md`  |
-| Tauri commands        | `rules/tauri-commands.md`  |
+| Concern                    | Rule File                            |
+| -------------------------- | ------------------------------------ |
+| Account/Terminal arch      | `rules/account-terminal-separation.md` |
+| No stubs/placeholders      | `rules/no-stubs.md`                  |
+| Security (secrets)         | `rules/security.md`                  |
+| Git workflow               | `rules/git.md`                       |
+| Zero tolerance             | `rules/zero-tolerance.md`            |
+| Testing                    | `rules/testing.md`                   |
+| Svelte patterns            | `rules/svelte-patterns.md`           |
+| Tauri patterns             | `rules/tauri-patterns.md`            |
+| Tauri commands             | `rules/tauri-commands.md`            |
 
 ## Agents
 

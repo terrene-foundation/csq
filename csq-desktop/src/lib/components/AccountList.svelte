@@ -53,6 +53,11 @@
   let error = $state<string | null>(null);
   let loading = $state(true);
   let modalOpen = $state(false);
+  /// When set, the Add Account modal targets this EXISTING slot
+  /// instead of the next free one. Used by the "Re-auth" button
+  /// on expired account cards so the user re-authenticates in
+  /// place rather than creating a new slot.
+  let reauthSlot = $state<number | null>(null);
 
   // ── First-paint instrumentation ──────────────────────────
   //
@@ -143,35 +148,49 @@
 {:else}
   <div class="account-list">
     {#each accounts as account (account.id)}
-      <button class="account-card" class:no-creds={!account.has_credentials}
-              onclick={() => handleSwap(account.id)}>
-        <div class="account-header">
-          <span class="account-id">#{account.id}</span>
-          <span class="account-label">{account.label}</span>
-          <TokenBadge status={account.token_status} expiresSecs={account.expires_in_secs} />
-        </div>
-        {#if account.last_refresh_error}
-          <div class="refresh-error" title="Most recent refresh failure tag from the daemon">
-            ⚠ {formatRefreshError(account.last_refresh_error)}
+      <div class="account-card" class:no-creds={!account.has_credentials}>
+        <button class="card-body" onclick={() => handleSwap(account.id)}>
+          <div class="account-header">
+            <span class="account-id">#{account.id}</span>
+            <span class="account-label">{account.label}</span>
+            <TokenBadge status={account.token_status} expiresSecs={account.expires_in_secs} />
           </div>
+          {#if account.last_refresh_error}
+            <div class="refresh-error" title="Most recent refresh failure tag from the daemon">
+              ⚠ {formatRefreshError(account.last_refresh_error)}
+            </div>
+          {/if}
+          <div class="usage-bars">
+            <UsageBar label="5h" pct={account.five_hour_pct} />
+            <UsageBar label="7d" pct={account.seven_day_pct} />
+          </div>
+        </button>
+        {#if account.token_status === 'expired' || account.token_status === 'missing' || account.last_refresh_error}
+          <button
+            class="reauth-btn"
+            onclick={(e) => {
+              e.stopPropagation();
+              reauthSlot = account.id;
+              modalOpen = true;
+            }}
+            title="Re-authenticate this account with a fresh OAuth login"
+          >
+            Re-auth
+          </button>
         {/if}
-        <div class="usage-bars">
-          <UsageBar label="5h" pct={account.five_hour_pct} />
-          <UsageBar label="7d" pct={account.seven_day_pct} />
-        </div>
-      </button>
+      </div>
     {/each}
   </div>
 {/if}
 
 <div class="actions">
-  <button class="add-account" onclick={() => (modalOpen = true)}>+ Add Account</button>
+  <button class="add-account" onclick={() => { reauthSlot = null; modalOpen = true; }}>+ Add Account</button>
 </div>
 
 <AddAccountModal
   isOpen={modalOpen}
-  nextAccountId={nextAccountId()}
-  onClose={() => (modalOpen = false)}
+  nextAccountId={reauthSlot ?? nextAccountId()}
+  onClose={() => { reauthSlot = null; modalOpen = false; }}
   onAccountAdded={() => fetchAccounts()}
 />
 
@@ -180,20 +199,43 @@
   .account-card {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    padding: 0.75rem;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 6px;
+    transition: border-color 0.15s;
+    overflow: hidden;
+  }
+  .account-card:hover { border-color: var(--accent); }
+  .account-card.no-creds { opacity: 0.5; }
+  .card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem;
+    background: transparent;
+    border: none;
     cursor: pointer;
     text-align: left;
     color: inherit;
     font: inherit;
     width: 100%;
-    transition: border-color 0.15s;
   }
-  .account-card:hover { border-color: var(--accent); }
-  .account-card.no-creds { opacity: 0.5; }
+  .reauth-btn {
+    padding: 0.4rem 0.75rem;
+    background: rgba(244, 67, 54, 0.08);
+    border: none;
+    border-top: 1px solid var(--border);
+    color: var(--red);
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: center;
+    transition: background 0.15s;
+  }
+  .reauth-btn:hover {
+    background: rgba(244, 67, 54, 0.18);
+  }
   .account-header {
     display: flex;
     align-items: center;

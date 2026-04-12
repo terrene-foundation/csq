@@ -97,7 +97,6 @@ pub async fn http_get_pipe_with_timeout(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    let pipe_str = pipe_path.to_string_lossy();
     let mut client = ClientOptions::new()
         .open(pipe_path)
         .map_err(DaemonClientError::Connect)?;
@@ -140,7 +139,6 @@ pub async fn http_get_pipe_with_timeout(
         }
     }
 
-    let _ = pipe_str; // suppress unused warning
     parse_response(&buf)
 }
 

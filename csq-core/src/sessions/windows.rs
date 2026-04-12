@@ -193,13 +193,15 @@ fn read_process(pid: u32) -> Option<SessionInfo> {
             .unwrap_or((None, None, None));
         let iterm_profile = environ.get("ITERM_PROFILE").cloned();
 
+        let started_at = get_process_start_time(handle);
+
         Some(SessionInfo {
             pid,
             cwd: PathBuf::from(cwd),
             config_dir,
             account_id,
-            started_at: None, // TODO: GetProcessTimes + FILETIME → unix seconds
-            tty: None,        // Windows has no TTY concept for GUI apps
+            started_at,
+            tty: None, // Windows has no TTY concept for GUI apps
             term_window,
             term_tab,
             term_pane,
@@ -212,6 +214,44 @@ fn read_process(pid: u32) -> Option<SessionInfo> {
         CloseHandle(handle);
     }
     result
+}
+
+/// Returns the process creation time as a Unix timestamp (seconds since epoch),
+/// or `None` if the call fails. Uses `GetProcessTimes` which returns
+/// `FILETIME` structs (100-nanosecond intervals since 1601-01-01 UTC).
+fn get_process_start_time(handle: HANDLE) -> Option<u64> {
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    // FILETIME = two u32s representing a 64-bit count of 100ns intervals
+    // since 1601-01-01 00:00:00 UTC.
+    let mut creation: u64 = 0;
+    let mut exit: u64 = 0;
+    let mut kernel: u64 = 0;
+    let mut user: u64 = 0;
+
+    // SAFETY: handle is a valid process handle opened with
+    // PROCESS_QUERY_INFORMATION. The four out-pointers are stack locals.
+    let ok = unsafe {
+        GetProcessTimes(
+            handle,
+            std::ptr::addr_of_mut!(creation).cast(),
+            std::ptr::addr_of_mut!(exit).cast(),
+            std::ptr::addr_of_mut!(kernel).cast(),
+            std::ptr::addr_of_mut!(user).cast(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    // Convert FILETIME (100ns since 1601-01-01) to Unix epoch (seconds since 1970-01-01).
+    // Difference between 1601 and 1970 epochs in 100ns intervals:
+    // 11644473600 seconds * 10_000_000 = 116444736000000000
+    const FILETIME_UNIX_DIFF: u64 = 116_444_736_000_000_000;
+    if creation < FILETIME_UNIX_DIFF {
+        return None; // date before Unix epoch — shouldn't happen
+    }
+    Some((creation - FILETIME_UNIX_DIFF) / 10_000_000)
 }
 
 /// Walks the PEB to extract the environment block and cwd.

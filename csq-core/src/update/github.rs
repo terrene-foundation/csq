@@ -410,6 +410,39 @@ mod tests {
     }
 
     #[test]
+    fn check_latest_returns_none_when_checksum_missing() {
+        // Arrange: binary + sig present but no SHA256SUMS
+        let stem = current_platform_stem();
+        let binary_name = binary_asset_name(&stem);
+        let sig_name = format!("{stem}.sig");
+        let json = serde_json::json!({
+            "tag_name": "v999.0.0",
+            "html_url": "https://github.com/terrene-foundation/csq/releases/tag/v999.0.0",
+            "assets": [
+                {
+                    "name": binary_name,
+                    "browser_download_url": format!("https://github.com/terrene-foundation/csq/releases/download/v999.0.0/{binary_name}")
+                },
+                {
+                    "name": sig_name,
+                    "browser_download_url": format!("https://github.com/terrene-foundation/csq/releases/download/v999.0.0/{sig_name}")
+                }
+            ]
+        })
+        .to_string()
+        .into_bytes();
+
+        // Act
+        let result = check_latest_version(|_url, _headers| Ok(json.clone()));
+
+        // Assert
+        assert!(
+            result.unwrap().is_none(),
+            "should return None when SHA256SUMS is missing"
+        );
+    }
+
+    #[test]
     fn compare_basic_greater() {
         assert_eq!(compare_versions("1.0.1", "1.0.0"), Ordering::Greater);
         assert_eq!(compare_versions("2.0.0", "1.99.99"), Ordering::Greater);

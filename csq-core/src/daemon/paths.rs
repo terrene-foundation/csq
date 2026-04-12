@@ -82,7 +82,7 @@ pub fn socket_path(base_dir: &Path) -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        let username = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+        let username = windows_username();
         PathBuf::from(format!(r"\\.\pipe\csq-{username}"))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -98,6 +98,44 @@ fn xdg_runtime_dir() -> Option<PathBuf> {
         Ok(s) if !s.is_empty() => Some(PathBuf::from(s)),
         _ => None,
     }
+}
+
+/// Returns the Windows username via `GetUserNameW` — the authoritative
+/// source. Falls back to `%USERNAME%` if the syscall fails (which would
+/// mean the process token is broken, an exceptional condition).
+///
+/// Using `GetUserNameW` instead of `std::env::var("USERNAME")` prevents
+/// a same-session process from poisoning the pipe name by mutating the
+/// environment variable before the daemon starts.
+#[cfg(target_os = "windows")]
+fn windows_username() -> String {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    // GetUserNameW fills a buffer with the username + NUL.
+    // First call with size 0 to get the required buffer length.
+    let mut size: u32 = 0;
+    unsafe {
+        windows_sys::Win32::System::WindowsProgramming::GetUserNameW(
+            std::ptr::null_mut(),
+            &mut size,
+        );
+    }
+    if size == 0 {
+        return std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+    }
+    let mut buf: Vec<u16> = vec![0u16; size as usize];
+    let ok = unsafe {
+        windows_sys::Win32::System::WindowsProgramming::GetUserNameW(buf.as_mut_ptr(), &mut size)
+    };
+    if ok == 0 {
+        return std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+    }
+    // size now includes the NUL terminator; strip it.
+    let len = (size as usize).saturating_sub(1);
+    OsString::from_wide(&buf[..len])
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(target_os = "windows")]

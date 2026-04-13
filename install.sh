@@ -23,7 +23,7 @@ CSQ_VERSION="${CSQ_VERSION:-latest}"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BOLD='\033[1m'; NC='\033[0m'
 ok()   { printf "${GREEN}✓${NC} %s\n" "$*"; }
-warn() { printf "${YELLOW}!${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}!${NC} %s\n" "$*" >&2; }
 err()  { printf "${RED}✗${NC} %s\n" "$*" >&2; }
 info() { printf "${BOLD}%s${NC}\n" "$*"; }
 
@@ -152,7 +152,12 @@ main() {
     echo
 
     tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
+    # `tmp` is declared `local` inside main, so it goes out of scope
+    # when main returns. The EXIT trap fires at SCRIPT exit, after
+    # main has already returned — `${tmp:-}` handles the out-of-scope
+    # case so `set -u` doesn't fail on unbound variable at teardown.
+    # shellcheck disable=SC2064  # expand tmp now, not at trap time
+    trap "rm -rf \"$tmp\"" EXIT
 
     # Distinguish "tag does not exist" from "asset not in this
     # release" so the user gets an actionable error. We resolved

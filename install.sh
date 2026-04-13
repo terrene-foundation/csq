@@ -95,30 +95,35 @@ resolve_tag() {
         echo "$CSQ_VERSION"
         return
     fi
-    # The GitHub API returns the latest STABLE release by default.
-    local tag
-    tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+    # Use /releases?per_page=1 rather than /releases/latest because
+    # /releases/latest skips prereleases and would hand back the old
+    # Python-era v1.x stable line even while the current Rust tool is
+    # in v2.0.0-alpha.* pre-release. Users running `install.sh` expect
+    # the newest csq regardless of prerelease flag.
+    #
+    # /releases returns entries sorted by published_at descending, so
+    # the first tag is always the most recently published release.
+    local tag is_prerelease
+    local response
+    response=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null)
+    tag=$(printf '%s' "$response" \
         | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
         | head -1 \
         | sed -E 's/.*"([^"]+)"$/\1/')
-    if [ -z "$tag" ]; then
-        # No stable releases yet — csq is in alpha. Fall back to
-        # the most recent pre-release, but warn loudly so the user
-        # understands they're getting an unstable build.
-        warn "no stable release found for ${REPO}"
-        warn "falling back to the latest PRE-RELEASE (alpha/beta/rc)"
-        warn "pin with CSQ_VERSION=vX.Y.Z to install a specific version"
-        tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" 2>/dev/null \
-            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
-            | head -1 \
-            | sed -E 's/.*"([^"]+)"$/\1/')
-    fi
+    is_prerelease=$(printf '%s' "$response" \
+        | grep -oE '"prerelease"[[:space:]]*:[[:space:]]*(true|false)' \
+        | head -1 \
+        | sed -E 's/.*:[[:space:]]*(true|false).*/\1/')
     if [ -z "$tag" ]; then
         err "could not resolve latest csq version from GitHub API"
         err "  set CSQ_VERSION=vX.Y.Z to install a specific version"
         exit 1
     fi
     validate_tag "$tag"
+    if [ "$is_prerelease" = "true" ]; then
+        warn "installing PRE-RELEASE build $tag"
+        warn "pin a specific version with CSQ_VERSION=vX.Y.Z if needed"
+    fi
     echo "$tag"
 }
 

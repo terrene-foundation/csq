@@ -122,12 +122,11 @@ pub(crate) async fn tick_3p(
         // Load base URL and default model from the provider catalog
         // as a fallback, then override BOTH the base URL and the
         // model with the per-slot binding's env.* values if set.
-        // The user may be hitting a non-default host (e.g.
-        // `api.minimax.io` vs catalog's `api.minimax.chat`) AND a
-        // non-default model (e.g. `MiniMax-M2.7-highspeed` vs
-        // catalog's `MiniMax-M2`). Both overrides are needed —
-        // probing the catalog model on a retired alias 404s and
-        // leaves the user with no quota data.
+        // A user may be hitting a non-default host or a non-default
+        // model (e.g. `MiniMax-M2.7-highspeed` vs catalog's
+        // `MiniMax-M2`). Both overrides are needed — probing the
+        // catalog model on a retired alias 404s and leaves the user
+        // with no quota data.
         let (catalog_base_url, default_model) =
             match crate::providers::catalog::get_provider(provider_id) {
                 Some(p) => (
@@ -1053,14 +1052,19 @@ mod tests {
 
     #[test]
     fn load_3p_base_url_for_slot_accepts_non_default_host() {
-        // The user's real setup uses `api.minimax.io`, not the
-        // catalog's `api.minimax.chat`. The loader must not second-
-        // guess the URL — whatever's in settings.json wins.
+        // Whatever's in settings.json wins — the loader must not
+        // second-guess the per-slot base URL, even if it differs
+        // from the catalog default.
         let tmp = tempfile::TempDir::new().unwrap();
-        write_slot_settings(tmp.path(), 9, "https://api.minimax.io/anthropic", "tok");
+        write_slot_settings(
+            tmp.path(),
+            9,
+            "https://api.minimax.example/anthropic",
+            "tok",
+        );
         assert_eq!(
             load_3p_base_url_for_slot(tmp.path(), 9).unwrap(),
-            "https://api.minimax.io/anthropic"
+            "https://api.minimax.example/anthropic"
         );
     }
 

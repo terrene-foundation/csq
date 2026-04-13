@@ -282,7 +282,7 @@ mod tests {
         let s = default_settings(p);
         let env = s.get("env").unwrap();
         for key in crate::session::merge::MODEL_KEYS {
-            assert_eq!(env.get(*key).unwrap().as_str().unwrap(), "MiniMax-M2");
+            assert_eq!(env.get(*key).unwrap().as_str().unwrap(), p.default_model);
         }
     }
 

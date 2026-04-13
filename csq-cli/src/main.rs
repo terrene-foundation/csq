@@ -161,16 +161,26 @@ enum SetkeyCmd {
     Mm {
         #[arg(long)]
         key: Option<String>,
+        /// Bind the key to slot N (e.g. `--slot 9`). If omitted, the key
+        /// is only stored in the global settings-mm.json.
+        #[arg(long)]
+        slot: Option<u16>,
     },
     /// Z.AI API key
     Zai {
         #[arg(long)]
         key: Option<String>,
+        /// Bind the key to slot N (e.g. `--slot 10`). If omitted, the key
+        /// is only stored in the global settings-zai.json.
+        #[arg(long)]
+        slot: Option<u16>,
     },
     /// Claude API key (for non-OAuth flows)
     Claude {
         #[arg(long)]
         key: Option<String>,
+        #[arg(long)]
+        slot: Option<u16>,
     },
 }
 
@@ -253,12 +263,18 @@ fn main() -> Result<()> {
             commands::logout::handle(&base_dir, account_num, yes)
         }
         Command::Setkey(sk) => {
-            let (provider, key) = match sk {
-                SetkeyCmd::Mm { key } => ("mm", key),
-                SetkeyCmd::Zai { key } => ("zai", key),
-                SetkeyCmd::Claude { key } => ("claude", key),
+            let (provider, key, slot) = match sk {
+                SetkeyCmd::Mm { key, slot } => ("mm", key, slot),
+                SetkeyCmd::Zai { key, slot } => ("zai", key, slot),
+                SetkeyCmd::Claude { key, slot } => ("claude", key, slot),
             };
-            commands::setkey::handle(&base_dir, provider, key.as_deref())
+            let slot = match slot {
+                Some(n) => Some(
+                    AccountNum::try_from(n).map_err(|e| anyhow::anyhow!("invalid --slot: {e}"))?,
+                ),
+                None => None,
+            };
+            commands::setkey::handle(&base_dir, provider, key.as_deref(), slot)
         }
         Command::Listkeys => commands::listkeys::handle(&base_dir, json),
         Command::Rmkey { provider } => commands::rmkey::handle(&base_dir, &provider),

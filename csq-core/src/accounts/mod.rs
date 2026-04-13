@@ -10,6 +10,7 @@ pub mod logout;
 pub mod markers;
 pub mod profiles;
 pub mod snapshot;
+pub mod third_party;
 
 use serde::{Deserialize, Serialize};
 

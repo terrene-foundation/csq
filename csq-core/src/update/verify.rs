@@ -37,28 +37,55 @@ use sha2::{Digest, Sha256};
 
 /// Ed25519 public key pinned for release verification.
 ///
-/// This is a placeholder keypair used during development and testing.
-/// Replace with the real 32-byte Foundation release public key when the
-/// signing pipeline (M11-01) is configured.
+/// Foundation release-signing public key (Ed25519, 32 bytes).
 ///
-/// To generate a new keypair for production:
-/// ```ignore
-/// use ed25519_dalek::SigningKey;
-/// use rand::rngs::OsRng;
-/// let signing_key = SigningKey::generate(&mut OsRng);
-/// let verifying_key = signing_key.verifying_key();
-/// println!("Public key (hex): {}", hex::encode(verifying_key.as_bytes()));
-/// // Store the signing key securely in the release pipeline.
-/// // Embed the public key here as RELEASE_PUBLIC_KEY_BYTES.
-/// ```
+/// Generated 2026-04-13. The corresponding private key lives ONLY in
+/// the `terrene-foundation/csq` GitHub Actions secret
+/// `RELEASE_SIGNING_KEY` and is read by the release workflow's
+/// signing step (`csq-core/src/bin/sign-release.rs`). It MUST NOT
+/// exist anywhere else — not on a developer machine, not in any
+/// commit, not in any backup. If the private key is lost, generate
+/// a new keypair and bump the public key constant here in a
+/// dedicated commit.
 ///
-/// The placeholder key is deterministically derived from a fixed seed.
-/// Its corresponding private key is only used in test code; production builds
-/// will reject any signature not made with the real Foundation release key.
+/// To rotate (e.g. after a suspected compromise):
+///
+/// 1. In a clean ephemeral workspace, run a one-off binary that
+///    calls `SigningKey::generate(&mut OsRng)` and prints the
+///    private key as hex (stdout) and the public key as a Rust
+///    array literal (stderr).
+/// 2. Pipe the private key into
+///    `gh secret set RELEASE_SIGNING_KEY --repo terrene-foundation/csq`.
+/// 3. Securely delete the local private key file.
+/// 4. Replace `RELEASE_PUBLIC_KEY_BYTES` here, commit, push, tag a
+///    new release. Old releases signed with the rotated-out key
+///    are still verifiable from cached binaries but the release
+///    workflow will sign new artifacts with the new key.
+///
+/// Production deployments verify every downloaded binary against
+/// this constant via `verify_signature` before the atomic swap. A
+/// signature made with the old key fails verification — that is
+/// the intended behavior of rotation.
+///
+/// # Test override
+///
+/// Under `#[cfg(test)]` the constant is overridden with the
+/// deterministic seed-1 placeholder so the existing
+/// `verify_signature_*` tests can sign with `test_signing_key()`
+/// and still verify against the constant. Production builds get
+/// the real Foundation key.
+#[cfg(not(test))]
 pub const RELEASE_PUBLIC_KEY_BYTES: [u8; 32] = [
-    // Placeholder: derived from seed [1u8; 32] — NOT a production key.
-    // Generated via: SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes()
-    // Actual bytes confirmed by test `print_public_key_bytes_for_seed_1`.
+    0x25, 0x57, 0x92, 0x5f, 0x72, 0x04, 0xd4, 0x95, 0x7a, 0x58, 0x17, 0x2f, 0xef, 0x81, 0x65, 0xaa,
+    0x34, 0x67, 0x98, 0xcf, 0x81, 0xec, 0xd2, 0xea, 0x7b, 0x96, 0x9f, 0x91, 0xe4, 0x1a, 0x93, 0xe1,
+];
+
+#[cfg(test)]
+pub const RELEASE_PUBLIC_KEY_BYTES: [u8; 32] = [
+    // Seed-1 derived placeholder — used only in test builds so the
+    // sign+verify round-trip in `test_signing_key()` works against
+    // the same key. Production builds compile in the Foundation key
+    // above instead.
     0x8a, 0x88, 0xe3, 0xdd, 0x74, 0x09, 0xf1, 0x95, 0xfd, 0x52, 0xdb, 0x2d, 0x3c, 0xba, 0x5d, 0x72,
     0xca, 0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b, 0xf3, 0x74, 0x88, 0x01, 0xb4, 0x0f, 0x6f, 0x5c,
 ];

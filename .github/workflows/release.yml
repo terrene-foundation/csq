@@ -198,6 +198,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-latest-cargo-signer-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build sign-release helper
+        run: cargo build --release --bin sign-release -p csq-core
+        timeout-minutes: 15
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -219,6 +237,76 @@ jobs:
           fi
           # Remove per-file .sha256 (keep combined SHA256SUMS)
           rm -f *.sha256
+          ls -la
+
+      - name: Sign CLI binaries with Foundation Ed25519 key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          # Fail loudly if the secret is missing — better than
+          # publishing unsigned artifacts that csq update install
+          # will refuse anyway.
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::error::RELEASE_SIGNING_KEY secret not set on this repository"
+            exit 1
+          fi
+
+          SIGNER="$GITHUB_WORKSPACE/target/release/sign-release"
+          if [ ! -x "$SIGNER" ]; then
+            echo "::error::sign-release binary not found at $SIGNER"
+            exit 1
+          fi
+
+          cd release-assets
+
+          # Sign each CLI binary. Match only csq-{linux,macos,windows}-*
+          # so we don't accidentally sign desktop bundles, SHA256SUMS,
+          # or pre-existing .sig files.
+          shopt -s nullglob
+          targets=(csq-linux-* csq-macos-* csq-windows-*)
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "::error::no CLI binaries found to sign"
+            exit 1
+          fi
+
+          # Filter out anything that's already a signature or checksum.
+          to_sign=()
+          for f in "${targets[@]}"; do
+            case "$f" in
+              *.sig|*.sha256) ;;
+              *) [ -f "$f" ] && to_sign+=("$f") ;;
+            esac
+          done
+
+          if [ ${#to_sign[@]} -eq 0 ]; then
+            echo "::error::no signable CLI binaries after filtering"
+            exit 1
+          fi
+
+          # Pass the key as the first argument; subsequent args are files.
+          # The signer reads the key from argv[1] then drops it before exit.
+          "$SIGNER" "$RELEASE_SIGNING_KEY" "${to_sign[@]}"
+
+          # Verify every binary now has a corresponding .sig file.
+          for f in "${to_sign[@]}"; do
+            if [ ! -f "$f.sig" ]; then
+              echo "::error::missing signature for $f"
+              exit 1
+            fi
+          done
+
+          # Sign SHA256SUMS too — `csq update install` does not currently
+          # consume this signature but it lets out-of-band verifiers
+          # confirm the SHA256SUMS file is Foundation-attested.
+          if [ -f SHA256SUMS ]; then
+            "$SIGNER" "$RELEASE_SIGNING_KEY" SHA256SUMS
+          fi
+
+          # Defense-in-depth: clear the env var even though the step
+          # ends here. GitHub masks the value in logs but the unset
+          # makes the intent explicit.
+          unset RELEASE_SIGNING_KEY
+
           ls -la
 
       - name: Upload assets to release

@@ -40,7 +40,13 @@ jobs:
             target: aarch64-apple-darwin
             artifact: csq-macos-aarch64
             ext: ""
-          - os: macos-13
+          # Cross-compile x86_64 from Apple Silicon — macos-13 (Intel)
+          # runners are scarce and consistently fail to allocate.
+          # macos-latest (arm64) ships with Xcode that supports both
+          # arches, so `cargo build --target x86_64-apple-darwin` just
+          # works after `rustup target add` (handled by the toolchain
+          # action's `targets:` input).
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: csq-macos-x86_64
             ext: ""

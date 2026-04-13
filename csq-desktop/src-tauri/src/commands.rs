@@ -73,10 +73,37 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    // Sibling-quota fallback map: email → quota of the first slot
+    // for that email that has any usage data. When a freshly-added
+    // duplicate-email slot has no quota entry yet (the daemon
+    // polls every 5 minutes), the dashboard borrows its sibling's
+    // numbers so the user sees the correct total immediately
+    // instead of "0%" for up to 5 minutes. Both slots share the
+    // same Anthropic backend account, so the numbers are identical
+    // by construction.
+    let mut sibling_quota: std::collections::HashMap<String, &csq_core::quota::AccountQuota> =
+        std::collections::HashMap::new();
+    for a in &accounts {
+        if matches!(a.source, AccountSource::Anthropic) && !a.label.is_empty() {
+            if let Some(q) = quota.get(a.id) {
+                if q.five_hour.is_some() || q.seven_day.is_some() {
+                    sibling_quota.entry(a.label.clone()).or_insert(q);
+                }
+            }
+        }
+    }
+
     let views = accounts
         .into_iter()
         .map(|a| {
-            let q = quota.get(a.id);
+            let own = quota.get(a.id);
+            let q = match own {
+                Some(q) if q.five_hour.is_some() || q.seven_day.is_some() => Some(q),
+                _ if matches!(a.source, AccountSource::Anthropic) && !a.label.is_empty() => {
+                    sibling_quota.get(a.label.as_str()).copied().or(own)
+                }
+                _ => own,
+            };
 
             // Token health depends on account type:
             // - Anthropic accounts: check OAuth credential expiry
@@ -155,12 +182,28 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
 /// Swaps the active account in the first config dir found for `target`.
 ///
 /// `base_dir` is the Claude accounts directory. `target` must be 1–999.
-/// Returns an error if no active session exists for the account.
+///
+/// Refuses to swap to a 3P provider slot (MiniMax, Z.AI, etc.). Those
+/// slots have no `credentials/N.json` — they're API-key based and
+/// require a *new* CC session pointed at the provider's base URL,
+/// which is `csq run <provider>` not `csq swap N`. Returns a typed
+/// THIRD_PARTY_NOT_SWAPPABLE error so the dashboard can phrase a
+/// useful message instead of bubbling up "credential file not found".
 #[tauri::command]
 pub fn swap_account(base_dir: String, target: u16) -> Result<String, String> {
     let base = PathBuf::from(&base_dir);
 
     let account = AccountNum::try_from(target).map_err(|e| format!("invalid account: {e}"))?;
+
+    // Reject 3P slots before touching the rotation path.
+    let all_accounts = discovery::discover_all(&base);
+    if let Some(matched) = all_accounts.iter().find(|a| a.id == target) {
+        if let AccountSource::ThirdParty { provider } = &matched.source {
+            return Err(format!(
+                "THIRD_PARTY_NOT_SWAPPABLE: account {target} is a {provider} slot. Open a new terminal and run `csq run {provider}` to use this provider — desktop swap only works for Anthropic OAuth accounts."
+            ));
+        }
+    }
 
     let config_dirs = fanout::scan_config_dirs(&base, account);
     let config_dir = config_dirs
@@ -572,26 +615,38 @@ pub fn begin_claude_login(
         .map_err(|e| e.to_string())
 }
 
-/// (LEGACY) Runs `claude auth login` subprocess for the given account slot.
+/// Runs `claude auth login` subprocess for the given account slot,
+/// using an absolute path to the `claude` binary so the call works
+/// in the Finder-launched desktop bundle (which doesn't inherit the
+/// user's shell `PATH`).
 ///
-/// This shells out to the `claude` binary and delegates the full
-/// OAuth flow to Claude Code's own process — browser open, callback
-/// capture, token exchange, and credential storage.
+/// Returns `CLAUDE_NOT_FOUND` if no `claude` install can be located
+/// in `$PATH` or any of the well-known directories searched by
+/// [`csq_core::accounts::login::find_claude_binary`]. The frontend
+/// uses that tag to fall back to the in-process paste-code flow.
 ///
-/// **Deprecated in favour of [`begin_claude_login`] + [`submit_oauth_code`]**,
-/// which run the entire exchange in-process without requiring `claude`
-/// to be installed on PATH and without spawning a subprocess.
+/// This is a BLOCKING command — runs on a Tokio blocking worker so
+/// it doesn't freeze the Tauri event loop. The OAuth handshake is
+/// owned entirely by the spawned `claude` process: it opens a
+/// browser, captures the callback, writes `.credentials.json` into
+/// the supplied `CLAUDE_CONFIG_DIR`. csq just reads the file after
+/// the subprocess exits and mirrors it to `credentials/N.json`.
 ///
-/// Retained as a fallback escape hatch; not wired to the main UI.
-///
-/// This is a BLOCKING command — runs in a spawned thread so it
-/// doesn't freeze the UI. The frontend should show a spinner.
+/// On 3P import, the daemon's account-discovery cache is invalidated
+/// so the dashboard sees the new account on its next 5s poll.
 #[tauri::command]
 pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
     let base = std::path::PathBuf::from(&base_dir);
 
     tokio::task::spawn_blocking(move || {
+        // Resolve `claude` via the shared finder before we start
+        // creating state — there's no point provisioning a new
+        // config dir if the binary is missing.
+        let claude_bin = csq_core::accounts::login::find_claude_binary().ok_or_else(|| {
+            "CLAUDE_NOT_FOUND: could not locate the `claude` binary in $PATH or any standard install location".to_string()
+        })?;
+
         let config_dir = base.join(format!("config-{}", account_num));
         std::fs::create_dir_all(&config_dir)
             .map_err(|e| format!("failed to create config dir: {e}"))?;
@@ -600,8 +655,10 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
         csq_core::accounts::markers::write_csq_account(&config_dir, account_num)
             .map_err(|e| format!("failed to write marker: {e}"))?;
 
-        // Run claude auth login with isolated config dir
-        let status = std::process::Command::new("claude")
+        // Run claude auth login with isolated config dir, calling
+        // by absolute path so the Finder-default $PATH gap can't
+        // bite us.
+        let status = std::process::Command::new(&claude_bin)
             .args(["auth", "login"])
             .env("CLAUDE_CONFIG_DIR", &config_dir)
             .status()
@@ -611,17 +668,37 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
             return Err("claude auth login failed or was cancelled".to_string());
         }
 
-        // CC writes credentials to `<CLAUDE_CONFIG_DIR>/.credentials.json`
-        // synchronously before `claude auth login` exits.
-        let creds = credentials::load(&config_dir.join(".credentials.json"))
-            .map_err(|e| format!("no credentials captured after login: {e}"))?;
+        // CC's modern `claude auth login` writes credentials to the
+        // macOS keychain at the hashed service name (sometimes also
+        // mirrored to `.credentials.json`, sometimes not). Read
+        // keychain first, fall back to file — at least one source
+        // is populated after a successful auth.
+        let creds = csq_core::credentials::keychain::read(&config_dir)
+            .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok())
+            .ok_or_else(|| {
+                "no credentials captured after login — keychain and file both empty".to_string()
+            })?;
 
         // Save canonical
         credentials::save_canonical(&base, account_num, &creds)
             .map_err(|e| format!("credential write failed: {e}"))?;
 
-        // Clear broker-failed flag
-        csq_core::broker::fanout::clear_broker_failed(&base, account_num);
+        // Marker, profiles.json email update, broker-failed clear —
+        // shared with `csq login` so the dashboard sees the real
+        // email instead of "unknown".
+        csq_core::accounts::login::finalize_login(&base, account_num)
+            .map_err(|e| format!("post-login bookkeeping failed: {e}"))?;
+
+        // Tell the daemon its account-discovery cache is stale so
+        // get_accounts picks up the new slot on the dashboard's
+        // next 5s poll.
+        #[cfg(unix)]
+        {
+            let sock = csq_core::daemon::socket_path(&base);
+            if sock.exists() {
+                let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+            }
+        }
 
         Ok(account_num.get())
     })
@@ -703,6 +780,23 @@ pub async fn submit_oauth_code(
 
         credentials::save_canonical(&base, pending.account, &credential)
             .map_err(|e| format!("credential write failed: {e}"))?;
+
+        // Mirror the start_claude_login bookkeeping so the paste-code
+        // path also populates profiles.json. In this branch CC did
+        // NOT run, so `.claude.json` is unlikely to exist with an
+        // emailAddress field — finalize_login falls back to "unknown"
+        // gracefully and still writes the marker + clears the
+        // broker-failed flag.
+        let _ = csq_core::accounts::login::finalize_login(&base, pending.account);
+
+        // Tell the daemon its account-discovery cache is stale.
+        #[cfg(unix)]
+        {
+            let sock = csq_core::daemon::socket_path(&base);
+            if sock.exists() {
+                let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+            }
+        }
 
         Ok(pending.account.get())
     })

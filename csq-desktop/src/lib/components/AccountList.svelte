@@ -235,7 +235,13 @@
       await invoke('swap_account', { baseDir, target: accountId });
       await fetchAccounts();
     } catch (e) {
-      error = String(e);
+      const raw = String(e);
+      if (raw.includes('THIRD_PARTY_NOT_SWAPPABLE')) {
+        // Strip the typed prefix so the user sees the human sentence.
+        error = raw.replace(/^.*THIRD_PARTY_NOT_SWAPPABLE:\s*/, '');
+      } else {
+        error = raw;
+      }
     }
   }
 
@@ -442,6 +448,7 @@
 <AddAccountModal
   isOpen={modalOpen}
   nextAccountId={reauthSlot ?? nextAccountId()}
+  reauthSlot={reauthSlot}
   onClose={() => { reauthSlot = null; modalOpen = false; }}
   onAccountAdded={() => fetchAccounts()}
 />

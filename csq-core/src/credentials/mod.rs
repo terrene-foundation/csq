@@ -5,9 +5,11 @@
 //! csq preserves every field, including unknown ones.
 
 pub mod file;
+pub mod keychain;
 pub mod refresh;
 
 pub use file::{load, save, save_canonical};
+pub use keychain::service_name;
 
 use crate::types::{AccessToken, RefreshToken};
 use serde::{Deserialize, Serialize};

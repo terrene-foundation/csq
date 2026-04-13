@@ -24,6 +24,7 @@ pub struct LogoutSummary {
     pub canonical_removed: bool,
     pub config_dir_removed: bool,
     pub profiles_entry_removed: bool,
+    pub quota_entry_removed: bool,
 }
 
 /// Failure modes for [`logout_account`].
@@ -125,13 +126,42 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
     };
 
     let profiles_entry_removed = remove_profiles_entry(base_dir, account)?;
+    let quota_entry_removed = remove_quota_entry(base_dir, account);
 
     Ok(LogoutSummary {
         account,
         canonical_removed,
         config_dir_removed,
         profiles_entry_removed,
+        quota_entry_removed,
     })
+}
+
+/// Removes the `account` entry from `quota.json` so a recycled slot
+/// can't display the previous tenant's usage. Best-effort — failures
+/// are logged but don't fail the logout, since the credential file
+/// is already gone and the daemon will just write fresh data on the
+/// next poll cycle.
+fn remove_quota_entry(base_dir: &Path, account: AccountNum) -> bool {
+    use crate::quota::state as quota_state;
+
+    let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
+    let _guard = match crate::platform::lock::lock_file(&lock_path) {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    let mut quota = match quota_state::load_state(base_dir) {
+        Ok(q) => q,
+        Err(_) => return false,
+    };
+
+    let key = account.get().to_string();
+    if quota.accounts.remove(&key).is_none() {
+        return false;
+    }
+
+    quota_state::save_state(base_dir, &quota).is_ok()
 }
 
 /// Returns the PIDs of any live `claude` processes whose handle dir
@@ -231,6 +261,27 @@ mod tests {
             );
         }
         profiles::save(&profiles::profiles_path(base), &file).unwrap();
+    }
+
+    fn write_quota_for(base: &Path, n: u16, pct_7d: f64) {
+        use crate::quota::state as quota_state;
+        use crate::quota::{AccountQuota, QuotaFile, UsageWindow};
+        let mut q = quota_state::load_state(base).unwrap_or_else(|_| QuotaFile::empty());
+        q.set(
+            n,
+            AccountQuota {
+                five_hour: None,
+                // resets_at deliberately in the year 2100 so
+                // clear_expired() doesn't null the window mid-test.
+                seven_day: Some(UsageWindow {
+                    used_percentage: pct_7d,
+                    resets_at: 4_102_444_800,
+                }),
+                rate_limits: None,
+                updated_at: 0.0,
+            },
+        );
+        quota_state::save_state(base, &q).unwrap();
     }
 
     #[test]
@@ -400,6 +451,52 @@ mod tests {
         logout_account(dir.path(), account(8)).unwrap();
         assert!(!dir.path().join("config-8").exists());
         assert!(dir.path().join("config-9").exists());
+    }
+
+    #[test]
+    fn logout_removes_quota_entry() {
+        use crate::quota::state as quota_state;
+
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 11);
+        write_quota_for(dir.path(), 11, 87.5);
+
+        let summary = logout_account(dir.path(), account(11)).unwrap();
+        assert!(summary.quota_entry_removed);
+
+        let q = quota_state::load_state(dir.path()).unwrap();
+        assert!(
+            q.get(11).is_none(),
+            "quota entry must be cleared after logout — otherwise a recycled slot inherits the previous tenant's stale percentage"
+        );
+    }
+
+    #[test]
+    fn logout_quota_cleanup_does_not_touch_other_accounts() {
+        use crate::quota::state as quota_state;
+
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 12);
+        provision_account(dir.path(), 13);
+        write_quota_for(dir.path(), 12, 50.0);
+        write_quota_for(dir.path(), 13, 75.0);
+
+        logout_account(dir.path(), account(12)).unwrap();
+
+        let q = quota_state::load_state(dir.path()).unwrap();
+        assert!(q.get(12).is_none());
+        let still = q.get(13).expect("account 13's quota must survive");
+        assert_eq!(still.seven_day_pct(), 75.0);
+    }
+
+    #[test]
+    fn logout_quota_cleanup_silent_when_no_entry() {
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 14);
+        // No quota.json written for account 14 at all.
+
+        let summary = logout_account(dir.path(), account(14)).unwrap();
+        assert!(!summary.quota_entry_removed);
     }
 
     #[test]

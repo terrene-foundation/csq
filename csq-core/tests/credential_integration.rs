@@ -1,9 +1,12 @@
 //! Integration tests for credential management.
 //!
-//! Tests round-trip file operations, refresh token merge, concurrent
-//! access, and canonical save mirroring.
+//! Tests keychain service-name parity (locking in CC's hash format
+//! so csq stays compatible with CC's keychain writes), round-trip
+//! file operations, refresh token merge, concurrent access, and
+//! canonical save mirroring.
 
 use csq_core::credentials::file::{canonical_path, live_path, load, save, save_canonical};
+use csq_core::credentials::keychain::service_name;
 use csq_core::credentials::refresh::{
     merge_refresh, refresh_token, RefreshResponse, TOKEN_ENDPOINT,
 };
@@ -30,6 +33,48 @@ fn sample_creds() -> CredentialFile {
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
+    }
+}
+
+// ── Keychain service name parity ──────────────────────────────────────
+
+#[test]
+fn keychain_service_name_known_paths() {
+    // Golden values computed from v1.x Python:
+    //   hashlib.sha256(unicodedata.normalize('NFC', path).encode()).hexdigest()[:8]
+    // CC's `claude auth login` writes the credential blob under the
+    // same hashed service name when launched with a non-default
+    // CLAUDE_CONFIG_DIR — locking these values keeps csq's read
+    // path compatible with CC's writes across both implementations.
+    let expected = [
+        (
+            "/Users/test/.claude/accounts/config-1",
+            "Claude Code-credentials-cfdcc24b",
+        ),
+        (
+            "/Users/test/.claude/accounts/config-2",
+            "Claude Code-credentials-550a6ea2",
+        ),
+        (
+            "/Users/test/.claude/accounts/config-3",
+            "Claude Code-credentials-d705092c",
+        ),
+        (
+            "/home/user/.claude/accounts/config-1",
+            "Claude Code-credentials-abf1dc4a",
+        ),
+        (
+            "/tmp/.claude/accounts/config-1",
+            "Claude Code-credentials-dbea6435",
+        ),
+    ];
+
+    for (path, expected_name) in &expected {
+        let actual = service_name(std::path::Path::new(path));
+        assert_eq!(
+            &actual, expected_name,
+            "v1.x parity failure for path {path}: got {actual}, expected {expected_name}"
+        );
     }
 }
 

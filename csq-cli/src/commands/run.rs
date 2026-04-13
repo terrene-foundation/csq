@@ -1,7 +1,7 @@
 //! `csq run [N]` — launch Claude Code with isolated credentials.
 
 use anyhow::{anyhow, Context, Result};
-use csq_core::accounts::{discovery, markers};
+use csq_core::accounts::{discovery, markers, AccountSource};
 use csq_core::broker::fanout::is_broker_failed;
 use csq_core::credentials::{self, file};
 use csq_core::session;
@@ -40,45 +40,114 @@ pub fn handle(
     // Mark onboarding complete on config-N
     session::mark_onboarding_complete(&config_dir)?;
 
-    // Check broker-failed flag before launching.
-    if is_broker_failed(base_dir, account) {
+    // Detect whether this slot is bound to a third-party provider
+    // (MiniMax, Z.AI, Ollama, ...). 3P slots have
+    // `config-<N>/settings.json` with a non-Anthropic
+    // `env.ANTHROPIC_BASE_URL` and no OAuth credential file.
+    let is_third_party = discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .any(|a| a.id == account.get() && matches!(a.source, AccountSource::ThirdParty { .. }));
+
+    if is_third_party {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for third-party slots (slot {account} is already provider-bound, requested: {profile_id})"
+            ));
+        }
+
+        launch_third_party(base_dir, &claude_home, account, rest)
+    } else {
+        // Anthropic OAuth path.
+        if is_broker_failed(base_dir, account) {
+            return Err(anyhow!(
+                "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
+                account,
+                account
+            ));
+        }
+
+        // Verify canonical credentials exist and are loadable
+        let canonical_path = file::canonical_path(base_dir, account);
+        let canonical = credentials::load(&canonical_path).with_context(|| {
+            format!("failed to load canonical credentials for account {account}")
+        })?;
+
+        // Warn if token is already expired
+        if canonical.claude_ai_oauth.is_expired_within(0) {
+            eprintln!(
+                "warning: access token for account {} has expired — CC may fail until the daemon refreshes it",
+                account
+            );
+        }
+
+        // Copy credentials into config-N so symlinks resolve
+        session::setup::copy_credentials_for_session(base_dir, &config_dir, account)
+            .context("failed to copy credentials")?;
+
+        // Profile support deferred
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile support is not yet implemented (requested: {profile_id})"
+            ));
+        }
+
+        launch_anthropic(base_dir, &claude_home, account, rest)
+    }
+}
+
+/// Launches CC for a 3P slot. The slot's `config-<N>/settings.json`
+/// carries `env.ANTHROPIC_BASE_URL` + `env.ANTHROPIC_AUTH_TOKEN`, and
+/// CC reads both on startup. We strip the parent env as usual so a
+/// poisoned dotfile can't redirect traffic, then exec with
+/// `CLAUDE_CONFIG_DIR` pointing at the handle dir whose
+/// `settings.json` symlink resolves back to `config-<N>`.
+fn launch_third_party(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    rest: &[String],
+) -> Result<()> {
+    let settings_path = base_dir.join(format!("config-{}/settings.json", account));
+    if !settings_path.exists() {
         return Err(anyhow!(
-            "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
-            account,
-            account
+            "slot {account} is missing config-{account}/settings.json — run `csq setkey <provider> --slot {account} --key <KEY>` first"
         ));
     }
 
-    // Verify canonical credentials exist and are loadable
-    let canonical_path = file::canonical_path(base_dir, account);
-    let canonical = credentials::load(&canonical_path)
-        .with_context(|| format!("failed to load canonical credentials for account {account}"))?;
+    let pid = std::process::id();
+    let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
+        .context("failed to create handle dir")?;
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
 
-    // Warn if token is already expired
-    if canonical.claude_ai_oauth.is_expired_within(0) {
-        eprintln!(
-            "warning: access token for account {} has expired — CC may fail until the daemon refreshes it",
-            account
-        );
-    }
+    println!(
+        "Launching claude for 3P slot {} (term-{}) via {}...",
+        account,
+        pid,
+        settings_path.display()
+    );
 
-    // Copy credentials into config-N so symlinks resolve
-    session::setup::copy_credentials_for_session(base_dir, &config_dir, account)
-        .context("failed to copy credentials")?;
+    let mut cmd = Command::new("claude");
+    cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
+    strip_sensitive_env(&mut cmd);
+    cmd.args(rest);
 
-    // Profile support deferred
-    if let Some(profile_id) = profile {
-        return Err(anyhow!(
-            "--profile support is not yet implemented (requested: {profile_id})"
-        ));
-    }
+    exec_or_spawn(cmd, &handle_dir)
+}
 
+/// Launches CC for an Anthropic OAuth slot. Assumes credentials have
+/// already been copied into `config-<N>` by the caller.
+fn launch_anthropic(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    rest: &[String],
+) -> Result<()> {
     // Create ephemeral handle dir: term-<pid> with symlinks to config-N
     // for credentials and ~/.claude for shared items. CC checks CWD
     // (not CLAUDE_CONFIG_DIR) for session identity, so handle dirs
     // are compatible with --resume as long as the CWD matches.
     let pid = std::process::id();
-    let handle_dir = session::create_handle_dir(base_dir, &claude_home, account, pid)
+    let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
         .context("failed to create handle dir")?;
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
@@ -91,12 +160,18 @@ pub fn handle(
     strip_sensitive_env(&mut cmd);
     cmd.args(rest);
 
+    exec_or_spawn(cmd, &handle_dir)
+}
+
+/// Execs CC on Unix or spawns + waits on Windows, cleaning up the
+/// handle dir on failure.
+fn exec_or_spawn(mut cmd: Command, handle_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // exec replaces process — if it fails, clean up handle dir
         let err = cmd.exec();
-        let _ = std::fs::remove_dir_all(&handle_dir);
+        let _ = std::fs::remove_dir_all(handle_dir);
         Err(anyhow!("exec failed: {err}"))
     }
 
@@ -107,18 +182,12 @@ pub fn handle(
         // apart from csq-cli. On Unix `exec` replaces csq-cli with
         // claude and the csq PID becomes claude's PID, so there is
         // only one PID and this marker is not needed.
-        //
-        // If csq-cli panics or is killed between `spawn` and
-        // `wait`, the handle dir survives and the sweep needs to
-        // know the child's PID to avoid deleting it out from under
-        // a running CC. We write the marker immediately after
-        // spawn — the write happens before any other work so the
-        // TOCTOU window is a handful of syscalls wide.
-        use csq_core::accounts::markers;
+        let handle_dir_abs =
+            std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&handle_dir);
+                let _ = std::fs::remove_dir_all(handle_dir);
                 return Err(anyhow!("failed to launch claude: {e}"));
             }
         };
@@ -127,7 +196,7 @@ pub fn handle(
             eprintln!("warning: could not record CC child PID: {e}");
         }
         let status = child.wait();
-        let _ = std::fs::remove_dir_all(&handle_dir);
+        let _ = std::fs::remove_dir_all(handle_dir);
         match status {
             Ok(s) if !s.success() => std::process::exit(s.code().unwrap_or(1)),
             Ok(_) => Ok(()),

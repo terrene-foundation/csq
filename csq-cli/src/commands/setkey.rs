@@ -5,7 +5,9 @@
 //! bytes on Darwin/BSD) are not truncated. MiniMax JWT keys regularly
 //! exceed this limit.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use csq_core::accounts::third_party;
+use csq_core::types::AccountNum;
 use csq_core::{http, providers};
 use std::io::Read;
 use std::path::Path;
@@ -14,7 +16,12 @@ use std::path::Path;
 /// under 2 KiB; 4096 is generous and bounds interactive input.
 const MAX_KEY_LEN: usize = 4096;
 
-pub fn handle(base_dir: &Path, provider_id: &str, key_arg: Option<&str>) -> Result<()> {
+pub fn handle(
+    base_dir: &Path,
+    provider_id: &str,
+    key_arg: Option<&str>,
+    slot: Option<AccountNum>,
+) -> Result<()> {
     let provider = providers::get_provider(provider_id)
         .ok_or_else(|| anyhow!("unknown provider: {provider_id}"))?;
 
@@ -30,11 +37,24 @@ pub fn handle(base_dir: &Path, provider_id: &str, key_arg: Option<&str>) -> Resu
     // Strip trailing \r from Windows clipboard paste
     let key = key.trim_end_matches('\r').to_string();
 
-    let mut settings = providers::settings::load_settings(base_dir, provider_id)?;
-    settings.set_api_key(&key)?;
-    providers::settings::save_settings(base_dir, &settings)?;
-
-    println!("Set {} key: {}", provider_id, settings.key_fingerprint());
+    match slot {
+        None => {
+            // Legacy global save: settings-<provider>.json only.
+            let mut settings = providers::settings::load_settings(base_dir, provider_id)?;
+            settings.set_api_key(&key)?;
+            providers::settings::save_settings(base_dir, &settings)?;
+            println!("Set {} key: {}", provider_id, settings.key_fingerprint());
+        }
+        Some(slot) => {
+            third_party::bind_provider_to_slot(base_dir, provider_id, slot, &key)
+                .with_context(|| format!("failed to bind {provider_id} to slot {slot}"))?;
+            println!(
+                "Assigned {} key to slot {} (config-{}/settings.json)",
+                provider_id, slot, slot
+            );
+            println!("  Launch with: csq run {}", slot);
+        }
+    }
 
     // Best-effort validation probe — report status but never fail the save
     if provider.validation_endpoint.is_some() {

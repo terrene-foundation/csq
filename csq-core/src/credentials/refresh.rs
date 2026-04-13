@@ -2,6 +2,7 @@
 
 use super::CredentialFile;
 use crate::error::{redact_tokens, OAuthError};
+use crate::oauth::constants::{scopes_joined, OAUTH_CLIENT_ID};
 use crate::types::{AccessToken, RefreshToken};
 use serde::Deserialize;
 use std::fmt;
@@ -82,15 +83,30 @@ pub fn merge_refresh(existing: &CredentialFile, response: &RefreshResponse) -> C
     merged
 }
 
-/// Builds the form-encoded body for a token refresh request.
+/// Builds the JSON body for a token refresh request.
 ///
-/// Format matches v1.x exactly:
-/// `grant_type=refresh_token&refresh_token={token}`
+/// Format matches Claude Code's `vw8` function in `cli.js`:
+/// ```json
+/// {
+///   "grant_type": "refresh_token",
+///   "refresh_token": "<token>",
+///   "client_id": "<CLIENT_ID>",
+///   "scope": "<space-joined scopes>"
+/// }
+/// ```
+///
+/// Anthropic's `/v1/oauth/token` endpoint rejects form-encoded bodies
+/// with `400 invalid_request_error` — it requires JSON. This caused a
+/// silent mass broker-failure across every account when the endpoint
+/// switched to JSON-only (journal 0034).
 pub fn build_refresh_body(refresh_token: &str) -> String {
-    format!(
-        "grant_type=refresh_token&refresh_token={}",
-        urlencoding::encode(refresh_token)
-    )
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+        "scope": scopes_joined(),
+    });
+    serde_json::to_string(&body).expect("static JSON always serializes")
 }
 
 /// Performs a token refresh using the provided HTTP function.
@@ -112,18 +128,28 @@ where
 {
     let body = build_refresh_body(existing.claude_ai_oauth.refresh_token.expose_secret());
 
+    // Single-shot. We do NOT retry inside this function even on 429.
+    // Anthropic's `/v1/oauth/token` rate-limits per IP, and retrying
+    // amplifies the very condition we'd be retrying through. The
+    // daemon's 5-minute tick + 10-minute cooldown already provides
+    // the right cadence to absorb transient throttling without a
+    // local retry storm. See journal 0034.
     let response_bytes =
         http_post(TOKEN_ENDPOINT, &body).map_err(|e| OAuthError::Exchange(redact_tokens(&e)))?;
 
-    // Try to deserialize as a success response. If that fails,
-    // check whether the server returned a structured error and
-    // surface the actual reason.
+    // Surface a structured error response (e.g. `rate_limit_error`
+    // or `invalid_grant`) as a typed OAuthError before attempting to
+    // deserialize the success shape. This lets the broker tag the
+    // failure correctly (rate-limit → long cooldown, skip sibling
+    // recovery) without losing the actual reason.
+    if let Some(detail) = extract_oauth_error(&response_bytes) {
+        return Err(OAuthError::Exchange(detail));
+    }
+
+    // Try to deserialize as a success response.
     let response: RefreshResponse = match serde_json::from_slice(&response_bytes) {
         Ok(r) => r,
         Err(serde_err) => {
-            if let Some(detail) = extract_oauth_error(&response_bytes) {
-                return Err(OAuthError::Exchange(detail));
-            }
             let raw = format!("invalid response JSON: {serde_err}");
             return Err(OAuthError::Exchange(redact_tokens(&raw)));
         }
@@ -200,16 +226,20 @@ mod tests {
     #[test]
     fn build_refresh_body_format() {
         let body = build_refresh_body("sk-ant-ort01-test");
-        assert_eq!(
-            body,
-            "grant_type=refresh_token&refresh_token=sk-ant-ort01-test"
-        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["grant_type"], "refresh_token");
+        assert_eq!(parsed["refresh_token"], "sk-ant-ort01-test");
+        assert_eq!(parsed["client_id"], OAUTH_CLIENT_ID);
+        assert!(parsed["scope"].as_str().unwrap().contains("user:inference"));
     }
 
     #[test]
-    fn build_refresh_body_encodes_special_chars() {
-        let body = build_refresh_body("token+with=special&chars");
-        assert!(body.contains("token%2Bwith%3Dspecial%26chars"));
+    fn build_refresh_body_handles_special_chars() {
+        // JSON serialization escapes quotes and backslashes; no
+        // percent-encoding required because the body isn't form-urlencoded.
+        let body = build_refresh_body("token\"with\\special");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["refresh_token"], "token\"with\\special");
     }
 
     #[test]

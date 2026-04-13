@@ -173,15 +173,21 @@ pub fn exchange_code<F>(
     http_post: F,
 ) -> Result<CredentialFile, OAuthError>
 where
-    F: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
+    F: Fn(&str, &str) -> Result<Vec<u8>, String>,
 {
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("client_id", OAUTH_CLIENT_ID),
-        ("code_verifier", verifier.expose_secret()),
-        ("redirect_uri", redirect_uri),
-    ];
+    // Build JSON body. Anthropic's /v1/oauth/token endpoint now
+    // rejects form-encoded bodies with `400 invalid_request_error`.
+    // The shape matches Claude Code's `Tw8` function in cli.js:
+    // `{grant_type, code, client_id, code_verifier, redirect_uri}`.
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": OAUTH_CLIENT_ID,
+        "code_verifier": verifier.expose_secret(),
+        "redirect_uri": redirect_uri,
+    });
+    let body_str = serde_json::to_string(&body)
+        .map_err(|e| OAuthError::Exchange(format!("json serialize: {e}")))?;
 
     // Retry with backoff on 429 (rate limit). Anthropic's token
     // endpoint has aggressive rate limiting — a burst of login
@@ -193,7 +199,7 @@ where
             std::thread::sleep(std::time::Duration::from_secs(*delay));
         }
 
-        response_bytes = http_post(OAUTH_TOKEN_URL, &params)
+        response_bytes = http_post(OAUTH_TOKEN_URL, &body_str)
             .map_err(|e| OAuthError::Exchange(redact_tokens(&e)))?;
 
         // Check for rate limit (429) — retry if we have attempts left
@@ -269,38 +275,33 @@ mod tests {
         CodeVerifier::new("test-verifier-value-for-exchange-tests-only".to_string())
     }
 
-    /// Wraps a closure that captures the URL + body so tests can
+    /// Wraps a closure that captures the URL + JSON body so tests can
     /// assert on what was actually sent to the mock transport.
     fn capturing_success<'a>(
         captured_url: &'a std::cell::RefCell<Option<String>>,
-        captured_params: &'a std::cell::RefCell<Option<Vec<(String, String)>>>,
+        captured_body: &'a std::cell::RefCell<Option<String>>,
         response_bytes: Vec<u8>,
-    ) -> impl Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String> + 'a {
-        move |url: &str, params: &[(&str, &str)]| {
+    ) -> impl Fn(&str, &str) -> Result<Vec<u8>, String> + 'a {
+        move |url: &str, body: &str| {
             *captured_url.borrow_mut() = Some(url.to_string());
-            *captured_params.borrow_mut() = Some(
-                params
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            );
+            *captured_body.borrow_mut() = Some(body.to_string());
             Ok(response_bytes.clone())
         }
     }
 
-    fn mock_ok(response: Vec<u8>) -> impl Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String> {
-        move |_url: &str, _params: &[(&str, &str)]| Ok(response.clone())
+    fn mock_ok(response: Vec<u8>) -> impl Fn(&str, &str) -> Result<Vec<u8>, String> {
+        move |_url: &str, _body: &str| Ok(response.clone())
     }
 
-    fn mock_err(msg: &str) -> impl Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String> {
+    fn mock_err(msg: &str) -> impl Fn(&str, &str) -> Result<Vec<u8>, String> {
         let msg = msg.to_string();
-        move |_url: &str, _params: &[(&str, &str)]| Err(msg.clone())
+        move |_url: &str, _body: &str| Err(msg.clone())
     }
 
     #[test]
     fn exchange_code_builds_correct_request_params() {
         let captured_url = std::cell::RefCell::new(None);
-        let captured_params = std::cell::RefCell::new(None);
+        let captured_body = std::cell::RefCell::new(None);
         let response = br#"{
             "access_token": "sk-ant-oat01-test-access",
             "refresh_token": "sk-ant-ort01-test-refresh",
@@ -312,7 +313,7 @@ mod tests {
             "auth-code-123",
             &test_verifier(),
             "http://127.0.0.1:8420/oauth/callback",
-            capturing_success(&captured_url, &captured_params, response),
+            capturing_success(&captured_url, &captured_body, response),
         );
         assert!(result.is_ok());
 
@@ -322,24 +323,19 @@ mod tests {
             "exchange must POST to the Anthropic token endpoint"
         );
 
-        let params = captured_params.borrow().clone().unwrap();
-        let get = |key: &str| {
-            params
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-        };
-        assert_eq!(get("grant_type"), Some("authorization_code"));
-        assert_eq!(get("code"), Some("auth-code-123"));
-        assert_eq!(get("client_id"), Some(OAUTH_CLIENT_ID));
+        // Body is a JSON object matching the shape Claude Code sends
+        // to /v1/oauth/token (see Tw8 in cli.js).
+        let body_str = captured_body.borrow().clone().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&body_str).expect("exchange_code must send valid JSON body");
+        assert_eq!(body["grant_type"], "authorization_code");
+        assert_eq!(body["code"], "auth-code-123");
+        assert_eq!(body["client_id"], OAUTH_CLIENT_ID);
         assert_eq!(
-            get("code_verifier"),
-            Some("test-verifier-value-for-exchange-tests-only")
+            body["code_verifier"],
+            "test-verifier-value-for-exchange-tests-only"
         );
-        assert_eq!(
-            get("redirect_uri"),
-            Some("http://127.0.0.1:8420/oauth/callback")
-        );
+        assert_eq!(body["redirect_uri"], "http://127.0.0.1:8420/oauth/callback");
     }
 
     #[test]
@@ -624,14 +620,9 @@ mod tests {
 
     #[test]
     fn exchange_code_uses_redirect_uri_verbatim() {
-        let captured_params = std::cell::RefCell::new(None);
-        let capture = |_url: &str, params: &[(&str, &str)]| {
-            *captured_params.borrow_mut() = Some(
-                params
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect::<Vec<_>>(),
-            );
+        let captured_body = std::cell::RefCell::new(None);
+        let capture = |_url: &str, body: &str| {
+            *captured_body.borrow_mut() = Some(body.to_string());
             Ok(br#"{"access_token":"at","refresh_token":"rt","expires_in":1}"#.to_vec())
         };
 
@@ -643,11 +634,8 @@ mod tests {
         )
         .unwrap();
 
-        let params = captured_params.borrow().clone().unwrap();
-        let redir = params
-            .iter()
-            .find(|(k, _)| k == "redirect_uri")
-            .map(|(_, v)| v.as_str());
-        assert_eq!(redir, Some("http://127.0.0.1:8420/oauth/callback"));
+        let body_str = captured_body.borrow().clone().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(body["redirect_uri"], "http://127.0.0.1:8420/oauth/callback");
     }
 }

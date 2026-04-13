@@ -95,8 +95,12 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
             // same signal.
             let shutdown = tokio_util::sync::CancellationToken::new();
 
+            // The refresh endpoint now requires JSON body (Anthropic
+            // switched to JSON-only — see journal 0034). post_json sets
+            // Content-Type: application/json; refresh::build_refresh_body
+            // produces the full JSON payload with client_id and scope.
             let http_post: daemon::HttpPostFn =
-                Arc::new(|url: &str, body: &str| http::post_form(url, body));
+                Arc::new(|url: &str, body: &str| http::post_json(url, body));
 
             // Router state: refresh cache + discovery cache +
             // base_dir + OAuth store. Arc'd so per-request

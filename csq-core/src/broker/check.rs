@@ -95,6 +95,23 @@ where
             Ok(BrokerResult::Refreshed)
         }
         Err(primary_err) => {
+            // On rate-limit errors, do NOT try siblings — that
+            // would fire another HTTP request against the same
+            // throttled endpoint, making the condition worse.
+            // Instead, return a Skipped result so the refresher
+            // sets its normal cooldown and we retry on the next
+            // tick when the rate-limit window has likely elapsed.
+            if is_rate_limited(&primary_err) {
+                warn!(
+                    account = %account,
+                    "primary refresh hit rate limit, skipping sibling recovery"
+                );
+                drop(guard);
+                // Preserve the existing broker_failed flag state.
+                // Do NOT set a broker_failed marker — the user
+                // isn't locked out, we're just throttled.
+                return Ok(BrokerResult::Skipped);
+            }
             // Primary refresh failed — attempt recovery from live siblings
             info!(account = %account, "primary refresh failed, attempting recovery");
             match recover_from_siblings(base_dir, account, http_post) {
@@ -243,6 +260,18 @@ fn restore_if_not_downgraded(canonical_path: &Path, original: &CredentialFile) {
         }
     }
     let _ = credentials::save(canonical_path, original);
+}
+
+/// Returns `true` if `e` looks like an Anthropic rate-limit error.
+///
+/// We match on the Display string because the refresh error path
+/// wraps structured response bodies through `OAuthError::Exchange`
+/// without preserving the HTTP status. Anthropic returns
+/// `{"error":{"type":"rate_limit_error", ...}}` for 429s, which
+/// `extract_oauth_error` stringifies as `rate_limit_error: ...`.
+fn is_rate_limited(e: &CsqError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("rate_limit") || msg.contains("rate limit")
 }
 
 #[cfg(test)]

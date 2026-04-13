@@ -644,7 +644,7 @@ pub async fn submit_oauth_code(
             &code,
             &pending.code_verifier,
             PASTE_CODE_REDIRECT_URI,
-            csq_core::http::post_form_params,
+            csq_core::http::post_json,
         )
         .map_err(|e| format!("exchange failed: {e}"))?;
 

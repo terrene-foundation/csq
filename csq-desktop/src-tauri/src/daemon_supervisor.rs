@@ -288,7 +288,11 @@ async fn run_daemon(
         Arc::new(TtlCache::new(daemon_server::DISCOVERY_CACHE_MAX_AGE));
     let oauth_store: Arc<OAuthStateStore> = Arc::new(OAuthStateStore::new());
 
-    let http_post: HttpPostFn = Arc::new(|url: &str, body: &str| http::post_form(url, body));
+    // The refresh endpoint requires JSON body (Anthropic switched to
+    // JSON-only — see journal 0034). post_json sets Content-Type:
+    // application/json; refresh::build_refresh_body produces the full
+    // JSON payload with client_id and scope.
+    let http_post: HttpPostFn = Arc::new(|url: &str, body: &str| http::post_json(url, body));
     let http_get: HttpGetFn = Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
         http::get_bearer(url, token, headers)
     });

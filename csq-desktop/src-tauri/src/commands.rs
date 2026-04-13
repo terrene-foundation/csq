@@ -184,6 +184,54 @@ pub fn rename_account(base_dir: String, account: u16, name: String) -> Result<()
         .map_err(|e| format!("rename failed: {e}"))
 }
 
+/// Removes an account: deletes credentials, config dir, and profile entry.
+///
+/// Refuses if a live `claude` process is currently bound to the
+/// account (returns the conflicting PIDs in the error message). Best-
+/// effort daemon cache invalidation runs after a successful removal.
+#[tauri::command]
+pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSummary, String> {
+    use csq_core::accounts::logout::{logout_account, LogoutError};
+
+    let base = PathBuf::from(&base_dir);
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+
+    match logout_account(&base, account_num) {
+        Ok(s) => {
+            // Best-effort daemon cache invalidation. Mirrors `csq logout`.
+            #[cfg(unix)]
+            {
+                let sock = csq_core::daemon::socket_path(&base);
+                if sock.exists() {
+                    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+                }
+            }
+            Ok(RemoveAccountSummary {
+                account: s.account.get(),
+                canonical_removed: s.canonical_removed,
+                config_dir_removed: s.config_dir_removed,
+                profiles_entry_removed: s.profiles_entry_removed,
+            })
+        }
+        Err(LogoutError::InUse { account: a, pids }) => Err(format!(
+            "ACCOUNT_IN_USE: account {} is bound to live process(es) {:?} — exit those terminals first",
+            a, pids
+        )),
+        Err(LogoutError::NotConfigured { account: a }) => {
+            Err(format!("NOT_CONFIGURED: account {a} has no state to remove"))
+        }
+        Err(e) => Err(format!("REMOVE_FAILED: {e}")),
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct RemoveAccountSummary {
+    pub account: u16,
+    pub canonical_removed: bool,
+    pub config_dir_removed: bool,
+    pub profiles_entry_removed: bool,
+}
+
 /// Returns the current auto-rotation configuration.
 ///
 /// Returns defaults if `rotation.json` does not exist.
@@ -563,12 +611,10 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
             return Err("claude auth login failed or was cancelled".to_string());
         }
 
-        // Read credentials — keychain first, then file
-        let captured = csq_core::credentials::keychain::read(&config_dir)
-            .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok());
-
-        let creds = captured
-            .ok_or_else(|| "no credentials captured after login — try again".to_string())?;
+        // CC writes credentials to `<CLAUDE_CONFIG_DIR>/.credentials.json`
+        // synchronously before `claude auth login` exits.
+        let creds = credentials::load(&config_dir.join(".credentials.json"))
+            .map_err(|e| format!("no credentials captured after login: {e}"))?;
 
         // Save canonical
         credentials::save_canonical(&base, account_num, &creds)

@@ -57,7 +57,21 @@ where
     F: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
 {
     let binary_path = current_binary_path()?;
+    download_and_apply_to(info, &binary_path, http_get)
+}
 
+/// Inner helper that accepts an explicit target binary path so tests can
+/// exercise the full verify + atomic-replace pipeline without pointing at
+/// the real test binary. Callers in production should use
+/// [`download_and_apply`] which resolves the current binary automatically.
+pub fn download_and_apply_to<F>(
+    info: &UpdateInfo,
+    binary_path: &std::path::Path,
+    http_get: F,
+) -> Result<()>
+where
+    F: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
+{
     // Step 1: download the binary into a temp file.
     eprintln!("Downloading csq v{}...", info.version);
     let binary_bytes = http_get(&info.download_url, &[("User-Agent", user_agent().as_str())])
@@ -87,7 +101,7 @@ where
     verify_signature(&binary_bytes, &sig_bytes).context("signature verification failed")?;
 
     // Step 6: write verified binary to a temp file.
-    let tmp_path = unique_tmp_path(&binary_path);
+    let tmp_path = unique_tmp_path(binary_path);
     write_binary(&tmp_path, &binary_bytes)
         .with_context(|| format!("failed to write temp binary to {}", tmp_path.display()))?;
 
@@ -97,7 +111,7 @@ where
 
     // Step 8: atomic replace.
     eprintln!("Replacing {} with new version...", binary_path.display());
-    atomic_replace(&tmp_path, &binary_path).with_context(|| {
+    atomic_replace(&tmp_path, binary_path).with_context(|| {
         // Clean up the temp file on failure to avoid leaving a stale binary.
         let _ = std::fs::remove_file(&tmp_path);
         format!(
@@ -356,6 +370,104 @@ mod tests {
             "checksum should pass for untampered binary"
         );
         assert!(sig_result.is_err(), "bad signature must be rejected");
+    }
+
+    #[test]
+    fn download_and_apply_to_replaces_target_binary_end_to_end() {
+        // Arrange: lay down an "old" binary at a tempdir target path.
+        let dir = TempDir::new().unwrap();
+        let target_path = dir.path().join("csq");
+        std::fs::write(&target_path, b"old binary content").unwrap();
+
+        // Build a valid release bundle for a new binary.
+        let new_content = b"new binary content v2.1.0";
+        let filename = "csq-linux-x86_64";
+        let bundle = build_bundle(new_content, filename);
+
+        let info = UpdateInfo {
+            version: "2.1.0".into(),
+            download_url: format!("https://example.com/{filename}"),
+            signature_url: format!("https://example.com/{filename}.sig"),
+            checksum_url: "https://example.com/SHA256SUMS".into(),
+            html_url: "https://example.com/releases/v2.1.0".into(),
+        };
+
+        let mut responses: HashMap<&'static str, Vec<u8>> = HashMap::new();
+        responses.insert("https://example.com/csq-linux-x86_64", bundle.binary);
+        responses.insert("https://example.com/csq-linux-x86_64.sig", bundle.sig);
+        responses.insert(
+            "https://example.com/SHA256SUMS",
+            bundle.sha256sums.as_bytes().to_vec(),
+        );
+        let transport = make_transport(responses);
+
+        // Act: run the full pipeline against our tempdir binary.
+        let result = download_and_apply_to(&info, &target_path, transport);
+
+        // Assert: no error, target now contains the new bytes, and the
+        // file mode is 0o755 on Unix.
+        assert!(
+            result.is_ok(),
+            "download_and_apply_to should succeed on happy path: {result:?}"
+        );
+        let written = std::fs::read(&target_path).unwrap();
+        assert_eq!(written, new_content, "target must contain new binary");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755, "target must be 0o755 after replace");
+        }
+    }
+
+    #[test]
+    fn download_and_apply_to_leaves_target_untouched_on_checksum_mismatch() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let target_path = dir.path().join("csq");
+        let old_content = b"OLD binary - must not be replaced";
+        std::fs::write(&target_path, old_content).unwrap();
+
+        // Build a bundle whose checksum matches `expected` but serve
+        // `tampered` from the transport — the chain must fail before
+        // the target is touched.
+        let expected = b"expected binary";
+        let tampered = b"TAMPERED binary";
+        let filename = "csq-linux-x86_64";
+        let bundle = build_bundle(expected, filename);
+
+        let info = UpdateInfo {
+            version: "2.1.0".into(),
+            download_url: format!("https://example.com/{filename}"),
+            signature_url: format!("https://example.com/{filename}.sig"),
+            checksum_url: "https://example.com/SHA256SUMS".into(),
+            html_url: "https://example.com/releases/v2.1.0".into(),
+        };
+
+        let mut responses: HashMap<&'static str, Vec<u8>> = HashMap::new();
+        responses.insert("https://example.com/csq-linux-x86_64", tampered.to_vec());
+        responses.insert("https://example.com/csq-linux-x86_64.sig", bundle.sig);
+        responses.insert(
+            "https://example.com/SHA256SUMS",
+            bundle.sha256sums.as_bytes().to_vec(),
+        );
+        let transport = make_transport(responses);
+
+        // Act
+        let result = download_and_apply_to(&info, &target_path, transport);
+
+        // Assert: error returned AND target still has old content.
+        assert!(result.is_err(), "checksum mismatch must abort the pipeline");
+        let after = std::fs::read(&target_path).unwrap();
+        assert_eq!(
+            after, old_content,
+            "target must be untouched when verification fails"
+        );
     }
 
     #[test]

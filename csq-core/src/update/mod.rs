@@ -89,8 +89,26 @@ pub fn auto_update_bg(base_dir: std::path::PathBuf) {
     });
 }
 
-/// Inner function for `auto_update_bg`. Separated for testability.
+/// Inner function for `auto_update_bg`. Uses the real HTTP transport.
 fn run_update_check(base_dir: std::path::PathBuf) -> anyhow::Result<()> {
+    run_update_check_with(base_dir, http::get_with_headers, default_notice_sink)
+}
+
+/// Testable variant of [`run_update_check`] with an injectable HTTP
+/// transport and notice sink. The transport is the same shape as the
+/// real `http::get_with_headers` so tests can drive the cache-fresh
+/// path, the happy path (update found), and the up-to-date path without
+/// touching the network. `notice_sink` receives the one-line stderr
+/// message so tests can assert on the output without capturing stderr.
+fn run_update_check_with<T, S>(
+    base_dir: std::path::PathBuf,
+    http_get: T,
+    mut notice_sink: S,
+) -> anyhow::Result<()>
+where
+    T: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
+    S: FnMut(&str),
+{
     let cache_path = base_dir.join(".csq-update-check");
 
     // Check if the cache is still fresh (< 24 hours).
@@ -98,19 +116,24 @@ fn run_update_check(base_dir: std::path::PathBuf) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let result = check_for_update()?;
+    let result = github::check_latest_version(http_get)?;
 
     // Update the cache timestamp regardless of whether an update was found.
     write_cache_timestamp(&cache_path);
 
     if let Some(info) = result {
-        eprintln!(
+        notice_sink(&format!(
             "csq v{} available — run `csq update install` to upgrade",
             info.version
-        );
+        ));
     }
 
     Ok(())
+}
+
+/// Default notice sink used in production: writes to stderr.
+fn default_notice_sink(msg: &str) {
+    eprintln!("{msg}");
 }
 
 /// Returns `true` if the cache file exists and its mtime is less than 24 hours ago.
@@ -219,6 +242,127 @@ mod tests {
             // On Windows, we can't easily backdate. Skip the assertion.
             let _ = past;
         }
+    }
+
+    // ── run_update_check_with (T2 coverage) ─────────────────────
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Builds a fake GitHub Releases JSON response with the given
+    /// version and a download URL for the current platform.
+    fn fake_release_json(version: &str) -> Vec<u8> {
+        let (platform_tag, filename) = current_platform_asset();
+        format!(
+            r#"{{
+  "tag_name": "v{version}",
+  "prerelease": false,
+  "html_url": "https://example.com/releases/v{version}",
+  "assets": [
+    {{"name": "{filename}", "browser_download_url": "https://example.com/{filename}"}},
+    {{"name": "{filename}.sig", "browser_download_url": "https://example.com/{filename}.sig"}},
+    {{"name": "SHA256SUMS", "browser_download_url": "https://example.com/SHA256SUMS"}}
+  ]
+}}"#,
+            version = version,
+            filename = filename,
+        )
+        .into_bytes()
+        .tap_mut(|_| {
+            // avoid unused_variables on platform_tag
+            let _ = platform_tag;
+        })
+    }
+
+    /// Dummy extension trait so the closure above compiles.
+    trait TapMut: Sized {
+        fn tap_mut(self, _: impl FnOnce(&mut Self)) -> Self {
+            self
+        }
+    }
+    impl<T> TapMut for T {}
+
+    /// Returns a (platform tag, asset filename) pair matching what
+    /// `github::check_latest_version` looks for on the current host.
+    fn current_platform_asset() -> (&'static str, &'static str) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        return ("linux-x86_64", "csq-linux-x86_64");
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return ("macos-aarch64", "csq-macos-aarch64");
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return ("macos-x86_64", "csq-macos-x86_64");
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        return ("windows-x86_64", "csq-windows-x86_64.exe");
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "windows", target_arch = "x86_64"),
+        )))]
+        return ("unknown", "csq-unknown");
+    }
+
+    #[test]
+    fn run_update_check_with_skips_when_cache_is_fresh() {
+        // Arrange: fresh cache file, transport that would panic if called.
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join(".csq-update-check");
+        write_cache_timestamp(&cache);
+
+        let calls = Rc::new(RefCell::new(0usize));
+        let calls_clone = Rc::clone(&calls);
+        let transport = move |_url: &str, _hdrs: &[(&str, &str)]| -> Result<Vec<u8>, String> {
+            *calls_clone.borrow_mut() += 1;
+            Err("transport must not be called when cache is fresh".into())
+        };
+        let notices = Rc::new(RefCell::new(Vec::<String>::new()));
+        let notices_clone = Rc::clone(&notices);
+        let sink = move |msg: &str| {
+            notices_clone.borrow_mut().push(msg.to_string());
+        };
+
+        // Act
+        let result = run_update_check_with(dir.path().to_path_buf(), transport, sink);
+
+        // Assert
+        assert!(result.is_ok());
+        assert_eq!(*calls.borrow(), 0, "no network calls when cache is fresh");
+        assert!(notices.borrow().is_empty(), "no notice when cache is fresh");
+    }
+
+    #[test]
+    fn run_update_check_with_writes_cache_on_up_to_date() {
+        // Arrange: stale cache (no file yet). Transport returns the
+        // CURRENT version so check_latest_version reports None.
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join(".csq-update-check");
+        assert!(!cache.exists());
+
+        let current = env!("CARGO_PKG_VERSION");
+        let json = fake_release_json(current);
+        let transport = move |_url: &str, _hdrs: &[(&str, &str)]| -> Result<Vec<u8>, String> {
+            Ok(json.clone())
+        };
+
+        let notices = Rc::new(RefCell::new(Vec::<String>::new()));
+        let notices_clone = Rc::clone(&notices);
+        let sink = move |msg: &str| {
+            notices_clone.borrow_mut().push(msg.to_string());
+        };
+
+        // Act
+        let result = run_update_check_with(dir.path().to_path_buf(), transport, sink);
+
+        // Assert
+        assert!(
+            result.is_ok(),
+            "up-to-date path should return Ok: {result:?}"
+        );
+        assert!(cache.exists(), "cache timestamp must be written");
+        assert!(
+            notices.borrow().is_empty(),
+            "no notice when already up to date"
+        );
     }
 
     #[test]

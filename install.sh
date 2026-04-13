@@ -76,16 +76,17 @@ pick_bin_dir() {
 # Validates that a tag name looks like a semver release. Rejects
 # arbitrary characters that could alter the download path or
 # resolve to an unexpected artifact.
+#
+# Bash `case` globs use `*` as "any char including /, ;, newline",
+# which is too permissive here — we use a strict `=~` regex anchor
+# so only vMAJOR.MINOR.PATCH[-prerelease] shapes pass.
 validate_tag() {
     local tag="$1"
-    case "$tag" in
-        v[0-9]*\.[0-9]*\.[0-9]*) return 0 ;;
-        *)
-            err "refusing unexpected tag name: '$tag'"
-            err "  expected format: vMAJOR.MINOR.PATCH[-prerelease]"
-            exit 1
-            ;;
-    esac
+    if [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+        err "refusing unexpected tag name: '$tag'"
+        err "  expected format: vMAJOR.MINOR.PATCH[-prerelease]"
+        exit 1
+    fi
 }
 
 resolve_tag() {

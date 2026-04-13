@@ -67,6 +67,17 @@ enum Command {
         account: u16,
     },
 
+    /// Remove an account: deletes credentials, config dir, and profile entry.
+    /// Refuses if a live `claude` process is still bound to the account.
+    #[command(alias = "remove")]
+    Logout {
+        /// Account number to log out
+        account: u16,
+        /// Skip the interactive confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
     /// Provider key management
     #[command(subcommand)]
     Setkey(SetkeyCmd),
@@ -235,6 +246,11 @@ fn main() -> Result<()> {
             let account_num = AccountNum::try_from(account)
                 .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
             commands::login::handle(&base_dir, account_num)
+        }
+        Command::Logout { account, yes } => {
+            let account_num = AccountNum::try_from(account)
+                .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
+            commands::logout::handle(&base_dir, account_num, yes)
         }
         Command::Setkey(sk) => {
             let (provider, key) = match sk {

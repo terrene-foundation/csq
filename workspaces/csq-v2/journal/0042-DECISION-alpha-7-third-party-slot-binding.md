@@ -1,6 +1,28 @@
+---
+type: DECISION
+date: 2026-04-13
+created_at: 2026-04-13T19:30:00+08:00
+author: co-authored
+session_id: 2026-04-13-alpha-7
+session_turn: 1
+project: csq-v2
+topic: alpha.7 binds third-party providers (MiniMax, Z.AI, Claude API key) to numbered slots via `csq setkey --slot N` and adds a 3P-aware launch path to `csq run` that skips OAuth credential loading
+phase: implement
+tags:
+  [
+    alpha-7,
+    setkey,
+    run,
+    third-party,
+    minimax,
+    zai,
+    slot-binding,
+    security-review,
+  ]
+---
+
 # 0042 — DECISION — alpha.7: Third-Party Slot Binding
 
-**Date**: 2026-04-13
 **Status**: Implemented, pending release
 **Predecessor**: 0041 (alpha.6 — logout, setkey, providers, Add Account redesign)
 
@@ -159,3 +181,29 @@ Items still in the alpha.7+ queue from session notes 0041:
 - Same-email duplicate-slot badge in `AccountList.svelte`
 - Bump GitHub Actions versions (deprecated 2026-09-16)
 - Windows desktop smoke test
+
+## For Discussion
+
+1. The decision keeps `csq setkey <provider>` (no `--slot`) working as a
+   global-only fallback that writes `settings-<provider>.json`. The
+   discovery layer treats those as synthetic slots 901/902. Is the
+   global-only fallback still earning its keep, or should alpha.8
+   collapse it into a single "must specify --slot" mode now that the
+   slot path exists? Consider that `csq run 901` has no
+   handle-dir-compatible path today.
+
+2. Security finding L1 (the `secure_file().ok()` swallow) was a copy of
+   the same pattern used elsewhere in the project. If we had instead
+   shipped the LOW finding as "documented and deferred" — the way the
+   image-cache redteam initially closed in journals 0036–0038 — would
+   the chmod-failure path ever have been exercised in practice on the
+   target threat model (single-user macOS/Linux laptop), and what's the
+   evidence either way? (See `feedback_zero_residual_risk.md`.)
+
+3. We resolved 3P launch by reusing the existing handle-dir model and
+   the slot's own `settings.json` as the env carrier. The alternative
+   was a new "3P launch profile" abstraction layered on top of slots.
+   If the codebase had three or more orthogonal launch dimensions
+   (provider × auth method × project × ...), would the slot-as-profile
+   collapse still be the right call, or would the orthogonal
+   abstraction win?

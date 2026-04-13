@@ -35,7 +35,7 @@
 use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::{markers, profiles};
 use csq_core::broker::fanout;
-use csq_core::credentials::{self, file, keychain};
+use csq_core::credentials::{self, file};
 use csq_core::types::AccountNum;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -347,13 +347,11 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
         return Err(anyhow!("claude auth login exited with non-zero status"));
     }
 
-    // Capture credentials — try keychain first, then file
-    let captured = keychain::read(&config_dir)
-        .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok());
-
-    let creds = captured.ok_or_else(|| {
-        anyhow!("no credentials captured after login — keychain and file both empty")
-    })?;
+    // CC writes credentials to `<CLAUDE_CONFIG_DIR>/.credentials.json`
+    // synchronously before `claude auth login` exits, so the file is
+    // always present at this point.
+    let creds = credentials::load(&config_dir.join(".credentials.json"))
+        .map_err(|e| anyhow!("no credentials captured after login: {e}"))?;
 
     // Save canonical + mirror
     file::save_canonical(base_dir, account, &creds)?;

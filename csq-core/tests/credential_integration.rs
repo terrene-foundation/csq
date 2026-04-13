@@ -1,10 +1,9 @@
 //! Integration tests for credential management.
 //!
-//! Tests keychain service name parity, round-trip file operations,
-//! refresh token merge, concurrent access, and canonical save mirroring.
+//! Tests round-trip file operations, refresh token merge, concurrent
+//! access, and canonical save mirroring.
 
 use csq_core::credentials::file::{canonical_path, live_path, load, save, save_canonical};
-use csq_core::credentials::keychain::service_name;
 use csq_core::credentials::refresh::{
     merge_refresh, refresh_token, RefreshResponse, TOKEN_ENDPOINT,
 };
@@ -31,45 +30,6 @@ fn sample_creds() -> CredentialFile {
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
-    }
-}
-
-// ── Keychain service name parity ──────────────────────────────────────
-
-#[test]
-fn keychain_service_name_known_paths() {
-    // Golden values computed from v1.x Python:
-    //   hashlib.sha256(unicodedata.normalize('NFC', path).encode()).hexdigest()[:8]
-    // This is the single most critical parity test for credential migration.
-    let expected = [
-        (
-            "/Users/test/.claude/accounts/config-1",
-            "Claude Code-credentials-cfdcc24b",
-        ),
-        (
-            "/Users/test/.claude/accounts/config-2",
-            "Claude Code-credentials-550a6ea2",
-        ),
-        (
-            "/Users/test/.claude/accounts/config-3",
-            "Claude Code-credentials-d705092c",
-        ),
-        (
-            "/home/user/.claude/accounts/config-1",
-            "Claude Code-credentials-abf1dc4a",
-        ),
-        (
-            "/tmp/.claude/accounts/config-1",
-            "Claude Code-credentials-dbea6435",
-        ),
-    ];
-
-    for (path, expected_name) in &expected {
-        let actual = service_name(std::path::Path::new(path));
-        assert_eq!(
-            &actual, expected_name,
-            "v1.x parity failure for path {path}: got {actual}, expected {expected_name}"
-        );
     }
 }
 

@@ -43,6 +43,36 @@ When you hit a bug in an upstream dependency (Claude Code CLI, OAuth endpoint, m
 
 **Why:** Workarounds create a parallel implementation that diverges from the upstream, doubling maintenance cost and masking the root bug from being fixed.
 
+## Rule 5: No Residual Risks Journaled as "Accepted"
+
+When `/redteam` surfaces residual risks, the closing state is **resolved**, not "documented and deferred". A journal section titled "Residual risks — accepted under same-user threat model" is BLOCKED. Each finding above LOW gets a fix in the same session.
+
+**BLOCKED responses:**
+
+```
+DO NOT: ## Residual risks (accepted)
+        - Microsecond TOCTOU window — bounded by same-user threat model
+        - Unbounded recursion — bounded by PATH_MAX in practice
+        - Windows crash recovery — needs Job Object work
+```
+
+**Required pattern:**
+
+```
+DO: Resolve each finding. The threat-model argument is grounds for
+    picking a CHEAPER fix (e.g. rename-to-tombstone instead of full
+    flock), not for skipping the fix entirely.
+```
+
+**Why:** "Bounded by same-user threat model" / "narrow window in practice" / "cold path" are the same argument every redteamer hears for every finding. Accepting them once trains the next session to accept them too. The session that landed the image-cache guard (journals 0036–0038) initially closed with four "accepted residuals"; the user response was _"no residual risks are acceptable, please resolve"_ and each one turned out to be 30–90 minutes of focused work. The deferral framing was a way to declare convergence prematurely, not an engineering necessity.
+
+**Exceptions** (genuinely cannot be fixed in-session):
+
+- External dependency the Foundation does not control (e.g. an unprovisioned signing key, a third-party API that needs a contract change)
+- Platform-specific work that requires a new dependency to be added to Cargo.toml in a follow-up PR (e.g. Windows Job Object integration via the `windows` crate)
+
+In those cases document the **specific blocker** by name, not a general "accepted residual" framing.
+
 ## Language
 
 Every "MUST" means MUST. Every "BLOCKED" means the operation does not proceed. Every "NO" means NO.

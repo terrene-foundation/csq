@@ -81,7 +81,7 @@ Then add `%USERPROFILE%\.local\bin` to `PATH` if it isn't already.
 After install:
 
 ```bash
-csq --version    # should print: csq 2.0.0-alpha.3
+csq --version    # should print: csq 2.0.0-alpha.4
 csq doctor       # runs diagnostics
 csq login 1      # authenticate your first account
 ```
@@ -174,11 +174,65 @@ cargo run -p csq-cli -- run 1                # run CLI from source without insta
 
 ## Upgrading from an earlier csq
 
-If you already have csq installed, you have two options:
+csq has been through three generations. Find your current version below
+and follow the matching path. **Your accounts and credentials in
+`~/.claude/accounts/` are preserved across every generation** — the
+credential file layout (`credentials/N.json` + `config-N/`) has been
+stable since the original Python version.
 
-### Option 1 — `csq update install` (auto-update, recommended)
+```bash
+csq --version    # tells you which generation you're on
+```
 
-Starting with `v2.0.0-alpha.3`, csq verifies releases against the
+### From the Python era (v1.x — `pip install csq` / git clone)
+
+The original csq was a stdlib-only Python tool (`rotation-engine.py`).
+If you installed it via `pip` or by cloning the repo and adding it to
+`$PATH`, that version is no longer maintained. Migrate to the Rust v2:
+
+```bash
+# Optional — uninstall the old Python version
+pip uninstall csq    # if you used pip
+# Or just delete your old git checkout — credentials live in
+# ~/.claude/accounts/ and are not touched by uninstall
+
+# Install the current Rust binary
+curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
+csq --version    # csq 2.0.0-alpha.4
+```
+
+Your accounts at `~/.claude/accounts/credentials/N.json` are picked
+up automatically by the Rust version — same paths, same JSON schema,
+no migration step needed. Run `csq doctor` to verify the daemon can
+see all your accounts.
+
+> **About commands**: a few v1.x command flags were renamed in v2.
+> `csq run N` and `csq swap N` are unchanged. If a script references
+> a flag that no longer exists, run `csq help` for the current
+> surface.
+
+### From an early Rust release (`v2.0.0-alpha.1`, `alpha.2`, or `alpha.3`)
+
+`csq update install` exists in your installed binary but will refuse
+with _"the release signing key has not been configured"_ — the
+Foundation Ed25519 key was first wired into a public release at
+`alpha.4` and your old binary still has the dev placeholder.
+(`alpha.3` was tagged but never published — its CI build failed.)
+Re-run the installer **once** to pick up `alpha.4`, after which
+auto-update works for every subsequent release:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
+csq --version    # csq 2.0.0-alpha.4
+csq update check # should now report up-to-date
+```
+
+After this one-shot upgrade, the canonical path is `csq update install`
+(see below) — you won't need the curl-pipe again.
+
+### From `v2.0.0-alpha.4` or later — `csq update install`
+
+Once you're on `alpha.4` or later, csq verifies releases against the
 Foundation's Ed25519 signing key and can upgrade itself in place:
 
 ```bash
@@ -188,37 +242,38 @@ csq update install       # download, verify SHA256 + Ed25519, atomic swap
 
 The CLI also runs a background check on every invocation and prints
 `csq vX.Y.Z available — run csq update install to upgrade` to stderr
-when a release lands. Cached for 24 hours per machine.
+when a release lands. Cached for 24 hours per machine. The desktop
+app does the same check on launch and surfaces the notice via system
+log.
 
-> **Note for users on `v2.0.0-alpha.2` or earlier**: your installed
-> binary still has the placeholder signing key and `csq update install`
-> will refuse with _"the release signing key has not been configured"_.
-> Use Option 2 (re-run the installer) **once** to pick up `alpha.3`,
-> after which `csq update install` becomes the canonical upgrade
-> path and you won't need the curl-pipe again.
+### Desktop app upgrades
 
-### Option 2 — re-run the installer (one-shot fallback)
-
-This always works and is the right call for first-time setup or for
-upgrading from any version with the placeholder signing key:
-
-```bash
-# macOS / Linux
-curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
-```
-
-The installer downloads the latest release for your platform, verifies
-SHA256 against the release's `SHA256SUMS`, and writes to
-`~/.local/bin/csq`. Existing `~/.claude/accounts/` data is untouched.
-
-### Desktop app
-
-The desktop app currently follows the binary-install pattern — re-download
-the `.dmg` / `.msi` / `.deb` / `.AppImage` from
+The desktop bundle (`Code Session Quota.app` on macOS, `.msi` on
+Windows, `.deb`/`.rpm`/`.AppImage` on Linux) is a separate artifact
+from the CLI binary and currently upgrades by re-downloading from
 [GitHub Releases](https://github.com/terrene-foundation/csq/releases).
-The desktop daemon does the same background update check as the CLI
-and surfaces a notice via the system log on launch when an update
-is available.
+The CLI binary inside the desktop bundle and the standalone CLI binary
+are interchangeable — installing the standalone CLI does NOT replace
+the desktop bundle, and vice versa. If you use both, upgrade both.
+
+The desktop daemon runs the same background update check as the CLI
+and prints to the system log on launch when an update is available;
+in-app notification UI is on the roadmap for a future release.
+
+### What if I have local changes?
+
+`csq` does not modify the user's `~/.claude/accounts/` data structure
+across versions, so an upgrade is safe even if you're mid-session:
+
+- Running CC sessions: each session uses an ephemeral
+  `term-<pid>/` handle dir under `~/.claude/accounts/`. The daemon
+  sweep preserves any pasted images into `~/.claude/image-cache/`
+  before removing dead handle dirs, so closing your terminal and
+  upgrading does not lose work.
+- The daemon: stop it before upgrading the desktop app
+  (`Quit` from the tray menu, or `csq daemon stop` for the CLI
+  daemon). The new version will re-launch on next CLI invocation
+  or on app start.
 
 ## Using local models (Ollama)
 

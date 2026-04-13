@@ -52,7 +52,12 @@
 //! already the same UID, which is exactly the threat model for a
 //! per-user daemon.
 
-#![cfg(unix)]
+// This module is shared by both the Unix-socket listener (cfg(unix))
+// and the Windows named-pipe listener (cfg(windows) — see
+// `server_windows.rs`). The router definition, RouterState, request
+// handlers, and request/response types are cross-platform. Only the
+// Unix-specific bind/accept loop and SO_PEERCRED helpers are gated
+// behind `#[cfg(unix)]` further down.
 
 use super::cache::TtlCache;
 use super::refresher::RefreshStatus;
@@ -70,10 +75,13 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
@@ -632,6 +640,7 @@ impl ServerHandle {
 /// Returns a [`ServerHandle`] the caller can use to trigger
 /// shutdown, and an awaitable future that resolves when the accept
 /// loop has exited.
+#[cfg(unix)]
 pub async fn serve(
     socket_path: &Path,
     state: RouterState,
@@ -713,6 +722,7 @@ pub async fn serve(
 /// shutdown — the daemon's main loop (in lifecycle.rs) is
 /// responsible for the wider graceful-shutdown deadline via
 /// `JoinHandle::abort` or a tokio `timeout`.
+#[cfg(unix)]
 async fn accept_loop(
     listener: UnixListener,
     app: Arc<Router>,
@@ -788,7 +798,7 @@ async fn accept_loop(
 ///
 /// Any getsockopt failure or UID mismatch returns `Err` — the
 /// caller drops the stream without invoking the HTTP router.
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
     // `libc::ucred` layout: { pid: pid_t, uid: uid_t, gid: gid_t }
     let fd = stream.as_raw_fd();
@@ -820,7 +830,7 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
     // macOS `struct xucred` from <sys/ucred.h>:
     //   cr_version: u32
@@ -868,7 +878,7 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn verify_peer_uid(_stream: &tokio::net::UnixStream) -> std::io::Result<()> {
     // Other Unixes: no portable peer-credential API. The 0o600
     // socket permission is the sole boundary; log a warning so

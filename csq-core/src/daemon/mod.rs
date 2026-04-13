@@ -32,7 +32,11 @@ pub mod pid;
 pub mod refresher;
 pub mod usage_poller;
 
-#[cfg(unix)]
+// `server` contains the cross-platform router, RouterState, request
+// handlers, and JSON types. The Unix-socket bind/accept loop inside
+// it is gated on `#[cfg(unix)]` per-function. The Windows named-pipe
+// listener (`server_windows`) imports `router` and `RouterState` from
+// here so both transports share the same axum router definition.
 pub mod server;
 #[cfg(windows)]
 pub mod server_windows;
@@ -53,8 +57,11 @@ pub use client::{
     http_get_unix, http_get_unix_with_timeout, http_post_unix, DaemonClientError, DaemonResponse,
     DEFAULT_TIMEOUT,
 };
+// Cross-platform router types.
+pub use server::{router, HealthResponse, ServerHandle};
+// Unix-only listener entry point.
 #[cfg(unix)]
-pub use server::{router, serve, HealthResponse, ServerHandle};
+pub use server::serve;
 
 #[cfg(windows)]
 pub use client_windows::{

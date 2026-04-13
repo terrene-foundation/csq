@@ -4,13 +4,15 @@ Quick reference for the background daemon's subsystem design, invariants, and se
 
 ## Subsystem Overview
 
-| Subsystem        | File                               | Interval   | Output                                   |
-| ---------------- | ---------------------------------- | ---------- | ---------------------------------------- |
-| Token refresher  | `daemon/refresher.rs`              | 5 min      | `RefreshStatus` cache + credential files |
-| Anthropic poller | `daemon/usage_poller.rs` tick()    | 5 min      | `quota.json`                             |
-| 3P poller        | `daemon/usage_poller.rs` tick_3p() | 15 min     | `quota.json` (with `RateLimitData`)      |
-| Auto-rotator     | `daemon/auto_rotate.rs`            | 30s        | Atomic swap via `rotation::swap_to`      |
-| HTTP server      | `daemon/server.rs`                 | on-request | JSON over Unix socket                    |
+| Subsystem        | File                               | Interval   | Output                                                  |
+| ---------------- | ---------------------------------- | ---------- | ------------------------------------------------------- |
+| Token refresher  | `daemon/refresher.rs`              | 5 min      | `RefreshStatus` cache + credential files                |
+| Anthropic poller | `daemon/usage_poller.rs` tick()    | 5 min      | `quota.json`                                            |
+| 3P poller        | `daemon/usage_poller.rs` tick_3p() | 15 min     | `quota.json` (with `RateLimitData`)                     |
+| Auto-rotator     | `daemon/auto_rotate.rs`            | 30s        | Atomic swap via `rotation::swap_to`                     |
+| Handle-dir sweep | `session/handle_dir.rs`            | 60s        | Removes orphan `term-*` dirs + preserves `image-cache/` |
+| Update check     | `update::auto_update_bg`           | 24h cache  | Stderr notice on new release                            |
+| HTTP server      | `daemon/server.rs`                 | on-request | JSON over Unix socket                                   |
 
 **Removed 2026-04-11** (see journal 0020): `daemon/oauth_callback.rs` was a TCP listener on `127.0.0.1:8420` serving `/oauth/callback` for the v1 loopback OAuth flow. Anthropic retired loopback for this client_id — the module and its ~1000 LOC are gone. OAuth now uses the paste-code flow via `/api/login/{N}` + `POST /api/oauth/exchange` on the Unix socket.
 
@@ -83,6 +85,40 @@ Tests inject mocks that return predetermined responses — no HTTP dependency in
 ## Cache Invalidation
 
 `POST /api/invalidate-cache` clears both `discovery_cache` and `cache`. Called by `csq swap` after a successful account switch. Silent on failure (cache expires naturally within 5s TTL).
+
+## Handle-Dir Sweep + Image-Cache Preservation
+
+The handle-dir sweep removes orphaned `term-<pid>/` directories whose owner process is dead. Two non-obvious invariants make this safe under concurrent `csq run` invocations:
+
+### Authority of `.live-pid`, not the dir name
+
+The dir name's parsed PID (`term-<pid>`) is only a first-pass filter. The authoritative owner is the `.live-pid` file written by `create_handle_dir`. The sweep:
+
+1. Reads `.live-pid` (`markers::read_live_pid`, refuses symlinks)
+2. Falls back to the dir-name PID only if the marker is missing or corrupt
+3. Re-reads `.live-pid` immediately before the destructive step to catch racing creates
+4. Atomic `rename` to `.sweep-tombstone-<pid>-<nanos>` frees the `term-<pid>` path in a single syscall
+5. `cleanup_stale_tombstones` runs at the top of every tick to mop up any tombstones from a crashed previous sweep
+
+### Why `image-cache` cannot be in `SHARED_ITEMS`
+
+CC writes pasted images to `$CLAUDE_CONFIG_DIR/image-cache/<session-id>/` and runs `Dv7()` periodically to delete every entry except the current session. If the dir were shared via symlink across handle dirs, two concurrent terminals would race to delete each other's caches.
+
+The fix is per-session preservation on sweep:
+
+- Walk dead `term-<pid>/image-cache/<session-id>/` entries
+- For each one whose name passes `is_valid_session_name` (lowercase `[0-9a-f-]{1,64}`):
+  - If the destination is clear: atomic `rename` (EXDEV → iterative copy fallback)
+  - If the destination collides (`--resume` from another handle): `merge_session_into_existing` walks file-by-file, **live side wins** on filename collision, recurses into subdirs
+- 3-layer symlink refusal: source `image-cache/`, per-entry `<sid>/`, destination `~/.claude/image-cache/`
+
+### Windows `.live-cc-pid`
+
+On Unix, `csq run` calls `exec` to replace csq-cli with claude — single PID. On Windows, `csq run` spawns claude as a child and writes the child's PID to `.live-cc-pid`. The sweep checks BOTH `.live-pid` (csq-cli) and `.live-cc-pid` (CC child) before treating a handle dir as orphaned. Closes the case where csq-cli crashes while CC is still running.
+
+`create_handle_dir` invariant: `pid` MUST equal `std::process::id()`. Breaking it opens a sweep race window where the sweep can observe a `term-<pid>` whose dir-name PID is dead while another live process is populating it.
+
+See journals 0035 (Dv7 race), 0036 (preservation design), 0037 (redteam convergence), 0038 (residual-risk resolution).
 
 ## Graceful Shutdown
 

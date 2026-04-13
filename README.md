@@ -23,9 +23,23 @@ Multi-provider session manager for Claude Code. Run Claude Code against local mo
 
 ## Install
 
-csq ships **unsigned** binaries for all three platforms. The Terrene Foundation has not yet provisioned code-signing certificates (Apple Developer ID, Authenticode) because the recurring cost is not yet justified for an alpha release. The CLI works identically to a signed build; the desktop app triggers a one-time Gatekeeper/SmartScreen warning on first launch.
+csq ships **unsigned** binaries for all three platforms (no Apple Developer ID, no Authenticode — the recurring cost isn't justified for an alpha release). The CLI works identically to a signed build; the desktop app triggers a one-time warning on first launch that you have to bypass.
 
-CLI binaries download via the install script without warnings. The desktop app ships as `.dmg` (macOS), `.AppImage`/`.deb`/`.rpm` (Linux), and `.msi` (Windows). You can also build any component from source.
+**macOS first-launch bypass** (from `v2.0.0-alpha.5` onward, the `.app` is ad-hoc signed so you get a proper bypass, not the older "file is damaged" dead-end):
+
+1. Mount the `.dmg` and drag the `.app` to `/Applications/` as usual
+2. **Right-click** `Code Session Quota.app` in Finder → **Open** → click **Open** on the dialog
+3. From then on, double-click works normally
+
+If you see **"file is damaged and can't be opened"** (only happens with binaries from `v2.0.0-alpha.4` or earlier), your copy has the broken Tauri bundler signature. Run this once:
+
+```bash
+xattr -cr "/Applications/Code Session Quota.app"
+codesign --force --deep --sign - "/Applications/Code Session Quota.app"
+open "/Applications/Code Session Quota.app"
+```
+
+CLI binaries download via the install script without any warnings. The desktop app ships as `.dmg` (macOS), `.AppImage`/`.deb`/`.rpm` (Linux), and `.msi` (Windows). You can also build any component from source.
 
 ### Prerequisites
 
@@ -230,7 +244,7 @@ csq update check # should now report up-to-date
 After this one-shot upgrade, the canonical path is `csq update install`
 (see below) — you won't need the curl-pipe again.
 
-### From `v2.0.0-alpha.5` or later — `csq update install`
+### From `v2.0.0-alpha.4` or later — `csq update install`
 
 Once you're on `alpha.4` or later, csq verifies releases against the
 Foundation's Ed25519 signing key and can upgrade itself in place:
@@ -449,6 +463,27 @@ csq login 2   # repeat for each account
 csq login 3
 # ...as many as you need
 ```
+
+**How `csq login N` works** (from `v2.0.0-alpha.5`): if the `claude`
+binary is on your `PATH`, csq delegates the OAuth flow to
+`claude auth login` with an isolated `CLAUDE_CONFIG_DIR=config-N/`.
+Same seamless UX as running `claude auth login` directly — browser
+opens, you sign in, Claude Code's hosted-callback page bridges the
+authorization code back automatically. csq imports the credentials
+from the isolated dir when CC exits, then writes `credentials/N.json`
+with the atomic-replace helpers.
+
+If `claude` isn't on your `PATH`, csq falls back to an in-process
+paste-code flow: it opens the authorize URL, then prompts on stdin
+for the authorization code Anthropic's hosted callback page displays.
+Paste the code and csq completes the exchange via the daemon.
+
+> **Known limitation**: there's currently no `csq logout N` or
+> `csq remove N` command. To free a slot you have to manually delete
+> `~/.claude/accounts/credentials/N.json`,
+> `~/.claude/accounts/config-N/.credentials.json`, and the entry in
+> `~/.claude/accounts/profiles.json`, then restart the daemon. Proper
+> `csq logout` + desktop "Remove account" UI are planned for `alpha.6`.
 
 ### Daily use
 

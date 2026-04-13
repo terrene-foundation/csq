@@ -79,6 +79,22 @@ pub fn bind_provider_to_slot(
     //    `default_settings` already populates base URL and all model keys.
     let mut settings_value = provider_settings::default_settings(provider);
     if let Some(obj) = settings_value.as_object_mut() {
+        // CC reads `apiKeyHelper` as a shell command that returns an API
+        // key — NOT as a system primer. The provider catalog stores the
+        // primer in `Provider::system_primer` and `default_settings`
+        // historically serialized it under `apiKeyHelper`, which is
+        // inert when written to the global `settings-<provider>.json`
+        // (CC never reads that file) but collides with
+        // `env.ANTHROPIC_AUTH_TOKEN` when the same Value is written to
+        // `config-<N>/settings.json` (which CC does read). CC then
+        // warns "Auth conflict: Both a token (ANTHROPIC_AUTH_TOKEN) and
+        // an API key (apiKeyHelper) are set."
+        //
+        // Strip `apiKeyHelper` from the slot-bound output unconditionally.
+        // Bearer-auth providers authenticate via the env token; the
+        // primer belongs in a system-prompt mechanism, not this field.
+        obj.remove("apiKeyHelper");
+
         let env_obj = obj
             .entry("env".to_string())
             .or_insert_with(|| Value::Object(Default::default()));
@@ -222,6 +238,36 @@ mod tests {
         assert_eq!(found.label, "MiniMax");
         assert_eq!(found.method, "api_key");
         assert!(found.has_credentials);
+    }
+
+    #[test]
+    fn bind_strips_api_key_helper() {
+        // Regression for alpha.7 auth-conflict bug: `default_settings`
+        // wrote the provider's system_primer into `apiKeyHelper`, which
+        // CC reads as a shell command returning an API key. Combined
+        // with `env.ANTHROPIC_AUTH_TOKEN`, CC warned about an auth
+        // conflict and refused to use the token cleanly. The slot-bind
+        // path MUST strip `apiKeyHelper` before writing.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, "sk-cp-test").unwrap();
+
+        let settings_path = dir.path().join("config-9/settings.json");
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            json.get("apiKeyHelper").is_none(),
+            "apiKeyHelper must not be written to slot-bound settings.json: {}",
+            json
+        );
+        // Sanity: the token is still there.
+        assert_eq!(
+            json.get("env")
+                .unwrap()
+                .get("ANTHROPIC_AUTH_TOKEN")
+                .unwrap(),
+            "sk-cp-test"
+        );
     }
 
     #[test]

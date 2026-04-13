@@ -390,17 +390,56 @@ fn finalize(base_dir: &Path, account: AccountNum) -> Result<()> {
     Ok(())
 }
 
+/// Reads the account email for a freshly-logged-in config dir.
+///
+/// Tries two sources, in order:
+///
+/// 1. **`config_dir/.claude.json`** → `oauthAccount.emailAddress`.
+///    CC writes this field to the local `.claude.json` as part of
+///    `claude auth login`, and it's the canonical on-disk copy of
+///    the user identity bound to that slot. File-based, no
+///    subprocess, no timing window — preferred.
+///
+/// 2. **`claude auth status --json`** fallback. Kept for cases
+///    where `.claude.json` is missing (e.g. the user ran
+///    `csq login` against a pre-existing config dir that CC had
+///    populated via `.credentials.json` but not `.claude.json`).
+///
+/// The previous implementation shelled out to `claude auth status`
+/// exclusively. That had a race window right after `claude auth login`
+/// exited where CC's keychain/.claude.json writes hadn't fully landed,
+/// causing the JSON output to lack `email` and the finalizer to
+/// report `Logged in as unknown`.
 fn get_email_from_cc(config_dir: &Path) -> Result<String> {
+    // Source 1: .claude.json local state (preferred)
+    let claude_json_path = config_dir.join(".claude.json");
+    if let Ok(content) = std::fs::read_to_string(&claude_json_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(email) = json
+                .get("oauthAccount")
+                .and_then(|a| a.get("emailAddress"))
+                .and_then(|v| v.as_str())
+            {
+                if !email.is_empty() {
+                    return Ok(email.to_string());
+                }
+            }
+        }
+    }
+
+    // Source 2: claude auth status --json (legacy fallback)
     let output = Command::new("claude")
         .args(["auth", "status", "--json"])
         .env("CLAUDE_CONFIG_DIR", config_dir)
-        .output()?;
+        .output()
+        .context("failed to spawn `claude auth status`")?;
 
     if !output.status.success() {
         return Err(anyhow!("claude auth status failed"));
     }
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("claude auth status produced non-JSON output")?;
     json.get("email")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())

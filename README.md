@@ -81,7 +81,7 @@ Then add `%USERPROFILE%\.local\bin` to `PATH` if it isn't already.
 After install:
 
 ```bash
-csq --version    # should print: csq 2.0.0-alpha.2
+csq --version    # should print: csq 2.0.0-alpha.3
 csq doctor       # runs diagnostics
 csq login 1      # authenticate your first account
 ```
@@ -171,6 +171,54 @@ Artifacts land at `target/release/bundle/<format>/`:
 cd csq-desktop && npx @tauri-apps/cli dev    # hot-reload desktop
 cargo run -p csq-cli -- run 1                # run CLI from source without install
 ```
+
+## Upgrading from an earlier csq
+
+If you already have csq installed, you have two options:
+
+### Option 1 — `csq update install` (auto-update, recommended)
+
+Starting with `v2.0.0-alpha.3`, csq verifies releases against the
+Foundation's Ed25519 signing key and can upgrade itself in place:
+
+```bash
+csq update check         # see if a newer version exists
+csq update install       # download, verify SHA256 + Ed25519, atomic swap
+```
+
+The CLI also runs a background check on every invocation and prints
+`csq vX.Y.Z available — run csq update install to upgrade` to stderr
+when a release lands. Cached for 24 hours per machine.
+
+> **Note for users on `v2.0.0-alpha.2` or earlier**: your installed
+> binary still has the placeholder signing key and `csq update install`
+> will refuse with _"the release signing key has not been configured"_.
+> Use Option 2 (re-run the installer) **once** to pick up `alpha.3`,
+> after which `csq update install` becomes the canonical upgrade
+> path and you won't need the curl-pipe again.
+
+### Option 2 — re-run the installer (one-shot fallback)
+
+This always works and is the right call for first-time setup or for
+upgrading from any version with the placeholder signing key:
+
+```bash
+# macOS / Linux
+curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
+```
+
+The installer downloads the latest release for your platform, verifies
+SHA256 against the release's `SHA256SUMS`, and writes to
+`~/.local/bin/csq`. Existing `~/.claude/accounts/` data is untouched.
+
+### Desktop app
+
+The desktop app currently follows the binary-install pattern — re-download
+the `.dmg` / `.msi` / `.deb` / `.AppImage` from
+[GitHub Releases](https://github.com/terrene-foundation/csq/releases).
+The desktop daemon does the same background update check as the CLI
+and surfaces a notice via the system log on launch when an update
+is available.
 
 ## Using local models (Ollama)
 

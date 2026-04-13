@@ -57,9 +57,9 @@ pub const PROVIDERS: &[Provider] = &[
         auth_type: AuthType::Bearer,
         key_env_var: Some("ANTHROPIC_AUTH_TOKEN"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
-        default_base_url: Some("https://api.minimax.chat/anthropic"),
-        default_model: "MiniMax-M2",
-        validation_endpoint: Some("https://api.minimax.chat/anthropic/v1/messages"),
+        default_base_url: Some("https://api.minimax.io/anthropic"),
+        default_model: "MiniMax-M2.7-highspeed",
+        validation_endpoint: Some("https://api.minimax.io/anthropic/v1/messages"),
         settings_filename: "settings-mm.json",
         system_primer: Some(
             "You are a helpful coding assistant with access to tools for editing files and running commands.",
@@ -73,7 +73,7 @@ pub const PROVIDERS: &[Provider] = &[
         key_env_var: Some("ANTHROPIC_AUTH_TOKEN"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
         default_base_url: Some("https://api.z.ai/api/anthropic"),
-        default_model: "glm-4.6",
+        default_model: "glm-5.1",
         validation_endpoint: Some("https://api.z.ai/api/anthropic/v1/messages"),
         settings_filename: "settings-zai.json",
         system_primer: Some(

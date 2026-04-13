@@ -1,7 +1,9 @@
 //! Integration tests for credential management.
 //!
-//! Tests keychain service name parity, round-trip file operations,
-//! refresh token merge, concurrent access, and canonical save mirroring.
+//! Tests keychain service-name parity (locking in CC's hash format
+//! so csq stays compatible with CC's keychain writes), round-trip
+//! file operations, refresh token merge, concurrent access, and
+//! canonical save mirroring.
 
 use csq_core::credentials::file::{canonical_path, live_path, load, save, save_canonical};
 use csq_core::credentials::keychain::service_name;
@@ -40,7 +42,10 @@ fn sample_creds() -> CredentialFile {
 fn keychain_service_name_known_paths() {
     // Golden values computed from v1.x Python:
     //   hashlib.sha256(unicodedata.normalize('NFC', path).encode()).hexdigest()[:8]
-    // This is the single most critical parity test for credential migration.
+    // CC's `claude auth login` writes the credential blob under the
+    // same hashed service name when launched with a non-default
+    // CLAUDE_CONFIG_DIR — locking these values keeps csq's read
+    // path compatible with CC's writes across both implementations.
     let expected = [
         (
             "/Users/test/.claude/accounts/config-1",

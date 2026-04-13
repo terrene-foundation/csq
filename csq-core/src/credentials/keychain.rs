@@ -1,8 +1,21 @@
-//! Keychain integration — service name derivation, read, and write.
+//! Keychain integration — service name derivation and read-only access.
 //!
-//! macOS: hex-encoded JSON via `security-framework` native API (CC compatibility).
-//! Linux/Windows: direct JSON via `keyring` crate (CC doesn't read
-//! keychain on these platforms).
+//! csq does NOT write to the keychain. CC owns its own keychain
+//! entries: when launched with `CLAUDE_CONFIG_DIR=config-N`, CC's
+//! `claude auth login` writes the credential JSON to a generic
+//! password whose service name is `Claude Code-credentials-{hash}`,
+//! where `{hash}` is the first 8 hex characters of SHA-256 of the
+//! NFC-normalized config dir path. csq only READS that entry to
+//! recover credentials in the rare case where CC writes the keychain
+//! but skips `.credentials.json` (observed: some CC versions / some
+//! configurations write keychain-only on first login).
+//!
+//! Without this fallback, `csq login N` cannot capture credentials
+//! after `claude auth login` exits — see journal 0040 §1 and the
+//! account-7 regression caught while testing alpha.6.
+//!
+//! On non-macOS platforms the read is a no-op stub: CC does not use
+//! the keychain crate on Linux or Windows.
 
 use super::CredentialFile;
 use crate::error::PlatformError;
@@ -11,30 +24,8 @@ use std::path::Path;
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
-/// Keychain account parameter. CC uses the system username.
-/// macOS GUI apps don't inherit $USER, so we use libc getpwuid.
-#[cfg(target_os = "macos")]
-fn keychain_account() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .or_else(|_| {
-            // POSIX fallback for GUI apps that don't have $USER
-            unsafe {
-                let uid = libc::getuid();
-                let pw = libc::getpwuid(uid);
-                if pw.is_null() {
-                    return Err(std::env::VarError::NotPresent);
-                }
-                let name = std::ffi::CStr::from_ptr((*pw).pw_name);
-                name.to_str()
-                    .map(|s| s.to_string())
-                    .map_err(|_| std::env::VarError::NotPresent)
-            }
-        })
-        .unwrap_or_else(|_| "credentials".to_string())
-}
-
-/// Derives the keychain service name for a given CC config directory.
+/// Derives the keychain service name CC uses for a given config
+/// directory.
 ///
 /// Format: `Claude Code-credentials-{hash}` where `{hash}` is the
 /// first 8 hex characters of SHA-256 of the NFC-normalized path.
@@ -45,30 +36,16 @@ pub fn service_name(config_dir: &Path) -> String {
     format!("Claude Code-credentials-{prefix}")
 }
 
-/// Writes credentials to the system keychain (best-effort).
+/// Reads credentials from the system keychain that CC wrote for the
+/// given config directory.
 ///
-/// On macOS: hex-encodes JSON before writing (CC compatibility).
-/// On other platforms: stores JSON directly.
+/// On macOS: uses the `security` CLI to find the generic password,
+/// then attempts to parse the value as raw JSON (CC's modern
+/// format) before falling back to a hex-decode (CC's legacy format).
 ///
-/// Failures are logged but never propagated — keychain writes are
-/// best-effort and must not block the critical path.
-pub fn write(config_dir: &Path, creds: &CredentialFile) {
-    let svc = service_name(config_dir);
-    if let Err(e) = write_impl(&svc, creds) {
-        warn!(
-            service = %svc,
-            error = %e,
-            "keychain write failed (best-effort, non-fatal)"
-        );
-    }
-}
-
-/// Reads credentials from the system keychain.
-///
-/// On macOS: reads and hex-decodes the payload.
-/// On other platforms: reads JSON directly.
-///
-/// Returns `None` if the keychain entry doesn't exist or can't be read.
+/// Returns `None` if the keychain entry doesn't exist, can't be
+/// read, or contains malformed data — the caller is expected to
+/// chain a file-based fallback.
 pub fn read(config_dir: &Path) -> Option<CredentialFile> {
     let svc = service_name(config_dir);
     match read_impl(&svc) {
@@ -77,7 +54,7 @@ pub fn read(config_dir: &Path) -> Option<CredentialFile> {
             warn!(
                 service = %svc,
                 error = %e,
-                "keychain read failed"
+                "keychain read failed (fallback to file path)"
             );
             None
         }
@@ -86,34 +63,14 @@ pub fn read(config_dir: &Path) -> Option<CredentialFile> {
 
 // ── macOS implementation ──────────────────────────────────────────────
 //
-// Uses the `security-framework` crate for native Keychain API access,
-// avoiding subprocess invocation and the C2 credential-exposure risk
-// (hex payload visible in `ps aux` when passed as a CLI argument).
-
-#[cfg(target_os = "macos")]
-fn write_impl(service: &str, creds: &CredentialFile) -> Result<(), PlatformError> {
-    use security_framework::passwords::{delete_generic_password, set_generic_password};
-
-    let json = serde_json::to_string(creds)
-        .map_err(|e| PlatformError::Keychain(format!("serialize: {e}")))?;
-    // Hex-encode for CC compatibility — CC reads hex-encoded JSON from the keychain.
-    let hex_payload = hex::encode(json.as_bytes());
-
-    // Delete first to handle the "already exists" case (equivalent to `security -U`).
-    // Ignore the error: if the entry doesn't exist, the delete is a no-op.
-    let _ = delete_generic_password(service, &keychain_account());
-
-    set_generic_password(service, &keychain_account(), hex_payload.as_bytes())
-        .map_err(|e| PlatformError::Keychain(format!("keychain write: {e}")))?;
-    Ok(())
-}
+// Uses the `security` CLI tool (already trusted on macOS) instead of
+// the `security-framework` crate so the read does not trigger a
+// per-binary keychain authorization prompt on every debug rebuild
+// (the binary hash changes each time and macOS treats it as a new
+// caller).
 
 #[cfg(target_os = "macos")]
 fn read_impl(service: &str) -> Result<CredentialFile, PlatformError> {
-    // Use the `security` CLI tool instead of security-framework crate.
-    // The CLI tool is already trusted by macOS and doesn't trigger
-    // per-binary keychain authorization prompts (which fire on every
-    // debug rebuild since the binary hash changes).
     let account = keychain_account();
     let output = std::process::Command::new("security")
         .args(["find-generic-password", "-s", service, "-a", &account, "-w"])
@@ -131,7 +88,7 @@ fn read_impl(service: &str) -> Result<CredentialFile, PlatformError> {
     let raw = raw.trim();
 
     // CC writes raw JSON; older csq versions wrote hex-encoded JSON.
-    // Try raw JSON first, fall back to hex-decode.
+    // Try raw JSON first, fall back to hex-decode for legacy entries.
     let json = if raw.starts_with('{') {
         raw.to_string()
     } else {
@@ -143,16 +100,33 @@ fn read_impl(service: &str) -> Result<CredentialFile, PlatformError> {
     serde_json::from_str(&json).map_err(|e| PlatformError::Keychain(format!("json parse: {e}")))
 }
 
-// ── Linux/Windows stub (keyring crate integration deferred) ───────────
-
-#[cfg(not(target_os = "macos"))]
-fn write_impl(_service: &str, _creds: &CredentialFile) -> Result<(), PlatformError> {
-    // Linux/Windows keychain integration requires the `keyring` crate.
-    // CC does not read the keychain on these platforms, so this is
-    // lower priority. For now, file-based storage is the primary path.
-    warn!("keychain write not implemented on this platform");
-    Ok(())
+/// Keychain account parameter. CC uses the system username, which
+/// macOS GUI apps don't always inherit through `$USER`, so we walk
+/// `$USER` → `$USERNAME` → `getpwuid(getuid())` before giving up.
+#[cfg(target_os = "macos")]
+fn keychain_account() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .or_else(|_| unsafe {
+            let uid = libc::getuid();
+            let pw = libc::getpwuid(uid);
+            if pw.is_null() {
+                return Err(std::env::VarError::NotPresent);
+            }
+            let name = std::ffi::CStr::from_ptr((*pw).pw_name);
+            name.to_str()
+                .map(|s| s.to_string())
+                .map_err(|_| std::env::VarError::NotPresent)
+        })
+        .unwrap_or_else(|_| "credentials".to_string())
 }
+
+// ── non-macOS stub ────────────────────────────────────────────────
+//
+// CC does not interact with the OS keychain on Linux or Windows; it
+// stores credentials directly in `<CLAUDE_CONFIG_DIR>/.credentials.json`
+// on those platforms. The read stub returns NotFound so the caller's
+// file fallback runs unconditionally.
 
 #[cfg(not(target_os = "macos"))]
 fn read_impl(_service: &str) -> Result<CredentialFile, PlatformError> {
@@ -175,9 +149,7 @@ mod tests {
     #[test]
     fn service_name_deterministic() {
         let path = Path::new("/Users/test/.claude/accounts/config-1");
-        let a = service_name(path);
-        let b = service_name(path);
-        assert_eq!(a, b);
+        assert_eq!(service_name(path), service_name(path));
     }
 
     #[test]
@@ -189,24 +161,33 @@ mod tests {
 
     #[test]
     fn service_name_nfc_normalization() {
-        // NFC normalization: é as single codepoint vs e + combining accent
+        // NFC normalization: é as single codepoint vs e + combining accent.
         let composed = service_name(Path::new("/tmp/caf\u{00e9}"));
         let decomposed = service_name(Path::new("/tmp/caf\u{0065}\u{0301}"));
-        assert_eq!(
-            composed, decomposed,
-            "NFC normalization should produce same hash"
-        );
+        assert_eq!(composed, decomposed);
     }
 
     #[test]
-    fn service_name_hex_is_lowercase() {
-        let svc = service_name(Path::new("/tmp/test"));
-        let hash_part = &svc["Claude Code-credentials-".len()..];
-        assert!(
-            hash_part
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "hash should be lowercase hex: {hash_part}"
-        );
+    fn service_name_known_paths_match_v1_python_parity() {
+        // Golden values computed from v1.x Python:
+        //   hashlib.sha256(unicodedata.normalize('NFC', path).encode()).hexdigest()[:8]
+        // Locking these in confirms csq still derives the same name CC writes to.
+        let cases = [
+            (
+                "/Users/test/.claude/accounts/config-1",
+                "Claude Code-credentials-cfdcc24b",
+            ),
+            (
+                "/Users/test/.claude/accounts/config-2",
+                "Claude Code-credentials-550a6ea2",
+            ),
+        ];
+        for (path, expected) in &cases {
+            assert_eq!(
+                &service_name(Path::new(path)),
+                expected,
+                "v1 parity failure for {path}"
+            );
+        }
     }
 }

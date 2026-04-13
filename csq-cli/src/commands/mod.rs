@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod install;
 pub mod listkeys;
 pub mod login;
+pub mod logout;
 pub mod models;
 pub mod repair_credentials;
 pub mod rmkey;

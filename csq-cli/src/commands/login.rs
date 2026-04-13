@@ -33,8 +33,7 @@
 //! `broker_failed` sentinel.
 
 use anyhow::{anyhow, Context, Result};
-use csq_core::accounts::{markers, profiles};
-use csq_core::broker::fanout;
+use csq_core::accounts::markers;
 use csq_core::credentials::{self, file, keychain};
 use csq_core::types::AccountNum;
 use std::io::{BufRead, Write};
@@ -48,7 +47,7 @@ use csq_core::daemon::{self, DaemonClientError, DetectResult};
 /// `claude auth login` (same UX as running CC directly); falls back
 /// to the daemon paste-code path when `claude` is unavailable.
 pub fn handle(base_dir: &Path, account: AccountNum) -> Result<()> {
-    if which_claude().is_some() {
+    if csq_core::accounts::login::find_claude_binary().is_some() {
         return handle_direct(base_dir, account);
     }
 
@@ -68,38 +67,11 @@ pub fn handle(base_dir: &Path, account: AccountNum) -> Result<()> {
     }
 }
 
-/// Returns `Some(path)` if `claude` is on `PATH`, `None` otherwise.
-/// Stdlib-only PATH walk — no `which` crate dependency.
-fn which_claude() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("claude");
-        if let Ok(meta) = candidate.metadata() {
-            if meta.is_file() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if meta.permissions().mode() & 0o111 != 0 {
-                        return Some(candidate);
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    return Some(candidate);
-                }
-            }
-        }
-        // Windows: also try `claude.exe`
-        #[cfg(windows)]
-        {
-            let candidate_exe = dir.join("claude.exe");
-            if candidate_exe.is_file() {
-                return Some(candidate_exe);
-            }
-        }
-    }
-    None
-}
+// `which_claude` was inlined and replaced by
+// `csq_core::accounts::login::find_claude_binary`, which also walks
+// well-known install paths so Finder-launched apps (the desktop
+// bundle) can find `claude` even when their `$PATH` is the minimal
+// Finder default.
 
 /// Paste-code login path via the csq daemon.
 ///
@@ -347,13 +319,21 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
         return Err(anyhow!("claude auth login exited with non-zero status"));
     }
 
-    // Capture credentials — try keychain first, then file
-    let captured = keychain::read(&config_dir)
-        .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok());
-
-    let creds = captured.ok_or_else(|| {
-        anyhow!("no credentials captured after login — keychain and file both empty")
-    })?;
+    // CC's modern `claude auth login` writes credentials to ONE of
+    // two places, depending on platform / version:
+    //   * macOS: the system keychain at the hashed service name
+    //     (`Claude Code-credentials-{hash}`) — sometimes ALSO
+    //     mirrored to `.credentials.json`, sometimes not.
+    //   * Linux/Windows: always `.credentials.json`.
+    //
+    // We read keychain first, fall back to file. Either source is
+    // authoritative — they hold the same payload — and at least one
+    // is guaranteed to exist after a successful auth.
+    let creds = keychain::read(&config_dir)
+        .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok())
+        .ok_or_else(|| {
+            anyhow!("no credentials captured after login — keychain and file both empty")
+        })?;
 
     // Save canonical + mirror
     file::save_canonical(base_dir, account, &creds)?;
@@ -373,95 +353,40 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
 ///    otherwise stores "unknown").
 /// 3. Clears any `broker_failed` sentinel for this account.
 fn finalize(base_dir: &Path, account: AccountNum) -> Result<()> {
-    let config_dir = base_dir.join(format!("config-{}", account));
-    if config_dir.exists() {
-        // Best-effort: the daemon path also creates this dir (via
-        // save_canonical's live_path mirror). The direct path
-        // already created it at the top of handle_direct().
-        markers::write_csq_account(&config_dir, account)?;
-    }
+    // Marker write + .claude.json email read + profiles update +
+    // broker-failed clear all live in csq_core so the desktop
+    // Add Account flow can call the same helper.
+    let email = csq_core::accounts::login::finalize_login(base_dir, account)
+        .with_context(|| format!("finalize for account {account}"))?;
 
-    let email = get_email_from_cc(&config_dir).unwrap_or_else(|_| "unknown".to_string());
-    update_profile(base_dir, account, &email)?;
-
-    fanout::clear_broker_failed(base_dir, account);
+    notify_daemon_cache_invalidation(base_dir);
 
     println!("Logged in as {} (account {}).", email, account);
     Ok(())
 }
 
-/// Reads the account email for a freshly-logged-in config dir.
-///
-/// Tries two sources, in order:
-///
-/// 1. **`config_dir/.claude.json`** → `oauthAccount.emailAddress`.
-///    CC writes this field to the local `.claude.json` as part of
-///    `claude auth login`, and it's the canonical on-disk copy of
-///    the user identity bound to that slot. File-based, no
-///    subprocess, no timing window — preferred.
-///
-/// 2. **`claude auth status --json`** fallback. Kept for cases
-///    where `.claude.json` is missing (e.g. the user ran
-///    `csq login` against a pre-existing config dir that CC had
-///    populated via `.credentials.json` but not `.claude.json`).
-///
-/// The previous implementation shelled out to `claude auth status`
-/// exclusively. That had a race window right after `claude auth login`
-/// exited where CC's keychain/.claude.json writes hadn't fully landed,
-/// causing the JSON output to lack `email` and the finalizer to
-/// report `Logged in as unknown`.
-fn get_email_from_cc(config_dir: &Path) -> Result<String> {
-    // Source 1: .claude.json local state (preferred)
-    let claude_json_path = config_dir.join(".claude.json");
-    if let Ok(content) = std::fs::read_to_string(&claude_json_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(email) = json
-                .get("oauthAccount")
-                .and_then(|a| a.get("emailAddress"))
-                .and_then(|v| v.as_str())
-            {
-                if !email.is_empty() {
-                    return Ok(email.to_string());
-                }
-            }
-        }
+#[cfg(unix)]
+fn notify_daemon_cache_invalidation(base_dir: &Path) {
+    let sock = csq_core::daemon::socket_path(base_dir);
+    if !sock.exists() {
+        return;
     }
-
-    // Source 2: claude auth status --json (legacy fallback)
-    let output = Command::new("claude")
-        .args(["auth", "status", "--json"])
-        .env("CLAUDE_CONFIG_DIR", config_dir)
-        .output()
-        .context("failed to spawn `claude auth status`")?;
-
-    if !output.status.success() {
-        return Err(anyhow!("claude auth status failed"));
-    }
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("claude auth status produced non-JSON output")?;
-    json.get("email")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("no email in claude auth status output"))
+    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
 }
 
-fn update_profile(base_dir: &Path, account: AccountNum, email: &str) -> Result<()> {
-    let path = profiles::profiles_path(base_dir);
-    let mut profiles = profiles::load(&path).unwrap_or_else(|_| profiles::ProfilesFile::empty());
-
-    profiles.set_profile(
-        account.get(),
-        profiles::AccountProfile {
-            email: email.to_string(),
-            method: "oauth".to_string(),
-            extra: std::collections::HashMap::new(),
-        },
-    );
-
-    profiles::save(&path, &profiles)?;
-    Ok(())
+#[cfg(not(unix))]
+fn notify_daemon_cache_invalidation(_base_dir: &Path) {
+    // Windows named-pipe invalidation is not yet implemented (M8-03).
 }
+
+// `get_email_from_cc` and `update_profile` were extracted to
+// `csq_core::accounts::login::finalize_login` so the desktop's
+// Add Account flow can call the same code. The legacy
+// `claude auth status --json` fallback was dropped along the way
+// because the `.claude.json` source is reliable on every CC version
+// we've shipped against and `auth status` was only used to recover
+// from a race that the file-source path (added in alpha.5) doesn't
+// have.
 
 #[cfg(all(test, unix))]
 mod tests {

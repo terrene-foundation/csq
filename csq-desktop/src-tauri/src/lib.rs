@@ -682,6 +682,7 @@ pub fn run() {
             commands::get_accounts,
             commands::swap_account,
             commands::rename_account,
+            commands::remove_account,
             commands::get_rotation_config,
             commands::set_rotation_enabled,
             commands::get_daemon_status,

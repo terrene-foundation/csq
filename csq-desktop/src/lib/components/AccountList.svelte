@@ -57,6 +57,11 @@
   let loading = $state(true);
   let modalOpen = $state(false);
   let reauthSlot = $state<number | null>(null);
+  // Two-tap remove: the first click on the × button arms the
+  // confirmation; the second click on the same card commits. Tapping
+  // any other card or letting the auto-disarm timer fire resets it.
+  let armedRemoveId = $state<number | null>(null);
+  let armedRemoveTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── Sort mode ────────────────────────────────────────────
 
@@ -230,7 +235,52 @@
       await invoke('swap_account', { baseDir, target: accountId });
       await fetchAccounts();
     } catch (e) {
-      error = String(e);
+      const raw = String(e);
+      if (raw.includes('THIRD_PARTY_NOT_SWAPPABLE')) {
+        // Strip the typed prefix so the user sees the human sentence.
+        error = raw.replace(/^.*THIRD_PARTY_NOT_SWAPPABLE:\s*/, '');
+      } else {
+        error = raw;
+      }
+    }
+  }
+
+  function disarmRemove() {
+    armedRemoveId = null;
+    if (armedRemoveTimer) {
+      clearTimeout(armedRemoveTimer);
+      armedRemoveTimer = null;
+    }
+  }
+
+  function armRemove(accountId: number) {
+    disarmRemove();
+    armedRemoveId = accountId;
+    // Auto-disarm after 4s if the user doesn't follow through.
+    armedRemoveTimer = setTimeout(() => disarmRemove(), 4000);
+  }
+
+  async function handleRemove(accountId: number, e: MouseEvent) {
+    e.stopPropagation();
+    if (armedRemoveId !== accountId) {
+      armRemove(accountId);
+      return;
+    }
+    disarmRemove();
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('remove_account', { baseDir, account: accountId });
+      await fetchAccounts();
+    } catch (e) {
+      // Surface the typed error message to the banner. Backend
+      // returns prefixed tags like ACCOUNT_IN_USE / NOT_CONFIGURED
+      // so the user can self-diagnose.
+      const raw = String(e);
+      if (raw.startsWith('ACCOUNT_IN_USE:')) {
+        error = `Cannot remove account ${accountId} — a Claude Code session is still running. Exit it first, then retry.`;
+      } else {
+        error = raw;
+      }
     }
   }
 
@@ -310,11 +360,25 @@
   <div class="account-list">
     {#each displayedAccounts as account, idx (account.id)}
       <div class="account-card" class:no-creds={!account.has_credentials} class:just-moved={justMovedId === account.id}>
-        {#if sortMode === 'custom'}
-          <div class="move-btns">
-            <button class="move-btn" onclick={() => moveCard(idx, -1)} disabled={idx === 0} title="Move up">▲</button>
-            <button class="move-btn" onclick={() => moveCard(idx, 1)} disabled={idx === displayedAccounts.length - 1} title="Move down">▼</button>
-          </div>
+        <div class="card-controls">
+          {#if sortMode === 'custom'}
+            <button class="move-btn" onclick={(e) => { e.stopPropagation(); moveCard(idx, -1); }} disabled={idx === 0} title="Move up">▲</button>
+            <button class="move-btn" onclick={(e) => { e.stopPropagation(); moveCard(idx, 1); }} disabled={idx === displayedAccounts.length - 1} title="Move down">▼</button>
+          {/if}
+          <button
+            class="remove-btn"
+            class:armed={armedRemoveId === account.id}
+            onclick={(e) => handleRemove(account.id, e)}
+            title={armedRemoveId === account.id ? 'Click again to confirm removal' : 'Remove this account'}
+          >{armedRemoveId === account.id ? 'Confirm' : '×'}</button>
+        </div>
+        {#if armedRemoveId === account.id}
+          <button
+            type="button"
+            class="armed-overlay"
+            aria-label="Cancel remove"
+            onclick={(e) => { e.stopPropagation(); disarmRemove(); }}
+          ></button>
         {/if}
         <button class="card-body" onclick={() => handleSwap(account.id)}>
           <div class="account-header">
@@ -384,6 +448,7 @@
 <AddAccountModal
   isOpen={modalOpen}
   nextAccountId={reauthSlot ?? nextAccountId()}
+  reauthSlot={reauthSlot}
   onClose={() => { reauthSlot = null; modalOpen = false; }}
   onAccountAdded={() => fetchAccounts()}
 />
@@ -448,7 +513,7 @@
     border-color: var(--accent);
     transition: border-color 0.3s;
   }
-  .move-btns {
+  .card-controls {
     position: absolute;
     right: 0.4rem;
     bottom: 0.4rem;
@@ -456,9 +521,12 @@
     gap: 2px;
     opacity: 0;
     transition: opacity 0.15s;
-    z-index: 2;
+    z-index: 3;
   }
-  .account-card:hover .move-btns { opacity: 1; }
+  .account-card:hover .card-controls { opacity: 1; }
+  /* Keep controls visible while the remove button is armed so the
+     user can complete the second tap without re-hovering. */
+  .account-card:has(.remove-btn.armed) .card-controls { opacity: 1; }
   .move-btn {
     background: var(--bg-tertiary);
     border: none;
@@ -471,6 +539,37 @@
   }
   .move-btn:hover { color: var(--accent); }
   .move-btn:disabled { opacity: 0.2; cursor: default; }
+  .remove-btn {
+    background: var(--bg-tertiary);
+    border: none;
+    color: var(--text-secondary);
+    font-size: 0.65rem;
+    padding: 0.15rem 0.35rem;
+    cursor: pointer;
+    border-radius: 2px;
+    line-height: 1;
+    margin-left: 2px;
+  }
+  .remove-btn:hover { color: var(--red); }
+  .remove-btn.armed {
+    background: var(--red);
+    color: white;
+    font-weight: 600;
+    font-size: 0.6rem;
+  }
+  /* Transparent click-trap covering the card body. Lets the user
+     dismiss an armed remove by clicking anywhere on the card (not
+     the × button). The button itself sits above this overlay
+     because .card-controls has a higher z-index. */
+  .armed-overlay {
+    position: absolute;
+    inset: 0;
+    background: transparent;
+    border: none;
+    cursor: default;
+    z-index: 2;
+    padding: 0;
+  }
   .card-body {
     display: flex;
     flex-direction: column;

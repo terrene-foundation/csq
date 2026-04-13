@@ -50,21 +50,32 @@ impl ModelCatalog {
                 },
                 // MiniMax
                 ModelInfo {
-                    id: "MiniMax-M2".into(),
-                    name: "MiniMax M2".into(),
+                    id: "MiniMax-M2.7-highspeed".into(),
+                    name: "MiniMax M2.7 (high-speed)".into(),
                     provider: "mm".into(),
                     context_window: Some(245_760),
                     output_limit: Some(8_192),
-                    aliases: vec!["m2".into(), "minimax-m2".into()],
+                    aliases: vec![
+                        "m2".into(),
+                        "m2.7".into(),
+                        "minimax-m2".into(),
+                        "minimax-m2.7".into(),
+                        "highspeed".into(),
+                    ],
                 },
                 // Z.AI
                 ModelInfo {
-                    id: "glm-4.6".into(),
-                    name: "GLM 4.6".into(),
+                    id: "glm-5.1".into(),
+                    name: "GLM 5.1".into(),
                     provider: "zai".into(),
                     context_window: Some(200_000),
                     output_limit: Some(8_192),
-                    aliases: vec!["glm".into(), "glm-4".into()],
+                    aliases: vec![
+                        "glm".into(),
+                        "glm-4".into(),
+                        "glm-4.6".into(),
+                        "glm-5".into(),
+                    ],
                 },
             ],
         }

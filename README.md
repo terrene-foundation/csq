@@ -12,7 +12,7 @@ Multi-provider session manager for Claude Code. Run Claude Code against local mo
 ## What it does
 
 - **Desktop dashboard** -- see all accounts, quota bars, token health, and reset times at a glance. Sort by custom order, 5h reset, or 7d reset. Ranked badges show which accounts to use first.
-- **Any model provider** -- `csq run 1 -p ollama` runs CC against a local Qwen/Gemma model. `csq run 2 -p mm` routes through MiniMax. `csq run 3` uses your Claude Max subscription.
+- **Any model provider** -- bind a provider to a slot with `csq setkey mm --slot 9 --key …`, then launch with `csq run 9`. Mix Claude Max OAuth slots, MiniMax, Z.AI, and local Ollama in the same account list.
 - **Per-terminal isolation** -- each terminal gets its own `CLAUDE_CONFIG_DIR` and keychain slot. Swapping one terminal doesn't affect others. 15+ concurrent terminals work without contention.
 - **Shared history & memory** -- conversations, projects, and auto-memory are symlinked from `~/.claude`, so `/resume` works across all accounts and providers.
 - **Background daemon** -- auto-refreshes OAuth tokens and polls Anthropic for usage data. No manual token management after initial login.
@@ -116,7 +116,7 @@ Then add `%USERPROFILE%\.local\bin` to `PATH` if it isn't already.
 After install:
 
 ```bash
-csq --version    # should print: csq 2.0.0-alpha.6
+csq --version    # should print: csq 2.0.0-alpha.7
 csq doctor       # runs diagnostics
 csq login 1      # authenticate your first account
 ```
@@ -233,7 +233,7 @@ pip uninstall csq    # if you used pip
 
 # Install the current Rust binary
 curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
-csq --version    # csq 2.0.0-alpha.6
+csq --version    # csq 2.0.0-alpha.7
 ```
 
 Your accounts at `~/.claude/accounts/credentials/N.json` are picked
@@ -258,7 +258,7 @@ auto-update works for every subsequent release:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
-csq --version    # csq 2.0.0-alpha.6
+csq --version    # csq 2.0.0-alpha.7
 csq update check # should now report up-to-date
 ```
 
@@ -362,63 +362,69 @@ See [Ollama's Claude Code integration docs](https://docs.ollama.com/integrations
 
 ## Using third-party APIs (MiniMax, Z.AI)
 
+Third-party providers are assigned to numbered slots the same way OAuth accounts are. Each slot gets its own `config-<N>/settings.json` with the provider's base URL, API key, and default model. You then launch it with plain `csq run <N>`.
+
 ### MiniMax (M2.7)
 
 ```bash
-csq setkey mm                # prompts for your MiniMax API key (hidden input)
+csq setkey mm --slot 9 --key sk-…   # validates the key, writes config-9/settings.json
+csq run 9                           # launches CC routed through MiniMax on slot 9
 ```
 
-Creates `~/.claude/settings-mm.json` with:
+`csq setkey mm --slot 9` writes `~/.claude/accounts/config-9/settings.json` with:
 
-| Setting              | Value                              |
-| -------------------- | ---------------------------------- |
-| `ANTHROPIC_BASE_URL` | `https://api.minimax.io/anthropic` |
-| `ANTHROPIC_MODEL`    | `MiniMax-M2.7-highspeed`           |
-| All model aliases    | `MiniMax-M2.7-highspeed`           |
+| Setting                | Value                              |
+| ---------------------- | ---------------------------------- |
+| `ANTHROPIC_BASE_URL`   | `https://api.minimax.io/anthropic` |
+| `ANTHROPIC_AUTH_TOKEN` | your key                           |
+| `ANTHROPIC_MODEL`      | `MiniMax-M2.7-highspeed`           |
 
-```bash
-csq run 1 -p mm              # start CC routed through MiniMax
-```
+It also upserts `profiles.json[9]` with `method: "api_key"` and writes the `.csq-account` marker so the dashboard and `csq run` can identify the slot.
+
+Omitting `--key` prompts for the key with hidden input (paste-safe for long JWTs). Omitting `--slot` falls back to the legacy global `settings-mm.json` store (no slot binding — useful only if you plan to attach it to a slot later).
 
 ### Z.AI (GLM-5.1)
 
 ```bash
-csq setkey zai               # prompts for your Z.AI API key (hidden input)
+csq setkey zai --slot 10 --key …
+csq run 10
 ```
 
-Creates `~/.claude/settings-zai.json` with:
+Writes `config-10/settings.json` with:
 
-| Setting              | Value                            |
-| -------------------- | -------------------------------- |
-| `ANTHROPIC_BASE_URL` | `https://api.z.ai/api/anthropic` |
-| `ANTHROPIC_MODEL`    | `glm-5.1`                        |
-| All model aliases    | `glm-5.1`                        |
-
-```bash
-csq run 1 -p zai             # start CC routed through Z.AI
-```
+| Setting                | Value                            |
+| ---------------------- | -------------------------------- |
+| `ANTHROPIC_BASE_URL`   | `https://api.z.ai/api/anthropic` |
+| `ANTHROPIC_AUTH_TOKEN` | your key                         |
+| `ANTHROPIC_MODEL`      | `glm-5.1`                        |
 
 ### Claude direct API key
 
 If you have a direct Anthropic API key (not OAuth/Max subscription):
 
 ```bash
-csq setkey claude            # prompts for your API key
-csq run 1 -p claude          # uses ANTHROPIC_API_KEY auth instead of OAuth
+csq setkey claude --slot 11 --key sk-ant-…
+csq run 11
 ```
 
-### How profiles work
+### How slot binding works
 
-Profiles are JSON files at `~/.claude/settings-<name>.json` that get deep-merged onto your default `~/.claude/settings.json` at terminal start. `csq setkey` creates and manages these files. You can edit them manually to change model names, timeouts, or add other settings.
+When you run `csq setkey <provider> --slot <N> --key <KEY>`, csq:
 
-When you run `csq run 5 -p mm`, csq:
+1. Validates the key against the provider (best-effort probe).
+2. Creates `~/.claude/accounts/config-<N>/` if missing.
+3. Writes `config-<N>/settings.json` with the provider's `env` block (base URL, token, model keys).
+4. Upserts `profiles.json[N]` with `method: "api_key"` and `provider: <id>`.
+5. Writes the `.csq-account` marker.
 
-1. Reads `~/.claude/settings.json` (your full default -- hooks, statusline, plugins, etc.)
-2. Reads `~/.claude/settings-mm.json` (the overlay)
-3. Deep-merges them (overlay keys win; your default hooks/statusline/plugins carry through)
-4. Writes the result to `config-5/settings.json` for that terminal only
+When you then run `csq run <N>`, csq:
 
-Your default settings are never modified. Each terminal gets a fresh settings snapshot.
+1. Detects the slot is third-party via `discover_per_slot_third_party()` (it reads `env.ANTHROPIC_BASE_URL` from `config-<N>/settings.json`).
+2. Skips the OAuth credential load — third-party slots have no `credentials/<N>.json` on purpose.
+3. Creates an ephemeral `term-<pid>` handle dir with a `settings.json` symlink back to `config-<N>`.
+4. Execs `claude` with `CLAUDE_CONFIG_DIR` set to the handle dir. CC reads the provider env from the symlinked `settings.json` at startup and routes every request through the provider.
+
+Your default `~/.claude/settings.json` is never modified. Each terminal gets a fresh handle dir that is swept when the process exits.
 
 ### Managing profiles
 
@@ -499,12 +505,9 @@ paste-code flow: it opens the authorize URL, then prompts on stdin
 for the authorization code Anthropic's hosted callback page displays.
 Paste the code and csq completes the exchange via the daemon.
 
-> **Known limitation**: there's currently no `csq logout N` or
-> `csq remove N` command. To free a slot you have to manually delete
-> `~/.claude/accounts/credentials/N.json`,
-> `~/.claude/accounts/config-N/.credentials.json`, and the entry in
-> `~/.claude/accounts/profiles.json`, then restart the daemon. Proper
-> `csq logout` + desktop "Remove account" UI are planned for `alpha.6`.
+To free a slot, run `csq logout N` (CLI) or click "Remove" on the slot
+card in the desktop dashboard. Both clear `credentials/N.json`,
+`config-N/`, the `profiles.json` entry, and the cached quota.
 
 ### Daily use
 
@@ -588,7 +591,7 @@ The desktop app provides a live dashboard for managing accounts and sessions. It
 
 ```bash
 # Session management
-csq run N [-p provider]      # start CC on account N, optional provider profile
+csq run N                    # start CC on account N (OAuth or 3P-bound slot)
 csq run N --resume           # resume most recent conversation on account N
 csq swap N                   # in-place swap THIS terminal to account N
 csq status                   # show all accounts with quota and reset times
@@ -599,10 +602,11 @@ csq statusline               # compact status for shell prompt integration
 csq login N                  # save account N's credentials (opens browser)
 csq repair-credentials       # fix cross-slot credential contamination
 
-# Provider profiles
-csq setkey <provider> [key]  # add/update provider API key
-csq listkeys                 # show configured providers with masked keys
-csq rmkey <provider>         # remove a provider profile
+# Provider slots (MiniMax, Z.AI, Claude API key)
+csq setkey <provider> --slot N --key KEY  # bind provider to slot N
+csq setkey <provider>                     # store key globally (no slot)
+csq listkeys                              # show configured providers with masked keys
+csq rmkey <provider>                      # remove a provider profile
 csq models                   # show all profiles + current models
 csq models <provider> <name> # switch a provider to a different model
 

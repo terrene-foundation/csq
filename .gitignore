@@ -36,6 +36,10 @@ journal/*-data/
 # Matches at any depth (csq-desktop/.claude/learning/ too) via the **/ prefix.
 **/.claude/learning/
 
+# Scheduled-task lock file — runtime state for the harness cron
+# scheduler. Recreated on every session; has no diff value.
+**/.claude/scheduled_tasks.lock
+
 # IDE settings
 .vscode/
 **/.vscode/

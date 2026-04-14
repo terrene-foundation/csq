@@ -499,7 +499,7 @@ async fn oauth_exchange_handler(
                 account: account.get(),
             }))
         }
-        Ok(Err(e)) => {
+        Ok(Err(_)) => {
             tracing::warn!(
                 account = account.get(),
                 error_kind = "credential_save",

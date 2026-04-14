@@ -1074,22 +1074,19 @@ mod tests {
 
     #[test]
     fn set_provider_key_rejects_unknown_provider() {
-        let err = set_provider_key("/fake".into(), "nonexistent".into(), "key".into())
-            .unwrap_err();
+        let err = set_provider_key("/fake".into(), "nonexistent".into(), "key".into()).unwrap_err();
         assert!(err.contains("unknown provider"));
     }
 
     #[test]
     fn set_provider_key_rejects_oauth_provider() {
-        let err = set_provider_key("/fake".into(), "claude".into(), "key".into())
-            .unwrap_err();
+        let err = set_provider_key("/fake".into(), "claude".into(), "key".into()).unwrap_err();
         assert!(err.contains("uses OAuth"));
     }
 
     #[test]
     fn set_provider_key_rejects_empty_key() {
-        let err = set_provider_key("/fake".into(), "mm".into(), "   ".into())
-            .unwrap_err();
+        let err = set_provider_key("/fake".into(), "mm".into(), "   ".into()).unwrap_err();
         assert!(err.contains("must not be empty"));
     }
 

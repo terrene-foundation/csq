@@ -1,0 +1,181 @@
+# OAuth Live Replay — contract test against Anthropic's /v1/oauth/token
+#
+# WHY THIS EXISTS:
+#   On 2026-04-13 (journal 0052), Anthropic silently changed their token
+#   endpoint to reject refresh bodies containing a `scope` field. Every
+#   unit test and integration test that asserted the refresh body shape
+#   used a mocked HTTP transport and kept passing. Production silently
+#   failed for ~8 hours before the cause was diagnosed manually.
+#
+#   This workflow hits the real endpoint with a real refresh token, so a
+#   similar upstream change produces a CI failure within one schedule
+#   window — not 8 hours of silent account rot.
+#
+# BLOCKER — DO NOT enable the schedule until:
+#   1. A dedicated Foundation test account has been created (NOT a user
+#      account — its refresh token would live in GitHub Secrets where any
+#      maintainer with secret-read access or any GitHub compromise would
+#      burn real user credentials).
+#   2. The `OAUTH_REPLAY_REFRESH_TOKEN` secret has been provisioned.
+#   3. This workflow has been triggered manually at least once to verify
+#      the secret resolves and the test passes.
+#   See "HOW TO PROVISION THE SECRET" below.
+#
+# HOW TO PROVISION THE SECRET:
+#   1. Create a dedicated Foundation test account (NOT a user account):
+#        - Use a Foundation-controlled email address
+#        - Authenticate from a maintainer's machine: csq login N
+#   2. Read the refresh token from the credential file:
+#        python3 -c "import json; \
+#          d = json.load(open('~/.claude/accounts/credentials/N.json')); \
+#          print(d['claudeAiOauth']['refreshToken'])"
+#   3. Add it as a repo secret:
+#        gh secret set OAUTH_REPLAY_REFRESH_TOKEN --body "<refresh_token>"
+#   4. Trigger this workflow manually to verify it works:
+#        gh workflow run oauth-replay.yml
+#   5. Once the manual run passes, uncomment the `schedule:` trigger below.
+#
+# TOKEN ROTATION (IMPORTANT):
+#   Anthropic's token endpoint returns a NEW refresh token on every
+#   successful call. This workflow writes the new token back to the
+#   `OAUTH_REPLAY_REFRESH_TOKEN` secret after each successful run via the
+#   `rotate-secret` step. Without rotation the secret becomes stale after
+#   the first run and every subsequent run fails with `invalid_grant`.
+#
+#   The rotation step requires the workflow to have `secrets: write`
+#   permission at the repo level, OR the caller must use a PAT with
+#   `secrets` scope. The default `GITHUB_TOKEN` does not have this scope,
+#   so a dedicated `FOUNDATION_PAT` secret is required for rotation.
+#   If `FOUNDATION_PAT` is not provisioned, rotation is skipped with a
+#   warning — the test will still pass on this run but will fail on the
+#   next scheduled run. Provision it alongside `OAUTH_REPLAY_REFRESH_TOKEN`.
+
+name: OAuth Live Replay
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 6 * * *"  # daily at 06:00 UTC
+  #   Uncomment after:
+  #   1. OAUTH_REPLAY_REFRESH_TOKEN secret has been provisioned
+  #   2. Manual workflow_dispatch run has passed
+  #   3. FOUNDATION_PAT secret has been provisioned (enables token rotation)
+
+permissions:
+  contents: read
+  issues: write # for the alert-issue step on failure
+
+jobs:
+  replay:
+    name: Live OAuth refresh contract test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: oauth-replay
+
+      - name: Check secret is provisioned
+        id: secret-check
+        env:
+          OAUTH_REPLAY_REFRESH_TOKEN: ${{ secrets.OAUTH_REPLAY_REFRESH_TOKEN }}
+        run: |
+          if [ -z "$OAUTH_REPLAY_REFRESH_TOKEN" ]; then
+            echo "::warning::OAUTH_REPLAY_REFRESH_TOKEN not set — skipping live replay."
+            echo "Provision the secret first; see the header comment in oauth-replay.yml."
+            echo "secret_set=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "secret_set=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run live replay test
+        if: steps.secret-check.outputs.secret_set == 'true'
+        env:
+          OAUTH_REPLAY_REFRESH_TOKEN: ${{ secrets.OAUTH_REPLAY_REFRESH_TOKEN }}
+        run: |
+          cargo test --package csq-core --test oauth_replay -- --ignored --nocapture
+        # --nocapture shows the test output (without token values — the test
+        # never prints tokens) so failure messages are visible in the log.
+
+      - name: Extract new refresh token from test output
+        id: extract-new-rt
+        if: >
+          steps.secret-check.outputs.secret_set == 'true' &&
+          success()
+        # The live test calls refresh_token() which rotates the RT server-side.
+        # We need to capture the new RT from the refreshed CredentialFile.
+        # However, the test does not write to disk or stdout (by design — no
+        # token should appear in logs). To enable secret rotation, the test
+        # must emit the new RT via a masked GitHub Actions output.
+        #
+        # CURRENT STATE: this step is a placeholder that emits a warning.
+        # The test currently does NOT emit the new token. Full rotation support
+        # requires modifying the test to emit the new refresh token via
+        # `::add-mask::` + a file/env write, then reading it here.
+        #
+        # CONSEQUENCE: without this step, the first manual run will succeed,
+        # but the next scheduled run will fail with `invalid_grant` because
+        # the old refresh token was invalidated. Implement the emission step
+        # before enabling the schedule trigger.
+        #
+        # See: workspaces/csq-v2/journal/ (oauth rotation tracking)
+        run: |
+          echo "::warning::Token rotation not yet implemented. The refresh token"
+          echo "::warning::was rotated server-side by this test run. If the"
+          echo "::warning::schedule trigger is enabled, the next run will fail"
+          echo "::warning::with invalid_grant. Implement token emission in the"
+          echo "::warning::test before enabling the cron schedule."
+          echo "new_token_available=false" >> "$GITHUB_OUTPUT"
+
+      - name: Rotate OAUTH_REPLAY_REFRESH_TOKEN secret
+        if: >
+          steps.extract-new-rt.outputs.new_token_available == 'true' &&
+          secrets.FOUNDATION_PAT != ''
+        env:
+          GH_TOKEN: ${{ secrets.FOUNDATION_PAT }}
+          NEW_REFRESH_TOKEN: ${{ steps.extract-new-rt.outputs.new_refresh_token }}
+        run: |
+          if [ -z "$NEW_REFRESH_TOKEN" ]; then
+            echo "::warning::New refresh token output is empty — skipping secret rotation."
+            exit 0
+          fi
+          gh secret set OAUTH_REPLAY_REFRESH_TOKEN \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "$NEW_REFRESH_TOKEN"
+          echo "OAUTH_REPLAY_REFRESH_TOKEN secret rotated successfully."
+
+      - name: Open alert issue on test failure
+        if: >
+          failure() &&
+          steps.secret-check.outputs.secret_set == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "[ALERT] Anthropic OAuth token endpoint rejects current refresh body shape",
+              body: [
+                `The OAuth live replay test failed in run [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
+                "",
+                "This usually means Anthropic changed the accepted body shape for `/v1/oauth/token`.",
+                "",
+                "**Reproduction steps:**",
+                "1. Read a refresh token from `~/.claude/accounts/credentials/N.json`",
+                "2. POST to `https://platform.claude.com/v1/oauth/token` with the current body shape",
+                "3. Compare the 400 error against the current `build_refresh_body` in",
+                "   `csq-core/src/credentials/refresh.rs`",
+                "",
+                "**Reference:**",
+                "- `workspaces/csq-v2/journal/0052-DISCOVERY-anthropic-rejects-scope-on-refresh.md`",
+                "  (the 2026-04-13 incident where `scope` caused silent mass account expiry)",
+                "- `csq-core/src/credentials/refresh.rs::build_refresh_body` — current body shape",
+              ].join("\n"),
+              labels: ["P0", "oauth", "alert"],
+            });

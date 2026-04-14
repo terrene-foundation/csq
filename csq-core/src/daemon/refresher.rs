@@ -294,13 +294,62 @@ pub(crate) async fn tick(
         }
 
         // Read expires_at for the cache record even if no refresh
-        // is needed.
+        // is needed. If canonical is missing — the alpha.11 bug shape
+        // where `discover_anthropic` yielded an account via its
+        // live-fallback pass — resurrect canonical from the live copy
+        // so broker_check (which reads canonical) has something to
+        // work with, AND append a breadcrumb record to
+        // `.resurrection-log.jsonl` so an operator can trace the
+        // orphaning write path later.
         let canonical = cred_file::canonical_path(base_dir, account);
         let expires_at_ms = match credentials::load(&canonical) {
             Ok(c) => c.claude_ai_oauth.expires_at,
-            Err(e) => {
-                debug!(account = info.id, error = %e, "could not read canonical");
-                continue;
+            Err(canonical_err) => {
+                // Try to resurrect from live.
+                let live = cred_file::live_path(base_dir, account);
+                match credentials::load(&live) {
+                    Ok(c) => {
+                        let live_mtime = std::fs::metadata(&live)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        warn!(
+                            account = info.id,
+                            canonical = %canonical.display(),
+                            live = %live.display(),
+                            live_mtime_secs = live_mtime,
+                            canonical_err = %canonical_err,
+                            "canonical missing; resurrecting from live .credentials.json \
+                             — something wrote live without mirroring to canonical; \
+                             investigate write path"
+                        );
+                        // Best-effort save. If this fails the next
+                        // tick will retry. broker_check below will
+                        // still operate on live via the recovery path.
+                        if let Err(e) = cred_file::save(&canonical, &c) {
+                            warn!(
+                                account = info.id,
+                                error = %e,
+                                "canonical resurrection save failed, will retry next tick"
+                            );
+                        } else {
+                            append_resurrection_breadcrumb(base_dir, info.id, live_mtime, &live);
+                        }
+                        c.claude_ai_oauth.expires_at
+                    }
+                    Err(live_err) => {
+                        warn!(
+                            account = info.id,
+                            canonical = %canonical.display(),
+                            canonical_err = %canonical_err,
+                            live_err = %live_err,
+                            "neither canonical nor live credentials readable, skipping"
+                        );
+                        continue;
+                    }
+                }
             }
         };
 
@@ -392,6 +441,53 @@ pub(crate) async fn tick(
 /// column all agree on what "broker_token_invalid" means).
 use crate::error::error_kind_tag;
 
+/// Appends a JSONL breadcrumb to `{base_dir}/.resurrection-log.jsonl`
+/// each time the refresher resurrects a missing canonical credential
+/// file from its live sibling. This is the forensic trail an operator
+/// (or `csq doctor`) uses to find the bad write path that orphaned the
+/// live copy.
+///
+/// Best-effort: every step is `.ok()`-swallowed. A forensic log is
+/// nice-to-have; refusing to refresh because we couldn't write a
+/// breadcrumb would turn every transient IO error into a user-visible
+/// outage.
+///
+/// One JSON object per line. Fields intentionally use flat string
+/// values so `jq` / `awk` / `csq doctor` can walk the file without a
+/// schema-aware parser.
+fn append_resurrection_breadcrumb(
+    base_dir: &std::path::Path,
+    account: u16,
+    live_mtime_secs: u64,
+    live_path: &std::path::Path,
+) {
+    let path = base_dir.join(".resurrection-log.jsonl");
+    let ts = now_secs();
+    // Hand-serialize because serde_json::to_string on a Map requires
+    // allocating a Map, which is more ceremony than we need for five
+    // scalar fields. Fields are all operator-supplied or internal
+    // integers — no token material flows here — so direct interpolation
+    // is safe.
+    let line = format!(
+        r#"{{"timestamp_secs":{ts},"account":{account},"event":"canonical_resurrected","live_mtime_secs":{live_mtime_secs},"live_path":"{lp}"}}"#,
+        lp = live_path.display().to_string().replace('"', "\\\"")
+    );
+
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+    // 0o600 on the breadcrumb log. The credential file paths it
+    // contains are user-identifying though not secret, and the log
+    // lives under ~/.claude/accounts which is already 0o700, so the
+    // permission bits here are belt-and-braces.
+    let _ = crate::platform::fs::secure_file(&path);
+}
+
 fn in_cooldown(cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>, account: u16) -> bool {
     let guard = cooldowns.lock().unwrap_or_else(|p| p.into_inner());
     match guard.get(&account) {
@@ -439,6 +535,19 @@ mod tests {
         credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
     }
 
+    /// Writes ONLY the live `config-N/.credentials.json` file —
+    /// intentionally skipping the canonical `credentials/N.json`
+    /// mirror. Simulates the alpha.11 bug state where a broken
+    /// write path orphaned the live copy.
+    fn install_live_only(base: &std::path::Path, account: u16, expires_at_ms: u64) {
+        let num = AccountNum::try_from(account).unwrap();
+        let config = base.join(format!("config-{account}"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(".csq-account"), account.to_string()).unwrap();
+        let creds = make_creds("at-live", "rt-live", expires_at_ms);
+        credentials::save(&cred_file::live_path(base, num), &creds).unwrap();
+    }
+
     /// Mock HTTP closure that always succeeds and counts calls.
     fn counting_success(counter: Arc<AtomicU32>) -> HttpPostFn {
         Arc::new(move |_url: &str, _body: &str| {
@@ -470,6 +579,57 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_resurrects_canonical_from_live_and_refreshes() {
+        // Alpha.11 regression fix: a slot with only config-N/.credentials.json
+        // (no credentials/N.json canonical) must be found by discovery,
+        // resurrected by the refresher, AND refreshed in the same tick
+        // so the user doesn't have to wait 5 minutes for round 2.
+        let dir = TempDir::new().unwrap();
+        // Live-only, expired token → should trigger refresh after resurrection.
+        install_live_only(dir.path(), 1, 0);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cache, &cooldowns).await;
+
+        // Canonical file must now exist — the resurrection write path
+        // ran before broker_check.
+        let canonical = cred_file::canonical_path(dir.path(), AccountNum::try_from(1u16).unwrap());
+        assert!(
+            canonical.exists(),
+            "canonical credentials/1.json must be resurrected from live"
+        );
+
+        // A refresh HTTP call must have happened (expiry 0 is in
+        // the 2h window) and the cache must reflect it.
+        assert!(
+            counter.load(Ordering::SeqCst) >= 1,
+            "broker_check should have run and called Anthropic"
+        );
+        let status = cache.get(&1).unwrap();
+        assert_eq!(status.account, 1);
+
+        // A breadcrumb must have been appended for forensics.
+        let breadcrumb = dir.path().join(".resurrection-log.jsonl");
+        assert!(
+            breadcrumb.exists(),
+            "resurrection breadcrumb must be written"
+        );
+        let content = std::fs::read_to_string(&breadcrumb).unwrap();
+        assert!(
+            content.contains(r#""account":1"#),
+            "breadcrumb must record the resurrected account: {content}"
+        );
+        assert!(
+            content.contains(r#""event":"canonical_resurrected""#),
+            "breadcrumb must tag the event type: {content}"
+        );
     }
 
     #[tokio::test]

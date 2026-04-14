@@ -194,54 +194,179 @@ pub fn discover_per_slot_third_party(base_dir: &Path) -> Vec<AccountInfo> {
     accounts
 }
 
-/// Discovers Anthropic OAuth accounts from `credentials/*.json`.
+/// Discovers Anthropic OAuth accounts.
+///
+/// Two-pass walk:
+///
+/// 1. **Canonical pass**: reads `credentials/N.json` (the daemon's
+///    authoritative source).
+/// 2. **Live fallback**: for any `config-N/` directory whose
+///    `.csq-account` marker identifies an OAuth slot that the canonical
+///    pass did NOT yield, check for a `config-N/.credentials.json` and
+///    synthesize an `AccountInfo`. This closes the alpha.11 bug where a
+///    broken write path left live credentials without a canonical
+///    mirror — the refresher's `discover_anthropic` call would skip the
+///    account entirely, the 5-min tick would never refresh it, the
+///    access token would expire at the 8h mark, and CC would demand
+///    re-auth.
+///
+/// Accounts found **only** through the live fallback are logged at WARN
+/// so the operator sees that canonical is missing and the daemon is
+/// running in degraded mode until a resurrection pass (see
+/// `refresher::tick`) rewrites the canonical file.
+///
 /// Cross-references with `profiles.json` for email labels.
 pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
-    let creds_dir = base_dir.join("credentials");
-    let entries = match std::fs::read_dir(&creds_dir) {
-        Ok(entries) => entries,
-        Err(_) => return vec![],
-    };
-
     let profiles_path = profiles::profiles_path(base_dir);
     let profiles =
         profiles::load(&profiles_path).unwrap_or_else(|_| profiles::ProfilesFile::empty());
 
     let mut accounts = Vec::new();
+    let mut seen_ids: std::collections::HashSet<u16> = std::collections::HashSet::new();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-
-        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let id: u16 = match stem.parse() {
-            Ok(n) if n >= 1 => n,
-            _ => continue,
-        };
-
-        let has_credentials = match credentials::load(&path) {
-            Ok(_) => true,
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "skipping invalid credential file");
-                false
+    // Pass 1: canonical credentials/*.json
+    let creds_dir = base_dir.join("credentials");
+    if let Ok(entries) = std::fs::read_dir(&creds_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
             }
-        };
 
-        let email = profiles.get_email(id).unwrap_or("unknown").to_string();
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
 
-        accounts.push(AccountInfo {
-            id,
-            label: email,
-            source: AccountSource::Anthropic,
-            method: "oauth".into(),
-            has_credentials,
-        });
+            let id: u16 = match stem.parse() {
+                Ok(n) if n >= 1 => n,
+                _ => continue,
+            };
+
+            let has_credentials = match credentials::load(&path) {
+                Ok(_) => true,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "skipping invalid credential file");
+                    false
+                }
+            };
+
+            let email = profiles.get_email(id).unwrap_or("unknown").to_string();
+            seen_ids.insert(id);
+            accounts.push(AccountInfo {
+                id,
+                label: email,
+                source: AccountSource::Anthropic,
+                method: "oauth".into(),
+                has_credentials,
+            });
+        }
+    }
+
+    // Pass 2: live-only fallback via config-*/.credentials.json.
+    //
+    // For each config-N dir with a valid `.csq-account` marker and a
+    // `.credentials.json` file whose content parses, yield an
+    // AccountInfo — but only if the canonical pass didn't already
+    // yield that slot. Third-party slots (which have `settings.json`
+    // with ANTHROPIC_BASE_URL) are excluded because they have no
+    // refresh token and should not route through the Anthropic
+    // refresher.
+    if let Ok(entries) = std::fs::read_dir(base_dir) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // Same symlink rejection as discover_per_slot_third_party —
+            // a config-N symlinked outside base_dir must not escape the
+            // boundary.
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+            let Some(num_str) = name.strip_prefix("config-") else {
+                continue;
+            };
+            let id: u16 = match num_str.parse() {
+                Ok(n) if (1..=999).contains(&n) => n,
+                _ => continue,
+            };
+
+            if seen_ids.contains(&id) {
+                continue;
+            }
+
+            let config_path = entry.path();
+
+            // Skip 3P slots — they don't belong to the OAuth refresher.
+            // Presence of settings.json with env.ANTHROPIC_BASE_URL is
+            // the 3P tell.
+            let settings_path = config_path.join("settings.json");
+            if settings_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&settings_path) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let has_base_url = json
+                            .get("env")
+                            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+                            .or_else(|| json.get("ANTHROPIC_BASE_URL"))
+                            .is_some();
+                        if has_base_url {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Must have a live credential file that parses, and the
+            // .csq-account marker (if present) must agree with the dir
+            // name — otherwise someone renamed a dir and we'd yield the
+            // wrong account number.
+            let live_cred = config_path.join(".credentials.json");
+            if !live_cred.exists() {
+                continue;
+            }
+            if let Err(e) = credentials::load(&live_cred) {
+                warn!(
+                    path = %live_cred.display(),
+                    error = %e,
+                    "live-only discovery: unparseable .credentials.json, skipping"
+                );
+                continue;
+            }
+
+            let marker = crate::accounts::markers::read_csq_account(&config_path);
+            if let Some(marker_id) = marker.map(|n| n.get()) {
+                if marker_id != id {
+                    warn!(
+                        dir = %config_path.display(),
+                        dir_id = id,
+                        marker_id,
+                        "live-only discovery: dir name / .csq-account marker mismatch, skipping"
+                    );
+                    continue;
+                }
+            }
+
+            warn!(
+                account = id,
+                path = %live_cred.display(),
+                "live-only discovery: canonical credentials/{id}.json is missing, \
+                 refresher will resurrect on next tick. Check for a broken write path."
+            );
+
+            let email = profiles.get_email(id).unwrap_or("unknown").to_string();
+            seen_ids.insert(id);
+            accounts.push(AccountInfo {
+                id,
+                label: email,
+                source: AccountSource::Anthropic,
+                method: "oauth".into(),
+                has_credentials: true,
+            });
+        }
     }
 
     accounts.sort_by_key(|a| a.id);
@@ -415,6 +540,110 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let accounts = discover_anthropic(dir.path());
         assert!(accounts.is_empty());
+    }
+
+    fn write_live_cred(base: &Path, account: u16) {
+        let config = base.join(format!("config-{account}"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(".csq-account"), account.to_string()).unwrap();
+        let creds = CredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new(format!("at-live-{account}")),
+                refresh_token: RefreshToken::new(format!("rt-live-{account}")),
+                expires_at: 9999999999999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: HashMap::new(),
+            },
+            extra: HashMap::new(),
+        };
+        credentials::save(&config.join(".credentials.json"), &creds).unwrap();
+    }
+
+    #[test]
+    fn discover_anthropic_finds_live_only_accounts() {
+        // Alpha.11 fix: if credentials/N.json is missing but
+        // config-N/.credentials.json exists, discover_anthropic must
+        // still yield the account. Without this, the daemon refresher
+        // silently skips live-only accounts, access tokens expire at
+        // the 8h boundary, and CC demands re-auth.
+        let dir = TempDir::new().unwrap();
+        // Slot 1 has canonical; slots 3 and 5 are live-only.
+        write_cred(dir.path(), 1);
+        write_live_cred(dir.path(), 3);
+        write_live_cred(dir.path(), 5);
+
+        let accounts = discover_anthropic(dir.path());
+
+        let ids: Vec<u16> = accounts.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![1, 3, 5], "both live-only slots must appear");
+        assert!(
+            accounts.iter().all(|a| a.has_credentials),
+            "all three accounts should report has_credentials=true"
+        );
+    }
+
+    #[test]
+    fn discover_anthropic_live_fallback_respects_marker_mismatch() {
+        // Someone renamed a dir from config-7 to config-4 without
+        // updating the .csq-account marker. The live-fallback pass
+        // must refuse to yield account 4 because the marker inside
+        // still says 7 — otherwise we'd attribute account 7's live
+        // credentials to slot 4 and refresh them against the wrong
+        // profile.
+        let dir = TempDir::new().unwrap();
+        write_live_cred(dir.path(), 4);
+        // Corrupt the marker to disagree with the dir name.
+        std::fs::write(dir.path().join("config-4/.csq-account"), "7").unwrap();
+
+        let accounts = discover_anthropic(dir.path());
+        assert!(
+            accounts.is_empty(),
+            "marker mismatch must disqualify live-fallback discovery"
+        );
+    }
+
+    #[test]
+    fn discover_anthropic_live_fallback_excludes_third_party() {
+        // A config-N with a settings.json carrying ANTHROPIC_BASE_URL
+        // is a 3P slot. Live-fallback must NOT yield it as an Anthropic
+        // OAuth account; 3P slots have no refresh token and belong to
+        // the third-party usage poller, not the OAuth refresher.
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-9");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(".csq-account"), "9").unwrap();
+        std::fs::write(
+            config.join(".credentials.json"),
+            r#"{"claude_ai_oauth":{"access_token":"t","refresh_token":"r","expires_at":99999999999,"scopes":[]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.minimax.io/anthropic","ANTHROPIC_AUTH_TOKEN":"k"}}"#,
+        )
+        .unwrap();
+
+        let accounts = discover_anthropic(dir.path());
+        assert!(
+            accounts.is_empty(),
+            "3P slot must not be yielded by Anthropic discovery: {accounts:?}"
+        );
+    }
+
+    #[test]
+    fn discover_anthropic_canonical_wins_over_live_fallback() {
+        // When both paths yield the same slot, the canonical pass
+        // wins (first-come in the merge) and the live fallback does
+        // not add a duplicate.
+        let dir = TempDir::new().unwrap();
+        write_cred(dir.path(), 2);
+        write_live_cred(dir.path(), 2);
+
+        let accounts = discover_anthropic(dir.path());
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, 2);
     }
 
     #[test]

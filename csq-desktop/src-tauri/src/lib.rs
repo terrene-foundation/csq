@@ -76,6 +76,25 @@ impl TrayIconKind {
     }
 }
 
+/// Serializable update info cached after a background check.
+///
+/// Stored separately from `csq_core::update::github::UpdateInfo`
+/// because that type does not implement `Serialize` — it carries
+/// download and signature URLs that MUST NOT be surfaced to the
+/// frontend (users cannot and should not invoke the download path
+/// from the desktop app; the signing key is a placeholder). Only
+/// the fields needed to show a notification and link the user to
+/// the GitHub release page are included here.
+#[derive(Clone, serde::Serialize)]
+pub struct CachedUpdateInfo {
+    /// Version string without leading `v` (e.g. `"2.1.0-alpha.14"`).
+    pub version: String,
+    /// Current running version (for "v{current} → v{latest}" display).
+    pub current_version: String,
+    /// HTTPS URL to the GitHub release page (html_url from the API).
+    pub release_url: String,
+}
+
 /// State shared with Tauri commands.
 ///
 /// Holds the PKCE state store for in-flight Claude OAuth logins.
@@ -91,9 +110,14 @@ impl TrayIconKind {
 /// hook can shut it down cleanly. The handle is wrapped in a Mutex
 /// because we need interior mutability (to `take` it on the single
 /// RunEvent::Exit) from inside an immutable `tauri::State` borrow.
+///
+/// `update_cache` stores the result of the most recent background
+/// update check. `None` means either the check has not run yet or
+/// the app is already up to date.
 pub struct AppState {
     pub oauth_store: Arc<OAuthStateStore>,
     pub daemon_supervisor: Mutex<Option<SupervisorHandle>>,
+    pub update_cache: Mutex<Option<CachedUpdateInfo>>,
 }
 
 /// Maximum length of an account label shown in the tray.
@@ -696,6 +720,9 @@ pub fn run() {
             commands::swap_session,
             commands::get_autostart_enabled,
             commands::set_autostart_enabled,
+            commands::check_for_update,
+            commands::get_update_status,
+            commands::open_release_page,
         ])
         .setup(|app| {
             // ── Logging ────────────────────────────────────────
@@ -779,6 +806,46 @@ pub fn run() {
             app.manage(AppState {
                 oauth_store,
                 daemon_supervisor: Mutex::new(supervisor),
+                update_cache: Mutex::new(None),
+            });
+
+            // ── Background update check ────────────────────────
+            //
+            // Fires 10s after app launch so startup isn't blocked
+            // on a network round-trip. Emits `update-available`
+            // to the frontend if a newer release exists on
+            // GitHub. Frontend listens and shows a banner; the
+            // user can click through to the release page for
+            // manual install (signing key still placeholder, so
+            // in-app install is intentionally not offered).
+            let handle_for_update = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                match csq_core::update::check_for_update() {
+                    Ok(Some(info)) => {
+                        let cached = CachedUpdateInfo {
+                            version: info.version,
+                            current_version: env!("CARGO_PKG_VERSION").to_string(),
+                            release_url: info.html_url,
+                        };
+                        // Persist to state cache for get_update_status.
+                        if let Some(state) = handle_for_update.try_state::<AppState>() {
+                            if let Ok(mut guard) = state.update_cache.lock() {
+                                *guard = Some(cached.clone());
+                            }
+                        }
+                        // Notify frontend so the banner renders
+                        // without the dashboard having to poll.
+                        use tauri::Emitter;
+                        let _ = handle_for_update.emit("update-available", &cached);
+                    }
+                    Ok(None) => {
+                        tracing::debug!("background update check: up to date");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "background update check failed");
+                    }
+                }
             });
 
             // ── System tray ──────────────────────────────────

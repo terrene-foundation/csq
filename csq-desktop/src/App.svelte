@@ -5,6 +5,7 @@
   import SessionList from "./lib/components/SessionList.svelte";
   import Header from "./lib/components/Header.svelte";
   import Toast from "./lib/components/Toast.svelte";
+  import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import { showToast } from "./lib/stores/toast.svelte";
 
   // ── Backend event payload shapes ─────────────────────────
@@ -82,6 +83,7 @@
 
 <div class="app">
   <Header />
+  <UpdateBanner />
   <div class="tabs" role="tablist" aria-label="Dashboard views">
     <button
       class="tab"

@@ -528,11 +528,23 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        // Prime an expired cooldown.
-        cooldowns.lock().unwrap().insert(
-            1,
-            Instant::now() - super::super::FAILURE_COOLDOWN - Duration::from_secs(1),
-        );
+        // Prime an expired cooldown. On fresh CI runners Instant::now() may
+        // be less than FAILURE_COOLDOWN since boot, so checked_sub returns
+        // None — skip the test rather than panic. See refresher.rs for the
+        // same pattern and a full explanation of the trade-off.
+        let past = match Instant::now()
+            .checked_sub(super::super::FAILURE_COOLDOWN + Duration::from_secs(1))
+        {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP tick_success_clears_cooldown: Instant::now() too close \
+                     to boot to simulate an expired cooldown"
+                );
+                return;
+            }
+        };
+        cooldowns.lock().unwrap().insert(1, past);
 
         tick(dir.path(), &http, &cooldowns, &backoffs).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);

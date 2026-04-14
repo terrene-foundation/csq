@@ -717,10 +717,23 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
 
         // Prime a cooldown that has already elapsed (simulate past failure).
-        cooldowns.lock().unwrap().insert(
-            1,
-            Instant::now() - FAILURE_COOLDOWN - Duration::from_secs(1),
-        );
+        // On fresh CI runners Instant::now() may be less than FAILURE_COOLDOWN
+        // since system boot, so naive subtraction would panic. `checked_sub`
+        // returns None in that case and we skip — the `tick_failure_sets_cooldown`
+        // test exercises the cooldown-write path on the same runner, so losing
+        // coverage of the expired-cooldown path here only on fresh-boot runners
+        // is an acceptable trade.
+        let past = match Instant::now().checked_sub(FAILURE_COOLDOWN + Duration::from_secs(1)) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP tick_success_clears_cooldown: Instant::now() too close \
+                     to boot to simulate an expired cooldown"
+                );
+                return;
+            }
+        };
+        cooldowns.lock().unwrap().insert(1, past);
 
         tick(dir.path(), &http, &cache, &cooldowns).await;
 

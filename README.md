@@ -116,7 +116,7 @@ Then add `%USERPROFILE%\.local\bin` to `PATH` if it isn't already.
 After install:
 
 ```bash
-csq --version    # should print: csq 2.0.0-alpha.8
+csq --version    # should print: csq 2.0.0-alpha.9
 csq doctor       # runs diagnostics
 csq login 1      # authenticate your first account
 ```
@@ -233,7 +233,7 @@ pip uninstall csq    # if you used pip
 
 # Install the current Rust binary
 curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
-csq --version    # csq 2.0.0-alpha.8
+csq --version    # csq 2.0.0-alpha.9
 ```
 
 Your accounts at `~/.claude/accounts/credentials/N.json` are picked
@@ -258,7 +258,7 @@ auto-update works for every subsequent release:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
-csq --version    # csq 2.0.0-alpha.8
+csq --version    # csq 2.0.0-alpha.9
 csq update check # should now report up-to-date
 ```
 

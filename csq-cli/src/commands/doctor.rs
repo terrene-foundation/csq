@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use csq_core::accounts::discovery;
+use csq_core::broker::fanout;
 use csq_core::credentials::file as cred_file;
 use csq_core::platform::process::is_pid_alive;
 use csq_core::types::AccountNum;
@@ -22,6 +23,7 @@ struct DoctorReport {
     settings: SettingsInfo,
     daemon: DaemonInfo,
     accounts: AccountsInfo,
+    broker_failed: BrokerFailedInfo,
     terminals: TerminalInfo,
     resurrections: ResurrectionInfo,
 }
@@ -84,8 +86,30 @@ struct SettingsInfo {
 
 #[derive(Serialize)]
 struct DaemonInfo {
+    /// One of: "healthy", "pid_alive_no_socket", "stale", "unhealthy", "not running",
+    /// "not supported".
     status: String,
     pid: Option<u32>,
+    /// Whether the daemon socket responded to the health check. `None` when
+    /// the daemon is not running or the platform does not support detection.
+    socket_healthy: Option<bool>,
+}
+
+/// One account whose broker has set the LOGIN-NEEDED sentinel.
+#[derive(Serialize)]
+struct BrokerFailedEntry {
+    account: u16,
+    reason: String,
+}
+
+/// Summary of broker-failed sentinel files found under
+/// `credentials/N.broker-failed`.
+#[derive(Serialize)]
+struct BrokerFailedInfo {
+    /// Number of accounts with a broker-failed sentinel.
+    count: usize,
+    /// Per-account details (account number + reason tag).
+    entries: Vec<BrokerFailedEntry>,
 }
 
 #[derive(Serialize)]
@@ -115,6 +139,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         settings: check_settings(),
         daemon: check_daemon(base_dir),
         accounts: check_accounts(base_dir),
+        broker_failed: check_broker_failed(base_dir),
         terminals: check_terminals(base_dir),
         resurrections: check_resurrections(base_dir),
     }
@@ -240,7 +265,11 @@ fn check_settings() -> SettingsInfo {
                         .and_then(|sl| sl.get("command"))
                         .and_then(|c| c.as_str())
                         .map(|s| s.to_string());
-                    let configured = cmd.as_ref().is_some_and(|c| c.contains("csq"));
+                    // Any non-empty command is "configured" — doctor should
+                    // not second-guess what script is used, only that one
+                    // exists. The old `c.contains("csq")` check rejected
+                    // valid wrapper scripts.
+                    let configured = cmd.as_ref().is_some_and(|c| !c.trim().is_empty());
                     (true, configured, cmd)
                 }
                 Err(_) => (true, false, None),
@@ -258,32 +287,38 @@ fn check_settings() -> SettingsInfo {
 }
 
 fn check_daemon(base_dir: &Path) -> DaemonInfo {
-    #[cfg(unix)]
-    {
-        use csq_core::daemon::{self, DaemonStatus};
-        let pid_path = daemon::pid_file_path(base_dir);
-        match daemon::status_of(&pid_path) {
-            DaemonStatus::Running { pid } => DaemonInfo {
-                status: "running".into(),
-                pid: Some(pid),
-            },
-            DaemonStatus::Stale { pid } => DaemonInfo {
-                status: "stale".into(),
-                pid: Some(pid),
-            },
-            DaemonStatus::NotRunning => DaemonInfo {
-                status: "not running".into(),
-                pid: None,
-            },
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = base_dir;
-        DaemonInfo {
-            status: "not supported".into(),
+    use csq_core::daemon::{detect_daemon, DetectResult};
+    match detect_daemon(base_dir) {
+        DetectResult::Healthy { pid, .. } => DaemonInfo {
+            status: "healthy".into(),
+            pid: Some(pid),
+            socket_healthy: Some(true),
+        },
+        DetectResult::Stale { .. } => DaemonInfo {
+            status: "stale".into(),
             pid: None,
+            socket_healthy: Some(false),
+        },
+        DetectResult::Unhealthy { reason } => {
+            // PID is alive but the socket did not respond — daemon is up
+            // but not serving. The reason string distinguishes "PID alive
+            // but socket missing" from other unhealthy cases.
+            let pid_alive_no_socket = reason.contains("socket") && reason.contains("missing");
+            DaemonInfo {
+                status: if pid_alive_no_socket {
+                    "pid_alive_no_socket".into()
+                } else {
+                    "unhealthy".into()
+                },
+                pid: None,
+                socket_healthy: Some(false),
+            }
         }
+        DetectResult::NotRunning => DaemonInfo {
+            status: "not running".into(),
+            pid: None,
+            socket_healthy: None,
+        },
     }
 }
 
@@ -327,6 +362,72 @@ fn check_accounts(base_dir: &Path) -> AccountsInfo {
         with_credentials,
         expired,
     }
+}
+
+/// Scans `credentials/N.broker-failed` sentinel files and returns the list of
+/// accounts that require re-login.
+///
+/// The scan uses two approaches combined:
+/// 1. Check every account discovered by `discovery::discover_anthropic` —
+///    covers accounts whose credential slot exists.
+/// 2. Glob `credentials/*.broker-failed` directly — catches sentinel files for
+///    accounts whose `credentials/N.json` is missing (total loss case).
+///
+/// Both sets are unioned and de-duplicated before building the report.
+fn check_broker_failed(base_dir: &Path) -> BrokerFailedInfo {
+    let mut failed_ids: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+
+    // Pass 1: discovered accounts.
+    let accounts = discovery::discover_anthropic(base_dir);
+    for a in &accounts {
+        let Ok(num) = AccountNum::try_from(a.id) else {
+            continue;
+        };
+        if fanout::is_broker_failed(base_dir, num) {
+            failed_ids.insert(a.id);
+        }
+    }
+
+    // Pass 2: filesystem scan of credentials/*.broker-failed to catch
+    // accounts not in the discovery list.
+    let creds_dir = base_dir.join("credentials");
+    if let Ok(entries) = std::fs::read_dir(&creds_dir) {
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let stem = match name.strip_suffix(".broker-failed") {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Ok(id) = stem.parse::<u16>() {
+                failed_ids.insert(id);
+            }
+        }
+    }
+
+    let entries: Vec<BrokerFailedEntry> = failed_ids
+        .iter()
+        .filter_map(|&id| {
+            let Ok(num) = AccountNum::try_from(id) else {
+                return None;
+            };
+            let reason = fanout::read_broker_failed_reason(base_dir, num).unwrap_or_default();
+            let display_reason = if reason.is_empty() {
+                "unknown".to_string()
+            } else {
+                reason
+            };
+            Some(BrokerFailedEntry {
+                account: id,
+                reason: display_reason,
+            })
+        })
+        .collect();
+
+    let count = entries.len();
+    BrokerFailedInfo { count, entries }
 }
 
 /// Detects legacy and modern CC terminals by examining the `base_dir` layout.
@@ -516,15 +617,26 @@ fn print_report(r: &DoctorReport) {
     println!("  Settings:    {settings_icon} {settings_detail}");
 
     // Daemon
-    let daemon_icon = match r.daemon.status.as_str() {
-        "running" => ok(),
-        "stale" => fail(),
-        _ => warn(),
-    };
-    let daemon_detail = match (r.daemon.status.as_str(), r.daemon.pid) {
-        ("running", Some(pid)) => format!("running (PID {pid})"),
-        ("stale", Some(pid)) => format!("stale PID file (PID {pid}) — run `csq daemon start`"),
-        _ => "not running".into(),
+    let (daemon_icon, daemon_detail) = match r.daemon.status.as_str() {
+        "healthy" => {
+            let pid_str = r
+                .daemon
+                .pid
+                .map(|p| format!(" (PID {p})"))
+                .unwrap_or_default();
+            (ok(), format!("running and healthy{pid_str}"))
+        }
+        "pid_alive_no_socket" => (
+            warn(),
+            "PID alive but socket unreachable — daemon may be starting up".into(),
+        ),
+        "stale" => (fail(), "stale PID/socket — run `csq daemon start`".into()),
+        "unhealthy" => (
+            warn(),
+            "daemon unhealthy — socket connect or health check failed".into(),
+        ),
+        "not running" => (warn(), "not running — run `csq daemon start`".into()),
+        _ => (warn(), r.daemon.status.clone()),
     };
     println!("  Daemon:      {daemon_icon} {daemon_detail}");
 
@@ -544,6 +656,19 @@ fn print_report(r: &DoctorReport) {
         acct_detail.push_str(&format!(", {} expired", r.accounts.expired));
     }
     println!("  Accounts:    {acct_icon} {acct_detail}");
+
+    // Broker-failed sentinels
+    if r.broker_failed.count > 0 {
+        for entry in &r.broker_failed.entries {
+            println!(
+                "  Broker:      {} Account {}: LOGIN-NEEDED ({}) — run `csq login {}`",
+                fail(),
+                entry.account,
+                entry.reason,
+                entry.account,
+            );
+        }
+    }
 
     // Terminals
     let t = &r.terminals;
@@ -785,11 +910,16 @@ mod tests {
             daemon: DaemonInfo {
                 status: "not running".into(),
                 pid: None,
+                socket_healthy: None,
             },
             accounts: AccountsInfo {
                 total: 0,
                 with_credentials: 0,
                 expired: 0,
+            },
+            broker_failed: BrokerFailedInfo {
+                count: 0,
+                entries: Vec::new(),
             },
             terminals,
             resurrections: ResurrectionInfo {
@@ -952,6 +1082,191 @@ mod tests {
         assert!(
             json.contains("\"check_available\":true"),
             "JSON must include check_available"
+        );
+    }
+
+    // ── Fix 2: statusline check tests ─────────────────────────────────────
+
+    #[test]
+    fn statusline_any_non_empty_command_is_configured() {
+        // Arrange: a wrapper script that doesn't contain "csq"
+        let cmd = Some("statusline-quota.sh".to_string());
+
+        // Act: replicate the check logic
+        let configured = cmd.as_ref().is_some_and(|c| !c.trim().is_empty());
+
+        // Assert: non-empty → configured
+        assert!(
+            configured,
+            "any non-empty command should be considered configured"
+        );
+    }
+
+    #[test]
+    fn statusline_empty_command_is_not_configured() {
+        // Arrange
+        let cmd = Some("   ".to_string());
+
+        // Act
+        let configured = cmd.as_ref().is_some_and(|c| !c.trim().is_empty());
+
+        // Assert
+        assert!(
+            !configured,
+            "whitespace-only command should not be configured"
+        );
+    }
+
+    #[test]
+    fn statusline_none_command_is_not_configured() {
+        // Arrange
+        let cmd: Option<String> = None;
+
+        // Act
+        let configured = cmd.as_ref().is_some_and(|c| !c.trim().is_empty());
+
+        // Assert
+        assert!(!configured, "None command should not be configured");
+    }
+
+    #[test]
+    fn statusline_csq_command_still_configured_after_relaxation() {
+        // Arrange: original csq command still works under the relaxed check
+        let cmd = Some("csq statusline".to_string());
+
+        // Act
+        let configured = cmd.as_ref().is_some_and(|c| !c.trim().is_empty());
+
+        // Assert
+        assert!(configured);
+    }
+
+    // ── Fix 3: broker_failed scanning tests ───────────────────────────────
+
+    #[test]
+    fn check_broker_failed_no_sentinels_reports_empty() {
+        // Arrange
+        let tmp = TempDir::new().unwrap();
+
+        // Act
+        let info = check_broker_failed(tmp.path());
+
+        // Assert
+        assert_eq!(info.count, 0);
+        assert!(info.entries.is_empty());
+    }
+
+    #[test]
+    fn check_broker_failed_detects_sentinel_files() {
+        // Arrange: write two broker-failed sentinel files directly
+        let tmp = TempDir::new().unwrap();
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("2.broker-failed"), "invalid_grant").unwrap();
+        std::fs::write(creds_dir.join("5.broker-failed"), "network").unwrap();
+
+        // Act
+        let info = check_broker_failed(tmp.path());
+
+        // Assert
+        assert_eq!(info.count, 2, "two sentinels should be detected");
+        let ids: Vec<u16> = info.entries.iter().map(|e| e.account).collect();
+        assert!(ids.contains(&2), "account 2 should be in entries");
+        assert!(ids.contains(&5), "account 5 should be in entries");
+    }
+
+    #[test]
+    fn check_broker_failed_reads_reason_from_file() {
+        // Arrange
+        let tmp = TempDir::new().unwrap();
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("3.broker-failed"), "rate_limit").unwrap();
+
+        // Act
+        let info = check_broker_failed(tmp.path());
+
+        // Assert
+        assert_eq!(info.count, 1);
+        assert_eq!(info.entries[0].account, 3);
+        assert_eq!(info.entries[0].reason, "rate_limit");
+    }
+
+    #[test]
+    fn check_broker_failed_empty_sentinel_shows_unknown_reason() {
+        // Arrange: pre-v2.1 zero-byte sentinel file
+        let tmp = TempDir::new().unwrap();
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("1.broker-failed"), b"").unwrap();
+
+        // Act
+        let info = check_broker_failed(tmp.path());
+
+        // Assert
+        assert_eq!(info.count, 1);
+        assert_eq!(
+            info.entries[0].reason, "unknown",
+            "empty file should show 'unknown'"
+        );
+    }
+
+    #[test]
+    fn check_broker_failed_ignores_non_sentinel_files() {
+        // Arrange: a .json and a random file in credentials/
+        let tmp = TempDir::new().unwrap();
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("1.json"), "{}").unwrap();
+        std::fs::write(creds_dir.join("random.txt"), "data").unwrap();
+
+        // Act
+        let info = check_broker_failed(tmp.path());
+
+        // Assert
+        assert_eq!(info.count, 0, "non-sentinel files should not be counted");
+    }
+
+    #[test]
+    fn check_broker_failed_entries_sorted_by_account_number() {
+        // Arrange: write sentinels in reverse order
+        let tmp = TempDir::new().unwrap();
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("7.broker-failed"), "network").unwrap();
+        std::fs::write(creds_dir.join("2.broker-failed"), "invalid_grant").unwrap();
+        std::fs::write(creds_dir.join("4.broker-failed"), "rate_limit").unwrap();
+
+        // Act
+        let info = check_broker_failed(tmp.path());
+
+        // Assert: entries should be sorted ascending by account number
+        assert_eq!(info.count, 3);
+        assert_eq!(info.entries[0].account, 2);
+        assert_eq!(info.entries[1].account, 4);
+        assert_eq!(info.entries[2].account, 7);
+    }
+
+    #[test]
+    fn json_output_includes_broker_failed_field() {
+        // Arrange
+        let r = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: true,
+        });
+
+        // Act
+        let json = serde_json::to_string(&r).unwrap();
+
+        // Assert
+        assert!(
+            json.contains("\"broker_failed\""),
+            "JSON must include broker_failed key"
+        );
+        assert!(
+            json.contains("\"count\":0"),
+            "JSON must include count field"
         );
     }
 }

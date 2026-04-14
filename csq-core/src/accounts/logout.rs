@@ -392,15 +392,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         provision_account(dir.path(), 6);
 
-        // Spawn a short-lived child and wait for it. The reaped PID
-        // is guaranteed dead at this point. (`u32::MAX` does NOT
-        // work — `pid_t` is `i32`, so `u32::MAX as i32 == -1`, which
-        // `kill(2)` interprets as "every process".)
-        let mut child = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn `true`");
-        let dead_pid = child.id();
-        let _ = child.wait();
+        // Pick a PID above `/proc/sys/kernel/pid_max` (4_194_304 on Linux
+        // default, 99999 on macOS) so it is never in use, but below
+        // `i32::MAX` so it is not reinterpreted as -1 ("every process")
+        // by kill(2). The earlier version spawned `true` and used the
+        // reaped child's PID — this was flaky because Linux can reuse
+        // a reaped PID within microseconds on a busy CI runner, at
+        // which point `is_pid_alive` returned true and the test
+        // panicked. The constant below bypasses the reuse race entirely.
+        let dead_pid: u32 = 2_000_000_000;
 
         let handle = dir.path().join(format!("term-{dead_pid}"));
         fs::create_dir_all(&handle).unwrap();

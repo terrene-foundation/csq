@@ -369,9 +369,26 @@ mod tests {
         assert_eq!(detect_daemon(dir.path()), DetectResult::NotRunning);
     }
 
+    // Gated off Windows: `pid_file_path` on Windows ignores `base_dir`
+    // and resolves to `%LOCALAPPDATA%\csq\csq-daemon.pid`. Two parallel
+    // tests that each write a different PID file content race on that
+    // global path, and overriding `LOCALAPPDATA` per-test isn't safe
+    // either because `std::env::set_var` is process-global and other
+    // parallel tests reading `pid_file_path` will see the wrong override.
+    // Linux + macOS both honor per-TempDir paths (Linux via
+    // `XDG_RUNTIME_DIR`, macOS via `base_dir`) so the corrupt-file code
+    // path is still covered there. The Windows pid-handling code is
+    // exercised by the gated `detect_windows_*` tests below.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn detect_corrupt_pid_file_is_stale() {
         let dir = TempDir::new().unwrap();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        }
+
         let pid_path = super::super::pid_file_path(dir.path());
         fs::create_dir_all(pid_path.parent().unwrap()).ok();
         fs::write(&pid_path, "garbage").unwrap();
@@ -384,9 +401,18 @@ mod tests {
         }
     }
 
+    // Gated off Windows for the same race reason documented on
+    // `detect_corrupt_pid_file_is_stale` above.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn detect_dead_pid_is_stale() {
         let dir = TempDir::new().unwrap();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        }
+
         let pid_path = super::super::pid_file_path(dir.path());
         fs::create_dir_all(pid_path.parent().unwrap()).ok();
         fs::write(&pid_path, "99999999\n").unwrap();

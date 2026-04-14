@@ -1,62 +1,49 @@
-# Session Notes — csq v2: Packaging + Installer + OAuth JSON Fix + Red Team Converged
+# Session Notes — csq alpha.9→alpha.13: five handle-dir fixes + update pipeline fixed
 
 ## Read These Files First (in order)
 
-1. `workspaces/csq-v2/journal/0034-DISCOVERY-oauth-json-body-required.md` — Anthropic OAuth endpoint now requires JSON body; single most important session finding
-2. `workspaces/csq-v2/journal/0035-DISCOVERY-image-cache-per-config-dir-race.md` — why image-cache is NOT shared yet + the medium-term fix design the next session must implement
-3. `csq-core/src/credentials/refresh.rs` — JSON body build for token refresh; matches CC `vw8` exactly
-4. `csq-core/src/oauth/exchange.rs` — JSON body build for auth-code exchange; matches CC `Tw8` exactly
-5. `csq-core/src/broker/check.rs` — `BrokerResult::RateLimited` variant + `is_rate_limited` helper; skip sibling recovery on 429
-6. `csq-core/src/daemon/refresher.rs:321-347` — exhaustive match over BrokerResult; cooldown on RateLimited, clear on Valid/Refreshed/Recovered
-7. `csq-core/src/session/handle_dir.rs` + `isolation.rs` — 35-item SHARED_ITEMS list, `.claude.json` copy-with-cwd-scoped-projects, live-pid safety in create_handle_dir
-8. `csq-core/src/session/handle_dir.rs` `sweep_dead_handles` — where the next-session image-cache guard must hook in
-9. `install.sh` — curl-pipe downloader with anchored `validate_tag` regex
-10. `.github/workflows/release.yml` — tag-triggered release builds for 3 platforms, SHA256SUMS
-11. `README.md` — platform-tabbed install instructions (CLI + desktop)
+1. `workspaces/csq-v2/journal/0044-DECISION-alpha-9-handle-dir-settings-merge.md` — settings.json materialized as real file (not symlink) by merging user global + slot overlay. Fixes statusLine/bypassPermissions vanishing under csq run.
+2. `workspaces/csq-v2/journal/0045-DISCOVERY-alpha-10-swap-stale-claude-json.md` — csq swap now atomically rewrites .claude.json so CC doesn't display pre-swap account's cached quota state.
+3. `workspaces/csq-v2/journal/0047-DISCOVERY-alpha-12-update-check-three-bugs.md` — /releases/latest skipped prereleases, compare_versions was lexicographic on alpha.N, GitHub list order unreliable. All three fixed with client-side semver sort.
+4. `workspaces/csq-v2/journal/0048-DISCOVERY-alpha-13-statusline-script-delivery-gap.md` — statusline-quota.sh never deployed by install.sh; now delivered alongside binary.
+5. `csq-core/src/session/handle_dir.rs` — `materialize_handle_settings` + `materialize_handle_claude_json` + `rebuild_claude_json_for_swap`. The core of alpha.9+10.
+6. `csq-core/src/update/github.rs` — `compare_prerelease` (SemVer §11 numeric segments), `/releases?per_page=30` + client-side sort.
 
 ## Accomplished
 
-- **PR #84 merged** (`cba7cbb`) — handle-dir resilience: expanded SHARED_ITEMS 10→35, `.claude.json` CWD-scoped copy, `create_handle_dir` live-pid safety check
-- **PR #85 merged** (`45fe239`) — README Install section rewritten
-- **PR #86 merged** (`4f3274a`) — packaging + installer + T1/T2 test gaps + OAuth refresh JSON fix; **red team converged in 4 rounds**
-- **v2.0.0-alpha.2 released** — tagged and published on GitHub
-- **Auto-refresh mass-failure root-caused**: Anthropic's `/v1/oauth/token` switched to JSON-only. All 7 accounts were failing with `400 invalid_request_error`. Fixed by building JSON body with `client_id` + `scope`. Removed retry-in-loop from both `refresh_token` and `exchange_code` — amplified rate-limit cascades.
-- **`BrokerResult::RateLimited`** — distinct from `Skipped` so refresher sets cooldown correctly on 429
-- **Linux .deb/.rpm/AppImage + Windows .msi + macOS .dmg** — Tauri bundler targets wired in `tauri.conf.json`; release workflow builds all three platforms on `v*` tag push
-- **`install.sh` curl-pipe** — platform detect, anchored semver regex (rejects path traversal, shell metachars, newline injection), exact `awk` field-match for SHA256, tag-vs-asset 404 distinction, pre-release fallback warning
-- **T1/T2 test gaps closed** — `download_and_apply_to` with injectable path, `run_update_check_with` with injectable transport + notice sink; 4 new tests
-- **Azure signup completed** — resource group `csq-signing-rg` in `eastus`, logged in as `jack@terrene.foundation` on "terrene foundation" tenant. No billable resources created. Code signing deferred.
+- **alpha.9** (PR #102): handle-dir settings.json materialized via deep-merge. Killed apiKeyHelper bug at source. 6 new tests.
+- **alpha.10** (PR #103): csq swap rewrites .claude.json atomically, preserving session-scoped projects. 2 new tests.
+- **alpha.11** (PR #104): live-only discovery fallback + in-tick canonical resurrection + forensic breadcrumbs + csq doctor resurrection summary. 9 new tests. **NOTE**: hypothesis was wrong — affected machine had all canonicals present. Real cause of 8h re-auth was no daemon running (desktop app not launched). Code is additive/harmless but untested in anger.
+- **alpha.12** (PR #105): update check fixed — /releases?per_page=30 + semver-aware prerelease compare + client-side sort. 8 new tests.
+- **alpha.13** (PRs #106+#107): statusline-quota.sh handle-dir compat + install.sh/csq update install now deploy the script. Validated: csq update install from alpha.12→13 worked end-to-end on user's other machine.
+- **Total**: 719 tests passing, clippy clean, fmt clean. 5 journal entries (0044-0048). 7 PRs merged.
 
 ## Outstanding
 
-- [ ] **`image-cache` medium-term fix (USER REQUESTED FOR NEXT SESSION)** — write a cleanup guard in `csq-core/src/session/handle_dir.rs` `sweep_dead_handles` that moves `term-<pid>/image-cache/<session-id>/` into `~/.claude/image-cache/<session-id>/` before removing the dead dir. Do NOT add `image-cache` to `SHARED_ITEMS` — CC's `Dv7` cleanup races on shared dirs. See journal 0035 for the design.
-- [ ] **`csq repair-sessions` command** — 1651 session JSONL files exist under wrong project dirs (their `cwd` field doesn't match the encoded dir name). 21 are loom/kailash-rs sessions misfiled under loom/. Build `csq repair-sessions` that finds mis-filed files and moves them to the correct project dir based on their first-line `cwd`.
-- [ ] **Replace placeholder Ed25519 key** — `csq-core/src/update/verify.rs:58-64`. Blocked on Foundation key provisioning.
-- [ ] **Pin GitHub Actions by SHA** — `.github/workflows/release.yml` pins `softprops/action-gh-release@v2` and `dtolnay/rust-toolchain@master` by mutable refs. Red team round 1 M1.
-- [ ] **Out-of-band signing of SHA256SUMS** — follow-up: `cosign sign-blob` step. Red team round 1 M2.
-- [ ] **Pre-existing flaky test** — `tick_3p_zai_polls_and_writes_quota` fails in isolation but not in `cargo test --workspace` parallel run. Not a regression from this session.
+- [ ] **Desktop app auto-updater** — Tauri `tauri-plugin-updater` for self-update + trigger CLI update + statusline script. User explicitly requested. Alpha.14 priority.
+- [ ] **Standalone daemon** (`csq daemon start/stop/status`) — root cause of 8h re-auth was no desktop app → no daemon → no refresh. CLI-only users need a background daemon. Now must-have.
+- [ ] **csq doctor false negatives** — (a) Daemon: check socket not just PID file; (b) Settings: statusline check too strict (requires literal "csq" in command).
+- [ ] **csq doctor broker_failed surface** — read `broker_failed_*` sentinels, print stuck slots with `csq login N` hint.
+- [ ] **Spec 02 update** — settings.json listed under account-bound symlinks but alpha.9 moved it to materialized.
+- [ ] **Uncommitted**: `0041-…md`, `0043-…md`, `0048-…md`, `csq-desktop/fix-dmg.sh`, `.claude/scheduled_tasks.lock`.
+- [ ] **Carried forward**: Anthropic OAuth cutover (blocked on client-id), same-email duplicate-slot badge, GH Actions v5 bump, Windows desktop smoke test.
 
 ## Oversight — Verify Before Starting
 
-- [ ] `git log --oneline -5` — HEAD should include `4f3274a` (PR #86 merge)
-- [ ] `csq --version` → `csq 2.0.0-alpha.2`
-- [ ] `cargo test --workspace` — 586 passed, 1 pre-existing zai flake
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` — zero
-- [ ] `cargo fmt --all -- --check` — zero drift
-- [ ] Daemon alive: `cat ~/.claude/accounts/csq-daemon.pid` returns a live PID
-- [ ] All 7 accounts healthy: 400+ minutes token remaining
-- [ ] No broker-failed markers: `ls ~/.claude/accounts/credentials/*.broker-failed` errors "no matches"
+- [ ] `git log --oneline -5` — HEAD includes `becb6dd` (PR #107 merge).
+- [ ] `csq --version` → `csq 2.0.0-alpha.13`.
+- [ ] `cargo test --workspace` — 719 tests, all ok.
+- [ ] `gh release view v2.0.0-alpha.13 --json assets --jq '.assets | length'` → `16`.
 
 ## Oversight — Verify After Completing
 
-- [ ] `cargo test --workspace` — no new regressions beyond the zai flake
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` — zero
-- [ ] `cargo fmt --all -- --check` — zero drift
-- [ ] Image cache test: paste image in a handle-dir terminal, exit, verify image survives into `~/.claude/image-cache/<session-id>/` after daemon sweep removes the dead dir
-- [ ] Red team convergence: run 2 consecutive clean rounds before opening the PR
+- [ ] `cargo test --workspace` — no regressions.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` — zero.
+- [ ] `cargo fmt --all -- --check` — zero drift.
+- [ ] If touching update/github.rs: `compare_versions("2.0.0-alpha.20", "2.0.0-alpha.9")` must return Greater.
+- [ ] If touching handle_dir.rs: `csq run 1` then `csq swap 5` mid-session — verify CC uses slot 5's quota.
 
 ## Blockers
 
-1. **Apple Developer cert** — blocks macOS desktop signing. User decided source-only, no action.
-2. **Azure Trusted Signing** — blocks Windows signing. ~$9.99/mo, not yet funded. User decided source-only, no action.
-3. **Foundation Ed25519 signing key** — blocks replacing the placeholder in `csq-core/src/update/verify.rs`. Needs Foundation decision to generate + publish.
+1. **Desktop updater** needs Tauri plugin config + signing key. Apple Developer ID still missing.
+2. **Standalone daemon** needs decision: launchd plist vs long-running `csq daemon start`.

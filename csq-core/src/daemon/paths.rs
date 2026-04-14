@@ -215,14 +215,19 @@ mod tests {
     #[test]
     fn windows_pipe_name_format() {
         let base = Path::new(r"C:\Users\testuser\AppData\Local\csq");
-        // Override USERNAME so the test is deterministic.
-        std::env::set_var("USERNAME", "testuser");
+        // Note: `pipe_name` calls `GetUserNameW` (Win32 API) first and
+        // only falls back to the `USERNAME` env var if the API fails.
+        // Setting the env var does NOT override the API, so on CI
+        // runners the suffix will be the runner's actual username
+        // (e.g. "runneradmin"), not our mock value. The invariants
+        // we *can* assert are: correct prefix, non-empty suffix.
         let p = pipe_name(base);
         let s = p.to_string_lossy();
         assert!(s.starts_with(r"\\.\pipe\csq-"), "unexpected pipe name: {s}");
+        let suffix = s.strip_prefix(r"\\.\pipe\csq-").unwrap();
         assert!(
-            s.contains("testuser"),
-            "pipe name should contain username: {s}"
+            !suffix.is_empty(),
+            "pipe name must have a non-empty username suffix: {s}"
         );
     }
 

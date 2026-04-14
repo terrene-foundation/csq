@@ -2,7 +2,7 @@
 
 use super::CredentialFile;
 use crate::error::{redact_tokens, OAuthError};
-use crate::oauth::constants::{scopes_joined, OAUTH_CLIENT_ID};
+use crate::oauth::constants::OAUTH_CLIENT_ID;
 use crate::types::{AccessToken, RefreshToken};
 use serde::Deserialize;
 use std::fmt;
@@ -85,26 +85,35 @@ pub fn merge_refresh(existing: &CredentialFile, response: &RefreshResponse) -> C
 
 /// Builds the JSON body for a token refresh request.
 ///
-/// Format matches Claude Code's `vw8` function in `cli.js`:
+/// Format:
 /// ```json
 /// {
 ///   "grant_type": "refresh_token",
 ///   "refresh_token": "<token>",
-///   "client_id": "<CLIENT_ID>",
-///   "scope": "<space-joined scopes>"
+///   "client_id": "<CLIENT_ID>"
 /// }
 /// ```
 ///
-/// Anthropic's `/v1/oauth/token` endpoint rejects form-encoded bodies
-/// with `400 invalid_request_error` — it requires JSON. This caused a
-/// silent mass broker-failure across every account when the endpoint
-/// switched to JSON-only (journal 0034).
+/// **No `scope` parameter.** Per RFC 6749 §6, scope is OPTIONAL on
+/// refresh requests and, if omitted, the new token retains the
+/// original scope set granted at authorize time. As of 2026-04-14,
+/// Anthropic's `/v1/oauth/token` endpoint REJECTS any `scope` field
+/// in the refresh body with `400 invalid_scope` — even when the
+/// scopes match what was originally granted. Sending it caused a
+/// silent mass broker-failure across every account; the daemon's
+/// `is_rate_limited` heuristic does not match `invalid_scope`, so
+/// failures fell through to recovery, hammered the endpoint, and
+/// eventually got the IP rate-limited for real (journal 0052).
+///
+/// Anthropic's `/v1/oauth/token` endpoint also rejects form-encoded
+/// bodies with `400 invalid_request_error` — it requires JSON. This
+/// caused a silent mass broker-failure across every account when the
+/// endpoint switched to JSON-only (journal 0034).
 pub fn build_refresh_body(refresh_token: &str) -> String {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": OAUTH_CLIENT_ID,
-        "scope": scopes_joined(),
     });
     serde_json::to_string(&body).expect("static JSON always serializes")
 }
@@ -230,7 +239,26 @@ mod tests {
         assert_eq!(parsed["grant_type"], "refresh_token");
         assert_eq!(parsed["refresh_token"], "sk-ant-ort01-test");
         assert_eq!(parsed["client_id"], OAUTH_CLIENT_ID);
-        assert!(parsed["scope"].as_str().unwrap().contains("user:inference"));
+    }
+
+    /// Regression test for journal 0052: Anthropic's
+    /// `/v1/oauth/token` endpoint returns `400 invalid_scope` when
+    /// the refresh body includes a `scope` field, even when the
+    /// scopes match what was originally granted at authorize time.
+    /// Per RFC 6749 §6, scope is OPTIONAL on refresh — the new token
+    /// retains the original scopes when scope is omitted. Sending
+    /// scope here previously broke every refresh in the daemon and
+    /// every account silently expired until the user manually
+    /// re-logged in.
+    #[test]
+    fn build_refresh_body_omits_scope_field() {
+        let body = build_refresh_body("sk-ant-ort01-test");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed.get("scope").is_none(),
+            "refresh body must NOT contain `scope` — Anthropic returns \
+             invalid_scope; see journal 0052. Got: {body}"
+        );
     }
 
     #[test]

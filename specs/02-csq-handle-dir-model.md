@@ -41,7 +41,7 @@ accounts/
 └── term-<pid>/               ← ephemeral handle dir, one per running `claude` process
     ├── .credentials.json  → ../config-<current>/.credentials.json   (symlink)
     ├── .csq-account       → ../config-<current>/.csq-account        (symlink)
-    ├── settings.json      → ../config-<current>/settings.json       (symlink)
+    ├── settings.json      ← materialized file (deep-merged: ~/.claude/settings.json + config-<current>/settings.json)
     ├── .claude.json       → ../config-<current>/.claude.json        (symlink)
     ├── .live-pid          ← contains the PID, used for sweep
     └── [shared symlinks to ~/.claude/*]
@@ -50,7 +50,7 @@ accounts/
 ### Two tiers of state
 
 1. **Permanent tier (`config-N`, `credentials/N.json`):** exists once per account, lives forever, only written by login or daemon refresh. Directory name encodes the account number and the name MUST match the `.csq-account` marker inside it.
-2. **Ephemeral tier (`term-<pid>`):** exists once per live CC process, lives exactly as long as that process. Created by `csq run`. Deleted on process exit. Contains only symlinks plus a `.live-pid` file; no real content.
+2. **Ephemeral tier (`term-<pid>`):** exists once per live CC process, lives exactly as long as that process. Created by `csq run`. Deleted on process exit. Contains symlinks, the `.live-pid` file, and the materialized `settings.json` (deep-merged from user global + account overlay).
 
 ### The shared items (both tiers)
 
@@ -72,9 +72,9 @@ Every directory that CC launches into MUST have symlinks for the shared items (`
 
 - Created atomically by `csq run N` before execing `claude`.
 - The directory name is `term-<pid>` where PID is the csq CLI's own process ID at handle-dir creation time (NOT the `claude` process that comes next, which is either the exec target of csq or a child). The PID is captured BEFORE `exec`, so it is stable for the lifetime of the resulting `claude` process.
-- Every file in `term-<pid>` is either a symlink to a `config-<current>/*` target or the `.live-pid` sentinel.
+- Every file in `term-<pid>` is either a symlink to a `config-<current>/*` target, the `.live-pid` sentinel, or the materialized `settings.json` (the sole non-symlink content file — deep-merged from `~/.claude/settings.json` + `config-<current>/settings.json`).
 - On `claude` process exit, csq (via a wrapper OR via daemon sweep) removes `term-<pid>`. See section 2.5.
-- **No long-lived content.** If csq ever writes real data into a `term-<pid>` dir, it's a bug against this spec.
+- **No long-lived content beyond settings.json.** If csq ever writes other real data into a `term-<pid>` dir, it's a bug against this spec.
 
 **INV-03: Identity derivation reads `.csq-account` through the symlink.**
 
@@ -87,8 +87,9 @@ Every directory that CC launches into MUST have symlinks for the shared items (`
 - `csq swap M` run inside a handle-dir-bound terminal MUST:
   1. Look up the current handle dir from `CLAUDE_CONFIG_DIR`.
   2. Verify that path is a `term-<pid>` dir under the csq base.
-  3. For each symlinked file in the handle dir (`.credentials.json`, `.csq-account`, `settings.json`, `.claude.json`, and any additional symlinks the launch created), atomically replace the symlink to point at `../config-<M>/<same-filename>`.
-  4. Atomic replace uses rename-over (`std::fs::rename` of a new symlink onto the old one — not delete-then-create, which races).
+  3. For each symlinked file in the handle dir (`.credentials.json`, `.csq-account`, `.claude.json`, and any additional symlinks the launch created), atomically replace the symlink to point at `../config-<M>/<same-filename>`.
+  4. Re-materialize `settings.json` by deep-merging `~/.claude/settings.json` (user global) with `config-<M>/settings.json` (new account's slot overlay) and writing the result to the handle dir.
+  5. Atomic replace uses rename-over (`std::fs::rename` of a new symlink onto the old one — not delete-then-create, which races).
 - csq swap MUST NOT write to the underlying `config-<M>/*` files. Those are permanent. The swap is purely a pointer change in the handle dir.
 - After the repoint, the next time CC in that terminal calls `fs.stat('.credentials.json')`, the stat follows the new symlink to `config-<M>/.credentials.json`, returns a DIFFERENT mtime from what CC saw before (almost certainly — it's a different file), and CC's `invalidateOAuthCacheIfDiskChanged` clears its memoize. The next API call uses account M. See spec 01 section 1.4.
 - **Other terminals (with their own `term-<otherPid>/.credentials.json` symlinks still pointing at `config-<current>`) are untouched.** Their stat resolves to the unchanged `config-<current>` files. They stay on their current account.
@@ -120,7 +121,8 @@ Every directory that CC launches into MUST have symlinks for the shared items (`
 
 1. Verify `config-<N>` exists and has valid credentials.
 2. Create `term-<my-pid>/` atomically. Populate with:
-   - Symlinks for `.credentials.json`, `.csq-account`, `settings.json`, `.claude.json` → `../config-<N>/<same>`.
+   - Symlinks for `.credentials.json`, `.csq-account`, `.claude.json` → `../config-<N>/<same>`.
+   - Materialize `settings.json` by deep-merging `~/.claude/settings.json` (user global) with `config-<N>/settings.json` (account overlay).
    - Symlinks for all shared items via `isolate_config_dir`.
    - Write `.live-pid` containing the csq CLI PID (which becomes the claude PID on exec).
 3. Set `CLAUDE_CONFIG_DIR=<absolute path to term-<my-pid>>` in the child env.
@@ -133,12 +135,13 @@ Every directory that CC launches into MUST have symlinks for the shared items (`
 1. Resolve `CLAUDE_CONFIG_DIR` from env; verify it's a `term-<pid>` dir under the csq base. If not (legacy `config-N` launch, unset env, or non-csq-managed dir), refuse with an error that explains the cause. **Never rewrite a `config-<N>` dir on swap.**
 2. Validate account M exists at `config-<M>/`. Refuse if not.
 3. Validate M's credentials are not in `LOGIN-NEEDED` state. Refuse if so (with suggestion to run `csq login M`).
-4. For each of `.credentials.json`, `.csq-account`, `settings.json`, `.claude.json`:
+4. For each of `.credentials.json`, `.csq-account`, `.claude.json`:
    - Construct the target `../config-<M>/<same-filename>`.
    - `std::os::unix::fs::symlink(target, tmp_path)` to create a new symlink at a temp path inside the handle dir.
    - `std::fs::rename(tmp_path, final_path)` to atomically replace the existing symlink.
-5. Notify daemon to invalidate caches (same as today).
-6. Print confirmation: `"Swapped to account M — token valid Xm"`.
+5. Re-materialize `settings.json` by deep-merging `~/.claude/settings.json` (user global) with `config-<M>/settings.json` (new account's slot overlay) and writing the result to `term-<pid>/settings.json`.
+6. Notify daemon to invalidate caches (same as today).
+7. Print confirmation: `"Swapped to account M — token valid Xm"`.
 
 **Swap is advisory only.** The CC process in the same terminal picks up the change on its next API call via spec 01 section 1.4. No inter-process signal is needed or possible. Swap latency from the user's perspective is "next API call," which is typically the user's next keystroke plus CC's normal startup.
 

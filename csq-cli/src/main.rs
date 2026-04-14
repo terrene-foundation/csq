@@ -147,12 +147,20 @@ enum UpdateCmd {
 
 #[derive(Subcommand, Debug)]
 enum DaemonCmd {
-    /// Start the daemon in the foreground (blocks until SIGTERM or Ctrl-C)
-    Start,
+    /// Start the daemon (foreground by default; use -d to background)
+    Start {
+        /// Detach and run in the background (re-execs the binary without this flag)
+        #[arg(short = 'd', long = "background")]
+        background: bool,
+    },
     /// Stop the running daemon via SIGTERM
     Stop,
     /// Show the daemon's status (running / stale / not running)
     Status,
+    /// Install csq as a platform service (launchd on macOS, systemd on Linux)
+    Install,
+    /// Uninstall the platform service installed by `csq daemon install`
+    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
@@ -294,9 +302,17 @@ fn main() -> Result<()> {
         Command::Install => commands::install::handle(),
         Command::Doctor => commands::doctor::handle(&base_dir, json),
         Command::Daemon { action } => match action {
-            DaemonCmd::Start => commands::daemon::handle_start(&base_dir),
+            DaemonCmd::Start { background } => {
+                if background {
+                    commands::daemon::handle_start_background(&base_dir)
+                } else {
+                    commands::daemon::handle_start(&base_dir)
+                }
+            }
             DaemonCmd::Stop => commands::daemon::handle_stop(&base_dir),
             DaemonCmd::Status => commands::daemon::handle_status(&base_dir),
+            DaemonCmd::Install => commands::daemon::handle_install(&base_dir),
+            DaemonCmd::Uninstall => commands::daemon::handle_uninstall(&base_dir),
         },
         Command::Update { action } => match action {
             UpdateCmd::Check => commands::update::check(),

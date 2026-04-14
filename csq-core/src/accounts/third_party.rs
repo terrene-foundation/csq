@@ -18,9 +18,10 @@ use crate::accounts::markers;
 use crate::accounts::profiles::{self, AccountProfile};
 use crate::error::ConfigError;
 use crate::platform::fs::{atomic_replace, secure_file};
-use crate::providers::{self, settings as provider_settings};
+use crate::providers;
+use crate::session::merge::MODEL_KEYS;
 use crate::types::AccountNum;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -75,40 +76,33 @@ pub fn bind_provider_to_slot(
         reason: format!("create_dir_all: {e}"),
     })?;
 
-    // 1. Build settings.json from the provider's defaults and inject the key.
-    //    `default_settings` already populates base URL and all model keys.
-    let mut settings_value = provider_settings::default_settings(provider);
-    if let Some(obj) = settings_value.as_object_mut() {
-        // CC reads `apiKeyHelper` as a shell command that returns an API
-        // key — NOT as a system primer. The provider catalog stores the
-        // primer in `Provider::system_primer` and `default_settings`
-        // historically serialized it under `apiKeyHelper`, which is
-        // inert when written to the global `settings-<provider>.json`
-        // (CC never reads that file) but collides with
-        // `env.ANTHROPIC_AUTH_TOKEN` when the same Value is written to
-        // `config-<N>/settings.json` (which CC does read). CC then
-        // warns "Auth conflict: Both a token (ANTHROPIC_AUTH_TOKEN) and
-        // an API key (apiKeyHelper) are set."
-        //
-        // Strip `apiKeyHelper` from the slot-bound output unconditionally.
-        // Bearer-auth providers authenticate via the env token; the
-        // primer belongs in a system-prompt mechanism, not this field.
-        obj.remove("apiKeyHelper");
-
-        let env_obj = obj
-            .entry("env".to_string())
-            .or_insert_with(|| Value::Object(Default::default()));
-        if let Some(env) = env_obj.as_object_mut() {
-            env.insert(key_env_var.to_string(), Value::String(key.to_string()));
-            // Defensive: re-assert base URL even though default_settings set it,
-            // so a future provider catalog change that drops the default can't
-            // silently write an incomplete settings file.
-            env.insert(
-                base_url_env_var.to_string(),
-                Value::String(base_url.to_string()),
-            );
-        }
+    // 1. Build a MINIMAL settings.json containing only the env block CC
+    //    needs to route through this provider. The handle-dir model
+    //    materializes the user-facing `term-<pid>/settings.json` by
+    //    deep-merging `~/.claude/settings.json` (user global — statusLine,
+    //    permissions, plugins) with this file (3P env overlay). Anything
+    //    beyond `env` here would leak into every terminal bound to this
+    //    slot and silently override the user's global customization.
+    //
+    //    Discovery (`discover_per_slot_third_party`) and the 3P usage
+    //    poller both read `env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+    //    / `ANTHROPIC_MODEL` from this file, so the env block is the
+    //    source of truth for slot identity and must be written here.
+    let mut env = Map::new();
+    env.insert(
+        base_url_env_var.to_string(),
+        Value::String(base_url.to_string()),
+    );
+    env.insert(key_env_var.to_string(), Value::String(key.to_string()));
+    for model_key in MODEL_KEYS {
+        env.insert(
+            (*model_key).to_string(),
+            Value::String(provider.default_model.to_string()),
+        );
     }
+    let mut settings_obj = Map::new();
+    settings_obj.insert("env".to_string(), Value::Object(env));
+    let settings_value = Value::Object(settings_obj);
 
     let settings_path = config_dir.join("settings.json");
     // SECURITY: the JSON value carries the API key. The reason field is a

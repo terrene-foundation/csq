@@ -9,7 +9,9 @@
 use crate::accounts::markers;
 use crate::error::CredentialError;
 use crate::session::isolation::{self, SHARED_ITEMS};
+use crate::session::merge::merge_settings;
 use crate::types::AccountNum;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -23,11 +25,18 @@ use tracing::{debug, info, warn};
 /// This causes `--resume` to show sessions from all projects instead of
 /// filtering to the current CWD. Letting CC create a fresh `.claude.json`
 /// per handle dir restores correct project-scoped behavior.
+///
+/// `settings.json` is also intentionally EXCLUDED — it is materialized as
+/// a real file by [`materialize_handle_settings`] by deep-merging the
+/// user's `~/.claude/settings.json` (global customization — statusLine,
+/// permissions.defaultMode, plugins) with `config-<N>/settings.json`
+/// (slot-specific env block for 3P bindings). A bare symlink would
+/// replace the user layer entirely because `CLAUDE_CONFIG_DIR` overrides
+/// the home settings path.
 const ACCOUNT_BOUND_ITEMS: &[&str] = &[
     ".credentials.json",
     ".csq-account",
     ".current-account",
-    "settings.json",
     ".quota-cursor",
 ];
 
@@ -162,11 +171,94 @@ pub fn create_handle_dir(
     // Copy .claude.json from config-N, scoping `projects` to CWD.
     copy_claude_json_stripped(&config_dir, &handle_dir);
 
+    // Materialize settings.json as a real file (NOT a symlink). CC reads
+    // this via CLAUDE_CONFIG_DIR and treats it as the user settings layer,
+    // replacing (not merging with) ~/.claude/settings.json. Deep-merge the
+    // user global settings with the slot's overlay so the statusLine,
+    // permissions, plugins, and any 3P env block all survive.
+    materialize_handle_settings(&handle_dir, claude_home, &config_dir)?;
+
     // Write .live-pid with the csq CLI PID
     markers::write_live_pid(&handle_dir, pid)?;
 
     info!(pid, account = %account, path = %handle_dir.display(), "handle dir created");
     Ok(handle_dir)
+}
+
+/// Writes `handle_dir/settings.json` as a real file by deep-merging
+/// `claude_home/settings.json` (base) with `config_dir/settings.json`
+/// (overlay).
+///
+/// The base carries user-global customization (statusLine, permissions,
+/// plugins, env experiments). The overlay carries slot-specific env for
+/// 3P bindings (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+/// `ANTHROPIC_MODEL`). Overlay keys win on merge. For OAuth slots where
+/// `config-<N>/settings.json` is absent or empty, the materialized file
+/// equals the user's global settings.
+///
+/// Failures at each step:
+/// - Missing `claude_home/settings.json` → base is `{}`
+/// - Invalid JSON in either source → logged at WARN, treated as `{}`
+/// - Write / secure_file / rename → propagated as [`CredentialError`]
+///
+/// # Security
+///
+/// The overlay may contain a 3P `ANTHROPIC_AUTH_TOKEN`. `secure_file`
+/// propagates (does not `.ok()`) so a permission failure fails closed
+/// rather than leaving a credential file at the umask default.
+pub(crate) fn materialize_handle_settings(
+    handle_dir: &Path,
+    claude_home: &Path,
+    config_dir: &Path,
+) -> Result<(), CredentialError> {
+    let base = read_json_object_or_empty(&claude_home.join("settings.json"));
+    let overlay = read_json_object_or_empty(&config_dir.join("settings.json"));
+    let merged = merge_settings(&base, &overlay);
+
+    let settings_path = handle_dir.join("settings.json");
+    let json = serde_json::to_string_pretty(&merged).map_err(|e| CredentialError::Corrupt {
+        path: settings_path.clone(),
+        reason: format!("merged settings serialize failed: {e}"),
+    })?;
+
+    let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| CredentialError::Io {
+        path: tmp.clone(),
+        source: e,
+    })?;
+    crate::platform::fs::secure_file(&tmp).map_err(|e| CredentialError::Corrupt {
+        path: tmp.clone(),
+        reason: format!("secure_file: {e}"),
+    })?;
+    crate::platform::fs::atomic_replace(&tmp, &settings_path).map_err(|e| {
+        CredentialError::Corrupt {
+            path: settings_path.clone(),
+            reason: format!("atomic replace: {e}"),
+        }
+    })?;
+    Ok(())
+}
+
+/// Reads a JSON file and returns its root object, or an empty object if
+/// the file is missing, unreadable, malformed, or not an object at the
+/// top level. Warnings are logged for malformed non-empty content so
+/// users see why their customization vanished.
+fn read_json_object_or_empty(path: &Path) -> Value {
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Value::Object(serde_json::Map::new()),
+    };
+    match serde_json::from_str::<Value>(&content) {
+        Ok(v) if v.is_object() => v,
+        Ok(_) => {
+            warn!(path = %path.display(), "settings file is not a JSON object, treating as empty");
+            Value::Object(serde_json::Map::new())
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "settings file has invalid JSON, treating as empty");
+            Value::Object(serde_json::Map::new())
+        }
+    }
 }
 
 /// Atomically repoints the account-bound symlinks in a handle dir
@@ -181,6 +273,7 @@ pub fn create_handle_dir(
 /// - On any I/O failure during repoint
 pub fn repoint_handle_dir(
     base_dir: &Path,
+    claude_home: &Path,
     handle_dir: &Path,
     target: AccountNum,
 ) -> Result<(), CredentialError> {
@@ -239,6 +332,13 @@ pub fn repoint_handle_dir(
 
         debug!(item, account = %target, "repointed symlink");
     }
+
+    // Re-materialize settings.json for the new slot so the user's global
+    // customization is preserved and any 3P env block from the new
+    // config-<target>/settings.json overlays correctly. atomic_replace
+    // keeps the swap semantics of INV-04: CC sees either the pre-swap or
+    // post-swap file, never a half-written one.
+    materialize_handle_settings(handle_dir, claude_home, &new_config)?;
 
     info!(account = %target, handle = %handle_dir.display(), "handle dir repointed");
     Ok(())
@@ -1192,7 +1292,7 @@ mod tests {
         let handle = create_handle_dir(base, &claude_home, account1, 88888).unwrap();
 
         // Repoint to account 2
-        repoint_handle_dir(base, &handle, account2).unwrap();
+        repoint_handle_dir(base, &claude_home, &handle, account2).unwrap();
 
         #[cfg(unix)]
         {
@@ -1204,13 +1304,269 @@ mod tests {
     }
 
     #[test]
+    fn create_handle_dir_materializes_user_settings() {
+        // The core bug alpha.9 fixes: user has statusLine + bypass mode
+        // in ~/.claude/settings.json, but csq run N used to symlink the
+        // handle dir's settings.json at a (usually empty) config-N copy,
+        // so CC — reading CLAUDE_CONFIG_DIR — saw no customization.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{
+                "statusLine": { "type": "command", "command": "echo hi" },
+                "permissions": { "defaultMode": "bypassPermissions" },
+                "enabledPlugins": { "my-plugin": true }
+            }"#,
+        )
+        .unwrap();
+        setup_config_dir(base, 1);
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 77777).unwrap();
+
+        let materialized = handle.join("settings.json");
+        // MUST be a real file, not a symlink. CC reads this as the
+        // user-settings layer and CLAUDE_CONFIG_DIR replaces the home
+        // settings path, so a symlink to an empty config-N copy would
+        // silently drop everything.
+        #[cfg(unix)]
+        assert!(
+            !materialized
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "handle dir settings.json must be a real file"
+        );
+
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&materialized).unwrap()).unwrap();
+        assert_eq!(
+            json.pointer("/statusLine/type").and_then(|v| v.as_str()),
+            Some("command"),
+            "user statusLine must survive materialization"
+        );
+        assert_eq!(
+            json.pointer("/permissions/defaultMode")
+                .and_then(|v| v.as_str()),
+            Some("bypassPermissions"),
+            "user bypassPermissions must survive materialization"
+        );
+        assert_eq!(
+            json.pointer("/enabledPlugins/my-plugin")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "user plugin list must survive materialization"
+        );
+    }
+
+    #[test]
+    fn create_handle_dir_merges_third_party_env_overlay() {
+        // 3P slot: user has global statusLine, and config-N/settings.json
+        // carries the provider env block. Both must appear in the
+        // materialized handle dir settings.json — the user keeps their
+        // statusline, CC picks up ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{
+                "statusLine": { "type": "command", "command": "echo hi" },
+                "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+            }"#,
+        )
+        .unwrap();
+
+        let config = base.join("config-9");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(".csq-account"), "9").unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            r#"{
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-slot-test",
+                    "ANTHROPIC_MODEL": "MiniMax-M2"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let handle = create_handle_dir(
+            base,
+            &claude_home,
+            AccountNum::try_from(9u16).unwrap(),
+            66666,
+        )
+        .unwrap();
+
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+
+        // User keeps statusline
+        assert_eq!(
+            json.pointer("/statusLine/command").and_then(|v| v.as_str()),
+            Some("echo hi")
+        );
+        // 3P env block merged in
+        let env = json.get("env").unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()),
+            Some("https://api.minimax.io/anthropic")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()),
+            Some("sk-slot-test")
+        );
+        // User's other env keys also preserved alongside the 3P overlay
+        assert_eq!(
+            env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                .and_then(|v| v.as_str()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn create_handle_dir_tolerates_missing_user_settings() {
+        // Fresh install: no ~/.claude/settings.json yet. Handle dir
+        // materialization must not fail; the file is just the config-N
+        // overlay (or empty for OAuth slots).
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 2);
+
+        let handle = create_handle_dir(
+            base,
+            &claude_home,
+            AccountNum::try_from(2u16).unwrap(),
+            55555,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(handle.join("settings.json")).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+        assert!(json.is_object());
+    }
+
+    #[test]
+    fn create_handle_dir_tolerates_malformed_user_settings() {
+        // User has a typo in ~/.claude/settings.json. We log a warning
+        // and proceed with an empty base — the alternative is leaving
+        // the user stranded with no handle dir at all.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(claude_home.join("settings.json"), r#"{ not valid json"#).unwrap();
+        setup_config_dir(base, 3);
+
+        let handle = create_handle_dir(
+            base,
+            &claude_home,
+            AccountNum::try_from(3u16).unwrap(),
+            44444,
+        )
+        .unwrap();
+
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(json.is_object());
+    }
+
+    #[test]
+    fn repoint_rewrites_materialized_settings_for_new_slot() {
+        // Swap from OAuth slot 1 (no env block) to 3P slot 9 (has env
+        // block). The handle dir's settings.json must be re-materialized
+        // so the new slot's env lands in it.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{"statusLine": {"type": "command", "command": "user-cmd"}}"#,
+        )
+        .unwrap();
+        setup_config_dir(base, 1);
+
+        // 3P slot
+        let slot9 = base.join("config-9");
+        std::fs::create_dir_all(&slot9).unwrap();
+        std::fs::write(slot9.join(".csq-account"), "9").unwrap();
+        std::fs::write(
+            slot9.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"zai-tok"}}"#,
+        )
+        .unwrap();
+
+        let handle = create_handle_dir(
+            base,
+            &claude_home,
+            AccountNum::try_from(1u16).unwrap(),
+            33333,
+        )
+        .unwrap();
+
+        // Before swap: only user statusline, no env block
+        let pre: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(pre.pointer("/env/ANTHROPIC_BASE_URL").is_none());
+
+        // Swap → slot 9
+        repoint_handle_dir(
+            base,
+            &claude_home,
+            &handle,
+            AccountNum::try_from(9u16).unwrap(),
+        )
+        .unwrap();
+
+        let post: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        // User statusline preserved
+        assert_eq!(
+            post.pointer("/statusLine/command").and_then(|v| v.as_str()),
+            Some("user-cmd")
+        );
+        // New slot's env block materialized
+        assert_eq!(
+            post.pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(|v| v.as_str()),
+            Some("https://api.z.ai/api/anthropic")
+        );
+        assert_eq!(
+            post.pointer("/env/ANTHROPIC_AUTH_TOKEN")
+                .and_then(|v| v.as_str()),
+            Some("zai-tok")
+        );
+    }
+
+    #[test]
     fn repoint_refuses_legacy_config_dir() {
         let dir = TempDir::new().unwrap();
         let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
         let config = base.join("config-1");
         std::fs::create_dir_all(&config).unwrap();
 
-        let result = repoint_handle_dir(base, &config, AccountNum::try_from(2u16).unwrap());
+        let result = repoint_handle_dir(
+            base,
+            &claude_home,
+            &config,
+            AccountNum::try_from(2u16).unwrap(),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("term-"), "error should mention term-: {err}");

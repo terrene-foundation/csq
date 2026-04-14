@@ -138,13 +138,13 @@ pub fn default_settings(provider: &Provider) -> Value {
     let mut settings = Map::new();
     settings.insert("env".to_string(), Value::Object(env));
 
-    // Non-Claude: add system primer
-    if let Some(primer) = provider.system_primer {
-        settings.insert(
-            "apiKeyHelper".to_string(),
-            Value::String(primer.to_string()),
-        );
-    }
+    // NOTE: `Provider::system_primer` is intentionally NOT serialized
+    // anywhere. It used to land under `apiKeyHelper`, which CC reads as
+    // a shell command that returns an API key — a misuse that triggered
+    // the alpha.7→alpha.8 auth-conflict bug when the same Value was
+    // written to `config-<N>/settings.json`. The primer field is kept
+    // on the catalog struct for possible future use as a system-prompt
+    // injection mechanism but has no current consumer.
 
     Value::Object(settings)
 }

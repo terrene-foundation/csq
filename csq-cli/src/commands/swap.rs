@@ -22,8 +22,9 @@ pub fn handle(base_dir: &Path, target: AccountNum) -> Result<()> {
         .unwrap_or("");
 
     if dir_name.starts_with("term-") {
-        // Handle-dir model: repoint symlinks (no credential writes)
-        handle_dir::repoint_handle_dir(base_dir, &config_dir, target)?;
+        // Handle-dir model: repoint symlinks + re-materialize settings.json
+        let claude_home = super::claude_home()?;
+        handle_dir::repoint_handle_dir(base_dir, &claude_home, &config_dir, target)?;
 
         // Notify the daemon to clear its caches
         notify_daemon_cache_invalidation(base_dir);

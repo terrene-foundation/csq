@@ -57,6 +57,12 @@ pub const SHARED_ITEMS: &[&str] = &[
 
 /// Items that are **isolated** per terminal — never linked, per-config copies.
 /// Listed here for documentation; they are created/written by other modules.
+///
+/// `settings.json` is technically per-terminal but is neither symlinked nor
+/// a per-config copy — it is **materialized** by `handle_dir::materialize_handle_settings`
+/// as a deep-merge of `~/.claude/settings.json` (user global customization)
+/// and `config-<N>/settings.json` (slot-specific overlay). See the doc on
+/// that function for rationale.
 pub const ISOLATED_ITEMS: &[&str] = &[
     ".credentials.json",
     ".current-account",

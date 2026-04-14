@@ -369,26 +369,30 @@ mod tests {
         assert_eq!(detect_daemon(dir.path()), DetectResult::NotRunning);
     }
 
-    // Gated off Windows: `pid_file_path` on Windows ignores `base_dir`
-    // and resolves to `%LOCALAPPDATA%\csq\csq-daemon.pid`. Two parallel
-    // tests that each write a different PID file content race on that
-    // global path, and overriding `LOCALAPPDATA` per-test isn't safe
-    // either because `std::env::set_var` is process-global and other
-    // parallel tests reading `pid_file_path` will see the wrong override.
-    // Linux + macOS both honor per-TempDir paths (Linux via
-    // `XDG_RUNTIME_DIR`, macOS via `base_dir`) so the corrupt-file code
-    // path is still covered there. The Windows pid-handling code is
-    // exercised by the gated `detect_windows_*` tests below.
-    #[cfg(not(target_os = "windows"))]
+    // macOS-only: `pid_file_path` honors `base_dir` directly on macOS
+    // (no env-var indirection), so each TempDir gets its own pid file
+    // and parallel tests isolate cleanly.
+    //
+    // Off Windows: `pid_file_path` resolves to `%LOCALAPPDATA%\csq\csq-daemon.pid`,
+    // a process-global path, so two tests writing different file contents
+    // race. Overriding `LOCALAPPDATA` per-test is unsafe under parallel
+    // execution (`std::env::set_var` is process-global).
+    //
+    // Off Linux: `pid_file_path` resolves to `$XDG_RUNTIME_DIR/csq-daemon.pid`
+    // when that env var is set (which it usually is on systemd-managed
+    // runners). The earlier attempt to override `XDG_RUNTIME_DIR` per-test
+    // worked in isolation but POLLUTED the env for unrelated tests like
+    // `detect_live_pid_but_missing_socket_is_stale`, which then read a
+    // stale TempDir path that no longer existed and saw `NotRunning`
+    // instead of `Stale`. Surfaced post-merge of #113.
+    //
+    // The corrupt + dead-pid code paths are still exercised on macOS,
+    // and the Windows + Linux pid-resolution paths have their own
+    // dedicated tests in this module that don't touch global env.
+    #[cfg(target_os = "macos")]
     #[test]
     fn detect_corrupt_pid_file_is_stale() {
         let dir = TempDir::new().unwrap();
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        }
-
         let pid_path = super::super::pid_file_path(dir.path());
         fs::create_dir_all(pid_path.parent().unwrap()).ok();
         fs::write(&pid_path, "garbage").unwrap();
@@ -401,18 +405,12 @@ mod tests {
         }
     }
 
-    // Gated off Windows for the same race reason documented on
+    // macOS-only for the same env-pollution reason documented on
     // `detect_corrupt_pid_file_is_stale` above.
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn detect_dead_pid_is_stale() {
         let dir = TempDir::new().unwrap();
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        }
-
         let pid_path = super::super::pid_file_path(dir.path());
         fs::create_dir_all(pid_path.parent().unwrap()).ok();
         fs::write(&pid_path, "99999999\n").unwrap();

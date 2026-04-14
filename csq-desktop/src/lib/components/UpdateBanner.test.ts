@@ -61,7 +61,7 @@ describe("UpdateBanner", () => {
   it("renders the banner when get_update_status returns a cached update", async () => {
     mockInvoke.mockResolvedValueOnce({
       version: "2.1.0-alpha.14",
-      current_version: "2.0.0-alpha.13",
+      current_version: "2.0.0-alpha.14",
       release_url:
         "https://github.com/terrene-foundation/csq/releases/tag/v2.1.0-alpha.14",
     });
@@ -74,7 +74,7 @@ describe("UpdateBanner", () => {
     const banner = container.querySelector(".update-banner");
     expect(banner).not.toBeNull();
     expect(banner?.textContent).toContain("Update available");
-    expect(banner?.textContent).toContain("v2.0.0-alpha.13");
+    expect(banner?.textContent).toContain("v2.0.0-alpha.14");
     expect(banner?.textContent).toContain("v2.1.0-alpha.14");
   });
 
@@ -89,7 +89,7 @@ describe("UpdateBanner", () => {
     capturedEventHandler!({
       payload: {
         version: "2.1.0",
-        current_version: "2.0.0-alpha.13",
+        current_version: "2.0.0-alpha.14",
         release_url: "https://example.test/release",
       },
     });
@@ -100,7 +100,7 @@ describe("UpdateBanner", () => {
   it("calls open_release_page when Download is clicked", async () => {
     mockInvoke.mockResolvedValueOnce({
       version: "2.1.0",
-      current_version: "2.0.0-alpha.13",
+      current_version: "2.0.0-alpha.14",
       release_url: "https://example.test/release",
     });
     const { container } = render(UpdateBanner);
@@ -123,7 +123,7 @@ describe("UpdateBanner", () => {
   it("hides the banner when the dismiss button is clicked", async () => {
     mockInvoke.mockResolvedValueOnce({
       version: "2.1.0",
-      current_version: "2.0.0-alpha.13",
+      current_version: "2.0.0-alpha.14",
       release_url: "https://example.test/release",
     });
     const { container } = render(UpdateBanner);
@@ -142,7 +142,7 @@ describe("UpdateBanner", () => {
   it("self-dismisses if open_release_page fails", async () => {
     mockInvoke.mockResolvedValueOnce({
       version: "2.1.0",
-      current_version: "2.0.0-alpha.13",
+      current_version: "2.0.0-alpha.14",
       release_url: "https://example.test/release",
     });
     const { container } = render(UpdateBanner);

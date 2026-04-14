@@ -4,9 +4,11 @@
 
 command -v jq >/dev/null 2>&1 || { echo ""; exit 0; }
 
-# Locate the csq binary
+# Locate the csq binary. Prefer PATH (user's installed version, likely
+# most recent) over the legacy ~/.claude/accounts/csq location which
+# may be a stale copy from a prior install.
 CSQ=""
-for candidate in "$HOME/.claude/accounts/csq" "$(command -v csq 2>/dev/null)"; do
+for candidate in "$(command -v csq 2>/dev/null)" "$HOME/.claude/accounts/csq"; do
     if [ -x "$candidate" ]; then
         CSQ="$candidate"
         break
@@ -44,9 +46,21 @@ get_claude_account() {
     if [ -n "$quota" ]; then
         echo "${quota}"
     elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-        local dir_name
-        dir_name=$(basename "$CLAUDE_CONFIG_DIR")
-        echo "${dir_name##config-}"
+        # Fallback: read the .csq-account marker inside the handle dir
+        # (or config dir). In the handle-dir model the marker is a
+        # symlink to config-<N>/.csq-account containing the account
+        # number. Reading the file (following symlinks) always gives
+        # the correct account number regardless of the dir name.
+        local marker="${CLAUDE_CONFIG_DIR}/.csq-account"
+        if [ -f "$marker" ]; then
+            cat "$marker"
+        else
+            local dir_name
+            dir_name=$(basename "$CLAUDE_CONFIG_DIR")
+            # Strip config- prefix for legacy dirs; term-<pid> dirs
+            # pass through as-is (better than nothing).
+            echo "${dir_name##config-}"
+        fi
     fi
 }
 
@@ -74,9 +88,10 @@ fmt_tokens() {
     fi
 }
 
-# Detect if THIS terminal is csq-managed
+# Detect if THIS terminal is csq-managed. Both legacy config-N dirs
+# and modern term-<pid> handle dirs live under ~/.claude/accounts/.
 is_csq_terminal=false
-if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [[ "$CLAUDE_CONFIG_DIR" == "$HOME/.claude/accounts/config-"* ]]; then
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [[ "$CLAUDE_CONFIG_DIR" == "$HOME/.claude/accounts/"* ]]; then
     is_csq_terminal=true
 fi
 

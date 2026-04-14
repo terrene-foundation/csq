@@ -1025,3 +1025,117 @@ pub fn open_release_page(state: State<'_, AppState>, app: AppHandle) -> Result<(
         .open_url(&url, None::<&str>)
         .map_err(|e| format!("failed to open release page: {e}"))
 }
+
+// ── Unit tests ──────────────────────────────────────────────────
+//
+// Tests the input-validation and mapping logic that runs before
+// any filesystem or network I/O. The core logic (discovery, swap,
+// quota) is tested exhaustively in csq-core; these tests verify
+// the IPC boundary catches bad inputs before they reach core code.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── list_providers ─────────────────────────────────────────
+
+    #[test]
+    fn list_providers_excludes_ollama() {
+        let providers = list_providers().unwrap();
+        assert!(
+            !providers.iter().any(|p| p.id == "ollama"),
+            "ollama should be filtered from the desktop provider list"
+        );
+    }
+
+    #[test]
+    fn list_providers_includes_anthropic() {
+        let providers = list_providers().unwrap();
+        assert!(providers.iter().any(|p| p.id == "claude"));
+    }
+
+    #[test]
+    fn list_providers_auth_types_are_valid() {
+        let providers = list_providers().unwrap();
+        for p in &providers {
+            assert!(
+                ["oauth", "bearer", "none"].contains(&p.auth_type.as_str()),
+                "unexpected auth_type '{}' for provider '{}'",
+                p.auth_type,
+                p.id
+            );
+        }
+    }
+
+    // ── set_provider_key validation ────────────────────────────
+    //
+    // These tests exercise the validation that runs before any
+    // filesystem access. Each case returns Err before touching disk.
+
+    #[test]
+    fn set_provider_key_rejects_unknown_provider() {
+        let err = set_provider_key("/fake".into(), "nonexistent".into(), "key".into())
+            .unwrap_err();
+        assert!(err.contains("unknown provider"));
+    }
+
+    #[test]
+    fn set_provider_key_rejects_oauth_provider() {
+        let err = set_provider_key("/fake".into(), "claude".into(), "key".into())
+            .unwrap_err();
+        assert!(err.contains("uses OAuth"));
+    }
+
+    #[test]
+    fn set_provider_key_rejects_empty_key() {
+        let err = set_provider_key("/fake".into(), "mm".into(), "   ".into())
+            .unwrap_err();
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn set_provider_key_rejects_oversized_key() {
+        let long_key = "x".repeat(5000);
+        let err = set_provider_key("/fake".into(), "mm".into(), long_key).unwrap_err();
+        assert!(err.contains("too long"));
+    }
+
+    // ── rename_account validation ──────────────────────────────
+
+    #[test]
+    fn rename_account_rejects_invalid_account_number() {
+        let err = rename_account("/fake".into(), 0, "test".into()).unwrap_err();
+        assert!(err.contains("invalid account"));
+    }
+
+    #[test]
+    fn rename_account_rejects_empty_name() {
+        let err = rename_account("/fake".into(), 1, "   ".into()).unwrap_err();
+        assert!(err.contains("must not be empty"));
+    }
+
+    // ── swap_account validation ────────────────────────────────
+
+    #[test]
+    fn swap_account_rejects_account_zero() {
+        let err = swap_account("/fake".into(), 0).unwrap_err();
+        assert!(err.contains("invalid account"));
+    }
+
+    // ── ClaudeLoginView conversion ─────────────────────────────
+
+    #[test]
+    fn claude_login_view_from_login_request() {
+        let req = LoginRequest {
+            auth_url: "https://example.com/auth".into(),
+            state: "state123".into(),
+            account: 5,
+            expires_in_secs: 600,
+        };
+        let view = ClaudeLoginView::from(req);
+        assert_eq!(view.auth_url, "https://example.com/auth");
+        assert_eq!(view.state, "state123");
+        assert_eq!(view.account, 5);
+        assert_eq!(view.expires_in_secs, 600);
+    }
+}

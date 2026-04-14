@@ -64,6 +64,9 @@ pub(crate) async fn tick(
             Ok(c) => c,
             Err(_) => continue,
         };
+        // Short-lived heap String passed into spawn_blocking; dropped
+        // when the blocking task completes. Never logged or stored in
+        // long-lived collections. Acceptable per security.md rule 8.
         let token = creds
             .claude_ai_oauth
             .access_token

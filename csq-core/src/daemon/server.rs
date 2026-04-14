@@ -503,7 +503,7 @@ async fn oauth_exchange_handler(
             tracing::warn!(
                 account = account.get(),
                 error_kind = "credential_save",
-                "credential write failed: {e}"
+                "credential write failed after oauth exchange"
             );
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,

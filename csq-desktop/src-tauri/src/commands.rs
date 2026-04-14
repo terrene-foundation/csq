@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::{AppState, CachedUpdateInfo};
 use csq_core::accounts::discovery;
 use csq_core::accounts::AccountSource;
 use csq_core::broker::fanout;
@@ -940,4 +940,88 @@ pub fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String
             .disable()
             .map_err(|e| format!("failed to disable autostart: {e}"))
     }
+}
+
+// ── Update check ─────────────────────────────────────────────────
+//
+// These commands expose the CLI's update-check mechanism
+// (`csq_core::update::check_for_update`) to the desktop frontend.
+// They do NOT install updates — the signing key is a placeholder
+// and `download_and_apply` rejects placeholder-signed releases.
+// Instead, the frontend should notify the user and open the GitHub
+// release page for manual install.
+
+/// Current running csq version — read at compile time from the
+/// workspace `Cargo.toml`. Shown in the "v{current} → v{latest}"
+/// update banner so users can confirm the delta.
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Triggers a synchronous GitHub Releases check.
+///
+/// Returns `Some(CachedUpdateInfo)` if a newer version is available,
+/// `None` otherwise. Caches the result in `AppState` so the frontend
+/// can re-read without re-polling. Network errors are surfaced as
+/// `Err(String)` — the frontend decides whether to retry or hide the
+/// banner.
+#[tauri::command]
+pub fn check_for_update(state: State<'_, AppState>) -> Result<Option<CachedUpdateInfo>, String> {
+    let info = match csq_core::update::check_for_update() {
+        Ok(v) => v,
+        Err(e) => return Err(format!("update check failed: {e}")),
+    };
+
+    let cached = info.map(|u| CachedUpdateInfo {
+        version: u.version,
+        current_version: CURRENT_VERSION.to_string(),
+        release_url: u.html_url,
+    });
+
+    // Store in cache so get_update_status can return it without a
+    // fresh network call. Lock held briefly; no await in scope.
+    if let Ok(mut guard) = state.update_cache.lock() {
+        *guard = cached.clone();
+    }
+
+    Ok(cached)
+}
+
+/// Returns the cached result of the most recent update check without
+/// re-polling GitHub. Intended for frontend callers that want to
+/// render the banner without paying network latency on every mount.
+///
+/// Returns `None` if no check has run yet OR the app is up to date.
+/// Callers distinguish the two by calling `check_for_update` once at
+/// startup (the desktop app does this automatically 10s after launch).
+#[tauri::command]
+pub fn get_update_status(state: State<'_, AppState>) -> Result<Option<CachedUpdateInfo>, String> {
+    match state.update_cache.lock() {
+        Ok(guard) => Ok(guard.clone()),
+        Err(_) => Err("update cache lock poisoned".into()),
+    }
+}
+
+/// Opens the GitHub release page for the cached update in the user's
+/// default browser. The frontend calls this from the update banner's
+/// "download" button. Manual install is the only option until the
+/// Foundation's Ed25519 signing key is provisioned.
+///
+/// Returns `Err` if no update is cached (the button should be hidden
+/// in that case — this guard is defense-in-depth, not a UX path).
+#[tauri::command]
+pub fn open_release_page(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    let url = {
+        let guard = state
+            .update_cache
+            .lock()
+            .map_err(|_| "update cache lock poisoned")?;
+        match guard.as_ref() {
+            Some(u) => u.release_url.clone(),
+            None => return Err("no cached update — call check_for_update first".into()),
+        }
+    };
+
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| format!("failed to open release page: {e}"))
 }

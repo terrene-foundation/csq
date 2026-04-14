@@ -68,6 +68,18 @@ The CLI reads: same files directly, with daemon as optional accelerator
 
 Anthropic accounts (IDs 1-999) and 3P accounts (synthetic IDs 901, 902) use **separate** cooldown/backoff maps to prevent ID collision. The tick functions run sequentially in the same async task — no lock ordering issues.
 
+### 5. Refresher `is_rate_limited` is Substring-Based and Can Lie (journal 0052)
+
+`broker::check::is_rate_limited` does `e.to_string().to_lowercase().contains("rate_limit")`. When it returns true, the refresher returns `BrokerResult::RateLimited` and enters the cooldown. When it returns false, the refresher falls through to `recover_from_siblings` (which is designed for the old multi-config-N layout and has nothing to scan in the handle-dir model).
+
+**The masking failure mode:** an Anthropic server-side contract change that returns a 400 with some _other_ error type (e.g. `invalid_scope`) fails `is_rate_limited`, hits the recovery dead-end, stacks 10-minute cooldowns, and after enough bad requests Cloudflare actually IP-throttles the daemon for real. The `rate_limited` cache entries that result are the _consequence_ of the cascade, not the original cause.
+
+**When reviewing changes that touch the refresher or broker_check:**
+
+- Any new error classification must distinguish "server-side contract failures" (e.g. `invalid_scope`, `invalid_request`) from "transient throttling". Contract failures should surface to the user, not silently cooldown-loop.
+- A multi-account wall of `rate_limited` that persists across multiple 5-minute ticks is a smoke alarm — it usually means the underlying error is something else entirely. See `.claude/skills/provider-integration/SKILL.md` for the manual replay runbook.
+- `error::redact_tokens` currently strips ALL tokens from the error string the classifier sees. If Anthropic starts responding with a novel error type, the tag passed to `error_kind_tag` and the log line will not name it. Diagnostic redaction relaxation (a small allowlist of OAuth error-type strings) is tracked but not yet shipped.
+
 ## Transport Injection Pattern
 
 Every network-touching function takes an injectable closure for testability:

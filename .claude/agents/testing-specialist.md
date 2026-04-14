@@ -67,6 +67,20 @@ assert_eq!(counter.load(Ordering::SeqCst), 1);
 
 **Used by:** `refresh_token`, `validate_key`, `exchange_code`, `poll_anthropic_usage`, `poll_3p_usage`
 
+#### Mocked transport hides server-side contract drift (journal 0052)
+
+Injectable closures give fast, hermetic tests — but they only assert what _our client sends_, not what _the upstream server accepts_. If the upstream tightens a requirement, a mock that returns `Ok((200, ...))` will keep passing while production fails.
+
+**Canonical incident:** `refresh_token_passes_correct_url_and_body` (integration) and `build_refresh_body_format` (unit) both explicitly asserted that the refresh JSON body contained a `scope` field. The tests were written to lock in the journal-0034 fix (form → JSON). They locked in the _wrong_ shape. Anthropic started returning `400 invalid_scope` for any refresh body containing `scope`. The mocks kept returning 200, the tests kept passing, and production silently expired every user account for ~8 hours.
+
+**Test design rules for HTTP contracts with a live upstream:**
+
+1. **A payload-shape test is not a contract test.** Asserting "we sent JSON key X with value Y" proves what we built, not what the server wants. Pair it with a live-replay test (see below).
+2. **Live-replay smoke test, gated behind manual workflow.** Add one test per production endpoint that hits the real server from CI when a GitHub Actions `workflow_dispatch` fires. It uses a dedicated test account's credentials stored in GitHub Secrets. It's slow and requires network — that's why it's gated — but it catches contract drift within hours of a server change instead of months.
+3. **Frozen-shape tests must cite the contract source.** When a test asserts `parsed["scope"]`, the test's comment MUST cite _where in the server's documentation / observed behavior_ that field is required. If the citation is just "we send this and it works", the test is locking in the wrong thing.
+4. **When adding a regression test for a fix, assert the absence of the old bug, not the presence of the new shape.** `build_refresh_body_omits_scope_field` checks `parsed.get("scope").is_none()` — it will not drift with future field additions, only fail if someone re-introduces the specific mistake.
+5. **After a contract-drift incident, audit every `captured_body` / `captured_args` assertion in integration tests.** These are the exact shape of the bug: they freeze a client payload that a mock always accepts.
+
 ### 2. TempDir Filesystem Tests
 
 Almost every test creates a `TempDir` and installs test fixtures (credential files, settings files, marker files) to test against a real filesystem:

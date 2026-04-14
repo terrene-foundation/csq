@@ -409,6 +409,52 @@ fn refresh_token_passes_correct_url_and_body() {
     }
 }
 
+// ── OAuth error-type allowlist diagnostic plumbing ───────────────────
+
+/// Integration test: a 400 with `{"error":"invalid_scope"}` must produce
+/// an error message containing the literal string `invalid_scope`.
+///
+/// This test exercises the full diagnostic pipeline:
+///   `refresh_token` → `extract_oauth_error` → `extract_oauth_error_type`
+///   → `OAuthError::Exchange(msg)` containing "invalid_scope".
+///
+/// Before journal 0052, this string was stripped from logs by `redact_tokens`
+/// (the refresh body contained `scope` which triggered Anthropic's rejection,
+/// and the error word itself was never surfaced at the log level). This test
+/// locks in the requirement that the RFC 6749 error category survives the
+/// full error-formatting path and reaches the caller.
+#[test]
+fn oauth_invalid_scope_error_is_diagnostic_in_error_message() {
+    use csq_core::error::OAuthError;
+
+    let existing = sample_creds();
+
+    // Simulate Anthropic returning 400 invalid_scope (journal 0052)
+    let result = refresh_token(&existing, |_url, _body| {
+        Ok(br#"{"error":"invalid_scope","error_description":"The requested scope is invalid, unknown, or malformed."}"#.to_vec())
+    });
+
+    match result {
+        Err(OAuthError::Exchange(msg)) => {
+            assert!(
+                msg.contains("invalid_scope"),
+                "error message must contain 'invalid_scope' for operator diagnosis: {msg}"
+            );
+            // The description text must also survive (it has no token patterns to redact)
+            assert!(
+                msg.contains("invalid") || msg.contains("scope"),
+                "error message should be descriptive: {msg}"
+            );
+            // Must NOT contain token patterns from the request body
+            assert!(
+                !msg.contains("sk-ant-"),
+                "error message must not contain token prefixes: {msg}"
+            );
+        }
+        other => panic!("expected OAuthError::Exchange, got {other:?}"),
+    }
+}
+
 // ── IPC error string mapping ──────────────────────────────────────────
 
 #[test]

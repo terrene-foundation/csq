@@ -1,6 +1,55 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// RFC 6749 §5.2 standard OAuth error-type strings.
+///
+/// These are a fixed, spec-defined vocabulary of category names. They carry
+/// no secrets — they identify the error class, not the credential. Keeping
+/// this allowlist lets diagnostic code surface the category through the
+/// redaction layer without widening what `redact_tokens` passes.
+///
+/// **Security contract:** callers MUST return `&'static str` slices from
+/// this array — never borrowed slices from the parsed input. This is the
+/// load-bearing defense against prompt-injection: even if an attacker
+/// crafts a response body whose `error` field reads `"invalid_scope"`, the
+/// returned pointer is into the compile-time constant, not into the
+/// attacker-controlled string.
+pub(crate) static OAUTH_ERROR_TYPES: &[&str] = &[
+    "invalid_request",
+    "invalid_grant",
+    "invalid_scope",
+    "unauthorized_client",
+    "unsupported_grant_type",
+];
+
+/// Extracts an RFC 6749 §5.2 OAuth error-type string from a JSON response
+/// body, returning a `&'static str` from [`OAUTH_ERROR_TYPES`] on match.
+///
+/// Returns `None` when:
+/// - The body is not valid JSON
+/// - The `error` field is absent or not a string
+/// - The `error` value does not exactly match an allowlisted string
+///   (prefix extensions like `"invalid_scope_extended"` are rejected)
+///
+/// # Security
+///
+/// The returned `&str` is a pointer into [`OAUTH_ERROR_TYPES`], NOT into
+/// the `body` argument. This is the primary defense against prompt
+/// injection: an attacker who controls the upstream response body cannot
+/// exfiltrate arbitrary content through this function even if they can
+/// reproduce an allowlisted string verbatim, because the returned bytes
+/// are always from the compile-time constant. Only the `error` field is
+/// consulted — `error_description` is free-form and attacker-controlled
+/// and is never examined here.
+pub fn extract_oauth_error_type(body: &str) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error_str = value.get("error")?.as_str()?;
+    OAUTH_ERROR_TYPES
+        .iter()
+        .find(|&&allowlisted| error_str == allowlisted)
+        .copied()
+}
+
 /// Sanitize HTTP response bodies to prevent token leaks in error messages.
 /// Truncates to 200 chars and redacts known token patterns.
 fn sanitize_body(body: &str) -> String {
@@ -504,5 +553,105 @@ mod tests {
     #[test]
     fn redact_tokens_empty_string() {
         assert_eq!(redact_tokens(""), "");
+    }
+
+    // --- extract_oauth_error_type ---
+
+    /// Each allowlisted entry round-trips: parsing a JSON body whose `error`
+    /// field equals that entry returns the exact entry.
+    #[test]
+    fn extract_oauth_error_type_returns_static_for_each_allowlist_entry() {
+        for &entry in OAUTH_ERROR_TYPES {
+            // Arrange
+            let body = format!(r#"{{"error":"{entry}"}}"#);
+            // Act
+            let result = extract_oauth_error_type(&body);
+            // Assert
+            assert_eq!(result, Some(entry), "entry '{entry}' should round-trip");
+        }
+    }
+
+    /// `"invalid_scope_extended"` is NOT in the allowlist; the function must
+    /// reject prefix extensions via exact-match semantics.
+    #[test]
+    fn extract_oauth_error_type_rejects_substring_extension() {
+        // Arrange
+        let body = r#"{"error":"invalid_scope_extended"}"#;
+        // Act
+        let result = extract_oauth_error_type(body);
+        // Assert
+        assert_eq!(result, None, "prefix extension must be rejected");
+    }
+
+    /// Completely unknown error types must return None.
+    #[test]
+    fn extract_oauth_error_type_rejects_unknown() {
+        // Arrange
+        let body = r#"{"error":"totally_made_up"}"#;
+        // Act
+        let result = extract_oauth_error_type(body);
+        // Assert
+        assert_eq!(result, None);
+    }
+
+    /// Non-JSON input must return None without panicking.
+    #[test]
+    fn extract_oauth_error_type_rejects_non_json() {
+        // Arrange
+        let body = "not json at all";
+        // Act
+        let result = extract_oauth_error_type(body);
+        // Assert
+        assert_eq!(result, None);
+    }
+
+    /// JSON with no `error` field must return None.
+    #[test]
+    fn extract_oauth_error_type_rejects_missing_error_field() {
+        // Arrange
+        let body = r#"{"foo":"bar"}"#;
+        // Act
+        let result = extract_oauth_error_type(body);
+        // Assert
+        assert_eq!(result, None);
+    }
+
+    /// The `error_description` field must be ignored — only the `error` field
+    /// is consulted. This prevents an attacker-controlled description from
+    /// leaking through the allowlist.
+    #[test]
+    fn extract_oauth_error_type_ignores_error_description() {
+        // Arrange — `error_description` contains an allowlisted string but
+        // `error` is absent, so the function must return None.
+        let body = r#"{"error_description":"invalid_scope"}"#;
+        // Act
+        let result = extract_oauth_error_type(body);
+        // Assert
+        assert_eq!(result, None);
+    }
+
+    /// The returned `&str` must be pointer-equal to the entry in
+    /// `OAUTH_ERROR_TYPES` — NOT a slice into the input body.
+    ///
+    /// This is the load-bearing defense against prompt injection: even if
+    /// the attacker controls the body, the bytes returned to the caller are
+    /// always from the compile-time constant array.
+    #[test]
+    fn extract_oauth_error_type_returns_static_pointer() {
+        for (i, &entry) in OAUTH_ERROR_TYPES.iter().enumerate() {
+            // Arrange — pad the body so the string value occupies different
+            // memory than the constant.  The value is the same bytes but at a
+            // different address.
+            let body = format!(r#"{{  "error"  :  "{entry}"  }}"#);
+            // Act
+            let result = extract_oauth_error_type(&body).expect("should match");
+            // Assert — pointer identity: result must point into the constant,
+            // not into `body` (which is on the heap).
+            assert!(
+                std::ptr::eq(result.as_ptr(), OAUTH_ERROR_TYPES[i].as_ptr()),
+                "returned ptr must equal OAUTH_ERROR_TYPES[{i}].as_ptr() — \
+                 got a slice into the input instead of the static constant"
+            );
+        }
     }
 }

@@ -23,6 +23,29 @@ struct DoctorReport {
     daemon: DaemonInfo,
     accounts: AccountsInfo,
     terminals: TerminalInfo,
+    resurrections: ResurrectionInfo,
+}
+
+/// Counts of canonical-credentials resurrection events the daemon
+/// has recorded in `.resurrection-log.jsonl`. Non-zero means the
+/// refresher found at least one account whose `credentials/N.json`
+/// was missing and had to rebuild it from `config-N/.credentials.json`
+/// — evidence that something in the write path is orphaning live
+/// files without mirroring to canonical. Operators should investigate
+/// recent write paths (login, Add Account, imports) when this is > 0.
+#[derive(Serialize)]
+struct ResurrectionInfo {
+    /// Total breadcrumb records found.
+    total: usize,
+    /// Number of distinct accounts that have been resurrected.
+    distinct_accounts: usize,
+    /// Unix seconds of the most recent resurrection event, if any.
+    last_timestamp_secs: Option<u64>,
+    /// Sample of the most recent account IDs (up to 5) for the
+    /// operator to start their investigation. Intentionally not
+    /// the whole list — if there are hundreds the doctor output
+    /// would become unreadable.
+    recent_accounts: Vec<u16>,
 }
 
 /// Information about running CC terminals (legacy vs modern handle-dir).
@@ -93,6 +116,71 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         daemon: check_daemon(base_dir),
         accounts: check_accounts(base_dir),
         terminals: check_terminals(base_dir),
+        resurrections: check_resurrections(base_dir),
+    }
+}
+
+/// Reads `{base_dir}/.resurrection-log.jsonl` and summarizes it.
+///
+/// Each line is an object emitted by the refresher when it had to
+/// rebuild a canonical credential file from its live sibling. Any
+/// non-zero count means at least one OAuth slot's canonical went
+/// missing — a symptom of a broken write path. The operator should
+/// investigate login / Add Account / import flows that touched the
+/// affected accounts.
+fn check_resurrections(base_dir: &Path) -> ResurrectionInfo {
+    let path = base_dir.join(".resurrection-log.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            return ResurrectionInfo {
+                total: 0,
+                distinct_accounts: 0,
+                last_timestamp_secs: None,
+                recent_accounts: Vec::new(),
+            };
+        }
+    };
+
+    let mut total = 0usize;
+    let mut last_ts: Option<u64> = None;
+    let mut distinct: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    // Keep the last 5 account IDs in insertion order for the recent
+    // sample. We don't guarantee chronological order of the file
+    // beyond "appended" — appender is single-threaded inside the
+    // daemon refresher so this is safe in practice.
+    let mut recent: std::collections::VecDeque<u16> = std::collections::VecDeque::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        total += 1;
+        if let Some(ts) = val.get("timestamp_secs").and_then(|v| v.as_u64()) {
+            last_ts = Some(last_ts.map_or(ts, |prev| prev.max(ts)));
+        }
+        if let Some(acct) = val
+            .get("account")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u16::try_from(n).ok())
+        {
+            distinct.insert(acct);
+            recent.push_back(acct);
+            while recent.len() > 5 {
+                recent.pop_front();
+            }
+        }
+    }
+
+    ResurrectionInfo {
+        total,
+        distinct_accounts: distinct.len(),
+        last_timestamp_secs: last_ts,
+        recent_accounts: recent.into_iter().collect(),
     }
 }
 
@@ -477,7 +565,58 @@ fn print_report(r: &DoctorReport) {
         println!("  Terminals:   - no active terminals detected");
     }
 
+    // Resurrection forensics — only printed when the daemon has had
+    // to rebuild a canonical credential file at least once. Non-zero
+    // is always a WARN because it implies a broken write path that
+    // the daemon is auto-healing.
+    let res = &r.resurrections;
+    if res.total > 0 {
+        let ts_str = res
+            .last_timestamp_secs
+            .map(format_utc_date)
+            .unwrap_or_else(|| "unknown".into());
+        let sample: Vec<String> = res.recent_accounts.iter().map(|a| a.to_string()).collect();
+        println!(
+            "  Resurrections: {} {} canonical rebuilds across {} account(s) — last at {} — \
+             investigate write path (recent: {}). Breadcrumbs: ~/.claude/accounts/.resurrection-log.jsonl",
+            warn(),
+            res.total,
+            res.distinct_accounts,
+            ts_str,
+            sample.join(", ")
+        );
+    }
+
     println!();
+}
+
+/// Formats a Unix epoch second count as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// Hand-rolled because bringing in `chrono` or `time` for a single
+/// print statement is excess baggage. The daemon stamps timestamps
+/// with `SystemTime::now().duration_since(UNIX_EPOCH)` so valid
+/// values are always non-negative and within the i64 range.
+fn format_utc_date(secs: u64) -> String {
+    let days = secs / 86_400;
+    let time_of_day = secs % 86_400;
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    // Civil from days algorithm (Howard Hinnant, "date algorithms",
+    // public domain). Converts days-since-1970-01-01 into Y/M/D.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
 }
 
 fn ok() -> &'static str {
@@ -653,7 +792,79 @@ mod tests {
                 expired: 0,
             },
             terminals,
+            resurrections: ResurrectionInfo {
+                total: 0,
+                distinct_accounts: 0,
+                last_timestamp_secs: None,
+                recent_accounts: Vec::new(),
+            },
         }
+    }
+
+    #[test]
+    fn check_resurrections_absent_file_reports_zero() {
+        let tmp = TempDir::new().unwrap();
+        let info = check_resurrections(tmp.path());
+        assert_eq!(info.total, 0);
+        assert_eq!(info.distinct_accounts, 0);
+        assert!(info.last_timestamp_secs.is_none());
+        assert!(info.recent_accounts.is_empty());
+    }
+
+    #[test]
+    fn check_resurrections_counts_unique_accounts() {
+        // Three breadcrumbs across two distinct accounts — distinct
+        // count should be 2, total count should be 3, and the recent
+        // sample should contain the most recent entries in insertion
+        // order.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".resurrection-log.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp_secs":1000,"account":3,"event":"canonical_resurrected","live_mtime_secs":950,"live_path":"/a"}"#, "\n",
+                r#"{"timestamp_secs":2000,"account":5,"event":"canonical_resurrected","live_mtime_secs":1950,"live_path":"/b"}"#, "\n",
+                r#"{"timestamp_secs":3000,"account":3,"event":"canonical_resurrected","live_mtime_secs":2950,"live_path":"/c"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let info = check_resurrections(tmp.path());
+
+        assert_eq!(info.total, 3);
+        assert_eq!(info.distinct_accounts, 2, "accounts 3 and 5 are distinct");
+        assert_eq!(info.last_timestamp_secs, Some(3000));
+        assert_eq!(info.recent_accounts, vec![3, 5, 3]);
+    }
+
+    #[test]
+    fn check_resurrections_ignores_malformed_lines() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".resurrection-log.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "not json\n",
+                r#"{"timestamp_secs":1000,"account":7,"event":"canonical_resurrected","live_mtime_secs":950,"live_path":"/a"}"#, "\n",
+                "\n",
+                "{ broken\n",
+            ),
+        )
+        .unwrap();
+
+        let info = check_resurrections(tmp.path());
+        assert_eq!(info.total, 1, "only the valid line counts");
+        assert_eq!(info.recent_accounts, vec![7]);
+    }
+
+    #[test]
+    fn format_utc_date_round_trips_known_timestamps() {
+        // 2026-04-14 02:00:00 UTC
+        let s = format_utc_date(1_776_132_000);
+        assert_eq!(s, "2026-04-14 02:00:00 UTC");
+        // 1970-01-01 00:00:00 UTC
+        let epoch = format_utc_date(0);
+        assert_eq!(epoch, "1970-01-01 00:00:00 UTC");
     }
 
     #[test]

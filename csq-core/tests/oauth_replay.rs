@@ -279,5 +279,55 @@ fn refresh_body_shape_accepted_by_anthropic() {
     });
 
     // Assert the response shape is valid without printing token values.
-    assert_refresh_response_valid(result);
+    // If the refresh succeeded, persist the new refresh token so the
+    // workflow can rotate the OAUTH_REPLAY_REFRESH_TOKEN secret.
+    match result {
+        Ok(ref refreshed) => {
+            assert_refresh_response_valid(Ok(refreshed.clone()));
+            emit_new_refresh_token_for_rotation(refreshed);
+        }
+        Err(e) => {
+            // Let assert_refresh_response_valid handle the panic.
+            assert_refresh_response_valid(Err(e));
+        }
+    }
+}
+
+/// Writes the new refresh token to a file so the GitHub Actions
+/// workflow can rotate the `OAUTH_REPLAY_REFRESH_TOKEN` secret.
+///
+/// The file path is read from `OAUTH_REPLAY_OUTPUT_FILE`. If the
+/// env var is unset (local run, not CI), this is a no-op.
+///
+/// The token is masked in the Actions log via `::add-mask::` so it
+/// never appears in plain text even if the step's stdout is captured.
+///
+/// SECURITY: the file is written with `0o600` and is deleted by the
+/// workflow step immediately after reading. The token value MUST NOT
+/// appear in any println!, eprintln!, or panic! message.
+fn emit_new_refresh_token_for_rotation(refreshed: &CredentialFile) {
+    let output_file = match std::env::var("OAUTH_REPLAY_OUTPUT_FILE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return, // not in CI or env var unset — no-op
+    };
+
+    let new_rt = refreshed.claude_ai_oauth.refresh_token.expose_secret();
+    if new_rt.is_empty() {
+        return;
+    }
+
+    // Mask the token in GitHub Actions logs so it can never appear
+    // in plain text, even if a subsequent step echoes the file.
+    println!("::add-mask::{new_rt}");
+
+    // Write to the designated file.
+    if let Err(e) = std::fs::write(&output_file, new_rt.as_bytes()) {
+        eprintln!("warning: failed to write new refresh token to {output_file}: {e}");
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&output_file, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }

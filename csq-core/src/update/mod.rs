@@ -252,18 +252,24 @@ mod tests {
     /// Builds a fake GitHub Releases JSON response with the given
     /// version and a download URL for the current platform.
     fn fake_release_json(version: &str) -> Vec<u8> {
+        // Alpha.12: `check_latest_version` switched from
+        // `/releases/latest` (single object) to `/releases?per_page=30`
+        // (array), so fake responses must be wrapped in a one-element
+        // array. The `draft` field defaults to false if absent but we
+        // set it explicitly to make the shape obvious.
         let filename = current_platform_asset().1;
         format!(
-            r#"{{
+            r#"[{{
   "tag_name": "v{version}",
   "prerelease": false,
+  "draft": false,
   "html_url": "https://example.com/releases/v{version}",
   "assets": [
     {{"name": "{filename}", "browser_download_url": "https://example.com/{filename}"}},
     {{"name": "{filename}.sig", "browser_download_url": "https://example.com/{filename}.sig"}},
     {{"name": "SHA256SUMS", "browser_download_url": "https://example.com/SHA256SUMS"}}
   ]
-}}"#,
+}}]"#,
             version = version,
             filename = filename,
         )

@@ -95,31 +95,77 @@ resolve_tag() {
         echo "$CSQ_VERSION"
         return
     fi
-    # Use /releases?per_page=1 rather than /releases/latest because
-    # /releases/latest skips prereleases and would hand back the old
-    # Python-era v1.x stable line even while the current Rust tool is
-    # in v2.0.0-alpha.* pre-release. Users running `install.sh` expect
-    # the newest csq regardless of prerelease flag.
+
+    # We do NOT use `/releases/latest` — that endpoint excludes
+    # prereleases and returns the old Python-era `v1.x` stable line
+    # while the current Rust tool is in `v2.0.0-alpha.*`.
     #
-    # /releases returns entries sorted by published_at descending, so
-    # the first tag is always the most recently published release.
-    local tag is_prerelease
+    # We also do NOT trust the server order of `/releases`. Observed
+    # live on the csq repo: GitHub returned `alpha.9` ahead of
+    # `alpha.11` even though `alpha.11` has a later `created_at` AND
+    # `published_at`. The server-side sort appears to be based on an
+    # internal `updated_at` that bumps when a second pass updates a
+    # release (e.g. a delayed asset upload). Client-side sort is the
+    # only reliable answer.
+    #
+    # Strategy: fetch 30 releases, extract every valid semver tag,
+    # sort with `sort -V` (GNU/BSD version sort), pick the highest.
     local response
-    response=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null)
-    tag=$(printf '%s' "$response" \
-        | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
-        | head -1 \
-        | sed -E 's/.*"([^"]+)"$/\1/')
-    is_prerelease=$(printf '%s' "$response" \
-        | grep -oE '"prerelease"[[:space:]]*:[[:space:]]*(true|false)' \
-        | head -1 \
-        | sed -E 's/.*:[[:space:]]*(true|false).*/\1/')
-    if [ -z "$tag" ]; then
-        err "could not resolve latest csq version from GitHub API"
+    response=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null)
+    if [ -z "$response" ]; then
+        err "could not fetch releases from GitHub API"
         err "  set CSQ_VERSION=vX.Y.Z to install a specific version"
         exit 1
     fi
+
+    # Extract all tag_name fields. GitHub's API always emits
+    # `"tag_name": "vX.Y.Z..."` so a grep+sed line-level match works
+    # without needing a JSON parser in the installer.
+    local tags
+    tags=$(printf '%s' "$response" \
+        | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | sed -E 's/.*"([^"]+)"$/\1/')
+
+    if [ -z "$tags" ]; then
+        err "could not parse any tag_name from GitHub API response"
+        err "  set CSQ_VERSION=vX.Y.Z to install a specific version"
+        exit 1
+    fi
+
+    # Filter to strict-semver shapes and sort descending. `sort -V`
+    # orders prerelease suffixes correctly (alpha.9 < alpha.10 <
+    # alpha.11), which `sort` without `-V` does not. Both GNU coreutils
+    # and macOS Ventura+ `sort` support `-V`.
+    local tag
+    tag=$(printf '%s\n' "$tags" \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$' \
+        | sort -Vr \
+        | head -1)
+
+    if [ -z "$tag" ]; then
+        err "no valid semver tag found in GitHub API response"
+        err "  set CSQ_VERSION=vX.Y.Z to install a specific version"
+        exit 1
+    fi
+
     validate_tag "$tag"
+
+    # Look up the `prerelease` flag for the selected tag. This is a
+    # second grep on the response; the JSON is ordered so each tag's
+    # prerelease field is the closest one that follows. We match in
+    # line order: find the line with our tag, then the next
+    # "prerelease":(true|false). Best-effort; if it fails we silently
+    # skip the PRE-RELEASE warning rather than block the install.
+    local is_prerelease
+    is_prerelease=$(printf '%s' "$response" \
+        | awk -v t="\"$tag\"" '
+            index($0, t) { found=1 }
+            found && /"prerelease"[[:space:]]*:[[:space:]]*(true|false)/ {
+                match($0, /(true|false)/);
+                print substr($0, RSTART, RLENGTH);
+                exit;
+            }' \
+        || true)
     if [ "$is_prerelease" = "true" ]; then
         warn "installing PRE-RELEASE build $tag"
         warn "pin a specific version with CSQ_VERSION=vX.Y.Z if needed"

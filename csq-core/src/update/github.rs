@@ -26,8 +26,24 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-const GITHUB_API_LATEST: &str =
-    "https://api.github.com/repos/terrene-foundation/csq/releases/latest";
+/// GitHub Releases listing endpoint. We DO NOT use `/releases/latest`
+/// because that endpoint excludes prereleases — for csq in
+/// `2.0.0-alpha.*` state it returns `v1.1.0` (the Python-era line)
+/// and `check_latest_version` would permanently report "up to date"
+/// even when a new alpha exists.
+///
+/// We also DO NOT trust the server ordering of `/releases`. Observed
+/// behavior on the live API: the list is ordered roughly by an
+/// internal `updated_at`, NOT by `published_at` or `created_at`, so
+/// a release whose assets finished uploading in a second pass floats
+/// to the top ahead of a chronologically later release. Client-side
+/// sort by proper semver is the only reliable answer.
+///
+/// `per_page=30` comfortably covers the last month of alpha churn
+/// without pagination, keeping the update check a single HTTPS
+/// round-trip.
+const GITHUB_API_RELEASES: &str =
+    "https://api.github.com/repos/terrene-foundation/csq/releases?per_page=30";
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -52,6 +68,11 @@ struct LatestRelease {
     tag_name: String,
     html_url: String,
     assets: Vec<ReleaseAsset>,
+    /// `true` if this release is marked as a draft. Drafts must not
+    /// be considered by auto-update — they are unfinished and their
+    /// assets may be rewritten.
+    #[serde(default)]
+    draft: bool,
 }
 
 /// One entry in `release.assets`.
@@ -87,7 +108,7 @@ where
 {
     let ua = format!("csq/{CURRENT_VERSION}");
     let body = http_get(
-        GITHUB_API_LATEST,
+        GITHUB_API_RELEASES,
         &[
             ("User-Agent", ua.as_str()),
             ("Accept", "application/vnd.github+json"),
@@ -96,8 +117,30 @@ where
     )
     .map_err(|e| anyhow::anyhow!("GitHub API request failed: {e}"))?;
 
-    let release: LatestRelease =
+    let mut releases: Vec<LatestRelease> =
         serde_json::from_slice(&body).context("failed to parse GitHub API response")?;
+
+    // Filter out drafts — they can be rewritten and their assets are
+    // not stable. Prereleases are KEPT because csq ships as
+    // `2.0.0-alpha.*` and the user opts in via semver ordering.
+    releases.retain(|r| !r.draft);
+
+    // Client-side sort by semver, descending. Server-side order is
+    // NOT reliable — observed live on the csq repo: `/releases`
+    // returned `alpha.9` before `alpha.11` even though `alpha.11`
+    // has a later `created_at` AND `published_at`. GitHub appears
+    // to sort by an internal `updated_at` that jumps around when
+    // assets are uploaded in a second pass.
+    releases.sort_by(|a, b| {
+        let av = a.tag_name.trim_start_matches('v');
+        let bv = b.tag_name.trim_start_matches('v');
+        compare_versions(bv, av) // reverse: b vs a = descending
+    });
+
+    let release = match releases.into_iter().next() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
 
     let latest_version = release.tag_name.trim_start_matches('v').to_string();
 
@@ -209,12 +252,59 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
         }
     }
 
+    // Prerelease comparison, per the SemVer 2.0.0 spec section 11:
+    //
+    //   - A version without a prerelease has HIGHER precedence than
+    //     the same version with one (`1.0.0 > 1.0.0-alpha`).
+    //   - Precedence for two prereleases is determined by comparing
+    //     dot-separated identifiers left to right:
+    //       * Numeric identifiers compare numerically.
+    //       * String identifiers compare lexicographically (ASCII).
+    //       * Numeric identifiers are always lower precedence than
+    //         non-numeric identifiers (`1.0.0-alpha.1 < 1.0.0-alpha.beta`).
+    //     A prerelease with fewer fields has LOWER precedence if all
+    //     preceding fields are equal (`1.0.0-alpha < 1.0.0-alpha.1`).
+    //
+    // Alpha.9/10/11 live-bug: the old implementation used plain
+    // `String::cmp` on the prerelease suffix, so `"alpha.11"` sorted
+    // BEFORE `"alpha.9"` because `'1' < '9'` lexicographically. That
+    // made `csq update install` refuse every double-digit alpha as a
+    // "downgrade". The per-segment compare below handles it correctly.
     match (a_pre, b_pre) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(a), Some(b)) => compare_prerelease(&a, &b),
     }
+}
+
+/// Compares two prerelease suffixes per SemVer 2.0.0 section 11.
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_ids: Vec<&str> = a.split('.').collect();
+    let b_ids: Vec<&str> = b.split('.').collect();
+
+    let min_len = std::cmp::min(a_ids.len(), b_ids.len());
+    for i in 0..min_len {
+        let ai = a_ids[i];
+        let bi = b_ids[i];
+        let a_num = ai.parse::<u64>().ok();
+        let b_num = bi.parse::<u64>().ok();
+        let ord = match (a_num, b_num) {
+            (Some(an), Some(bn)) => an.cmp(&bn),
+            // Numeric identifiers ALWAYS have lower precedence than
+            // non-numeric identifiers.
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => ai.cmp(bi),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+
+    // All shared identifiers compare equal; longer prerelease wins
+    // (has higher precedence) per SemVer: `1.0.0-alpha < 1.0.0-alpha.1`.
+    a_ids.len().cmp(&b_ids.len())
 }
 
 fn split_version(v: &str) -> (Vec<u32>, Option<String>) {
@@ -232,7 +322,15 @@ mod tests {
     use std::cmp::Ordering;
 
     // Minimal canned GitHub API response with all assets present.
+    // Now wrapped in a one-element array because check_latest_version
+    // fetches `/releases?per_page=30` and expects a JSON array.
     fn fake_release_json(version: &str, platform_stem: &str) -> Vec<u8> {
+        serde_json::Value::Array(vec![fake_release_value(version, platform_stem)])
+            .to_string()
+            .into_bytes()
+    }
+
+    fn fake_release_value(version: &str, platform_stem: &str) -> serde_json::Value {
         let binary_name = binary_asset_name(platform_stem);
         let sig_name = format!("{platform_stem}.sig");
         let base =
@@ -240,6 +338,7 @@ mod tests {
         serde_json::json!({
             "tag_name": format!("v{version}"),
             "html_url": format!("https://github.com/terrene-foundation/csq/releases/tag/v{version}"),
+            "draft": false,
             "assets": [
                 {
                     "name": binary_name,
@@ -255,8 +354,15 @@ mod tests {
                 }
             ]
         })
-        .to_string()
-        .into_bytes()
+    }
+
+    /// Wraps a bare release JSON object (single release) in an array,
+    /// for the tests that were written before the endpoint switch and
+    /// need a minimal shim rather than a full rewrite.
+    fn wrap_in_array(release: serde_json::Value) -> Vec<u8> {
+        serde_json::Value::Array(vec![release])
+            .to_string()
+            .into_bytes()
     }
 
     #[test]
@@ -296,18 +402,17 @@ mod tests {
     #[test]
     fn check_latest_returns_none_when_no_platform_asset() {
         // Arrange: newer version but only assets for a different platform
-        let json = serde_json::json!({
+        let json = wrap_in_array(serde_json::json!({
             "tag_name": "v999.0.0",
             "html_url": "https://github.com/terrene-foundation/csq/releases/tag/v999.0.0",
+            "draft": false,
             "assets": [
                 {
                     "name": "csq-other-platform",
                     "browser_download_url": "https://github.com/example/csq-other-platform"
                 }
             ]
-        })
-        .to_string()
-        .into_bytes();
+        }));
 
         // Act
         let result = check_latest_version(|_url, _headers| Ok(json.clone()));
@@ -324,9 +429,10 @@ mod tests {
         // Arrange: binary present but no .sig — must refuse without signature
         let stem = current_platform_stem();
         let binary_name = binary_asset_name(&stem);
-        let json = serde_json::json!({
+        let json = wrap_in_array(serde_json::json!({
             "tag_name": "v999.0.0",
             "html_url": "https://github.com/terrene-foundation/csq/releases/tag/v999.0.0",
+            "draft": false,
             "assets": [
                 {
                     "name": binary_name,
@@ -337,9 +443,7 @@ mod tests {
                     "browser_download_url": "https://github.com/terrene-foundation/csq/releases/download/v999.0.0/SHA256SUMS"
                 }
             ]
-        })
-        .to_string()
-        .into_bytes();
+        }));
 
         // Act
         let result = check_latest_version(|_url, _headers| Ok(json.clone()));
@@ -357,9 +461,10 @@ mod tests {
         let stem = current_platform_stem();
         let binary_name = binary_asset_name(&stem);
         let sig_name = format!("{stem}.sig");
-        let json = serde_json::json!({
+        let json = wrap_in_array(serde_json::json!({
             "tag_name": "v999.0.0",
             "html_url": "https://github.com/terrene-foundation/csq/releases/tag/v999.0.0",
+            "draft": false,
             "assets": [
                 {
                     "name": binary_name,
@@ -374,9 +479,7 @@ mod tests {
                     "browser_download_url": "https://github.com/download/SHA256SUMS"
                 }
             ]
-        })
-        .to_string()
-        .into_bytes();
+        }));
 
         // Act
         let result = check_latest_version(|_url, _headers| Ok(json.clone()));
@@ -415,9 +518,10 @@ mod tests {
         let stem = current_platform_stem();
         let binary_name = binary_asset_name(&stem);
         let sig_name = format!("{stem}.sig");
-        let json = serde_json::json!({
+        let json = wrap_in_array(serde_json::json!({
             "tag_name": "v999.0.0",
             "html_url": "https://github.com/terrene-foundation/csq/releases/tag/v999.0.0",
+            "draft": false,
             "assets": [
                 {
                     "name": binary_name,
@@ -428,9 +532,7 @@ mod tests {
                     "browser_download_url": format!("https://github.com/terrene-foundation/csq/releases/download/v999.0.0/{sig_name}")
                 }
             ]
-        })
-        .to_string()
-        .into_bytes();
+        }));
 
         // Act
         let result = check_latest_version(|_url, _headers| Ok(json.clone()));
@@ -458,6 +560,147 @@ mod tests {
     #[test]
     fn compare_equal() {
         assert_eq!(compare_versions("1.2.3", "1.2.3"), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_double_digit_alpha_numeric_order() {
+        // The alpha.9/10/11 bug: old code used lexicographic string
+        // compare on the prerelease suffix, so "alpha.11" sorted
+        // BEFORE "alpha.9" and csq update rejected every double-digit
+        // alpha as a downgrade. New code parses each dot-segment as
+        // a number where possible and compares numerically.
+        assert_eq!(
+            compare_versions("2.0.0-alpha.11", "2.0.0-alpha.9"),
+            Ordering::Greater,
+            "alpha.11 MUST be greater than alpha.9"
+        );
+        assert_eq!(
+            compare_versions("2.0.0-alpha.10", "2.0.0-alpha.9"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("2.0.0-alpha.9", "2.0.0-alpha.11"),
+            Ordering::Less,
+            "alpha.9 MUST be less than alpha.11"
+        );
+        assert_eq!(
+            compare_versions("2.0.0-alpha.100", "2.0.0-alpha.99"),
+            Ordering::Greater,
+            "triple-digit alpha must beat double-digit"
+        );
+    }
+
+    #[test]
+    fn compare_prerelease_semver_spec_rules() {
+        // SemVer 2.0.0 section 11: numeric < non-numeric in
+        // per-segment compare; fewer segments < more segments when
+        // prefix matches.
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0-alpha.1"),
+            Ordering::Less,
+            "shorter prerelease has lower precedence"
+        );
+        assert_eq!(
+            compare_versions("1.0.0-alpha.1", "1.0.0-alpha.beta"),
+            Ordering::Less,
+            "numeric identifier < non-numeric identifier"
+        );
+        assert_eq!(
+            compare_versions("1.0.0-beta", "1.0.0-alpha"),
+            Ordering::Greater,
+            "beta > alpha lexicographically"
+        );
+    }
+
+    #[test]
+    fn check_latest_picks_highest_semver_from_unsorted_list() {
+        // Regression for the live bug: GitHub `/releases` returned
+        // alpha.9 BEFORE alpha.11 in server order. check_latest_version
+        // must client-side sort and pick the highest. Uses 999.x.x
+        // prereleases so the selected one is always newer than the
+        // current compile-time version regardless of what release
+        // this test runs on.
+        let stem = current_platform_stem();
+        let json = serde_json::Value::Array(vec![
+            fake_release_value("999.0.0-alpha.9", &stem),
+            fake_release_value("999.0.0-alpha.11", &stem),
+            fake_release_value("999.0.0-alpha.10", &stem),
+            fake_release_value("998.0.0", &stem),
+        ])
+        .to_string()
+        .into_bytes();
+
+        let info = check_latest_version(|_url, _headers| Ok(json.clone()))
+            .unwrap()
+            .expect("should return Some when a newer release exists");
+
+        assert_eq!(
+            info.version, "999.0.0-alpha.11",
+            "client-side sort must pick alpha.11 even though the server \
+             returned alpha.9 first (and even though alpha.11 < alpha.9 \
+             under the pre-fix lexicographic compare)"
+        );
+    }
+
+    #[test]
+    fn check_latest_ignores_v1_x_stable_when_current_is_alpha() {
+        // GitHub's /releases/latest endpoint returns v1.1.0 because
+        // all 2.0.0-alpha.* are prereleases. We deliberately do NOT
+        // hit /releases/latest. This test simulates the list response
+        // to ensure a later alpha beats v1.1.0 in the semver sort.
+        let stem = current_platform_stem();
+        let json = serde_json::Value::Array(vec![
+            fake_release_value("1.1.0", &stem),
+            fake_release_value("999.0.0-alpha.1", &stem),
+        ])
+        .to_string()
+        .into_bytes();
+
+        let info = check_latest_version(|_url, _headers| Ok(json.clone()))
+            .unwrap()
+            .expect("should return Some when a newer prerelease exists");
+
+        // 999.0.0-alpha.1 is strictly greater than any 2.x; 1.1.0
+        // would only win under `/releases/latest`-semantics we no
+        // longer use.
+        assert_eq!(info.version, "999.0.0-alpha.1");
+    }
+
+    #[test]
+    fn check_latest_skips_draft_releases() {
+        let stem = current_platform_stem();
+        let mut draft = fake_release_value("999.9.9", &stem);
+        draft["draft"] = serde_json::Value::Bool(true);
+        let json =
+            serde_json::Value::Array(vec![draft, fake_release_value("999.0.0-alpha.1", &stem)])
+                .to_string()
+                .into_bytes();
+
+        let info = check_latest_version(|_url, _headers| Ok(json.clone()))
+            .unwrap()
+            .expect("should find the non-draft release");
+
+        assert_eq!(
+            info.version, "999.0.0-alpha.1",
+            "drafts must be excluded even if they have a higher version"
+        );
+    }
+
+    #[test]
+    fn check_latest_returns_none_when_all_older() {
+        // Every release in the list is older than the current version.
+        // This is the normal "up to date" path.
+        let stem = current_platform_stem();
+        let json = serde_json::Value::Array(vec![
+            fake_release_value("0.0.1", &stem),
+            fake_release_value("0.0.2", &stem),
+        ])
+        .to_string()
+        .into_bytes();
+
+        assert!(check_latest_version(|_url, _headers| Ok(json.clone()))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -256,7 +256,7 @@ pub(crate) async fn tick(
     cache: &Arc<TtlCache<u16, RefreshStatus>>,
     cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
 ) {
-    debug!("refresher tick starting");
+    info!("refresher tick starting");
 
     // Discover all Anthropic accounts. (Third-party accounts do not
     // have refresh tokens; the usage poller in M8.5 handles them.)
@@ -427,11 +427,25 @@ pub(crate) async fn tick(
                 // data, so it's safe to log directly.
                 warn!(account = info.id, error = %join_err, "refresh task panicked");
                 set_cooldown(cooldowns, info.id);
+                // Write a "panic" entry so `/api/refresh-status`
+                // shows something for this account instead of
+                // silently omitting it.  Without this, the
+                // dashboard sees an empty list until a non-panic
+                // tick fires — the 15-min empty window observed
+                // in the 2026-04-14 PM session (task #12).
+                let status = RefreshStatus {
+                    account: info.id,
+                    last_result: "panic".to_string(),
+                    expires_at_ms,
+                    checked_at_secs: now_secs(),
+                };
+                cache.set(info.id, status);
+                processed += 1;
             }
         }
     }
 
-    debug!(processed, skipped_cooldown, "refresher tick complete");
+    info!(processed, skipped_cooldown, "refresher tick complete");
 }
 
 /// Re-export of the shared `error_kind_tag` so the refresher's

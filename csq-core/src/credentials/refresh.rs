@@ -1,7 +1,7 @@
 //! OAuth token refresh — exchange a refresh token for new access/refresh tokens.
 
 use super::CredentialFile;
-use crate::error::{redact_tokens, OAuthError};
+use crate::error::{extract_oauth_error_type, redact_tokens, OAuthError};
 use crate::oauth::constants::OAUTH_CLIENT_ID;
 use crate::types::{AccessToken, RefreshToken};
 use serde::Deserialize;
@@ -10,15 +10,26 @@ use std::fmt;
 /// Anthropic OAuth token endpoint.
 pub const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 
-/// Extracts a human-readable error from a token endpoint error
-/// response. See [`crate::oauth::exchange::extract_oauth_error`]
-/// for the full format documentation (handles both API-style and
-/// standard OAuth error shapes).
+/// Extracts a human-readable error from a token endpoint error response.
+///
+/// Two JSON shapes are handled:
+///
+/// - **Standard OAuth** (`{"error": "invalid_grant", "error_description": "..."}`):
+///   For allowlisted RFC 6749 error types (see [`extract_oauth_error_type`]),
+///   the category name is a `&'static str` from the allowlist — immune to
+///   prompt injection. The `error_description` is included but passes through
+///   `redact_tokens` because it is free-form and may contain echoed token
+///   fragments (journal 0007, 0010).
+///
+/// - **API-style** (`{"error": {"type": "rate_limit_error", "message": "..."}}`)
+///   The `type` and `message` strings are both redacted before inclusion.
 fn extract_oauth_error(body: &[u8]) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let body_str = std::str::from_utf8(body).ok()?;
+    let json: serde_json::Value = serde_json::from_str(body_str).ok()?;
     let error_val = json.get("error")?;
 
     let detail = if let Some(obj) = error_val.as_object() {
+        // API-style error object: {"error": {"type": "...", "message": "..."}}
         let err_type = obj
             .get("type")
             .and_then(|v| v.as_str())
@@ -28,9 +39,16 @@ fn extract_oauth_error(body: &[u8]) -> Option<String> {
             None => err_type.to_string(),
         }
     } else if let Some(err_str) = error_val.as_str() {
+        // Standard OAuth error string: {"error": "invalid_grant", ...}
+        //
+        // Use extract_oauth_error_type to get a &'static str for allowlisted
+        // categories. This means the category name in the returned detail is
+        // always from the compile-time constant — an attacker who controls
+        // the response body cannot inject arbitrary text through this path.
+        let category: &str = extract_oauth_error_type(body_str).unwrap_or(err_str);
         match json.get("error_description").and_then(|v| v.as_str()) {
-            Some(desc) => format!("{err_str}: {desc}"),
-            None => err_str.to_string(),
+            Some(desc) => format!("{category}: {desc}"),
+            None => category.to_string(),
         }
     } else {
         return None;

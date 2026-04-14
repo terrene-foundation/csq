@@ -98,40 +98,37 @@ jobs:
         if: steps.secret-check.outputs.secret_set == 'true'
         env:
           OAUTH_REPLAY_REFRESH_TOKEN: ${{ secrets.OAUTH_REPLAY_REFRESH_TOKEN }}
+          OAUTH_REPLAY_OUTPUT_FILE: ${{ runner.temp }}/oauth-replay-new-rt
         run: |
           cargo test --package csq-core --test oauth_replay -- --ignored --nocapture
         # --nocapture shows the test output (without token values — the test
-        # never prints tokens) so failure messages are visible in the log.
+        # masks them via ::add-mask::) so failure messages are visible in the
+        # log. The test writes the new refresh token to OAUTH_REPLAY_OUTPUT_FILE.
 
-      - name: Extract new refresh token from test output
+      - name: Extract new refresh token
         id: extract-new-rt
         if: >
           steps.secret-check.outputs.secret_set == 'true' &&
           success()
-        # The live test calls refresh_token() which rotates the RT server-side.
-        # We need to capture the new RT from the refreshed CredentialFile.
-        # However, the test does not write to disk or stdout (by design — no
-        # token should appear in logs). To enable secret rotation, the test
-        # must emit the new RT via a masked GitHub Actions output.
-        #
-        # CURRENT STATE: this step is a placeholder that emits a warning.
-        # The test currently does NOT emit the new token. Full rotation support
-        # requires modifying the test to emit the new refresh token via
-        # `::add-mask::` + a file/env write, then reading it here.
-        #
-        # CONSEQUENCE: without this step, the first manual run will succeed,
-        # but the next scheduled run will fail with `invalid_grant` because
-        # the old refresh token was invalidated. Implement the emission step
-        # before enabling the schedule trigger.
-        #
-        # See: workspaces/csq-v2/journal/ (oauth rotation tracking)
         run: |
-          echo "::warning::Token rotation not yet implemented. The refresh token"
-          echo "::warning::was rotated server-side by this test run. If the"
-          echo "::warning::schedule trigger is enabled, the next run will fail"
-          echo "::warning::with invalid_grant. Implement token emission in the"
-          echo "::warning::test before enabling the cron schedule."
-          echo "new_token_available=false" >> "$GITHUB_OUTPUT"
+          RT_FILE="${{ runner.temp }}/oauth-replay-new-rt"
+          if [ ! -f "$RT_FILE" ]; then
+            echo "::warning::No output file — test may not have emitted new token."
+            echo "new_token_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NEW_RT=$(cat "$RT_FILE")
+          rm -f "$RT_FILE"
+          if [ -z "$NEW_RT" ]; then
+            echo "::warning::Output file was empty — skipping rotation."
+            echo "new_token_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Mask the token so it never appears in logs.
+          echo "::add-mask::$NEW_RT"
+          echo "new_refresh_token=$NEW_RT" >> "$GITHUB_OUTPUT"
+          echo "new_token_available=true" >> "$GITHUB_OUTPUT"
+          echo "New refresh token extracted for rotation."
 
       - name: Rotate OAUTH_REPLAY_REFRESH_TOKEN secret
         if: >

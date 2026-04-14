@@ -4,10 +4,11 @@ name: Release
 # Builds CLI and desktop artifacts for all 3 platforms in parallel,
 # then uploads them to the matching GitHub Release.
 #
-# Artifacts are UNSIGNED. Users on macOS will see Gatekeeper warnings
-# on first launch of the .app bundle; users on Windows will see
-# SmartScreen warnings on first launch of .msi/.exe. CLI binaries
-# downloaded via curl/install.sh do not trigger either warning.
+# All release artifacts (CLI + desktop) receive Foundation Ed25519
+# .sig files. macOS Gatekeeper and Windows SmartScreen still warn on
+# first launch of the desktop bundles — those require an Apple
+# Developer ID / Microsoft signing cert, which are separate from our
+# Ed25519 signatures.
 
 on:
   push:
@@ -295,7 +296,7 @@ jobs:
           rm -f *.sha256
           ls -la
 
-      - name: Sign CLI binaries with Foundation Ed25519 key
+      - name: Sign release artifacts with Foundation Ed25519 key
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
@@ -315,13 +316,13 @@ jobs:
 
           cd release-assets
 
-          # Sign each CLI binary. Match only csq-{linux,macos,windows}-*
-          # so we don't accidentally sign desktop bundles, SHA256SUMS,
-          # or pre-existing .sig files.
+          # Sign each release artifact: CLI binaries and desktop bundles.
+          # Excludes SHA256SUMS and pre-existing .sig/.sha256 files via
+          # the filter below.
           shopt -s nullglob
-          targets=(csq-linux-* csq-macos-* csq-windows-*)
+          targets=(csq-linux-* csq-macos-* csq-windows-* csq-desktop-*)
           if [ ${#targets[@]} -eq 0 ]; then
-            echo "::error::no CLI binaries found to sign"
+            echo "::error::no release artifacts found to sign"
             exit 1
           fi
 
@@ -335,7 +336,7 @@ jobs:
           done
 
           if [ ${#to_sign[@]} -eq 0 ]; then
-            echo "::error::no signable CLI binaries after filtering"
+            echo "::error::no signable artifacts after filtering"
             exit 1
           fi
 

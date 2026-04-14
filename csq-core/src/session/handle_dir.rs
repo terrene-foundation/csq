@@ -169,7 +169,7 @@ pub fn create_handle_dir(
     }
 
     // Copy .claude.json from config-N, scoping `projects` to CWD.
-    copy_claude_json_stripped(&config_dir, &handle_dir);
+    materialize_handle_claude_json(&config_dir, &handle_dir);
 
     // Materialize settings.json as a real file (NOT a symlink). CC reads
     // this via CLAUDE_CONFIG_DIR and treats it as the user settings layer,
@@ -340,58 +340,162 @@ pub fn repoint_handle_dir(
     // post-swap file, never a half-written one.
     materialize_handle_settings(handle_dir, claude_home, &new_config)?;
 
+    // Re-materialize .claude.json for the new slot. This is the bug fix
+    // for alpha.10: `csq swap` used to repoint credential symlinks but
+    // leave `.claude.json` as the stale copy from whichever slot the
+    // handle dir was created with. CC reads account-scoped caches from
+    // .claude.json — `oauthAccount`, `overageCreditGrantCache`,
+    // `cachedExtraUsageDisabledReason`, `cachedGrowthBookFeatures`,
+    // `additionalModelCostsCache`, `clientDataCache`, etc. — and
+    // displays "you've hit your limit" from those caches without
+    // necessarily making a fresh API call. Swapping without refreshing
+    // .claude.json meant CC continued reporting the pre-swap account's
+    // state for the remainder of the session.
+    //
+    // Session-scoped project entries from the old handle dir (CC writes
+    // them during the session) are preserved so `--resume` and per-CWD
+    // state survive the swap. See `rebuild_claude_json_for_swap` for
+    // the atomic write + projects merge.
+    rebuild_claude_json_for_swap(&new_config, handle_dir);
+
     info!(account = %target, handle = %handle_dir.display(), "handle dir repointed");
     Ok(())
 }
 
-/// Copies `.claude.json` from `config_dir` into `handle_dir`, scoping
-/// the `projects` map to only the current working directory.
+/// Builds a `.claude.json` for `handle_dir` from `config_dir/.claude.json`
+/// with the `projects` map scoped to the current working directory.
 ///
-/// CC uses `projects` in `.claude.json` to track per-project settings
-/// AND to enumerate resumable sessions. If we copy the full map, `--resume`
+/// CC uses `projects` in `.claude.json` to track per-project settings AND
+/// to enumerate resumable sessions. If we copy the full map, `--resume`
 /// shows sessions from every directory this account was ever used in.
-/// If we strip it entirely, CC thinks there are no projects and `/resume`
-/// says "No conversations found". The fix: keep only entries whose key
-/// matches the current CWD or is a subdirectory of it.
+/// If we strip it entirely, CC thinks there are no projects. The middle
+/// ground: keep only entries whose key matches the current CWD or is a
+/// subdirectory of it.
 ///
-/// This works together with `scope_projects_to_cwd` — `.claude.json`
-/// tells CC which projects exist, `projects/` provides the session data.
-fn copy_claude_json_stripped(config_dir: &Path, handle_dir: &Path) {
-    let src = config_dir.join(".claude.json");
-    let dst = handle_dir.join(".claude.json");
+/// On swap (`preserve_handle_projects = Some`), project entries that CC
+/// has written to the handle dir's own `.claude.json` during the session
+/// are overlaid on top of the new slot's projects. This preserves
+/// session-scoped state like the `--resume` list and per-project
+/// settings that CC populated while the session was running, even
+/// though the rest of the file is refreshed from the new slot.
+///
+/// Returns the merged JSON ready to write, or `None` if the new slot's
+/// source file is missing or unparseable (in which case the caller
+/// should leave the existing handle-dir file alone).
+fn build_scoped_claude_json(source: &Path, preserve_handle: Option<&Path>) -> Option<Value> {
+    let content = std::fs::read_to_string(source).ok()?;
+    let mut json: Value = serde_json::from_str(&content).ok()?;
 
-    let content = match std::fs::read_to_string(&src) {
-        Ok(c) => c,
-        Err(_) => return,
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c.to_string_lossy().to_string(),
+        Err(_) => return Some(json),
     };
 
-    let mut json: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    // Scope the `projects` map to the current CWD and its subdirs.
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_str = cwd.to_string_lossy().to_string();
-        if let Some(obj) = json.as_object_mut() {
-            if let Some(projects) = obj.get("projects").cloned() {
-                if let Some(proj_map) = projects.as_object() {
-                    let mut scoped = serde_json::Map::new();
-                    for (key, val) in proj_map {
-                        if key == &cwd_str || key.starts_with(&format!("{cwd_str}/")) {
-                            scoped.insert(key.clone(), val.clone());
+    // Collect session-scoped project entries that CC wrote into the
+    // handle dir during this session. These are newer than the entries
+    // in the new source file, so they win the merge.
+    let mut session_projects: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Some(preserve_path) = preserve_handle {
+        if let Ok(old_content) = std::fs::read_to_string(preserve_path) {
+            if let Ok(Value::Object(old_obj)) = serde_json::from_str::<Value>(&old_content) {
+                if let Some(Value::Object(old_projects)) = old_obj.get("projects") {
+                    for (k, v) in old_projects {
+                        if k == &cwd || k.starts_with(&format!("{cwd}/")) {
+                            session_projects.insert(k.clone(), v.clone());
                         }
                     }
-                    obj.insert("projects".to_string(), serde_json::Value::Object(scoped));
                 }
             }
         }
     }
 
-    if let Ok(out) = serde_json::to_string_pretty(&json) {
-        let _ = std::fs::write(&dst, out);
-        debug!("copied .claude.json (scoped projects to CWD)");
+    // Build the final projects map: source's CWD-scoped entries, then
+    // overlay session-scoped entries from the handle dir (newer wins).
+    let mut scoped = serde_json::Map::new();
+    if let Some(obj) = json.as_object() {
+        if let Some(Value::Object(src_projects)) = obj.get("projects") {
+            for (k, v) in src_projects {
+                if k == &cwd || k.starts_with(&format!("{cwd}/")) {
+                    scoped.insert(k.clone(), v.clone());
+                }
+            }
+        }
     }
+    for (k, v) in session_projects {
+        scoped.insert(k, v);
+    }
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("projects".to_string(), Value::Object(scoped));
+    }
+
+    Some(json)
+}
+
+/// Writes the handle dir's `.claude.json` from `config_dir` at
+/// handle-dir-creation time. Best-effort: if the source is missing
+/// or unparseable, the handle dir simply has no `.claude.json` and
+/// CC will create one on first run.
+fn materialize_handle_claude_json(config_dir: &Path, handle_dir: &Path) {
+    let Some(json) = build_scoped_claude_json(&config_dir.join(".claude.json"), None) else {
+        return;
+    };
+    let dst = handle_dir.join(".claude.json");
+    if let Ok(out) = serde_json::to_string_pretty(&json) {
+        // Non-atomic write is fine at create time — CC isn't running yet.
+        let _ = std::fs::write(&dst, out);
+        debug!("materialized .claude.json (scoped projects to CWD)");
+    }
+}
+
+/// Rebuilds the handle dir's `.claude.json` during a swap. Unlike
+/// `materialize_handle_claude_json`, this function **atomically
+/// replaces** the existing file so a concurrent CC read never sees a
+/// half-written one, and it preserves any session-scoped project
+/// entries that CC wrote into the handle dir during the running
+/// session.
+///
+/// On the rare event of a missing or unparseable source
+/// (`config_dir/.claude.json`) we leave the handle dir's file alone.
+/// Wiping it would strand CC with zero state, which is strictly worse
+/// than keeping the stale copy.
+fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
+    let handle_claude_json = handle_dir.join(".claude.json");
+    let Some(json) =
+        build_scoped_claude_json(&config_dir.join(".claude.json"), Some(&handle_claude_json))
+    else {
+        warn!(
+            src = %config_dir.join(".claude.json").display(),
+            "swap: new slot has no readable .claude.json, leaving handle dir file as-is"
+        );
+        return;
+    };
+
+    let out = match serde_json::to_string_pretty(&json) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "swap: failed to serialize new .claude.json");
+            return;
+        }
+    };
+
+    // Atomic write: temp + rename. CC may be reading .claude.json
+    // concurrently with this swap; a partial write would corrupt its
+    // parse and potentially wipe session state.
+    let tmp = crate::platform::fs::unique_tmp_path(&handle_claude_json);
+    if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
+        warn!(path = %tmp.display(), error = %e, "swap: temp .claude.json write failed");
+        return;
+    }
+    if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &handle_claude_json) {
+        warn!(
+            path = %handle_claude_json.display(),
+            error = %e,
+            "swap: atomic replace of .claude.json failed"
+        );
+        return;
+    }
+    debug!("swap: rebuilt .claude.json for new slot");
 }
 
 /// Sweeps orphaned `term-*` handle directories under `base_dir`.
@@ -1480,6 +1584,199 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
                 .unwrap();
         assert!(json.is_object());
+    }
+
+    #[test]
+    fn repoint_rewrites_claude_json_for_new_slot() {
+        // Alpha.10 regression fix: csq swap used to leave .claude.json
+        // as the copy from whichever slot the handle dir was created
+        // with. CC reads per-account caches from that file
+        // (oauthAccount, overageCreditGrantCache,
+        // cachedExtraUsageDisabledReason, cachedGrowthBookFeatures,
+        // etc.) and displays "you've hit your limit" off the stale
+        // cache without hitting Anthropic for a fresh answer. This
+        // test asserts swap rewrites .claude.json so the new slot's
+        // state wins.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        // Two slots. Each has a distinct .claude.json with account
+        // identity and an account-scoped cache.
+        let slot1 = base.join("config-1");
+        std::fs::create_dir_all(&slot1).unwrap();
+        std::fs::write(slot1.join(".csq-account"), "1").unwrap();
+        std::fs::write(slot1.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(
+            slot1.join(".claude.json"),
+            r#"{
+                "oauthAccount": { "emailAddress": "one@example.com", "accountUuid": "uuid-1" },
+                "cachedExtraUsageDisabledReason": "org_level_disabled",
+                "overageCreditGrantCache": { "uuid-1": { "info": { "available": false } } }
+            }"#,
+        )
+        .unwrap();
+
+        let slot2 = base.join("config-2");
+        std::fs::create_dir_all(&slot2).unwrap();
+        std::fs::write(slot2.join(".csq-account"), "2").unwrap();
+        std::fs::write(slot2.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(
+            slot2.join(".claude.json"),
+            r#"{
+                "oauthAccount": { "emailAddress": "two@example.com", "accountUuid": "uuid-2" }
+            }"#,
+        )
+        .unwrap();
+
+        let handle = create_handle_dir(
+            base,
+            &claude_home,
+            AccountNum::try_from(1u16).unwrap(),
+            22222,
+        )
+        .unwrap();
+
+        // Before swap: handle dir's .claude.json matches slot 1.
+        let pre: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            pre.pointer("/oauthAccount/emailAddress")
+                .and_then(|v| v.as_str()),
+            Some("one@example.com")
+        );
+        assert_eq!(
+            pre.pointer("/cachedExtraUsageDisabledReason")
+                .and_then(|v| v.as_str()),
+            Some("org_level_disabled"),
+            "pre-swap should reflect slot 1's stale cache"
+        );
+
+        // Swap to slot 2.
+        repoint_handle_dir(
+            base,
+            &claude_home,
+            &handle,
+            AccountNum::try_from(2u16).unwrap(),
+        )
+        .unwrap();
+
+        // Post-swap: handle dir's .claude.json matches slot 2. Stale
+        // cache from slot 1 must be gone — slot 2 never had it.
+        let post: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            post.pointer("/oauthAccount/emailAddress")
+                .and_then(|v| v.as_str()),
+            Some("two@example.com"),
+            "swap must rewrite .claude.json to reflect new slot identity"
+        );
+        assert!(
+            post.get("cachedExtraUsageDisabledReason").is_none(),
+            "swap must drop account-scoped cache from previous slot: {post}"
+        );
+        assert!(
+            post.get("overageCreditGrantCache").is_none(),
+            "swap must drop overage credit cache from previous slot: {post}"
+        );
+    }
+
+    #[test]
+    fn repoint_preserves_session_scoped_projects() {
+        // CC writes per-project state into .claude.json's projects map
+        // during a session (MCP server state, model selection, resume
+        // list, etc.). That state is scoped to the current CWD and must
+        // survive a swap — otherwise --resume forgets the current
+        // session and users lose their continuity.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        setup_config_dir(base, 2);
+
+        // Write slot 2's .claude.json with a project entry for a
+        // DIFFERENT cwd (should be stripped on swap).
+        std::fs::write(
+            base.join("config-2/.claude.json"),
+            r#"{
+                "oauthAccount": { "emailAddress": "two@example.com" },
+                "projects": {
+                    "/some/other/dir": { "lastModel": "old" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let handle = create_handle_dir(
+            base,
+            &claude_home,
+            AccountNum::try_from(1u16).unwrap(),
+            11111,
+        )
+        .unwrap();
+
+        // Simulate CC writing a session-scoped project entry after
+        // handle dir creation. Use the CWD so the scoping preserves it.
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let handle_cj = handle.join(".claude.json");
+        let existing: Value = serde_json::from_str(
+            &std::fs::read_to_string(&handle_cj).unwrap_or_else(|_| "{}".into()),
+        )
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+        let mut existing_obj = existing.as_object().cloned().unwrap_or_default();
+        let mut projects = serde_json::Map::new();
+        projects.insert(
+            cwd_str.clone(),
+            serde_json::json!({ "cc_session_state": "session-in-progress" }),
+        );
+        existing_obj.insert("projects".to_string(), Value::Object(projects));
+        std::fs::write(
+            &handle_cj,
+            serde_json::to_string_pretty(&Value::Object(existing_obj)).unwrap(),
+        )
+        .unwrap();
+
+        // Swap to slot 2.
+        repoint_handle_dir(
+            base,
+            &claude_home,
+            &handle,
+            AccountNum::try_from(2u16).unwrap(),
+        )
+        .unwrap();
+
+        let post: Value =
+            serde_json::from_str(&std::fs::read_to_string(&handle_cj).unwrap()).unwrap();
+
+        // Slot 2 identity is now in place.
+        assert_eq!(
+            post.pointer("/oauthAccount/emailAddress")
+                .and_then(|v| v.as_str()),
+            Some("two@example.com")
+        );
+
+        // Session-scoped project entry survived the swap (CC's
+        // running-session state is preserved).
+        assert_eq!(
+            post.pointer(&format!(
+                "/projects/{}/cc_session_state",
+                cwd_str.replace('/', "~1")
+            ))
+            .and_then(|v| v.as_str()),
+            Some("session-in-progress"),
+            "session-scoped project state must survive swap: {post}"
+        );
+
+        // Slot 2's unrelated-CWD project entry was stripped.
+        assert!(
+            post.pointer("/projects/~1some~1other~1dir").is_none(),
+            "foreign-CWD project from new slot must be stripped: {post}"
+        );
     }
 
     #[test]

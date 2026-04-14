@@ -312,6 +312,7 @@ pub const SHARED_ITEMS: &[&str] = &[
 
 - CC's OAuth flow (authorization code exchange, PKCE, scope list). See `src/services/oauth/client.ts` and `src/constants/oauth.ts` if needed.
 - CC's own token refresh timing and expiry check. csq keeps canonical tokens fresh ahead of expiry (2-hour window) to minimize cases where CC's refresh runs and rotates the refresh token without csq's knowledge. See spec 04 for the broker design.
+- **Anthropic's server-side contract for `/v1/oauth/token` (the token endpoint).** Authoritative documentation of the refresh request body shape, field requirements, and known server-side drift events lives in `.claude/skills/provider-integration/SKILL.md`. Two known drift events so far: journal 0034 (form-encoded → JSON-only) and journal 0052 (JSON body MUST NOT contain `scope` — Anthropic returns `400 invalid_scope` even when the value matches the original grant). Any change to csq's `build_refresh_body` or the broker classifier must re-verify against the skill's runbook.
 - The `CLAUDE_CODE_OAUTH_TOKEN` env var override (`auth.ts:1260`). This is an SDK path bypassing all file and keychain logic. csq does not use it — env var overrides cannot be changed in a running process.
 - Third-party provider credential handling. Those live in per-slot `settings.json` files, not `.credentials.json`. See spec 05.
 
@@ -331,3 +332,4 @@ Any of these changing invalidates this spec and requires both code and spec upda
 ## Revisions
 
 - 2026-04-12 — 1.0.0 — Initial draft from CC 2.1.104 source. Derived during the csq-v2 handle-dir redesign after journal 0029 Finding 4 was empirically disproved.
+- 2026-04-14 — 1.0.1 — Added §1.9 forward-pointer to `provider-integration` skill for Anthropic token-endpoint contract; linked journals 0034 (JSON-only migration) and 0052 (scope-field rejection) as the two drift events this spec intentionally does NOT track inline.

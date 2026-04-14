@@ -37,13 +37,81 @@ Anthropic no longer accepts `http://127.0.0.1:8420/oauth/callback` as a `redirec
 
 The `csq` bash wrapper shells out to `claude auth login` for this flow — it does not drive the OAuth handshake itself. csq-core's `oauth::start_login` + `oauth::exchange_code` reimplement the same flow for the desktop app and daemon HTTP API.
 
-### Required scopes
+### Required scopes (authorize only — NOT refresh)
 
 ```
 org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload
 ```
 
 `org:create_api_key` is **new** vs. v1.x csq — Claude Code added it. If you see "unauthorized" errors after a fresh login, check this scope first.
+
+### OAuth refresh body: `scope` field is FORBIDDEN (journal 0052)
+
+Per RFC 6749 §6, `scope` is OPTIONAL on refresh requests and the new access token retains the grant's original scopes when omitted. Anthropic enforces this harder than the spec requires: **if `scope` is present at all in the refresh body, `/v1/oauth/token` returns `400 invalid_scope` — even when the value exactly matches what was granted at authorize time.**
+
+```rust
+// DO — only four fields
+{
+  "grant_type": "refresh_token",
+  "refresh_token": "sk-ant-ort01-...",
+  "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+}
+
+// DO NOT — adding scope returns 400 invalid_scope
+{
+  "grant_type": "refresh_token",
+  "refresh_token": "sk-ant-ort01-...",
+  "client_id": "9d1c250a-...",
+  "scope": "org:create_api_key user:profile ..."
+}
+```
+
+**Why it hid for so long:** `is_rate_limited` in `broker/check.rs` substring-matches `"rate_limit"`, so `invalid_scope` fell through to recovery. Recovery also failed. 10-minute cooldown, retry on next tick, repeat. After hours of bad requests Cloudflare IP-throttled us for real, so the dashboard cache eventually showed `last_result: "rate_limited"` — the _consequence_ masking the _cause_. On top of that, `error::redact_tokens` ate the word `invalid_scope` from every log line as part of token-leak defense, so nothing in telemetry named the actual error.
+
+**Diagnostic pattern:** if the `/api/refresh-status` cache shows multiple accounts stuck at `rate_limited` for multiple ticks, or accounts keep disappearing from the cache (in cooldown), **do not trust the classification** — replay the refresh endpoint manually (see runbook below). This same shape will repeat the next time Anthropic tightens a field requirement.
+
+### Runbook: "dashboard says healthy but CC says /login"
+
+```bash
+# 1. Check the daemon is alive.
+csq doctor
+
+# 2. Inspect token expiries directly (bypasses daemon cache).
+for n in $(seq 1 10); do
+  f=~/.claude/accounts/credentials/$n.json
+  [ -f "$f" ] && python3 -c "
+import json, datetime, sys
+d = json.load(open('$f'))
+e = d['claudeAiOauth']['expiresAt']
+print('account $n:', datetime.datetime.fromtimestamp(e/1000))
+"
+done
+
+# 3. Query the refresher cache over the Unix socket.
+echo -e "GET /api/refresh-status HTTP/1.1\r\nHost: csq\r\nConnection: close\r\n\r\n" \
+  | nc -U ~/.claude/accounts/csq.sock
+
+# 4. If the cache shows rate_limited on multiple accounts, replay ONE refresh
+#    manually, toggling fields (omit scope first — it is the most common drift).
+python3 <<'PY'
+import json, urllib.request, os
+n = 1  # pick a healthy account
+rt = json.load(open(f"{os.environ['HOME']}/.claude/accounts/credentials/{n}.json"))['claudeAiOauth']['refreshToken']
+body = json.dumps({
+    'grant_type': 'refresh_token',
+    'refresh_token': rt,
+    'client_id': '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+    # NO scope field
+}).encode()
+req = urllib.request.Request(
+    'https://platform.claude.com/v1/oauth/token', data=body,
+    headers={'Content-Type':'application/json','User-Agent':'claude-cli/1.0.114 (external, cli)','Accept-Encoding':'identity'},
+)
+print(urllib.request.urlopen(req, timeout=20).read().decode()[:300])
+PY
+```
+
+**A successful refresh rotates the RT server-side.** If you run the manual replay above, you MUST atomically write the new tokens back into both `credentials/N.json` and `config-N/.credentials.json` immediately, or the old RT will show up dead on the next daemon tick.
 
 ### Token endpoint does NOT return subscription metadata
 

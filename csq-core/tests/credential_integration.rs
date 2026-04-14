@@ -355,12 +355,16 @@ fn save_canonical_succeeds_when_live_dir_unwritable() {
 #[test]
 fn refresh_token_passes_correct_url_and_body() {
     // Anthropic's token endpoint now rejects form-encoded bodies and
-    // requires JSON with client_id + scope (see journal 0034 and
-    // commit 8a9fdc9). This test locks in the exact JSON shape: a
-    // regression back to form-encoded fails fast at from_str, and
-    // a regression that drifts client_id/scope away from the
-    // authoritative constants fails at assert_eq.
-    use csq_core::oauth::constants::{OAUTH_CLIENT_ID, OAUTH_SCOPES};
+    // requires JSON with client_id (see journal 0034 and commit
+    // 8a9fdc9). It ALSO rejects `scope` in the refresh body with
+    // `400 invalid_scope` (journal 0052 / 2026-04-14) — per RFC 6749
+    // §6, scope is OPTIONAL on refresh and the new token retains the
+    // original grant scopes when omitted. This test locks in the
+    // exact JSON shape: a regression back to form-encoded fails fast
+    // at from_str, a regression that drifts client_id away from the
+    // authoritative constant fails at assert_eq, and a regression
+    // that re-adds the `scope` field fails at the obj.len() check.
+    use csq_core::oauth::constants::OAUTH_CLIENT_ID;
 
     let existing = sample_creds();
 
@@ -383,15 +387,18 @@ fn refresh_token_passes_correct_url_and_body() {
     assert_eq!(parsed["grant_type"], "refresh_token");
     assert_eq!(parsed["refresh_token"], "sk-ant-ort01-integration-test");
     assert_eq!(parsed["client_id"], OAUTH_CLIENT_ID);
-    let expected_scope = OAUTH_SCOPES.join(" ");
-    assert_eq!(parsed["scope"], expected_scope);
+    assert!(
+        parsed.get("scope").is_none(),
+        "refresh body must NOT contain `scope` — Anthropic returns invalid_scope (journal 0052)"
+    );
 
     // No extra fields — a future regression that adds e.g. client_secret
-    // should fail this check rather than silently change the payload.
+    // or re-adds scope should fail this check rather than silently
+    // change the payload.
     let obj = parsed
         .as_object()
         .expect("refresh body must be a JSON object");
-    let expected_keys = ["grant_type", "refresh_token", "client_id", "scope"];
+    let expected_keys = ["grant_type", "refresh_token", "client_id"];
     assert_eq!(
         obj.len(),
         expected_keys.len(),

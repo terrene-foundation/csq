@@ -42,6 +42,20 @@ warn!(error_kind = "refresh_failed", "token refresh failed");
 **Check**: `grep -rn 'format!.*{e}' csq-core/src/credentials/ csq-core/src/oauth/ csq-core/src/daemon/`
 **Check**: Verify all error paths pass through `error::redact_tokens()` before reaching logs
 
+#### Diagnostic Redaction vs. Defense Balance (journal 0052)
+
+`error::redact_tokens` currently strips ALL `sk-ant-*` substrings AND long hex runs. As of 2026-04, it also effectively strips OAuth `error` type strings from log lines — not by matching them, but because the word lives inside an `OAuthError::Exchange` wrapper that downstream code does not surface by name.
+
+**Real incident:** in the invalid_scope cascade (journal 0052), the word `invalid_scope` was erased from every log line. Operators had no diagnostic vocabulary and spent 8 hours debugging a problem that was visible in a single curl response body.
+
+**When reviewing redaction changes, weigh:**
+
+- **OAuth error type strings are NOT secrets.** They are a fixed RFC 6749 / OAuth 2.0 vocabulary: `invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `access_denied`, `server_error`, `temporarily_unavailable`. Letting these through the redactor is a defensible diagnostic improvement.
+- **But the surrounding `error_description` CAN contain echoed tokens.** Anthropic's `invalid_grant` response has been observed echoing a refresh-token prefix into the description (journals 0007, 0010). Any allowlist must let through the `error` field ONLY, not the whole error object.
+- **Don't widen the hex allowlist.** 32+ hex runs match raw 3P API keys.
+
+**Tightening proposal** (tracked, not yet shipped): add a small post-redaction pass that re-inserts OAuth error type strings into the redacted output when they are recognized in the original. Review for prompt-injection / log-forgery risk before shipping — if an attacker can get Anthropic to echo a crafted error type, they could smuggle content through the allowlist.
+
 ### 3. Input Validation — AccountNum (CRITICAL)
 
 All account values MUST use `AccountNum` newtype (validated 1..999). Raw `u16` must not reach filesystem paths or keychain operations without `AccountNum::try_from()`.

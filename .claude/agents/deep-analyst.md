@@ -165,6 +165,31 @@ async fn refresh_token_with_retry(token: &mut OAuthToken) -> Result<(), AppError
 | IPC Command  | Panics instead of Err  | Frontend 500   | Catch in command wrapper |
 ```
 
+### Cascade-Failure Pattern: Consequence Masks the Cause
+
+Some incidents present a symptom that is NOT the root cause but its downstream consequence. The failure mode looks like "X" in every dashboard and log, but the actual fault is elsewhere. Spotting this shape early saves hours.
+
+**Canonical example** — csq journal 0052, the invalid_scope incident:
+
+1. Anthropic tightened a contract: `/v1/oauth/token` now returns `400 invalid_scope` when the refresh body contains a `scope` field.
+2. csq's `is_rate_limited` substring-matches `"rate_limit"`. `invalid_scope` doesn't match → fall through to recovery.
+3. Recovery scans for sibling refresh tokens (none in the handle-dir model) → `RecoveryFailed`.
+4. 10-minute cooldown, retry on next tick, fail the same way.
+5. After hours of ~100 failed requests/hour, Cloudflare actually IP-throttles the daemon.
+6. The refresher cache now shows `last_result: "rate_limited"` for every account it manages to touch — because the LATE-stage consequence (Cloudflare 429) is what `is_rate_limited` matches, even though the EARLY-stage cause (`invalid_scope`) went through recovery.
+7. The `redact_tokens` log defense eats `invalid_scope` as part of token-leak hygiene. Telemetry contains no evidence of the actual error.
+
+**When debugging a cascade-failure shape, ask:**
+
+| Question                                                                 | What it tests                                                                                                                               |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| If the classifier were tightened, would the _same_ symptom still appear? | If yes, the symptom is from the classifier, not the cause.                                                                                  |
+| Did the symptom start suddenly across multiple accounts?                 | Single-account faults are usually local; multi-account synchronized faults almost always point upstream (contract drift, DNS, IP throttle). |
+| Is the log redactor erasing the diagnostic vocabulary?                   | `redact_tokens`, `error_kind_tag`, and similar layers trade debuggability for safety — a cascade can be invisible to the bucketed tag.      |
+| Does manual replay (bypassing the classifier) return the same error?     | If manual replay reveals a different error string than the classifier reports, the classifier is masking the cause.                         |
+
+**Rescue pattern:** when a suspected cascade is live, stop trusting the daemon's telemetry and replay one request end-to-end from the command line with maximum verbosity (unredacted, full headers, full body). The goal is to observe the _first_ server response, not the Nth after backoff has kicked in.
+
 ## MUST Rules
 
 1. **Every failure has a root cause** — do not stop at the symptom

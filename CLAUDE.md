@@ -58,6 +58,8 @@ src-tauri/                   — Rust backend
 | Svelte patterns       | `rules/svelte-patterns.md`             |
 | Tauri patterns        | `rules/tauri-patterns.md`              |
 | Tauri commands        | `rules/tauri-commands.md`              |
+| Rule authoring        | `rules/rule-authoring.md`              |
+| Specs authority       | `rules/specs-authority.md`             |
 
 ## Agents
 

@@ -84,15 +84,23 @@ Anthropic accounts (IDs 1-999) and 3P accounts (synthetic IDs 901, 902) use **se
 
 Every network-touching function takes an injectable closure for testability:
 
-| Function               | Closure type                                          | Production impl                |
-| ---------------------- | ----------------------------------------------------- | ------------------------------ |
-| `refresh_token`        | `HttpPostFn`                                          | `http::post_form`              |
-| `poll_anthropic_usage` | `HttpGetFn`                                           | `http::get_bearer`             |
-| `poll_3p_usage`        | `HttpPostProbeFn`                                     | `http::post_json_with_headers` |
-| `exchange_code`        | `FnOnce(url, body) -> Result<Vec<u8>>`                | `http::post_json`              |
-| `validate_key`         | `FnOnce(url, headers, body) -> Result<(u16, String)>` | `http::post_json_probe`        |
+| Function               | Closure type                                          | Production impl (Anthropic)    | Production impl (3P)           |
+| ---------------------- | ----------------------------------------------------- | ------------------------------ | ------------------------------ |
+| `refresh_token`        | `HttpPostFn`                                          | `http::post_json_node`         | n/a                            |
+| `poll_anthropic_usage` | `HttpGetFn`                                           | `http::get_bearer_node`        | n/a                            |
+| `poll_3p_usage`        | `HttpPostProbeFn`                                     | n/a                            | `http::post_json_with_headers` |
+| `exchange_code`        | `FnOnce(url, body) -> Result<Vec<u8>>`                | `http::post_json_node`         | n/a                            |
+| `validate_key`         | `FnOnce(url, headers, body) -> Result<(u16, String)>` | n/a                            | `http::post_json_probe`        |
 
-Tests inject mocks that return predetermined responses — no HTTP dependency in the test suite.
+**Anthropic endpoints use Node.js subprocess transport** (journal 0056). Cloudflare JA3/JA4 TLS fingerprinting blocks `reqwest`/`rustls`. The `_node` functions shell out to `node`, piping request bodies via stdin. 3P endpoints use `reqwest` — they don't have Cloudflare's fingerprinting.
+
+Tests inject mocks that return predetermined responses — no HTTP or subprocess dependency in the test suite.
+
+## Refresher Backoff (journal 0056)
+
+Rate-limited accounts use exponential backoff: `FAILURE_COOLDOWN` (10 min) × 2^n, capped at `MAX_BACKOFF` (8 → 80 min). Non-rate-limited failures use the base 10-minute cooldown without backoff escalation.
+
+**Stop-on-rate-limit:** When any account hits a rate limit within a tick, remaining accounts that need refresh (within the 2-hour window) are skipped for that tick. Valid tokens are still checked — they don't make HTTP requests, so skipping them would leave the cache empty. Skipped accounts get a `rate_limited` cache entry so the dashboard shows their state.
 
 ## Cache Invalidation
 

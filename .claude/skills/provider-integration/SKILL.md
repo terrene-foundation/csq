@@ -37,7 +37,7 @@ Anthropic no longer accepts `http://127.0.0.1:8420/oauth/callback` as a `redirec
 
 The `csq` bash wrapper shells out to `claude auth login` for this flow — it does not drive the OAuth handshake itself. csq-core's `oauth::start_login` + `oauth::exchange_code` reimplement the same flow for the desktop app and daemon HTTP API.
 
-### Required scopes (authorize only — NOT refresh)
+### Required scopes
 
 ```
 org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload
@@ -45,73 +45,71 @@ org:create_api_key user:profile user:inference user:sessions:claude_code user:mc
 
 `org:create_api_key` is **new** vs. v1.x csq — Claude Code added it. If you see "unauthorized" errors after a fresh login, check this scope first.
 
-### OAuth refresh body: `scope` field is FORBIDDEN (journal 0052)
+### OAuth refresh body shape
 
-Per RFC 6749 §6, `scope` is OPTIONAL on refresh requests and the new access token retains the grant's original scopes when omitted. Anthropic enforces this harder than the spec requires: **if `scope` is present at all in the refresh body, `/v1/oauth/token` returns `400 invalid_scope` — even when the value exactly matches what was granted at authorize time.**
+CC sends `scope` in the refresh body (`services/oauth/client.ts:159-162`). Our code currently omits it (safe per RFC 6749 §6 — omitted scope retains the original grant). Both work.
 
-```rust
-// DO — only four fields
+```json
 {
   "grant_type": "refresh_token",
   "refresh_token": "sk-ant-ort01-...",
   "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 }
-
-// DO NOT — adding scope returns 400 invalid_scope
-{
-  "grant_type": "refresh_token",
-  "refresh_token": "sk-ant-ort01-...",
-  "client_id": "9d1c250a-...",
-  "scope": "org:create_api_key user:profile ..."
-}
 ```
 
-**Why it hid for so long:** `is_rate_limited` in `broker/check.rs` substring-matches `"rate_limit"`, so `invalid_scope` fell through to recovery. Recovery also failed. 10-minute cooldown, retry on next tick, repeat. After hours of bad requests Cloudflare IP-throttled us for real, so the dashboard cache eventually showed `last_result: "rate_limited"` — the _consequence_ masking the _cause_. On top of that, `error::redact_tokens` ate the word `invalid_scope` from every log line as part of token-leak defense, so nothing in telemetry named the actual error.
+### Cloudflare TLS fingerprinting — Node.js transport required (journal 0056)
 
-**Diagnostic pattern:** if the `/api/refresh-status` cache shows multiple accounts stuck at `rate_limited` for multiple ticks, or accounts keep disappearing from the cache (in cooldown), **do not trust the classification** — replay the refresh endpoint manually (see runbook below). This same shape will repeat the next time Anthropic tightens a field requirement.
+Anthropic endpoints (`platform.claude.com`, `api.anthropic.com`) are behind Cloudflare which performs JA3/JA4 TLS fingerprinting. **reqwest with rustls is blocked** — every request returns `429 rate_limit_error` regardless of volume. `curl` is also blocked. Only Node.js's OpenSSL TLS stack produces an accepted fingerprint.
 
-### Runbook: "dashboard says healthy but CC says /login"
+```
+DO:  http::post_json_node(url, body)   — shells out to `node`, pipes body via stdin
+DO:  http::get_bearer_node(url, token) — shells out to `node`, pipes token via stdin
+DO NOT: http::post_json(url, body)     — reqwest/rustls, blocked by Cloudflare
+DO NOT: http::get_bearer(url, token)   — reqwest/rustls, blocked by Cloudflare
+```
+
+**Why:** Proven empirically: same endpoint, same body, same headers — `node` succeeds, `reqwest`/`curl` get 429. The TLS handshake fingerprint is the only difference. CC itself uses Bun (OpenSSL-based) for the same reason.
+
+**No fallback.** If `node`/`bun` is not found on PATH, `post_json_node` returns `Err` immediately. Falling back to reqwest would just hit the Cloudflare wall and trigger cooldowns.
+
+**Scope of the node transport:** Only Anthropic endpoints. 3P endpoints (MiniMax, Z.AI, GitHub Releases) use reqwest — they don't have Cloudflare's aggressive fingerprinting.
+
+**Journal 0052 correction:** Journal 0052 attributed mass refresh failure to the `scope` field in the refresh body. That was a misdiagnosis — the root cause was the TLS fingerprint. See journal 0056.
+
+### Runbook: "all accounts asking to re-auth"
 
 ```bash
 # 1. Check the daemon is alive.
-csq doctor
+curl --unix-socket ~/.claude/accounts/csq.sock http://localhost/api/health
 
 # 2. Inspect token expiries directly (bypasses daemon cache).
-for n in $(seq 1 10); do
+for n in $(seq 1 7); do
   f=~/.claude/accounts/credentials/$n.json
   [ -f "$f" ] && python3 -c "
-import json, datetime, sys
+import json, time
 d = json.load(open('$f'))
-e = d['claudeAiOauth']['expiresAt']
-print('account $n:', datetime.datetime.fromtimestamp(e/1000))
+e = d['claudeAiOauth']['expiresAt'] / 1000
+diff = e - time.time()
+status = f'{diff/3600:.1f}h left' if diff > 0 else f'EXPIRED {-diff/3600:.1f}h ago'
+print(f'account $n: {status}')
 "
 done
 
-# 3. Query the refresher cache over the Unix socket.
-echo -e "GET /api/refresh-status HTTP/1.1\r\nHost: csq\r\nConnection: close\r\n\r\n" \
-  | nc -U ~/.claude/accounts/csq.sock
+# 3. Query the refresher cache.
+curl --unix-socket ~/.claude/accounts/csq.sock http://localhost/api/refresh-status
 
-# 4. If the cache shows rate_limited on multiple accounts, replay ONE refresh
-#    manually, toggling fields (omit scope first — it is the most common drift).
-python3 <<'PY'
-import json, urllib.request, os
-n = 1  # pick a healthy account
-rt = json.load(open(f"{os.environ['HOME']}/.claude/accounts/credentials/{n}.json"))['claudeAiOauth']['refreshToken']
-body = json.dumps({
-    'grant_type': 'refresh_token',
-    'refresh_token': rt,
-    'client_id': '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
-    # NO scope field
-}).encode()
-req = urllib.request.Request(
-    'https://platform.claude.com/v1/oauth/token', data=body,
-    headers={'Content-Type':'application/json','User-Agent':'claude-cli/1.0.114 (external, cli)','Accept-Encoding':'identity'},
-)
-print(urllib.request.urlopen(req, timeout=20).read().decode()[:300])
-PY
+# 4. If rate_limited on multiple accounts, test via node (NOT curl/reqwest):
+RT=$(python3 -c "import json; print(json.load(open('$HOME/.claude/accounts/credentials/1.json'))['claudeAiOauth']['refreshToken'])")
+node -e "
+const https = require('https');
+const body = JSON.stringify({grant_type:'refresh_token',refresh_token:'$RT',client_id:'9d1c250a-e61b-44d9-88ed-5944d1962f5e'});
+const req = https.request('https://platform.claude.com/v1/oauth/token',{method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)},timeout:15000},res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>console.log(d));});
+req.write(body);req.end();
+"
+# If node succeeds but daemon fails → check that post_json_node is wired (not post_json)
 ```
 
-**A successful refresh rotates the RT server-side.** If you run the manual replay above, you MUST atomically write the new tokens back into both `credentials/N.json` and `config-N/.credentials.json` immediately, or the old RT will show up dead on the next daemon tick.
+**A successful refresh rotates the RT server-side.** If you run the manual replay above, you MUST write the new tokens back into both `credentials/N.json` and `config-N/.credentials.json` immediately, or the old RT will show up dead on the next daemon tick.
 
 ### Token endpoint does NOT return subscription metadata
 

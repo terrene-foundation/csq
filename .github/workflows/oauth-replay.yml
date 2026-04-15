@@ -131,13 +131,17 @@ jobs:
           echo "New refresh token extracted for rotation."
 
       - name: Rotate OAUTH_REPLAY_REFRESH_TOKEN secret
-        if: >
-          steps.extract-new-rt.outputs.new_token_available == 'true' &&
-          secrets.FOUNDATION_PAT != ''
+        if: steps.extract-new-rt.outputs.new_token_available == 'true'
         env:
           GH_TOKEN: ${{ secrets.FOUNDATION_PAT }}
           NEW_REFRESH_TOKEN: ${{ steps.extract-new-rt.outputs.new_refresh_token }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::FOUNDATION_PAT not set — skipping secret rotation."
+            echo "The test passed but the refresh token was not rotated."
+            echo "Next scheduled run will fail with invalid_grant."
+            exit 0
+          fi
           if [ -z "$NEW_REFRESH_TOKEN" ]; then
             echo "::warning::New refresh token output is empty — skipping secret rotation."
             exit 0

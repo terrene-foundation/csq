@@ -288,13 +288,13 @@ async fn run_daemon(
         Arc::new(TtlCache::new(daemon_server::DISCOVERY_CACHE_MAX_AGE));
     let oauth_store: Arc<OAuthStateStore> = Arc::new(OAuthStateStore::new());
 
-    // The refresh endpoint requires JSON body (Anthropic switched to
-    // JSON-only — see journal 0034). post_json sets Content-Type:
-    // application/json; refresh::build_refresh_body produces the full
-    // JSON payload with client_id and scope.
-    let http_post: HttpPostFn = Arc::new(|url: &str, body: &str| http::post_json(url, body));
+    // Anthropic endpoints are behind Cloudflare which blocks
+    // reqwest's rustls TLS fingerprint (JA3/JA4). Use Node.js
+    // subprocess transport — its OpenSSL fingerprint passes
+    // Cloudflare. Falls back to reqwest if no JS runtime found.
+    let http_post: HttpPostFn = Arc::new(|url: &str, body: &str| http::post_json_node(url, body));
     let http_get: HttpGetFn = Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
-        http::get_bearer(url, token, headers)
+        http::get_bearer_node(url, token, headers)
     });
     let http_post_probe: HttpPostProbeFn =
         Arc::new(|url: &str, headers: &[(String, String)], body: &str| {

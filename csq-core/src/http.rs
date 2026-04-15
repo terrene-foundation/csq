@@ -1,31 +1,25 @@
-//! Blocking HTTP client for CLI-path operations (token refresh, key validation).
+//! HTTP transports for csq.
 //!
-//! Uses `reqwest::blocking` with `rustls-tls-webpki-roots` so we avoid
-//! native OpenSSL linkage and system cert-store dependencies. The daemon
-//! (M8.2+) will use the async `reqwest::Client` through the same transport
-//! contracts.
+//! Two transport layers:
 //!
-//! # Transport contracts
+//! 1. **reqwest** (`rustls-tls-webpki-roots`) — used for 3P provider
+//!    endpoints (MiniMax, Z.AI, GitHub Releases) that don't fingerprint
+//!    TLS connections.
 //!
-//! Two closure signatures are exposed:
-//!
-//! - [`post_form`] — `(url, body) -> Result<Vec<u8>, String>` matches
-//!   `credentials::refresh::refresh_token`'s `http_post` parameter. Used
-//!   for `grant_type=refresh_token` form posts to the Anthropic OAuth
-//!   endpoint.
-//! - [`post_json_probe`] — `(url, headers, body) -> Result<(u16, String),
-//!   String>` matches `providers::validate::validate_key`'s `http_post`
-//!   parameter. Used for `max_tokens=1` validation probes against
-//!   provider endpoints.
+//! 2. **Node.js subprocess** — used for Anthropic endpoints
+//!    (`platform.claude.com`, `api.anthropic.com`). Cloudflare's
+//!    JA3/JA4 TLS fingerprinting blocks reqwest/rustls connections to
+//!    these hosts, returning `429 rate_limit_error` regardless of actual
+//!    request volume. Node.js's OpenSSL-based TLS stack produces a
+//!    fingerprint Cloudflare accepts. CC itself uses Bun (OpenSSL)
+//!    for the same reason.
 //!
 //! # Security
 //!
-//! - HTTPS only (`https_only(true)`). A `http://` URL will be rejected
-//!   by reqwest at request time.
-//! - 10-second default timeout. OAuth token exchange is well under 1s
-//!   in practice; 10s covers slow CI and retries.
-//! - Max 2 redirects. Anthropic/3P APIs never redirect; 2 is generous.
-//! - `User-Agent: csq/{version}` so requests are attributable.
+//! - HTTPS only — the Node.js transport rejects non-`https://` URLs
+//!   at the Rust call site before spawning any subprocess.
+//! - Request bodies are piped via stdin, never via argv, so refresh
+//!   tokens don't appear in `ps` output.
 //! - Errors are stringified and returned as `Err(String)` — we never
 //!   leak the request body (which contains the refresh token) into
 //!   error messages. The caller sees only a sanitized reason.
@@ -349,6 +343,205 @@ pub fn get_with_headers(url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, 
     let response = req.send().map_err(sanitize_err)?;
     let bytes = response.bytes().map_err(sanitize_err)?;
     Ok(bytes.to_vec())
+}
+
+// ─── Node.js subprocess transport (Anthropic endpoints) ──────
+
+/// Timeout for Node.js subprocess HTTP requests (milliseconds).
+const NODE_TIMEOUT_MS: u64 = 15_000;
+
+/// Finds the first available JS runtime (`node` or `bun`).
+fn find_js_runtime() -> Result<&'static str, String> {
+    static RUNTIME: OnceLock<Result<&'static str, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            for cmd in ["node", "bun"] {
+                if std::process::Command::new(cmd)
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok()
+                {
+                    return Ok(cmd);
+                }
+            }
+            Err("neither node nor bun found on PATH".into())
+        })
+        .clone()
+}
+
+/// POSTs a JSON body to `url` using a Node.js subprocess.
+///
+/// The body is piped via stdin (not argv) so tokens don't appear
+/// in `ps` output. Returns the response body bytes on any HTTP
+/// status — the caller classifies the response.
+///
+/// Returns `Err` if no JS runtime (`node` or `bun`) is found.
+pub fn post_json_node(url: &str, body: &str) -> Result<Vec<u8>, String> {
+    if !url.starts_with("https://") {
+        return Err("https required".into());
+    }
+
+    let runtime = find_js_runtime()?;
+
+    // Inline JS: reads JSON body from stdin, POSTs to url, writes
+    // response body to stdout. Exits 0 on any HTTP response, 1 on
+    // transport error.
+    let script = format!(
+        r#"
+const https = require('https');
+const url = new URL('{url}');
+let body = '';
+process.stdin.on('data', c => body += c);
+process.stdin.on('end', () => {{
+  const req = https.request(url, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)}},
+    timeout: {NODE_TIMEOUT_MS}
+  }}, res => {{
+    let data = [];
+    res.on('data', c => data.push(c));
+    res.on('end', () => process.stdout.write(Buffer.concat(data)));
+  }});
+  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
+  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+  req.write(body);
+  req.end();
+}});
+"#
+    );
+
+    let mut child = std::process::Command::new(runtime)
+        .arg("-e")
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
+
+    // Write body to stdin, then close it.
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().ok_or("failed to open stdin")?;
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("stdin write failed: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("node http failed: {stderr}"));
+    }
+
+    Ok(output.stdout)
+}
+
+/// GETs a URL with a Bearer token using a Node.js subprocess.
+///
+/// Returns `(status_code, body_bytes)`. The bearer token is passed
+/// via stdin (one line: `token\nextra_header_json`), not argv.
+pub fn get_bearer_node(
+    url: &str,
+    token: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, Vec<u8>), String> {
+    if !url.starts_with("https://") {
+        return Err("https required".into());
+    }
+
+    let runtime = find_js_runtime()?;
+
+    // Build extra headers JSON for the script.
+    let headers_json: String = {
+        let pairs: Vec<String> = extra_headers
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}:{}",
+                    serde_json::to_string(k).unwrap_or_default(),
+                    serde_json::to_string(v).unwrap_or_default()
+                )
+            })
+            .collect();
+        format!("{{{}}}", pairs.join(","))
+    };
+
+    let script = format!(
+        r#"
+const https = require('https');
+const url = new URL('{url}');
+let input = '';
+process.stdin.on('data', c => input += c);
+process.stdin.on('end', () => {{
+  const lines = input.split('\n');
+  const token = lines[0];
+  const extra = JSON.parse(lines[1] || '{{}}');
+  const headers = {{'Authorization': 'Bearer ' + token, 'Accept': 'application/json', ...extra}};
+  const req = https.request(url, {{
+    method: 'GET',
+    headers,
+    timeout: {NODE_TIMEOUT_MS}
+  }}, res => {{
+    let data = [];
+    res.on('data', c => data.push(c));
+    res.on('end', () => {{
+      const body = Buffer.concat(data);
+      // First line of stdout: status code. Rest: body.
+      process.stdout.write(res.statusCode + '\n');
+      process.stdout.write(body);
+    }});
+  }});
+  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
+  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+  req.end();
+}});
+"#
+    );
+
+    let mut child = std::process::Command::new(runtime)
+        .arg("-e")
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
+
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().ok_or("failed to open stdin")?;
+        writeln!(stdin, "{token}").map_err(|e| format!("stdin write failed: {e}"))?;
+        write!(stdin, "{headers_json}").map_err(|e| format!("stdin write failed: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("node http failed: {stderr}"));
+    }
+
+    let stdout = output.stdout;
+    let newline_pos = stdout
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or("missing status line in node output")?;
+    let status_str =
+        std::str::from_utf8(&stdout[..newline_pos]).map_err(|_| "invalid status line")?;
+    let status: u16 = status_str
+        .parse()
+        .map_err(|_| format!("invalid status code: {status_str}"))?;
+    let body = stdout[newline_pos + 1..].to_vec();
+
+    Ok((status, body))
 }
 
 #[cfg(test)]

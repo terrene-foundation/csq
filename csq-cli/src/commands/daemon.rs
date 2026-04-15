@@ -95,12 +95,13 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
             // same signal.
             let shutdown = tokio_util::sync::CancellationToken::new();
 
-            // The refresh endpoint now requires JSON body (Anthropic
-            // switched to JSON-only — see journal 0034). post_json sets
-            // Content-Type: application/json; refresh::build_refresh_body
-            // produces the full JSON payload with client_id and scope.
+            // Anthropic endpoints are behind Cloudflare which blocks
+            // reqwest's rustls TLS fingerprint (JA3/JA4). Use Node.js
+            // subprocess transport for token refresh — its OpenSSL
+            // fingerprint passes Cloudflare. Falls back to reqwest if
+            // no JS runtime is available.
             let http_post: daemon::HttpPostFn =
-                Arc::new(|url: &str, body: &str| http::post_json(url, body));
+                Arc::new(|url: &str, body: &str| http::post_json_node(url, body));
 
             // Router state: refresh cache + discovery cache +
             // base_dir + OAuth store. Arc'd so per-request
@@ -135,9 +136,11 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     // for each Anthropic account every 5 min and writes
                     // quota data to the local quota.json file so
                     // `csq status` shows real percentages.
+                    // Usage poller also hits Anthropic (api.anthropic.com)
+                    // — same Cloudflare fingerprint issue.
                     let http_get: daemon::HttpGetFn =
                         Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
-                            http::get_bearer(url, token, headers)
+                            http::get_bearer_node(url, token, headers)
                         });
                     let http_post_probe: daemon::HttpPostProbeFn =
                         Arc::new(|url: &str, headers: &[(String, String)], body: &str| {

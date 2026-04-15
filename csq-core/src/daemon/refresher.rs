@@ -23,9 +23,19 @@
 //! 3. The 5-minute interval provides more than enough headroom to
 //!    refresh 10+ accounts sequentially even on slow networks.
 //!
-//! # Cooldown
+//! # Cooldown & backoff
 //!
 //! Any account that fails a refresh enters a 10-minute cooldown.
+//! Rate-limited accounts (429 / `rate_limit_error`) use
+//! exponential backoff: 10min × 2^n, capped at 80min. This
+//! prevents the self-reinforcing cycle where N expired accounts
+//! all retry simultaneously after a fixed cooldown, re-trigger
+//! the rate limit, and repeat forever.
+//!
+//! Additionally, when any account hits a rate limit within a tick,
+//! the remaining accounts are skipped to avoid amplifying the
+//! throttled condition.
+//!
 //! Subsequent ticks skip cooldown accounts to avoid hammering
 //! Anthropic when an account is in a bad state (invalid RT, 500
 //! loop, etc.). The cooldown is wall-clock-based and stored **in
@@ -69,8 +79,13 @@ use tracing::{debug, info, warn};
 /// Default interval between refresher ticks: 5 minutes.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Cooldown after a failed refresh: 10 minutes.
+/// Base cooldown after a failed refresh: 10 minutes.
 pub const FAILURE_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Maximum backoff multiplier for rate-limited accounts.
+/// 8 × 10min = 80min — long enough to let Anthropic's IP-level
+/// rate limit clear without the daemon re-triggering it.
+const MAX_BACKOFF: u32 = 8;
 
 /// Short initial delay before the first tick so the daemon has
 /// time to finish starting up (bind sockets, initialize subsystems)
@@ -191,6 +206,7 @@ pub fn spawn_with_config(
 ) -> RefresherHandle {
     let cache_for_task = Arc::clone(&cache);
     let cooldowns: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    let backoffs: Arc<Mutex<HashMap<u16, u32>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let join = tokio::spawn(async move {
         run_loop(
@@ -198,6 +214,7 @@ pub fn spawn_with_config(
             http_post,
             cache_for_task,
             cooldowns,
+            backoffs,
             shutdown,
             interval,
             startup_delay,
@@ -208,11 +225,13 @@ pub fn spawn_with_config(
     RefresherHandle { join, cache }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     base_dir: PathBuf,
     http_post: HttpPostFn,
     cache: Arc<TtlCache<u16, RefreshStatus>>,
     cooldowns: Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: Arc<Mutex<HashMap<u16, u32>>>,
     shutdown: CancellationToken,
     interval: Duration,
     startup_delay: Duration,
@@ -232,7 +251,7 @@ async fn run_loop(
 
     loop {
         // Run one tick.
-        tick(&base_dir, &http_post, &cache, &cooldowns).await;
+        tick(&base_dir, &http_post, &cache, &cooldowns, &backoffs).await;
 
         // Wait for the next interval or cancellation.
         tokio::select! {
@@ -255,6 +274,7 @@ pub(crate) async fn tick(
     http_post: &HttpPostFn,
     cache: &Arc<TtlCache<u16, RefreshStatus>>,
     cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
 ) {
     info!("refresher tick starting");
 
@@ -275,6 +295,11 @@ pub(crate) async fn tick(
 
     let mut processed = 0usize;
     let mut skipped_cooldown = 0usize;
+    // Stop processing remaining accounts after any rate limit.
+    // Anthropic rate-limits per IP, so if one request is throttled
+    // the rest will be too — sending them just amplifies the
+    // condition and extends the rate-limit window.
+    let mut rate_limited_this_tick = false;
 
     for info in accounts {
         if info.source != AccountSource::Anthropic || !info.has_credentials {
@@ -287,7 +312,7 @@ pub(crate) async fn tick(
         };
 
         // Cooldown check: skip accounts that recently failed.
-        if in_cooldown(cooldowns, info.id) {
+        if in_cooldown(cooldowns, backoffs, info.id) {
             skipped_cooldown += 1;
             debug!(account = info.id, "in cooldown, skipping");
             continue;
@@ -353,6 +378,35 @@ pub(crate) async fn tick(
             }
         };
 
+        // Check if this account needs a refresh (within the 2-hour
+        // window). If so and we already hit a rate limit this tick,
+        // skip the HTTP call but still record the status so the
+        // dashboard shows something. Valid tokens are always processed
+        // because they don't make HTTP requests.
+        let needs_refresh = {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            expires_at_ms < now_ms + (crate::broker::check::REFRESH_WINDOW_SECS * 1000)
+        };
+
+        if rate_limited_this_tick && needs_refresh {
+            debug!(
+                account = info.id,
+                "rate-limited earlier this tick, skipping refresh"
+            );
+            let status = RefreshStatus {
+                account: info.id,
+                last_result: "rate_limited".to_string(),
+                expires_at_ms,
+                checked_at_secs: now_secs(),
+            };
+            cache.set(info.id, status);
+            processed += 1;
+            continue;
+        }
+
         // Run broker_check inside spawn_blocking because it does
         // blocking file IO and may invoke the synchronous HTTP
         // transport.
@@ -371,18 +425,25 @@ pub(crate) async fn tick(
                     BrokerResult::Failed(_) => {
                         warn!(account = info.id, "refresh failed, entering cooldown");
                         set_cooldown(cooldowns, info.id);
+                        // Don't increase backoff for generic failures —
+                        // the account might need re-auth, and aggressive
+                        // backoff would delay recovery after re-login.
                     }
                     BrokerResult::RateLimited => {
                         // Rate-limited by Anthropic. Set a cooldown
-                        // so the next tick does not hit the endpoint
-                        // again immediately. Do NOT clear any
-                        // existing cooldown. This is the whole
-                        // point of distinguishing RateLimited from
-                        // Skipped — a plain `Skipped` (lock held
-                        // by another process) is safe to clear on,
-                        // a `RateLimited` is not.
-                        warn!(account = info.id, "refresh rate limited, entering cooldown");
+                        // with exponential backoff and stop processing
+                        // remaining accounts this tick.
+                        let factor = get_backoff(backoffs, info.id);
+                        let effective = FAILURE_COOLDOWN * factor;
+                        warn!(
+                            account = info.id,
+                            backoff_factor = factor,
+                            cooldown_secs = effective.as_secs(),
+                            "refresh rate limited, entering backoff cooldown"
+                        );
+                        increase_backoff(backoffs, info.id);
                         set_cooldown(cooldowns, info.id);
+                        rate_limited_this_tick = true;
                     }
                     BrokerResult::Skipped => {
                         // Another process holds the refresh lock.
@@ -393,6 +454,7 @@ pub(crate) async fn tick(
                     }
                     BrokerResult::Valid | BrokerResult::Refreshed | BrokerResult::Recovered => {
                         clear_cooldown(cooldowns, info.id);
+                        clear_backoff(backoffs, info.id);
                     }
                 }
                 cache.set(info.id, status);
@@ -502,12 +564,35 @@ fn append_resurrection_breadcrumb(
     let _ = crate::platform::fs::secure_file(&path);
 }
 
-fn in_cooldown(cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>, account: u16) -> bool {
+fn in_cooldown(
+    cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
+    account: u16,
+) -> bool {
     let guard = cooldowns.lock().unwrap_or_else(|p| p.into_inner());
     match guard.get(&account) {
-        Some(t) => t.elapsed() < FAILURE_COOLDOWN,
+        Some(t) => {
+            let factor = get_backoff(backoffs, account);
+            t.elapsed() < FAILURE_COOLDOWN * factor
+        }
         None => false,
     }
+}
+
+fn get_backoff(backoffs: &Arc<Mutex<HashMap<u16, u32>>>, account: u16) -> u32 {
+    let guard = backoffs.lock().unwrap_or_else(|p| p.into_inner());
+    *guard.get(&account).unwrap_or(&1)
+}
+
+fn increase_backoff(backoffs: &Arc<Mutex<HashMap<u16, u32>>>, account: u16) {
+    let mut guard = backoffs.lock().unwrap_or_else(|p| p.into_inner());
+    let current = guard.get(&account).copied().unwrap_or(1);
+    guard.insert(account, (current * 2).min(MAX_BACKOFF));
+}
+
+fn clear_backoff(backoffs: &Arc<Mutex<HashMap<u16, u32>>>, account: u16) {
+    let mut guard = backoffs.lock().unwrap_or_else(|p| p.into_inner());
+    guard.remove(&account);
 }
 
 fn set_cooldown(cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>, account: u16) {
@@ -588,8 +673,9 @@ mod tests {
         let http = counting_success(Arc::clone(&counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns).await;
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert!(cache.is_empty());
@@ -609,8 +695,9 @@ mod tests {
         let http = counting_success(Arc::clone(&counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns).await;
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
 
         // Canonical file must now exist — the resurrection write path
         // ran before broker_check.
@@ -656,8 +743,9 @@ mod tests {
         let http = counting_success(Arc::clone(&counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns).await;
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -679,8 +767,9 @@ mod tests {
         let http = counting_success(Arc::clone(&counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns).await;
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 0, "no HTTP for valid token");
         let status = cache.get(&1).unwrap();
@@ -696,8 +785,9 @@ mod tests {
         let http = counting_failure(Arc::clone(&counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns).await;
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
         let first_calls = counter.load(Ordering::SeqCst);
         // broker_check tries refresh once, then recovery once — so 2 http calls.
         assert!(
@@ -705,14 +795,14 @@ mod tests {
             "expected at least 1 HTTP call, got {first_calls}"
         );
         assert!(
-            in_cooldown(&cooldowns, 1),
+            in_cooldown(&cooldowns, &backoffs, 1),
             "failed account must be in cooldown"
         );
         let status = cache.get(&1).unwrap();
         assert_eq!(status.last_result, "failed");
 
         // Second tick immediately: cooldown should prevent any new HTTP.
-        tick(dir.path(), &http, &cache, &cooldowns).await;
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
         let second_calls = counter.load(Ordering::SeqCst);
         assert_eq!(
             second_calls, first_calls,
@@ -729,6 +819,7 @@ mod tests {
         let http = counting_success(Arc::clone(&counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
         // Prime a cooldown that has already elapsed (simulate past failure).
         // On fresh CI runners Instant::now() may be less than FAILURE_COOLDOWN
@@ -749,11 +840,11 @@ mod tests {
         };
         cooldowns.lock().unwrap().insert(1, past);
 
-        tick(dir.path(), &http, &cache, &cooldowns).await;
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(
-            !in_cooldown(&cooldowns, 1),
+            !in_cooldown(&cooldowns, &backoffs, 1),
             "expired cooldown should not block"
         );
     }
@@ -828,5 +919,94 @@ mod tests {
         );
         // Verify the cache was populated.
         assert!(handle.cache.get(&1).is_some());
+    }
+
+    /// Mock HTTP closure that returns a rate-limit error.
+    fn counting_rate_limit(counter: Arc<AtomicU32>) -> HttpPostFn {
+        Arc::new(move |_url: &str, _body: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(br#"{"error":{"type":"rate_limit_error","message":"Rate limited"}}"#.to_vec())
+        })
+    }
+
+    #[tokio::test]
+    async fn tick_rate_limit_stops_remaining_accounts() {
+        let dir = TempDir::new().unwrap();
+        // Two expired accounts.
+        install_account(dir.path(), 1, 0);
+        install_account(dir.path(), 2, 0);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_rate_limit(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+
+        // Only ONE account should have attempted refresh — the second
+        // should be skipped because the first hit a rate limit.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "rate-limited tick must stop after first 429, not attempt remaining accounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_rate_limit_increases_backoff() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_rate_limit(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        // First tick: hits rate limit, backoff goes 1 → 2.
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        assert_eq!(get_backoff(&backoffs, 1), 2);
+        assert!(in_cooldown(&cooldowns, &backoffs, 1));
+
+        // Simulate time passing: clear the cooldown timestamp but
+        // keep the backoff — this is what happens when the base
+        // cooldown (10min) elapses but the backoff-scaled cooldown
+        // (20min) has not.
+        let just_past_base = Instant::now()
+            .checked_sub(FAILURE_COOLDOWN + Duration::from_secs(1))
+            .expect("clock should be far enough from boot");
+        cooldowns.lock().unwrap().insert(1, just_past_base);
+
+        // With backoff=2, the effective cooldown is 20min. 10min+1s
+        // has elapsed, so 20min hasn't — should still be in cooldown.
+        assert!(
+            in_cooldown(&cooldowns, &backoffs, 1),
+            "backoff×2 cooldown should still be active after base cooldown elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_success_clears_backoff() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        // Prime a backoff from a prior rate limit.
+        backoffs.lock().unwrap().insert(1, 4);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+
+        assert_eq!(
+            get_backoff(&backoffs, 1),
+            1,
+            "successful refresh must clear backoff"
+        );
     }
 }

@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 /// Refresh window: refresh if token expires within this many seconds.
 /// 2 hours = 7200 seconds, per ADR-006.
-const REFRESH_WINDOW_SECS: u64 = 7200;
+pub const REFRESH_WINDOW_SECS: u64 = 7200;
 
 /// Result of a broker check.
 #[derive(Debug)]

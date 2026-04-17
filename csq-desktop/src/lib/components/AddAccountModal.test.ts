@@ -38,7 +38,7 @@ const ANTHROPIC_PROVIDER = {
   name: "Anthropic",
   auth_type: "oauth" as const,
   default_base_url: null,
-  default_model: "claude-opus-4-6",
+  default_model: "claude-opus-4-7",
 };
 
 const MINIMAX_PROVIDER = {
@@ -49,14 +49,23 @@ const MINIMAX_PROVIDER = {
   default_model: "MiniMax-M1",
 };
 
+const OLLAMA_PROVIDER = {
+  id: "ollama",
+  name: "Ollama",
+  auth_type: "none" as const,
+  default_base_url: "http://localhost:11434",
+  default_model: "llama3.3",
+};
+
 let mockResponses: Record<string, unknown> = {};
 
 function setupMocks(overrides: Record<string, unknown> = {}) {
   mockResponses = {
-    list_providers: [ANTHROPIC_PROVIDER, MINIMAX_PROVIDER],
+    list_providers: [ANTHROPIC_PROVIDER, MINIMAX_PROVIDER, OLLAMA_PROVIDER],
     get_accounts: [],
     start_claude_login: 1,
     set_provider_key: "abc…xyz",
+    bind_keyless_provider: null,
     ...overrides,
   };
   mockInvoke.mockImplementation((cmd: string) => {
@@ -122,9 +131,10 @@ describe("AddAccountModal", () => {
     await tick();
     await tick();
     const cards = container.querySelectorAll(".provider-card");
-    expect(cards.length).toBe(2);
+    expect(cards.length).toBe(3);
     expect(cards[0].textContent).toContain("Anthropic");
     expect(cards[1].textContent).toContain("MiniMax");
+    expect(cards[2].textContent).toContain("Ollama");
   });
 
   it("shows default model on provider cards", async () => {
@@ -132,8 +142,18 @@ describe("AddAccountModal", () => {
     await tick();
     await tick();
     await tick();
-    expect(container.textContent).toContain("claude-opus-4-6");
+    expect(container.textContent).toContain("claude-opus-4-7");
     expect(container.textContent).toContain("MiniMax-M1");
+    expect(container.textContent).toContain("llama3.3");
+  });
+
+  it("labels the Ollama card as keyless", async () => {
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+    const cards = container.querySelectorAll(".provider-card");
+    expect(cards[2].textContent).toContain("no key");
   });
 
   // ── Slot picker ─────────────────────────────────────────────
@@ -194,6 +214,84 @@ describe("AddAccountModal", () => {
       'input[type="password"]',
     ) as HTMLInputElement;
     expect(keyInput).not.toBeNull();
+  });
+
+  // ── Keyless flow ───────────────────────────────────────────
+
+  it("navigates to keyless confirm when Ollama is picked", async () => {
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const cards = container.querySelectorAll(".provider-card");
+    await fireEvent.click(cards[2]);
+    await tick();
+    await tick();
+
+    expect(container.textContent).toContain("Bind");
+    expect(container.textContent).toContain("Ollama");
+    expect(container.textContent).toContain("http://localhost:11434");
+    // Keyless flow must never prompt for a key.
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+  });
+
+  it("calls bind_keyless_provider with slot on Confirm and reports success", async () => {
+    const onAccountAdded = vi.fn();
+    const { container } = renderModal({ nextAccountId: 7, onAccountAdded });
+    await tick();
+    await tick();
+    await tick();
+
+    const cards = container.querySelectorAll(".provider-card");
+    await fireEvent.click(cards[2]);
+    await tick();
+    await tick();
+
+    const confirmBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Bind to slot"),
+    ) as HTMLButtonElement;
+    expect(confirmBtn).not.toBeUndefined();
+    await fireEvent.click(confirmBtn);
+    await tick();
+    await tick();
+
+    const call = mockInvoke.mock.calls.find(
+      (args) => args[0] === "bind_keyless_provider",
+    );
+    expect(call).toBeTruthy();
+    expect(call?.[1]).toMatchObject({
+      providerId: "ollama",
+      slot: 7,
+    });
+    expect(onAccountAdded).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Ollama bound to slot #7");
+  });
+
+  it("surfaces backend error on keyless bind failure", async () => {
+    setupMocks();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "bind_keyless_provider")
+        return Promise.reject(new Error("ollama unreachable"));
+      return Promise.resolve(mockResponses[cmd]);
+    });
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const cards = container.querySelectorAll(".provider-card");
+    await fireEvent.click(cards[2]);
+    await tick();
+
+    const confirmBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Bind to slot"),
+    ) as HTMLButtonElement;
+    await fireEvent.click(confirmBtn);
+    await tick();
+    await tick();
+
+    expect(container.textContent).toContain("ollama unreachable");
   });
 
   // ── Error display ───────────────────────────────────────────

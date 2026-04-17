@@ -27,6 +27,14 @@ pub struct Provider {
     pub system_primer: Option<&'static str>,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
+    /// Dummy `ANTHROPIC_AUTH_TOKEN` for keyless providers.
+    ///
+    /// CC's HTTP client requires an auth token header to be present on
+    /// outgoing requests. Keyless providers (currently Ollama) accept
+    /// any literal — we store a fixed placeholder so `csq setkey
+    /// <keyless>` produces a settings file CC can use without error.
+    /// `None` for providers that use a real API key.
+    pub default_auth_token: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,11 +53,12 @@ pub const PROVIDERS: &[Provider] = &[
         key_env_var: Some("ANTHROPIC_API_KEY"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
         default_base_url: Some("https://api.anthropic.com"),
-        default_model: "claude-opus-4-6",
+        default_model: "claude-opus-4-7",
         validation_endpoint: Some("https://api.anthropic.com/v1/messages"),
         settings_filename: "settings.json",
         system_primer: None,
         timeout_secs: 30,
+        default_auth_token: None,
     },
     Provider {
         id: "mm",
@@ -65,6 +74,7 @@ pub const PROVIDERS: &[Provider] = &[
             "You are a helpful coding assistant with access to tools for editing files and running commands.",
         ),
         timeout_secs: 60,
+        default_auth_token: None,
     },
     Provider {
         id: "zai",
@@ -80,6 +90,7 @@ pub const PROVIDERS: &[Provider] = &[
             "You are a helpful coding assistant with access to tools for editing files and running commands.",
         ),
         timeout_secs: 60,
+        default_auth_token: None,
     },
     Provider {
         id: "ollama",
@@ -95,6 +106,7 @@ pub const PROVIDERS: &[Provider] = &[
             "You are a helpful coding assistant. Use tools when they would help answer the user.",
         ),
         timeout_secs: 120,
+        default_auth_token: Some("ollama"),
     },
 ];
 

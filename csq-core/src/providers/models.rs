@@ -25,12 +25,12 @@ impl ModelCatalog {
             models: vec![
                 // Claude
                 ModelInfo {
-                    id: "claude-opus-4-6".into(),
-                    name: "Claude Opus 4.6".into(),
+                    id: "claude-opus-4-7".into(),
+                    name: "Claude Opus 4.7".into(),
                     provider: "claude".into(),
                     context_window: Some(200_000),
                     output_limit: Some(8_192),
-                    aliases: vec!["opus".into(), "opus-4-6".into()],
+                    aliases: vec!["opus".into(), "opus-4-7".into(), "opus-4-6".into()],
                 },
                 ModelInfo {
                     id: "claude-sonnet-4-6".into(),
@@ -123,13 +123,13 @@ mod tests {
     fn default_catalog_has_models() {
         let cat = ModelCatalog::default_catalog();
         assert!(!cat.models.is_empty());
-        assert!(cat.find("claude-opus-4-6").is_some());
+        assert!(cat.find("claude-opus-4-7").is_some());
     }
 
     #[test]
     fn find_by_id() {
         let cat = ModelCatalog::default_catalog();
-        let m = cat.find("claude-opus-4-6").unwrap();
+        let m = cat.find("claude-opus-4-7").unwrap();
         assert_eq!(m.provider, "claude");
     }
 
@@ -137,14 +137,14 @@ mod tests {
     fn find_by_alias() {
         let cat = ModelCatalog::default_catalog();
         let m = cat.find("opus").unwrap();
-        assert_eq!(m.id, "claude-opus-4-6");
+        assert_eq!(m.id, "claude-opus-4-7");
     }
 
     #[test]
     fn find_case_insensitive() {
         let cat = ModelCatalog::default_catalog();
         assert!(cat.find("OPUS").is_some());
-        assert!(cat.find("Claude-Opus-4-6").is_some());
+        assert!(cat.find("Claude-Opus-4-7").is_some());
     }
 
     #[test]

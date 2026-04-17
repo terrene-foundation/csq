@@ -741,6 +741,7 @@ pub fn run() {
             commands::cancel_login,
             commands::start_claude_login,
             commands::set_provider_key,
+            commands::bind_keyless_provider,
             commands::list_sessions,
             commands::swap_session,
             commands::get_autostart_enabled,

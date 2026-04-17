@@ -127,6 +127,16 @@ pub fn default_settings(provider: &Provider) -> Value {
         }
     }
 
+    // Keyless providers (Ollama) need a placeholder ANTHROPIC_AUTH_TOKEN
+    // because CC always sends an auth header. The literal value is
+    // irrelevant to the provider itself.
+    if let Some(token) = provider.default_auth_token {
+        env.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            Value::String(token.to_string()),
+        );
+    }
+
     // Model defaults
     for key in crate::session::merge::MODEL_KEYS {
         env.insert(

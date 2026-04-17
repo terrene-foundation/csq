@@ -529,13 +529,16 @@ pub struct ProviderView {
     pub default_model: String,
 }
 
-/// Returns the provider catalog, excluding `ollama` for now
-/// (the desktop Add Account flow covers Claude/MiniMax/Z.AI).
+/// Returns the full provider catalog (Claude, MiniMax, Z.AI, Ollama).
+///
+/// The frontend branches on `auth_type`:
+/// - `"oauth"` → Claude sign-in flow
+/// - `"bearer"` → API-key entry (MiniMax, Z.AI)
+/// - `"none"` → keyless slot binding (Ollama) via [`bind_keyless_provider`]
 #[tauri::command]
 pub fn list_providers() -> Result<Vec<ProviderView>, String> {
     Ok(providers::PROVIDERS
         .iter()
-        .filter(|p| p.id != "ollama")
         .map(|p| ProviderView {
             id: p.id.to_string(),
             name: p.name.to_string(),
@@ -900,6 +903,50 @@ pub fn set_provider_key(
     Ok(settings.key_fingerprint())
 }
 
+/// Binds a keyless provider (Ollama) to an account slot.
+///
+/// The UI flow calls this when the user picks Ollama from the Add
+/// Account modal — there is no key to enter, so the command just
+/// writes `config-<slot>/settings.json` with the provider's base
+/// URL, placeholder auth token, and default model. Mirrors the CLI
+/// `csq setkey ollama --slot N` path.
+///
+/// Thin wrapper around [`csq_core::accounts::third_party::bind_provider_to_slot`]
+/// with `key = None`, plus input validation (bounds on slot, existence
+/// of base dir, provider must be keyless).
+///
+/// # Errors
+///
+/// - `"unknown provider: X"` — provider id not in catalog
+/// - `"provider X is not keyless"` — called on a keyed provider
+/// - `"invalid slot: ..."` — slot out of range 1..=999
+/// - `"base directory does not exist: ..."` — base dir missing
+/// - filesystem errors surfaced from the core bind path
+#[tauri::command]
+pub fn bind_keyless_provider(
+    base_dir: String,
+    provider_id: String,
+    slot: u16,
+) -> Result<(), String> {
+    let provider = providers::get_provider(&provider_id)
+        .ok_or_else(|| format!("unknown provider: {provider_id}"))?;
+
+    if provider.auth_type != providers::catalog::AuthType::None {
+        return Err(format!("provider {provider_id} is not keyless"));
+    }
+
+    let slot =
+        csq_core::types::AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
+
+    let base = PathBuf::from(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+
+    csq_core::accounts::third_party::bind_provider_to_slot(&base, &provider_id, slot, None)
+        .map_err(|e| format!("bind provider: {e}"))
+}
+
 // ── Launch-on-login (tauri-plugin-autostart) ──────────────────
 
 /// Returns whether the csq desktop app is registered to auto-start
@@ -1040,12 +1087,14 @@ mod tests {
     // ── list_providers ─────────────────────────────────────────
 
     #[test]
-    fn list_providers_excludes_ollama() {
+    fn list_providers_includes_ollama() {
         let providers = list_providers().unwrap();
-        assert!(
-            !providers.iter().any(|p| p.id == "ollama"),
-            "ollama should be filtered from the desktop provider list"
-        );
+        let ollama = providers
+            .iter()
+            .find(|p| p.id == "ollama")
+            .expect("ollama should appear in the desktop provider list");
+        assert_eq!(ollama.auth_type, "none");
+        assert!(ollama.default_base_url.is_some());
     }
 
     #[test]
@@ -1095,6 +1144,53 @@ mod tests {
         let long_key = "x".repeat(5000);
         let err = set_provider_key("/fake".into(), "mm".into(), long_key).unwrap_err();
         assert!(err.contains("too long"));
+    }
+
+    // ── bind_keyless_provider validation ───────────────────────
+
+    #[test]
+    fn bind_keyless_provider_rejects_unknown_provider() {
+        let err = bind_keyless_provider("/fake".into(), "nonexistent".into(), 1).unwrap_err();
+        assert!(err.contains("unknown provider"));
+    }
+
+    #[test]
+    fn bind_keyless_provider_rejects_keyed_provider() {
+        let err = bind_keyless_provider("/fake".into(), "mm".into(), 1).unwrap_err();
+        assert!(err.contains("not keyless"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_keyless_provider_rejects_invalid_slot() {
+        let err = bind_keyless_provider("/fake".into(), "ollama".into(), 0).unwrap_err();
+        assert!(err.contains("invalid slot"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_keyless_provider_rejects_missing_base_dir() {
+        let err =
+            bind_keyless_provider("/nonexistent/base/dir".into(), "ollama".into(), 5).unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_keyless_provider_ollama_writes_settings() {
+        // End-to-end: real temp dir, real ollama bind. Verifies the
+        // command writes the slot's settings.json with the placeholder
+        // auth token and base URL.
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = bind_keyless_provider(
+            dir.path().to_string_lossy().into_owned(),
+            "ollama".into(),
+            9,
+        );
+        assert!(result.is_ok(), "bind should succeed: {result:?}");
+
+        let settings_path = dir.path().join("config-9/settings.json");
+        assert!(settings_path.exists());
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(content.contains("\"ANTHROPIC_AUTH_TOKEN\": \"ollama\""));
+        assert!(content.contains("localhost:11434"));
     }
 
     // ── rename_account validation ──────────────────────────────

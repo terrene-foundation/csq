@@ -190,6 +190,13 @@ enum SetkeyCmd {
         #[arg(long)]
         slot: Option<u16>,
     },
+    /// Ollama profile (keyless — creates the settings file with defaults)
+    Ollama {
+        /// Bind the Ollama profile to slot N (e.g. `--slot 9`). If
+        /// omitted, only the global `settings-ollama.json` is written.
+        #[arg(long)]
+        slot: Option<u16>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -275,6 +282,7 @@ fn main() -> Result<()> {
                 SetkeyCmd::Mm { key, slot } => ("mm", key, slot),
                 SetkeyCmd::Zai { key, slot } => ("zai", key, slot),
                 SetkeyCmd::Claude { key, slot } => ("claude", key, slot),
+                SetkeyCmd::Ollama { slot } => ("ollama", None, slot),
             };
             let slot = match slot {
                 Some(n) => Some(

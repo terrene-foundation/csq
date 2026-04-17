@@ -56,6 +56,10 @@
   // Bearer-key flow (MiniMax, Z.AI):
   //   1. `picker`        — user picks a provider
   //   2. `bearer-form`   — user pastes an API key
+  //
+  // Keyless flow (Ollama):
+  //   1. `picker`         — user picks Ollama
+  //   2. `keyless-confirm` — info screen, Confirm binds slot
   type Step =
     | { kind: 'picker' }
     | { kind: 'running-claude'; account: number }
@@ -70,6 +74,12 @@
         kind: 'bearer-form';
         provider: ProviderView;
         key: string;
+        submitting: boolean;
+        error: string | null;
+      }
+    | {
+        kind: 'keyless-confirm';
+        provider: ProviderView;
         submitting: boolean;
         error: string | null;
       }
@@ -163,9 +173,9 @@
 
   // ── Provider pick ─────────────────────────────────────────
   async function pickProvider(provider: ProviderView) {
-    // Slot picker is only meaningful for the OAuth (account) flow.
-    // 3P provider keys live in settings-mm.json / settings-zai.json
-    // — no per-account slot semantics.
+    // The slot picker gates every flow that writes `config-<N>/` —
+    // OAuth (credentials) AND keyless (settings.json with a provider
+    // env block). Only the global bearer-key flow is slot-free.
     if (provider.auth_type === 'oauth') {
       if (slotError) return; // disabled in UI but defend in JS too
       await startClaudeOAuth(chosenSlot);
@@ -174,6 +184,14 @@
         kind: 'bearer-form',
         provider,
         key: '',
+        submitting: false,
+        error: null,
+      };
+    } else if (provider.auth_type === 'none') {
+      if (slotError) return;
+      step = {
+        kind: 'keyless-confirm',
+        provider,
         submitting: false,
         error: null,
       };
@@ -292,6 +310,28 @@
     }
   }
 
+  // ── Keyless flow (Ollama) ─────────────────────────────────
+  async function submitKeyless() {
+    if (step.kind !== 'keyless-confirm') return;
+    const current = step;
+    step = { ...current, submitting: true, error: null };
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('bind_keyless_provider', {
+        baseDir,
+        providerId: current.provider.id,
+        slot: chosenSlot,
+      });
+      onAccountAdded();
+      step = {
+        kind: 'success',
+        message: `${current.provider.name} bound to slot #${chosenSlot}.`,
+      };
+    } catch (e) {
+      step = { ...current, submitting: false, error: String(e) };
+    }
+  }
+
   // ── Close behavior ────────────────────────────────────────
   async function handleClose() {
     onClose();
@@ -361,12 +401,18 @@
               <button
                 class="provider-card"
                 onclick={() => pickProvider(provider)}
-                disabled={provider.auth_type === 'oauth' && slotError !== null}
-                title={provider.auth_type === 'oauth' && slotError ? slotError : ''}
+                disabled={(provider.auth_type === 'oauth' || provider.auth_type === 'none') && slotError !== null}
+                title={(provider.auth_type === 'oauth' || provider.auth_type === 'none') && slotError ? slotError ?? '' : ''}
               >
                 <div class="provider-name">{provider.name}</div>
                 <div class="provider-meta">
-                  {provider.auth_type === 'oauth' ? `Sign in with Anthropic → slot #${chosenSlot}` : 'Paste an API key'}
+                  {#if provider.auth_type === 'oauth'}
+                    Sign in with Anthropic → slot #{chosenSlot}
+                  {:else if provider.auth_type === 'none'}
+                    Local provider → slot #{chosenSlot} (no key)
+                  {:else}
+                    Paste an API key
+                  {/if}
                 </div>
                 {#if provider.default_model}
                   <div class="provider-model">{provider.default_model}</div>
@@ -431,6 +477,35 @@
             Exchanging the code for account #{step.account}…
           </p>
           <p class="hint">Talking to Anthropic. This usually takes a second.</p>
+        {:else if step.kind === 'keyless-confirm'}
+          <p class="lede">
+            Bind <strong>{step.provider.name}</strong> to slot #{chosenSlot}.
+          </p>
+          <p class="hint">
+            {step.provider.name} is keyless — no API token needed. Claude Code
+            will route every request on this slot to the endpoint below.
+          </p>
+          {#if step.provider.default_base_url}
+            <p class="hint">
+              Endpoint: <code>{step.provider.default_base_url}</code>
+            </p>
+          {/if}
+          {#if step.provider.default_model}
+            <p class="hint">
+              Default model: <code>{step.provider.default_model}</code>
+            </p>
+          {/if}
+          {#if step.error}
+            <div class="error-banner">{step.error}</div>
+          {/if}
+          <div class="actions">
+            <button class="secondary" onclick={() => (step = { kind: 'picker' })}>
+              Back
+            </button>
+            <button class="primary" onclick={submitKeyless} disabled={step.submitting}>
+              {step.submitting ? 'Binding…' : `Bind to slot #${chosenSlot}`}
+            </button>
+          </div>
         {:else if step.kind === 'bearer-form'}
           <p class="lede">Paste your {step.provider.name} API key.</p>
           <label class="field">

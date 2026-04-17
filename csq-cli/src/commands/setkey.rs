@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::third_party;
+use csq_core::providers::catalog::AuthType;
 use csq_core::types::AccountNum;
 use csq_core::{http, providers};
 use std::io::Read;
@@ -24,6 +25,16 @@ pub fn handle(
 ) -> Result<()> {
     let provider = providers::get_provider(provider_id)
         .ok_or_else(|| anyhow!("unknown provider: {provider_id}"))?;
+
+    // Keyless providers (Ollama) take no user-supplied key. Writing
+    // the settings file is enough — CC only needs the base URL, model,
+    // and a placeholder auth token (see `default_auth_token`).
+    if provider.auth_type == AuthType::None {
+        if key_arg.is_some() {
+            return Err(anyhow!("provider {provider_id} is keyless — drop --key"));
+        }
+        return handle_keyless(base_dir, provider, slot);
+    }
 
     let key = match key_arg {
         Some(k) => k.trim().to_string(),
@@ -46,7 +57,7 @@ pub fn handle(
             println!("Set {} key: {}", provider_id, settings.key_fingerprint());
         }
         Some(slot) => {
-            third_party::bind_provider_to_slot(base_dir, provider_id, slot, &key)
+            third_party::bind_provider_to_slot(base_dir, provider_id, slot, Some(&key))
                 .with_context(|| format!("failed to bind {provider_id} to slot {slot}"))?;
             println!(
                 "Assigned {} key to slot {} (config-{}/settings.json)",
@@ -75,6 +86,46 @@ pub fn handle(
         }
     }
 
+    Ok(())
+}
+
+/// Keyless (Ollama) branch: writes the provider settings file (or
+/// slot-bound `config-N/settings.json`) with the provider's defaults.
+/// No TTY prompt, no validation probe — local providers don't have
+/// an auth endpoint to probe.
+fn handle_keyless(
+    base_dir: &Path,
+    provider: &providers::Provider,
+    slot: Option<AccountNum>,
+) -> Result<()> {
+    match slot {
+        None => {
+            // Round-trip `load_settings` → `save_settings`. When the
+            // file is missing, `load_settings` returns the provider
+            // defaults (base URL, placeholder auth token, model keys)
+            // which we then persist. When it exists, the file is
+            // re-saved unchanged — idempotent.
+            let settings = providers::settings::load_settings(base_dir, provider.id)?;
+            providers::settings::save_settings(base_dir, &settings)?;
+            println!(
+                "Wrote {} profile ({}).",
+                provider.name, provider.settings_filename
+            );
+            if let Some(base) = provider.default_base_url {
+                println!("  Base URL: {}", base);
+            }
+            println!("  Default model: {}", provider.default_model);
+        }
+        Some(slot) => {
+            third_party::bind_provider_to_slot(base_dir, provider.id, slot, None)
+                .with_context(|| format!("failed to bind {} to slot {slot}", provider.id))?;
+            println!(
+                "Assigned {} profile to slot {} (config-{}/settings.json)",
+                provider.id, slot, slot
+            );
+            println!("  Launch with: csq run {}", slot);
+        }
+    }
     Ok(())
 }
 

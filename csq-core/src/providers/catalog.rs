@@ -99,7 +99,7 @@ pub const PROVIDERS: &[Provider] = &[
         key_env_var: None,
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
         default_base_url: Some("http://localhost:11434"),
-        default_model: "llama3.3",
+        default_model: "gemma4",
         validation_endpoint: None, // Validated via `ollama list`
         settings_filename: "settings-ollama.json",
         system_primer: Some(

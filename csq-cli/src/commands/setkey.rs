@@ -57,7 +57,7 @@ pub fn handle(
             println!("Set {} key: {}", provider_id, settings.key_fingerprint());
         }
         Some(slot) => {
-            third_party::bind_provider_to_slot(base_dir, provider_id, slot, Some(&key))
+            third_party::bind_provider_to_slot(base_dir, provider_id, slot, Some(&key), None)
                 .with_context(|| format!("failed to bind {provider_id} to slot {slot}"))?;
             println!(
                 "Assigned {} key to slot {} (config-{}/settings.json)",
@@ -117,7 +117,7 @@ fn handle_keyless(
             println!("  Default model: {}", provider.default_model);
         }
         Some(slot) => {
-            third_party::bind_provider_to_slot(base_dir, provider.id, slot, None)
+            third_party::bind_provider_to_slot(base_dir, provider.id, slot, None, None)
                 .with_context(|| format!("failed to bind {} to slot {slot}", provider.id))?;
             println!(
                 "Assigned {} profile to slot {} (config-{}/settings.json)",

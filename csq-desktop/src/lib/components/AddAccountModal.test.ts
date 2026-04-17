@@ -54,7 +54,7 @@ const OLLAMA_PROVIDER = {
   name: "Ollama",
   auth_type: "none" as const,
   default_base_url: "http://localhost:11434",
-  default_model: "llama3.3",
+  default_model: "gemma4",
 };
 
 let mockResponses: Record<string, unknown> = {};
@@ -66,6 +66,7 @@ function setupMocks(overrides: Record<string, unknown> = {}) {
     start_claude_login: 1,
     set_provider_key: "abc…xyz",
     bind_keyless_provider: null,
+    list_ollama_models: ["gemma4", "qwen3:latest", "gpt-oss:20b"],
     ...overrides,
   };
   mockInvoke.mockImplementation((cmd: string) => {
@@ -144,7 +145,7 @@ describe("AddAccountModal", () => {
     await tick();
     expect(container.textContent).toContain("claude-opus-4-7");
     expect(container.textContent).toContain("MiniMax-M1");
-    expect(container.textContent).toContain("llama3.3");
+    expect(container.textContent).toContain("gemma4");
   });
 
   it("labels the Ollama card as keyless", async () => {
@@ -236,7 +237,7 @@ describe("AddAccountModal", () => {
     expect(container.querySelector('input[type="password"]')).toBeNull();
   });
 
-  it("calls bind_keyless_provider with slot on Confirm and reports success", async () => {
+  it("calls bind_keyless_provider with slot and first installed model on Confirm", async () => {
     const onAccountAdded = vi.fn();
     const { container } = renderModal({ nextAccountId: 7, onAccountAdded });
     await tick();
@@ -245,8 +246,16 @@ describe("AddAccountModal", () => {
 
     const cards = container.querySelectorAll(".provider-card");
     await fireEvent.click(cards[2]);
+    // Extra ticks for async list_ollama_models to settle.
     await tick();
     await tick();
+    await tick();
+    await tick();
+
+    // Dropdown should be populated with the installed models.
+    const select = container.querySelector("select") as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    expect(select.value).toBe("gemma4");
 
     const confirmBtn = Array.from(container.querySelectorAll("button")).find(
       (b) => b.textContent?.includes("Bind to slot"),
@@ -263,9 +272,78 @@ describe("AddAccountModal", () => {
     expect(call?.[1]).toMatchObject({
       providerId: "ollama",
       slot: 7,
+      model: "gemma4",
     });
     expect(onAccountAdded).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("Ollama bound to slot #7");
+  });
+
+  it("passes the chosen model when the user changes the dropdown", async () => {
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const cards = container.querySelectorAll(".provider-card");
+    await fireEvent.click(cards[2]);
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+
+    const select = container.querySelector("select") as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "qwen3:latest" } });
+    await tick();
+
+    const confirmBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Bind to slot"),
+    ) as HTMLButtonElement;
+    await fireEvent.click(confirmBtn);
+    await tick();
+    await tick();
+
+    const call = mockInvoke.mock.calls.find(
+      (args) => args[0] === "bind_keyless_provider",
+    );
+    expect(call?.[1]).toMatchObject({
+      providerId: "ollama",
+      model: "qwen3:latest",
+    });
+  });
+
+  it("shows a warning and uses catalog default when no Ollama models are installed", async () => {
+    setupMocks({ list_ollama_models: [] });
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const cards = container.querySelectorAll(".provider-card");
+    await fireEvent.click(cards[2]);
+    await tick();
+    await tick();
+    await tick();
+
+    expect(container.querySelector("select")).toBeNull();
+    expect(container.textContent).toContain("No Ollama models found locally");
+    // Catalog default (gemma4) is mentioned in the ollama-pull hint.
+    expect(container.textContent).toContain("gemma4");
+
+    const confirmBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Bind to slot"),
+    ) as HTMLButtonElement;
+    await fireEvent.click(confirmBtn);
+    await tick();
+    await tick();
+
+    const call = mockInvoke.mock.calls.find(
+      (args) => args[0] === "bind_keyless_provider",
+    );
+    // Empty selection → model omitted → backend falls back to default.
+    expect(call?.[1]).toMatchObject({
+      providerId: "ollama",
+      model: null,
+    });
   });
 
   it("surfaces backend error on keyless bind failure", async () => {

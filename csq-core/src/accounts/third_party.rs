@@ -68,6 +68,14 @@ fn validate_key_shape(key: &str) -> Result<(), ConfigError> {
 /// use `Provider::default_auth_token` as the placeholder value CC sends
 /// on the wire.
 ///
+/// `model` overrides the provider's catalog `default_model` for the
+/// written `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` env keys.
+/// Pass `None` to accept the catalog default (MM/ZAI one canonical
+/// model; Ollama falls back to `gemma4` which may not be installed).
+/// The value is written verbatim; callers are responsible for
+/// validating that it's a real model id (Ollama: walk `ollama list`;
+/// MM/ZAI: see the provider catalog).
+///
 /// After a successful bind, `csq run <slot>` can launch CC against this
 /// provider and the dashboard will show the slot labelled with the
 /// provider name.
@@ -85,6 +93,7 @@ pub fn bind_provider_to_slot(
     provider_id: &str,
     slot: AccountNum,
     key: Option<&str>,
+    model: Option<&str>,
 ) -> Result<(), ConfigError> {
     let provider =
         providers::get_provider(provider_id).ok_or_else(|| ConfigError::ProfileNotFound {
@@ -155,10 +164,11 @@ pub fn bind_provider_to_slot(
         Value::String(base_url.to_string()),
     );
     env.insert(key_env_var.to_string(), Value::String(token));
+    let model_to_write = model.unwrap_or(provider.default_model);
     for model_key in MODEL_KEYS {
         env.insert(
             (*model_key).to_string(),
-            Value::String(provider.default_model.to_string()),
+            Value::String(model_to_write.to_string()),
         );
     }
     let mut settings_obj = Map::new();
@@ -338,7 +348,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(9u16).unwrap();
 
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
 
         let settings_path = dir.path().join("config-9/settings.json");
         assert!(settings_path.exists());
@@ -362,7 +372,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(9u16).unwrap();
 
-        bind_provider_to_slot(dir.path(), "zai", slot, Some("key-zai-123")).unwrap();
+        bind_provider_to_slot(dir.path(), "zai", slot, Some("key-zai-123"), None).unwrap();
 
         let profiles_file = profiles::load(&profiles::profiles_path(dir.path())).unwrap();
         let p = profiles_file.get_profile(9).unwrap();
@@ -378,7 +388,7 @@ mod tests {
     fn bind_writes_csq_account_marker() {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(7u16).unwrap();
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("key-long-7")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("key-long-7"), None).unwrap();
 
         let marker = dir.path().join("config-7/.csq-account");
         assert!(marker.exists());
@@ -391,7 +401,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(12u16).unwrap();
 
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("key-discover")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("key-discover"), None).unwrap();
 
         let slots = discovery::discover_per_slot_third_party(dir.path());
         let found = slots.iter().find(|a| a.id == 12).expect("slot 12 missing");
@@ -410,7 +420,7 @@ mod tests {
         // path MUST strip `apiKeyHelper` before writing.
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(9u16).unwrap();
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-cp-test")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-cp-test"), None).unwrap();
 
         let settings_path = dir.path().join("config-9/settings.json");
         let json: Value =
@@ -434,7 +444,7 @@ mod tests {
     fn bind_rejects_empty_key() {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(3u16).unwrap();
-        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some(""));
+        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some(""), None);
         assert!(err.is_err());
     }
 
@@ -442,7 +452,7 @@ mod tests {
     fn bind_rejects_key_shorter_than_min() {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(3u16).unwrap();
-        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some("short"))
+        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some("short"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("too short"), "got: {err}");
@@ -457,7 +467,7 @@ mod tests {
         // prompt ever regresses.
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(3u16).unwrap();
-        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some("good-\x1b-bad"))
+        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some("good-\x1b-bad"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("control characters"), "got: {err}");
@@ -470,7 +480,7 @@ mod tests {
         // shape gate before any filesystem write happens.
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(3u16).unwrap();
-        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some("\x1b"));
+        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some("\x1b"), None);
         assert!(err.is_err());
         // Confirm no settings.json was created.
         assert!(!dir.path().join("config-3/settings.json").exists());
@@ -480,7 +490,7 @@ mod tests {
     fn bind_rejects_unknown_provider() {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(3u16).unwrap();
-        let err = bind_provider_to_slot(dir.path(), "bogus", slot, Some("k"));
+        let err = bind_provider_to_slot(dir.path(), "bogus", slot, Some("k"), None);
         assert!(err.is_err());
     }
 
@@ -489,7 +499,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(5u16).unwrap();
 
-        bind_provider_to_slot(dir.path(), "ollama", slot, None).unwrap();
+        bind_provider_to_slot(dir.path(), "ollama", slot, None, None).unwrap();
 
         let settings_path = dir.path().join("config-5/settings.json");
         assert!(settings_path.exists());
@@ -512,7 +522,7 @@ mod tests {
         // so we don't silently overwrite the placeholder with user input.
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(5u16).unwrap();
-        let err = bind_provider_to_slot(dir.path(), "ollama", slot, Some("something"));
+        let err = bind_provider_to_slot(dir.path(), "ollama", slot, Some("something"), None);
         assert!(err.is_err());
     }
 
@@ -521,8 +531,46 @@ mod tests {
         // Symmetric: MM/Z.AI must have a key.
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(5u16).unwrap();
-        let err = bind_provider_to_slot(dir.path(), "mm", slot, None);
+        let err = bind_provider_to_slot(dir.path(), "mm", slot, None, None);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn bind_with_model_override_writes_chosen_model() {
+        // Ollama users pick a model from their local `ollama list`.
+        // The override must land in every MODEL_KEYS entry.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(6u16).unwrap();
+        bind_provider_to_slot(dir.path(), "ollama", slot, None, Some("qwen3:latest")).unwrap();
+
+        let settings_path = dir.path().join("config-6/settings.json");
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let env = json.get("env").unwrap();
+        for model_key in MODEL_KEYS {
+            assert_eq!(
+                env.get(*model_key).unwrap().as_str().unwrap(),
+                "qwen3:latest",
+                "{model_key} should reflect the model override"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_without_model_uses_catalog_default() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(7u16).unwrap();
+        bind_provider_to_slot(dir.path(), "ollama", slot, None, None).unwrap();
+
+        let settings_path = dir.path().join("config-7/settings.json");
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let env = json.get("env").unwrap();
+        let provider = providers::get_provider("ollama").unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").unwrap().as_str().unwrap(),
+            provider.default_model
+        );
     }
 
     #[test]
@@ -530,8 +578,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(4u16).unwrap();
 
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("first-key")).unwrap();
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("second-key")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("first-key"), None).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("second-key"), None).unwrap();
 
         let settings_path = dir.path().join("config-4/settings.json");
         let json: Value =
@@ -567,6 +615,7 @@ mod tests {
             "mm",
             AccountNum::try_from(9u16).unwrap(),
             Some("test-key-8"),
+            None,
         )
         .unwrap();
 
@@ -581,7 +630,7 @@ mod tests {
     fn unbind_removes_3p_env_block_and_deletes_empty_file() {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(1u16).unwrap();
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
 
         let settings_path = dir.path().join("config-1/settings.json");
         assert!(settings_path.exists(), "bind should have created the file");
@@ -598,7 +647,7 @@ mod tests {
     fn unbind_after_bind_reclassifies_slot_as_non_third_party() {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(1u16).unwrap();
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
 
         let pre = discovery::discover_per_slot_third_party(dir.path());
         assert!(
@@ -630,7 +679,7 @@ mod tests {
         // by `csq login N`. Only the known 3P keys get stripped.
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(2u16).unwrap();
-        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345")).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
 
         // Hand-patch: add a user env key.
         let settings_path = dir.path().join("config-2/settings.json");

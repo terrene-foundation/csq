@@ -903,23 +903,26 @@ pub fn set_provider_key(
     Ok(settings.key_fingerprint())
 }
 
-/// Binds a keyless provider (Ollama) to an account slot.
+/// Binds a keyless provider (Ollama) to an account slot, optionally
+/// with a user-selected model.
 ///
 /// The UI flow calls this when the user picks Ollama from the Add
-/// Account modal — there is no key to enter, so the command just
-/// writes `config-<slot>/settings.json` with the provider's base
-/// URL, placeholder auth token, and default model. Mirrors the CLI
-/// `csq setkey ollama --slot N` path.
+/// Account modal — there is no key to enter, but the user MAY have
+/// multiple models installed locally (`ollama list`). Passing `model`
+/// overrides the catalog default (currently `gemma4`) and is written
+/// verbatim to every `ANTHROPIC_*_MODEL` env key. Omit to accept the
+/// default.
 ///
 /// Thin wrapper around [`csq_core::accounts::third_party::bind_provider_to_slot`]
 /// with `key = None`, plus input validation (bounds on slot, existence
-/// of base dir, provider must be keyless).
+/// of base dir, provider must be keyless, model non-empty when given).
 ///
 /// # Errors
 ///
 /// - `"unknown provider: X"` — provider id not in catalog
 /// - `"provider X is not keyless"` — called on a keyed provider
 /// - `"invalid slot: ..."` — slot out of range 1..=999
+/// - `"model must not be empty"` — model override supplied but blank
 /// - `"base directory does not exist: ..."` — base dir missing
 /// - filesystem errors surfaced from the core bind path
 #[tauri::command]
@@ -927,6 +930,7 @@ pub fn bind_keyless_provider(
     base_dir: String,
     provider_id: String,
     slot: u16,
+    model: Option<String>,
 ) -> Result<(), String> {
     let provider = providers::get_provider(&provider_id)
         .ok_or_else(|| format!("unknown provider: {provider_id}"))?;
@@ -938,13 +942,44 @@ pub fn bind_keyless_provider(
     let slot =
         csq_core::types::AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
 
+    let model = match model {
+        Some(m) => {
+            let trimmed = m.trim();
+            if trimmed.is_empty() {
+                return Err("model must not be empty".into());
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+
     let base = PathBuf::from(&base_dir);
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
 
-    csq_core::accounts::third_party::bind_provider_to_slot(&base, &provider_id, slot, None)
-        .map_err(|e| format!("bind provider: {e}"))
+    csq_core::accounts::third_party::bind_provider_to_slot(
+        &base,
+        &provider_id,
+        slot,
+        None,
+        model.as_deref(),
+    )
+    .map_err(|e| format!("bind provider: {e}"))
+}
+
+/// Returns the list of locally-installed Ollama models by running
+/// `ollama list`. Returns an empty list if Ollama is not installed
+/// or has no models pulled — the frontend treats empty as a prompt
+/// to `ollama pull <model>` before retrying.
+///
+/// Wraps [`csq_core::providers::ollama::get_ollama_models`]; errors
+/// from the subprocess (not-found, non-zero exit) collapse into an
+/// empty list so a missing Ollama install surfaces as "no models
+/// found" rather than a hang.
+#[tauri::command]
+pub fn list_ollama_models() -> Result<Vec<String>, String> {
+    Ok(providers::ollama::get_ollama_models())
 }
 
 // ── Launch-on-login (tauri-plugin-autostart) ──────────────────
@@ -1150,27 +1185,37 @@ mod tests {
 
     #[test]
     fn bind_keyless_provider_rejects_unknown_provider() {
-        let err = bind_keyless_provider("/fake".into(), "nonexistent".into(), 1).unwrap_err();
+        let err = bind_keyless_provider("/fake".into(), "nonexistent".into(), 1, None).unwrap_err();
         assert!(err.contains("unknown provider"));
     }
 
     #[test]
     fn bind_keyless_provider_rejects_keyed_provider() {
-        let err = bind_keyless_provider("/fake".into(), "mm".into(), 1).unwrap_err();
+        let err = bind_keyless_provider("/fake".into(), "mm".into(), 1, None).unwrap_err();
         assert!(err.contains("not keyless"), "got: {err}");
     }
 
     #[test]
     fn bind_keyless_provider_rejects_invalid_slot() {
-        let err = bind_keyless_provider("/fake".into(), "ollama".into(), 0).unwrap_err();
+        let err = bind_keyless_provider("/fake".into(), "ollama".into(), 0, None).unwrap_err();
         assert!(err.contains("invalid slot"), "got: {err}");
     }
 
     #[test]
     fn bind_keyless_provider_rejects_missing_base_dir() {
-        let err =
-            bind_keyless_provider("/nonexistent/base/dir".into(), "ollama".into(), 5).unwrap_err();
+        let err = bind_keyless_provider("/nonexistent/base/dir".into(), "ollama".into(), 5, None)
+            .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_keyless_provider_rejects_empty_model_override() {
+        // An all-whitespace model from the UI dropdown would silently
+        // write `ANTHROPIC_MODEL=""` and make CC unusable. Reject
+        // before the filesystem write.
+        let err = bind_keyless_provider("/fake".into(), "ollama".into(), 1, Some("   ".into()))
+            .unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
     }
 
     #[test]
@@ -1183,6 +1228,7 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
             "ollama".into(),
             9,
+            None,
         );
         assert!(result.is_ok(), "bind should succeed: {result:?}");
 
@@ -1191,6 +1237,33 @@ mod tests {
         let content = std::fs::read_to_string(&settings_path).unwrap();
         assert!(content.contains("\"ANTHROPIC_AUTH_TOKEN\": \"ollama\""));
         assert!(content.contains("localhost:11434"));
+    }
+
+    #[test]
+    fn bind_keyless_provider_with_model_override_writes_chosen_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        bind_keyless_provider(
+            dir.path().to_string_lossy().into_owned(),
+            "ollama".into(),
+            11,
+            Some("qwen3:latest".into()),
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join("config-11/settings.json")).unwrap();
+        assert!(
+            content.contains("\"ANTHROPIC_MODEL\": \"qwen3:latest\""),
+            "expected model override in settings, got: {content}"
+        );
+    }
+
+    #[test]
+    fn list_ollama_models_returns_vec() {
+        // Can't assume Ollama is installed in CI — just assert the
+        // command returns Ok (possibly empty). Exhaustive parsing
+        // tests live in csq_core::providers::ollama.
+        let result = list_ollama_models();
+        assert!(result.is_ok());
     }
 
     // ── rename_account validation ──────────────────────────────

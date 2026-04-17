@@ -80,6 +80,12 @@
     | {
         kind: 'keyless-confirm';
         provider: ProviderView;
+        /// Installed models from the provider (e.g. `ollama list`).
+        /// Populated asynchronously on step entry; null while loading.
+        availableModels: string[] | null;
+        /// The model the user has selected. Empty string = catalog
+        /// default (shown to the user as "(default: <model>)").
+        selectedModel: string;
         submitting: boolean;
         error: string | null;
       }
@@ -192,9 +198,32 @@
       step = {
         kind: 'keyless-confirm',
         provider,
+        availableModels: null,
+        selectedModel: '',
         submitting: false,
         error: null,
       };
+      // Kick off model discovery in the background. Empty result is
+      // legitimate (Ollama not installed or no models pulled); the
+      // UI falls back to the catalog default with a warning.
+      if (provider.id === 'ollama') {
+        try {
+          const models = await invoke<string[]>('list_ollama_models');
+          if (step.kind === 'keyless-confirm' && step.provider.id === provider.id) {
+            step = {
+              ...step,
+              availableModels: models,
+              selectedModel: models[0] ?? '',
+            };
+          }
+        } catch {
+          if (step.kind === 'keyless-confirm' && step.provider.id === provider.id) {
+            step = { ...step, availableModels: [] };
+          }
+        }
+      } else if (step.kind === 'keyless-confirm') {
+        step = { ...step, availableModels: [] };
+      }
     }
   }
 
@@ -317,10 +346,15 @@
     step = { ...current, submitting: true, error: null };
     try {
       const baseDir = await getBaseDir();
+      // Pass the user's selection only when it differs from the
+      // catalog default — an empty string means "accept default"
+      // and the backend will fall back to `provider.default_model`.
+      const model = current.selectedModel.trim();
       await invoke('bind_keyless_provider', {
         baseDir,
         providerId: current.provider.id,
         slot: chosenSlot,
+        model: model.length > 0 ? model : null,
       });
       onAccountAdded();
       step = {
@@ -490,11 +524,32 @@
               Endpoint: <code>{step.provider.default_base_url}</code>
             </p>
           {/if}
-          {#if step.provider.default_model}
-            <p class="hint">
-              Default model: <code>{step.provider.default_model}</code>
-            </p>
-          {/if}
+          <label class="field">
+            <span>Model</span>
+            {#if step.availableModels === null}
+              <p class="hint">Loading installed models…</p>
+            {:else if step.availableModels.length === 0}
+              <p class="hint">
+                No {step.provider.name} models found locally. The binding will use
+                <code>{step.provider.default_model}</code>; pull it with
+                <code>ollama pull {step.provider.default_model}</code>
+                before launching.
+              </p>
+            {:else}
+              <select
+                bind:value={step.selectedModel}
+                disabled={step.submitting}
+              >
+                {#each step.availableModels as m}
+                  <option value={m}>{m}</option>
+                {/each}
+              </select>
+              <span class="hint">
+                Installed via <code>ollama list</code>. Change later with
+                <code>csq models switch ollama &lt;model&gt;</code>.
+              </span>
+            {/if}
+          </label>
           {#if step.error}
             <div class="error-banner">{step.error}</div>
           {/if}
@@ -692,7 +747,8 @@
     font-size: 0.8rem;
     color: var(--text-secondary);
   }
-  .field input {
+  .field input,
+  .field select {
     padding: 0.5rem;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -702,7 +758,8 @@
     font-family: ui-monospace, monospace;
     font-size: 0.85rem;
   }
-  .field input:focus {
+  .field input:focus,
+  .field select:focus {
     outline: 2px solid var(--accent);
     outline-offset: -1px;
   }

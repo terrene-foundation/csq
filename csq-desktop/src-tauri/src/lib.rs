@@ -696,7 +696,32 @@ pub fn run() {
     // should NOT open the main window automatically — the tray keeps
     // the app alive silently, and the user clicks the tray icon to
     // open the dashboard when they need it.
+    // `tauri-plugin-single-instance` MUST be the first plugin
+    // registered. It opens a per-user IPC endpoint on startup; a
+    // second process that reaches this line detects the endpoint,
+    // forwards its argv into the running instance, and exits before
+    // building any windows, tray icons, or daemon supervisors.
+    //
+    // This matters at login because two launch paths race:
+    //
+    //   1. `tauri-plugin-autostart`'s LaunchAgent (installed by the
+    //      user via the Preferences toggle).
+    //   2. macOS "Reopen windows when logging back in" (on by default
+    //      in System Settings > Desktops & Dock), which restores the
+    //      app if it was running at logout.
+    //
+    // Without single-instance both fire, leaving the user with two
+    // tray icons, two update checkers, and two daemon supervisors
+    // wrestling over the PID file. The callback fires in the already-
+    // running instance so we can surface the main window.
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,

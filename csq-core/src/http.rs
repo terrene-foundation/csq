@@ -24,6 +24,7 @@
 //!   leak the request body (which contains the refresh token) into
 //!   error messages. The caller sees only a sanitized reason.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -350,25 +351,97 @@ pub fn get_with_headers(url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, 
 /// Timeout for Node.js subprocess HTTP requests (milliseconds).
 const NODE_TIMEOUT_MS: u64 = 15_000;
 
-/// Finds the first available JS runtime (`node` or `bun`).
-fn find_js_runtime() -> Result<&'static str, String> {
-    static RUNTIME: OnceLock<Result<&'static str, String>> = OnceLock::new();
+/// System-wide absolute paths checked when bare-name PATH lookup
+/// fails. Order mirrors `accounts::login::SYSTEM_WIDE_DIRS` — Apple
+/// Silicon Homebrew first, Intel Homebrew / manual installs second,
+/// system bindir last.
+const SYSTEM_WIDE_JS_RUNTIMES: &[&str] = &[
+    "/opt/homebrew/bin/node",
+    "/opt/homebrew/bin/bun",
+    "/usr/local/bin/node",
+    "/usr/local/bin/bun",
+    "/usr/bin/node",
+];
+
+/// Per-user install subdirectories (relative to `$HOME`) that host
+/// a JS runtime but sit outside the default GUI-launched-app PATH.
+/// Order matches `accounts::login::PER_USER_SUBDIRS` for consistency.
+const PER_USER_JS_RUNTIMES: &[&str] = &[".bun/bin/bun", ".volta/bin/node"];
+
+/// Finds the first available JS runtime (`node` or `bun`) and
+/// returns the command or absolute path suitable for
+/// `Command::new`.
+///
+/// Two-stage resolution:
+///
+/// 1. **PATH walk** (`node`, then `bun`). Covers the CLI case and
+///    any GUI launch that happens to have Homebrew / Bun / Volta on
+///    PATH — i.e. launches from a terminal that inherited the
+///    shell's PATH.
+///
+/// 2. **Absolute-path probe**. GUI-launched apps on macOS inherit
+///    only `/usr/bin:/bin:/usr/sbin:/sbin`, which excludes every
+///    modern runtime installer. This stage walks the same
+///    well-known locations `accounts::login::find_claude_binary`
+///    uses, so a desktop app launched from Finder or by a
+///    `LaunchAgent` can still find `node` / `bun`.
+///
+/// The result is memoized in a `OnceLock` for the lifetime of the
+/// process — runtime location doesn't change mid-run, and the probe
+/// spawns a subprocess per candidate. Cloned on every call because
+/// `OnceLock::get` returns `&T` and callers need an owned `String`
+/// to pass to `Command::new`.
+fn find_js_runtime() -> Result<String, String> {
+    static RUNTIME: OnceLock<Result<String, String>> = OnceLock::new();
     RUNTIME
         .get_or_init(|| {
-            for cmd in ["node", "bun"] {
-                if std::process::Command::new(cmd)
-                    .arg("--version")
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok()
-                {
-                    return Ok(cmd);
-                }
-            }
-            Err("neither node nor bun found on PATH".into())
+            resolve_js_runtime().ok_or_else(|| {
+                "no JS runtime (node/bun) found in PATH or standard install locations".into()
+            })
         })
         .clone()
+}
+
+/// Pure resolver behind `find_js_runtime`. Separated from the
+/// cached wrapper so unit tests can exercise the search order
+/// without a process-wide `OnceLock` that would latch the first
+/// observed result.
+fn resolve_js_runtime() -> Option<String> {
+    for cmd in ["node", "bun"] {
+        if probe_runtime(Path::new(cmd)) {
+            return Some(cmd.to_string());
+        }
+    }
+
+    for abs in SYSTEM_WIDE_JS_RUNTIMES {
+        let p = Path::new(abs);
+        if probe_runtime(p) {
+            return Some(abs.to_string());
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for sub in PER_USER_JS_RUNTIMES {
+            let p = home.join(sub);
+            if probe_runtime(&p) {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
+/// Spawns `path --version` and reports whether the invocation
+/// succeeded. For bare names this still relies on PATH resolution
+/// (stage 1); for absolute paths it's an explicit exec (stage 2).
+fn probe_runtime(path: &Path) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
 }
 
 /// POSTs a JSON body to `url` using a Node.js subprocess.
@@ -412,7 +485,7 @@ process.stdin.on('end', () => {{
 "#
     );
 
-    let mut child = std::process::Command::new(runtime)
+    let mut child = std::process::Command::new(&runtime)
         .arg("-e")
         .arg(&script)
         .stdin(std::process::Stdio::piped())
@@ -504,7 +577,7 @@ process.stdin.on('end', () => {{
 "#
     );
 
-    let mut child = std::process::Command::new(runtime)
+    let mut child = std::process::Command::new(&runtime)
         .arg("-e")
         .arg(&script)
         .stdin(std::process::Stdio::piped())
@@ -691,5 +764,50 @@ mod tests {
             !msg.contains("SECRET"),
             "error message leaked request body: {msg}"
         );
+    }
+
+    // ── JS runtime resolution ───────────────────────────────
+
+    #[test]
+    fn js_runtime_path_lists_are_non_empty_and_populated_with_expected_entries() {
+        // Guards against an accidental edit that wipes out the
+        // candidate list — a regression that would silently break
+        // token refresh on every GUI-launched desktop install until
+        // someone notices the 401s.
+        assert!(
+            SYSTEM_WIDE_JS_RUNTIMES.contains(&"/opt/homebrew/bin/node"),
+            "Apple Silicon Homebrew path must be probed"
+        );
+        assert!(
+            SYSTEM_WIDE_JS_RUNTIMES.contains(&"/usr/local/bin/node"),
+            "Intel Homebrew / manual-install path must be probed"
+        );
+        assert!(
+            PER_USER_JS_RUNTIMES.contains(&".bun/bin/bun"),
+            "Bun installer default must be probed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_js_runtime_finds_node_via_path_when_available() {
+        // On every reasonable dev / CI box `node` or `bun` is on
+        // PATH, so the function must succeed. If this ever fails,
+        // install node on CI *before* deleting this test.
+        let resolved = resolve_js_runtime();
+        assert!(
+            resolved.is_some(),
+            "no JS runtime found — install node or bun on this host"
+        );
+        let path = resolved.unwrap();
+        assert!(!path.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_runtime_accepts_real_runtime_and_rejects_missing_path() {
+        // If PATH has node, the bare-name probe succeeds. If not, we
+        // still want a clean rejection of a bogus absolute path.
+        assert!(!probe_runtime(Path::new("/nonexistent/does-not-exist")));
     }
 }

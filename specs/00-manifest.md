@@ -26,7 +26,7 @@ These are absolute scope boundaries. Violating any of them is a bug against this
 - **csq must not own chat history or session state.** CC's `history`, `sessions`, `projects`, `commands`, `skills`, `agents`, `rules`, `mcp`, `plugins`, `snippets`, `todos` all live in `~/.claude` and are shared via symlink from every handle dir. csq never writes into these. Reference: `csq-core/src/session/isolation.rs:12-15`.
 - **csq must not require a terminal restart to swap accounts.** Swap is in-flight. The running `claude` process reloads credentials via CC's mtime check on its next API call. Reference: spec 01, section 1.4.
 - **csq must not write quota data from the terminal side.** Quota is owned exclusively by the daemon's usage poller. CC's per-request `rate_limits` JSON is a terminal-scoped snapshot and must never be attributed to an account. Reference: `.claude/rules/account-terminal-separation.md` rules 1-4.
-- **csq must not require Python, Node at runtime, jq, or any non-platform tool.** Single Rust binary. Reference: ADR-001 in `workspaces/csq-v2/01-analysis/01-research/03-architecture-decision-records.md`.
+- **csq ships as a single Rust binary with no Python or jq runtime dependency.** Original ADR-001 stated "no Node at runtime" as well, but Cloudflare TLS fingerprinting on Anthropic endpoints forced a deviation: the OAuth refresher and usage poller shell out to a JS runtime (`node` or `bun`) for `platform.claude.com` / `api.anthropic.com` requests only. Third-party providers still use `reqwest`. The runtime is resolved via `csq-core::http::find_js_runtime` which walks `$PATH` first, then probes `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `$HOME/.bun/bin`, and `$HOME/.volta/bin` so GUI-launched Tauri instances (which inherit only `/usr/bin:/bin:/usr/sbin:/sbin` on macOS) still find the runtime. Reference: journals `0056`, `0057`; ADR-001 in `workspaces/csq-v2/01-analysis/01-research/03-architecture-decision-records.md`.
 
 ## 0.4 Core invariants (derived from the detailed specs)
 
@@ -56,3 +56,4 @@ These are absolute scope boundaries. Violating any of them is a bug against this
 ## Revisions
 
 - 2026-04-12 — 1.0.0 — Initial draft, derived from CC 2.1.104 source read in the csq-v2 redesign session. Journal 0031 retracts journal 0029 Finding 4 which contradicted section 1.4 of spec 01.
+- 2026-04-17 — 1.0.1 — Corrected the §0.3 "no Node at runtime" invariant to reflect the post-journal-0056 reality. Added runtime-resolution note covering PATH probe + absolute-path fallbacks for GUI-launched apps. Journal 0057.

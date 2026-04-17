@@ -140,6 +140,59 @@ fn stdin_is_tty() -> bool {
     true
 }
 
+/// Step signal returned by `handle_key_byte`: either continue reading
+/// the next byte or break out of the read loop because the user hit
+/// a submit key.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyInputStep {
+    /// Keep reading. The buffer may or may not have been mutated.
+    Continue,
+    /// Stop reading. The current buffer is the final key.
+    Done,
+}
+
+/// Pure byte handler for the hidden-key prompt. Extracted out of
+/// `read_hidden_line` so the state machine can be unit-tested without
+/// putting the TTY into raw mode.
+///
+/// Recognized bytes:
+///
+/// * `\n`, `\r` — submit (`Done`)
+/// * `0x1b` (ESC) — cancel immediately with `"cancelled"`. ESC is the
+///   universal TTY-prompt cancel key and users reach for it when they
+///   hit the wrong command. A previous revision pushed ESC into the
+///   buffer as data, so `csq setkey mm --slot N` followed by ESC then
+///   ENTER silently submitted a 1-byte key `"\x1b"` and left the slot
+///   bound to MiniMax with a garbage token. Journal 0058.
+/// * `0x04` (Ctrl-D) — cancel if buffer is empty, submit if non-empty
+/// * `0x08`, `0x7f` (backspace, DEL) — pop the last byte
+/// * `MAX_KEY_LEN` reached — `Err("key input too large")`
+/// * anything else — push to the buffer and continue
+fn handle_key_byte(byte: u8, key: &mut Vec<u8>) -> Result<KeyInputStep> {
+    match byte {
+        b'\n' | b'\r' => Ok(KeyInputStep::Done),
+        0x1b => Err(anyhow!("cancelled")),
+        0x04 => {
+            if key.is_empty() {
+                Err(anyhow!("cancelled"))
+            } else {
+                Ok(KeyInputStep::Done)
+            }
+        }
+        0x08 | 0x7f => {
+            key.pop();
+            Ok(KeyInputStep::Continue)
+        }
+        b => {
+            if key.len() >= MAX_KEY_LEN {
+                return Err(anyhow!("key input too large (limit {MAX_KEY_LEN} bytes)"));
+            }
+            key.push(b);
+            Ok(KeyInputStep::Continue)
+        }
+    }
+}
+
 #[cfg(unix)]
 fn read_hidden_line() -> Result<String> {
     let fd: i32 = libc::STDIN_FILENO;
@@ -188,26 +241,9 @@ fn read_hidden_line() -> Result<String> {
     loop {
         match handle.read(&mut byte) {
             Ok(0) => break,
-            Ok(_) => match byte[0] {
-                b'\n' | b'\r' => break,
-                // Ctrl-D as first char = cancel; otherwise submit
-                0x04 => {
-                    if key.is_empty() {
-                        return Err(anyhow!("cancelled"));
-                    } else {
-                        break;
-                    }
-                }
-                // Backspace / DEL
-                0x08 | 0x7f => {
-                    key.pop();
-                }
-                b => {
-                    if key.len() >= MAX_KEY_LEN {
-                        return Err(anyhow!("key input too large (limit {MAX_KEY_LEN} bytes)"));
-                    }
-                    key.push(b);
-                }
+            Ok(_) => match handle_key_byte(byte[0], &mut key)? {
+                KeyInputStep::Continue => {}
+                KeyInputStep::Done => break,
             },
             Err(e) => return Err(anyhow!("stdin read failed: {e}")),
         }
@@ -231,4 +267,85 @@ fn read_hidden_line() -> Result<String> {
         return Err(anyhow!("key input too large (limit {MAX_KEY_LEN} bytes)"));
     }
     Ok(buf.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut key = Vec::new();
+        for &b in bytes {
+            match handle_key_byte(b, &mut key)? {
+                KeyInputStep::Continue => {}
+                KeyInputStep::Done => return Ok(key),
+            }
+        }
+        Ok(key)
+    }
+
+    #[test]
+    fn submits_on_newline() {
+        let key = run_bytes(b"hello\n").unwrap();
+        assert_eq!(key, b"hello");
+    }
+
+    #[test]
+    fn submits_on_carriage_return() {
+        let key = run_bytes(b"hello\r").unwrap();
+        assert_eq!(key, b"hello");
+    }
+
+    #[test]
+    fn escape_cancels_on_empty_buffer() {
+        let err = run_bytes(&[0x1b]).unwrap_err().to_string();
+        assert_eq!(err, "cancelled");
+    }
+
+    #[test]
+    fn escape_cancels_even_with_partial_buffer() {
+        // The pre-fix bug: ESC was pushed into the buffer, then ENTER
+        // submitted "\x1b" as the key. This test asserts the new
+        // contract: ESC unconditionally cancels, regardless of what
+        // the user already typed.
+        let err = run_bytes(b"partial\x1b").unwrap_err().to_string();
+        assert_eq!(err, "cancelled");
+    }
+
+    #[test]
+    fn ctrl_d_on_empty_cancels() {
+        let err = run_bytes(&[0x04]).unwrap_err().to_string();
+        assert_eq!(err, "cancelled");
+    }
+
+    #[test]
+    fn ctrl_d_on_nonempty_submits() {
+        let key = run_bytes(&[b'a', b'b', 0x04]).unwrap();
+        assert_eq!(key, b"ab");
+    }
+
+    #[test]
+    fn backspace_pops_last_byte() {
+        let key = run_bytes(&[b'a', b'b', 0x08, b'c', b'\n']).unwrap();
+        assert_eq!(key, b"ac");
+    }
+
+    #[test]
+    fn del_pops_last_byte() {
+        let key = run_bytes(&[b'a', b'b', 0x7f, b'c', b'\n']).unwrap();
+        assert_eq!(key, b"ac");
+    }
+
+    #[test]
+    fn overflow_returns_error() {
+        let mut key = vec![b'x'; MAX_KEY_LEN];
+        let err = handle_key_byte(b'y', &mut key).unwrap_err().to_string();
+        assert!(err.contains("too large"), "got: {err}");
+    }
+
+    #[test]
+    fn non_special_bytes_accumulate() {
+        let key = run_bytes(b"sk-ant-oat01-test\n").unwrap();
+        assert_eq!(key, b"sk-ant-oat01-test");
+    }
 }

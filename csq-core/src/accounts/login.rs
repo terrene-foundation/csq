@@ -98,11 +98,18 @@ pub fn read_email_from_claude_json(config_dir: &Path) -> Option<String> {
 ///    `config-N/` directory (best-effort if the dir doesn't exist
 ///    yet — the canonical save in `credentials::save_canonical`
 ///    will create it).
-/// 2. Reads the OAuth email from `config-N/.claude.json` and
+/// 2. **Unbinds any third-party provider pinned to this slot.** If a
+///    user ran `csq setkey mm --slot N` earlier (intentionally or by
+///    accidentally submitting a junk key, journal 0058), slot N's
+///    `settings.json` contains `ANTHROPIC_BASE_URL` +
+///    `ANTHROPIC_AUTH_TOKEN` env vars that override OAuth
+///    credentials at CC startup. Strip them here so the fresh OAuth
+///    tokens actually route to Anthropic.
+/// 3. Reads the OAuth email from `config-N/.claude.json` and
 ///    updates `profiles.json`. Falls back to `"unknown"` if the
 ///    email is missing — non-fatal because the credential file is
 ///    already written and CC can use the account.
-/// 3. Clears the `broker_failed` sentinel for this account so the
+/// 4. Clears the `broker_failed` sentinel for this account so the
 ///    daemon retries refresh on the next tick.
 ///
 /// Errors are propagated only when the *bookkeeping* itself fails
@@ -115,6 +122,21 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
         // Best-effort — save_canonical above already created the
         // dir, but the marker may not be there yet.
         let _ = markers::write_csq_account(&config_dir, account);
+    }
+
+    // Strip any pre-existing 3P binding. If this fails we let the
+    // error propagate — we'd rather the user see "login cleanup
+    // failed" than a silent-success followed by "my OAuth login
+    // didn't take because the slot is still pinned to MiniMax".
+    match crate::accounts::third_party::unbind_provider_from_slot(base_dir, account) {
+        Ok(true) => {
+            tracing::info!(
+                account = account.get(),
+                "finalize_login: stripped third-party provider binding"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => return Err(e),
     }
 
     let email = read_email_from_claude_json(&config_dir).unwrap_or_else(|| "unknown".to_string());

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Code Session Quota",
-  "version": "2.0.0-alpha.15",
+  "version": "2.0.0-alpha.16",
   "identifier": "foundation.terrene.claude-squad",
   "build": {
     "frontendDist": "../dist",
@@ -20,8 +20,16 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src https://platform.claude.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
+      "csp": "default-src 'self'; connect-src https://platform.claude.com https://github.com https://objects.githubusercontent.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
       "freezePrototype": true
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYxQzJGN0ZENzlGOTUyREQKUldUZFV2bDUvZmZDOFFEWU83V1J3TDZPb21wVXI2My9XVml2WWdHZWUxTG55SjUxY3JyVUY1M0gK",
+      "endpoints": [
+        "https://github.com/terrene-foundation/csq/releases/latest/download/latest.json"
+      ]
     }
   },
   "bundle": {
@@ -47,8 +55,9 @@
       }
     },
     "windows": {
-      "wix": { "version": "2.0.15" }
+      "wix": { "version": "2.0.16" }
     },
+    "createUpdaterArtifacts": true,
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libappindicator3-1"],

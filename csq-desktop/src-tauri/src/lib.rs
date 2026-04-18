@@ -727,6 +727,13 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
+        // Updater + process plugins for in-app auto-update. The
+        // updater plugin verifies bundle signatures against the
+        // pinned minisign pubkey in tauri.conf.json; the process
+        // plugin exposes `relaunch()` so the frontend can restart
+        // the app after a successful install.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_accounts,
             commands::swap_account,

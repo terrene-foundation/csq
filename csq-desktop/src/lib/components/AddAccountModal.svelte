@@ -154,10 +154,15 @@
   // Reset to picker whenever the modal re-opens. Cancel any
   // in-flight PKCE state when the modal closes mid-flow so the
   // state store doesn't fill with abandoned entries.
+  //
+  // IMPORTANT: this effect MUST only track `isOpen`. Reading
+  // `nextAccountId` here re-fires the effect when an account is
+  // added (parent recomputes the next free slot), which previously
+  // slammed the user back to `picker` the instant they saw the
+  // success banner. Slot sync lives in the separate effect above.
   $effect(() => {
     if (isOpen) {
       step = { kind: 'picker' };
-      chosenSlot = nextAccountId;
       let cancelled = false;
       (async () => {
         if (!cancelled) {
@@ -808,20 +813,5 @@
     padding: 0.55rem 0.7rem;
     color: #4caf50;
     font-size: 0.9rem;
-  }
-
-  .url-box {
-    width: 100%;
-    padding: 0.5rem;
-    margin: 0.35rem 0;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: inherit;
-    font: inherit;
-    font-family: ui-monospace, monospace;
-    font-size: 0.75rem;
-    resize: vertical;
-    word-break: break-all;
   }
 </style>

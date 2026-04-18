@@ -432,6 +432,16 @@ fn resolve_js_runtime() -> Option<String> {
     None
 }
 
+/// Returns the first working `node` or `bun` path, or `None` if none
+/// is available. Thin public wrapper over `resolve_js_runtime` for
+/// diagnostic callers (e.g. `csq doctor`) that want to surface a
+/// "no JS runtime found" warning. Intentionally uncached — doctor is
+/// a one-shot command, and the HTTP client has its own memoized
+/// [`find_js_runtime`] for hot paths.
+pub fn js_runtime_path() -> Option<String> {
+    resolve_js_runtime()
+}
+
 /// Spawns `path --version` and reports whether the invocation
 /// succeeded. For bare names this still relies on PATH resolution
 /// (stage 1); for absolute paths it's an explicit exec (stage 2).

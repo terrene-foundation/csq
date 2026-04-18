@@ -7,7 +7,7 @@
 //! Outputs color-coded text by default, or structured JSON with `--json`.
 
 use anyhow::Result;
-use csq_core::accounts::discovery;
+use csq_core::accounts::{discovery, AccountSource};
 use csq_core::broker::fanout;
 use csq_core::credentials::file as cred_file;
 use csq_core::platform::process::is_pid_alive;
@@ -20,12 +20,44 @@ struct DoctorReport {
     version: String,
     platform: PlatformInfo,
     claude_code: ClaudeCodeInfo,
+    js_runtime: JsRuntimeInfo,
     settings: SettingsInfo,
     daemon: DaemonInfo,
     accounts: AccountsInfo,
     broker_failed: BrokerFailedInfo,
+    mixed_state_slots: MixedStateInfo,
     terminals: TerminalInfo,
     resurrections: ResurrectionInfo,
+}
+
+/// Whether a JS runtime (`node` or `bun`) is available for the
+/// Anthropic HTTP subprocess path. `reqwest/rustls` is blocked by
+/// Cloudflare's JA3/JA4 fingerprint (journal 0056), so the token
+/// refresher and usage poller shell out via Node — without one the
+/// daemon cannot refresh OAuth tokens or pull quota.
+#[derive(Serialize)]
+struct JsRuntimeInfo {
+    found: bool,
+    path: Option<String>,
+}
+
+/// One slot that has BOTH a 3P `config-N/settings.json` env block
+/// AND a valid OAuth `credentials/N.json`. This is an inconsistent
+/// state usually caused by partial recovery: e.g. `csq login N` ran
+/// but the pre-existing 3P env block was not stripped, so CC still
+/// routes to the 3P endpoint despite having OAuth creds. Resolve by
+/// running `csq login N` on a build that includes the automatic
+/// unbind (PR #130) or manually removing the env block.
+#[derive(Serialize)]
+struct MixedStateSlot {
+    account: u16,
+    provider: String,
+}
+
+#[derive(Serialize)]
+struct MixedStateInfo {
+    count: usize,
+    entries: Vec<MixedStateSlot>,
 }
 
 /// Counts of canonical-credentials resurrection events the daemon
@@ -136,12 +168,71 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: check_platform(),
         claude_code: check_claude_code(),
+        js_runtime: check_js_runtime(),
         settings: check_settings(),
         daemon: check_daemon(base_dir),
         accounts: check_accounts(base_dir),
         broker_failed: check_broker_failed(base_dir),
+        mixed_state_slots: check_mixed_state_slots(base_dir),
         terminals: check_terminals(base_dir),
         resurrections: check_resurrections(base_dir),
+    }
+}
+
+/// Probes for a `node` or `bun` binary using the same two-stage
+/// resolver as the HTTP client (PATH + known install locations).
+/// The daemon cannot refresh tokens or poll quota without one, so
+/// `not found` is reported as a WARN.
+fn check_js_runtime() -> JsRuntimeInfo {
+    match csq_core::http::js_runtime_path() {
+        Some(p) => JsRuntimeInfo {
+            found: true,
+            path: Some(p),
+        },
+        None => JsRuntimeInfo {
+            found: false,
+            path: None,
+        },
+    }
+}
+
+/// Finds slots whose `config-N/settings.json` carries a 3P env block
+/// AND whose `credentials/N.json` is a valid OAuth credential.
+///
+/// This is a mixed-state slot — on `csq run N` CC will route to the
+/// 3P endpoint because `env.ANTHROPIC_BASE_URL` wins over OAuth, so
+/// the OAuth credential sits unused. `csq login N` on a post-PR-#130
+/// build auto-strips the 3P env block; older installs leave the slot
+/// stuck.
+fn check_mixed_state_slots(base_dir: &Path) -> MixedStateInfo {
+    let third_party = discovery::discover_per_slot_third_party(base_dir);
+    let mut entries: Vec<MixedStateSlot> = Vec::new();
+
+    for slot in third_party {
+        let Ok(num) = AccountNum::try_from(slot.id) else {
+            continue;
+        };
+        let canonical = cred_file::canonical_path(base_dir, num);
+        // Only flag when the OAuth file is parseable. A corrupt or
+        // empty `credentials/N.json` isn't "mixed state" — it's a
+        // separate kind of broken that other doctor checks surface
+        // (`expired`, `broker_failed`).
+        if csq_core::credentials::load(&canonical).is_ok() {
+            let provider = match &slot.source {
+                AccountSource::ThirdParty { provider } => provider.clone(),
+                _ => "third-party".to_string(),
+            };
+            entries.push(MixedStateSlot {
+                account: slot.id,
+                provider,
+            });
+        }
+    }
+
+    entries.sort_by_key(|e| e.account);
+    MixedStateInfo {
+        count: entries.len(),
+        entries,
     }
 }
 
@@ -596,6 +687,15 @@ fn print_report(r: &DoctorReport) {
     };
     println!("  Claude Code: {cc_icon} {cc_detail}");
 
+    // JS runtime (node/bun) — required for the Cloudflare-bypass
+    // HTTP path. Missing runtime = broken token refresh + quota poll.
+    let js_icon = if r.js_runtime.found { ok() } else { warn() };
+    let js_detail = match &r.js_runtime.path {
+        Some(p) => format!("found at {p}"),
+        None => "not found — daemon can't refresh tokens or poll quota; install node or bun".into(),
+    };
+    println!("  JS runtime:  {js_icon} {js_detail}");
+
     // Settings
     let settings_icon = if r.settings.statusline_configured {
         ok()
@@ -656,6 +756,20 @@ fn print_report(r: &DoctorReport) {
         acct_detail.push_str(&format!(", {} expired", r.accounts.expired));
     }
     println!("  Accounts:    {acct_icon} {acct_detail}");
+
+    // Mixed-state slots (3P env block + OAuth creds)
+    if r.mixed_state_slots.count > 0 {
+        for entry in &r.mixed_state_slots.entries {
+            println!(
+                "  Mixed:       {} Slot {} has both {} env and OAuth creds — CC will route via {}. Run `csq login {}` to unbind.",
+                warn(),
+                entry.account,
+                entry.provider,
+                entry.provider,
+                entry.account,
+            );
+        }
+    }
 
     // Broker-failed sentinels
     if r.broker_failed.count > 0 {
@@ -902,6 +1016,10 @@ mod tests {
                 path: None,
                 version: None,
             },
+            js_runtime: JsRuntimeInfo {
+                found: false,
+                path: None,
+            },
             settings: SettingsInfo {
                 exists: false,
                 statusline_configured: false,
@@ -918,6 +1036,10 @@ mod tests {
                 expired: 0,
             },
             broker_failed: BrokerFailedInfo {
+                count: 0,
+                entries: Vec::new(),
+            },
+            mixed_state_slots: MixedStateInfo {
                 count: 0,
                 entries: Vec::new(),
             },
@@ -1245,6 +1367,90 @@ mod tests {
         assert_eq!(info.entries[0].account, 2);
         assert_eq!(info.entries[1].account, 4);
         assert_eq!(info.entries[2].account, 7);
+    }
+
+    // ── mixed-state slot tests ─────────────────────────────────
+
+    #[test]
+    fn check_mixed_state_slots_reports_empty_when_no_slots_mixed() {
+        let tmp = TempDir::new().unwrap();
+        let info = check_mixed_state_slots(tmp.path());
+        assert_eq!(info.count, 0);
+        assert!(info.entries.is_empty());
+    }
+
+    #[test]
+    fn check_mixed_state_slots_flags_oauth_plus_3p_slot() {
+        // Arrange: write a 3P env block AND a valid-shape OAuth
+        // credential for slot 3. This is the exact state the PR
+        // #130 login flow now prevents; older installs can still
+        // produce it via manual filesystem edits.
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config-3");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.minimax.io/anthropic","ANTHROPIC_AUTH_TOKEN":"sk-fake-minimax-12345"}}"#,
+        ).unwrap();
+
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        // Minimum-viable OAuth credential — must parse, concrete values don't matter.
+        std::fs::write(
+            creds_dir.join("3.json"),
+            r#"{"claudeAiOauth":{"accessToken":"oat-stub","refreshToken":"rt-stub","expiresAt":9999999999999,"scopes":["user:profile"],"subscriptionType":"max"}}"#,
+        ).unwrap();
+
+        // Act
+        let info = check_mixed_state_slots(tmp.path());
+
+        // Assert
+        assert_eq!(info.count, 1, "slot 3 should be flagged");
+        assert_eq!(info.entries[0].account, 3);
+        assert_eq!(info.entries[0].provider, "MiniMax");
+    }
+
+    #[test]
+    fn check_mixed_state_slots_ignores_3p_only_slot() {
+        // 3P env block without any OAuth credential is the normal
+        // MM/Z.AI/Ollama state — must not be flagged.
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config-3");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"http://localhost:11434","ANTHROPIC_AUTH_TOKEN":"ollama"}}"#,
+        ).unwrap();
+
+        let info = check_mixed_state_slots(tmp.path());
+        assert_eq!(info.count, 0);
+    }
+
+    #[test]
+    fn check_mixed_state_slots_ignores_oauth_only_slot() {
+        // Pure OAuth slot (no 3P settings) is the normal Anthropic
+        // path — must not be flagged.
+        let tmp = TempDir::new().unwrap();
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("1.json"),
+            r#"{"claudeAiOauth":{"accessToken":"oat-stub","refreshToken":"rt-stub","expiresAt":9999999999999,"scopes":["user:profile"],"subscriptionType":"max"}}"#,
+        ).unwrap();
+
+        let info = check_mixed_state_slots(tmp.path());
+        assert_eq!(info.count, 0);
+    }
+
+    // ── js_runtime test ────────────────────────────────────────
+
+    #[test]
+    fn check_js_runtime_returns_consistent_structure() {
+        // Can't assume the CI has node/bun installed — just assert
+        // the invariant: `found == path.is_some()`. Exhaustive probe
+        // logic lives in csq_core::http tests.
+        let info = check_js_runtime();
+        assert_eq!(info.found, info.path.is_some());
     }
 
     #[test]

@@ -9,6 +9,8 @@
     "core:tray:default",
     "core:event:default",
     "opener:default",
-    "autostart:default"
+    "autostart:default",
+    "updater:default",
+    "process:default"
   ]
 }

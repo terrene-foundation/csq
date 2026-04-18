@@ -153,6 +153,14 @@ jobs:
 
       - name: Build desktop
         working-directory: csq-desktop
+        # TAURI_SIGNING_* env vars trigger `createUpdaterArtifacts:
+        # true` in tauri.conf.json to emit `.app.tar.gz`,
+        # `.AppImage.tar.gz`, and `-setup.nsis.zip` bundles alongside
+        # the regular installers, each paired with a minisign `.sig`
+        # file the updater plugin verifies on install.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx @tauri-apps/cli build
         timeout-minutes: 45
 
@@ -213,23 +221,56 @@ jobs:
           # Tauri outputs land under target/release/bundle/<format>/
           if [ "$RUNNER_OS" = "Linux" ]; then
             find target/release/bundle -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) -exec cp {} dist-desktop/ \;
+            # Updater bundle (AppImage-based) + its minisign signature.
+            find target/release/bundle -type f \( -name "*.AppImage.tar.gz" -o -name "*.AppImage.tar.gz.sig" \) -exec cp {} dist-desktop/ \;
           elif [ "$RUNNER_OS" = "macOS" ]; then
             find target/release/bundle -type f -name "*.dmg" -exec cp {} dist-desktop/ \;
+            # Updater bundle (.app.tar.gz) + minisign signature.
+            find target/release/bundle -type f \( -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) -exec cp {} dist-desktop/ \;
           elif [ "$RUNNER_OS" = "Windows" ]; then
             find target/release/bundle -type f \( -name "*.msi" -o -name "*.exe" \) -exec cp {} dist-desktop/ \;
+            # NSIS setup is the updater path on Windows; MSI would
+            # require separate `.msi.zip` packaging (not emitted by
+            # default). NSIS ships both `-setup.exe` and its `.sig`.
+            find target/release/bundle -type f \( -name "*-setup.exe.sig" -o -name "*-setup.nsis.zip" -o -name "*-setup.nsis.zip.sig" \) -exec cp {} dist-desktop/ \;
           fi
-          # Rename to a predictable scheme: csq-desktop-<platform>.<ext>
+          # Rename installers to csq-desktop-<platform>.<ext>.
+          # Updater bundles get a longer name so they stay
+          # distinguishable from the `.dmg` / `.AppImage` installers
+          # and the publish job can spot them for `latest.json`.
           cd dist-desktop
           for f in *; do
-            ext="${f##*.}"
-            case "$ext" in
-              deb|rpm|AppImage|dmg|msi|exe)
-                mv "$f" "csq-desktop-${{ matrix.platform }}.${ext}"
-                ;;
+            case "$f" in
+              *.app.tar.gz)       mv "$f" "csq-desktop-${{ matrix.platform }}.app.tar.gz" ;;
+              *.app.tar.gz.sig)   mv "$f" "csq-desktop-${{ matrix.platform }}.app.tar.gz.sig" ;;
+              *.AppImage.tar.gz)  mv "$f" "csq-desktop-${{ matrix.platform }}.AppImage.tar.gz" ;;
+              *.AppImage.tar.gz.sig) mv "$f" "csq-desktop-${{ matrix.platform }}.AppImage.tar.gz.sig" ;;
+              *-setup.nsis.zip)   mv "$f" "csq-desktop-${{ matrix.platform }}-setup.nsis.zip" ;;
+              *-setup.nsis.zip.sig) mv "$f" "csq-desktop-${{ matrix.platform }}-setup.nsis.zip.sig" ;;
+              *-setup.exe.sig)    mv "$f" "csq-desktop-${{ matrix.platform }}-setup.exe.sig" ;;
             esac
           done
-          # Compute SHA256 for each remaining file
+          # Then rename the installers. Guard against colliding with
+          # the updater bundles already renamed above — the ext check
+          # on a trailing `.tar.gz` would collapse to `gz`.
+          for f in *; do
+            case "$f" in
+              csq-desktop-*) continue ;;
+              *.deb)       mv "$f" "csq-desktop-${{ matrix.platform }}.deb" ;;
+              *.rpm)       mv "$f" "csq-desktop-${{ matrix.platform }}.rpm" ;;
+              *.AppImage)  mv "$f" "csq-desktop-${{ matrix.platform }}.AppImage" ;;
+              *.dmg)       mv "$f" "csq-desktop-${{ matrix.platform }}.dmg" ;;
+              *.msi)       mv "$f" "csq-desktop-${{ matrix.platform }}.msi" ;;
+              *.exe)       mv "$f" "csq-desktop-${{ matrix.platform }}.exe" ;;
+            esac
+          done
+          # Compute SHA256 for installers only — `.sig` files from
+          # the Tauri signer are themselves text and should not be
+          # hashed for the SHA256SUMS file.
           for f in csq-desktop-*; do
+            case "$f" in
+              *.sig) continue ;;
+            esac
             if [ -f "$f" ]; then
               if [ "$RUNNER_OS" = "Windows" ]; then
                 certutil -hashfile "$f" SHA256 | grep -v ":" | tr -d ' \r' > "$f.sha256"
@@ -326,11 +367,15 @@ jobs:
             exit 1
           fi
 
-          # Filter out anything that's already a signature or checksum.
+          # Filter out anything that's already a signature or checksum,
+          # AND the updater bundles (*.tar.gz, *-setup.nsis.zip) — those
+          # carry a Tauri minisign `.sig` produced at build time and
+          # double-signing would collide on the output filename.
           to_sign=()
           for f in "${targets[@]}"; do
             case "$f" in
               *.sig|*.sha256) ;;
+              *.tar.gz|*-setup.nsis.zip) ;;
               *) [ -f "$f" ] && to_sign+=("$f") ;;
             esac
           done
@@ -365,6 +410,82 @@ jobs:
           unset RELEASE_SIGNING_KEY
 
           ls -la
+
+      - name: Generate latest.json for tauri-plugin-updater
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # tauri-plugin-updater polls an endpoint that returns a JSON
+          # manifest keyed by `<os>-<arch>`; the plugin compares the
+          # shipped binary version to `version` and — if newer —
+          # downloads the per-platform URL, verifies the `signature`
+          # (minisign format) against the pubkey baked into the app,
+          # and swaps the bundle. Manifest is uploaded as
+          # `latest.json` in the same release assets.
+          #
+          # Platforms we publish today: darwin-aarch64 (from macOS
+          # runner), linux-x86_64, windows-x86_64. darwin-x86_64 is
+          # intentionally omitted — the macOS runner is arm64 and we
+          # don't cross-build desktop bundles. Intel Mac users on
+          # the CLI path are unaffected.
+          cd release-assets
+
+          export VERSION="${TAG#v}"
+          export PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export RELEASE_URL_BASE="https://github.com/terrene-foundation/csq/releases/download/${TAG}"
+
+          read_sig() {
+            # Minisign `.sig` files are short text blobs. Read them
+            # verbatim so `latest.json` can embed them as a single
+            # `signature` string the plugin validates at install time.
+            local path="$1"
+            if [ -f "$path" ]; then
+              cat "$path"
+            fi
+          }
+
+          export DARWIN_AARCH64_SIG="$(read_sig csq-desktop-macos.app.tar.gz.sig)"
+          export LINUX_X86_64_SIG="$(read_sig csq-desktop-linux.AppImage.tar.gz.sig)"
+          export WINDOWS_X86_64_SIG="$(read_sig csq-desktop-windows-setup.nsis.zip.sig)"
+
+          # Build the manifest only from platforms whose updater
+          # bundle + signature are both present. Missing pairs
+          # reduce to an empty `platforms` branch — out-of-date
+          # clients on that OS keep the banner but stay on the
+          # manual download path rather than erroring.
+          python3 <<'PY' > latest.json
+          import json, os
+
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          pub_date = os.environ["PUB_DATE"]
+          base = os.environ["RELEASE_URL_BASE"]
+
+          platforms = {}
+          sigs = {
+              "darwin-aarch64": ("csq-desktop-macos.app.tar.gz", os.environ.get("DARWIN_AARCH64_SIG", "")),
+              "linux-x86_64": ("csq-desktop-linux.AppImage.tar.gz", os.environ.get("LINUX_X86_64_SIG", "")),
+              "windows-x86_64": ("csq-desktop-windows-setup.nsis.zip", os.environ.get("WINDOWS_X86_64_SIG", "")),
+          }
+          for key, (filename, sig) in sigs.items():
+              if sig and os.path.exists(filename):
+                  platforms[key] = {
+                      "signature": sig,
+                      "url": f"{base}/{filename}",
+                  }
+
+          manifest = {
+              "version": version,
+              "notes": f"csq {version} — see https://github.com/terrene-foundation/csq/releases/tag/{tag}",
+              "pub_date": pub_date,
+              "platforms": platforms,
+          }
+          print(json.dumps(manifest, indent=2))
+          PY
+
+          echo "--- generated latest.json ---"
+          cat latest.json
 
       - name: Upload assets to release
         uses: softprops/action-gh-release@v2

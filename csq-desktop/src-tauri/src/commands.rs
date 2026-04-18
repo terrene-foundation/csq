@@ -854,6 +854,8 @@ pub fn cancel_login(state: State<'_, AppState>, state_token: String) -> Result<(
 /// - `"provider X uses OAuth, not API keys"` — wrong flow for Claude
 /// - `"provider X does not use API keys"` — keyless provider
 /// - `"key must not be empty"` — empty input
+/// - `"key too short ..."` — fewer than 8 bytes after trimming
+/// - `"key contains control characters ..."` — control byte in key
 /// - `"key too long"` — input >4096 bytes
 #[tauri::command]
 pub fn set_provider_key(
@@ -863,6 +865,10 @@ pub fn set_provider_key(
 ) -> Result<String, String> {
     // 4096 matches MAX_KEY_LEN in csq-cli setkey.
     const MAX_KEY_LEN: usize = 4096;
+    // Mirrors csq_core::accounts::third_party::MIN_KEY_LEN (journal 0058).
+    // Defense in depth against ESC / garbage tokens slipping through the
+    // Bearer form's input box.
+    const MIN_KEY_LEN: usize = 8;
 
     let provider = providers::get_provider(&provider_id)
         .ok_or_else(|| format!("unknown provider: {provider_id}"))?;
@@ -885,6 +891,12 @@ pub fn set_provider_key(
     }
     if key.len() > MAX_KEY_LEN {
         return Err(format!("key too long (limit {MAX_KEY_LEN} bytes)"));
+    }
+    if key.len() < MIN_KEY_LEN {
+        return Err(format!("key too short (need at least {MIN_KEY_LEN} bytes)"));
+    }
+    if key.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("key contains control characters — check your clipboard and try again".into());
     }
 
     let base = PathBuf::from(&base_dir);
@@ -1179,6 +1191,37 @@ mod tests {
         let long_key = "x".repeat(5000);
         let err = set_provider_key("/fake".into(), "mm".into(), long_key).unwrap_err();
         assert!(err.contains("too long"));
+    }
+
+    #[test]
+    fn set_provider_key_rejects_key_shorter_than_min() {
+        // Seven-char key passes the old "non-empty" gate but is
+        // obviously not a real API key — MM JWTs are kilobytes, Z.AI
+        // keys are 40+ chars. Must match the csq-core shape gate.
+        let err = set_provider_key("/fake".into(), "mm".into(), "short12".into()).unwrap_err();
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn set_provider_key_rejects_key_with_control_char() {
+        // ESC (0x1b) slipping through the Bearer form's password
+        // input is the desktop twin of the CLI bug in journal 0058.
+        let key = "valid-prefix\x1b-rest".to_string();
+        let err = set_provider_key("/fake".into(), "mm".into(), key).unwrap_err();
+        assert!(err.contains("control characters"), "got: {err}");
+    }
+
+    #[test]
+    fn set_provider_key_order_rejects_too_short_before_too_long() {
+        // Sanity: the order of checks matters only when all three
+        // could apply. Verify "too long" still fires before "too
+        // short" — a 5000-char key with control chars should still
+        // hit the too-long branch, not control-char, because the
+        // length ceiling is a cheaper check and a huge input is
+        // almost certainly a clipboard mishap.
+        let key = "x".repeat(5000);
+        let err = set_provider_key("/fake".into(), "mm".into(), key).unwrap_err();
+        assert!(err.contains("too long"), "got: {err}");
     }
 
     // ── bind_keyless_provider validation ───────────────────────

@@ -46,6 +46,9 @@
         "windowSize": { "width": 560, "height": 400 }
       }
     },
+    "windows": {
+      "wix": { "version": "2.0.15" }
+    },
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libappindicator3-1"],

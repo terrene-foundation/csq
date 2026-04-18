@@ -66,7 +66,7 @@
 <header>
   <div class="left">
     <h1>Code Session Quota</h1>
-    <span class="version">v2.0.0</span>
+    <span class="version">v2.0.0-alpha.15</span>
   </div>
   <div class="right">
     <label class="autostart" title="Start Code Session Quota automatically when you log in">

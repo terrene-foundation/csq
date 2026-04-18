@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Code Session Quota",
-  "version": "2.0.0",
+  "version": "2.0.0-alpha.15",
   "identifier": "foundation.terrene.claude-squad",
   "build": {
     "frontendDist": "../dist",

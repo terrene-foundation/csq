@@ -4,6 +4,7 @@
   import UsageBar from './UsageBar.svelte';
   import TokenBadge from './TokenBadge.svelte';
   import AddAccountModal from './AddAccountModal.svelte';
+  import ChangeModelModal from './ChangeModelModal.svelte';
 
   interface AccountView {
     id: number;
@@ -22,6 +23,10 @@
     /// Rendered next to the token status so "Expired" grows a
     /// "— invalid token" suffix when the refresh token is dead.
     last_refresh_error: string | null;
+    /// Stable 3P provider id ("mm" | "zai" | "ollama"), or null
+    /// for Anthropic OAuth slots. Used to branch UI on provider
+    /// type (e.g. only Ollama slots get a "Change model" button).
+    provider_id: string | null;
   }
 
   /// Maps the backend's fixed-vocabulary error tag to human text.
@@ -57,6 +62,8 @@
   let loading = $state(true);
   let modalOpen = $state(false);
   let reauthSlot = $state<number | null>(null);
+  // Ollama-slot model-change modal. `null` = closed; number = slot id.
+  let changeModelSlot = $state<number | null>(null);
   // Two-tap remove: the first click on the × button arms the
   // confirmation; the second click on the same card commits. Tapping
   // any other card or letting the auto-disarm timer fire resets it.
@@ -436,6 +443,18 @@
             Re-auth
           </button>
         {/if}
+        {#if account.provider_id === 'ollama'}
+          <button
+            class="change-model-btn"
+            onclick={(e) => {
+              e.stopPropagation();
+              changeModelSlot = account.id;
+            }}
+            title="Switch which local Ollama model this slot uses"
+          >
+            Change model
+          </button>
+        {/if}
       </div>
     {/each}
   </div>
@@ -451,6 +470,13 @@
   reauthSlot={reauthSlot}
   onClose={() => { reauthSlot = null; modalOpen = false; }}
   onAccountAdded={() => fetchAccounts()}
+/>
+
+<ChangeModelModal
+  isOpen={changeModelSlot !== null}
+  slot={changeModelSlot ?? 0}
+  onClose={() => { changeModelSlot = null; }}
+  onChanged={() => fetchAccounts()}
 />
 
 <style>
@@ -598,6 +624,22 @@
   }
   .reauth-btn:hover {
     background: rgba(244, 67, 54, 0.18);
+  }
+  .change-model-btn {
+    padding: 0.4rem 0.75rem;
+    background: var(--bg-secondary);
+    border: none;
+    border-top: 1px solid var(--border);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: center;
+    transition: color 0.15s;
+  }
+  .change-model-btn:hover {
+    color: var(--accent);
   }
   .account-header {
     display: flex;

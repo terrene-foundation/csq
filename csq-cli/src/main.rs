@@ -213,6 +213,19 @@ enum ModelsCmd {
         provider: String,
         /// Model ID or alias
         model: String,
+        /// Retarget a slot's `config-N/settings.json` instead of
+        /// the global profile file. Required when the slot was
+        /// bound via `csq setkey <provider> --slot N` — editing
+        /// the global profile wouldn't affect the slot.
+        #[arg(long)]
+        slot: Option<u16>,
+        /// For keyless providers (Ollama): when the chosen model
+        /// isn't in `ollama list`, run `ollama pull <model>`
+        /// before writing. Default: on. Pass `--no-pull` to
+        /// refuse the network fetch (e.g. writing a model id
+        /// for a machine you'll `ollama pull` on later).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        pull_if_missing: bool,
     },
 }
 
@@ -302,8 +315,26 @@ fn main() -> Result<()> {
                 ModelsCmd::List { provider } => {
                     commands::models::handle_list(&base_dir, &provider, json)
                 }
-                ModelsCmd::Switch { provider, model } => {
-                    commands::models::handle_switch(&base_dir, &provider, &model)
+                ModelsCmd::Switch {
+                    provider,
+                    model,
+                    slot,
+                    pull_if_missing,
+                } => {
+                    let slot = match slot {
+                        Some(n) => Some(
+                            AccountNum::try_from(n)
+                                .map_err(|e| anyhow::anyhow!("invalid --slot: {e}"))?,
+                        ),
+                        None => None,
+                    };
+                    commands::models::handle_switch(
+                        &base_dir,
+                        &provider,
+                        &model,
+                        slot,
+                        pull_if_missing,
+                    )
                 }
             }
         }

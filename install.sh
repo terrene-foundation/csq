@@ -265,26 +265,11 @@ main() {
     install -m 0755 "$tmp/$artifact" "$bin_dir/csq"
     ok "Installed csq to ${bin_dir}/csq"
 
-    # ── Deploy statusline script ──────────────────────────────
-    # The statusline-quota.sh script runs inside CC's statusLine hook.
-    # It's a pure-shell wrapper that calls `csq statusline` and formats
-    # the output. Unlike the binary, it's not versioned in the release
-    # assets — we fetch it from the repo at the same tag to keep the
-    # script and binary in sync.
-    local sl_dir="$HOME/.claude/accounts"
-    local sl_path="${sl_dir}/statusline-quota.sh"
-    local sl_url="https://raw.githubusercontent.com/${REPO}/${tag}/statusline-quota.sh"
-
-    mkdir -p "$sl_dir"
-    if curl -fsSL -o "$tmp/statusline-quota.sh" "$sl_url" 2>/dev/null; then
-        install -m 0755 "$tmp/statusline-quota.sh" "$sl_path"
-        ok "Updated statusline script at ${sl_path}"
-    else
-        # Not fatal — the script may not exist in very old tags.
-        # The binary works without it; the user just won't get the
-        # rich statusline until the script is updated.
-        warn "could not download statusline-quota.sh (non-fatal)"
-    fi
+    # The rich statusline (account + quota + model + project +
+    # context window + cost + git) now lives entirely inside the
+    # `csq statusline` binary. Earlier versions shipped a companion
+    # `statusline-quota.sh` shell wrapper; post-alpha.18 that script
+    # is obsolete and `csq install` backs up any lingering copy.
 
     echo
     if echo ":$PATH:" | grep -q ":$bin_dir:"; then

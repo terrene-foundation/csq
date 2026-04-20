@@ -33,6 +33,14 @@ pub fn handle() -> Result<()> {
         println!("  ✓ Patched {}/settings.json", claude_home.display());
     }
 
+    // Seed an empty keybindings.json if the user doesn't already
+    // have one. CC expects this file to exist; without it the UI
+    // logs a keybinding-error on every launch. Non-destructive —
+    // we only create it when missing, never overwrite.
+    if seed_keybindings_json(&claude_home)? {
+        println!("  ✓ Seeded {}/keybindings.json", claude_home.display());
+    }
+
     // Clean up v1.x artifacts
     let cleaned = cleanup_v1_artifacts(&claude_home);
     if !cleaned.is_empty() {
@@ -100,6 +108,29 @@ fn patch_settings_json(claude_home: &Path) -> Result<()> {
     csq_core::platform::fs::atomic_replace(&tmp, &path)
         .map_err(|e| anyhow!("atomic replace: {e}"))?;
     Ok(())
+}
+
+/// Creates `<claude_home>/keybindings.json` with `{"bindings": []}`
+/// only if the file does not already exist. Returns `Ok(true)`
+/// when the file was created, `Ok(false)` when it was already
+/// present (no-op). Never overwrites — user customization wins.
+///
+/// CC logs a keybinding-error on every launch when this file is
+/// absent. csq's handle-dir model then symlinks each terminal's
+/// `keybindings.json` to the global one, so seeding the global
+/// eliminates the error across every spawned session.
+fn seed_keybindings_json(claude_home: &Path) -> Result<bool> {
+    std::fs::create_dir_all(claude_home)?;
+    let path = claude_home.join("keybindings.json");
+    if path.exists() {
+        return Ok(false);
+    }
+    let tmp = csq_core::platform::fs::unique_tmp_path(&path);
+    std::fs::write(&tmp, b"{\n  \"bindings\": []\n}\n")
+        .with_context(|| format!("writing temp file {}", tmp.display()))?;
+    csq_core::platform::fs::atomic_replace(&tmp, &path)
+        .map_err(|e| anyhow!("atomic replace: {e}"))?;
+    Ok(true)
 }
 
 /// Detects a v1.x statusline command in settings.json.
@@ -285,5 +316,38 @@ mod tests {
     fn backup_artifact_missing_is_noop() {
         let dir = TempDir::new().unwrap();
         assert!(!backup_artifact(&dir.path().join("nonexistent.sh")));
+    }
+
+    #[test]
+    fn seed_keybindings_creates_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let created = seed_keybindings_json(dir.path()).unwrap();
+        assert!(created, "should return true when file was created");
+
+        let path = dir.path().join("keybindings.json");
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(v.get("bindings").is_some_and(|b| b.is_array()));
+    }
+
+    #[test]
+    fn seed_keybindings_preserves_existing_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keybindings.json");
+        // Pretend the user already set up custom bindings.
+        std::fs::write(
+            &path,
+            r#"{"bindings": [{"key": "ctrl+s", "command": "save"}]}"#,
+        )
+        .unwrap();
+
+        let created = seed_keybindings_json(dir.path()).unwrap();
+        assert!(!created, "should return false when file already exists");
+
+        // Custom bindings must survive — we never overwrite.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("ctrl+s"));
+        assert!(content.contains("save"));
     }
 }

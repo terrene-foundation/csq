@@ -118,6 +118,15 @@ pub struct AppState {
     pub oauth_store: Arc<OAuthStateStore>,
     pub daemon_supervisor: Mutex<Option<SupervisorHandle>>,
     pub update_cache: Mutex<Option<CachedUpdateInfo>>,
+    /// Running `ollama pull` child, shared between the
+    /// pull worker and the cancel command. Wrapped in
+    /// `Arc<Mutex<...>>` so the cancel path can hold a
+    /// reference across the subprocess's lifetime without
+    /// the pull worker needing to give up its
+    /// `State<AppState>` borrow. Cleared by the pull worker
+    /// on normal exit; populated for the duration of any
+    /// live `ollama pull`.
+    pub ollama_pull_child: Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
 }
 
 /// Maximum length of an account label shown in the tray.
@@ -292,11 +301,19 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
     let open_dashboard = MenuItemBuilder::with_id("open", "Open Dashboard").build(app)?;
     let hide_dashboard = MenuItemBuilder::with_id("hide", "Hide Dashboard").build(app)?;
+    // On-demand update trigger — bypasses the 30-min timer so the
+    // user doesn't have to quit+relaunch after a release cut while
+    // the app was running. Calls `request_update_check_now()`
+    // which wakes the background loop via a mpsc channel.
+    let check_updates =
+        MenuItemBuilder::with_id("check_updates", "Check for updates").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit csq").build(app)?;
 
     builder
         .item(&open_dashboard)
         .item(&hide_dashboard)
+        .item(&PredefinedMenuItem::separator(app)?)
+        .item(&check_updates)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&quit)
         .build()
@@ -555,6 +572,122 @@ fn perform_tray_swap(base: &Path, account: AccountNum) -> TraySwapResult {
 /// queued — queuing leads to confusing "which click won?" UX).
 static SWAP_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Interval between background update checks (30 minutes).
+///
+/// Lower bound: GitHub API rate-limit is 60 unauthenticated
+/// requests/hour, so even a 60-second cadence would be safe — but
+/// 30 minutes is the right signal-to-noise for the user (a release
+/// cut while they're idle surfaces within half an hour without
+/// pestering GitHub every few seconds).
+///
+/// Tests use `cfg!(test)` to shorten the loop, but the const itself
+/// stays at the production value — the channel-driven early wake
+/// makes test-only overrides unnecessary.
+const UPDATE_CHECK_INTERVAL_SECS: u64 = 30 * 60;
+
+/// Channel for on-demand update checks. Only the Sender half is
+/// a static — the background update-check loop owns the Receiver
+/// locally, so there's only ever one consumer and no mutex is
+/// needed. The tray menu item calls `request_update_check_now()`
+/// which sends a unit; the loop's `recv_timeout` wakes early, the
+/// loop drains any additional queued messages non-blockingly (so
+/// 100 user clicks coalesce into one check), and then runs the
+/// check.
+static UPDATE_CHECK_TX: std::sync::OnceLock<std::sync::mpsc::Sender<()>> =
+    std::sync::OnceLock::new();
+
+/// Lower bound for the update-check loop's back-off. Always the
+/// second-through-first wait; only affects the RECOVERY interval
+/// after a failed check — success resets to [`UPDATE_CHECK_INTERVAL_SECS`].
+const UPDATE_CHECK_BACKOFF_MIN_SECS: u64 = 60;
+
+/// Upper bound for exponential backoff. Caps an offline laptop's
+/// checks at one every six hours so we don't burn battery waking
+/// up DNS for an unreachable host every 30 minutes.
+const UPDATE_CHECK_BACKOFF_MAX_SECS: u64 = 6 * 3600;
+
+/// Publishes a manual update-check request. Non-blocking: if the
+/// background loop is already on the wait side of `recv_timeout`
+/// it wakes up immediately; if it's mid-check the send queues and
+/// the NEXT loop iteration picks it up. Failure to send (receiver
+/// dropped on shutdown) is logged at debug and swallowed — tray
+/// clicks during teardown shouldn't panic the process.
+fn request_update_check_now() {
+    match UPDATE_CHECK_TX.get() {
+        Some(tx) => {
+            if let Err(e) = tx.send(()) {
+                tracing::debug!(error = %e, "update-check channel closed");
+            }
+        }
+        None => {
+            // Sender not yet initialized — the bg loop hasn't
+            // started. Silently drop; a check is coming anyway
+            // when the loop fires 10s after launch.
+            tracing::debug!("update-check sender not yet initialized; ignoring manual trigger");
+        }
+    }
+}
+
+/// Return value of [`run_update_check_with_outcome`]: did the
+/// network call succeed (up-to-date or new release), or did it
+/// fail (HTTP error, parse error, rate limit)? Drives the
+/// backoff logic in the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateCheckOutcome {
+    Success,
+    Failure,
+}
+
+/// Single update-check cycle: hit GitHub Releases, cache the
+/// result in `AppState.update_cache`, and emit `update-available`
+/// to the frontend when a newer release exists.
+///
+/// Factored out of the background thread so the 10-second settle
+/// path and the recurring-timer path call the same code. Returns
+/// `()` regardless of outcome — the loop doesn't differentiate
+/// between "up to date" (normal) and "HTTP error" (flaky network)
+/// because both reduce to "don't show a banner this cycle".
+fn run_update_check(handle: &AppHandle) -> UpdateCheckOutcome {
+    match csq_core::update::check_for_update() {
+        Ok(Some(info)) => {
+            let cached = CachedUpdateInfo {
+                version: info.version,
+                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                release_url: info.html_url,
+            };
+            if let Some(state) = handle.try_state::<AppState>() {
+                if let Ok(mut guard) = state.update_cache.lock() {
+                    *guard = Some(cached.clone());
+                }
+            }
+            let _ = handle.emit("update-available", &cached);
+            UpdateCheckOutcome::Success
+        }
+        Ok(None) => {
+            tracing::debug!("update check: up to date");
+            UpdateCheckOutcome::Success
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "update check failed");
+            UpdateCheckOutcome::Failure
+        }
+    }
+}
+
+/// Pure function: compute the next sleep duration given the
+/// number of consecutive failures. Zero failures → normal
+/// cadence. One failure → `UPDATE_CHECK_BACKOFF_MIN_SECS` (60s).
+/// Two failures → 120s. Doubles each subsequent failure, capped
+/// at `UPDATE_CHECK_BACKOFF_MAX_SECS` (6h).
+pub(crate) fn update_check_wait_secs(consecutive_failures: u32) -> u64 {
+    if consecutive_failures == 0 {
+        return UPDATE_CHECK_INTERVAL_SECS;
+    }
+    let exp = consecutive_failures.saturating_sub(1);
+    let raw = UPDATE_CHECK_BACKOFF_MIN_SECS.saturating_mul(1u64 << exp.min(20));
+    raw.min(UPDATE_CHECK_BACKOFF_MAX_SECS)
+}
+
 /// Handles a tray menu click.
 ///
 /// Account rows dispatch the swap work to a `spawn_blocking` worker
@@ -577,6 +710,12 @@ fn handle_tray_event(app: &AppHandle, id: &str) {
         }
         "quit" => {
             app.exit(0);
+        }
+        "check_updates" => {
+            // Non-blocking: publishes to the mpsc channel the
+            // background loop is waiting on. The actual network
+            // call happens on the update-check thread, not here.
+            request_update_check_now();
         }
         s if s.starts_with("acct:") => {
             let Some(num_str) = s.strip_prefix("acct:") else {
@@ -750,6 +889,9 @@ pub fn run() {
             commands::set_provider_key,
             commands::bind_keyless_provider,
             commands::list_ollama_models,
+            commands::set_slot_model,
+            commands::pull_ollama_model,
+            commands::cancel_ollama_pull,
             commands::list_sessions,
             commands::swap_session,
             commands::get_autostart_enabled,
@@ -841,44 +983,60 @@ pub fn run() {
                 oauth_store,
                 daemon_supervisor: Mutex::new(supervisor),
                 update_cache: Mutex::new(None),
+                ollama_pull_child: Arc::new(Mutex::new(None)),
             });
 
             // ── Background update check ────────────────────────
             //
             // Fires 10s after app launch so startup isn't blocked
-            // on a network round-trip. Emits `update-available`
-            // to the frontend if a newer release exists on
-            // GitHub. Frontend listens and shows a banner; the
-            // user can click through to the release page for
-            // manual install (signing key still placeholder, so
-            // in-app install is intentionally not offered).
+            // on a network round-trip, then re-checks on a cadence
+            // that depends on consecutive-failure count:
+            //   - 0 failures → UPDATE_CHECK_INTERVAL_SECS (30 min)
+            //   - N failures → min(60s * 2^(N-1), 6h)
+            //
+            // The recurring cadence closes the gap where a release
+            // cut while the app was already running would never
+            // surface without a quit+relaunch. The backoff prevents
+            // an offline laptop from hammering GitHub every 30 min
+            // for days; success resets the counter.
+            //
+            // The tray's "Check for updates" menu item publishes on
+            // the local-Receiver channel; the loop wakes early,
+            // drains any additional queued messages (coalescing
+            // rapid-fire clicks into one check), and runs.
             let handle_for_update = app.handle().clone();
+            let (update_tx, update_rx) = std::sync::mpsc::channel::<()>();
+            UPDATE_CHECK_TX
+                .set(update_tx)
+                .expect("UPDATE_CHECK_TX set twice — lib::run called more than once?");
             std::thread::spawn(move || {
+                let mut consecutive_failures: u32 = 0;
+                // Initial settle delay so launch isn't blocked.
                 std::thread::sleep(std::time::Duration::from_secs(10));
-                match csq_core::update::check_for_update() {
-                    Ok(Some(info)) => {
-                        let cached = CachedUpdateInfo {
-                            version: info.version,
-                            current_version: env!("CARGO_PKG_VERSION").to_string(),
-                            release_url: info.html_url,
-                        };
-                        // Persist to state cache for get_update_status.
-                        if let Some(state) = handle_for_update.try_state::<AppState>() {
-                            if let Ok(mut guard) = state.update_cache.lock() {
-                                *guard = Some(cached.clone());
-                            }
-                        }
-                        // Notify frontend so the banner renders
-                        // without the dashboard having to poll.
-                        use tauri::Emitter;
-                        let _ = handle_for_update.emit("update-available", &cached);
+                let outcome = run_update_check(&handle_for_update);
+                consecutive_failures = match outcome {
+                    UpdateCheckOutcome::Success => 0,
+                    UpdateCheckOutcome::Failure => consecutive_failures.saturating_add(1),
+                };
+
+                loop {
+                    let wait = update_check_wait_secs(consecutive_failures);
+                    let awoke_early = update_rx
+                        .recv_timeout(std::time::Duration::from_secs(wait))
+                        .is_ok();
+                    if awoke_early {
+                        // Drain any additional queued messages —
+                        // a rapid-fire clicker shouldn't cause N
+                        // sequential GitHub checks. We want one
+                        // check per observable user intent.
+                        while update_rx.try_recv().is_ok() {}
+                        tracing::debug!("update check: manual request");
                     }
-                    Ok(None) => {
-                        tracing::debug!("background update check: up to date");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "background update check failed");
-                    }
+                    let outcome = run_update_check(&handle_for_update);
+                    consecutive_failures = match outcome {
+                        UpdateCheckOutcome::Success => 0,
+                        UpdateCheckOutcome::Failure => consecutive_failures.saturating_add(1),
+                    };
                 }
             });
 
@@ -976,6 +1134,55 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    // ── update-check backoff + channel ──────────────────────
+
+    #[test]
+    fn update_check_wait_zero_failures_is_normal_interval() {
+        assert_eq!(update_check_wait_secs(0), UPDATE_CHECK_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn update_check_wait_one_failure_is_backoff_min() {
+        // First retry waits the configured backoff floor (60s).
+        assert_eq!(update_check_wait_secs(1), UPDATE_CHECK_BACKOFF_MIN_SECS);
+    }
+
+    #[test]
+    fn update_check_wait_doubles_each_failure() {
+        // 60s → 120s → 240s → 480s
+        assert_eq!(update_check_wait_secs(2), 120);
+        assert_eq!(update_check_wait_secs(3), 240);
+        assert_eq!(update_check_wait_secs(4), 480);
+    }
+
+    #[test]
+    fn update_check_wait_caps_at_max() {
+        // Plenty of failures — must saturate at the 6-hour ceiling
+        // rather than overflow or grow unbounded.
+        assert_eq!(update_check_wait_secs(30), UPDATE_CHECK_BACKOFF_MAX_SECS);
+        // Very high counts must also cap without panicking.
+        assert_eq!(
+            update_check_wait_secs(u32::MAX),
+            UPDATE_CHECK_BACKOFF_MAX_SECS
+        );
+    }
+
+    #[test]
+    fn request_update_check_now_without_consumer_does_not_panic() {
+        // Before `lib::run()` has initialized the sender, manual
+        // triggers must no-op silently (tray could fire any time
+        // during startup). The alternative — panicking — would
+        // take out the tray event dispatcher.
+        let prev = UPDATE_CHECK_TX.get().is_some();
+        if !prev {
+            request_update_check_now();
+            request_update_check_now();
+        }
+        // If the static was already set by another test in this
+        // process, the call still must not panic.
+        request_update_check_now();
+    }
 
     // ── sanitize_label ──────────────────────────────────────
 

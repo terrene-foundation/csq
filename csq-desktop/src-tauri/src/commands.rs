@@ -14,7 +14,8 @@ use csq_core::sessions;
 use csq_core::types::AccountNum;
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::{AppHandle, State};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_autostart::ManagerExt;
 
 /// Public view of a single account, safe to send over IPC.
@@ -45,6 +46,11 @@ pub struct AccountView {
     /// "Expired — invalid token" so users know WHY a slot is
     /// stuck, not just that it is.
     pub last_refresh_error: Option<String>,
+    /// Third-party provider id ("mm" | "zai" | "ollama") for
+    /// slots bound to a 3P provider, else None. Lets the
+    /// frontend branch on stable ids rather than on the display
+    /// label (which is localizable and could drift).
+    pub provider_id: Option<String>,
 }
 
 /// Daemon status, safe to send over IPC.
@@ -145,6 +151,19 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 }
             };
 
+            // Resolve the stable provider id ("mm", "zai", "ollama")
+            // for 3P slots so the frontend can branch on a value
+            // the Rust catalog owns, rather than on the localisable
+            // display name.
+            let provider_id = if matches!(a.source, AccountSource::ThirdParty { .. }) {
+                providers::PROVIDERS
+                    .iter()
+                    .find(|p| p.name == a.label)
+                    .map(|p| p.id.to_string())
+            } else {
+                None
+            };
+
             AccountView {
                 id: a.id,
                 label: a.label,
@@ -172,6 +191,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 token_status,
                 expires_in_secs,
                 last_refresh_error,
+                provider_id,
             }
         })
         .collect();
@@ -994,6 +1014,294 @@ pub fn list_ollama_models() -> Result<Vec<String>, String> {
     Ok(providers::ollama::get_ollama_models())
 }
 
+/// Retargets a slot's `config-<slot>/settings.json` to a new model
+/// by rewriting every `ANTHROPIC_*_MODEL` env key.
+///
+/// The slot must already be bound (via `bind_keyless_provider` or
+/// `setkey` on the CLI). This is the runtime model-change path
+/// for Ollama slots whose installed model list expands post-bind.
+/// Same semantics as the CLI's `csq models switch <provider> <model>
+/// --slot N --no-pull`: we assume any required pull has already
+/// happened via [`pull_ollama_model`].
+///
+/// # Errors
+///
+/// - `"invalid slot: ..."` — slot out of range 1..=999
+/// - `"model must not be empty"` — blank input
+/// - `"base directory does not exist: ..."` — base dir missing
+/// - `"slot N is not bound — ..."` — slot has no settings.json
+/// - filesystem errors surfaced from the atomic-write path
+pub fn set_slot_model_write(base_dir: String, slot: u16, model: String) -> Result<(), String> {
+    use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+    use csq_core::session::merge::MODEL_KEYS;
+    use serde_json::Value;
+
+    let slot_num =
+        csq_core::types::AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("model must not be empty".into());
+    }
+
+    let base = PathBuf::from(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+
+    let settings_path = base
+        .join(format!("config-{}", slot_num))
+        .join("settings.json");
+    let content = std::fs::read_to_string(&settings_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("slot {slot_num} is not bound — add it via the Add Account modal first")
+        } else {
+            format!("read {}: {e}", settings_path.display())
+        }
+    })?;
+    let mut value: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("{} is not valid JSON: {e}", settings_path.display()))?;
+
+    let env = value
+        .as_object_mut()
+        .and_then(|o| o.get_mut("env"))
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| {
+            format!(
+                "{} has no `env` object — can't set model",
+                settings_path.display()
+            )
+        })?;
+    for key in MODEL_KEYS {
+        env.insert((*key).to_string(), Value::String(model.clone()));
+    }
+
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("serialize slot settings: {e}"))?;
+    let tmp = unique_tmp_path(&settings_path);
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write tmp: {e}"))?;
+    secure_file(&tmp).map_err(|e| format!("secure_file: {e}"))?;
+    atomic_replace(&tmp, &settings_path).map_err(|e| format!("atomic replace: {e}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_slot_model(
+    app: AppHandle,
+    base_dir: String,
+    slot: u16,
+    model: String,
+) -> Result<(), String> {
+    set_slot_model_write(base_dir, slot, model.clone())?;
+    // Notify any other listening window / tray menu that the slot
+    // changed, so they can refresh their view. Best-effort: a
+    // failed emit doesn't undo the successful file write.
+    let _ = app.emit(
+        "slot-model-changed",
+        serde_json::json!({ "slot": slot, "model": model }),
+    );
+    Ok(())
+}
+
+/// Fetches an Ollama model via `ollama pull <model>`, streaming
+/// progress segments back to the frontend on the
+/// `ollama-pull-progress` Tauri event so the UI can render a
+/// progress indicator. Returns once the pull subprocess exits.
+///
+/// **Streaming**: ollama renders progress as a single line
+/// updated with carriage returns, not newlines. A naive
+/// `BufRead::lines()` reader would buffer the entire pull into
+/// one string and never emit anything until completion. This
+/// function instead reads bytes and flushes a payload on either
+/// `\r` or `\n`, so the UI sees live progress bars.
+///
+/// **Cancellation**: the running child is registered in
+/// `AppState.ollama_pull_child` so a later `cancel_ollama_pull`
+/// command can send SIGTERM and release the UI from a stuck
+/// (or unwanted) download. Normal completion clears the handle.
+///
+/// **Pre-check**: if the `ollama` binary is not on PATH we fail
+/// fast with an installable-ness hint rather than letting the
+/// user wait on a silent exec failure.
+///
+/// Failure modes:
+///   - `ollama` binary not found → `"ollama not found: ..."`
+///   - non-zero exit from the pull → `"ollama pull exited with N"`
+///     (if the exit was SIGTERM from cancel_ollama_pull the
+///     payload matches `"ollama pull exited with -1"` or a
+///     signal code; the frontend treats any non-zero exit the
+///     same — back to the picker screen).
+#[tauri::command]
+pub async fn pull_ollama_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<(), String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("model must not be empty".into());
+    }
+
+    // Pre-check: exec `ollama --version`. If the binary isn't
+    // installed we fail immediately with an actionable hint
+    // rather than spawning `ollama pull` and reporting a
+    // confusing `No such file or directory`.
+    if std::process::Command::new("ollama")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        return Err("ollama not found — install via https://ollama.com or add it to PATH".into());
+    }
+
+    // Capture the child-slot Arc BEFORE `spawn_blocking` so the
+    // worker thread doesn't need to borrow `State<AppState>`.
+    let child_slot = state.ollama_pull_child.clone();
+
+    tauri::async_runtime::spawn_blocking(move || pull_ollama_model_blocking(app, child_slot, model))
+        .await
+        .map_err(|e| format!("pull task join error: {e}"))?
+}
+
+/// Pure-Rust body of `pull_ollama_model` (no Tauri traits) so it
+/// can be invoked from `spawn_blocking` without the caller
+/// holding a `State<AppState>` borrow.
+fn pull_ollama_model_blocking(
+    app: AppHandle,
+    child_slot: Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<std::process::Child>>>>>,
+    model: String,
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("ollama")
+        .arg("pull")
+        .arg(&model)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn ollama pull: {e}"))?;
+
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    let child_arc = Arc::new(std::sync::Mutex::new(child));
+
+    // Register for cancel. Overwrite any stale entry — the
+    // frontend guards against concurrent pulls, but defence
+    // in depth doesn't hurt here.
+    {
+        let mut slot = child_slot.lock().map_err(|_| "child slot poisoned")?;
+        *slot = Some(child_arc.clone());
+    }
+
+    let stderr_t = spawn_progress_reader(stderr, "stderr", app.clone());
+    let stdout_t = spawn_progress_reader(stdout, "stdout", app.clone());
+
+    // Wait for the child to exit (or be killed via cancel).
+    let status = {
+        let mut guard = child_arc.lock().map_err(|_| "child lock poisoned")?;
+        guard
+            .wait()
+            .map_err(|e| format!("wait on ollama pull: {e}"))?
+    };
+
+    if let Some(t) = stderr_t {
+        let _ = t.join();
+    }
+    if let Some(t) = stdout_t {
+        let _ = t.join();
+    }
+
+    {
+        let mut slot = child_slot.lock().map_err(|_| "child slot poisoned")?;
+        *slot = None;
+    }
+
+    if !status.success() {
+        return Err(format!(
+            "ollama pull exited with {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
+/// Byte-level progress reader. `ollama pull` updates a single
+/// progress line with carriage returns, not newlines, so a
+/// standard `BufRead::lines()` reader would buffer the entire
+/// multi-gigabyte download into one string. This function reads
+/// bytes and flushes on either `\r` or `\n` so the UI sees live
+/// progress. The 1 MiB buffer cap is a defence against a stream
+/// that never emits a delimiter.
+fn spawn_progress_reader(
+    stream: Option<impl std::io::Read + Send + 'static>,
+    tag: &'static str,
+    app: AppHandle,
+) -> Option<std::thread::JoinHandle<()>> {
+    let mut stream = stream?;
+    Some(std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(2048);
+        let mut byte = [0u8; 1];
+        let flush = |buf: &mut Vec<u8>, app: &AppHandle| {
+            if buf.is_empty() {
+                return;
+            }
+            let line = String::from_utf8_lossy(buf).to_string();
+            let _ = app.emit(
+                "ollama-pull-progress",
+                serde_json::json!({ "stream": tag, "line": line }),
+            );
+            buf.clear();
+        };
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let b = byte[0];
+                    if b == b'\r' || b == b'\n' {
+                        flush(&mut buf, &app);
+                    } else {
+                        buf.push(b);
+                        if buf.len() >= 1 << 20 {
+                            flush(&mut buf, &app);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        flush(&mut buf, &app);
+    }))
+}
+
+/// Cancels an in-flight `ollama pull` by killing the child
+/// process. No-op when no pull is running — the modal's Cancel
+/// button calls this unconditionally, and the frontend treats a
+/// successful cancel as "return to picker".
+///
+/// Uses `Child::kill` (SIGKILL on Unix, TerminateProcess on
+/// Windows). The companion `pull_ollama_model` reader threads
+/// see EOF on their piped stdout/stderr and exit cleanly; the
+/// `wait()` call in the blocking task returns a non-success
+/// status which the frontend maps to the error banner.
+#[tauri::command]
+pub fn cancel_ollama_pull(state: State<'_, AppState>) -> Result<(), String> {
+    let handle_opt = {
+        let slot = state
+            .ollama_pull_child
+            .lock()
+            .map_err(|_| "child slot poisoned")?;
+        slot.clone()
+    };
+    let Some(handle) = handle_opt else {
+        return Ok(());
+    };
+    let mut child = handle.lock().map_err(|_| "child lock poisoned")?;
+    let _ = child.kill();
+    Ok(())
+}
+
 // ── Launch-on-login (tauri-plugin-autostart) ──────────────────
 
 /// Returns whether the csq desktop app is registered to auto-start
@@ -1280,6 +1588,85 @@ mod tests {
         let content = std::fs::read_to_string(&settings_path).unwrap();
         assert!(content.contains("\"ANTHROPIC_AUTH_TOKEN\": \"ollama\""));
         assert!(content.contains("localhost:11434"));
+    }
+
+    // ── set_slot_model_write validation ─────────────────────
+
+    #[test]
+    fn set_slot_model_rejects_invalid_slot() {
+        let err = set_slot_model_write("/fake".into(), 0, "gemma4".into()).unwrap_err();
+        assert!(err.contains("invalid slot"), "got: {err}");
+    }
+
+    #[test]
+    fn set_slot_model_rejects_empty_model() {
+        let err = set_slot_model_write("/fake".into(), 1, "   ".into()).unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn set_slot_model_rejects_missing_base_dir() {
+        let err =
+            set_slot_model_write("/nonexistent/base/dir".into(), 1, "gemma4".into()).unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn set_slot_model_errors_when_slot_not_bound() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = set_slot_model_write(
+            dir.path().to_string_lossy().into_owned(),
+            7,
+            "gemma4".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not bound"), "got: {err}");
+    }
+
+    #[test]
+    fn set_slot_model_rewrites_every_model_key() {
+        // Bind an ollama slot, then retarget its model. All five
+        // MODEL_KEYS in config-N/settings.json should reflect the
+        // new value. Other env keys (ANTHROPIC_BASE_URL,
+        // ANTHROPIC_AUTH_TOKEN) survive untouched.
+        let dir = tempfile::TempDir::new().unwrap();
+        csq_core::accounts::third_party::bind_provider_to_slot(
+            dir.path(),
+            "ollama",
+            csq_core::types::AccountNum::try_from(5u16).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        set_slot_model_write(
+            dir.path().to_string_lossy().into_owned(),
+            5,
+            "qwen3:latest".into(),
+        )
+        .unwrap();
+
+        let path = dir.path().join("config-5/settings.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for key in csq_core::session::merge::MODEL_KEYS {
+            assert_eq!(
+                v.pointer(&format!("/env/{}", key)).and_then(|x| x.as_str()),
+                Some("qwen3:latest"),
+                "{key} should reflect the new model"
+            );
+        }
+        // Base URL and auth token survived.
+        assert_eq!(
+            v.pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(|x| x.as_str()),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(
+            v.pointer("/env/ANTHROPIC_AUTH_TOKEN")
+                .and_then(|x| x.as_str()),
+            Some("ollama")
+        );
     }
 
     #[test]

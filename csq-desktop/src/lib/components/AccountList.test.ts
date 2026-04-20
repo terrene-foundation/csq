@@ -53,6 +53,7 @@ const ACCOUNT_1 = {
   token_status: "valid",
   expires_in_secs: 3600,
   last_refresh_error: null,
+  provider_id: null,
 };
 
 const ACCOUNT_2 = {
@@ -68,6 +69,7 @@ const ACCOUNT_2 = {
   token_status: "expired",
   expires_in_secs: null,
   last_refresh_error: "broker_token_invalid",
+  provider_id: null,
 };
 
 let mockResponses: Record<string, unknown> = {};

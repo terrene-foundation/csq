@@ -498,3 +498,34 @@ jobs:
           files: release-assets/*
           prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
           fail_on_unmatched_files: true
+
+      - name: Upsert rolling updater-manifest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # tauri-plugin-updater needs a STABLE URL that returns the
+          # freshest latest.json regardless of prerelease flags. GitHub's
+          # /releases/latest/download/ resolves only to the release marked
+          # as "Latest", and that pointer skips prereleases by default —
+          # if every alpha is prerelease, the URL redirects to the
+          # previous stable (or 404s on a brand-new repo).
+          #
+          # Fix: keep a single, non-prerelease release tagged
+          # `updater-manifest` whose only asset is latest.json. The
+          # workflow upserts it on every release. The plugin polls
+          # `/releases/download/updater-manifest/latest.json` — stable
+          # URL, always fresh, independent of the "Latest" pointer.
+          #
+          # Users shouldn't download from this release — it has no
+          # installers. The release body explains that.
+          if ! gh release view updater-manifest \
+            -R ${{ github.repository }} >/dev/null 2>&1; then
+            gh release create updater-manifest \
+              -R ${{ github.repository }} \
+              --target main \
+              --title "Updater manifest (auto, do not install)" \
+              --notes "Rolling latest.json for tauri-plugin-updater. Auto-updated on every release. No installers — use the versioned release tags."
+          fi
+          gh release upload updater-manifest \
+            -R ${{ github.repository }} \
+            release-assets/latest.json --clobber

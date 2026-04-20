@@ -32,11 +32,10 @@ Review plans against claude-squad's architecture constraints: Python stdlib only
 
 ### 2. Codebase locations
 
-- `rotation-engine.py` — the core Python engine (quota, OAuth, swap, backsync)
-- `csq` — the bash CLI wrapper
-- `statusline-quota.sh` — the CC statusline hook
-- `install.sh` — one-time installer
-- `test-platform.sh` — cross-platform smoke suite
+- `csq-core/` — Rust crate holding quota, OAuth broker, sessions, handle-dir, daemon
+- `csq-cli/` — Rust binary (`csq`) with all subcommands including `statusline`
+- `csq-desktop/` — Tauri + Svelte app with tray UI + updater
+- `install.sh` — one-time bootstrap installer (downloads CLI binary from latest release)
 - `journal/` — project decisions, discoveries, gaps
 - `workspaces/<project>/` — active workspace with briefs/plans/todos for larger initiatives
 

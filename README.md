@@ -695,7 +695,7 @@ No VS Code extension or plugin is needed. Install csq once via the regular insta
 
 ## Troubleshooting
 
-**Statusline not showing** -- check that `~/.claude/accounts/statusline-quota.sh` exists and that your `~/.claude/settings.json` has `"statusLine": {"type":"command","command":"bash ~/.claude/accounts/statusline-quota.sh"}`. Run `csq doctor` for diagnostics.
+**Statusline not showing** -- check that `~/.claude/settings.json` has `"statusLine": {"type":"command","command":"csq statusline"}`. `csq install` sets this automatically; run it once if you're upgrading from a pre-alpha.18 install that used the old `statusline-quota.sh` wrapper. Run `csq doctor` for diagnostics.
 
 **`csq swap` says swap succeeded but CC shows "rate limited"** -- the access token may be stuck on Anthropic's side. Run `csq login N` to capture a fresh token via a full OAuth flow.
 

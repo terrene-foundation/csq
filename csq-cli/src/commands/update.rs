@@ -117,52 +117,8 @@ pub fn install() -> Result<()> {
 
     csq_core::update::download_and_apply(&info).context("update failed")?;
 
-    // Deploy the statusline script from the same tag so it stays in
-    // sync with the binary. The script is a shell wrapper that calls
-    // `csq statusline` — if the script is stale, the statusline shows
-    // `term-<pid>` instead of the account email.
-    deploy_statusline_script(&info.version);
-
     println!("Restart csq to use v{}.", info.version);
     Ok(())
-}
-
-/// Best-effort download + install of `statusline-quota.sh` from the
-/// repo at the tag matching the update version. Non-fatal: if the
-/// download fails (e.g. the tag predates the script, network error,
-/// missing ~/.claude/accounts), we print a warning and move on. The
-/// binary is the critical payload; the script is a convenience.
-fn deploy_statusline_script(version: &str) {
-    let accounts_dir = match super::claude_home() {
-        Ok(h) => h.join("accounts"),
-        Err(_) => return,
-    };
-    let url = format!(
-        "https://raw.githubusercontent.com/terrene-foundation/csq/v{version}/statusline-quota.sh"
-    );
-    let ua = format!("csq/{}", env!("CARGO_PKG_VERSION"));
-    let bytes = match csq_core::http::get_with_headers(&url, &[("User-Agent", &ua)]) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("warning: could not download statusline-quota.sh: {e}");
-            return;
-        }
-    };
-    let path = accounts_dir.join("statusline-quota.sh");
-    if let Err(e) = std::fs::create_dir_all(&accounts_dir) {
-        eprintln!("warning: could not create {}: {e}", accounts_dir.display());
-        return;
-    }
-    if let Err(e) = std::fs::write(&path, &bytes) {
-        eprintln!("warning: could not write {}: {e}", path.display());
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-    }
-    eprintln!("Updated statusline script at {}", path.display());
 }
 
 // Version comparison tests live in csq-core/src/update/github.rs alongside

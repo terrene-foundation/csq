@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Code Session Quota",
-  "version": "2.0.0-alpha.18",
+  "version": "2.0.0-alpha.19",
   "identifier": "foundation.terrene.claude-squad",
   "build": {
     "frontendDist": "../dist",
@@ -55,7 +55,7 @@
       }
     },
     "windows": {
-      "wix": { "version": "2.0.18" }
+      "wix": { "version": "2.0.19" }
     },
     "createUpdaterArtifacts": true,
     "linux": {

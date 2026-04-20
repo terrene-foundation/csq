@@ -145,14 +145,19 @@ pub fn create_handle_dir(
         }
     }
 
-    // Symlink shared items to ~/.claude
+    // Symlink shared items to ~/.claude. Use the shape-aware
+    // `ensure_shared_target` helper so file-named items
+    // (`keybindings.json`, `history.jsonl`, `__store.db`, etc.)
+    // get seeded as parseable files instead of directories — the
+    // pre-alpha.18 bug that left CC logging a keybinding-error on
+    // every launch once csq run had run once on a fresh install.
     for item in SHARED_ITEMS {
         let target = claude_home.join(item);
         let link = handle_dir.join(item);
 
-        // Ensure target exists (create empty dir if missing)
-        if !target.exists() {
-            std::fs::create_dir_all(&target).ok();
+        if let Err(e) = isolation::ensure_shared_target(&target, item) {
+            warn!(path = %target.display(), error = %e, "failed to create shared target");
+            continue;
         }
 
         if target.exists() {
@@ -2597,5 +2602,247 @@ mod tests {
             None,
             "symlink .live-cc-pid must be refused"
         );
+    }
+
+    // ── Issue 2 reproduction: onboarding "re-init" claim ────────────
+    //
+    // User reports that after `csq install` + manual keybindings.json
+    // + first `csq run`, their `~/.claude/settings.json` and
+    // statusline "disappear". The tests below pin the actual contract
+    // so any future regression is caught:
+    //
+    //   - `create_handle_dir` must NEVER mutate `~/.claude/settings.json`.
+    //   - The handle dir's materialized settings MUST carry through
+    //     every user-customized key (statusLine, permissions, plugins,
+    //     mcpServers, env).
+    //   - On fresh install the global `keybindings.json` must be a
+    //     file (issue 1 regression) so a user who manually edits it
+    //     doesn't have their `{"bindings": []}` overwritten by a
+    //     later `csq run` turning it into a dir.
+
+    #[test]
+    #[cfg(unix)]
+    fn user_global_settings_json_is_byte_identical_after_csq_run() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        // Realistic user global: statusLine, permissions, plugins,
+        // mcpServers, env. Mirrors what `csq install` + a few weeks
+        // of customization would leave behind.
+        let user_settings = r#"{
+          "$schema": "https://json.schemastore.org/claude-code-settings.json",
+          "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" },
+          "permissions": {
+            "allow": ["Bash(git rm:*)", "WebSearch"],
+            "defaultMode": "bypassPermissions"
+          },
+          "statusLine": { "type": "command", "command": "csq statusline" },
+          "enabledPlugins": { "rust-analyzer-lsp@claude-plugins-official": true },
+          "alwaysThinkingEnabled": true,
+          "effortLevel": "xhigh"
+        }
+        "#;
+        std::fs::write(claude_home.join("settings.json"), user_settings).unwrap();
+        let settings_path = claude_home.join("settings.json");
+        let before_bytes = std::fs::read(&settings_path).unwrap();
+
+        setup_config_dir(base, 1);
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 55555).unwrap();
+        assert!(handle.exists());
+
+        // The global MUST be untouched — not a single byte changed.
+        let after_bytes = std::fs::read(&settings_path).unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "csq run must never mutate ~/.claude/settings.json"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handle_dir_settings_carries_every_user_customization() {
+        // Core of the "re-init" claim: the handle dir CC reads must
+        // expose the same keys the user set in the global, so CC
+        // doesn't behave as if this is a first-run session.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let user_settings = r#"{
+          "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" },
+          "permissions": {
+            "allow": ["Bash(git *)"],
+            "defaultMode": "bypassPermissions"
+          },
+          "statusLine": { "type": "command", "command": "csq statusline" },
+          "enabledPlugins": { "frontend-design@claude-plugins-official": true },
+          "enableAllProjectMcpServers": true,
+          "alwaysThinkingEnabled": true,
+          "effortLevel": "xhigh",
+          "voiceEnabled": true
+        }
+        "#;
+        std::fs::write(claude_home.join("settings.json"), user_settings).unwrap();
+        setup_config_dir(base, 1);
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 44444).unwrap();
+
+        let materialized: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+
+        // Every user-touched key must be present in the handle dir.
+        assert_eq!(
+            materialized
+                .pointer("/statusLine/command")
+                .and_then(|v| v.as_str()),
+            Some("csq statusline"),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/permissions/defaultMode")
+                .and_then(|v| v.as_str()),
+            Some("bypassPermissions"),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/permissions/allow/0")
+                .and_then(|v| v.as_str()),
+            Some("Bash(git *)"),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/enabledPlugins/frontend-design@claude-plugins-official")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/env/CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                .and_then(|v| v.as_str()),
+            Some("1"),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/enableAllProjectMcpServers")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/alwaysThinkingEnabled")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/effortLevel")
+                .and_then(|v| v.as_str()),
+            Some("xhigh"),
+        );
+        assert_eq!(
+            materialized
+                .pointer("/voiceEnabled")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn keybindings_json_stays_a_file_through_multiple_csq_runs() {
+        // The pre-alpha.18 bug turned `~/.claude/keybindings.json`
+        // into a directory the first time csq run was invoked on a
+        // fresh install. If the user then tried to manually create
+        // `{"bindings":[]}` they'd hit "is a directory" or end up
+        // writing INTO the dir — which the user reports as "settings
+        // and statusline disappears" (CC fails to parse its config).
+        //
+        // Post-fix: the file gets seeded with parseable JSON, and
+        // subsequent runs must never promote it to a dir.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        // First run: seeds keybindings.json as a FILE.
+        let h1 = create_handle_dir(base, &claude_home, account, 11111).unwrap();
+        let kb = claude_home.join("keybindings.json");
+        let meta = std::fs::metadata(&kb).unwrap();
+        assert!(
+            meta.is_file(),
+            "first csq run must leave keybindings.json as a file"
+        );
+        let first_content = std::fs::read_to_string(&kb).unwrap();
+        let _: serde_json::Value = serde_json::from_str(&first_content)
+            .expect("seeded keybindings.json must be valid JSON");
+
+        // User now edits keybindings.json with their custom bindings.
+        std::fs::write(&kb, r#"{"bindings":[{"key":"cmd+s","cmd":"save"}]}"#).unwrap();
+
+        // Clean up first handle so second run can reuse PID 11111
+        // (simulates `exec` or the handle-dir being swept).
+        std::fs::remove_dir_all(&h1).unwrap();
+
+        // Second run: must not overwrite or promote to dir.
+        let _h2 = create_handle_dir(base, &claude_home, account, 22222).unwrap();
+        let meta = std::fs::metadata(&kb).unwrap();
+        assert!(meta.is_file(), "second csq run must preserve the file");
+        let second_content = std::fs::read_to_string(&kb).unwrap();
+        assert!(
+            second_content.contains("cmd+s"),
+            "user custom bindings must not be overwritten"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settings_local_and_default_are_files_not_directories() {
+        // Same bug class as keybindings.json — any file-named
+        // SHARED_ITEMS entry must land as a FILE on fresh install.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let _h = create_handle_dir(base, &claude_home, account, 33333).unwrap();
+
+        for name in [
+            "keybindings.json",
+            "settings.local.json",
+            "settings-default.json",
+            "stats-cache.json",
+        ] {
+            let path = claude_home.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let meta = std::fs::metadata(&path).unwrap();
+            assert!(meta.is_file(), "{name} must be a FILE");
+            let content = std::fs::read_to_string(&path).unwrap();
+            let _: serde_json::Value = serde_json::from_str(&content)
+                .unwrap_or_else(|_| panic!("{name} must be valid JSON"));
+        }
+
+        // Non-JSON file-shaped items also check out.
+        for name in ["history.jsonl", "__store.db"] {
+            let path = claude_home.join(name);
+            if !path.exists() {
+                continue;
+            }
+            assert!(
+                std::fs::metadata(&path).unwrap().is_file(),
+                "{name} must be a file"
+            );
+        }
     }
 }

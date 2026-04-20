@@ -74,6 +74,58 @@ pub const ISOLATED_ITEMS: &[&str] = &[
     ".quota-cursor",
 ];
 
+/// Creates the `~/.claude/<item>` target when it's missing so the
+/// subsequent symlink has something to point at. Shape-aware:
+///
+/// - file-shaped (`keybindings.json`, `history.jsonl`, `__store.db`,
+///   `settings.local.json`, `settings-default.json`,
+///   `stats-cache.json`) are seeded with content CC will accept
+///   (`{"bindings": []}` for keybindings, `{}` for other JSON,
+///   empty bytes for `.jsonl`/`.db`).
+/// - dir-shaped (`projects`, `sessions`, `mcp`, etc.) get
+///   `create_dir_all`.
+///
+/// Returns `Ok(false)` if the target already exists (no-op).
+/// Returns `Ok(true)` after successfully creating the missing
+/// target. Returns `Err` on filesystem failure — callers may
+/// choose to `warn!` and continue, but MUST NOT proceed to
+/// symlink a non-existent target shaped as a directory.
+///
+/// The pre-alpha.18 code always called `create_dir_all`, which
+/// turned `~/.claude/keybindings.json` into a DIRECTORY the first
+/// time `csq run` ran on a fresh install. CC then failed to parse
+/// the directory as JSON and logged a keybinding-error on every
+/// launch.
+pub fn ensure_shared_target(target: &Path, item: &str) -> Result<bool, std::io::Error> {
+    if target.exists() {
+        return Ok(false);
+    }
+
+    if let Some(default_bytes) = default_content_for(item) {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, default_bytes)?;
+    } else {
+        std::fs::create_dir_all(target)?;
+    }
+    Ok(true)
+}
+
+/// Returns the default byte content for a file-shaped shared item,
+/// or `None` when the item is directory-shaped. Used by
+/// [`ensure_shared_target`] to pre-create missing targets with
+/// content CC can parse.
+fn default_content_for(item: &str) -> Option<&'static [u8]> {
+    match item {
+        "keybindings.json" => Some(b"{\n  \"bindings\": []\n}\n"),
+        "settings.local.json" | "settings-default.json" | "stats-cache.json" => Some(b"{}\n"),
+        "history.jsonl" => Some(b""),
+        "__store.db" => Some(b""),
+        _ => None,
+    }
+}
+
 /// Creates or updates the isolated config directory.
 ///
 /// For each entry in [`SHARED_ITEMS`]:
@@ -97,12 +149,14 @@ pub fn isolate_config_dir(
         let target = home_claude.join(item);
         let link = config_dir.join(item);
 
-        // Ensure target exists (create empty dir if missing)
-        if !target.exists() {
-            if let Err(e) = std::fs::create_dir_all(&target) {
-                warn!(path = %target.display(), error = %e, "failed to create shared target");
-                continue;
-            }
+        // Shape-aware seed: `.json`/`.jsonl`/`.db` items become
+        // files with parseable default content; other names get
+        // `create_dir_all`. See `ensure_shared_target` for the bug
+        // this replaces (pre-alpha.18 created keybindings.json as
+        // a directory, breaking CC every launch).
+        if let Err(e) = ensure_shared_target(&target, item) {
+            warn!(path = %target.display(), error = %e, "failed to create shared target");
+            continue;
         }
 
         match ensure_symlink(&target, &link) {
@@ -266,6 +320,154 @@ mod tests {
         // All targets should now exist
         for item in SHARED_ITEMS {
             assert!(home.join(item).exists(), "target {item} should exist");
+        }
+    }
+
+    // ── file-vs-dir regression suite for ensure_shared_target ──────────
+    //
+    // Pre-alpha.18, the loop always called create_dir_all on the target,
+    // turning `~/.claude/keybindings.json` into a DIRECTORY on first run.
+    // CC then logged a parse error on every launch. These tests pin the
+    // correct shape for every file-named SHARED_ITEMS entry and verify
+    // the default content is parseable.
+
+    #[test]
+    fn ensure_shared_target_creates_keybindings_as_json_file() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("keybindings.json");
+
+        let created = ensure_shared_target(&target, "keybindings.json").unwrap();
+        assert!(created, "first call should create the target");
+
+        let meta = std::fs::metadata(&target).unwrap();
+        assert!(
+            meta.is_file(),
+            "keybindings.json MUST be a file, not a directory — CC parses it as JSON"
+        );
+        let content = std::fs::read_to_string(&target).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("seeded keybindings.json must be valid JSON");
+        assert!(parsed.get("bindings").is_some_and(|b| b.is_array()));
+    }
+
+    #[test]
+    fn ensure_shared_target_creates_other_json_files_as_empty_object() {
+        let dir = TempDir::new().unwrap();
+        for name in [
+            "settings.local.json",
+            "settings-default.json",
+            "stats-cache.json",
+        ] {
+            let target = dir.path().join(name);
+            ensure_shared_target(&target, name).unwrap();
+            let meta = std::fs::metadata(&target).unwrap();
+            assert!(meta.is_file(), "{name} must be a file");
+            let content = std::fs::read_to_string(&target).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&content)
+                .unwrap_or_else(|_| panic!("{name} must be valid JSON: {content:?}"));
+            assert!(parsed.is_object(), "{name} must be a JSON object");
+        }
+    }
+
+    #[test]
+    fn ensure_shared_target_creates_jsonl_as_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("history.jsonl");
+        ensure_shared_target(&target, "history.jsonl").unwrap();
+        let meta = std::fs::metadata(&target).unwrap();
+        assert!(meta.is_file(), "history.jsonl must be a file");
+        assert_eq!(meta.len(), 0, "jsonl seed should be an empty file");
+    }
+
+    #[test]
+    fn ensure_shared_target_creates_store_db_as_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("__store.db");
+        ensure_shared_target(&target, "__store.db").unwrap();
+        assert!(std::fs::metadata(&target).unwrap().is_file());
+    }
+
+    #[test]
+    fn ensure_shared_target_creates_dir_items_as_directories() {
+        let dir = TempDir::new().unwrap();
+        for name in ["projects", "sessions", "mcp", "plugins", "commands"] {
+            let target = dir.path().join(name);
+            ensure_shared_target(&target, name).unwrap();
+            assert!(
+                std::fs::metadata(&target).unwrap().is_dir(),
+                "{name} must be a directory"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_shared_target_is_noop_when_target_exists() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("keybindings.json");
+        // Pre-seed with custom content — MUST NOT be overwritten.
+        std::fs::write(&target, r#"{"bindings":[{"key":"cmd+s"}]}"#).unwrap();
+
+        let created = ensure_shared_target(&target, "keybindings.json").unwrap();
+        assert!(!created, "existing target → returns false, no overwrite");
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            content.contains("cmd+s"),
+            "user custom bindings must survive"
+        );
+    }
+
+    #[test]
+    fn isolate_seeds_keybindings_as_file_not_directory() {
+        // The exact bug user reported: on a fresh install running
+        // `csq run N` once, `~/.claude/keybindings.json` ends up as
+        // a DIRECTORY and CC logs `keybinding error` on every launch.
+        // Post-fix it must be a FILE containing valid JSON.
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join(".claude");
+        let config = dir.path().join("config-1");
+
+        isolate_config_dir(&home, &config).unwrap();
+
+        let path = home.join("keybindings.json");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            meta.is_file(),
+            "regression: ~/.claude/keybindings.json must be a FILE"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("bindings").is_some());
+    }
+
+    #[test]
+    fn isolate_seeds_all_file_items_as_files() {
+        // Gate test: EVERY file-named SHARED_ITEMS entry must end up
+        // as a file. Any new file-named item added to the list will
+        // fail here until default_content_for is extended.
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join(".claude");
+        let config = dir.path().join("config-1");
+
+        isolate_config_dir(&home, &config).unwrap();
+
+        for item in SHARED_ITEMS {
+            let path = home.join(item);
+            if !path.exists() {
+                continue;
+            }
+            let meta = std::fs::metadata(&path).unwrap();
+            // File-shaped items end in one of these suffixes.
+            let is_file_shape =
+                item.ends_with(".json") || item.ends_with(".jsonl") || item.ends_with(".db");
+            if is_file_shape {
+                assert!(
+                    meta.is_file(),
+                    "shared item {item} should be a FILE (not a directory)"
+                );
+            } else {
+                assert!(meta.is_dir(), "shared item {item} should be a DIRECTORY");
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Code Session Quota",
-  "version": "2.0.0-alpha.19",
+  "version": "2.0.0-alpha.20",
   "identifier": "foundation.terrene.claude-squad",
   "build": {
     "frontendDist": "../dist",
@@ -28,6 +28,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYxQzJGN0ZENzlGOTUyREQKUldUZFV2bDUvZmZDOFFEWU83V1J3TDZPb21wVXI2My9XVml2WWdHZWUxTG55SjUxY3JyVUY1M0gK",
       "endpoints": [
+        "https://github.com/terrene-foundation/csq/releases/download/updater-manifest/latest.json",
         "https://github.com/terrene-foundation/csq/releases/latest/download/latest.json"
       ]
     }
@@ -55,7 +56,7 @@
       }
     },
     "windows": {
-      "wix": { "version": "2.0.19" }
+      "wix": { "version": "2.0.20" }
     },
     "createUpdaterArtifacts": true,
     "linux": {

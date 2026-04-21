@@ -10,7 +10,8 @@ pub mod merge;
 pub mod setup;
 
 pub use handle_dir::{
-    create_handle_dir, repoint_handle_dir, spawn_sweep, sweep_dead_handles, SweepHandle,
+    create_handle_dir, materialize_handle_settings, repoint_handle_dir, spawn_sweep,
+    sweep_dead_handles, SweepHandle,
 };
 pub use isolation::isolate_config_dir;
 pub use merge::merge_settings;

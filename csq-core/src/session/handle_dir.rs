@@ -211,7 +211,14 @@ pub fn create_handle_dir(
 /// The overlay may contain a 3P `ANTHROPIC_AUTH_TOKEN`. `secure_file`
 /// propagates (does not `.ok()`) so a permission failure fails closed
 /// rather than leaving a credential file at the umask default.
-pub(crate) fn materialize_handle_settings(
+///
+/// Also exposed publicly so `csq run` can defensively re-materialize as a
+/// belt-and-suspenders after `create_handle_dir`, in case future refactors
+/// factor the step out of `create_handle_dir`. See journal 0059 — stale
+/// per-slot settings drifted silently through a csq install upgrade;
+/// making the invariant explicit at the call site guards against the same
+/// class of regression.
+pub fn materialize_handle_settings(
     handle_dir: &Path,
     claude_home: &Path,
     config_dir: &Path,

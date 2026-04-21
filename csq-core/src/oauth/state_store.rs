@@ -46,6 +46,19 @@
 //! on any hot path. A plain `std::sync::Mutex` is simpler than
 //! `tokio::sync::Mutex` here: no lock is ever held across an
 //! `await`.
+//!
+//! # Poison recovery (PR-B7, journal 0063 P2-3)
+//!
+//! `std::sync::Mutex` poisons when a holder panics. Prior to PR-B7
+//! all `lock()` sites here called `.expect("...")`, which turns a
+//! non-fatal poison into a process panic. None of the critical
+//! sections do anything that can leave the map in a corrupt state
+//! (inserts and removes on a HashMap are exception-safe at the Rust
+//! level), so we can safely recover via `into_inner()`. The
+//! `locked()` helper below centralises that recovery — every call
+//! site uses it instead of `.lock().unwrap()` or `.lock().expect()`.
+//! This matches the parking_lot-style "mutexes don't poison"
+//! contract without adding a new dependency.
 
 use crate::error::OAuthError;
 use crate::oauth::pkce::CodeVerifier;
@@ -184,7 +197,7 @@ impl OAuthStateStore {
             created_at: Instant::now(),
         };
 
-        let mut guard = self.inner.lock().expect("state store lock poisoned");
+        let mut guard = self.locked();
         if guard.len() >= self.max_pending {
             if let Some(oldest_key) = guard
                 .iter()
@@ -209,7 +222,7 @@ impl OAuthStateStore {
     /// The entry is **always** removed on consume — there is no
     /// code path that leaves a consumed state in the store.
     pub fn consume(&self, state: &str) -> Result<PendingState, OAuthError> {
-        let mut guard = self.inner.lock().expect("state store lock poisoned");
+        let mut guard = self.locked();
         let pending = guard.remove(state).ok_or(OAuthError::StateMismatch)?;
 
         if pending.created_at.elapsed() > self.ttl {
@@ -224,7 +237,7 @@ impl OAuthStateStore {
     /// number of entries removed. Called by a background sweep
     /// task in M8.7b; also callable from tests.
     pub fn sweep_expired(&self) -> usize {
-        let mut guard = self.inner.lock().expect("state store lock poisoned");
+        let mut guard = self.locked();
         let before = guard.len();
         let ttl = self.ttl;
         guard.retain(|_, v| v.created_at.elapsed() <= ttl);
@@ -234,7 +247,19 @@ impl OAuthStateStore {
     /// Returns the number of currently-pending entries. Primarily
     /// for tests and diagnostics — not on any hot path.
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("state store lock poisoned").len()
+        self.locked().len()
+    }
+
+    /// Acquires the inner mutex with poison recovery.
+    ///
+    /// `std::sync::Mutex` poisons when a holder panics. The critical
+    /// sections in this store (HashMap insert/remove/retain/len) are
+    /// exception-safe — a panic can't leave the map in a corrupt
+    /// state — so we recover via `into_inner()` instead of panicking
+    /// ourselves. See module doc "Poison recovery" for the full
+    /// rationale. Journal 0063 P2-3, PR-B7.
+    fn locked(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingState>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Returns true if the store has no pending entries.
@@ -392,5 +417,54 @@ mod tests {
             !dbg.contains("secret-verifier-bytes"),
             "PendingState Debug leaked the verifier: {dbg}"
         );
+    }
+
+    #[test]
+    fn store_recovers_from_poisoned_mutex() {
+        // Regression guard for PR-B7 (journal 0063 P2-3). Prior to
+        // PR-B7 every lock site called `.expect("state store lock
+        // poisoned")`, which turned a non-fatal poison into a
+        // process panic. The new `locked()` helper uses
+        // `unwrap_or_else(|e| e.into_inner())` to recover.
+        //
+        // We simulate a poison by panicking inside a closure that
+        // holds the lock, catching the panic on the outside, then
+        // verifying the store still serves requests normally.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::Arc;
+
+        let store = Arc::new(OAuthStateStore::new());
+
+        // Seed one pending entry so we can assert state survives.
+        let pre_state = store.insert(verifier("pre-poison"), account(1));
+        assert_eq!(store.len(), 1);
+
+        // Poison the mutex by panicking while holding it. We go
+        // through the private `inner` field via a clone; no public
+        // method panics while holding the lock, so we use the
+        // internal API reachable from the test module.
+        let store_clone = Arc::clone(&store);
+        let _ = thread::spawn(move || {
+            let _guard = store_clone.inner.lock().unwrap();
+            panic!("deliberate panic to poison the mutex");
+        })
+        .join();
+
+        // The mutex is now poisoned. `locked()` must recover.
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            // All four public API paths must work after poison.
+            let new_state = store.insert(verifier("post-poison"), account(2));
+            let len = store.len();
+            let consumed = store.consume(&pre_state);
+            let swept = store.sweep_expired();
+            (new_state, len, consumed, swept)
+        }));
+
+        let (new_state, len_after_insert, consumed, _swept) =
+            res.expect("locked() must not panic on a poisoned mutex");
+
+        assert!(!new_state.is_empty(), "insert worked after poison");
+        assert_eq!(len_after_insert, 2, "both entries present after poison");
+        assert!(consumed.is_ok(), "pre-poison entry consumable after poison");
     }
 }

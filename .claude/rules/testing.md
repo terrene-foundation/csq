@@ -130,6 +130,50 @@ let http_get = |_url: &str, _token: &str| Ok((200, vec![]));
 
 **Why:** Type-checked transport injection is the entire point of the closure pattern. A mock that omits parameters or returns a different shape passes the test build but the type system never catches the contract drift, leaving a gap between what the test exercises and what production calls.
 
+### 6. Component Tests MUST Exercise the Production Mount Sequence
+
+Tests for modal / dialog / popover components MUST NOT mount with the final `isOpen=true` state when production mounts them with `isOpen=false` and toggles later. At least one test per component MUST mount with the initial closed state, rerender to open, and assert both the IPC side-effect fires AND the post-open DOM renders.
+
+```ts
+// DO — matches AccountList's real render sequence (mount closed, flip open)
+it("loads data when isOpen flips false → true", async () => {
+  mockInvoke.mockResolvedValue(["qwen3:latest"]);
+  const { container, rerender } = render(ChangeModelModal, {
+    props: { isOpen: false, slot: 4, onClose: vi.fn(), onChanged: vi.fn() },
+  });
+  await tick();
+  expect(mockInvoke).not.toHaveBeenCalled(); // no leak on mount
+
+  await rerender({
+    isOpen: true,
+    slot: 4,
+    onClose: vi.fn(),
+    onChanged: vi.fn(),
+  });
+  for (let i = 0; i < 8; i++) await tick(); // effect → invoke → state → DOM
+
+  expect(mockInvoke).toHaveBeenCalledWith("list_ollama_models");
+  expect(container.querySelector("select")).not.toBeNull();
+});
+
+// DO NOT — mounting with isOpen=true bypasses the open-edge $effect entirely
+it("loads installed list", async () => {
+  render(ChangeModelModal, { props: { isOpen: true /* ... */ } });
+  // This test PASSES whether or not the $effect fires — onMount covers
+  // the load path. Any open-edge bug is invisible.
+});
+```
+
+**BLOCKED responses:**
+
+- "The onMount path covers it" — onMount only fires on the initial mount, with whatever props were passed at render time
+- "Rerender with different props doesn't happen in production" — every conditional-isOpen parent triggers exactly this sequence
+- "The second test is a duplicate" — no, the first exercises a code path the second cannot reach
+
+**Why:** The alpha.21 ChangeModelModal spinner hung because every existing Svelte test mounted with `isOpen: true`. Two independent defects (the `modalState.kind !== 'loading'` guard and the `$effect` cancellation race) were both masked by the test mount shape. Journal 0061 + 0063 P1-6.
+
+Origin: journal 0061 (DISCOVERY — ChangeModelModal first-open hang).
+
 ## SHOULD Rules
 
 ### 1. Round-Trip Tests Cover Both Directions

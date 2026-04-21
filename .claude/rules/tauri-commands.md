@@ -122,6 +122,45 @@ Tauri uses capability-based security. Scope commands per-window, not globally:
 
 Assume renderer code is potentially adversarial — never expose admin commands to the renderer unless explicitly granted.
 
+### Permission Grant Shape — Narrow by default
+
+Every non-`core:default` grant MUST either be a specific sub-permission (`opener:allow-open-url`, `updater:allow-check`) OR have an explicit comment naming every sub-permission the plugin will expose and why the bundle is needed. A `<plugin>:default` grant loads the plugin's entire permission manifest — usually a superset of what the frontend actually calls.
+
+```json
+// DO — specific sub-permissions matching what Svelte invokes
+{
+  "permissions": [
+    "core:default",
+    "opener:allow-open-url",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+    "process:allow-restart",
+    "process:allow-exit"
+  ]
+}
+
+// DO NOT — `:default` bundles grant unused sub-permissions (allow-download, allow-install)
+// that widen the renderer's attack surface with no frontend caller
+{
+  "permissions": ["core:default", "updater:default", "process:default"]
+}
+```
+
+**BLOCKED responses:**
+
+- "The renderer is trusted" — `rules/tauri-commands.md` "Permissions" says the opposite
+- "The sub-permission list is too long to maintain" — it's shorter than the default bundle's actual footprint
+- "We narrowed the important ones" — narrow ALL of them or none; partial narrowing is worse than none because it telegraphs the intent without completing it
+
+**Why:** Red-team B3 in journal 0065 surfaced that `updater:default` was left unchanged while `opener:default`, `process:default`, and `autostart:default` were narrowed in the same PR. The `updater:default` bundle included `allow-install` and `allow-download` which `UpdateBanner.svelte` never calls — two unused renderer-reachable code paths left open. Narrow-3-of-4 is the failure mode; the fix is enumerating every grant.
+
+**Audit checklist before merging a capability change:**
+
+- `grep -Eh '"[a-z-]+:default"' src-tauri/capabilities/*.json` — every match needs justification or narrowing
+- For each narrowed bundle, confirm the replacement sub-permissions cover every frontend caller (vitest pass + manual smoke on the affected feature)
+
+Origin: journal 0065 B3 (red-team convergence for v2.0.0).
+
 ## Multi-Window
 
 Target specific windows explicitly via `AppHandle::emit_to`:

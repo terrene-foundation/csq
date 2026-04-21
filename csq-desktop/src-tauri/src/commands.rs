@@ -1142,27 +1142,38 @@ pub async fn pull_ollama_model(
         return Err("model must not be empty".into());
     }
 
-    // Pre-check: exec `ollama --version`. If the binary isn't
-    // installed we fail immediately with an actionable hint
-    // rather than spawning `ollama pull` and reporting a
-    // confusing `No such file or directory`.
-    if std::process::Command::new("ollama")
+    // Pre-check: resolve the ollama binary. A Finder-launched macOS
+    // GUI inherits `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so bare
+    // `Command::new("ollama")` fails to locate the binary at the
+    // usual Homebrew prefixes. `find_ollama_bin` walks the known
+    // install paths and honours the `OLLAMA_BIN` override.
+    let ollama_bin = match providers::ollama::find_ollama_bin() {
+        Some(p) if p.is_file() => p,
+        _ => {
+            return Err(
+                "ollama not found — install via https://ollama.com or set OLLAMA_BIN".into(),
+            );
+        }
+    };
+    if std::process::Command::new(&ollama_bin)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_err()
     {
-        return Err("ollama not found — install via https://ollama.com or add it to PATH".into());
+        return Err("ollama not found — install via https://ollama.com or set OLLAMA_BIN".into());
     }
 
     // Capture the child-slot Arc BEFORE `spawn_blocking` so the
     // worker thread doesn't need to borrow `State<AppState>`.
     let child_slot = state.ollama_pull_child.clone();
 
-    tauri::async_runtime::spawn_blocking(move || pull_ollama_model_blocking(app, child_slot, model))
-        .await
-        .map_err(|e| format!("pull task join error: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        pull_ollama_model_blocking(app, child_slot, ollama_bin, model)
+    })
+    .await
+    .map_err(|e| format!("pull task join error: {e}"))?
 }
 
 /// Pure-Rust body of `pull_ollama_model` (no Tauri traits) so it
@@ -1171,11 +1182,12 @@ pub async fn pull_ollama_model(
 fn pull_ollama_model_blocking(
     app: AppHandle,
     child_slot: Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<std::process::Child>>>>>,
+    ollama_bin: std::path::PathBuf,
     model: String,
 ) -> Result<(), String> {
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new("ollama")
+    let mut child = Command::new(&ollama_bin)
         .arg("pull")
         .arg(&model)
         .stdout(Stdio::piped())

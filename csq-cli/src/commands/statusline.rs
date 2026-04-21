@@ -230,7 +230,17 @@ fn git_status(dir: &str) -> Option<GitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Serialises tests that mutate `CLAUDE_CONFIG_DIR`.
+    ///
+    /// `std::env::set_var` is process-wide; running two env-mutating
+    /// tests in parallel produces a read/write race where one test
+    /// sees the other's value. Predates PR-A1 — surfaced when the
+    /// auto-rotate test additions shifted the workspace-wide test
+    /// scheduling. Fix follows `zero-tolerance.md` Rule 1.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn run_git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -304,13 +314,11 @@ mod tests {
 
     #[test]
     fn is_csq_managed_terminal_matches_subdirectory() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let base = TempDir::new().unwrap();
         let term_dir = base.path().join("term-12345");
         std::fs::create_dir_all(&term_dir).unwrap();
 
-        // SAFETY: this test sets a process-wide env var. Other
-        // tests in this module don't depend on CLAUDE_CONFIG_DIR,
-        // and the value is restored before the function returns.
         let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &term_dir) };
         let result = is_csq_managed_terminal(base.path());
@@ -325,6 +333,7 @@ mod tests {
 
     #[test]
     fn is_csq_managed_terminal_rejects_unrelated_path() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let base = TempDir::new().unwrap();
         let other = TempDir::new().unwrap();
 

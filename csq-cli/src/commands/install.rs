@@ -33,6 +33,26 @@ pub fn handle() -> Result<()> {
         println!("  ✓ Patched {}/settings.json", claude_home.display());
     }
 
+    // Per-slot statusline migration — journal 0059.
+    //
+    // CC merges settings with per-slot winning over global for leaf
+    // fields. Earlier csq versions wrote `statusLine.command =
+    // "bash ~/.claude/accounts/statusline-quota.sh"` into every
+    // config-<N>/settings.json. A later global upgrade to
+    // `csq statusline` has no effect on those slots because the
+    // stale per-slot value still wins. Walk every per-slot settings
+    // file and strip the statusLine key when it points at a known
+    // legacy wrapper so global inherits forever.
+    let migrated_slots = migrate_per_slot_statuslines(&base_dir)?;
+    if !migrated_slots.is_empty() {
+        let summary = migrated_slots
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  ✓ Cleared stale per-slot statusLine on slot(s): {summary}");
+    }
+
     // Seed an empty keybindings.json if the user doesn't already
     // have one. CC expects this file to exist; without it the UI
     // logs a keybinding-error on every launch. Non-destructive —
@@ -151,6 +171,94 @@ fn detect_v1_statusline(claude_home: &Path) -> Option<String> {
     } else {
         Some(cmd.to_string())
     }
+}
+
+/// Walks `<base_dir>/config-<N>/settings.json` files and removes the
+/// `statusLine` block whenever its `command` matches a known v1.x
+/// shell wrapper (`statusline-quota.sh`, `statusline-command.sh`).
+///
+/// Removal — not rewrite — is deliberate. The only reason a per-slot
+/// `statusLine` key exists is that a much earlier csq installer wrote
+/// one before csq learned to patch global. Today, csq statusline
+/// belongs in global; removing the per-slot override lets global
+/// cascade forever and insulates slots from future statusline
+/// contract changes.
+///
+/// A `statusLine.command` containing `csq statusline` is treated as
+/// already current and left alone. A user-custom command that does
+/// not match a known legacy wrapper is also preserved — csq will
+/// never silently overwrite user customisation.
+///
+/// Returns the sorted list of slot numbers whose per-slot statusLine
+/// was removed so the caller can surface a summary line. Unparseable
+/// settings files are skipped silently: the parse-failure branch of
+/// `patch_settings_json` already teaches the user how to recover, so
+/// we don't repeat it per slot.
+fn migrate_per_slot_statuslines(base_dir: &Path) -> Result<Vec<u16>> {
+    let mut migrated: Vec<u16> = Vec::new();
+
+    let entries = match std::fs::read_dir(base_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(migrated), // base_dir doesn't exist yet — no slots
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(slot_str) = name_str.strip_prefix("config-") else {
+            continue;
+        };
+        let Ok(slot) = slot_str.parse::<u16>() else {
+            continue;
+        };
+
+        let settings_path = entry.path().join("settings.json");
+        let content = match std::fs::read_to_string(&settings_path) {
+            Ok(c) if !c.trim().is_empty() => c,
+            _ => continue,
+        };
+        let mut value: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(obj) = value.as_object_mut() else {
+            continue;
+        };
+
+        let cmd_is_legacy = obj
+            .get("statusLine")
+            .and_then(|sl| sl.get("command"))
+            .and_then(|c| c.as_str())
+            .map(is_legacy_statusline_wrapper)
+            .unwrap_or(false);
+        if !cmd_is_legacy {
+            continue;
+        }
+
+        obj.remove("statusLine");
+
+        let json = serde_json::to_string_pretty(&value)?;
+        let tmp = csq_core::platform::fs::unique_tmp_path(&settings_path);
+        std::fs::write(&tmp, json.as_bytes())
+            .with_context(|| format!("writing temp file {}", tmp.display()))?;
+        csq_core::platform::fs::atomic_replace(&tmp, &settings_path)
+            .map_err(|e| anyhow!("atomic replace: {e}"))?;
+
+        migrated.push(slot);
+    }
+
+    migrated.sort();
+    Ok(migrated)
+}
+
+/// Returns true when the `statusLine.command` string points at a
+/// known v1.x shell wrapper that csq has since deprecated. User-
+/// written commands that don't contain one of these tokens are left
+/// alone.
+fn is_legacy_statusline_wrapper(cmd: &str) -> bool {
+    cmd.contains("statusline-quota.sh") || cmd.contains("statusline-command.sh")
 }
 
 fn cleanup_v1_artifacts(claude_home: &Path) -> Vec<String> {
@@ -329,6 +437,160 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v.get("bindings").is_some_and(|b| b.is_array()));
+    }
+
+    // ── migrate_per_slot_statuslines ─────────────────────────
+
+    fn write_slot_settings(base: &Path, slot: u16, json: &str) {
+        let dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), json).unwrap();
+    }
+
+    fn read_slot_settings(base: &Path, slot: u16) -> serde_json::Value {
+        let path = base.join(format!("config-{slot}")).join("settings.json");
+        let content = std::fs::read_to_string(&path).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    #[test]
+    fn migrate_strips_legacy_wrapper_and_preserves_other_fields() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(
+            dir.path(),
+            3,
+            r#"{
+                "statusLine": {"type":"command","command":"bash ~/.claude/accounts/statusline-quota.sh"},
+                "permissions": {"read": true},
+                "plugins": ["foo"],
+                "effortLevel": "high"
+            }"#,
+        );
+
+        let migrated = migrate_per_slot_statuslines(dir.path()).unwrap();
+
+        assert_eq!(migrated, vec![3]);
+        let v = read_slot_settings(dir.path(), 3);
+        assert!(v.get("statusLine").is_none(), "statusLine must be removed");
+        assert_eq!(v["permissions"]["read"], true);
+        assert_eq!(v["plugins"][0], "foo");
+        assert_eq!(v["effortLevel"], "high");
+    }
+
+    #[test]
+    fn migrate_leaves_csq_statusline_value_alone() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(
+            dir.path(),
+            2,
+            r#"{"statusLine":{"type":"command","command":"csq statusline"}}"#,
+        );
+
+        let migrated = migrate_per_slot_statuslines(dir.path()).unwrap();
+
+        assert!(migrated.is_empty());
+        let v = read_slot_settings(dir.path(), 2);
+        assert_eq!(v["statusLine"]["command"], "csq statusline");
+    }
+
+    #[test]
+    fn migrate_preserves_user_custom_statusline() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(
+            dir.path(),
+            5,
+            r#"{"statusLine":{"type":"command","command":"my-custom-tool --slot 5"}}"#,
+        );
+
+        let migrated = migrate_per_slot_statuslines(dir.path()).unwrap();
+
+        assert!(
+            migrated.is_empty(),
+            "user custom commands must be preserved"
+        );
+        let v = read_slot_settings(dir.path(), 5);
+        assert_eq!(v["statusLine"]["command"], "my-custom-tool --slot 5");
+    }
+
+    #[test]
+    fn migrate_matches_statusline_command_sh_wrapper() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(
+            dir.path(),
+            4,
+            r#"{"statusLine":{"type":"command","command":"bash ~/.claude/statusline-command.sh"}}"#,
+        );
+
+        let migrated = migrate_per_slot_statuslines(dir.path()).unwrap();
+        assert_eq!(migrated, vec![4]);
+    }
+
+    #[test]
+    fn migrate_handles_many_slots_and_returns_sorted() {
+        let dir = TempDir::new().unwrap();
+        // Slots 1, 6, 10 have legacy; 2 has csq; 7 has no statusLine.
+        let legacy = r#"{"statusLine":{"type":"command","command":"bash ~/.claude/accounts/statusline-quota.sh"}}"#;
+        let csq = r#"{"statusLine":{"type":"command","command":"csq statusline"}}"#;
+        let none = r#"{"permissions":{}}"#;
+        write_slot_settings(dir.path(), 10, legacy);
+        write_slot_settings(dir.path(), 1, legacy);
+        write_slot_settings(dir.path(), 6, legacy);
+        write_slot_settings(dir.path(), 2, csq);
+        write_slot_settings(dir.path(), 7, none);
+
+        let migrated = migrate_per_slot_statuslines(dir.path()).unwrap();
+        assert_eq!(migrated, vec![1, 6, 10]);
+    }
+
+    #[test]
+    fn migrate_skips_unparseable_settings_files() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 1, "not valid json {{{");
+
+        let migrated = migrate_per_slot_statuslines(dir.path()).unwrap();
+        assert!(migrated.is_empty());
+        // File is untouched (still not-valid-json bytes).
+        let raw = std::fs::read_to_string(dir.path().join("config-1/settings.json")).unwrap();
+        assert_eq!(raw, "not valid json {{{");
+    }
+
+    #[test]
+    fn migrate_skips_non_config_directories() {
+        let dir = TempDir::new().unwrap();
+        // A `term-1234` handle dir with a legacy-looking statusLine
+        // should NOT be touched by the per-slot migration.
+        let term_dir = dir.path().join("term-1234");
+        std::fs::create_dir_all(&term_dir).unwrap();
+        std::fs::write(
+            term_dir.join("settings.json"),
+            r#"{"statusLine":{"type":"command","command":"bash ~/.claude/accounts/statusline-quota.sh"}}"#,
+        )
+        .unwrap();
+
+        let migrated = migrate_per_slot_statuslines(dir.path()).unwrap();
+        assert!(migrated.is_empty());
+        // term dir file still has the legacy statusLine.
+        let content = std::fs::read_to_string(term_dir.join("settings.json")).unwrap();
+        assert!(content.contains("statusline-quota.sh"));
+    }
+
+    #[test]
+    fn migrate_no_base_dir_is_ok() {
+        let dir = TempDir::new().unwrap();
+        // Path does not exist at all.
+        let migrated = migrate_per_slot_statuslines(&dir.path().join("nonexistent")).unwrap();
+        assert!(migrated.is_empty());
+    }
+
+    #[test]
+    fn is_legacy_wrapper_detection() {
+        assert!(is_legacy_statusline_wrapper(
+            "bash ~/.claude/accounts/statusline-quota.sh"
+        ));
+        assert!(is_legacy_statusline_wrapper("statusline-command.sh"));
+        assert!(!is_legacy_statusline_wrapper("csq statusline"));
+        assert!(!is_legacy_statusline_wrapper("my-custom-tool"));
+        assert!(!is_legacy_statusline_wrapper(""));
     }
 
     #[test]

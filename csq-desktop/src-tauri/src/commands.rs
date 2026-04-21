@@ -857,7 +857,17 @@ pub fn cancel_login(state: State<'_, AppState>, state_token: String) -> Result<(
             // gone from the store.
             Ok(())
         }
-        Err(e) => Err(format!("cancel failed: {e}")),
+        // Fixed-vocabulary fallback to avoid leaking `OAuthError::Http { body }`
+        // or `OAuthError::Exchange(String)` content through the IPC
+        // response if a future refactor widens `consume`'s error
+        // surface. Journal 0063 M1.
+        Err(csq_core::error::OAuthError::Http { .. }) => Err("cancel failed: http_error".into()),
+        Err(csq_core::error::OAuthError::PkceVerification) => {
+            Err("cancel failed: pkce_verification".into())
+        }
+        Err(csq_core::error::OAuthError::Exchange(_)) => {
+            Err("cancel failed: exchange_failed".into())
+        }
     }
 }
 

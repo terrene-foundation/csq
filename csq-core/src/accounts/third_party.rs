@@ -146,19 +146,60 @@ pub fn bind_provider_to_slot(
         reason: format!("create_dir_all: {e}"),
     })?;
 
-    // 1. Build a MINIMAL settings.json containing only the env block CC
-    //    needs to route through this provider. The handle-dir model
-    //    materializes the user-facing `term-<pid>/settings.json` by
-    //    deep-merging `~/.claude/settings.json` (user global — statusLine,
-    //    permissions, plugins) with this file (3P env overlay). Anything
-    //    beyond `env` here would leak into every terminal bound to this
-    //    slot and silently override the user's global customization.
+    // 1. Read-modify-write the per-slot settings.json. We overlay
+    //    the 3P env keys (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
+    //    ANTHROPIC_*_MODEL) onto whatever env block is already there
+    //    and preserve every other top-level field (permissions,
+    //    plugins, feedbackSurveyState, user-custom env vars like
+    //    NODE_ENV). Journal 0063 P1-2: earlier revisions built a
+    //    minimal settings object from scratch via `Map::new()`, which
+    //    silently destroyed any field the user had hand-edited on
+    //    the slot. This shape mirrors `unbind_provider_from_slot`
+    //    (same file), which has been preserving unrelated fields
+    //    since introduction and has a test
+    //    (`unbind_preserves_non_3p_env_keys`) anchoring the contract.
     //
-    //    Discovery (`discover_per_slot_third_party`) and the 3P usage
-    //    poller both read `env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
-    //    / `ANTHROPIC_MODEL` from this file, so the env block is the
-    //    source of truth for slot identity and must be written here.
-    let mut env = Map::new();
+    //    Discovery (`discover_per_slot_third_party`) and the 3P
+    //    usage poller both read `env.ANTHROPIC_BASE_URL` /
+    //    `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` from this file,
+    //    so the env block is the source of truth for slot identity
+    //    and must be written here.
+    let settings_path = config_dir.join("settings.json");
+    let mut settings_value: Value = match std::fs::read_to_string(&settings_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            serde_json::from_str(&content).unwrap_or_else(|_| {
+                // On parse failure, fall back to an empty object so
+                // the bind still completes. The alternative —
+                // refusing — would strand the user on a slot they
+                // can no longer bind to. Overwriting an unparseable
+                // file is the lesser evil.
+                Value::Object(Map::new())
+            })
+        }
+        _ => Value::Object(Map::new()),
+    };
+
+    // Ensure top-level is an object.
+    if !settings_value.is_object() {
+        settings_value = Value::Object(Map::new());
+    }
+    let settings_obj = settings_value
+        .as_object_mut()
+        .expect("ensured object above");
+
+    // Ensure `env` is an object; preserve any user-custom keys.
+    let env_value = settings_obj
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !env_value.is_object() {
+        *env_value = Value::Object(Map::new());
+    }
+    let env = env_value.as_object_mut().expect("ensured object above");
+
+    // Overlay the 3P-specific env keys. Any key already present is
+    // overwritten (e.g. rebinding with a new API key updates the
+    // AUTH_TOKEN); user-custom keys (NODE_ENV, CUSTOM_API_URL) are
+    // untouched.
     env.insert(
         base_url_env_var.to_string(),
         Value::String(base_url.to_string()),
@@ -171,11 +212,7 @@ pub fn bind_provider_to_slot(
             Value::String(model_to_write.to_string()),
         );
     }
-    let mut settings_obj = Map::new();
-    settings_obj.insert("env".to_string(), Value::Object(env));
-    let settings_value = Value::Object(settings_obj);
 
-    let settings_path = config_dir.join("settings.json");
     // SECURITY: the JSON value carries the API key. The reason field is a
     // fixed string (not `format!("...: {e}")`) so a future serialize impl
     // that included the value in its error message could not echo the key
@@ -187,21 +224,33 @@ pub fn bind_provider_to_slot(
         })?;
 
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("write: {e}"),
-    })?;
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("write: {e}"),
+        });
+    }
     // SECURITY: propagate (not `.ok()`) — a silent permission failure would
     // publish the credential file at the umask default, potentially
-    // world-readable. Fail closed.
-    secure_file(&tmp).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("secure_file: {e}"),
-    })?;
-    atomic_replace(&tmp, &settings_path).map_err(|e| ConfigError::InvalidJson {
-        path: settings_path.clone(),
-        reason: format!("atomic replace: {e}"),
-    })?;
+    // world-readable. Fail closed. Red-team B2: `std::fs::write` above
+    // created `tmp` at umask-default permissions with the token in
+    // plaintext; on any failure path below we MUST `remove_file`
+    // before propagating so the token isn't left readable on disk.
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("secure_file: {e}"),
+        });
+    }
+    if let Err(e) = atomic_replace(&tmp, &settings_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: settings_path.clone(),
+            reason: format!("atomic replace: {e}"),
+        });
+    }
 
     // 2. Upsert profiles.json entry.
     let profiles_path = profiles::profiles_path(base_dir);
@@ -320,19 +369,34 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
         path: settings_path.clone(),
         reason: "settings serialize failed".into(),
     })?;
+    // Red-team B2: any failure on the tmp file must delete it
+    // before propagating. Even though unbind's path no longer
+    // holds the 3P token (we just removed the env block), the
+    // unrelated settings fields that DO remain (permissions,
+    // plugins, user env vars) may still be sensitive, and the
+    // umask-default artifact would be surprising.
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("write: {e}"),
-    })?;
-    secure_file(&tmp).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("secure_file: {e}"),
-    })?;
-    atomic_replace(&tmp, &settings_path).map_err(|e| ConfigError::InvalidJson {
-        path: settings_path.clone(),
-        reason: format!("atomic replace: {e}"),
-    })?;
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("write: {e}"),
+        });
+    }
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("secure_file: {e}"),
+        });
+    }
+    if let Err(e) = atomic_replace(&tmp, &settings_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: settings_path.clone(),
+            reason: format!("atomic replace: {e}"),
+        });
+    }
 
     Ok(true)
 }
@@ -365,6 +429,115 @@ mod tests {
             "https://api.minimax.io/anthropic"
         );
         assert!(env.get("ANTHROPIC_MODEL").is_some());
+    }
+
+    /// Regression for journal 0063 P1-2: bind_provider_to_slot must
+    /// preserve every user-edited field in config-N/settings.json.
+    /// Earlier revisions built a minimal settings from scratch via
+    /// `Map::new()`, silently destroying permissions, plugins, and
+    /// user-custom env keys. Matches the preservation contract that
+    /// `unbind_provider_from_slot` has via
+    /// `unbind_preserves_non_3p_env_keys`.
+    #[test]
+    fn bind_preserves_user_customisations_in_settings_json() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        let config_dir = dir.path().join("config-9");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let settings_path = config_dir.join("settings.json");
+
+        // User hand-edits settings.json BEFORE running `csq setkey`.
+        let seed = serde_json::json!({
+            "env": {
+                "NODE_ENV": "development",
+                "CUSTOM_API_URL": "https://internal.example.com"
+            },
+            "permissions": { "read": true, "write": false },
+            "plugins": ["foo", "bar"],
+            "effortLevel": "high",
+            "feedbackSurveyState": { "dismissed": true }
+        });
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        // Act: bind MiniMax to the slot.
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-mm-abc123"), None).unwrap();
+
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+
+        // 3P keys were overlaid correctly.
+        let env = json.get("env").unwrap().as_object().unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").unwrap(),
+            "sk-test-mm-abc123"
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap(),
+            "https://api.minimax.io/anthropic"
+        );
+
+        // User-custom env keys survived.
+        assert_eq!(env.get("NODE_ENV").unwrap(), "development");
+        assert_eq!(
+            env.get("CUSTOM_API_URL").unwrap(),
+            "https://internal.example.com"
+        );
+
+        // Top-level user fields all survived.
+        let perms = json.get("permissions").unwrap();
+        assert_eq!(perms.get("read").unwrap(), true);
+        assert_eq!(perms.get("write").unwrap(), false);
+
+        let plugins = json.get("plugins").unwrap().as_array().unwrap();
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0], "foo");
+        assert_eq!(plugins[1], "bar");
+
+        assert_eq!(json.get("effortLevel").unwrap(), "high");
+        assert_eq!(
+            json.get("feedbackSurveyState")
+                .unwrap()
+                .get("dismissed")
+                .unwrap(),
+            true
+        );
+    }
+
+    /// Rebinding with a new key must overwrite the old AUTH_TOKEN
+    /// but still preserve unrelated fields.
+    #[test]
+    fn bind_rebinding_updates_token_and_preserves_other_fields() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+
+        // First bind.
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-old-key"), None).unwrap();
+        let settings_path = dir.path().join("config-9/settings.json");
+
+        // User edits settings.json between binds.
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let mut json: Value = serde_json::from_str(&content).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("permissions".to_string(), serde_json::json!({"read": true}));
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Rebind with a fresh key.
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-new-key"), None).unwrap();
+
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+
+        // Token updated.
+        assert_eq!(
+            json.get("env")
+                .unwrap()
+                .get("ANTHROPIC_AUTH_TOKEN")
+                .unwrap(),
+            "sk-test-new-key"
+        );
+        // Permissions survived the rebind.
+        assert_eq!(json.get("permissions").unwrap().get("read").unwrap(), true);
     }
 
     #[test]

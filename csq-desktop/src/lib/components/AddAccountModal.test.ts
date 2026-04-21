@@ -124,6 +124,49 @@ describe("AddAccountModal", () => {
     expect(container.textContent).toContain("Add Account");
   });
 
+  // Regression for journal 0063 P1-6 (and journal 0061 pattern): the
+  // modal is rendered by AccountList even when closed; the user only
+  // flips it open later. Mount with isOpen=false, then flip true via
+  // rerender — list_providers MUST fire on the open edge and the
+  // provider cards MUST render. ChangeModelModal had an analogous bug
+  // that shipped in alpha.21 precisely because its tests all mounted
+  // with isOpen=true; locking this down for AddAccountModal prevents
+  // the same class regression.
+  it("loads providers when isOpen flips from false to true after mount", async () => {
+    const { container, rerender } = render(AddAccountModal, {
+      props: {
+        isOpen: false,
+        nextAccountId: 3,
+        reauthSlot: null,
+        onClose: vi.fn(),
+        onAccountAdded: vi.fn(),
+      },
+    });
+    await tick();
+
+    // Mount happened with isOpen=false — no network/IPC should fire.
+    expect(mockInvoke).not.toHaveBeenCalled();
+
+    // User clicks "+ Add Account" → parent flips isOpen true.
+    await rerender({
+      isOpen: true,
+      nextAccountId: 3,
+      reauthSlot: null,
+      onClose: vi.fn(),
+      onAccountAdded: vi.fn(),
+    });
+    for (let i = 0; i < 8; i++) {
+      await tick();
+    }
+
+    expect(mockInvoke).toHaveBeenCalledWith("list_providers");
+    const cards = container.querySelectorAll(".provider-card");
+    expect(
+      cards.length,
+      `expected 3 provider cards after open edge; got HTML: ${container.innerHTML.slice(0, 500)}`,
+    ).toBe(3);
+  });
+
   // ── Provider list ───────────────────────────────────────────
 
   it("loads and displays provider cards", async () => {

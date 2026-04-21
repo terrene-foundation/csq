@@ -220,16 +220,42 @@ pub fn save_settings(base_dir: &Path, settings: &ProviderSettings) -> Result<(),
     }
 
     let tmp = crate::platform::fs::unique_tmp_path(&path);
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("write: {e}"),
-    })?;
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        // `std::fs::write` may partially write before returning Err,
+        // leaving a tmp file containing the token at umask-default
+        // permissions. Clean up before propagating.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("write: {e}"),
+        });
+    }
 
-    secure_file(&tmp).ok();
-    atomic_replace(&tmp, &path).map_err(|e| ConfigError::InvalidJson {
-        path: path.clone(),
-        reason: format!("atomic replace: {e}"),
-    })?;
+    // SECURITY: propagate (not `.ok()`). This file holds 3P API
+    // tokens (ANTHROPIC_AUTH_TOKEN for MiniMax / Z.AI) under the
+    // env block — a silent chmod failure on an exotic filesystem
+    // (network mount, restrictive-ACL tmpfs) would publish the
+    // credential file at the umask default. Fail closed. Journal
+    // 0063 P1-4, red-team B2. On failure the tmp file must be
+    // removed — `std::fs::write` above created it at umask-default
+    // permissions, so leaving it behind would defeat the fail-
+    // closed intent. Uses a fixed reason string so a future
+    // secure_file implementation that included the path or file
+    // contents in its error message could not echo the key.
+    if secure_file(&tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: "secure_file: chmod failed".into(),
+        });
+    }
+    if let Err(e) = atomic_replace(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: path.clone(),
+            reason: format!("atomic replace: {e}"),
+        });
+    }
 
     Ok(())
 }

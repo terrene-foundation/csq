@@ -121,6 +121,26 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
         return;
     }
 
+    // Handle-dir model guard (journal 0064, P0-1). Under the handle-
+    // dir model (spec 02, INV-01), config-<N>/.credentials.json is
+    // permanent account-N credentials. Auto-rotation's legacy `swap_to`
+    // path writes target account M's credentials INTO config-N, which
+    // silently corrupts identity for every terminal whose handle dir
+    // symlinks back through config-N. The structural fix is to rotate
+    // `term-<pid>` handle-dir symlinks instead of config-N files; that
+    // redesign ships in 2.0.1. For 2.0.0 we refuse-to-run when any
+    // handle dir exists and leave a clear WARN so the user knows the
+    // feature is deferred, rather than running and corrupting state.
+    if handle_dirs_present(base_dir) {
+        warn!(
+            "auto-rotation: skipping tick — handle-dir mode detected \
+             (term-*/ directories present). Auto-rotation in handle-dir \
+             mode is deferred to csq 2.0.1 pending a handle-dir-native \
+             rotator. See journal 0064."
+        );
+        return;
+    }
+
     let cooldown_duration = Duration::from_secs(cfg.cooldown_secs);
 
     // Scan config-* directories under base_dir.
@@ -250,6 +270,28 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
     } else {
         debug!("auto-rotation tick: no config dirs processed");
     }
+}
+
+/// Returns true when at least one `term-<pid>` handle directory exists
+/// directly under `base_dir`. Presence of any handle dir is the signal
+/// that the installation is using the handle-dir model (spec 02);
+/// auto-rotation's legacy swap path is unsafe in that mode. Journal
+/// 0064. A read-dir error returns false so a genuinely empty / missing
+/// base_dir doesn't flip the feature on by accident.
+fn handle_dirs_present(base_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.starts_with("term-") && entry.path().is_dir() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Finds the best rotation target, respecting the user's exclusion list.
@@ -602,6 +644,86 @@ mod tests {
         assert_eq!(
             markers::read_csq_account(&config_dir),
             Some(AccountNum::try_from(1u16).unwrap())
+        );
+    }
+
+    // ── handle-dir guard (journal 0064, P0-1) ────────────────────────────
+
+    #[test]
+    fn handle_dirs_present_detects_term_dir() {
+        let dir = TempDir::new().unwrap();
+        assert!(!handle_dirs_present(dir.path()));
+
+        std::fs::create_dir_all(dir.path().join("term-12345")).unwrap();
+        assert!(handle_dirs_present(dir.path()));
+    }
+
+    #[test]
+    fn handle_dirs_present_ignores_config_dirs() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("config-1")).unwrap();
+        std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
+        assert!(!handle_dirs_present(dir.path()));
+    }
+
+    #[test]
+    fn handle_dirs_present_ignores_files_named_term() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("term-regular-file"), b"x").unwrap();
+        assert!(!handle_dirs_present(dir.path()));
+    }
+
+    #[test]
+    fn tick_enabled_with_handle_dir_refuses_to_swap() {
+        // Journal 0064 regression: with rotation enabled AND a handle
+        // dir present, tick MUST short-circuit rather than call
+        // swap_to on config-N. Writing account M's credentials into
+        // config-N violates INV-01 and corrupts identity for every
+        // terminal symlinking to that config dir.
+        let dir = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
+        setup_quota(dir.path(), 1, 97.0); // above threshold
+        setup_quota(dir.path(), 2, 10.0);
+        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+
+        // Seed a handle dir to signal handle-dir mode.
+        std::fs::create_dir_all(dir.path().join("term-9999")).unwrap();
+
+        // Snapshot config-1/.credentials.json BEFORE tick. It was
+        // written by setup_account via canonical_path — but only the
+        // credentials/1.json canonical, not the live config-1 copy.
+        // For this test we write a marker file ("account 1 lives
+        // here") and verify it's untouched.
+        let live_cred = config_dir.join(".credentials.json");
+        std::fs::write(&live_cred, b"account-1-creds-sentinel").unwrap();
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), &mut cooldowns);
+
+        // Asserts: config-1/.credentials.json is UNCHANGED. Account-1
+        // marker is UNCHANGED. No cooldown entry (tick short-circuited
+        // before reaching cooldown tracking).
+        let contents = std::fs::read(&live_cred).unwrap();
+        assert_eq!(
+            contents, b"account-1-creds-sentinel",
+            "config-N/.credentials.json MUST NOT be rewritten under handle-dir mode"
+        );
+        assert_eq!(
+            markers::read_csq_account(&config_dir),
+            Some(AccountNum::try_from(1u16).unwrap()),
+            "config-N marker must remain account 1 — handle-dir guard failed"
+        );
+        assert!(
+            cooldowns.is_empty(),
+            "cooldowns must be empty — guard should short-circuit before tracking"
         );
     }
 }

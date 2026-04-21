@@ -151,6 +151,32 @@ pub fn start(base_dir: PathBuf) -> SupervisorHandle {
 /// - On clean daemon exit (we owned it, cancellation not fired):
 ///   stay at the reset value and retry after 5s
 async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
+    // Windows honesty guard — journal 0063 P1-3. The non-unix path
+    // of `run_daemon` is a stub with no subsystems. Without this
+    // guard the supervisor would still acquire the PidFile, making
+    // `detect_daemon` and the tray both report "daemon running"
+    // while tokens silently go stale. Until the Windows named-pipe
+    // daemon (server_windows.rs exists in csq-core) is wired up end
+    // to end, refuse to claim ownership on Windows and surface
+    // "daemon not available" instead.
+    #[cfg(not(unix))]
+    {
+        let _ = base_dir;
+        log::warn!(
+            "in-process daemon is not yet available on this platform \
+             (Windows named-pipe daemon pending). Tokens will not refresh \
+             automatically. See release notes for manual workflow."
+        );
+        cancel.cancelled().await;
+        return;
+    }
+
+    #[cfg(unix)]
+    supervisor_loop_unix(base_dir, cancel).await;
+}
+
+#[cfg(unix)]
+async fn supervisor_loop_unix(base_dir: PathBuf, cancel: CancellationToken) {
     log::info!("daemon supervisor starting");
     let mut backoff = Backoff::new();
     loop {

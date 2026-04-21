@@ -52,19 +52,44 @@ pub fn backsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     // Acquire per-canonical lock
     let _guard = lock::lock_file(&lock_path)?;
 
-    // Re-read canonical inside lock (monotonicity guard)
-    let canonical_expires = match credentials::load(&canonical_path) {
-        Ok(c) => c.claude_ai_oauth.expires_at,
-        Err(_) => 0, // no canonical yet — any live is newer
-    };
+    // Re-read canonical inside lock (monotonicity guard AND
+    // subscription-metadata preservation source, journal 0063 P1-1).
+    let canonical_existing = credentials::load(&canonical_path).ok();
+    let canonical_expires = canonical_existing
+        .as_ref()
+        .map(|c| c.claude_ai_oauth.expires_at)
+        .unwrap_or(0);
 
     if live_creds.claude_ai_oauth.expires_at <= canonical_expires {
         debug!(account = %account, "backsync: live is not newer, skipping");
         return Ok(false);
     }
 
+    // Subscription preservation guard — mirror the shape from
+    // `rotation::swap_to` and `broker::fanout::fan_out_credentials`.
+    // Anthropic's token endpoint does NOT return `subscription_type`
+    // or `rate_limit_tier`; CC backfills them into the live file on
+    // its first API call after a fresh login. If CC just wrote a
+    // fresh `.credentials.json` (post-re-login) and backsync fires
+    // before CC makes its first API call, live carries `None` for
+    // both fields. Without this guard we'd overwrite canonical's
+    // `Some(max)` with `None` and the user's Max tier vanishes until
+    // the next daemon refresh backfills it — typically up to 5
+    // hours. Preserve canonical's value when live is None.
+    let mut to_save = live_creds.clone();
+    if let Some(existing) = canonical_existing.as_ref() {
+        if to_save.claude_ai_oauth.subscription_type.is_none() {
+            to_save.claude_ai_oauth.subscription_type =
+                existing.claude_ai_oauth.subscription_type.clone();
+        }
+        if to_save.claude_ai_oauth.rate_limit_tier.is_none() {
+            to_save.claude_ai_oauth.rate_limit_tier =
+                existing.claude_ai_oauth.rate_limit_tier.clone();
+        }
+    }
+
     // Live is newer — update canonical
-    credentials::save(&canonical_path, &live_creds)?;
+    credentials::save(&canonical_path, &to_save)?;
     debug!(account = %account, "backsync: canonical updated from live");
     Ok(true)
 }
@@ -193,6 +218,81 @@ mod tests {
 
         let synced = backsync(&config, dir.path()).unwrap();
         assert!(!synced);
+    }
+
+    /// Regression for journal 0063 P1-1: when live.subscription_type is
+    /// None (Anthropic's token endpoint doesn't include it; CC backfills
+    /// on first API call), backsync must preserve canonical's Some(max)
+    /// rather than overwriting with None. Without the guard, the user's
+    /// Max tier silently disappears until the next daemon refresh.
+    #[test]
+    fn backsync_preserves_subscription_type_when_live_has_none() {
+        let dir = TempDir::new().unwrap();
+        let acct = AccountNum::try_from(5u16).unwrap();
+
+        // Canonical has Max.
+        let mut canonical = make_creds("at-canonical", "rt-5", 1000);
+        canonical.claude_ai_oauth.subscription_type = Some("max".to_string());
+        canonical.claude_ai_oauth.rate_limit_tier = Some("tier_4".to_string());
+        credentials::save(&file::canonical_path(dir.path(), acct), &canonical).unwrap();
+
+        // Live is fresh (newer expires_at) but subscription fields
+        // are None — matches the post-re-login state before CC
+        // makes its first API call.
+        let config = dir.path().join("config-5");
+        std::fs::create_dir_all(&config).unwrap();
+        markers::write_csq_account(&config, acct).unwrap();
+        let live = make_creds("at-live-fresh", "rt-5", 2000);
+        assert!(live.claude_ai_oauth.subscription_type.is_none());
+        credentials::save(&config.join(".credentials.json"), &live).unwrap();
+
+        // Act
+        let synced = backsync(&config, dir.path()).unwrap();
+        assert!(synced, "live is newer — backsync must update canonical");
+
+        // Assert: expires_at updated (freshness carried over) AND
+        // subscription_type/rate_limit_tier preserved from canonical.
+        let post = credentials::load(&file::canonical_path(dir.path(), acct)).unwrap();
+        assert_eq!(post.claude_ai_oauth.expires_at, 2000);
+        assert_eq!(
+            post.claude_ai_oauth.subscription_type.as_deref(),
+            Some("max"),
+            "subscription_type must be preserved when live has None"
+        );
+        assert_eq!(
+            post.claude_ai_oauth.rate_limit_tier.as_deref(),
+            Some("tier_4"),
+            "rate_limit_tier must be preserved when live has None"
+        );
+    }
+
+    /// When live has a subscription_type (e.g. CC already made its
+    /// first API call and backfilled), backsync must take live's
+    /// value — not cling to canonical's stale one.
+    #[test]
+    fn backsync_takes_live_subscription_type_when_present() {
+        let dir = TempDir::new().unwrap();
+        let acct = AccountNum::try_from(6u16).unwrap();
+
+        let mut canonical = make_creds("at-canonical", "rt-6", 1000);
+        canonical.claude_ai_oauth.subscription_type = Some("max".to_string());
+        credentials::save(&file::canonical_path(dir.path(), acct), &canonical).unwrap();
+
+        let config = dir.path().join("config-6");
+        std::fs::create_dir_all(&config).unwrap();
+        markers::write_csq_account(&config, acct).unwrap();
+        let mut live = make_creds("at-live", "rt-6", 2000);
+        live.claude_ai_oauth.subscription_type = Some("pro".to_string());
+        credentials::save(&config.join(".credentials.json"), &live).unwrap();
+
+        backsync(&config, dir.path()).unwrap();
+
+        let post = credentials::load(&file::canonical_path(dir.path(), acct)).unwrap();
+        assert_eq!(
+            post.claude_ai_oauth.subscription_type.as_deref(),
+            Some("pro"),
+            "live's Some value must win over canonical's when present"
+        );
     }
 
     #[test]

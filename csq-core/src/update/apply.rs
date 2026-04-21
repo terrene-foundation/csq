@@ -36,7 +36,7 @@
 use crate::platform::fs::secure_file;
 use crate::platform::fs::{atomic_replace, unique_tmp_path};
 use crate::update::github::UpdateInfo;
-use crate::update::verify::{verify_checksum, verify_signature};
+use crate::update::verify::{is_placeholder_key, verify_checksum, verify_signature};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::PathBuf;
@@ -56,6 +56,27 @@ pub fn download_and_apply<F>(info: &UpdateInfo, http_get: F) -> Result<()>
 where
     F: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
 {
+    // Structural placeholder-key guard (journal 0063, H1). The CLI
+    // wrapper at `csq-cli/src/commands/update.rs:75` used to be the
+    // only caller that enforced this check. Keeping the gate on the
+    // public entry point of csq-core ensures every future caller —
+    // desktop Tauri command, `csq doctor --install-update`, or any
+    // rogue integration test promoted to `pub` — inherits the
+    // defense. `download_and_apply_to` (pub(crate)) is deliberately
+    // left unguarded so unit tests that sign with the placeholder
+    // key for a round-trip against `verify_signature` continue to
+    // work.
+    if is_placeholder_key() {
+        anyhow::bail!(
+            "refusing to install update: release verification key is still \
+             the deterministic placeholder seed. This build cannot safely \
+             verify binaries — the placeholder's private key is reproducible \
+             from the committed source. Foundation must provision the \
+             production release-signing key before in-app update install is \
+             enabled. Download the new installer manually from GitHub Releases."
+        );
+    }
+
     let binary_path = current_binary_path()?;
     download_and_apply_to(info, &binary_path, http_get)
 }
@@ -476,10 +497,20 @@ mod tests {
     }
 
     #[test]
-    fn download_and_apply_fails_on_transport_error() {
-        // Arrange: transport that always errors
+    fn download_and_apply_to_fails_on_transport_error() {
+        // Arrange: transport that always errors. Must go through
+        // `download_and_apply_to` in test builds — the public
+        // `download_and_apply` refuses before calling the transport
+        // because the `#[cfg(test)]` key override is the placeholder
+        // and the H1 guard fires. Production builds hit the transport
+        // because the compiled-in key is the real Foundation key.
+        let dir = TempDir::new().unwrap();
+        let target_path = dir.path().join("csq");
+        std::fs::write(&target_path, b"old binary").unwrap();
         let info = fake_update_info("2.1.0");
-        let result = download_and_apply(&info, |_url, _headers| Err("connection failed".into()));
+        let result = download_and_apply_to(&info, &target_path, |_url, _headers| {
+            Err("connection failed".into())
+        });
 
         // Assert
         assert!(result.is_err());
@@ -487,6 +518,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("failed to download"));
+    }
+
+    // ── H1 regression (journal 0063) ──────────────────────────────────────
+
+    #[test]
+    fn download_and_apply_refuses_when_placeholder_key_is_compiled_in() {
+        // Under `#[cfg(test)]`, `RELEASE_PUBLIC_KEY_BYTES` IS the
+        // seed-1 placeholder by construction — see verify.rs. The
+        // H1 guard at the top of `download_and_apply` must fire and
+        // bail with a message that references "placeholder". This
+        // is the regression test that catches any refactor which
+        // accidentally weakens the gate or moves the check back to
+        // the CLI wrapper.
+        let info = fake_update_info("2.1.0");
+        let result = download_and_apply(&info, |_url, _headers| {
+            unreachable!("transport must not be called — guard should short-circuit")
+        });
+        let err = result.expect_err("placeholder-key guard must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("placeholder"),
+            "error must mention 'placeholder' so the user gets actionable guidance; got: {msg}"
+        );
     }
 
     #[test]

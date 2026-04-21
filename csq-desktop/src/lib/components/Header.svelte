@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { getVersion } from '@tauri-apps/api/app';
   import { homeDir, join } from '@tauri-apps/api/path';
 
   interface DaemonStatusView {
@@ -10,6 +11,13 @@
   let daemonRunning = $state(false);
   let autostartEnabled = $state(false);
   let autostartBusy = $state(false);
+  // Version string shown in the header. Bound to the Tauri app's
+  // `getVersion()` so it always reflects the bundled `tauri.conf.json`
+  // version rather than a hardcoded literal that drifts across
+  // releases (journal 0063 P1-5: alpha.21 shipped with a literal
+  // "v2.0.0-alpha.21" string that would embarrass us on day-1 of
+  // 2.0.0 stable).
+  let appVersion = $state<string | null>(null);
 
   async function fetchDaemonStatus() {
     try {
@@ -55,9 +63,20 @@
     }
   }
 
+  async function fetchVersion() {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      // Version lookup should never fail — but if it does, hide
+      // the span rather than show misleading text.
+      appVersion = null;
+    }
+  }
+
   $effect(() => {
     fetchDaemonStatus();
     fetchAutostart();
+    fetchVersion();
     const interval = setInterval(fetchDaemonStatus, 10000);
     return () => clearInterval(interval);
   });
@@ -66,7 +85,7 @@
 <header>
   <div class="left">
     <h1>Code Session Quota</h1>
-    <span class="version">v2.0.0-alpha.21</span>
+    {#if appVersion}<span class="version">v{appVersion}</span>{/if}
   </div>
   <div class="right">
     <label class="autostart" title="Start Code Session Quota automatically when you log in">

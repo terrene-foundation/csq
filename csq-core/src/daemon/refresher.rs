@@ -539,15 +539,27 @@ fn append_resurrection_breadcrumb(
 ) {
     let path = base_dir.join(".resurrection-log.jsonl");
     let ts = now_secs();
-    // Hand-serialize because serde_json::to_string on a Map requires
-    // allocating a Map, which is more ceremony than we need for five
-    // scalar fields. Fields are all operator-supplied or internal
-    // integers — no token material flows here — so direct interpolation
-    // is safe.
-    let line = format!(
-        r#"{{"timestamp_secs":{ts},"account":{account},"event":"canonical_resurrected","live_mtime_secs":{live_mtime_secs},"live_path":"{lp}"}}"#,
-        lp = live_path.display().to_string().replace('"', "\\\"")
-    );
+    // serde_json serialize — journal 0063 M3 replaces the prior
+    // hand-rolled format! that only escaped double quotes. A path
+    // containing backslashes or control characters (CR/LF) would
+    // corrupt the JSONL so `jq` / `csq doctor` can't parse the
+    // forensic trail. serde_json handles every JSON-reserved byte.
+    let line = serde_json::to_string(&serde_json::json!({
+        "timestamp_secs": ts,
+        "account": account,
+        "event": "canonical_resurrected",
+        "live_mtime_secs": live_mtime_secs,
+        "live_path": live_path.display().to_string(),
+    }))
+    .unwrap_or_else(|_| {
+        // serde_json::to_string on a pre-built Value<String> can
+        // only fail for non-UTF-8 map keys — all ours are literals,
+        // so this branch is unreachable. Fall through with a minimal
+        // breadcrumb so the log never truncates silently.
+        format!(
+            r#"{{"timestamp_secs":{ts},"account":{account},"event":"canonical_resurrected","serialize_error":true}}"#
+        )
+    });
 
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()

@@ -224,21 +224,33 @@ pub fn bind_provider_to_slot(
         })?;
 
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("write: {e}"),
-    })?;
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("write: {e}"),
+        });
+    }
     // SECURITY: propagate (not `.ok()`) — a silent permission failure would
     // publish the credential file at the umask default, potentially
-    // world-readable. Fail closed.
-    secure_file(&tmp).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("secure_file: {e}"),
-    })?;
-    atomic_replace(&tmp, &settings_path).map_err(|e| ConfigError::InvalidJson {
-        path: settings_path.clone(),
-        reason: format!("atomic replace: {e}"),
-    })?;
+    // world-readable. Fail closed. Red-team B2: `std::fs::write` above
+    // created `tmp` at umask-default permissions with the token in
+    // plaintext; on any failure path below we MUST `remove_file`
+    // before propagating so the token isn't left readable on disk.
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("secure_file: {e}"),
+        });
+    }
+    if let Err(e) = atomic_replace(&tmp, &settings_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: settings_path.clone(),
+            reason: format!("atomic replace: {e}"),
+        });
+    }
 
     // 2. Upsert profiles.json entry.
     let profiles_path = profiles::profiles_path(base_dir);
@@ -357,19 +369,34 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
         path: settings_path.clone(),
         reason: "settings serialize failed".into(),
     })?;
+    // Red-team B2: any failure on the tmp file must delete it
+    // before propagating. Even though unbind's path no longer
+    // holds the 3P token (we just removed the env block), the
+    // unrelated settings fields that DO remain (permissions,
+    // plugins, user env vars) may still be sensitive, and the
+    // umask-default artifact would be surprising.
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("write: {e}"),
-    })?;
-    secure_file(&tmp).map_err(|e| ConfigError::InvalidJson {
-        path: tmp.clone(),
-        reason: format!("secure_file: {e}"),
-    })?;
-    atomic_replace(&tmp, &settings_path).map_err(|e| ConfigError::InvalidJson {
-        path: settings_path.clone(),
-        reason: format!("atomic replace: {e}"),
-    })?;
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("write: {e}"),
+        });
+    }
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("secure_file: {e}"),
+        });
+    }
+    if let Err(e) = atomic_replace(&tmp, &settings_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: settings_path.clone(),
+            reason: format!("atomic replace: {e}"),
+        });
+    }
 
     Ok(true)
 }

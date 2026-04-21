@@ -117,6 +117,23 @@ fn launch_third_party(
     let pid = std::process::id();
     let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
         .context("failed to create handle dir")?;
+
+    // Defensive re-materialize: create_handle_dir already calls
+    // materialize_handle_settings internally, but calling it explicitly
+    // here makes the contract visible at the call site and survives
+    // any refactor that factors the step out of create_handle_dir.
+    // See journal 0059 — stale per-slot settings drifted silently
+    // through a csq install upgrade; making the invariant explicit is
+    // a belt-and-suspenders guard against the same class of regression.
+    let config_dir = base_dir.join(format!("config-{}", account));
+    if let Err(e) = session::materialize_handle_settings(&handle_dir, claude_home, &config_dir) {
+        // Non-fatal: create_handle_dir already populated settings.json
+        // successfully (otherwise we wouldn't be here). A secondary
+        // failure here means the settings.json on disk is the one
+        // create_handle_dir wrote, which is still correct.
+        eprintln!("warning: defensive settings re-materialize failed: {e}");
+    }
+
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
 
     println!(
@@ -149,6 +166,22 @@ fn launch_anthropic(
     let pid = std::process::id();
     let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
         .context("failed to create handle dir")?;
+
+    // Defensive re-materialize: create_handle_dir already calls
+    // materialize_handle_settings internally, but calling it explicitly
+    // here makes the contract visible at the call site and survives
+    // any refactor that factors the step out of create_handle_dir.
+    // See journal 0059 — stale per-slot settings drifted silently
+    // through a csq install upgrade; making the invariant explicit is
+    // a belt-and-suspenders guard against the same class of regression.
+    let config_dir = base_dir.join(format!("config-{}", account));
+    if let Err(e) = session::materialize_handle_settings(&handle_dir, claude_home, &config_dir) {
+        // Non-fatal: create_handle_dir already populated settings.json
+        // successfully (otherwise we wouldn't be here). A secondary
+        // failure here means the settings.json on disk is the one
+        // create_handle_dir wrote, which is still correct.
+        eprintln!("warning: defensive settings re-materialize failed: {e}");
+    }
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
 
@@ -302,5 +335,153 @@ mod tests {
                 || var == "CLAUDE_API_KEY";
             assert_eq!(matches, should_strip, "var {var}");
         }
+    }
+
+    /// Regression guard for journal 0059 invariant: csq run N MUST leave
+    /// term-<pid>/settings.json populated after handle dir creation.
+    ///
+    /// This test exercises `csq_core::session::create_handle_dir` plus the
+    /// explicit defensive re-materialize that run.rs adds at the call site.
+    /// It does NOT invoke `run()` itself because `run()` execs claude and
+    /// would hang the test suite. The invariant we care about — settings.json
+    /// exists, is valid JSON, and reflects the merged base+overlay — is fully
+    /// observable at the handle-dir level.
+    ///
+    /// Arrange: tempdir with ~/.claude/settings.json (global base) and
+    ///          config-1/settings.json (slot overlay).
+    /// Act:     create_handle_dir + defensive re-materialize.
+    /// Assert:  term-<pid>/settings.json exists, is a regular file (not a
+    ///          symlink), is parseable JSON, and merges content from both
+    ///          sources (overlay key wins).
+    #[test]
+    fn settings_json_exists_after_create_handle_dir() {
+        use csq_core::session;
+        use csq_core::types::AccountNum;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let claude_home = tempfile::tempdir().expect("tempdir");
+
+        // Arrange: permanent account dir
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Write account marker so create_handle_dir sees a valid config-N
+        csq_core::accounts::markers::write_csq_account(&config_dir, account).unwrap();
+        csq_core::accounts::markers::write_current_account(&config_dir, account).unwrap();
+
+        // Global settings: base layer (statusLine customization)
+        let global_settings = serde_json::json!({
+            "env": {},
+            "statusBar": {"visible": true},
+            "theme": "dark"
+        });
+        std::fs::write(
+            claude_home.path().join("settings.json"),
+            serde_json::to_string_pretty(&global_settings).unwrap(),
+        )
+        .unwrap();
+
+        // Slot settings: overlay layer (3P env block wins over base)
+        let slot_settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://example.com/v1"
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&slot_settings).unwrap(),
+        )
+        .unwrap();
+
+        // Act: create handle dir (which calls materialize internally)
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+
+        // Defensive re-materialize — mirrors exactly what run.rs does
+        let result =
+            session::materialize_handle_settings(&handle_dir, claude_home.path(), &config_dir);
+        assert!(
+            result.is_ok(),
+            "defensive re-materialize failed: {:?}",
+            result.err()
+        );
+
+        // Assert: settings.json exists as a real file (not a symlink)
+        let settings_path = handle_dir.join("settings.json");
+        assert!(settings_path.exists(), "settings.json must exist");
+        let metadata = std::fs::symlink_metadata(&settings_path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "settings.json must be a real file, not a symlink"
+        );
+
+        // Assert: parseable JSON
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json must be valid JSON");
+
+        // Assert: overlay key present (env.ANTHROPIC_BASE_URL from slot settings)
+        assert_eq!(
+            parsed["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::json!("https://example.com/v1"),
+            "slot overlay env key must survive merge"
+        );
+
+        // Assert: base key present (theme from global settings)
+        assert_eq!(
+            parsed["theme"],
+            serde_json::json!("dark"),
+            "global base key must survive merge"
+        );
+    }
+
+    /// Regression guard: calling `materialize_handle_settings` twice on the
+    /// same handle dir produces identical byte content (idempotency).
+    ///
+    /// This pins the invariant that the defensive re-materialize in run.rs
+    /// cannot corrupt a settings.json that create_handle_dir already wrote.
+    #[test]
+    fn materialize_handle_settings_is_idempotent() {
+        use csq_core::session;
+        use csq_core::types::AccountNum;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let claude_home = tempfile::tempdir().expect("tempdir");
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        csq_core::accounts::markers::write_csq_account(&config_dir, account).unwrap();
+        csq_core::accounts::markers::write_current_account(&config_dir, account).unwrap();
+
+        let slot_settings = serde_json::json!({
+            "env": {"ANTHROPIC_MODEL": "claude-opus-4"},
+            "statusBar": {"visible": false}
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&slot_settings).unwrap(),
+        )
+        .unwrap();
+
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+
+        // First call (already done by create_handle_dir, but call explicitly)
+        session::materialize_handle_settings(&handle_dir, claude_home.path(), &config_dir).unwrap();
+        let first_read = std::fs::read(handle_dir.join("settings.json")).unwrap();
+
+        // Second call — must produce identical bytes
+        session::materialize_handle_settings(&handle_dir, claude_home.path(), &config_dir).unwrap();
+        let second_read = std::fs::read(handle_dir.join("settings.json")).unwrap();
+
+        assert_eq!(
+            first_read, second_read,
+            "materialize_handle_settings must be idempotent: second call produced different bytes"
+        );
     }
 }

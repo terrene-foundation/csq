@@ -76,6 +76,61 @@ describe("ChangeModelModal", () => {
     expect(options).toEqual(["gemma4:latest", "llama3:8b"]);
   });
 
+  // Regression for journal 0061: the modal is rendered by AccountList
+  // even when closed, so mount happens with isOpen=false; the user
+  // only flips it open later. Earlier code had a $effect guard that
+  // skipped the load whenever modalState was already 'loading' — which
+  // it always was on first open — so list_ollama_models was never
+  // invoked and the spinner hung forever. This test reproduces the
+  // real-world open sequence: mount closed, flip open, assert the
+  // invoke fired and the picker rendered.
+  it("fires list_ollama_models when isOpen flips from false to true after mount", async () => {
+    // Use mockResolvedValue (not Once) so the promise still resolves
+    // if something else happens to invoke the mock.
+    mockInvoke.mockResolvedValue(["qwen3:latest"]);
+    const { container, rerender } = render(ChangeModelModal, {
+      props: {
+        isOpen: false,
+        slot: 4,
+        onClose: vi.fn(),
+        onChanged: vi.fn(),
+      },
+    });
+    await tick();
+
+    // Mount happened with isOpen=false — Tauri must NOT have been
+    // called yet. Otherwise we'd be hammering the endpoint on every
+    // AccountList render.
+    expect(mockInvoke).not.toHaveBeenCalled();
+
+    // User clicks "Change model" on the account card → parent flips
+    // isOpen to true.
+    await rerender({
+      isOpen: true,
+      slot: 4,
+      onClose: vi.fn(),
+      onChanged: vi.fn(),
+    });
+    // Enough ticks to clear: $effect run → invoke microtask resolve →
+    // modalState set → rerender → select rendered.
+    for (let i = 0; i < 8; i++) {
+      await tick();
+    }
+
+    expect(mockInvoke).toHaveBeenCalledWith("list_ollama_models");
+    // Debug: dump container state to diagnose what's rendered when
+    // the select assertion fails. Vitest prints this automatically
+    // on assertion failure via the expect message.
+    const select = container.querySelector("select") as HTMLSelectElement;
+    expect(
+      select,
+      `container HTML after open: ${container.innerHTML}`,
+    ).not.toBeNull();
+    expect(Array.from(select.options).map((o) => o.value)).toEqual([
+      "qwen3:latest",
+    ]);
+  });
+
   it("shows the pull hint when no models are installed", async () => {
     mockInvoke.mockResolvedValueOnce([]);
     const { container } = renderModal();

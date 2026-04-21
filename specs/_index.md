@@ -21,6 +21,7 @@ Workspace artifacts (`workspaces/csq-v2/journal`, `workspaces/csq-v2/todos`) are
 | 04  | [csq Daemon Architecture](04-csq-daemon-architecture.md)                | Daemon subsystems, IPC surface, refresh + fanout, usage poller, supervisor                              |
 | 05  | [Quota Polling Contracts](05-quota-polling-contracts.md)                | Anthropic `/api/oauth/usage`, 3P provider probes, poll cadence, backoff                                 |
 | 06  | [Keychain Integration](06-keychain-integration.md)                      | macOS service name derivation, write path, 30s TTL, Linux/Windows fallback                              |
+| 07  | [Provider Surface Dispatch](07-provider-surface-dispatch.md)            | Surface enum, per-surface on-disk layout, spawn/login/quota/model-config dispatch, cross-surface swap   |
 
 ## How to use
 

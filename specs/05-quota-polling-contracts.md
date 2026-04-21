@@ -191,15 +191,170 @@ On 2026-04-12 the daemon's usage poller stopped firing after the 12:17 UTC tick.
 
 These fixes live in the implementation scope of the upgrade that lands specs 01-04. They do not require architecture changes, only hardening.
 
-## 5.7 Cross-references
+## 5.7 Codex `/backend-api/wham/usage` (PROPOSED — schema pending live capture)
+
+**Status:** PROPOSED. Endpoint is undocumented; response schema must be captured on first live call in a Codex-provisioned environment. This section locks down what we know; the schema block below is placeholder until verified.
+
+**Request:**
+
+```
+GET https://chatgpt.com/backend-api/wham/usage
+Authorization: Bearer <codex_access_token>
+ChatGPT-Account-Id: <account_id>
+Accept: application/json
+User-Agent: <csq/version>   (User-Agent gating not confirmed; start with a csq UA + fall back to curl UA on 4xx)
+```
+
+Transport considerations:
+
+- TLS-fingerprint behavior (Cloudflare/Akamai) for `chatgpt.com/backend-api/*` is unverified. OPEN-C04 in spec 07 §7.7.4 gates this — if reqwest is blocked, Codex polling reuses the JS-runtime subprocess transport (same pattern as Anthropic per journal 0056). Otherwise native typed HTTP.
+- Per-call timeout: 30s (inherits §5.6).
+
+**Response shape (placeholder, TO BE VERIFIED):**
+
+```json
+{
+  "five_hour": { "utilization": 42.0, "resets_at": "2026-04-22T20:00:00Z" },
+  "seven_day": { "utilization": 15.0, "resets_at": "2026-04-28T00:00:00Z" }
+}
+```
+
+The real shape may differ — confirmed via openai/codex issue #15281 that the field set is richer than what `codex /status` surfaces. First live capture becomes the authority.
+
+**Parse contract:**
+
+- Versioned parser emits `QuotaKind::Utilization` with value in `[0, 100]` on known schema.
+- Unknown shape → `QuotaKind::Unknown`; raw body persisted to `accounts/codex-wham-drift.json` (cap 64 KB; redactor runs before write) for bug-report attachment.
+- Status codes MUST be enumerated from observation (OPEN-C05, new gap): what does wham/usage return for over-quota, suspended, or throttled accounts? Defer until observed; dispatch mapping documented as errors land.
+
+**Write invariants (inherits §5.5):**
+
+- Daemon is sole writer. Stamp `surface: "codex"`, `kind: "utilization"`, `schema_version: 2` per spec 07 §7.4.
+- `updated_at` timestamp; freshness follows standard cadence.
+
+**Poll cadence:** 5 minutes per active Codex account. Matches Anthropic §5.1 per spec 04 INV-06.
+
+**Circuit breaker:**
+
+- 5 consecutive drift detections (`QuotaKind::Unknown`) → 15-minute cooldown, doubling with cap 80 minutes (standard §5.6 backoff).
+- 5 consecutive 4xx/5xx failures → same backoff; last-known-good `quota.json` value preserved.
+
+**Refresh coupling:**
+
+- wham/usage polling MUST use the per-account access_token provided by the daemon's refresher (spec 07 INV-P01). Never a separate token.
+- If refresh fails (account LOGIN-NEEDED), polling pauses for that slot.
+
+**Implementation site:** `csq-core/src/daemon/usage_poller/codex.rs` (new).
+
+## 5.8 Gemini counter + 429 parse (PROPOSED — event-driven, no public quota endpoint)
+
+**Status:** PROPOSED. Google exposes no public quota endpoint for AI Studio API keys. This section defines the event-driven counter + 429-body parser that stands in for polling.
+
+**Context:** unlike Anthropic / Codex / MiniMax / Z.AI, there is no `GET /usage` shape for Gemini API keys. Quota signal is best-effort: increment a client-side counter on every spawn, parse `RESOURCE_EXHAUSTED` response bodies on 429 for rate-limit reset, capture effective-model from the response payload for silent-downgrade detection.
+
+**Inputs (event-driven, not polled):**
+
+1. **Spawn event** — csq-cli emits `gemini_counter_increment { slot, ts }` via daemon IPC at the moment `gemini` is successfully spawned.
+2. **429 event** — csq-cli wraps `gemini` stderr, detects `RESOURCE_EXHAUSTED` response bodies, parses `quotaMetric` + `retryDelay`, emits `gemini_rate_limited { slot, retry_delay_s, quota_metric }`.
+3. **Effective-model event** — csq-cli parses `modelVersion` (location pinned by OPEN-G02 in workspaces/gemini/01-analysis/01-research/04-risk-analysis.md §4 GG3) from response, emits `gemini_effective_model_observed { slot, selected, effective }` on every response (debounced on the receive side).
+4. **ToS-guard event** — csq-cli response-body sentinel detects OAuth-flow markers (`"Opening browser"`, `oauth2.googleapis.com`, `cloudcode-pa.googleapis.com`) on AI-Studio-provisioned slots; emits `gemini_tos_guard_tripped { slot, trigger }`; csq-cli kills the child.
+
+**429 response shape (placeholder, TO BE VERIFIED):**
+
+```json
+{
+  "error": {
+    "code": 429,
+    "status": "RESOURCE_EXHAUSTED",
+    "message": "...",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+        "violations": [
+          {
+            "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+            "quotaId": "..."
+          }
+        ]
+      },
+      {
+        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+        "retryDelay": "3600s"
+      }
+    ]
+  }
+}
+```
+
+OPEN-G03 (new gap): exact field positions in 2026-04 need live verification. Parser versioned; drift → `gemini_quota_schema_drift` error tag + raw body to `accounts/gemini-429-drift.json` (cap 64 KB, redacted).
+
+**Counter state in `quota.json`:**
+
+```json
+{
+  "accounts": {
+    "5": {
+      "surface": "gemini",
+      "kind": "counter",
+      "counter": {
+        "requests_today": 237,
+        "resets_at_tz": "America/Los_Angeles",
+        "last_reset": "2026-04-22T00:00:00-07:00"
+      },
+      "rate_limit": {
+        "active": false,
+        "reset_at": null,
+        "last_retry_delay_s": null,
+        "last_quota_metric": null
+      },
+      "selected_model": "gemini-3-pro-preview",
+      "effective_model": "gemini-2.5-pro",
+      "effective_model_first_seen_at": "2026-04-22T14:12:00Z",
+      "mismatch_count_today": 3,
+      "is_downgrade": true,
+      "updated_at": 1745332320,
+      "schema_version": 2
+    }
+  }
+}
+```
+
+**Write invariants (inherits §5.5):**
+
+- Daemon is sole writer. csq-cli emits events, daemon writes.
+- **When daemon is down**, csq-cli does NOT attempt to write quota.json directly. Events are dropped; UI reads stale data with honest freshness indicator.
+- Effective-model debounce: latch `is_downgrade = true` only after 3 mismatches in 5 minutes (ADR-G06).
+- Counter reset: scheduled daemon task runs at midnight America/Los_Angeles (pinned TZ for DST-correctness per ADR-G05).
+
+**UI invariants:**
+
+- When counter present: `AccountCard` shows "N requests today".
+- When 429 active: `AccountCard` shows rate-limit countdown.
+- When counter absent AND no 429: `AccountCard` shows "quota: n/a". **NEVER synthesize a percentage** (rules/account-terminal-separation.md rule 4; ADR-G05).
+- When `is_downgrade`: `AccountCard` shows downgrade badge with `selected → effective`.
+
+**Circuit breaker:**
+
+- 5 consecutive 429-body-parse failures → flip to `QuotaKind::Unknown` state; preserve last-known-good.
+- No poll to circuit-break on the main path (Gemini is event-driven); circuit breaker only applies to the parser.
+
+**No refresh coupling** — Gemini API keys are flat; no refresh subsystem interacts.
+
+**Implementation site:** `csq-core/src/daemon/usage_poller/gemini.rs` (new, event consumer only; no poll loop).
+
+## 5.9 Cross-references
 
 - `specs/04-csq-daemon-architecture.md` section 4.2.2 — usage poller subsystem.
+- `specs/07-provider-surface-dispatch.md` §7.4 — surface → quota-kind dispatch table; §7.7.1 resolution of Codex refresh semantics.
 - `rules/account-terminal-separation.md` rules 1, 2, 4 — quota writer and source-of-truth invariants.
-- `csq-core/src/daemon/usage_poller.rs` — implementation site.
+- `csq-core/src/daemon/usage_poller.rs` — implementation site (splits into Anthropic/MiniMax/Z.AI/Codex/Gemini modules per spec 07).
 - Journal `0028-DECISION-account-terminal-separation-python-elimination.md` — utilization-as-percentage discovery.
 - Journal `0025-DISCOVERY-per-slot-third-party-provider-bindings.md` — per-slot 3P binding model.
+- workspaces/codex/journal/0004 — Codex pre-expiry refresh strategy (load-bearing for §5.7 coupling).
+- workspaces/gemini/journal/0002 — silent-downgrade detection design (load-bearing for §5.8 `effective_model` field).
 
 ## Revisions
 
 - 2026-04-12 — 1.0.0 — Initial draft. Sections 5.2-5.4 pending Playwright investigation. Section 5.6 documents the 2026-04-12 poller hang and mandates supervisor + per-call timeout fixes.
 - 2026-04-13 — 1.1.0 — Sections 5.3 and 5.4 corrected per journal 0032: MiniMax GroupId is optional, Z.AI API key works (JWT not required), MiniMax usage_count = remaining not consumed. Both fixes shipped in PRs #79 and #80.
+- 2026-04-22 — 1.2.0 — Added §5.7 (Codex `/backend-api/wham/usage`, PROPOSED — schema pending live capture) and §5.8 (Gemini counter + 429 parse, event-driven). Former §5.7 "Cross-references" renumbered to §5.9. Both new sections ship as PROPOSED status until live response capture verifies schema; escalation to VERIFIED follows the spec-05 pattern set by MiniMax (§5.3) and Z.AI (§5.4) via journal 0032 — never commit to a verbatim response shape without observation. Journaled in workspaces/codex/journal/0004 and workspaces/gemini/journal/0002.

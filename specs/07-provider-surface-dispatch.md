@@ -1,0 +1,337 @@
+# 07 Provider Surface Dispatch
+
+Spec version: 1.0.0 | Status: DRAFT | Governs: per-surface on-disk layout, spawn command, login flow, quota dispatch, model-config key, cross-surface operations
+
+---
+
+## 7.0 Scope
+
+csq originally launched only the `claude` binary. Third-party providers (MiniMax, Z.AI, Ollama) were bolted on by pointing `claude` at an alternative `ANTHROPIC_BASE_URL`. This spec adds a **surface abstraction** so csq can launch first-class native CLIs (`codex`, `gemini`) alongside `claude`, without a translation proxy and without regressing any existing provider.
+
+A **surface** is the CLI binary csq spawns for a slot and the on-disk shape that binary expects. Three surfaces are in scope:
+
+| Surface      | Binary   | Home env var        | Config-dir shape                                  |
+| ------------ | -------- | ------------------- | ------------------------------------------------- |
+| `ClaudeCode` | `claude` | `CLAUDE_CONFIG_DIR` | handle dir contains symlinks into `config-<N>`    |
+| `Codex`      | `codex`  | `CODEX_HOME`        | handle dir IS the `CODEX_HOME`; symlinks for auth |
+| `Gemini`     | `gemini` | `GEMINI_CLI_HOME`   | `handle-dir/.gemini/` is the effective state dir  |
+
+This spec is additive on top of specs 01–05. It does not replace them. Spec 02 remains the base handle-dir model; this spec describes the per-surface specializations the `Surface` enum dispatches into.
+
+## 7.1 The Surface abstraction
+
+### 7.1.1 Type
+
+The `Provider` struct (`csq-core/src/providers/catalog.rs`) gains:
+
+```rust
+pub enum Surface {
+    ClaudeCode,
+    Codex,
+    Gemini,
+}
+
+pub struct Provider {
+    // existing fields (id, name, auth_type, key_env_var, base_url_env_var, ...)
+    pub surface: Surface,
+    pub spawn_command: &'static str,
+    pub home_env_var: &'static str,
+    pub home_subdir: Option<&'static str>,     // Some(".gemini") for Gemini; None otherwise
+    pub model_config: ModelConfigTarget,
+    pub quota_kind: QuotaKind,                 // Utilization | Counter | Unknown
+}
+
+pub enum ModelConfigTarget {
+    EnvInSettingsJson,      // ClaudeCode (Anthropic/MM/Z.AI): env.ANTHROPIC_MODEL in settings.json
+    TomlModelKey,           // Codex: top-level `model = "..."` in config.toml
+    SettingsModelName,      // Gemini: model.name in .gemini/settings.json
+}
+```
+
+### 7.1.2 Dispatch tables
+
+The following tables are the authority for per-surface behavior. Any code that switches on surface MUST read from these (or from constants derived from them), never hardcode a binary name or env var.
+
+| Surface      | spawn_command | home_env_var        | home_subdir     | quota_kind  | model_config      |
+| ------------ | ------------- | ------------------- | --------------- | ----------- | ----------------- |
+| `ClaudeCode` | `claude`      | `CLAUDE_CONFIG_DIR` | None            | Utilization | EnvInSettingsJson |
+| `Codex`      | `codex`       | `CODEX_HOME`        | None            | Utilization | TomlModelKey      |
+| `Gemini`     | `gemini`      | `GEMINI_CLI_HOME`   | Some(".gemini") | Counter     | SettingsModelName |
+
+## 7.2 Per-surface on-disk layouts
+
+Base layout (spec 02 §2.1) is unchanged. The following amendments describe what each surface adds INSIDE its per-account `config-<N>/` and per-terminal `term-<pid>/`.
+
+### 7.2.1 `Surface::ClaudeCode`
+
+Unchanged from spec 02. `config-<N>` holds `.credentials.json`, `.csq-account`, `settings.json`, `.claude.json`. Handle dir holds symlinks + materialized `settings.json`.
+
+### 7.2.2 `Surface::Codex`
+
+```
+config-<N>/                              (permanent, per-account)
+├── .csq-account                         "N"
+├── codex-auth.json          → ../credentials/codex-<N>.json   (symlink)
+├── config.toml                          (daemon-writable; contains model + auth-store mode)
+├── codex-sessions/                      (per-account, persistent)
+├── codex-history.jsonl                  (per-account, persistent)
+└── [shared symlinks — same set as ClaudeCode]
+
+credentials/codex-<N>.json               (canonical, daemon-owned, mode 0400 outside refresh windows)
+
+term-<pid>/                              (ephemeral; this IS CODEX_HOME)
+├── .csq-account             → ../config-<N>/.csq-account       (symlink)
+├── auth.json                → ../credentials/codex-<N>.json    (symlink)
+├── config.toml              → ../config-<N>/config.toml        (symlink)
+├── sessions                 → ../config-<N>/codex-sessions     (symlink)
+├── history.jsonl            → ../config-<N>/codex-history.jsonl(symlink)
+├── log/                                 (ephemeral, per-terminal)
+└── .live-pid
+```
+
+**Why auth.json lives at `credentials/codex-<N>.json`, not inside `config-<N>`:** separation of concerns. The daemon's refresher owns tokens for every account regardless of surface; putting all canonical credentials in a single directory simplifies fanout reasoning and keeps config-<N> focused on user-editable state.
+
+**Why `codex-sessions/` and `codex-history.jsonl` are persistent:** spec 02 INV-02 makes handle dirs ephemeral. Codex stores `sessions/` and `history.jsonl` inside `CODEX_HOME` by default; if we honored that literally, daemon sweep would delete user transcripts. The symlink relocates them to per-account persistent storage, analogous to how `Surface::ClaudeCode` symlinks `history/`, `sessions/`, etc. back to `~/.claude`.
+
+### 7.2.3 `Surface::Gemini`
+
+```
+config-<N>/                              (permanent, per-account)
+├── .csq-account                         "N"
+├── .gemini/
+│   ├── settings.json                    (pre-seeded; security.auth.selectedType = "gemini-api-key")
+│   └── [sub-state symlinks into gemini-state]
+├── gemini-state/                        (per-account, persistent)
+│   ├── shell_history
+│   └── tmp/
+├── gemini-key.enc                       (API key, 0600; read by daemon only on spawn)
+└── [shared symlinks]
+
+term-<pid>/.gemini/                      (effective state dir under GEMINI_CLI_HOME)
+├── settings.json            → ../../config-<N>/.gemini/settings.json (symlink)
+├── .csq-account             → ../../config-<N>/.csq-account          (symlink)
+├── shell_history            → ../../config-<N>/gemini-state/shell_history (symlink)
+└── tmp                      → ../../config-<N>/gemini-state/tmp      (symlink)
+```
+
+**Why `home_subdir = Some(".gemini")`:** gemini-cli prepends `.gemini/` to whatever `GEMINI_CLI_HOME` points at. Setting `GEMINI_CLI_HOME=term-<pid>` causes gemini-cli to read/write `term-<pid>/.gemini/*`. The handle dir itself therefore needs a `.gemini/` subdir.
+
+**Why the API key is never in `.env`:** `google-gemini/gemini-cli#21744` shows that if ANY `.env` exists in the `$CWD → ancestors → $GEMINI_CLI_HOME → $HOME` discovery chain, the first file found short-circuits the lookup. csq injects `GEMINI_API_KEY` directly into the spawned child process environment. No `.env` files are written or relied upon by csq.
+
+## 7.3 Per-surface login and setup
+
+### 7.3.1 `Surface::ClaudeCode` (Anthropic)
+
+Unchanged: delegate to `claude auth login` inside `config-<N>/`. See spec 03.
+
+### 7.3.2 `Surface::ClaudeCode` (MM / Z.AI)
+
+Unchanged: API-key capture into `config-<N>/settings.json` under `env.ANTHROPIC_AUTH_TOKEN` + `env.ANTHROPIC_BASE_URL`. See journal 0025.
+
+### 7.3.3 `Surface::Codex`
+
+Ordered sequence (any deviation is a spec violation):
+
+1. `mkdir -p config-<N>/` and `mkdir -p config-<N>/codex-sessions/`.
+2. Write `config-<N>/config.toml` with:
+   ```toml
+   cli_auth_credentials_store = "file"
+   model = "<default-model>"
+   ```
+   This MUST happen BEFORE step 3. Rationale: without this file, `codex login` uses the keychain default and writes a credential entry under `com.openai.codex` keychain service; a later csq rewrite of `config.toml` does not retroactively move the token to a file.
+3. Shell out: `CODEX_HOME=config-<N> codex login --device-auth`. User completes device code in browser.
+4. On success, codex writes `config-<N>/auth.json`. Daemon moves it to `credentials/codex-<N>.json` (atomic rename), then replaces `config-<N>/auth.json` with `codex-auth.json → ../credentials/codex-<N>.json` symlink.
+5. Flip `credentials/codex-<N>.json` mode to `0400` outside refresh windows.
+6. On first Codex login on the machine, probe for pre-existing keychain entry via `security find-generic-password -s com.openai.codex` (macOS). If present, offer purge via modal before proceeding.
+7. Register account N with daemon refresher + usage poller.
+
+### 7.3.4 `Surface::Gemini`
+
+1. `mkdir -p config-<N>/.gemini/` and `mkdir -p config-<N>/gemini-state/tmp/`.
+2. Write `config-<N>/.gemini/settings.json` pre-seeded:
+   ```json
+   {
+     "security": { "auth": { "selectedType": "gemini-api-key" } },
+     "model": { "name": "auto" }
+   }
+   ```
+   This MUST happen BEFORE the first `gemini` spawn so the TUI does not interactively prompt for auth type.
+3. Capture API key (AI Studio or Vertex service-account JSON path) via desktop modal or `csq setkey gemini --slot N`.
+4. Encrypt at rest in `config-<N>/gemini-key.enc` using the platform-native secret layer. Never plaintext.
+5. Probe: `GEMINI_CLI_HOME=config-<N> GEMINI_API_KEY=<key> gemini -p "ping" -m gemini-2.5-flash-lite --output-format json`. Exit 0 → valid.
+6. Register account with daemon usage poller (counter mode).
+
+## 7.4 Per-surface quota dispatch
+
+Amends spec 05 — new sections are added there (§5.7 Codex, §5.8 Gemini), this spec fixes the dispatch table.
+
+| Surface      | QuotaKind   | Endpoint                                                  | Refresh invariant                            |
+| ------------ | ----------- | --------------------------------------------------------- | -------------------------------------------- |
+| `ClaudeCode` | Utilization | `https://api.anthropic.com/api/oauth/usage` (or 3P probe) | Daemon-owned, spec 05 §5.1–5.4               |
+| `Codex`      | Utilization | `https://chatgpt.com/backend-api/wham/usage`              | Daemon-owned, versioned parser, spec 05 §5.7 |
+| `Gemini`     | Counter     | Client-side counter + 429 `RESOURCE_EXHAUSTED` parse      | Daemon-owned, spec 05 §5.8                   |
+
+`quota.json` gains a `schema_version: 2` field and per-account `surface` + `kind` tags. Daemon startup runs a one-shot v1→v2 migration that stamps all existing records with `surface: "claude-code"` and `kind: "utilization"`.
+
+## 7.5 Invariants
+
+**INV-P01: Daemon is the _scheduled pre-expiry_ refresher across refreshable surfaces.**
+
+- For `Surface::Codex`, daemon refresh writes `credentials/codex-<N>.json` under `tokio::sync::Mutex` AT LEAST 2 HOURS before JWT expiry. Handle dirs NEVER hold a copy — only a symlink. Rationale: `openai/codex#10332` (refresh-token single-use race), `#15502` (copies of auth.json break refresh).
+- **Why pre-expiry specifically:** codex's in-process refresh path (`codex-rs/login/src/auth/manager.rs:1863-1883` `is_stale_for_proactive_refresh`) fires only when the access-token `exp` claim is `<= Utc::now()`. There is NO pre-expiry leeway window in codex's own logic. The `cli_auth_credentials_store = "file"` flag does NOT disable in-process refresh; it only selects a write destination (verified OPEN-C01 resolution, 2026-04-22). The daemon prevents the in-process path from firing by always keeping tokens fresh enough that codex's threshold is never reached.
+- For `Surface::ClaudeCode`, INV-06 (spec 02 / 04) still applies unchanged (2h pre-expiry window).
+- For `Surface::Gemini` (API-key only), there is no refresh — API keys are flat and long-lived.
+- **Clock-skew risk:** if local clock drifts > 2h ahead of server, the daemon will miss its refresh window and codex will fire its own refresh. Daemon emits `clock_skew_detected` warning when local time differs from HTTP `Date` header by > 5 min. See workspaces/codex/journal/0004.
+- **Contingency:** if codex ever tightens its refresh threshold to pre-expiry (making the scheduled-refresh mitigation unreliable), csq interposes via `CODEX_REFRESH_TOKEN_URL_OVERRIDE` pointing at a daemon-local OAuth token-grant endpoint. Not shipped in PR1; captured as a follow-up track.
+
+**INV-P02: Daemon is a hard prerequisite for refreshable surfaces.**
+
+- `csq run N` for a slot bound to `Surface::Codex` MUST refuse to spawn if the daemon is not running, with an actionable error message. Rationale: INV-P01 depends on the daemon firing pre-expiry; without it, codex WILL hit its on-expiry threshold and refresh in-process, burning the refresh token via openai/codex#10332.
+- `Surface::ClaudeCode` with Anthropic OAuth gets the same treatment (existing behavior from spec 04).
+- `Surface::ClaudeCode` with MM/Z.AI and `Surface::Gemini` (API-key only) do NOT require the daemon — flat keys, no refresh.
+
+**INV-P03: Configuration pre-seed is ordered.**
+
+- For `Surface::Codex`, `config-<N>/config.toml` is written BEFORE `codex login` is invoked. Integration test asserts the ordering.
+- For `Surface::Gemini`, `config-<N>/.gemini/settings.json` is written BEFORE the first `gemini` spawn. Integration test asserts the ordering.
+
+**INV-P04: Handle dir persistence carveouts are surface-dispatched.**
+
+- `Surface::ClaudeCode`: no per-terminal persistent state; `history/`, `sessions/` etc. symlink to `~/.claude` (spec 02 §2.1.3).
+- `Surface::Codex`: `sessions/` and `history.jsonl` symlink to `config-<N>/codex-sessions/` and `config-<N>/codex-history.jsonl`. Daemon sweep of handle dir MUST NOT dereference these symlinks.
+- `Surface::Gemini`: `shell_history` and `tmp/` symlink to `config-<N>/gemini-state/`. Same sweep guarantee.
+
+**INV-P05: Cross-surface `csq swap` warns and exec-replaces.**
+
+- If the target slot's surface differs from the current terminal's surface, `csq swap` prints a warning: `conversation will not transfer across surfaces`, prompts for confirmation (`--yes` bypasses), and then `exec`s the new surface's binary in place with the appropriate home env var and handle dir.
+- Same-surface swap retains the existing in-flight symlink-repoint behavior (spec 02 INV-04).
+
+**INV-P06: Model selection is dispatched by `ModelConfigTarget`.**
+
+- `EnvInSettingsJson`: write `env.ANTHROPIC_MODEL` in `config-<N>/settings.json`.
+- `TomlModelKey`: write top-level `model = "..."` in `config-<N>/config.toml`.
+- `SettingsModelName`: write `model.name` in `config-<N>/.gemini/settings.json`.
+- Native in-session `/model` slash commands (CC's, codex's, gemini's) are unaffected. csq seeds the default; the user overrides per-session.
+
+**INV-P07: Token redaction covers all surface token formats before first log line.**
+
+- `error::redact_tokens` MUST match: Anthropic `sk-ant-*`, Codex `sess-*` + JWT pattern, Gemini `AIza*`. Extension lands with the Codex PR and is verified by unit tests on the redactor.
+
+**INV-P08: Credential mode-flip is mutex-coordinated.**
+
+- `credentials/codex-<N>.json` (and any other canonical credential file that implements the 0400-outside-refresh pattern) MUST only be mode-flipped under the per-account `tokio::sync::Mutex` also held by the refresher.
+- All writers (daemon refresh, `csq login N --provider codex`, re-login after `invalid_grant`) acquire the mutex, flip to `0600`, write (atomic rename), flip back to `0400`, release.
+- Daemon startup runs a reconciler that flips any `0600` canonical credential file back to `0400` if no refresh is in progress. Derived from workspaces/codex/01-analysis/01-research/04-risk-analysis.md §2 R7 + ADR-C13.
+
+**INV-P09: Per-account refresh mutex lifecycle is tied to slot provisioning.**
+
+- Per-account `tokio::sync::Mutex` instances live in `DashMap<(Surface, AccountNum), Arc<Mutex<()>>>`.
+- `csq login N --provider <surface>` allocates the mutex on first provisioning.
+- `csq logout N` MUST acquire the mutex (serializing any in-progress refresh), delete the credential file, then remove the mutex entry from the DashMap.
+- Memory is not leaked across logout/login cycles. Keyed on `(Surface, AccountNum)` prevents slot-9-Codex and slot-9-Anthropic from sharing a lock. Derived from ADR-C14.
+
+**INV-P10: Cross-surface swap cleans up the source handle dir before exec.**
+
+- When `csq swap M` crosses surfaces, csq MUST remove the current (source-surface) handle dir BEFORE `exec`ing the target binary on the new (target-surface) handle dir.
+- If removal fails, swap aborts with non-zero exit; the `exec` is not attempted.
+- If removal succeeds but `exec` fails (binary not on PATH, permission denied), csq exits non-zero with an actionable error; the user must re-run `csq run M`. The source terminal is already gone; this is deliberate — swap is destructive by its cross-surface nature. Derived from workspaces/codex/01-analysis/01-research/04-risk-analysis.md §4 G6.
+
+**INV-P11: Auto-rotation refuses cross-surface candidates.**
+
+- The daemon's auto-rotation subsystem (`daemon::auto_rotate`) MUST filter rotation candidates to the same `Surface` as the currently-active terminal.
+- When no same-surface candidate is available, auto-rotation surfaces a user-visible notification rather than silently rotating across surfaces (which would require `exec` in place, an action reserved for explicit user `csq swap`).
+- Derived from workspaces/codex/01-analysis/01-research/04-risk-analysis.md §4 G13.
+
+## 7.6 Migration
+
+### 7.6.1 Refactor existing providers to `Surface::ClaudeCode`
+
+Current `catalog.rs` entries (claude, mm, zai, ollama) gain `surface: Surface::ClaudeCode`. Their `spawn_command` becomes `"claude"`, `home_env_var` becomes `"CLAUDE_CONFIG_DIR"`, `home_subdir` becomes `None`. Their `model_config` becomes `EnvInSettingsJson`. All existing tests must pass unchanged after the refactor.
+
+### 7.6.2 `quota.json` v1→v2
+
+On daemon startup, if `quota.json.schema_version < 2`, rewrite atomically: stamp all records with `surface: "claude-code"`, `kind: "utilization"`, bump schema to 2. Non-destructive — old value + timestamp preserved.
+
+### 7.6.3 Existing handle dirs on upgrade
+
+Pre-upgrade handle dirs have no `surface` marker. Daemon sweep treats them as `ClaudeCode`; they continue to work until the user exits their terminal. No forced migration.
+
+## 7.7 Open preconditions
+
+These are items that MUST be resolved (verified or decided) before the first Codex implementation PR lands. They are spec preconditions, not spec content per se — the spec's invariants above assume each of them resolves as expected.
+
+### 7.7.1 OPEN-C01 — Verify `cli_auth_credentials_store = "file"` semantics re: in-process refresh
+
+**Status:** RESOLVED 2026-04-22. Finding: the flag does NOT disable in-process refresh; it only selects a storage backend.
+
+**Resolution summary** (full source citations in workspaces/codex/journal/0004-DECISION-daemon-pre-expiry-refresh-strategy.md):
+
+- `codex-rs/login/src/auth/storage.rs:319-332` — `cli_auth_credentials_store` enum only chooses between `FileAuthStorage`, `KeyringAuthStorage`, `AutoAuthStorage`, `EphemeralAuthStorage`. No refresh gating.
+- `codex-rs/login/src/auth/manager.rs:1376-1389` — `AuthManager::auth()` unconditionally invokes `refresh_token()` when `is_stale_for_proactive_refresh` returns true. Called from every codex HTTP path.
+- `codex-rs/login/src/auth/manager.rs:1863-1883` — `is_stale_for_proactive_refresh` returns true when JWT `exp <= Utc::now()` OR `auth_dot_json.last_refresh > 8 days`. **No pre-expiry leeway**; codex refreshes ON expiry, not before.
+- `codex-rs/login/src/auth/manager.rs:1745-1750` — in-process refresh is serialized by `refresh_lock` SCOPED TO ONE `AuthManager` (one codex process). Two sibling codex processes have no cross-process coordination → exactly the openai/codex#10332 failure mode.
+- Grep of `codex-rs/` for `DISABLE_REFRESH|READONLY|NO_REFRESH|skip_refresh`: zero hits. No escape-hatch env var exists.
+
+**Adopted mitigation:** daemon pre-expiry scheduled refresh with 2h safety margin (INV-P01 re-framed). Codex's on-expiry threshold is never reached because the daemon refreshes first. Contingency on failure: interpose via `CODEX_REFRESH_TOKEN_URL_OVERRIDE` (seen at `manager.rs:99`) to point codex's refresh endpoint at a daemon-local proxy. Upstream feature request for `CODEX_SKIP_INPROCESS_REFRESH=1` filed as a separate long-lead track.
+
+**Confidence:** HIGH (direct source read, multi-branch grep, shallow clone of codex main 2026-04-22).
+
+**Reference:** workspaces/codex/journal/0004; ADR-C15 (resolved); 04-risk-analysis.md §4 G1 (resolved).
+
+### 7.7.2 OPEN-C02 — Verify `codex` honors `CODEX_HOME` for sessions/ and history.jsonl
+
+**Status:** Blocker for PR2.
+
+**What must be verified:** whether codex writes sessions/history inside `$CODEX_HOME` or hardcodes paths under `~/.codex/`. Spec 07 §7.2.2 assumes `CODEX_HOME` rules everything; if codex ignores it for these, the handle-dir symlinks for `sessions` and `history.jsonl` are dead code and conversation data leaks to the user's global `~/.codex/`.
+
+**Method:** `CODEX_HOME=/tmp/x codex -e 'print("hi")' && find /tmp/x ~/.codex -newer /tmp/x`.
+
+**Consequence of resolution:** spec 07 §7.2.2 either stands or gains a second symlink strategy for the non-honored paths.
+
+**Reference:** 04-risk-analysis.md §4 G4.
+
+### 7.7.3 OPEN-C03 — Verify `remove_dir_all` symlink-safety
+
+**Status:** Blocker for PR2.
+
+**What must be verified:** `std::fs::remove_dir_all` on a handle dir containing `sessions` as a symlink to `config-<N>/codex-sessions/` does NOT traverse the symlink and delete the persistent transcripts. Expected Rust 1.74+ behavior is that symlinks-to-dirs are unlinked, not traversed. Platform-specific behavior on macOS APFS, Linux ext4, Linux btrfs must be pinned by test.
+
+**Method:** integration test with a real filesystem layout; run on CI across platforms.
+
+**Consequence of resolution:** spec 07 INV-P04 holds, or sweep is rewritten to explicitly walk-and-unlink by type before `remove_dir_all`.
+
+**Reference:** 04-risk-analysis.md §2 R3, §6.
+
+### 7.7.4 OPEN-C04 — Verify HTTP transport for Codex endpoints
+
+**Status:** Blocker for PR3.
+
+**What must be verified:** whether `auth.openai.com` and `chatgpt.com/backend-api/*` are behind the same Cloudflare TLS-fingerprint filter that blocks reqwest/rustls for Anthropic endpoints (journal 0056). If yes, csq reuses the JS-runtime subprocess transport; if no, csq uses the native typed HTTP client.
+
+**Method:** probe each endpoint with both transports from a clean environment; capture status + headers.
+
+**Consequence of resolution:** daemon HTTP layer for Codex is sized correctly — either reuses existing Node.js infrastructure or uses lighter native path.
+
+**Reference:** 02-non-functional-requirements.md NFR-C07.
+
+## 7.8 What this spec does NOT cover
+
+- The exact `wham/usage` response schema — that lives in spec 05 §5.7 (to be captured on first live observation).
+- The exact `RESOURCE_EXHAUSTED` error-body schema for Gemini 429s — spec 05 §5.8.
+- CLI argument surfaces (`csq run`, `csq swap`, `csq login`, `csq models switch`) — spec 03.
+- Desktop UI component design — workspaces/codex/05-frontend-design/, workspaces/gemini/05-frontend-design/.
+
+## 7.8 Cross-references
+
+- Spec 01 — CC credential architecture. Still authoritative for `Surface::ClaudeCode`.
+- Spec 02 — Handle-dir model. Base invariants hold; §7.2 adds per-surface overlays.
+- Spec 04 — Daemon architecture. §7.5 INV-P01, P02 extend the refresh invariants.
+- Spec 05 — Quota polling contracts. §7.4 defines the dispatch; §5.7 / §5.8 (to be added) hold the per-endpoint contracts.
+- `.claude/rules/account-terminal-separation.md` — rule 4 (account quota from provider endpoint, not CC) applies surface-generically.
+- Workspaces: `workspaces/codex/`, `workspaces/gemini/` — per-surface analysis, plans, validation, journals.
+
+## Revisions
+
+- 2026-04-21 — 1.0.0 — Initial draft, introduced for Codex + Gemini integration. Derived from research + red team findings in this session (see workspaces/codex/04-validate/, workspaces/gemini/04-validate/ when populated). References openai/codex#10332, #15502; google-gemini/gemini-cli#21744.
+- 2026-04-21 — 1.0.1 — /analyze phase for Codex surface completed (workspaces/codex/01-analysis/). Added INV-P08 (credential mode-flip mutex coordination), INV-P09 (per-account mutex lifecycle), INV-P10 (cross-surface swap cleanup), INV-P11 (auto-rotation refuses cross-surface). Added §7.7 Open preconditions OPEN-C01..C04 as PR-gating verifications. Spec ordering numbering shift: former §7.7 "What this spec does NOT cover" becomes §7.8; former §7.8 "Cross-references" becomes §7.9. Journaled in workspaces/codex/journal/0001.
+- 2026-04-22 — 1.0.2 — OPEN-C01 RESOLVED via direct openai/codex source read. Finding: `cli_auth_credentials_store = "file"` does NOT disable in-process refresh; codex refreshes on-expiry regardless. INV-P01 re-framed to "scheduled pre-expiry refresher" with 2h safety margin (matches spec 04 INV-06 Anthropic pattern). INV-P02 rationale refined accordingly. Clock-skew mitigation added. Gemini /analyze phase completed (workspaces/gemini/01-analysis/) — no spec 07 changes required; Gemini inherits the abstraction unchanged. Journaled in workspaces/codex/journal/0004 and workspaces/gemini/journal/0001.

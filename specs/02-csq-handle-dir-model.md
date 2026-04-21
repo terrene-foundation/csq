@@ -218,7 +218,9 @@ This spec supersedes and partially retracts:
 - The CLI surface of `csq swap` and `csq run` (flags, exit codes, output format). See spec 03.
 - Daemon internals (refresh cadence, lock file management, subsystem lifecycle). See spec 04.
 - Third-party providers (Z.AI, MiniMax) — they have their own per-slot `settings.json` files outside the OAuth flow. See spec 05.
+- Per-surface on-disk layouts for providers that run a non-Claude-Code native CLI (Codex via `CODEX_HOME`, Gemini via `GEMINI_CLI_HOME`). See spec 07. Per-surface persistence carve-outs from INV-02 live there as INV-P04 and do not alter the base invariant for the `Surface::ClaudeCode` case.
 
 ## Revisions
 
 - 2026-04-12 — 1.0.0 — Initial draft replacing the `config-N = slot` model with permanent `config-N` + ephemeral `term-<pid>` handle dirs. Retracts journal 0029 Finding 4 via journal 0031.
+- 2026-04-21 — 1.0.1 — §2.8 cross-reference added for spec 07 (Provider Surface Dispatch). INV-02 remains unchanged for the `Surface::ClaudeCode` case; per-surface carve-outs for Codex and Gemini are spec 07's responsibility and reference this spec as the base model. No invariant changes in this file. Journaled in workspaces/codex/journal/0001.

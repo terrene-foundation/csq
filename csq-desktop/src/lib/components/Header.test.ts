@@ -23,6 +23,14 @@ vi.mock("@tauri-apps/api/path", () => ({
   join: (...parts: string[]) => Promise.resolve(parts.join("/")),
 }));
 
+// `getVersion()` backs the dynamic version string rendered in the
+// header (journal 0063 P1-5 replaced the hardcoded alpha.21 literal).
+// The version string span is conditionally rendered — tests that
+// expect it to exist rely on this mock resolving synchronously.
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: () => Promise.resolve("2.0.0-test"),
+}));
+
 import Header from "./Header.svelte";
 
 // Default mock responses by command name. Tests override specific
@@ -61,11 +69,16 @@ describe("Header", () => {
     expect(container.textContent).toContain("Code Session Quota");
   });
 
-  it("renders a version string", async () => {
+  it("renders a version string from getVersion()", async () => {
     const { container } = render(Header);
+    // getVersion() resolves asynchronously; needs a few ticks for
+    // the promise to resolve and the DOM to reflect the state.
+    await tick();
+    await tick();
+    await tick();
     const versionEl = container.querySelector(".version");
     expect(versionEl).not.toBeNull();
-    expect(versionEl?.textContent).toMatch(/v\d/);
+    expect(versionEl?.textContent).toBe("v2.0.0-test");
   });
 
   // ── Daemon status indicator ───────────────────────────────────

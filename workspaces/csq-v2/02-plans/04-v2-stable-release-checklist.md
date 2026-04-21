@@ -211,13 +211,15 @@ These are explicit non-claims for v2.0.0. Each has release-notes text and the ma
 
 **Workaround that works:** Right-click → Open is tested by gate B5. CLI-only users (`curl | sh`) are unaffected.
 
-### L2 — `csq update install` end-to-end not guaranteed until Foundation signs
+### L2 — `csq update install` one-click upgrade has limited manual validation
 
-**What doesn't work:** If `RELEASE_PUBLIC_KEY_BYTES` in `verify.rs` is still the placeholder test seed at release time, `csq update install` will fail signature verification on any artifact signed with the real Foundation key (and vice-versa). `csq update check` is unaffected — it only reads `latest.json` and prints the banner.
+**Status (updated 2026-04-22 per commit `499d131`):** The Foundation's Ed25519 release-signing key was provisioned in `3af4f3e` and is compiled into `csq-core/src/update/verify.rs` as `RELEASE_PUBLIC_KEY_BYTES` in non-test builds. `SHA256SUMS` + `.sig` artifacts are published on every release; the signing pipeline is live. Cryptographic verification is NOT the gap. The remaining unknown is whether the in-app update flow (download → verify → apply) survives a real cross-version upgrade (e.g. alpha.21 → 2.0.0) on a fresh profile. Journal 0065 B1 records the key-provisioning confirmation.
 
-**Release-notes text (verbatim):**
+**What isn't yet validated:** end-to-end `csq update install` against a real cross-version release on a fresh install. The first cross-version validation opportunity is the 2.0.0 → 2.0.1 cycle.
 
-> In csq 2.0.0, the in-app "Update" button and `csq update check` CLI detect new releases and prompt you. The one-click `csq update install` path is gated behind the Foundation's production release-signing key; until that key is provisioned, install 2.0.1+ manually by downloading the new DMG/AppImage/MSI from GitHub Releases. Update check and detection work normally.
+**Release-notes text (verbatim, matches `docs/releases/v2.0.0.md` post-499d131):**
+
+> In csq 2.0.0, the in-app "Update" button and `csq update check` CLI detect new releases and prompt you. The Foundation's Ed25519 release-signing key is provisioned and `SHA256SUMS` / `.sig` assets are published with every release, so in-app install should succeed end-to-end. However, `csq update install` has not been exercised against a real cross-version release (alpha.N → 2.0.0) on a fresh install. If the in-app installer reports a verification or write failure, fall back to downloading the new DMG / AppImage / MSI from GitHub Releases and reinstalling manually — credentials and config persist across reinstalls. File any failure under the `updater` label with the command output and platform.
 
 **Workaround that works:** Download the new installer from `https://github.com/terrene-foundation/csq/releases` and reinstall. Credentials and config persist across reinstalls — nothing is lost.
 

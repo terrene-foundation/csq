@@ -23,7 +23,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { homeDir, join } from '@tauri-apps/api/path';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
 
   interface Props {
     isOpen: boolean;
@@ -85,9 +85,14 @@
     }
   }
 
+  let wasOpen = $state(false);
+
   onMount(() => {
     let cancelled = false;
     if (isOpen) {
+      // Mounted already open — load now. Mark wasOpen=true so the
+      // $effect below doesn't double-fire on the same edge.
+      wasOpen = true;
       loadInstalled(() => cancelled);
     }
     return () => {
@@ -96,27 +101,41 @@
     };
   });
 
-  // When the modal is toggled OPEN (false → true edge) after a
-  // close/reopen cycle, re-fetch the installed list so any model
-  // the user pulled in a terminal while the modal was closed
-  // shows up. Reading `isOpen` reactively; `wasOpen` anchors the
-  // edge detection so we don't re-fetch on every internal modalState
-  // transition (pulling → error → etc.).
-  let wasOpen = $state(false);
+  // Load (or reload) the installed list on every `false → true`
+  // isOpen edge after mount. The modal is rendered by AccountList
+  // even when closed, so the first-open transition — user clicks
+  // "Change model" — flips isOpen here. Any model the user pulled
+  // in a terminal while the modal was closed should show up on
+  // reopen. `wasOpen` anchors the edge so we don't re-fetch on
+  // every internal modalState transition (pulling → error → etc.).
+  //
+  // Regression guard (journal 0061): an earlier version had a guard
+  // `modalState.kind !== 'loading'` that skipped the load when the
+  // modal was already in its initial 'loading' state — which it
+  // always was on first open, so list_ollama_models was never
+  // invoked and the spinner hung forever. The guard is removed;
+  // loading on every open edge is cheap (2s-timeout localhost call)
+  // and correct.
+  // `wasOpen` is written inside the effect but we don't want its
+  // write to invalidate the effect — otherwise Svelte schedules a
+  // re-run whose cleanup sets `cancelled=true` before `loadInstalled`
+  // resolves, and the modal stays stuck in 'loading'. `untrack` tells
+  // Svelte not to invalidate this effect just because wasOpen changed.
   $effect(() => {
-    if (isOpen && !wasOpen) {
-      wasOpen = true;
-      // Already fetched on initial mount; skip that one.
-      if (modalState.kind !== 'loading' && modalState.kind !== 'picker') {
-        let cancelled = false;
-        modalState = { kind: 'loading' };
-        loadInstalled(() => cancelled);
-        return () => {
-          cancelled = true;
-        };
-      }
-    } else if (!isOpen && wasOpen) {
-      wasOpen = false;
+    if (isOpen && !untrack(() => wasOpen)) {
+      untrack(() => {
+        wasOpen = true;
+      });
+      let cancelled = false;
+      modalState = { kind: 'loading' };
+      loadInstalled(() => cancelled);
+      return () => {
+        cancelled = true;
+      };
+    } else if (!isOpen && untrack(() => wasOpen)) {
+      untrack(() => {
+        wasOpen = false;
+      });
     }
   });
 

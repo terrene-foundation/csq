@@ -153,13 +153,20 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         shutdown.clone(),
                     );
 
-                    // Start the background auto-rotation loop. Scans
-                    // config-* directories every 30 seconds and swaps
-                    // accounts when 5-hour quota exceeds the configured
-                    // threshold. Disabled by default; enable via
-                    // {base_dir}/rotation.json.
-                    let auto_rotator =
-                        daemon::spawn_auto_rotate(base_dir_for_runtime.clone(), shutdown.clone());
+                    // Start the background auto-rotation loop (PR-A1).
+                    // Walks term-<pid>/ handle dirs and calls
+                    // repoint_handle_dir to atomically repoint symlinks
+                    // without touching config-N/ (INV-01). Disabled by
+                    // default; enable via {base_dir}/rotation.json.
+                    // claude_home is needed to re-materialize settings.json
+                    // after each repoint; pass None if $HOME is unavailable
+                    // and the rotator becomes a no-op.
+                    let claude_home_for_rotate = super::claude_home().ok();
+                    let auto_rotator = daemon::spawn_auto_rotate(
+                        base_dir_for_runtime.clone(),
+                        claude_home_for_rotate,
+                        shutdown.clone(),
+                    );
 
                     // Start the handle-dir sweep. Scans term-* dirs
                     // every 60 seconds, preserves each dead dir's

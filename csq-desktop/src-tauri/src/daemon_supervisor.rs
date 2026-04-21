@@ -358,7 +358,15 @@ async fn run_daemon(
         http_post_probe,
         shutdown.clone(),
     );
-    let auto_rotator = daemon::spawn_auto_rotate(base_dir.to_path_buf(), shutdown.clone());
+    // PR-A1: pass claude_home so the rotator can re-materialize
+    // settings.json after each handle dir repoint. Reuse the same
+    // dirs::home_dir() resolution the sweep uses. None → rotator no-op.
+    let claude_home_for_rotate = dirs::home_dir().map(|h| h.join(".claude"));
+    let auto_rotator = daemon::spawn_auto_rotate(
+        base_dir.to_path_buf(),
+        claude_home_for_rotate,
+        shutdown.clone(),
+    );
     // Sweep preserves each dead handle dir's image-cache into
     // ~/.claude/image-cache/ before removing the orphan. If we
     // cannot resolve ~/.claude (no $HOME in a sandboxed env), pass

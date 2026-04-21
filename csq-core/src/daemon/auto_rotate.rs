@@ -1,24 +1,35 @@
-//! Background auto-rotation loop.
+//! Background auto-rotation loop — handle-dir-native (PR-A1, v2.0.1).
 //!
-//! Scans all `config-*` directories every 30 seconds and swaps the
-//! active account whenever the current account's 5-hour quota exceeds
-//! the configured threshold.
+//! Scans all `accounts/term-<pid>` handle dirs every 30 seconds and
+//! repoints the active account whenever the current account's 5-hour
+//! quota exceeds the configured threshold.
 //!
-//! # M5a scope
+//! # PR-A1 structural fix (journal 0064, Option A)
 //!
-//! - Reads `{base_dir}/rotation.json` on each tick (live config reload).
-//! - Applies a per-config-dir cooldown so the same directory is not
-//!   rotated more than once per `cooldown_secs`.
-//! - Delegates account selection to `rotation::picker::pick_best`.
-//! - Delegates the actual swap to `rotation::swap::swap_to`.
-//! - Does NOT block swap for live CC processes — `swap_to` is atomic
-//!   and CC reads the new `.credentials.json` on its next API call.
+//! v2.0.0 shipped `swap_to(base_dir, config_dir, target)` which writes
+//! target account M's `.credentials.json` INTO `config-N/`. Under the
+//! handle-dir model (spec 02, INV-01), `config-<N>/.credentials.json`
+//! is PERMANENT account-N credentials — overwriting it corrupts identity
+//! for every terminal whose `term-<pid>/` symlinks back through that
+//! config-N. PR-A1 replaces that guard (which refused to run when any
+//! `term-*/` exists) with the structural fix: walk `term-<pid>/` handle
+//! dirs and call `handle_dir::repoint_handle_dir`, which atomically
+//! repoints symlinks WITHOUT touching `config-<N>/`.
 //!
 //! # Cooldown map
 //!
-//! The cooldown is keyed on the *config-dir path* (not the account
-//! number) so each terminal session has an independent cooldown.
-//! This prevents one busy session from blocking rotation of other sessions.
+//! The cooldown is keyed on the *handle-dir path* (not the account
+//! number and not the config dir) so each terminal session has an
+//! independent cooldown. This prevents one busy session from blocking
+//! rotation of other sessions.
+//!
+//! # claude_home requirement
+//!
+//! `repoint_handle_dir` must re-materialize `settings.json` after the
+//! repoint (it deep-merges `~/.claude/settings.json` with the new
+//! slot's overlay). If `claude_home` cannot be resolved at spawn time,
+//! the rotator logs a WARN and becomes a no-op — fail-safe is "don't
+//! rotate" rather than "rotate with an empty settings base".
 //!
 //! # Shutdown
 //!
@@ -27,7 +38,8 @@
 
 use crate::accounts::markers;
 use crate::quota::state as quota_state;
-use crate::rotation::{config as rotation_config, pick_best, swap_to};
+use crate::rotation::config as rotation_config;
+use crate::session::handle_dir::repoint_handle_dir;
 use crate::types::AccountNum;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,21 +60,54 @@ pub struct AutoRotateHandle {
 }
 
 /// Spawns the auto-rotation background task on the current tokio runtime.
-pub fn spawn(base_dir: PathBuf, shutdown: CancellationToken) -> AutoRotateHandle {
-    spawn_with_config(base_dir, shutdown, TICK_INTERVAL, STARTUP_DELAY)
+///
+/// `claude_home` is `Option<PathBuf>` so callers that cannot resolve
+/// `~/.claude` (rare sandbox / missing $HOME) can pass `None`. The
+/// rotator logs a single WARN at spawn time and becomes a no-op for
+/// every tick — fail-safe is "don't rotate" rather than "rotate with
+/// an empty base settings file that would overwrite user customization".
+pub fn spawn(
+    base_dir: PathBuf,
+    claude_home: Option<PathBuf>,
+    shutdown: CancellationToken,
+) -> AutoRotateHandle {
+    spawn_with_config(
+        base_dir,
+        claude_home,
+        shutdown,
+        TICK_INTERVAL,
+        STARTUP_DELAY,
+    )
 }
 
 /// Like [`spawn`] but with explicit intervals for testing.
 pub fn spawn_with_config(
     base_dir: PathBuf,
+    claude_home: Option<PathBuf>,
     shutdown: CancellationToken,
     interval: Duration,
     startup_delay: Duration,
 ) -> AutoRotateHandle {
+    if claude_home.is_none() {
+        warn!(
+            "auto-rotation: claude_home is None — rotator will be a no-op. \
+             Cannot repoint handle dirs without a known ~/.claude path \
+             (materialize_handle_settings requires it). Check that $HOME is set."
+        );
+    }
+
     let cooldowns: HashMap<PathBuf, Instant> = HashMap::new();
 
     let join = tokio::spawn(async move {
-        run_loop(base_dir, shutdown, interval, startup_delay, cooldowns).await;
+        run_loop(
+            base_dir,
+            claude_home,
+            shutdown,
+            interval,
+            startup_delay,
+            cooldowns,
+        )
+        .await;
     });
 
     AutoRotateHandle { join }
@@ -70,6 +115,7 @@ pub fn spawn_with_config(
 
 async fn run_loop(
     base_dir: PathBuf,
+    claude_home: Option<PathBuf>,
     shutdown: CancellationToken,
     interval: Duration,
     startup_delay: Duration,
@@ -90,7 +136,7 @@ async fn run_loop(
     }
 
     loop {
-        tick(&base_dir, &mut cooldowns);
+        tick(&base_dir, claude_home.as_deref(), &mut cooldowns);
 
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -102,10 +148,40 @@ async fn run_loop(
     }
 }
 
+/// Same-surface filter for auto-rotation candidates.
+///
+/// v2.0.1: trivially accepts every candidate because all existing
+/// providers are Surface::ClaudeCode. Codex PR-C1 (v2.1) replaces this
+/// with a real Surface enum check per spec 07 INV-P11. Keeping this as
+/// a named function (rather than inline) makes the flip a one-line
+/// change without restructuring the rotator.
+const fn same_surface_as_active(_candidate: AccountNum) -> bool {
+    // TODO(PR-C1): replace with Surface enum dispatch per spec 07 INV-P11
+    true
+}
+
 /// Runs a single auto-rotation tick.
 ///
-/// Exposed `pub(crate)` for unit tests.
-pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
+/// Exposed `pub` for both unit tests and integration tests.
+///
+/// When `claude_home` is `None`, returns immediately (no-op). This is the
+/// fail-safe path for environments where $HOME is unavailable — the rotator
+/// cannot safely repoint without knowing where `~/.claude/settings.json` lives.
+pub fn tick(
+    base_dir: &Path,
+    claude_home: Option<&Path>,
+    cooldowns: &mut HashMap<PathBuf, Instant>,
+) {
+    // Fail-safe: without claude_home we cannot re-materialize settings.json
+    // after repoint. Do not rotate.
+    let claude_home = match claude_home {
+        Some(p) => p,
+        None => {
+            debug!("auto-rotation: claude_home is None, skipping tick (no-op)");
+            return;
+        }
+    };
+
     // Load config fresh on every tick so changes to rotation.json
     // take effect within one tick interval without restarting the daemon.
     let cfg = match rotation_config::load(base_dir) {
@@ -121,29 +197,11 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
         return;
     }
 
-    // Handle-dir model guard (journal 0064, P0-1). Under the handle-
-    // dir model (spec 02, INV-01), config-<N>/.credentials.json is
-    // permanent account-N credentials. Auto-rotation's legacy `swap_to`
-    // path writes target account M's credentials INTO config-N, which
-    // silently corrupts identity for every terminal whose handle dir
-    // symlinks back through config-N. The structural fix is to rotate
-    // `term-<pid>` handle-dir symlinks instead of config-N files; that
-    // redesign ships in 2.0.1. For 2.0.0 we refuse-to-run when any
-    // handle dir exists and leave a clear WARN so the user knows the
-    // feature is deferred, rather than running and corrupting state.
-    if handle_dirs_present(base_dir) {
-        warn!(
-            "auto-rotation: skipping tick — handle-dir mode detected \
-             (term-*/ directories present). Auto-rotation in handle-dir \
-             mode is deferred to csq 2.0.1 pending a handle-dir-native \
-             rotator. See journal 0064."
-        );
-        return;
-    }
-
     let cooldown_duration = Duration::from_secs(cfg.cooldown_secs);
 
-    // Scan config-* directories under base_dir.
+    // Scan term-* handle dirs under base_dir (PR-A1: walk handle dirs,
+    // not config-* dirs). Each term-<pid>/ is a running terminal session;
+    // we repoint its symlinks, never touching config-N/.
     let entries = match std::fs::read_dir(base_dir) {
         Ok(e) => e,
         Err(e) => {
@@ -156,35 +214,37 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
     let mut skipped = 0usize;
 
     for entry in entries.flatten() {
-        let config_dir = entry.path();
+        let handle_dir = entry.path();
 
-        // Only consider config-* directories.
-        let name = match config_dir.file_name().and_then(|n| n.to_str()) {
+        // Only consider term-* directories (handle dirs).
+        let name = match handle_dir.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
-        if !name.starts_with("config-") {
+        if !name.starts_with("term-") {
             continue;
         }
-        if !config_dir.is_dir() {
+        if !handle_dir.is_dir() {
             continue;
         }
 
-        // Read which account this config dir is currently using.
-        let current_account = match markers::read_csq_account(&config_dir) {
+        // Read which account this handle dir is currently bound to.
+        // The symlink `term-<pid>/.csq-account` → `config-<current>/.csq-account`
+        // resolves to the current account's canonical marker.
+        let current_account = match markers::read_csq_account(&handle_dir) {
             Some(a) => a,
             None => {
-                debug!(dir = %config_dir.display(), "auto-rotation: no .csq-account marker, skipping");
+                debug!(dir = %handle_dir.display(), "auto-rotation: no .csq-account marker in handle dir, skipping");
                 skipped += 1;
                 continue;
             }
         };
 
-        // Check per-config-dir cooldown.
-        if let Some(&last_rotated) = cooldowns.get(&config_dir) {
+        // Check per-handle-dir cooldown (keyed on handle_dir path, not account).
+        if let Some(&last_rotated) = cooldowns.get(&handle_dir) {
             if last_rotated.elapsed() < cooldown_duration {
                 debug!(
-                    dir = %config_dir.display(),
+                    dir = %handle_dir.display(),
                     remaining_secs = (cooldown_duration - last_rotated.elapsed()).as_secs(),
                     "auto-rotation: in cooldown, skipping"
                 );
@@ -194,7 +254,7 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
         }
 
         // Check quota for current account.
-        let quota_state = match quota_state::load_state(base_dir) {
+        let quota = match quota_state::load_state(base_dir) {
             Ok(q) => q,
             Err(e) => {
                 warn!(error = %e, "auto-rotation: failed to load quota state");
@@ -203,14 +263,14 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
             }
         };
 
-        let five_hour_pct = quota_state
+        let five_hour_pct = quota
             .get(current_account.get())
             .map(|q| q.five_hour_pct())
             .unwrap_or(0.0);
 
         if five_hour_pct < cfg.threshold_percent {
             debug!(
-                dir = %config_dir.display(),
+                dir = %handle_dir.display(),
                 account = current_account.get(),
                 pct = five_hour_pct,
                 threshold = cfg.threshold_percent,
@@ -221,16 +281,13 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
         }
 
         // Account has exceeded the threshold — find a better account.
-        // Build the effective exclude set: current account + user-specified exclusions.
-        // pick_best already excludes the current account; we apply user exclusions
-        // by calling pick_best and then filtering out excluded targets.
         let target = find_target(base_dir, current_account, &cfg.exclude_accounts);
 
         let target = match target {
             Some(t) => t,
             None => {
                 debug!(
-                    dir = %config_dir.display(),
+                    dir = %handle_dir.display(),
                     account = current_account.get(),
                     "auto-rotation: no better account available, skipping"
                 );
@@ -239,26 +296,30 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
             }
         };
 
-        // Perform the swap.
-        match swap_to(base_dir, &config_dir, target) {
-            Ok(result) => {
+        // PR-A1 structural fix: repoint the handle dir's symlinks to the
+        // target account. This atomically updates `.credentials.json`,
+        // `.csq-account`, `.claude.json`, and `.quota-cursor` symlinks
+        // and re-materializes `settings.json`. config-N/.credentials.json
+        // is NEVER written (INV-01 preserved).
+        match repoint_handle_dir(base_dir, claude_home, &handle_dir, target) {
+            Ok(()) => {
                 info!(
-                    dir = %config_dir.display(),
+                    dir = %handle_dir.display(),
                     from = current_account.get(),
-                    to = result.account.get(),
+                    to = target.get(),
                     threshold = cfg.threshold_percent,
                     pct = five_hour_pct,
-                    "auto-rotation: rotated account"
+                    "auto-rotation: repointed handle dir to new account"
                 );
-                cooldowns.insert(config_dir.clone(), Instant::now());
+                cooldowns.insert(handle_dir.clone(), Instant::now());
                 rotated += 1;
             }
             Err(e) => {
                 warn!(
-                    dir = %config_dir.display(),
+                    dir = %handle_dir.display(),
                     account = current_account.get(),
                     error = %e,
-                    "auto-rotation: swap failed"
+                    "auto-rotation: repoint failed"
                 );
                 skipped += 1;
             }
@@ -268,82 +329,51 @@ pub(crate) fn tick(base_dir: &Path, cooldowns: &mut HashMap<PathBuf, Instant>) {
     if rotated > 0 || skipped > 0 {
         info!(rotated, skipped, "auto-rotation tick complete");
     } else {
-        debug!("auto-rotation tick: no config dirs processed");
+        debug!("auto-rotation tick: no handle dirs processed");
     }
 }
 
-/// Returns true when at least one `term-<pid>` handle directory exists
-/// directly under `base_dir`. Presence of any handle dir is the signal
-/// that the installation is using the handle-dir model (spec 02);
-/// auto-rotation's legacy swap path is unsafe in that mode. Journal
-/// 0064. A read-dir error returns false so a genuinely empty / missing
-/// base_dir doesn't flip the feature on by accident.
-fn handle_dirs_present(base_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(base_dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if name_str.starts_with("term-") && entry.path().is_dir() {
-            return true;
-        }
-    }
-    false
-}
-
-/// Finds the best rotation target, respecting the user's exclusion list.
+/// Finds the best rotation target, respecting the user's exclusion list
+/// and the same-surface filter.
 ///
-/// `pick_best` already excludes the current account; this function
-/// additionally filters out any accounts in `exclude_accounts`. If the
-/// first `pick_best` result is in the exclusion list, we iterate until
-/// we find one that isn't — or return None if no eligible account exists.
+/// Additionally filters out any accounts in `exclude_accounts`. If the
+/// first candidate is in the exclusion list, we iterate until we find
+/// one that isn't — or return None if no eligible account exists.
 fn find_target(
     base_dir: &Path,
     current: AccountNum,
     exclude_accounts: &[u16],
 ) -> Option<AccountNum> {
-    if exclude_accounts.is_empty() {
-        return pick_best(base_dir, Some(current));
-    }
-
-    // Build a combined exclusion set: current + user list.
-    // We ask pick_best repeatedly, each time adding the rejected candidate
-    // to a temporary exclude set, until we get an acceptable target or
-    // run out of candidates.
-    //
-    // In practice, the number of accounts is small (≤7), so this loop
-    // terminates very quickly.
-    let extra_excludes: Vec<AccountNum> = exclude_accounts
-        .iter()
-        .filter_map(|&id| AccountNum::try_from(id).ok())
-        .collect();
-
-    // Temporarily combine current + extra_excludes into a single exclusion
-    // by iterating candidates from quota state directly.
-    // Since pick_best only accepts a single exclude, we use the quota state
-    // to find the best account not in our combined exclusion set.
     use crate::accounts::discovery;
     use crate::quota::state as qs;
 
     let accounts = discovery::discover_anthropic(base_dir);
     let quota = qs::load_state(base_dir).ok()?;
 
-    // Collect candidates: has credentials, not current, not excluded.
+    // Build a combined exclusion set: current + user list.
+    let extra_excludes: Vec<AccountNum> = exclude_accounts
+        .iter()
+        .filter_map(|&id| AccountNum::try_from(id).ok())
+        .collect();
+
     let excluded_ids: std::collections::HashSet<u16> = extra_excludes
         .iter()
         .map(|a| a.get())
         .chain(std::iter::once(current.get()))
         .collect();
 
+    // Collect candidates: has credentials, not current, not excluded,
+    // passes the same-surface filter (stub: always true pre-PR-C1).
     let candidates: Vec<(AccountNum, f64, u64)> = accounts
         .into_iter()
         .filter(|a| a.has_credentials)
         .filter_map(|a| {
             let num = AccountNum::try_from(a.id).ok()?;
             if excluded_ids.contains(&num.get()) {
+                return None;
+            }
+            // Surface filter: PR-C1 will replace this with a real check.
+            if !same_surface_as_active(num) {
                 return None;
             }
             let pct = quota
@@ -389,6 +419,7 @@ mod tests {
     use crate::credentials::{self, file as cred_file, CredentialFile, OAuthPayload};
     use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
     use crate::rotation::config::{save as save_rotation_config, RotationConfig};
+    use crate::session::handle_dir::create_handle_dir;
     use crate::types::{AccessToken, AccountNum, RefreshToken};
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -423,7 +454,9 @@ mod tests {
             AccountQuota {
                 five_hour: Some(UsageWindow {
                     used_percentage: five_hour_pct,
-                    resets_at: 9999999999,
+                    // Far-future reset so clear_expired doesn't drop these
+                    // during the load cycle. Year 2100 = 4102444800 seconds.
+                    resets_at: 4_102_444_800,
                 }),
                 seven_day: None,
                 rate_limits: None,
@@ -433,26 +466,39 @@ mod tests {
         quota_state::save_state(base, &quota).unwrap();
     }
 
-    fn setup_config_dir(base: &Path, dir_name: &str, account: u16) -> PathBuf {
-        let config_dir = base.join(dir_name);
+    /// Creates `config-<account>/` with a .csq-account marker.
+    fn setup_config_dir(base: &Path, account: u16) -> PathBuf {
+        let config_dir = base.join(format!("config-{account}"));
         std::fs::create_dir_all(&config_dir).unwrap();
         let target = AccountNum::try_from(account).unwrap();
         markers::write_csq_account(&config_dir, target).unwrap();
         config_dir
     }
 
-    // ── tests ────────────────────────────────────────────────────────────
+    /// Creates a `term-<pid>/` handle dir with symlinks pointing at
+    /// `config-<account>/`. Uses `create_handle_dir` so the structure
+    /// matches production exactly. The `claude_home` is a fresh temp dir
+    /// so shared-items symlinks don't escape into `~/.claude`.
+    fn setup_handle_dir(base: &Path, claude_home: &Path, pid: u32, account: u16) -> PathBuf {
+        let account_num = AccountNum::try_from(account).unwrap();
+        create_handle_dir(base, claude_home, account_num, pid).unwrap()
+    }
+
+    // ── adapted existing tests ────────────────────────────────────────────
 
     #[test]
     fn tick_disabled_config_no_swaps() {
+        // Arrange: two accounts, account 1 over threshold, rotation DISABLED
         let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
         setup_account(dir.path(), 1);
         setup_account(dir.path(), 2);
         setup_quota(dir.path(), 1, 99.0);
         setup_quota(dir.path(), 2, 10.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10001, 1);
 
-        // Arrange: disabled rotation config
         let cfg = RotationConfig {
             enabled: false,
             ..RotationConfig::default()
@@ -461,11 +507,11 @@ mod tests {
 
         // Act
         let mut cooldowns = HashMap::new();
-        tick(dir.path(), &mut cooldowns);
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
 
-        // Assert: account 1 is still active (no swap happened)
+        // Assert: handle dir still bound to account 1 (no repoint happened)
         assert_eq!(
-            markers::read_csq_account(&config_dir),
+            markers::read_csq_account(&handle_dir),
             Some(AccountNum::try_from(1u16).unwrap())
         );
         assert!(cooldowns.is_empty());
@@ -473,13 +519,16 @@ mod tests {
 
     #[test]
     fn tick_enabled_below_threshold_no_swap() {
+        // Arrange: account 1 at 50% — below the 95% default threshold
         let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
         setup_account(dir.path(), 1);
         setup_account(dir.path(), 2);
-        // Account 1 at 50% — below the 95% default threshold
         setup_quota(dir.path(), 1, 50.0);
         setup_quota(dir.path(), 2, 10.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10002, 1);
 
         let cfg = RotationConfig {
             enabled: true,
@@ -488,26 +537,56 @@ mod tests {
         };
         save_rotation_config(dir.path(), &cfg).unwrap();
 
+        // Act
         let mut cooldowns = HashMap::new();
-        tick(dir.path(), &mut cooldowns);
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
 
-        // No swap — still on account 1
+        // Assert: no repoint, still on account 1
         assert_eq!(
-            markers::read_csq_account(&config_dir),
+            markers::read_csq_account(&handle_dir),
             Some(AccountNum::try_from(1u16).unwrap())
         );
         assert!(cooldowns.is_empty());
     }
 
     #[test]
-    fn tick_enabled_above_threshold_swaps() {
+    fn tick_missing_config_uses_defaults_disabled() {
+        // When no rotation.json exists, defaults have enabled=false.
         let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
         setup_account(dir.path(), 1);
         setup_account(dir.path(), 2);
-        // Account 1 at 97% — above threshold
+        setup_quota(dir.path(), 1, 99.0);
+        setup_quota(dir.path(), 2, 10.0);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10003, 1);
+
+        // Act: no rotation.json written — defaults have enabled=false
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        // Assert: default config has enabled=false — no rotation
+        assert_eq!(
+            markers::read_csq_account(&handle_dir),
+            Some(AccountNum::try_from(1u16).unwrap())
+        );
+    }
+
+    // ── handle-dir-native repoint tests (PR-A1) ──────────────────────────
+
+    #[test]
+    fn tick_enabled_above_threshold_repoints_handle_dir() {
+        // Arrange: account 1 at 97% — above threshold
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
         setup_quota(dir.path(), 1, 97.0);
         setup_quota(dir.path(), 2, 10.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10004, 1);
 
         let cfg = RotationConfig {
             enabled: true,
@@ -516,26 +595,35 @@ mod tests {
         };
         save_rotation_config(dir.path(), &cfg).unwrap();
 
+        // Act
         let mut cooldowns = HashMap::new();
-        tick(dir.path(), &mut cooldowns);
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
 
-        // Should have rotated to account 2
+        // Assert: handle dir's .csq-account symlink now resolves to account 2
         assert_eq!(
-            markers::read_csq_account(&config_dir),
-            Some(AccountNum::try_from(2u16).unwrap())
+            markers::read_csq_account(&handle_dir),
+            Some(AccountNum::try_from(2u16).unwrap()),
+            "handle dir should be repointed to account 2"
         );
-        // Cooldown entry should be set for this config dir
-        assert!(cooldowns.contains_key(&config_dir));
+        // Cooldown entry keyed on handle_dir path
+        assert!(
+            cooldowns.contains_key(&handle_dir),
+            "cooldown entry should be set for the handle dir"
+        );
     }
 
     #[test]
-    fn tick_respects_cooldown_on_second_call() {
+    fn tick_respects_cooldown_per_handle_dir() {
+        // Arrange: account 1 at 97%, cooldown active after first tick
         let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
         setup_account(dir.path(), 1);
         setup_account(dir.path(), 2);
         setup_quota(dir.path(), 1, 97.0);
         setup_quota(dir.path(), 2, 10.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10005, 1);
 
         let cfg = RotationConfig {
             enabled: true,
@@ -547,37 +635,41 @@ mod tests {
 
         let mut cooldowns = HashMap::new();
 
-        // First tick: rotates
-        tick(dir.path(), &mut cooldowns);
+        // First tick: rotates to account 2
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
         assert_eq!(
-            markers::read_csq_account(&config_dir),
-            Some(AccountNum::try_from(2u16).unwrap())
+            markers::read_csq_account(&handle_dir),
+            Some(AccountNum::try_from(2u16).unwrap()),
+            "first tick should repoint to account 2"
         );
 
-        // Simulate account 2 also going over threshold — would want to rotate back
+        // Simulate account 2 also going over threshold
         setup_quota(dir.path(), 2, 98.0);
         setup_quota(dir.path(), 1, 10.0); // account 1 recovered
-                                          // Put account marker back to simulate it was on account 2
-        let target2 = AccountNum::try_from(2u16).unwrap();
-        markers::write_csq_account(&config_dir, target2).unwrap();
+                                          // Manually repoint back to account 2 to simulate post-first-tick state
+        let acc2 = AccountNum::try_from(2u16).unwrap();
+        markers::write_csq_account(&handle_dir.join(".csq-account"), acc2).ok();
 
-        // Second tick: cooldown prevents rotation
-        tick(dir.path(), &mut cooldowns);
+        // Second tick: cooldown prevents rotation (keyed on handle_dir)
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
 
-        // Still on account 2 because cooldown is active
+        // Still on account 2 because cooldown is active for this handle dir
         assert_eq!(
-            markers::read_csq_account(&config_dir),
-            Some(AccountNum::try_from(2u16).unwrap())
+            markers::read_csq_account(&handle_dir),
+            Some(AccountNum::try_from(2u16).unwrap()),
+            "handle dir should stay on account 2 during cooldown"
         );
     }
 
     #[test]
     fn tick_no_better_account_no_swap() {
-        let dir = TempDir::new().unwrap();
         // Only one account — nothing to rotate to
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
         setup_account(dir.path(), 1);
         setup_quota(dir.path(), 1, 97.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+        setup_config_dir(dir.path(), 1);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10006, 1);
 
         let cfg = RotationConfig {
             enabled: true,
@@ -587,11 +679,11 @@ mod tests {
         save_rotation_config(dir.path(), &cfg).unwrap();
 
         let mut cooldowns = HashMap::new();
-        tick(dir.path(), &mut cooldowns);
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
 
-        // No other account — should stay on account 1
+        // No other account — should stay on account 1, no cooldown entry
         assert_eq!(
-            markers::read_csq_account(&config_dir),
+            markers::read_csq_account(&handle_dir),
             Some(AccountNum::try_from(1u16).unwrap())
         );
         assert!(cooldowns.is_empty());
@@ -599,16 +691,20 @@ mod tests {
 
     #[test]
     fn tick_respects_exclude_accounts() {
+        // Account 2 excluded — should rotate to 3 instead
         let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
         setup_account(dir.path(), 1);
         setup_account(dir.path(), 2);
         setup_account(dir.path(), 3);
         setup_quota(dir.path(), 1, 97.0);
         setup_quota(dir.path(), 2, 20.0);
         setup_quota(dir.path(), 3, 10.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        setup_config_dir(dir.path(), 3);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10007, 1);
 
-        // Exclude account 2 — should rotate to 3 instead
         let cfg = RotationConfig {
             enabled: true,
             threshold_percent: 95.0,
@@ -618,84 +714,36 @@ mod tests {
         save_rotation_config(dir.path(), &cfg).unwrap();
 
         let mut cooldowns = HashMap::new();
-        tick(dir.path(), &mut cooldowns);
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
 
-        // Should have rotated to account 3 (not 2, which was excluded)
+        // Should have repointed to account 3 (not 2, which was excluded)
         assert_eq!(
-            markers::read_csq_account(&config_dir),
+            markers::read_csq_account(&handle_dir),
             Some(AccountNum::try_from(3u16).unwrap())
         );
     }
 
+    // ── PR-A1 invariant tests ─────────────────────────────────────────────
+
     #[test]
-    fn tick_missing_config_uses_defaults_disabled() {
-        // When no rotation.json exists, defaults have enabled=false.
+    fn auto_rotate_walks_handle_dirs_not_config_dirs() {
+        // Arrange: config-1 has a sentinel credential file. A handle dir
+        // (term-10008) is on account 1 over threshold. After tick, the
+        // sentinel in config-1/.credentials.json MUST be unchanged
+        // (INV-01), while the handle dir's .csq-account resolves to account 2.
         let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
         setup_account(dir.path(), 1);
         setup_account(dir.path(), 2);
-        setup_quota(dir.path(), 1, 99.0);
+        setup_quota(dir.path(), 1, 97.0);
         setup_quota(dir.path(), 2, 10.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
+        let config_dir_1 = setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10008, 1);
 
-        let mut cooldowns = HashMap::new();
-        tick(dir.path(), &mut cooldowns);
-
-        // Default config has enabled=false — no rotation should happen
-        assert_eq!(
-            markers::read_csq_account(&config_dir),
-            Some(AccountNum::try_from(1u16).unwrap())
-        );
-    }
-
-    // ── handle-dir guard (journal 0064, P0-1) ────────────────────────────
-
-    #[test]
-    fn handle_dirs_present_detects_term_dir() {
-        let dir = TempDir::new().unwrap();
-        assert!(!handle_dirs_present(dir.path()));
-
-        std::fs::create_dir_all(dir.path().join("term-12345")).unwrap();
-        assert!(handle_dirs_present(dir.path()));
-    }
-
-    #[test]
-    fn handle_dirs_present_ignores_config_dirs() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("config-1")).unwrap();
-        std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
-        assert!(!handle_dirs_present(dir.path()));
-    }
-
-    #[test]
-    fn handle_dirs_present_ignores_files_named_term() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("term-regular-file"), b"x").unwrap();
-        assert!(!handle_dirs_present(dir.path()));
-    }
-
-    #[test]
-    fn tick_enabled_with_handle_dir_refuses_to_swap() {
-        // Journal 0064 regression: with rotation enabled AND a handle
-        // dir present, tick MUST short-circuit rather than call
-        // swap_to on config-N. Writing account M's credentials into
-        // config-N violates INV-01 and corrupts identity for every
-        // terminal symlinking to that config dir.
-        let dir = TempDir::new().unwrap();
-        setup_account(dir.path(), 1);
-        setup_account(dir.path(), 2);
-        setup_quota(dir.path(), 1, 97.0); // above threshold
-        setup_quota(dir.path(), 2, 10.0);
-        let config_dir = setup_config_dir(dir.path(), "config-1", 1);
-
-        // Seed a handle dir to signal handle-dir mode.
-        std::fs::create_dir_all(dir.path().join("term-9999")).unwrap();
-
-        // Snapshot config-1/.credentials.json BEFORE tick. It was
-        // written by setup_account via canonical_path — but only the
-        // credentials/1.json canonical, not the live config-1 copy.
-        // For this test we write a marker file ("account 1 lives
-        // here") and verify it's untouched.
-        let live_cred = config_dir.join(".credentials.json");
+        // Write a sentinel into config-1/.credentials.json that we can
+        // verify is untouched after the tick.
+        let live_cred = config_dir_1.join(".credentials.json");
         std::fs::write(&live_cred, b"account-1-creds-sentinel").unwrap();
 
         let cfg = RotationConfig {
@@ -705,25 +753,185 @@ mod tests {
         };
         save_rotation_config(dir.path(), &cfg).unwrap();
 
+        // Act
         let mut cooldowns = HashMap::new();
-        tick(dir.path(), &mut cooldowns);
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
 
-        // Asserts: config-1/.credentials.json is UNCHANGED. Account-1
-        // marker is UNCHANGED. No cooldown entry (tick short-circuited
-        // before reaching cooldown tracking).
+        // Assert 1: config-1/.credentials.json is UNCHANGED (INV-01)
         let contents = std::fs::read(&live_cred).unwrap();
         assert_eq!(
             contents, b"account-1-creds-sentinel",
-            "config-N/.credentials.json MUST NOT be rewritten under handle-dir mode"
+            "config-N/.credentials.json MUST NOT be rewritten by the rotator (INV-01)"
+        );
+
+        // Assert 2: handle dir's .csq-account symlink now resolves to account 2
+        assert_eq!(
+            markers::read_csq_account(&handle_dir),
+            Some(AccountNum::try_from(2u16).unwrap()),
+            "handle dir should be repointed to account 2"
+        );
+    }
+
+    #[test]
+    fn auto_rotate_preserves_config_n_when_repointing() {
+        // Arrange: config-1 and config-2 have distinct credential bytes.
+        // Handle dir on account 1, account 1 over threshold.
+        // After tick, BOTH config dirs' credential files must be byte-identical
+        // to their pre-tick content.
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
+        setup_quota(dir.path(), 1, 97.0);
+        setup_quota(dir.path(), 2, 10.0);
+        let config_dir_1 = setup_config_dir(dir.path(), 1);
+        let config_dir_2 = setup_config_dir(dir.path(), 2);
+        let _handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10009, 1);
+
+        let cred_path_1 = config_dir_1.join(".credentials.json");
+        let cred_path_2 = config_dir_2.join(".credentials.json");
+        std::fs::write(&cred_path_1, b"creds-account-1-distinct").unwrap();
+        std::fs::write(&cred_path_2, b"creds-account-2-distinct").unwrap();
+
+        let pre_creds_1 = std::fs::read(&cred_path_1).unwrap();
+        let pre_creds_2 = std::fs::read(&cred_path_2).unwrap();
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        // Act
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        // Assert: both config dirs' credential files are byte-identical pre/post
+        let post_creds_1 = std::fs::read(&cred_path_1).unwrap();
+        let post_creds_2 = std::fs::read(&cred_path_2).unwrap();
+        assert_eq!(
+            pre_creds_1, post_creds_1,
+            "config-1/.credentials.json MUST NOT be modified by the rotator"
         );
         assert_eq!(
-            markers::read_csq_account(&config_dir),
+            pre_creds_2, post_creds_2,
+            "config-2/.credentials.json MUST NOT be modified by the rotator"
+        );
+    }
+
+    #[test]
+    fn same_surface_stub_always_true_pre_c1() {
+        // Regression guard: same_surface_as_active must return true for any
+        // account number until Codex PR-C1 flips it to a real Surface enum
+        // check. If this test fails, it means PR-C1 landed without this test
+        // being updated — verify the Surface filter is correct before removing.
+        let acc = AccountNum::try_from(5u16).unwrap();
+        assert!(
+            same_surface_as_active(acc),
+            "same_surface_as_active should return true for all accounts pre-PR-C1"
+        );
+        let acc1 = AccountNum::try_from(1u16).unwrap();
+        assert!(same_surface_as_active(acc1));
+        let acc7 = AccountNum::try_from(7u16).unwrap();
+        assert!(same_surface_as_active(acc7));
+    }
+
+    #[test]
+    fn tick_noop_when_claude_home_none() {
+        // Arrange: handle dir on account 1, account 1 over threshold,
+        // but claude_home is None.
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
+        setup_quota(dir.path(), 1, 97.0);
+        setup_quota(dir.path(), 2, 10.0);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10010, 1);
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        // Act: pass None for claude_home
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), None, &mut cooldowns);
+
+        // Assert: handle dir is unchanged (tick is a no-op when claude_home is None)
+        assert_eq!(
+            markers::read_csq_account(&handle_dir),
             Some(AccountNum::try_from(1u16).unwrap()),
-            "config-N marker must remain account 1 — handle-dir guard failed"
+            "tick with claude_home=None must be a no-op"
         );
         assert!(
             cooldowns.is_empty(),
-            "cooldowns must be empty — guard should short-circuit before tracking"
+            "no cooldown entries should be set when tick is a no-op"
+        );
+    }
+
+    #[test]
+    fn tick_cooldown_keyed_on_handle_dir_not_account() {
+        // Two handle dirs both pointing at account 1. Account 1 over threshold.
+        // Both should get their own independent cooldown map entries keyed on
+        // their own path — not on the account number.
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
+        setup_quota(dir.path(), 1, 97.0);
+        setup_quota(dir.path(), 2, 10.0);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let handle_dir_a = setup_handle_dir(dir.path(), claude_home.path(), 10011, 1);
+        let handle_dir_b = setup_handle_dir(dir.path(), claude_home.path(), 10012, 1);
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            cooldown_secs: 300,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        // Act
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        // Assert: both handle dirs were repointed (both had account 1 over threshold)
+        assert_eq!(
+            markers::read_csq_account(&handle_dir_a),
+            Some(AccountNum::try_from(2u16).unwrap()),
+            "handle_dir_a should be repointed to account 2"
+        );
+        assert_eq!(
+            markers::read_csq_account(&handle_dir_b),
+            Some(AccountNum::try_from(2u16).unwrap()),
+            "handle_dir_b should be repointed to account 2"
+        );
+
+        // Assert: cooldown map has TWO entries, each keyed on a distinct handle dir path
+        assert_eq!(
+            cooldowns.len(),
+            2,
+            "cooldown map must have one entry per handle dir, not per account"
+        );
+        assert!(
+            cooldowns.contains_key(&handle_dir_a),
+            "cooldown keyed on handle_dir_a path"
+        );
+        assert!(
+            cooldowns.contains_key(&handle_dir_b),
+            "cooldown keyed on handle_dir_b path"
+        );
+        // Verify the two keys are different paths (not the same account key)
+        assert_ne!(
+            handle_dir_a, handle_dir_b,
+            "two distinct handle dirs must have distinct cooldown keys"
         );
     }
 }

@@ -203,7 +203,46 @@ This mode is **deprecated**. The code to create legacy-mode terminals (`run.rs:3
 
 The first upgrade should not find any `term-*` dirs because they did not exist pre-spec. If found (future upgrade from a prior handle-dir version), the daemon sweep handles them as orphans.
 
-## 2.7 Cross-references and retractions
+## 2.7 Handle-dir-native auto-rotator
+
+Introduced in PR-A1 (v2.0.1). Fixes the v2.0.0 guard that refused to run when any `term-*/` handle dir existed (journal 0064, Option B). Option A — the structural fix — is now implemented.
+
+### What the rotator does
+
+1. Loads `rotation.json` on each tick (live reload; changes take effect within one tick interval).
+2. If `enabled: false`, returns immediately.
+3. Walks `accounts/term-*/` handle dirs (NOT `config-*/` dirs).
+4. For each `term-<pid>/`:
+   - Reads `.csq-account` via the handle dir's symlink. The symlink resolves through `term-<pid>/.csq-account → config-<current>/.csq-account`, returning the current account number.
+   - Checks per-handle-dir cooldown (keyed on the `term-<pid>/` path, not the account number). One cooldown per terminal, independent across sessions.
+   - Loads quota for the current account. If `five_hour_pct >= threshold_percent`, looks for a lower-usage target account.
+   - Calls `handle_dir::repoint_handle_dir(base_dir, claude_home, &handle_dir, target)`. This atomically repoints the handle dir's symlinks (`.credentials.json`, `.csq-account`, `.claude.json`, `.quota-cursor`) to point at `config-<target>/` and re-materializes `settings.json`.
+5. Logs rotated/skipped counts.
+
+### Invariant preservation
+
+- **INV-01 preserved**: `config-<N>/.credentials.json` is NEVER written by the rotator. The rotator only rewrites symlinks inside `term-<pid>/`. The permanent account credentials stay exactly where they are.
+- **INV-04**: Repoint is atomic via rename-over (new symlink at a `.swap-tmp` path, then `std::fs::rename` over the existing symlink). CC sees either the pre-swap or post-swap file; never a half-written state.
+
+### Cooldown semantics
+
+The cooldown map is keyed on the `term-<pid>/` handle dir path. Two terminals bound to the same account each have their own independent cooldown entry. This allows them to rotate at different times and diverge to different accounts after cooldown expiry.
+
+### Surface filter stub (PR-C1 placeholder)
+
+`same_surface_as_active(_: AccountNum) -> bool` is a `const fn` that returns `true` for all accounts. It gates candidate selection in `find_target`. Codex PR-C1 (v2.1) replaces this stub with a real `Surface` enum check per spec 07 INV-P11. The stub is named (not inlined) so PR-C1's flip is a one-line change.
+
+### claude_home requirement
+
+`repoint_handle_dir` calls `materialize_handle_settings(handle_dir, claude_home, new_config)` to deep-merge `~/.claude/settings.json` (user global) with `config-<target>/settings.json` (slot overlay). If `claude_home` is unresolvable (missing `$HOME` in a sandboxed environment), `spawn` logs a single WARN at startup and every `tick` call returns immediately (no-op). Fail-safe is "don't rotate" rather than "rotate with an empty settings base that would overwrite user customization".
+
+### Discovery notes
+
+- **Journal 0064**: Discovery that v2.0.0 rotator wrote target credentials into `config-N/`, corrupting identity for every terminal symlinked to that config dir.
+- **Journal 0069**: Audit confirming journal 0018's "auto-rotation picks the handle dir" claim never landed in production code; PR-A1 is the first implementation of handle-dir-native rotation.
+- **Journal 0067 H3**: Red-team finding that required the Surface stub to be named and documented as a PR-C1 placeholder.
+
+## 2.8 Cross-references and retractions
 
 This spec supersedes and partially retracts:
 
@@ -213,7 +252,7 @@ This spec supersedes and partially retracts:
 - **Journal 0018** (tray swap targets the single most-recent config dir): The tray swap mechanism must be reconceived. In the handle-dir model, the tray menu lists accounts, not config dirs, and a click targets the most-recently-active terminal (identified by PID or by a running-session-list query) rather than a mtime heuristic on credentials files. This is scoped to a follow-up; the retraction of the current behavior must be journaled.
 - **Gap-resolutions.md:635** ("Auto-rotation is per-terminal, each terminal may end up on different accounts"): RESTORED as architecturally possible. The new model makes this a first-class feature, not a gap.
 
-## 2.8 What this spec does NOT cover
+## 2.9 What this spec does NOT cover
 
 - The CLI surface of `csq swap` and `csq run` (flags, exit codes, output format). See spec 03.
 - Daemon internals (refresh cadence, lock file management, subsystem lifecycle). See spec 04.
@@ -224,3 +263,4 @@ This spec supersedes and partially retracts:
 
 - 2026-04-12 — 1.0.0 — Initial draft replacing the `config-N = slot` model with permanent `config-N` + ephemeral `term-<pid>` handle dirs. Retracts journal 0029 Finding 4 via journal 0031.
 - 2026-04-21 — 1.0.1 — §2.8 cross-reference added for spec 07 (Provider Surface Dispatch). INV-02 remains unchanged for the `Surface::ClaudeCode` case; per-surface carve-outs for Codex and Gemini are spec 07's responsibility and reference this spec as the base model. No invariant changes in this file. Journaled in workspaces/codex/journal/0001.
+- 2026-04-22 — 1.1.0 — §2.7 added: handle-dir-native auto-rotator (PR-A1). Documents rotator semantics, INV-01 preservation, cooldown-per-handle-dir, Surface stub (PR-C1 placeholder), and claude_home requirement. Old §2.7 (cross-references) renumbered to §2.8; old §2.8 (what this spec does not cover) to §2.9. References journals 0064, 0067, 0069.

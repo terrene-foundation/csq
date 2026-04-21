@@ -18,7 +18,7 @@ let doubled = $derived(count * 2);
 
 // Effects — use $effect()
 $effect(() => {
-  console.log('count changed:', count);
+  console.log("count changed:", count);
 });
 
 // Props — use $props()
@@ -39,21 +39,24 @@ let { name, age = 18 } = $props<{ name: string; age?: number }>();
 ## Tauri IPC in Svelte
 
 ```typescript
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from "@tauri-apps/api/core";
 
 // Invoke a Rust command
-const accounts = await invoke<string[]>('list_accounts');
-await invoke('swap_to_account', { index: 2 });
+const accounts = await invoke<string[]>("list_accounts");
+await invoke("swap_to_account", { index: 2 });
 ```
 
 ## Svelte Stores (non-rune interop)
 
 ```typescript
 // stores/accountStore.ts
-import { writable } from 'svelte/store';
+import { writable } from "svelte/store";
 
 export const activeAccount = writable<string | null>(null);
-export const quotaInfo = writable<{ used: number; limit: number }>({ used: 0, limit: 100 });
+export const quotaInfo = writable<{ used: number; limit: number }>({
+  used: 0,
+  limit: 100,
+});
 ```
 
 ## Event Handling
@@ -137,18 +140,44 @@ Available: `fade`, `blur`, `fly`, `slide`, `scale`, `draw` (for SVG paths), `cro
 
 ## Common Patterns
 
-| Pattern           | Approach                                          |
-| ----------------- | ------------------------------------------------ |
-| Async data load   | `$state<Promise<T> \| null>(null)` + `{#await}` |
-| Form handling     | Bound `$state` + Tauri `invoke` on submit        |
-| Error display     | `$state<Error \| null>(null)` + conditional      |
-| Loading spinner   | `$state(false)` + `{#if loading}`                |
+| Pattern         | Approach                                        |
+| --------------- | ----------------------------------------------- |
+| Async data load | `$state<Promise<T> \| null>(null)` + `{#await}` |
+| Form handling   | Bound `$state` + Tauri `invoke` on submit       |
+| Error display   | `$state<Error \| null>(null)` + conditional     |
+| Loading spinner | `$state(false)` + `{#if loading}`               |
 
 ## CRITICAL Gotchas
 
-| Rule                                          | Why                                                    |
-| --------------------------------------------- | ------------------------------------------------------ |
-| Use `$state` for mutable reactive values      | Plain `let` is NOT reactive in Svelte 5              |
-| Always type props with `$props<T>()`          | Untyped props lose type safety                        |
-| Use `invoke` from `@tauri-apps/api/core`      | Not from `window.__TAURI__` directly                  |
-| Handle Promise state with `{#await}` block    | Clean loading/error/content phases                     |
+| Rule                                       | Why                                                                         |
+| ------------------------------------------ | --------------------------------------------------------------------------- |
+| Use `$state` for mutable reactive values   | Plain `let` is NOT reactive in Svelte 5                                     |
+| Always type props with `$props<T>()`       | Untyped props lose type safety                                              |
+| Use `invoke` from `@tauri-apps/api/core`   | Not from `window.__TAURI__` directly                                        |
+| Handle Promise state with `{#await}` block | Clean loading/error/content phases                                          |
+| Untrack `$state` writes inside `$effect`   | Tracked writes invalidate the effect → cleanup fires → async work cancelled |
+| Test mount shape must match production     | Mount with `isOpen=true` hides first-open-edge bugs                         |
+
+## $effect Cancellation Race (journal 0061)
+
+Writing a `$state` value inside an `$effect` that also reads it triggers a re-run. The re-run fires the previous effect's cleanup — BEFORE the body finishes. Any closure-captured `cancelled` flag flips to `true`, and the in-flight async Promise resolves into a no-op. Symptom: the Tauri `invoke` fires correctly, the mock returns the right value, but `modalState` never transitions and the spinner hangs forever.
+
+```ts
+import { untrack } from "svelte";
+
+let wasOpen = $state(false);
+$effect(() => {
+  if (isOpen && !untrack(() => wasOpen)) {
+    untrack(() => {
+      wasOpen = true;
+    });
+    let cancelled = false;
+    loadInstalled(() => cancelled);
+    return () => {
+      cancelled = true;
+    }; // fires on re-run OR unmount
+  }
+});
+```
+
+Rule: wrap both the read AND the write of any `$state` used as a bookkeeping flag inside `$effect` with `untrack(...)`. See `.claude/rules/svelte-patterns.md` §5.

@@ -61,6 +61,43 @@ After writing a credential file, call `platform::fs::secure_file()` to set `0o60
 
 **Why:** Default permissions on macOS/Linux are world-readable.
 
+### 5a. Partial-Failure Cleanup on Sensitive-File Writes
+
+Every code path that writes a tmp file with secret content (OAuth tokens, 3P API keys, credential payloads) and then chains `secure_file(&tmp)` / `atomic_replace(&tmp, …)` MUST `let _ = std::fs::remove_file(&tmp);` before propagating ANY error from the subsequent call. `std::fs::write` creates `tmp` at umask-default permissions (typically `0o644`) with the secret inside; an early `?` return leaves that artifact on disk until the next GC.
+
+```rust
+// DO — clean up on every failure branch
+let tmp = unique_tmp_path(&path);
+if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    let _ = std::fs::remove_file(&tmp);
+    return Err(ConfigError::InvalidJson { path: tmp, reason: format!("write: {e}") });
+}
+if let Err(e) = secure_file(&tmp) {
+    let _ = std::fs::remove_file(&tmp);
+    return Err(ConfigError::InvalidJson { path: tmp, reason: format!("secure_file: {e}") });
+}
+if let Err(e) = atomic_replace(&tmp, &path) {
+    let _ = std::fs::remove_file(&tmp);
+    return Err(ConfigError::InvalidJson { path, reason: format!("atomic replace: {e}") });
+}
+
+// DO NOT — `?` leaves the token readable on disk on any failure
+let tmp = unique_tmp_path(&path);
+std::fs::write(&tmp, json.as_bytes())?;
+secure_file(&tmp)?;           // failure here → tmp stays at 0o644 with the token
+atomic_replace(&tmp, &path)?;
+```
+
+**BLOCKED responses:**
+
+- "The tmp file naming is random, so it's fine" — `unique_tmp_path` uses PID + atomic counter; predictable
+- "Same-user threat model protects it" — the MEDIUM fix was the whole point; cleanup is in-scope
+- "`atomic_replace` consumes `tmp` on success" — correct, but only on success; failure leaves it
+
+**Why:** Red-team B2 in journal 0065 showed three sites (`providers::settings::save_settings`, `third_party::bind_provider_to_slot`, `third_party::unbind_provider_to_slot`) propagated `secure_file` errors via `?` and left a umask-default tmp file containing the token on disk. "Fail closed" without cleanup isn't fail closed.
+
+Origin: journal 0065 B2 (red-team convergence for v2.0.0).
+
 ### 6. Fail-Closed on Keychain/Lock Contention
 
 Keychain writes (now via `security-framework` native API on macOS) and file locks can hang under concurrent load. Every call MUST have a timeout path. Never block a statusline render on the keychain.

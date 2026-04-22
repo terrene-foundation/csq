@@ -423,14 +423,43 @@ mod tests {
         }
     }
 
+    /// Serializes the two tests that read / write the shared
+    /// `socket_path(base_dir)` on Linux. `socket_path` ignores
+    /// `base_dir` when `XDG_RUNTIME_DIR` is set (paths.rs:65-78),
+    /// which is the common case on Ubuntu CI runners — so
+    /// `detect_live_pid_but_missing_socket_is_stale` and
+    /// `detect_live_daemon_returns_healthy` contend on the same
+    /// `$XDG_RUNTIME_DIR/csq.sock` file regardless of their
+    /// per-test TempDir. Running them concurrently produces a flaky
+    /// Healthy / Stale outcome depending on scheduler order. Origin:
+    /// PR-C3c CI flake surfaced on PR #174; pre-existing latent race
+    /// but never manifested until new tests changed parallel timing.
+    #[cfg(unix)]
+    static SOCKET_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[tokio::test]
+    // Serializing the whole test is the point — the `.await`s
+    // below are not a lock-contention hazard because no other code
+    // path acquires this mutex.
+    #[allow(clippy::await_holding_lock)]
     async fn detect_live_pid_but_missing_socket_is_stale() {
+        let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         let pid_path = super::super::pid_file_path(dir.path());
         fs::create_dir_all(pid_path.parent().unwrap()).ok();
         // Write our own PID — we're alive.
         fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+
+        // Defensive unlink: XDG_RUNTIME_DIR on Linux means
+        // `socket_path(dir.path())` may return a path shared with
+        // the detect_live_daemon_returns_healthy test. The mutex
+        // prevents those two from running concurrently, but a stale
+        // socket from a prior test run (or an orphaned real csq
+        // daemon on the runner) would still fail the assertion. The
+        // mutex plus this delete make the test hermetic.
+        let sock_path = super::super::socket_path(dir.path());
+        let _ = fs::remove_file(&sock_path);
 
         match detect_daemon(dir.path()) {
             DetectResult::Stale { reason } => {
@@ -445,9 +474,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // See sibling test comment.
     async fn detect_live_daemon_returns_healthy() {
         use crate::daemon::server;
 
+        let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         let pid_path = super::super::pid_file_path(dir.path());
         let sock_path = super::super::socket_path(dir.path());

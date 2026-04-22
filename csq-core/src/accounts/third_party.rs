@@ -164,7 +164,20 @@ pub fn bind_provider_to_slot(
     //    `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` from this file,
     //    so the env block is the source of truth for slot identity
     //    and must be written here.
+    //
+    //    VP-H1 (HIGH): concurrent `csq setkey` or desktop setkey
+    //    calls on the same slot race on this RMW. Without a lock,
+    //    the last atomic_replace wins and the other's overlay is
+    //    silently dropped. We hold the flock for the full RMW span
+    //    so only one writer can read-modify-write at a time.
     let settings_path = config_dir.join("settings.json");
+    let settings_lock_path = settings_path.with_extension("lock");
+    let _settings_lock = crate::platform::lock::lock_file(&settings_lock_path).map_err(|e| {
+        ConfigError::InvalidJson {
+            path: settings_lock_path.clone(),
+            reason: format!("lock: {e}"),
+        }
+    })?;
     let mut settings_value: Value = match std::fs::read_to_string(&settings_path) {
         Ok(content) if !content.trim().is_empty() => {
             serde_json::from_str(&content).unwrap_or_else(|_| {
@@ -308,6 +321,22 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
     let settings_path = base_dir
         .join(format!("config-{}", slot))
         .join("settings.json");
+
+    // VP-H1 (HIGH): concurrent bind and unbind on the same slot race on this
+    // RMW. Hold the flock (same lock path as bind_provider_to_slot) for the
+    // full read-check-write span so the two operations serialize correctly.
+    let settings_lock_path = settings_path.with_extension("lock");
+    // Ensure the parent directory exists before trying to create the lock
+    // file — unbind may be called on a slot that never had settings.json.
+    if let Some(parent) = settings_lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _settings_lock = crate::platform::lock::lock_file(&settings_lock_path).map_err(|e| {
+        ConfigError::InvalidJson {
+            path: settings_lock_path.clone(),
+            reason: format!("lock: {e}"),
+        }
+    })?;
 
     let content = match std::fs::read_to_string(&settings_path) {
         Ok(s) => s,
@@ -902,5 +931,130 @@ mod tests {
             std::fs::read_to_string(&settings_path).unwrap(),
             "not valid json {{{"
         );
+    }
+    // ── VP-H1 concurrency guards ───────────────────────────────────────────
+
+    /// VP-H1 (HIGH): two threads both calling `bind_provider_to_slot` on
+    /// the same slot with different providers must serialize their RMWs.
+    /// The final settings.json must contain exactly ONE provider's env
+    /// block — no merge corruption or lost update is acceptable.
+    ///
+    /// We cannot assert WHICH provider wins (scheduling-dependent),
+    /// but we can assert the JSON is well-formed and contains exactly one
+    /// consistent ANTHROPIC_BASE_URL (not a partial overlay from both).
+    #[test]
+    fn bind_provider_serializes_concurrent_binds() {
+        {
+            let dir = TempDir::new().unwrap();
+            let slot = AccountNum::try_from(8u16).unwrap();
+            let base = dir.path().to_path_buf();
+
+            let base_mm = base.clone();
+            let t1 = std::thread::spawn(move || {
+                {
+                    bind_provider_to_slot(
+                        &base_mm,
+                        "mm",
+                        slot,
+                        Some("sk-test-minimax-thread1"),
+                        None,
+                    )
+                }
+            });
+            let base_zai = base.clone();
+            let t2 = std::thread::spawn(move || {
+                {
+                    bind_provider_to_slot(&base_zai, "zai", slot, Some("sk-test-zai-thread2"), None)
+                }
+            });
+
+            t1.join().unwrap().expect("bind mm must succeed");
+            t2.join().unwrap().expect("bind zai must succeed");
+
+            // The resulting file must be valid JSON — no partial write or
+            // interleaving that corrupts the structure.
+            let settings_path = base.join("config-8/settings.json");
+            let content = std::fs::read_to_string(&settings_path).unwrap();
+            let json: Value = serde_json::from_str(&content)
+                .expect("settings.json must be valid JSON after concurrent binds");
+
+            // The env block must have a consistent ANTHROPIC_BASE_URL
+            // (either MiniMax's or Z.AI's — not a mixed or missing value).
+            let base_url = json
+                .get("env")
+                .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+                .and_then(|v| v.as_str())
+                .expect("ANTHROPIC_BASE_URL must be present");
+            let valid_urls = [
+                "https://api.minimax.io/anthropic",
+                "https://api.z.ai/api/anthropic",
+            ];
+            assert!(
+                valid_urls.contains(&base_url),
+                "ANTHROPIC_BASE_URL must be one complete provider URL, got: {{base_url}}"
+            );
+
+            // The auth token must be one of the two exact keys — no interleaving.
+            let auth_token = json
+                .get("env")
+                .and_then(|e| e.get("ANTHROPIC_AUTH_TOKEN"))
+                .and_then(|v| v.as_str())
+                .expect("ANTHROPIC_AUTH_TOKEN must be present");
+            assert!(
+                auth_token == "sk-test-minimax-thread1" || auth_token == "sk-test-zai-thread2",
+                "ANTHROPIC_AUTH_TOKEN must be one of the two written keys, got: {{auth_token}}"
+            );
+        }
+    }
+
+    /// VP-H1 (HIGH): one thread binds while another unbinds concurrently
+    /// on the same slot. The final state must be deterministic — either
+    /// fully bound or fully unbound (not interleaved or corrupted).
+    #[test]
+    fn bind_and_unbind_serialize_same_lock() {
+        {
+            let dir = TempDir::new().unwrap();
+            let slot = AccountNum::try_from(9u16).unwrap();
+            let base = dir.path().to_path_buf();
+
+            // Pre-seed the slot so unbind has something to remove.
+            bind_provider_to_slot(&base, "mm", slot, Some("sk-test-mm-seed-key12"), None).unwrap();
+
+            let base_bind = base.clone();
+            let t_bind = std::thread::spawn(move || {
+                {
+                    bind_provider_to_slot(
+                        &base_bind,
+                        "zai",
+                        slot,
+                        Some("sk-test-zai-rebind-key"),
+                        None,
+                    )
+                }
+            });
+            let base_unbind = base.clone();
+            let t_unbind =
+                std::thread::spawn(move || unbind_provider_from_slot(&base_unbind, slot));
+
+            t_bind.join().unwrap().expect("bind must succeed");
+            t_unbind.join().unwrap().expect("unbind must succeed");
+
+            let settings_path = base.join("config-9/settings.json");
+
+            // Outcome A: unbind won — file is gone or has no 3P keys.
+            // Outcome B: bind won — file has a valid 3P env block from zai.
+            // Both are acceptable. What is NOT acceptable: malformed JSON.
+            if settings_path.exists() {
+                {
+                    let content = std::fs::read_to_string(&settings_path).unwrap();
+                    let json: Value = serde_json::from_str(&content)
+                        .expect("settings.json must be valid JSON after concurrent bind+unbind");
+                    assert!(
+                        json.is_object(),
+                        "settings.json root must be a JSON object, got: {{json}}"
+                    );
+                }
+            }
+        }
     }
 }

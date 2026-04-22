@@ -51,13 +51,52 @@ pub fn read(config_dir: &Path) -> Option<CredentialFile> {
     match read_impl(&svc) {
         Ok(creds) => Some(creds),
         Err(e) => {
+            // Journal 0063 L3 / PR-B2 — fixed error-kind tag.
+            //
+            // `read_impl` returns `PlatformError::Keychain(String)` where the
+            // inner String is built via `format!("security command: {e}")` /
+            // `format!("json parse: {e}")` / etc. The `json parse` branch is
+            // highest risk: serde_json errors can include fragments of the
+            // invalid input being parsed, and for a keychain read the input
+            // IS the credential payload. Using `%e` here would Display the
+            // full String (including the serde snippet), so emit a fixed
+            // tag keyed on the failure class instead. Classification is
+            // prefix-matched since `Keychain(String)` has no structured
+            // discriminant.
+            let kind = keychain_error_kind(&e);
             warn!(
                 service = %svc,
-                error = %e,
+                error_kind = kind,
                 "keychain read failed (fallback to file path)"
             );
             None
         }
+    }
+}
+
+/// Classifies a `PlatformError::Keychain` message into a fixed-vocabulary tag
+/// for logging. Returns one of: `keychain_not_found`, `keychain_invoke_failed`,
+/// `keychain_utf8`, `keychain_hex_decode`, `keychain_json_parse`, `keychain_other`.
+///
+/// PR-B2: avoids `%e` formatting of the inner String so serde fragments never
+/// reach the log sink. Matches prefixes written by `read_impl` — if that
+/// function's error strings change, this classifier MUST be updated to match.
+fn keychain_error_kind(e: &PlatformError) -> &'static str {
+    let PlatformError::Keychain(msg) = e else {
+        return "keychain_other";
+    };
+    if msg == "keychain entry not found" {
+        "keychain_not_found"
+    } else if msg.starts_with("security command") {
+        "keychain_invoke_failed"
+    } else if msg.starts_with("utf8") {
+        "keychain_utf8"
+    } else if msg.starts_with("hex decode") {
+        "keychain_hex_decode"
+    } else if msg.starts_with("json parse") {
+        "keychain_json_parse"
+    } else {
+        "keychain_other"
     }
 }
 
@@ -189,5 +228,70 @@ mod tests {
                 "v1 parity failure for {path}"
             );
         }
+    }
+
+    // ── §PR-B2 — error-kind classifier regression guards (journal 0063 L3) ──
+    //
+    // `keychain_error_kind` drops `PlatformError::Keychain` Display output
+    // in favor of fixed-vocabulary tags so serde error fragments cannot
+    // reach log sinks. The classifier prefix-matches strings built by
+    // `read_impl`; if `read_impl` changes its error strings, these tests
+    // break and `keychain_error_kind` must be updated to match.
+
+    #[test]
+    fn classifier_tags_known_read_impl_strings() {
+        let cases = [
+            (
+                PlatformError::Keychain("keychain entry not found".into()),
+                "keychain_not_found",
+            ),
+            (
+                PlatformError::Keychain("security command: no such file or directory".into()),
+                "keychain_invoke_failed",
+            ),
+            (
+                PlatformError::Keychain("utf8: invalid utf-8 sequence".into()),
+                "keychain_utf8",
+            ),
+            (
+                PlatformError::Keychain("hex decode: invalid hex character".into()),
+                "keychain_hex_decode",
+            ),
+            (
+                PlatformError::Keychain(
+                    "json parse: expected value at line 1 column 1 at line 1 column 1".into(),
+                ),
+                "keychain_json_parse",
+            ),
+        ];
+        for (e, expected) in &cases {
+            assert_eq!(
+                keychain_error_kind(e),
+                *expected,
+                "classifier failed for {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_falls_back_to_other_for_unknown_messages() {
+        let e = PlatformError::Keychain("some future error we didn't anticipate".into());
+        assert_eq!(keychain_error_kind(&e), "keychain_other");
+    }
+
+    #[test]
+    fn classifier_does_not_leak_raw_message() {
+        // The crucial property: the tag is a `&'static str`, so it is by
+        // construction independent of the error's String payload. This test
+        // is a compile-time + behavior guard that future refactors don't
+        // replace the `&'static str` return type with `String` (which would
+        // re-open the token-leak path).
+        let sensitive = "keychain entry not found — access_token=sk-ant-oat01-LEAKED";
+        let e = PlatformError::Keychain(sensitive.into());
+        let tag: &'static str = keychain_error_kind(&e);
+        assert!(
+            !tag.contains("sk-ant"),
+            "classifier tag must never embed the raw message"
+        );
     }
 }

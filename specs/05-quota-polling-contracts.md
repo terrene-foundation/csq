@@ -326,10 +326,93 @@ Note the `cap` field inside `rate_limit` (populated from `RESOURCE_EXHAUSTED` bo
 
 **Write invariants (inherits §5.5):**
 
-- Daemon is sole writer. csq-cli emits events, daemon writes.
-- **When daemon is down**, csq-cli does NOT attempt to write quota.json directly. Events are dropped; UI reads stale data with honest freshness indicator.
+- Daemon is sole writer to `quota.json`. csq-cli emits events, daemon writes.
+- **When daemon is down, events are NOT dropped.** csq-cli writes every event to the CLI-durable NDJSON log (§5.8.1 below) before returning; the log outlives the daemon-down window and is drained on daemon startup. This replaces the 1.2.0 "events are dropped" behaviour per C-CR2 (journal 0067).
 - Effective-model debounce: latch `is_downgrade = true` only after 3 mismatches in 5 minutes (ADR-G06).
 - Counter reset: scheduled daemon task runs at midnight America/Los_Angeles (pinned TZ for DST-correctness per ADR-G05).
+
+### 5.8.1 CLI-durable NDJSON event log (FROZEN — PR-G0)
+
+Pinned by PR-G0 so PR-G2a (emitter in `csq-core/src/providers/gemini/capture.rs`) and PR-G3 (drain in `csq-core/src/daemon/usage_poller/gemini.rs`) implement against a stable contract. Sits under the event-delivery contract in spec 07 §7.2.3.1 — §7.2.3.1 governs IPC; this subsection governs durability.
+
+**File layout (one file per slot, per surface):**
+
+```
+~/.claude/accounts/gemini-events-<slot>.ndjson    (mode 0600)
+```
+
+Slot-scoped so per-slot drain locks never contend across slots, and so a slot rename / account deletion can remove a single file without affecting siblings. Path resolution follows the same discipline as `csq.sock` (spec 04 §4.2.5 layer 3); platform helper `platform::paths::gemini_event_log(slot)` is the sole source of truth — emitters and drainers MUST NOT construct the path inline.
+
+**Encoding — one event per line, JSON-encoded:**
+
+```json
+{"v":1,"id":"01HG…26-char-uuidv7","ts":"2026-04-22T14:12:00Z","slot":5,"surface":"gemini","kind":"counter_increment","payload":{}}
+{"v":1,"id":"01HG…26-char-uuidv7","ts":"2026-04-22T14:12:03Z","slot":5,"surface":"gemini","kind":"rate_limited","payload":{"retry_delay_s":3600,"quota_metric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","cap":250}}
+{"v":1,"id":"01HG…26-char-uuidv7","ts":"2026-04-22T14:12:05Z","slot":5,"surface":"gemini","kind":"effective_model_observed","payload":{"selected":"gemini-3-pro-preview","effective":"gemini-2.5-pro"}}
+{"v":1,"id":"01HG…26-char-uuidv7","ts":"2026-04-22T14:12:06Z","slot":5,"surface":"gemini","kind":"tos_guard_tripped","payload":{"trigger":"oauth2.googleapis.com"}}
+```
+
+| Field     | Type   | Required | Notes                                                                                                  |
+| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------ |
+| `v`       | u8     | yes      | Event schema version. v1 = this shape. Drainer rejects unknown values (circuit-breaker, §5.8 breaker). |
+| `id`      | string | yes      | UUIDv7 (26-char base32). Deduplication key — daemon applies each `id` at most once.                    |
+| `ts`      | string | yes      | RFC 3339 in UTC with `Z` suffix. Not used for ordering (file order wins); used for TTL + audit.        |
+| `slot`    | u16    | yes      | Must equal the slot encoded in the filename; mismatch → drainer rejects and moves to `.corrupt`.       |
+| `surface` | string | yes      | `"gemini"` in v1. Reserved for future surfaces that adopt the NDJSON durability pattern.               |
+| `kind`    | string | yes      | One of `counter_increment`, `rate_limited`, `effective_model_observed`, `tos_guard_tripped`.           |
+| `payload` | object | yes      | Kind-specific shape. MUST NOT contain secrets. Redactor (§redact_tokens) runs over serialised line.    |
+
+**Write discipline (emitter side):**
+
+1. Serialise the event to a single line (`serde_json::to_string` + `\n`). No pretty-printing — one line per event, end-of-line delimiter is `\n`.
+2. `OpenOptions::new().create(true).append(true).mode(0o600).open(path)` — `O_APPEND` guarantees concurrent emitters see atomic writes (POSIX append atomicity for writes ≤ `PIPE_BUF` = 4 KiB; all four event kinds are well under that bound).
+3. `write_all(line.as_bytes())` — single syscall, no partial writes on POSIX `O_APPEND`.
+4. `sync_data(&file)` — forces the kernel to flush the append to the underlying block device. Yes this adds latency; yes it is required for the "survives daemon crash mid-event" durability guarantee.
+5. Close the file. Emitters open-append-close per event — no long-lived handle.
+
+If any step fails, the emitter logs `error_kind = "gemini_event_ndjson_write_failed"` with fixed-vocabulary fields and returns `Ok(())` to the spawn path (matching §7.2.3.1 drop-on-unavailable philosophy: event loss is preferable to spawn failure). NDJSON write failure is the durability-floor failure; there is no further fallback.
+
+**Drain discipline (daemon side):**
+
+On daemon startup and on every reconnect (post-restart, post-unix-socket-rebind):
+
+1. For each slot N with an extant account, resolve `~/.claude/accounts/gemini-events-<N>.ndjson`.
+2. Acquire per-slot advisory file lock (`fcntl(F_SETLK, F_WRLCK)`). If contended, skip and retry on next tick — never block.
+3. Open `O_RDWR`. Read to EOF, parse each line as `Event { v, id, ts, slot, surface, kind, payload }`.
+4. For each event with `v == 1` and `id` NOT in the in-memory applied-event set, apply to `quota.json` (via the standard atomic-replace path) and insert `id` into the applied-event set. Applied-event set is bounded (LRU 16 k entries) because UUIDv7 ordering makes dedup a sliding window, not a growing set.
+5. On successful apply of ALL lines in the file, `ftruncate` to 0 and `fsync`. On ANY parse error, move the file to `gemini-events-<slot>.corrupt.<ts>` (for operator inspection) and start a fresh log.
+6. Release lock.
+
+Drain runs under the daemon's per-slot mutex (same mutex that guards `quota.json` writes for that slot) — single-writer-to-quota.json invariant preserved across IPC path AND NDJSON drain path because both terminate at the same mutex.
+
+**Durability guarantees:**
+
+- **Daemon-down event loss:** zero events lost for events successfully `sync_data`-ed to the log. Emitter-crash-before-sync may lose the in-flight event (acceptable; the emitter is a short-lived spawn with a single event in flight).
+- **Daemon-crash mid-drain event loss:** zero events lost. Drain is not atomic, but the `id` dedup set means partial drain followed by full re-drain at restart reapplies exactly once.
+- **Log file corruption (power loss mid-append):** bounded — POSIX `O_APPEND` + `sync_data` limits corruption to at most the final line. The `.corrupt` quarantine + fresh start rule handles the corner case; operator inspects; next slot interaction writes fresh events.
+
+**Retention + size bound:**
+
+- Each event is ~180 bytes. A saturated slot emitting one event per second produces ~15 MiB/day uncompressed; drain cadence is sub-minute under a healthy daemon so steady-state file size is bytes, not megabytes.
+- Hard cap: emitter refuses to write if the log exceeds 10 MiB (logged as `error_kind = "gemini_event_ndjson_log_full"`; operator action needed — drain stalled). Circuit-breaker threshold chosen so a pathological runaway never fills the disk.
+
+**Security invariants:**
+
+- Mode 0600 enforced at open (umask + explicit). Owner = current user. File lives under `~/.claude/accounts/` which is already 0700.
+- Payload MUST NOT contain tokens, API keys, or OAuth fragments. Redactor (`error::redact_tokens`) runs over every serialised line before write — defence in depth for accidental inclusion.
+- Gitignore MUST cover `gemini-events-*.ndjson` (no repository leak).
+- File path MUST be validated against slot-N bound (§account-terminal-separation rule 3) — prevents writes outside `accounts/`.
+
+**Test fixtures (PR-G0 docs-only; implementation tests in PR-G2a/PR-G3):**
+
+- `ndjson_event_survives_daemon_restart` (write with daemon down, start daemon, drain, quota.json reflects event)
+- `ndjson_log_truncated_after_successful_drain`
+- `concurrent_emitters_produce_well_formed_lines` (O_APPEND atomicity regression)
+- `drainer_rejects_v0_or_vN>1_events`
+- `drainer_quarantines_corrupt_line_and_continues`
+- `dedup_via_uuidv7_id_prevents_double_apply`
+- `log_fsync_before_emitter_returns` (durability regression)
+- `emitter_hits_10mib_cap_cleanly` (circuit-breaker regression)
 
 **UI invariants:**
 
@@ -364,3 +447,4 @@ Note the `cap` field inside `rate_limit` (populated from `RESOURCE_EXHAUSTED` bo
 - 2026-04-13 — 1.1.0 — Sections 5.3 and 5.4 corrected per journal 0032: MiniMax GroupId is optional, Z.AI API key works (JWT not required), MiniMax usage_count = remaining not consumed. Both fixes shipped in PRs #79 and #80.
 - 2026-04-22 — 1.2.0 — Added §5.7 (Codex `/backend-api/wham/usage`, PROPOSED — schema pending live capture) and §5.8 (Gemini counter + 429 parse, event-driven). Former §5.7 "Cross-references" renumbered to §5.9. Both new sections ship as PROPOSED status until live response capture verifies schema; escalation to VERIFIED follows the spec-05 pattern set by MiniMax (§5.3) and Z.AI (§5.4) via journal 0032 — never commit to a verbatim response shape without observation. Journaled in workspaces/codex/journal/0004 and workspaces/gemini/journal/0002.
 - 2026-04-22 — 1.2.1 — PR-VP-final red-team R1 reconciliation. §5.8 counter-state example reconciled with spec 07 §7.4.1: added `cap` field inside `rate_limit` struct so the 429 `quotaValue` has a home; added cross-reference note that field definitions are owned by spec 07 §7.4.1 to prevent future drift. No behaviour change; shape-compatible with the updated spec 07 1.1.1 frozen schema. Journal 0067 R1.
+- 2026-04-22 — 1.3.0 — PR-G0: §5.8.1 "CLI-durable NDJSON event log" added. Pins file layout (`gemini-events-<slot>.ndjson`, 0600), event envelope (`v`, `id` UUIDv7, `ts`, `slot`, `surface`, `kind`, `payload`), write discipline (`O_APPEND` + `sync_data`), drain discipline (per-slot fcntl lock + UUIDv7 dedup + atomic truncate-after-drain), durability guarantees (zero-loss for sync'd events across daemon-down + daemon-crash), retention cap (10 MiB emitter-side circuit breaker), and security invariants (0600 + redactor + gitignore). Write-invariants bullet in §5.8 updated: "events are dropped" → "events are durable via NDJSON" per C-CR2. Consumed by PR-G2a emitter and PR-G3 drain. Journal 0067 C-CR2.

@@ -223,6 +223,20 @@ pub fn refresh_access_token(refresh_token: &str) -> Result<CodexTokens, CodexHtt
     refresh_with_http(refresh_token, super::post_json_node)
 }
 
+/// Like [`refresh_access_token`] but also returns the response `Date`
+/// header for clock-skew detection (PR-C4 INV-P01).
+///
+/// The returned `Option<String>` is whatever the Node transport
+/// surfaced as the server's `Date` header (RFC 7231 §7.1.1.2 IMF-fixdate
+/// format, e.g. `"Tue, 22 Apr 2026 14:32:01 GMT"`). Callers parse it
+/// via [`parse_http_date_secs`] and emit a `clock_skew_detected` warn
+/// when local time differs from server by > [`CLOCK_SKEW_WARN_SECS`].
+pub fn refresh_access_token_with_date(
+    refresh_token: &str,
+) -> Result<(CodexTokens, Option<String>), CodexHttpError> {
+    refresh_with_http_meta(refresh_token, super::post_json_node_with_date)
+}
+
 /// Fetches a wham/usage snapshot via the bearer access token.
 ///
 /// Parses into [`WhamSnapshot`] with PII dropped (user_id, account_id,
@@ -256,6 +270,176 @@ where
     // Success/error discrimination by shape, not status (post_json_node
     // doesn't surface status). Try success first; fall back to error.
     parse_refresh_response(200, &bytes)
+}
+
+/// Like [`refresh_with_http`] but the injected transport also returns
+/// the server `Date` header. PR-C4 broker_codex_check uses this to
+/// emit `clock_skew_detected` when local time differs from server by
+/// > [`CLOCK_SKEW_WARN_SECS`].
+pub(crate) fn refresh_with_http_meta<F>(
+    refresh_token: &str,
+    http_post: F,
+) -> Result<(CodexTokens, Option<String>), CodexHttpError>
+where
+    F: FnOnce(&str, &str) -> Result<(Vec<u8>, Option<String>), String>,
+{
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    })
+    .to_string();
+
+    let (bytes, date) = http_post(OAUTH_TOKEN_URL, &body).map_err(|_| CodexHttpError::Transport)?;
+
+    parse_refresh_response(200, &bytes).map(|tokens| (tokens, date))
+}
+
+/// Threshold beyond which the daemon emits a `clock_skew_detected`
+/// warning (spec 07 §7.5 INV-P01). Local time differing from the
+/// server `Date` header by more than this value indicates the host
+/// clock has drifted enough to risk the daemon's pre-expiry refresh
+/// missing the codex on-expiry threshold.
+pub const CLOCK_SKEW_WARN_SECS: u64 = 5 * 60;
+
+/// Parses an RFC 7231 §7.1.1.2 IMF-fixdate `Date` header into seconds
+/// since the Unix epoch.
+///
+/// Returns `None` if the input does not match the IMF-fixdate format.
+/// The two RFC-allowed obsolete formats (RFC 850 / asctime) are not
+/// accepted — modern HTTP servers (including OpenAI's Cloudflare-
+/// fronted endpoints) emit IMF-fixdate; conservative parsing avoids
+/// false positives that would mis-fire the clock-skew warning.
+///
+/// Implementation is hand-rolled to avoid pulling in a date crate
+/// (csq currently depends on no time-parsing dependency). Only month
+/// and day-of-month parsing is done from scratch; leap-year and
+/// month-length tables are inline.
+pub fn parse_http_date_secs(date: &str) -> Option<u64> {
+    // IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`
+    let s = date.trim();
+    if !s.ends_with(" GMT") {
+        return None;
+    }
+    let parts: Vec<&str> = s.split_ascii_whitespace().collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    // parts: ["Sun,", "06", "Nov", "1994", "08:49:37", "GMT"]
+    let day: u32 = parts[1].parse().ok()?;
+    let month = match parts[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u32 = parts[3].parse().ok()?;
+    let time: Vec<&str> = parts[4].split(':').collect();
+    if time.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time[0].parse().ok()?;
+    let minute: u32 = time[1].parse().ok()?;
+    let second: u32 = time[2].parse().ok()?;
+
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    // Days from epoch (1970-01-01) to the given date.
+    let days_to_year: u64 = (1970..year)
+        .map(|y| if is_leap(y) { 366 } else { 365 })
+        .sum();
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut days_to_month: u64 = month_days[..(month as usize - 1)].iter().sum();
+    if month > 2 && is_leap(year) {
+        days_to_month += 1;
+    }
+    let total_days = days_to_year + days_to_month + (day as u64 - 1);
+    Some(total_days * 86_400 + (hour as u64) * 3_600 + (minute as u64) * 60 + (second as u64))
+}
+
+fn is_leap(y: u32) -> bool {
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+/// Decodes the `exp` claim from a JWT access token, returning epoch
+/// seconds. Returns `None` for any malformed input — callers treat
+/// "undecodeable" as "needs refresh now" (safer to refresh than to
+/// trust an opaque token).
+///
+/// JWT format: `<base64url-header>.<base64url-payload>.<signature>`.
+/// Only the payload is decoded; signature validation is the upstream's
+/// job (csq is the client, not the verifier).
+///
+/// Hand-rolled base64url-no-padding decoder so csq does not pull in a
+/// new dependency. The header and signature segments are not touched.
+pub fn jwt_exp_secs(jwt: &str) -> Option<u64> {
+    let mut parts = jwt.split('.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _sig = parts.next()?;
+    if parts.next().is_some() {
+        return None; // more than 3 segments
+    }
+    let payload_bytes = b64url_decode(payload_b64)?;
+    let value: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let exp = value.get("exp")?;
+    exp.as_u64()
+        .or_else(|| exp.as_i64().and_then(|n| u64::try_from(n).ok()))
+}
+
+/// Minimal base64url (RFC 4648 §5) decoder, no-padding tolerant.
+/// Returns `None` on any non-charset byte.
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => 26 + (c - b'a') as u32,
+            b'0'..=b'9' => 52 + (c - b'0') as u32,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        })
+    }
+
+    // Strip optional padding.
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|&b| b != b'=' && b != b'\n' && b != b'\r')
+        .collect();
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4 + 3);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for c in bytes {
+        let v = val(c)?;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 pub(crate) fn fetch_wham_with_http<F>(
@@ -569,6 +753,113 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── refresh_with_http_meta ───────────────────────────────────
+
+    #[test]
+    fn refresh_with_http_meta_returns_date_alongside_tokens() {
+        let mock_post = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
+            Ok((
+                br#"{"access_token":"fresh"}"#.to_vec(),
+                Some("Tue, 22 Apr 2026 14:32:01 GMT".to_string()),
+            ))
+        };
+        let (tokens, date) = refresh_with_http_meta("rt_x", mock_post).expect("ok");
+        assert_eq!(tokens.access_token, "fresh");
+        assert_eq!(date.as_deref(), Some("Tue, 22 Apr 2026 14:32:01 GMT"));
+    }
+
+    #[test]
+    fn refresh_with_http_meta_propagates_transport_error() {
+        let mock_post = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
+            Err("connect refused".into())
+        };
+        let e = refresh_with_http_meta("rt_x", mock_post).unwrap_err();
+        assert_eq!(e, CodexHttpError::Transport);
+    }
+
+    #[test]
+    fn refresh_with_http_meta_returns_typed_token_expired_with_date() {
+        let mock_post = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
+            Ok((
+                br#"{"error":{"code":"token_expired"}}"#.to_vec(),
+                Some("Tue, 22 Apr 2026 14:32:01 GMT".to_string()),
+            ))
+        };
+        let e = refresh_with_http_meta("rt_x", mock_post).unwrap_err();
+        assert_eq!(e, CodexHttpError::TokenExpired);
+    }
+
+    // ── parse_http_date_secs ─────────────────────────────────────
+
+    #[test]
+    fn parse_http_date_imf_fixdate_round_trips_known_epoch() {
+        // Cross-checked against `date -u -d "2024-01-01 00:00:00" +%s` → 1704067200.
+        let secs = parse_http_date_secs("Mon, 01 Jan 2024 00:00:00 GMT").unwrap();
+        assert_eq!(secs, 1_704_067_200);
+    }
+
+    #[test]
+    fn parse_http_date_unix_epoch_is_zero() {
+        let secs = parse_http_date_secs("Thu, 01 Jan 1970 00:00:00 GMT").unwrap();
+        assert_eq!(secs, 0);
+    }
+
+    #[test]
+    fn parse_http_date_handles_leap_year() {
+        // 2024-02-29 12:00:00 UTC — must not reject the leap day.
+        let secs = parse_http_date_secs("Thu, 29 Feb 2024 12:00:00 GMT").unwrap();
+        assert!(secs > 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_http_date_rejects_non_imf_format() {
+        // RFC 850 obsolete format — not accepted.
+        assert!(parse_http_date_secs("Sunday, 06-Nov-94 08:49:37 GMT").is_none());
+        // asctime — not accepted.
+        assert!(parse_http_date_secs("Sun Nov  6 08:49:37 1994").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_rejects_garbage() {
+        assert!(parse_http_date_secs("not a date").is_none());
+        assert!(parse_http_date_secs("").is_none());
+        assert!(parse_http_date_secs("Mon, 32 Apr 2026 14:32:01 GMT").is_none());
+        assert!(parse_http_date_secs("Mon, 22 Foo 2026 14:32:01 GMT").is_none());
+        assert!(parse_http_date_secs("Mon, 22 Apr 2026 25:32:01 GMT").is_none());
+    }
+
+    // ── jwt_exp_secs ────────────────────────────────────────────
+
+    #[test]
+    fn jwt_exp_secs_decodes_payload_exp_claim() {
+        // header={"alg":"none"}, payload={"exp":1700000000}, sig=anything.
+        // base64url no-padding: "eyJhbGciOiJub25lIn0", "eyJleHAiOjE3MDAwMDAwMDB9", "sig".
+        let jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjE3MDAwMDAwMDB9.sig";
+        assert_eq!(jwt_exp_secs(jwt), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn jwt_exp_secs_returns_none_for_malformed_jwt() {
+        assert_eq!(jwt_exp_secs("not.a.jwt-payload"), None);
+        assert_eq!(jwt_exp_secs("only-one-segment"), None);
+        assert_eq!(jwt_exp_secs("two.segments"), None);
+        // Four segments
+        assert_eq!(jwt_exp_secs("a.b.c.d"), None);
+    }
+
+    #[test]
+    fn jwt_exp_secs_returns_none_when_payload_missing_exp() {
+        // payload={"sub":"foo"} — no exp claim.
+        let jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJmb28ifQ.sig";
+        assert_eq!(jwt_exp_secs(jwt), None);
+    }
+
+    #[test]
+    fn jwt_exp_secs_returns_none_for_non_b64url_payload() {
+        let jwt = "header.+++not_b64url+++.sig";
+        assert_eq!(jwt_exp_secs(jwt), None);
     }
 
     // ── CodexHttpError::Display (no body fragments leak) ─────────

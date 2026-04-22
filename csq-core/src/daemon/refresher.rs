@@ -65,8 +65,10 @@
 use super::cache::TtlCache;
 use crate::accounts::discovery;
 use crate::accounts::AccountSource;
-use crate::broker::check::{broker_check, BrokerResult};
+use crate::broker::check::{broker_check, broker_codex_check, BrokerResult};
 use crate::credentials::{self, file as cred_file};
+use crate::http::codex as http_codex;
+use crate::providers::catalog::Surface;
 use crate::types::AccountNum;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -151,6 +153,12 @@ fn now_secs() -> u64 {
 /// or a test mock.
 pub type HttpPostFn = Arc<dyn Fn(&str, &str) -> Result<Vec<u8>, String> + Send + Sync + 'static>;
 
+/// Date-aware sibling of [`HttpPostFn`] used by the Codex refresh
+/// path. Returns `(body, Option<Date header>)` — the Date header
+/// drives spec 07 §7.5 INV-P01 clock-skew detection.
+pub type HttpPostFnCodex =
+    Arc<dyn Fn(&str, &str) -> Result<(Vec<u8>, Option<String>), String> + Send + Sync + 'static>;
+
 /// Handle to a running refresher task. Drop does NOT cancel —
 /// callers must explicitly cancel the `CancellationToken` passed
 /// into [`spawn`] and await the `JoinHandle`.
@@ -181,12 +189,14 @@ pub fn spawn(
     base_dir: PathBuf,
     cache: Arc<TtlCache<u16, RefreshStatus>>,
     http_post: HttpPostFn,
+    http_post_codex: HttpPostFnCodex,
     shutdown: CancellationToken,
 ) -> RefresherHandle {
     spawn_with_config(
         base_dir,
         cache,
         http_post,
+        http_post_codex,
         shutdown,
         REFRESH_INTERVAL,
         STARTUP_DELAY,
@@ -200,6 +210,7 @@ pub fn spawn_with_config(
     base_dir: PathBuf,
     cache: Arc<TtlCache<u16, RefreshStatus>>,
     http_post: HttpPostFn,
+    http_post_codex: HttpPostFnCodex,
     shutdown: CancellationToken,
     interval: Duration,
     startup_delay: Duration,
@@ -212,6 +223,7 @@ pub fn spawn_with_config(
         run_loop(
             base_dir,
             http_post,
+            http_post_codex,
             cache_for_task,
             cooldowns,
             backoffs,
@@ -229,6 +241,7 @@ pub fn spawn_with_config(
 async fn run_loop(
     base_dir: PathBuf,
     http_post: HttpPostFn,
+    http_post_codex: HttpPostFnCodex,
     cache: Arc<TtlCache<u16, RefreshStatus>>,
     cooldowns: Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs: Arc<Mutex<HashMap<u16, u32>>>,
@@ -251,7 +264,15 @@ async fn run_loop(
 
     loop {
         // Run one tick.
-        tick(&base_dir, &http_post, &cache, &cooldowns, &backoffs).await;
+        tick(
+            &base_dir,
+            &http_post,
+            &http_post_codex,
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         // Wait for the next interval or cancellation.
         tokio::select! {
@@ -269,9 +290,11 @@ async fn run_loop(
 ///
 /// Exposed `pub(crate)` so tests can drive a single tick without
 /// spawning the whole loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn tick(
     base_dir: &std::path::Path,
     http_post: &HttpPostFn,
+    http_post_codex: &HttpPostFnCodex,
     cache: &Arc<TtlCache<u16, RefreshStatus>>,
     cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
@@ -315,21 +338,139 @@ pub(crate) async fn tick(
     // condition and extends the rate-limit window.
     let mut rate_limited_this_tick = false;
 
-    let mut skipped_codex = 0usize;
+    let mut codex_processed = 0usize;
     for info in accounts {
-        // Codex slots are chained into the discovery list so telemetry
-        // sees them (per journal 0015 — PR-C3c), but `broker_check`
-        // below is Anthropic-only and would panic on the Codex
-        // `CredentialFile` variant. Skip Codex slots with a fixed-
-        // vocabulary breadcrumb so PR-C4's `broker_codex_check` can
-        // drop in with one `match` arm.
+        // Surface dispatch (PR-C4): Codex slots route to
+        // `broker_codex_check` instead of `broker_check`. Both share
+        // the per-account cooldown / backoff bookkeeping below.
         if info.source == AccountSource::Codex {
-            skipped_codex += 1;
-            debug!(
-                account = info.id,
-                source = "codex",
-                "codex slot iterated; refresh deferred until PR-C4 broker_codex_check"
-            );
+            if !info.has_credentials {
+                continue;
+            }
+            let account = match AccountNum::try_from(info.id) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            if in_cooldown(cooldowns, backoffs, info.id) {
+                skipped_cooldown += 1;
+                debug!(
+                    account = info.id,
+                    surface = "codex",
+                    "in cooldown, skipping"
+                );
+                continue;
+            }
+
+            // Codex's canonical lives at `credentials/codex-<N>.json`
+            // and the access-token JWT carries its own exp claim.
+            // Reading it here gives us an `expires_at_ms` field for
+            // the cache record even when the token is fresh enough
+            // that no HTTP fires.
+            let canonical = cred_file::canonical_path_for(base_dir, account, Surface::Codex);
+            let codex_creds = match credentials::load(&canonical) {
+                Ok(c) => c,
+                Err(e) => {
+                    // CredentialError::Corrupt's `reason` carries
+                    // serde_json's error Display, which can echo input
+                    // bytes — and the input here IS credential JSON.
+                    // Redact before formatting per security.md MUST Rule 8
+                    // / journal 0010.
+                    let redacted = crate::error::redact_tokens(&e.to_string());
+                    warn!(
+                        account = info.id,
+                        surface = "codex",
+                        canonical = %canonical.display(),
+                        error_kind = "codex_canonical_load_failed",
+                        canonical_err = %redacted,
+                        "codex canonical credential file unreadable, skipping"
+                    );
+                    continue;
+                }
+            };
+            let exp_secs = codex_creds
+                .codex()
+                .and_then(|c| http_codex::jwt_exp_secs(&c.tokens.access_token))
+                .unwrap_or(0);
+            let expires_at_ms = exp_secs.saturating_mul(1000);
+
+            let base = base_dir.to_path_buf();
+            let http = Arc::clone(http_post_codex);
+            let result = tokio::task::spawn_blocking(move || {
+                let http_closure = move |url: &str, body: &str| http(url, body);
+                broker_codex_check(&base, account, http_closure)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(broker_result)) => {
+                    let status = RefreshStatus::from_result(account, expires_at_ms, &broker_result);
+                    match &broker_result {
+                        BrokerResult::Failed(_) => {
+                            warn!(
+                                account = info.id,
+                                surface = "codex",
+                                "codex refresh failed, entering cooldown"
+                            );
+                            set_cooldown(cooldowns, info.id);
+                        }
+                        BrokerResult::RateLimited => {
+                            let factor = get_backoff(backoffs, info.id);
+                            let effective = FAILURE_COOLDOWN * factor;
+                            warn!(
+                                account = info.id,
+                                surface = "codex",
+                                backoff_factor = factor,
+                                cooldown_secs = effective.as_secs(),
+                                "codex refresh rate limited, entering backoff cooldown"
+                            );
+                            increase_backoff(backoffs, info.id);
+                            set_cooldown(cooldowns, info.id);
+                            rate_limited_this_tick = true;
+                        }
+                        BrokerResult::Skipped => {}
+                        BrokerResult::Valid | BrokerResult::Refreshed | BrokerResult::Recovered => {
+                            clear_cooldown(cooldowns, info.id);
+                            clear_backoff(backoffs, info.id);
+                        }
+                    }
+                    cache.set(info.id, status);
+                    codex_processed += 1;
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        account = info.id,
+                        surface = "codex",
+                        error_kind = error_kind_tag(&e),
+                        "codex broker_check errored, entering cooldown"
+                    );
+                    set_cooldown(cooldowns, info.id);
+                    let status = RefreshStatus {
+                        account: info.id,
+                        last_result: "error".to_string(),
+                        expires_at_ms,
+                        checked_at_secs: now_secs(),
+                    };
+                    cache.set(info.id, status);
+                    codex_processed += 1;
+                }
+                Err(join_err) => {
+                    warn!(
+                        account = info.id,
+                        surface = "codex",
+                        error = %join_err,
+                        "codex refresh task panicked"
+                    );
+                    set_cooldown(cooldowns, info.id);
+                    let status = RefreshStatus {
+                        account: info.id,
+                        last_result: "panic".to_string(),
+                        expires_at_ms,
+                        checked_at_secs: now_secs(),
+                    };
+                    cache.set(info.id, status);
+                    codex_processed += 1;
+                }
+            }
             continue;
         }
 
@@ -540,7 +681,7 @@ pub(crate) async fn tick(
 
     info!(
         processed,
-        skipped_cooldown, skipped_codex, "refresher tick complete"
+        skipped_cooldown, codex_processed, "refresher tick complete"
     );
 }
 
@@ -739,6 +880,62 @@ mod tests {
         })
     }
 
+    /// No-op Codex HTTP transport for Anthropic-only tests. Counts
+    /// calls so a misrouted Anthropic refresh hitting the Codex
+    /// closure is detectable.
+    fn noop_codex_http(counter: Arc<AtomicU32>) -> HttpPostFnCodex {
+        Arc::new(move |_url: &str, _body: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok((b"{}".to_vec(), None))
+        })
+    }
+
+    /// Codex success transport: returns a refresh response whose new
+    /// access_token JWT exp is 6h ahead. Counts calls.
+    fn counting_codex_success(counter: Arc<AtomicU32>) -> HttpPostFnCodex {
+        Arc::new(move |_url: &str, _body: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let exp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 6 * 3600;
+            // header={"alg":"HS256"}, payload={"exp":<exp>}, sig=stub.
+            // base64url(payload) is computed via the same encoder used in
+            // broker::check tests; reused inline here to keep refresher's
+            // test helpers self-contained.
+            let payload = format!(r#"{{"exp":{exp}}}"#);
+            let payload_b64 = b64url_encode_inline(payload.as_bytes());
+            let access = format!("eyJhbGciOiJIUzI1NiJ9.{payload_b64}.testsig");
+            let body = format!(
+                r#"{{"access_token":"{access}","refresh_token":"rt_new","expires_in":3600}}"#
+            );
+            Ok((body.into_bytes(), None))
+        })
+    }
+
+    fn b64url_encode_inline(data: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::with_capacity(data.len() * 4 / 3 + 4);
+        let mut buf: u32 = 0;
+        let mut bits: u32 = 0;
+        for &b in data {
+            buf = (buf << 8) | (b as u32);
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                let idx = ((buf >> bits) & 0x3f) as usize;
+                out.push(ALPHABET[idx] as char);
+            }
+        }
+        if bits > 0 {
+            let idx = ((buf << (6 - bits)) & 0x3f) as usize;
+            out.push(ALPHABET[idx] as char);
+        }
+        out
+    }
+
     #[tokio::test]
     async fn tick_does_nothing_with_no_accounts() {
         let dir = TempDir::new().unwrap();
@@ -748,67 +945,152 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert!(cache.is_empty());
     }
 
-    /// PR-C3c regression: a tick that discovers a Codex slot MUST NOT
-    /// call `broker_check` on it (broker_check is Anthropic-only and
-    /// would panic on the Codex `CredentialFile` variant via
-    /// `expect_anthropic`). The iterate-and-skip design lets PR-C4
-    /// land `broker_codex_check` with one `match` arm in the same
-    /// loop.
+    /// PR-C4 regression: a tick that discovers a Codex slot routes
+    /// through the Codex transport (NOT the Anthropic transport).
+    /// The Codex slot's stub access_token has no decodeable JWT exp
+    /// claim → broker_codex_check treats it as "needs refresh now"
+    /// → the codex closure fires.
     #[tokio::test]
-    async fn tick_iterates_codex_slot_without_calling_broker_check() {
+    async fn tick_dispatches_codex_to_codex_transport() {
         let dir = TempDir::new().unwrap();
         install_codex_account(dir.path(), 4);
 
-        let counter = Arc::new(AtomicU32::new(0));
-        let http = counting_success(Arc::clone(&counter));
+        let anth_counter = Arc::new(AtomicU32::new(0));
+        let codex_counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&anth_counter));
+        let codex_http = counting_codex_success(Arc::clone(&codex_counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &codex_http,
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         assert_eq!(
-            counter.load(Ordering::SeqCst),
+            anth_counter.load(Ordering::SeqCst),
             0,
-            "broker_check must not be invoked for Codex slots until PR-C4"
+            "Anthropic transport MUST NOT fire for a Codex slot"
+        );
+        assert_eq!(
+            codex_counter.load(Ordering::SeqCst),
+            1,
+            "Codex transport must fire exactly once for a near-expiry Codex slot"
         );
         assert!(
-            cache.get(&4).is_none(),
-            "no cache entry should be written for a skipped Codex slot"
+            cache.get(&4).is_some(),
+            "Codex cache entry expected after PR-C4 refresh"
         );
     }
 
-    /// PR-C3c regression: a mixed tick (Anthropic + Codex) still
-    /// refreshes the Anthropic slot. The Codex-skip must not swallow
-    /// an Anthropic refresh that would have happened on its own.
+    /// PR-C4 regression: a mixed tick (Anthropic + Codex) routes each
+    /// slot to its own transport, with neither closure seeing the
+    /// other surface's URL or body.
     #[tokio::test]
-    async fn tick_refreshes_anthropic_alongside_skipped_codex() {
+    async fn tick_refreshes_anthropic_and_codex_via_separate_transports() {
         let dir = TempDir::new().unwrap();
-        install_account(dir.path(), 1, 0); // expired Anthropic slot → triggers refresh
-        install_codex_account(dir.path(), 4); // Codex slot → skipped
+        install_account(dir.path(), 1, 0); // expired Anthropic slot
+        install_codex_account(dir.path(), 4); // Codex slot (no exp claim → refresh)
 
-        let counter = Arc::new(AtomicU32::new(0));
-        let http = counting_success(Arc::clone(&counter));
+        let anth_counter = Arc::new(AtomicU32::new(0));
+        let codex_counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&anth_counter));
+        let codex_http = counting_codex_success(Arc::clone(&codex_counter));
         let cache = Arc::new(TtlCache::with_default_age());
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &codex_http,
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
-        assert!(
-            counter.load(Ordering::SeqCst) >= 1,
-            "Anthropic slot must still refresh even when a Codex slot is present"
+        assert_eq!(
+            anth_counter.load(Ordering::SeqCst),
+            1,
+            "Anthropic transport must fire exactly once for slot 1"
+        );
+        assert_eq!(
+            codex_counter.load(Ordering::SeqCst),
+            1,
+            "Codex transport must fire exactly once for slot 4"
         );
         assert!(cache.get(&1).is_some(), "Anthropic cache entry expected");
-        assert!(
-            cache.get(&4).is_none(),
-            "Codex cache entry must not be written this PR"
+        assert!(cache.get(&4).is_some(), "Codex cache entry expected");
+    }
+
+    /// PR-C4 regression: two refresher ticks back-to-back where the
+    /// Codex slot was successfully refreshed in the first tick must
+    /// NOT fire the Codex transport in the second — the new JWT exp
+    /// is far in the future, so broker_codex_check returns Valid.
+    /// This is the in-process analogue of journal 0015's "two-codex-
+    /// process never both refresh" guarantee — once one tick lands a
+    /// fresh JWT, subsequent ticks within the 2h window are no-ops.
+    #[tokio::test]
+    async fn tick_after_codex_refresh_does_not_re_fire_inside_window() {
+        let dir = TempDir::new().unwrap();
+        install_codex_account(dir.path(), 5);
+
+        let anth_counter = Arc::new(AtomicU32::new(0));
+        let codex_counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&anth_counter));
+        let codex_http = counting_codex_success(Arc::clone(&codex_counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        // First tick — refresh fires.
+        tick(
+            dir.path(),
+            &http,
+            &codex_http,
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+        assert_eq!(codex_counter.load(Ordering::SeqCst), 1);
+
+        // Second tick — token is fresh (6h ahead), broker_codex_check
+        // returns Valid without HTTP. The counter MUST NOT increment.
+        tick(
+            dir.path(),
+            &http,
+            &codex_http,
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+        assert_eq!(
+            codex_counter.load(Ordering::SeqCst),
+            1,
+            "second tick must not re-fire Codex refresh while inside 2h window"
         );
     }
 
@@ -828,7 +1110,15 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         // Canonical file must now exist — the resurrection write path
         // ran before broker_check.
@@ -876,7 +1166,15 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -900,7 +1198,15 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 0, "no HTTP for valid token");
         let status = cache.get(&1).unwrap();
@@ -918,7 +1224,15 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
         let first_calls = counter.load(Ordering::SeqCst);
         // broker_check tries refresh once, then recovery once — so 2 http calls.
         assert!(
@@ -933,7 +1247,15 @@ mod tests {
         assert_eq!(status.last_result, "failed");
 
         // Second tick immediately: cooldown should prevent any new HTTP.
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
         let second_calls = counter.load(Ordering::SeqCst);
         assert_eq!(
             second_calls, first_calls,
@@ -971,7 +1293,15 @@ mod tests {
         };
         cooldowns.lock().unwrap().insert(1, past);
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(
@@ -994,6 +1324,7 @@ mod tests {
             dir.path().to_path_buf(),
             cache,
             http,
+            noop_codex_http(Arc::new(AtomicU32::new(0))),
             shutdown.clone(),
             Duration::from_secs(1),
             Duration::from_millis(500), // long startup delay
@@ -1030,6 +1361,7 @@ mod tests {
             dir.path().to_path_buf(),
             cache,
             http,
+            noop_codex_http(Arc::new(AtomicU32::new(0))),
             shutdown.clone(),
             Duration::from_secs(60), // long interval so only the first tick runs
             Duration::from_millis(0), // no startup delay
@@ -1073,7 +1405,15 @@ mod tests {
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         // Only ONE account should have attempted refresh — the second
         // should be skipped because the first hit a rate limit.
@@ -1096,7 +1436,15 @@ mod tests {
         let backoffs = Arc::new(Mutex::new(HashMap::new()));
 
         // First tick: hits rate limit, backoff goes 1 → 2.
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
         assert_eq!(get_backoff(&backoffs, 1), 2);
         assert!(in_cooldown(&cooldowns, &backoffs, 1));
 
@@ -1146,7 +1494,15 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let http = counting_success(Arc::clone(&counter));
 
-        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
 
         assert_eq!(
             get_backoff(&backoffs, 1),

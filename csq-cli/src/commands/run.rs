@@ -11,7 +11,6 @@ use csq_core::types::AccountNum;
 use std::path::Path;
 use std::process::Command;
 
-#[cfg(unix)]
 use csq_core::daemon::{self, DetectResult};
 
 /// Exit code when `csq run` cannot spawn a Codex slot because the
@@ -341,44 +340,37 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
 /// refresh will fire and burn the refresh token. Exits with
 /// [`EXIT_CODE_DAEMON_REQUIRED`] on any non-Healthy state so scripts
 /// can distinguish "daemon-down" from other launch failures.
-fn require_daemon_healthy(_base_dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        match daemon::detect_daemon(_base_dir) {
-            DetectResult::Healthy { .. } => Ok(()),
-            DetectResult::NotRunning => {
-                eprintln!(
-                    "Codex spawn refused — csq daemon is not running.\n\
-                     The daemon must own token refresh for Codex (spec 07 §7.5 INV-P02);\n\
-                     start it with `csq daemon start` or install the desktop app."
-                );
-                std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
-            }
-            DetectResult::Stale { reason } => {
-                eprintln!(
-                    "Codex spawn refused — csq daemon is stale: {reason}.\n\
-                     Restart with `csq daemon stop && csq daemon start`."
-                );
-                std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
-            }
-            DetectResult::Unhealthy { reason } => {
-                eprintln!(
-                    "Codex spawn refused — csq daemon is unhealthy: {reason}.\n\
-                     Inspect logs with `csq daemon status` and restart if needed."
-                );
-                std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
-            }
+///
+/// PR-C4 (H2 gate): cross-platform — `daemon::detect_daemon` already
+/// has a Windows named-pipe branch (`csq-core/src/daemon/detect.rs`
+/// `windows_health_check`), so the same DetectResult variants apply
+/// across Unix and Windows. This closes the journal 0015
+/// `#[cfg(not(unix))] Ok(())` carve-out.
+fn require_daemon_healthy(base_dir: &Path) -> Result<()> {
+    match daemon::detect_daemon(base_dir) {
+        DetectResult::Healthy { .. } => Ok(()),
+        DetectResult::NotRunning => {
+            eprintln!(
+                "Codex spawn refused — csq daemon is not running.\n\
+                 The daemon must own token refresh for Codex (spec 07 §7.5 INV-P02);\n\
+                 start it with `csq daemon start` or install the desktop app."
+            );
+            std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        // Windows named-pipe daemon detection (M8-03) is the focus of
-        // PR-C4's H2 gate. Until the pipe client lands we cannot
-        // refuse on Windows — the spawn-time refusal would brick
-        // Codex login UX for every Windows user with a live daemon.
-        // Documented as a known gap in workspaces/codex/journal/0015.
-        Ok(())
+        DetectResult::Stale { reason } => {
+            eprintln!(
+                "Codex spawn refused — csq daemon is stale: {reason}.\n\
+                 Restart with `csq daemon stop && csq daemon start`."
+            );
+            std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
+        }
+        DetectResult::Unhealthy { reason } => {
+            eprintln!(
+                "Codex spawn refused — csq daemon is unhealthy: {reason}.\n\
+                 Inspect logs with `csq daemon status` and restart if needed."
+            );
+            std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
+        }
     }
 }
 

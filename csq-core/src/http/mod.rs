@@ -527,6 +527,106 @@ process.stdin.on('end', () => {{
     Ok(output.stdout)
 }
 
+/// POSTs a JSON body to `url` using a Node.js subprocess and also
+/// captures the response `Date` header.
+///
+/// Behaves identically to [`post_json_node`] (HTTPS-only, body-via-
+/// stdin, returns body bytes on any HTTP status) but additionally
+/// returns the `Date` response header as `Option<String>` for
+/// callers that need server clock-skew detection (PR-C4 INV-P01:
+/// daemon Codex refresher emits `clock_skew_detected` when local
+/// time differs from server `Date` by > 5 min).
+///
+/// Wire format on stdout:
+///
+/// - First line: server `Date` header value (empty line if absent).
+/// - Remaining bytes: response body, byte-for-byte identical to what
+///   [`post_json_node`] returns.
+///
+/// Splitting on the first `\n` keeps body bytes lossless even if the
+/// body itself contains newlines (JSON-pretty-printed responses).
+pub fn post_json_node_with_date(
+    url: &str,
+    body: &str,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    if !url.starts_with("https://") {
+        return Err("https required".into());
+    }
+
+    let runtime = find_js_runtime()?;
+
+    let script = format!(
+        r#"
+const https = require('https');
+const url = new URL('{url}');
+let body = '';
+process.stdin.on('data', c => body += c);
+process.stdin.on('end', () => {{
+  const req = https.request(url, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)}},
+    timeout: {NODE_TIMEOUT_MS}
+  }}, res => {{
+    const dateHeader = res.headers['date'] || '';
+    let data = [];
+    res.on('data', c => data.push(c));
+    res.on('end', () => {{
+      // First line: Date header value (empty if absent). Then body.
+      process.stdout.write(dateHeader + '\n');
+      process.stdout.write(Buffer.concat(data));
+    }});
+  }});
+  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
+  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+  req.write(body);
+  req.end();
+}});
+"#
+    );
+
+    let mut child = std::process::Command::new(&runtime)
+        .arg("-e")
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
+
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().ok_or("failed to open stdin")?;
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("stdin write failed: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("node http failed: {stderr}"));
+    }
+
+    let stdout = output.stdout;
+    let newline_pos = stdout
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or("missing date line in node output")?;
+    let date_str = std::str::from_utf8(&stdout[..newline_pos])
+        .map_err(|_| "invalid date line")?
+        .to_string();
+    let date = if date_str.is_empty() {
+        None
+    } else {
+        Some(date_str)
+    };
+    let body = stdout[newline_pos + 1..].to_vec();
+    Ok((body, date))
+}
+
 /// GETs a URL with a Bearer token using a Node.js subprocess.
 ///
 /// Returns `(status_code, body_bytes)`. The bearer token is passed

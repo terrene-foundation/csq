@@ -473,12 +473,12 @@ pub fn save_manual_account(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{self, CredentialFile, OAuthPayload};
+    use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
     use tempfile::TempDir;
 
     fn write_cred(dir: &Path, account: u16) {
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(format!("at-{account}")),
                 refresh_token: RefreshToken::new(format!("rt-{account}")),
@@ -489,7 +489,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        };
+        });
         let path = dir.join("credentials").join(format!("{account}.json"));
         credentials::save(&path, &creds).unwrap();
     }
@@ -551,7 +551,7 @@ mod tests {
         let config = base.join(format!("config-{account}"));
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join(".csq-account"), account.to_string()).unwrap();
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(format!("at-live-{account}")),
                 refresh_token: RefreshToken::new(format!("rt-live-{account}")),
@@ -562,7 +562,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        };
+        });
         credentials::save(&config.join(".credentials.json"), &creds).unwrap();
     }
 

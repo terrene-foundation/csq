@@ -85,8 +85,10 @@ where
         let account: AccountNum = stem.parse().ok()?;
 
         if let Ok(cred_file) = credentials::load(&path) {
-            if predicate(&cred_file.claude_ai_oauth) {
-                return Some(account);
+            if let Some(inner) = cred_file.anthropic() {
+                if predicate(&inner.claude_ai_oauth) {
+                    return Some(account);
+                }
             }
         }
     }
@@ -126,13 +128,13 @@ fn account_from_cc_auth(config_dir: &Path, base_dir: &Path) -> Option<AccountNum
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{self, CredentialFile, OAuthPayload};
+    use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
     use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn write_cred(dir: &Path, account: u16, access: &str, refresh: &str) {
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(access.into()),
                 refresh_token: RefreshToken::new(refresh.into()),
@@ -143,7 +145,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        };
+        });
         let path = dir.join("credentials").join(format!("{account}.json"));
         credentials::save(&path, &creds).unwrap();
     }

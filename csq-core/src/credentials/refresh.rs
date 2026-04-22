@@ -94,9 +94,12 @@ pub fn merge_refresh(existing: &CredentialFile, response: &RefreshResponse) -> C
         .as_millis() as u64;
 
     let mut merged = existing.clone();
-    merged.claude_ai_oauth.access_token = AccessToken::new(response.access_token.clone());
-    merged.claude_ai_oauth.refresh_token = RefreshToken::new(response.refresh_token.clone());
-    merged.claude_ai_oauth.expires_at = now_ms + (response.expires_in * 1000);
+    merged.expect_anthropic_mut().claude_ai_oauth.access_token =
+        AccessToken::new(response.access_token.clone());
+    merged.expect_anthropic_mut().claude_ai_oauth.refresh_token =
+        RefreshToken::new(response.refresh_token.clone());
+    merged.expect_anthropic_mut().claude_ai_oauth.expires_at =
+        now_ms + (response.expires_in * 1000);
     // scopes, subscription_type, rate_limit_tier, extra: preserved from existing
     merged
 }
@@ -153,7 +156,13 @@ pub fn refresh_token<F>(
 where
     F: FnOnce(&str, &str) -> Result<Vec<u8>, String>,
 {
-    let body = build_refresh_body(existing.claude_ai_oauth.refresh_token.expose_secret());
+    let body = build_refresh_body(
+        existing
+            .expect_anthropic()
+            .claude_ai_oauth
+            .refresh_token
+            .expose_secret(),
+    );
 
     // Single-shot. We do NOT retry inside this function even on 429.
     // Anthropic's `/v1/oauth/token` rate-limits per IP, and retrying
@@ -188,11 +197,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::OAuthPayload;
+    use crate::credentials::{AnthropicCredentialFile, OAuthPayload};
     use std::collections::HashMap;
 
     fn sample_creds() -> CredentialFile {
-        CredentialFile {
+        CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("sk-ant-oat01-old-access".into()),
                 refresh_token: RefreshToken::new("sk-ant-ort01-old-refresh".into()),
@@ -203,7 +212,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        }
+        })
     }
 
     #[test]
@@ -218,14 +227,22 @@ mod tests {
         let merged = merge_refresh(&sample_creds(), &response);
 
         assert_eq!(
-            merged.claude_ai_oauth.access_token.expose_secret(),
+            merged
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "sk-ant-oat01-new-access"
         );
         assert_eq!(
-            merged.claude_ai_oauth.refresh_token.expose_secret(),
+            merged
+                .expect_anthropic()
+                .claude_ai_oauth
+                .refresh_token
+                .expose_secret(),
             "sk-ant-ort01-new-refresh"
         );
-        assert!(merged.claude_ai_oauth.expires_at > 1000);
+        assert!(merged.expect_anthropic().claude_ai_oauth.expires_at > 1000);
     }
 
     #[test]
@@ -240,14 +257,22 @@ mod tests {
         let merged = merge_refresh(&sample_creds(), &response);
 
         assert_eq!(
-            merged.claude_ai_oauth.subscription_type.as_deref(),
+            merged
+                .expect_anthropic()
+                .claude_ai_oauth
+                .subscription_type
+                .as_deref(),
             Some("max")
         );
         assert_eq!(
-            merged.claude_ai_oauth.rate_limit_tier.as_deref(),
+            merged
+                .expect_anthropic()
+                .claude_ai_oauth
+                .rate_limit_tier
+                .as_deref(),
             Some("default_claude_max_20x")
         );
-        assert_eq!(merged.claude_ai_oauth.scopes.len(), 2);
+        assert_eq!(merged.expect_anthropic().claude_ai_oauth.scopes.len(), 2);
     }
 
     #[test]
@@ -303,12 +328,20 @@ mod tests {
 
         let refreshed = result.unwrap();
         assert_eq!(
-            refreshed.claude_ai_oauth.access_token.expose_secret(),
+            refreshed
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "sk-ant-oat01-refreshed"
         );
         // Metadata preserved
         assert_eq!(
-            refreshed.claude_ai_oauth.subscription_type.as_deref(),
+            refreshed
+                .expect_anthropic()
+                .claude_ai_oauth
+                .subscription_type
+                .as_deref(),
             Some("max")
         );
     }

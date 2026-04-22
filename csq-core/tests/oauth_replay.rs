@@ -26,7 +26,7 @@
 //! - It does NOT print, log, or panic-display any token field.
 
 use csq_core::credentials::refresh::{refresh_token, TOKEN_ENDPOINT};
-use csq_core::credentials::{CredentialFile, OAuthPayload};
+use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
 use csq_core::types::{AccessToken, RefreshToken};
 use std::collections::HashMap;
 
@@ -35,7 +35,7 @@ use std::collections::HashMap;
 /// The access token and expiry are placeholder values — the refresh
 /// endpoint only consumes the refresh token from the credential file.
 fn creds_from_refresh_token(rt: &str) -> CredentialFile {
-    CredentialFile {
+    CredentialFile::Anthropic(AnthropicCredentialFile {
         claude_ai_oauth: OAuthPayload {
             access_token: AccessToken::new("placeholder-not-used-by-refresh".into()),
             refresh_token: RefreshToken::new(rt.to_owned()),
@@ -52,7 +52,7 @@ fn creds_from_refresh_token(rt: &str) -> CredentialFile {
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
-    }
+    })
 }
 
 /// Asserts the response shape is valid without printing any token value.
@@ -65,6 +65,7 @@ fn assert_refresh_response_valid(result: Result<CredentialFile, csq_core::error:
             // Assert access token is present (non-empty) without logging it.
             assert!(
                 !refreshed
+                    .expect_anthropic()
                     .claude_ai_oauth
                     .access_token
                     .expose_secret()
@@ -75,6 +76,7 @@ fn assert_refresh_response_valid(result: Result<CredentialFile, csq_core::error:
             // Assert refresh token is present (non-empty) without logging it.
             assert!(
                 !refreshed
+                    .expect_anthropic()
                     .claude_ai_oauth
                     .refresh_token
                     .expose_secret()
@@ -88,9 +90,9 @@ fn assert_refresh_response_valid(result: Result<CredentialFile, csq_core::error:
                 .unwrap_or_default()
                 .as_millis() as u64;
             assert!(
-                refreshed.claude_ai_oauth.expires_at > now_ms,
+                refreshed.expect_anthropic().claude_ai_oauth.expires_at > now_ms,
                 "expires_at ({}) must be greater than now ({})",
-                refreshed.claude_ai_oauth.expires_at,
+                refreshed.expect_anthropic().claude_ai_oauth.expires_at,
                 now_ms,
             );
         }
@@ -163,7 +165,7 @@ fn refresh_body_shape_assertions_unit_rejects_empty_access_token() {
     let is_ok = result.is_ok();
     if is_ok {
         let panicked = std::panic::catch_unwind(|| {
-            assert_refresh_response_valid(Ok(CredentialFile {
+            assert_refresh_response_valid(Ok(CredentialFile::Anthropic(AnthropicCredentialFile {
                 claude_ai_oauth: OAuthPayload {
                     access_token: AccessToken::new("".into()),
                     refresh_token: RefreshToken::new("sk-ant-ort01-mock".into()),
@@ -178,7 +180,7 @@ fn refresh_body_shape_assertions_unit_rejects_empty_access_token() {
                     extra: HashMap::new(),
                 },
                 extra: HashMap::new(),
-            }));
+            })));
         });
         assert!(
             panicked.is_err(),
@@ -311,7 +313,11 @@ fn emit_new_refresh_token_for_rotation(refreshed: &CredentialFile) {
         _ => return, // not in CI or env var unset — no-op
     };
 
-    let new_rt = refreshed.claude_ai_oauth.refresh_token.expose_secret();
+    let new_rt = refreshed
+        .expect_anthropic()
+        .claude_ai_oauth
+        .refresh_token
+        .expose_secret();
     if new_rt.is_empty() {
         return;
     }

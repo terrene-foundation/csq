@@ -73,7 +73,11 @@ pub fn handle(
         })?;
 
         // Warn if token is already expired
-        if canonical.claude_ai_oauth.is_expired_within(0) {
+        if canonical
+            .expect_anthropic()
+            .claude_ai_oauth
+            .is_expired_within(0)
+        {
             eprintln!(
                 "warning: access token for account {} has expired — CC may fail until the daemon refreshes it",
                 account

@@ -80,7 +80,7 @@ pub fn cleanup_stale_pid(config_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{CredentialFile, OAuthPayload};
+    use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -160,7 +160,7 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
 
         let account = AccountNum::try_from(1u16).unwrap();
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("at-1".into()),
                 refresh_token: RefreshToken::new("rt-1".into()),
@@ -171,12 +171,18 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        };
+        });
         credentials::save(&file::canonical_path(dir.path(), account), &creds).unwrap();
 
         copy_credentials_for_session(dir.path(), &config, account).unwrap();
 
         let live = credentials::load(&config.join(".credentials.json")).unwrap();
-        assert_eq!(live.claude_ai_oauth.access_token.expose_secret(), "at-1");
+        assert_eq!(
+            live.expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
+            "at-1"
+        );
     }
 }

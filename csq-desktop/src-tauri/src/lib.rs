@@ -425,11 +425,16 @@ fn compute_tray_status(base: &Path) -> TrayStatus {
 
         let canonical = cred_file::canonical_path(base, num);
         if let Ok(creds) = credentials::load(&canonical) {
-            let exp_ms = creds.claude_ai_oauth.expires_at;
+            let exp_ms = creds.expect_anthropic().claude_ai_oauth.expires_at;
             let secs = exp_ms as i64 - now_ms as i64;
             // "Expiring" matches `commands::get_accounts` — anything
             // expired or within 2h (7200s) of expiry.
-            if secs <= 0 || creds.claude_ai_oauth.is_expired_within(7200) {
+            if secs <= 0
+                || creds
+                    .expect_anthropic()
+                    .claude_ai_oauth
+                    .is_expired_within(7200)
+            {
                 expiring += 1;
             }
         }

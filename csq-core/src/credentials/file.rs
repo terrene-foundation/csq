@@ -79,13 +79,12 @@ pub fn save(path: &Path, creds: &CredentialFile) -> Result<(), CredentialError> 
     Ok(())
 }
 
-/// Saves credentials to both canonical and live paths for the
-/// [`Surface::ClaudeCode`] surface.
+/// Saves credentials to both canonical and live paths. Surface is
+/// derived from the [`CredentialFile`] variant; the write target
+/// paths are automatically Anthropic or Codex.
 ///
-/// Thin wrapper over [`save_canonical_for`] that preserves the
-/// pre-PR-C2a 3-argument signature for the ~70 existing call sites
-/// that are Anthropic-only today. New Codex writers MUST call
-/// [`save_canonical_for`] directly with [`Surface::Codex`].
+/// Thin wrapper over [`save_canonical_for`] for pre-PR-C2a callers
+/// that do not inspect the return surface.
 ///
 /// If the canonical write succeeds but the live write fails, a warning
 /// is logged but the error is not propagated — the canonical file is
@@ -95,24 +94,26 @@ pub fn save_canonical(
     account: AccountNum,
     creds: &CredentialFile,
 ) -> Result<(), CredentialError> {
-    save_canonical_for(base_dir, account, creds, Surface::ClaudeCode)
+    save_canonical_for(base_dir, account, creds)
 }
 
 /// Surface-dispatched canonical write.
 ///
-/// Per spec 07 INV-P08 / INV-P09 (PR-C2a):
+/// Per spec 07 INV-P08 / INV-P09:
 ///
-/// 1. Acquires the per-`(Surface, AccountNum)` write mutex from the
+/// 1. Surface is derived from `creds.surface()` (PR-C2b) — no caller
+///    surface parameter, so data shape and path shape cannot drift.
+/// 2. Acquires the per-`(Surface, AccountNum)` write mutex from the
 ///    process-global [`AccountMutexTable`]. Serialises concurrent
 ///    writers within one process; cross-process serialisation is the
 ///    flock'd `refresh-lock` path in [`crate::broker::check`].
-/// 2. Writes the canonical file atomically (atomic_replace + 0o600
+/// 3. Writes the canonical file atomically (atomic_replace + 0o600
 ///    via [`secure_file`], identical to [`save`]).
-/// 3. For [`Surface::Codex`] only, flips the canonical file to 0o400
+/// 4. For [`Surface::Codex`] only, flips the canonical file to 0o400
 ///    after the write — the canonical Codex credential file lives at
 ///    0o400 outside narrow refresh windows per INV-P08. Anthropic
 ///    canonicals stay at 0o600 (unchanged behaviour).
-/// 4. Writes the live mirror into the account's `config-<N>/` dir.
+/// 5. Writes the live mirror into the account's `config-<N>/` dir.
 ///    Mirror failures are logged with a fixed-vocabulary tag and
 ///    swallowed; the canonical is authoritative.
 ///
@@ -125,8 +126,8 @@ pub fn save_canonical_for(
     base_dir: &Path,
     account: AccountNum,
     creds: &CredentialFile,
-    surface: Surface,
 ) -> Result<(), CredentialError> {
+    let surface = creds.surface();
     let slot_mutex = AccountMutexTable::global().get_or_insert(surface, account);
     let _guard = slot_mutex.lock().expect("per-account write mutex poisoned");
 
@@ -236,7 +237,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn sample_creds() -> CredentialFile {
-        CredentialFile {
+        CredentialFile::Anthropic(crate::credentials::AnthropicCredentialFile {
             claude_ai_oauth: crate::credentials::OAuthPayload {
                 access_token: AccessToken::new("sk-ant-oat01-test".into()),
                 refresh_token: RefreshToken::new("sk-ant-ort01-test".into()),
@@ -247,7 +248,23 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        }
+        })
+    }
+
+    fn sample_codex_creds() -> CredentialFile {
+        CredentialFile::Codex(crate::credentials::CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: crate::credentials::CodexTokensFile {
+                account_id: Some("test-account-uuid".into()),
+                access_token: "eyJhbGciOiJIUzI1NiJ9.test-at.sig".into(),
+                refresh_token: Some("rt_test".into()),
+                id_token: Some("eyJhbGciOiJIUzI1NiJ9.test-id.sig".into()),
+                extra: HashMap::new(),
+            },
+            last_refresh: Some("2026-04-22T00:00:00Z".into()),
+            extra: HashMap::new(),
+        })
     }
 
     #[test]
@@ -259,11 +276,12 @@ mod tests {
         save(&path, &original).unwrap();
 
         let loaded = load(&path).unwrap();
+        let a = loaded.anthropic().expect("sample is Anthropic");
         assert_eq!(
-            loaded.claude_ai_oauth.access_token.expose_secret(),
+            a.claude_ai_oauth.access_token.expose_secret(),
             "sk-ant-oat01-test"
         );
-        assert_eq!(loaded.claude_ai_oauth.expires_at, 1775726524877);
+        assert_eq!(a.claude_ai_oauth.expires_at, 1775726524877);
     }
 
     #[test]
@@ -431,7 +449,7 @@ mod tests {
         assert!(live_path(dir.path(), account).exists());
 
         // Overwrite via explicit surface form — same paths are hit.
-        save_canonical_for(dir.path(), account, &sample_creds(), Surface::ClaudeCode).unwrap();
+        save_canonical_for(dir.path(), account, &sample_creds()).unwrap();
         assert!(canonical_path_for(dir.path(), account, Surface::ClaudeCode).exists());
     }
 
@@ -440,7 +458,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let account = AccountNum::try_from(6u16).unwrap();
 
-        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+        save_canonical_for(dir.path(), account, &sample_codex_creds()).unwrap();
 
         let canonical = canonical_path_for(dir.path(), account, Surface::Codex);
         let live = live_path_for(dir.path(), account, Surface::Codex);
@@ -467,7 +485,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let account = AccountNum::try_from(2u16).unwrap();
 
-        save_canonical_for(dir.path(), account, &sample_creds(), Surface::ClaudeCode).unwrap();
+        save_canonical_for(dir.path(), account, &sample_creds()).unwrap();
 
         let canonical = canonical_path_for(dir.path(), account, Surface::ClaudeCode);
         let mode = std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777;
@@ -485,7 +503,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let account = AccountNum::try_from(8u16).unwrap();
 
-        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+        save_canonical_for(dir.path(), account, &sample_codex_creds()).unwrap();
 
         let canonical = canonical_path_for(dir.path(), account, Surface::Codex);
         let mode = std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777;
@@ -506,7 +524,7 @@ mod tests {
         let account = AccountNum::try_from(9u16).unwrap();
 
         // First write: file lands at 0o400.
-        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+        save_canonical_for(dir.path(), account, &sample_codex_creds()).unwrap();
         let canonical = canonical_path_for(dir.path(), account, Surface::Codex);
         assert_eq!(
             std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
@@ -516,7 +534,7 @@ mod tests {
         // Second write: atomic_replace must still succeed even though the
         // prior file is 0o400 (non-writable). This verifies the writer
         // does not rely on the prior mode being 0o600.
-        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+        save_canonical_for(dir.path(), account, &sample_codex_creds()).unwrap();
         assert_eq!(
             std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
             0o400,
@@ -539,9 +557,7 @@ mod tests {
         let handles: Vec<_> = (0..16)
             .map(|_| {
                 let base = Arc::clone(&base);
-                thread::spawn(move || {
-                    save_canonical_for(&base, account, &sample_creds(), Surface::ClaudeCode)
-                })
+                thread::spawn(move || save_canonical_for(&base, account, &sample_creds()))
             })
             .collect();
 
@@ -552,9 +568,50 @@ mod tests {
         let canonical = canonical_path(&base, account);
         // File must be parseable JSON — no torn writes.
         let loaded = load(&canonical).expect("post-write canonical must parse");
+        let a = loaded.anthropic().expect("sample is Anthropic");
         assert_eq!(
-            loaded.claude_ai_oauth.access_token.expose_secret(),
+            a.claude_ai_oauth.access_token.expose_secret(),
             "sk-ant-oat01-test"
+        );
+    }
+
+    // ── PR-C2b tests: enum-variant-driven dispatch ─────────────────────
+
+    #[test]
+    fn save_canonical_for_dispatches_to_codex_when_variant_is_codex() {
+        // save_canonical_for no longer accepts a Surface parameter — the
+        // write target is derived from the CredentialFile variant. This
+        // test verifies a Codex variant lands at the codex-prefixed
+        // canonical without the caller naming the surface.
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(12u16).unwrap();
+
+        save_canonical_for(dir.path(), account, &sample_codex_creds()).unwrap();
+
+        assert!(
+            canonical_path_for(dir.path(), account, Surface::Codex).exists(),
+            "Codex variant must write to codex-prefixed canonical"
+        );
+        assert!(
+            !canonical_path_for(dir.path(), account, Surface::ClaudeCode).exists(),
+            "Codex variant must NOT write to ClaudeCode canonical"
+        );
+    }
+
+    #[test]
+    fn save_canonical_for_dispatches_to_anthropic_when_variant_is_anthropic() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(13u16).unwrap();
+
+        save_canonical_for(dir.path(), account, &sample_creds()).unwrap();
+
+        assert!(
+            canonical_path_for(dir.path(), account, Surface::ClaudeCode).exists(),
+            "Anthropic variant must write to ClaudeCode canonical"
+        );
+        assert!(
+            !canonical_path_for(dir.path(), account, Surface::Codex).exists(),
+            "Anthropic variant must NOT write to Codex canonical"
         );
     }
 }

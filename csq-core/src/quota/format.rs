@@ -362,8 +362,15 @@ pub fn is_swap_stuck(config_dir: &Path, base_dir: &Path) -> bool {
         return false;
     };
 
-    live.claude_ai_oauth.access_token.expose_secret()
-        != canonical.claude_ai_oauth.access_token.expose_secret()
+    live.expect_anthropic()
+        .claude_ai_oauth
+        .access_token
+        .expose_secret()
+        != canonical
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret()
 }
 
 #[cfg(test)]

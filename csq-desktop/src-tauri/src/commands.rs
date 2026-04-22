@@ -133,11 +133,15 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                                 .filter(|s| !s.is_empty());
                         match credentials::load(&canonical) {
                             Ok(creds) => {
-                                let exp_ms = creds.claude_ai_oauth.expires_at;
+                                let exp_ms = creds.expect_anthropic().claude_ai_oauth.expires_at;
                                 let secs = (exp_ms as i64 - now_ms as i64) / 1000;
                                 let status = if secs <= 0 {
                                     "expired"
-                                } else if creds.claude_ai_oauth.is_expired_within(7200) {
+                                } else if creds
+                                    .expect_anthropic()
+                                    .claude_ai_oauth
+                                    .is_expired_within(7200)
+                                {
                                     "expiring"
                                 } else {
                                     "healthy"

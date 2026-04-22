@@ -6,7 +6,9 @@
 //! once their cooldowns expire at different times.
 
 use csq_core::accounts::markers;
-use csq_core::credentials::{self, file as cred_file, CredentialFile, OAuthPayload};
+use csq_core::credentials::{
+    self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
+};
 use csq_core::daemon::auto_rotate::tick;
 use csq_core::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
 use csq_core::rotation::config::{save as save_rotation_config, RotationConfig};
@@ -17,7 +19,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 fn make_creds(access: &str, refresh: &str) -> CredentialFile {
-    CredentialFile {
+    CredentialFile::Anthropic(AnthropicCredentialFile {
         claude_ai_oauth: OAuthPayload {
             access_token: AccessToken::new(access.into()),
             refresh_token: RefreshToken::new(refresh.into()),
@@ -28,7 +30,7 @@ fn make_creds(access: &str, refresh: &str) -> CredentialFile {
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
-    }
+    })
 }
 
 fn setup_account(base: &Path, account: u16) {

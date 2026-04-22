@@ -55,7 +55,11 @@ pub fn scan_config_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
 /// dir does not stop fanout to others.
 pub fn fan_out_credentials(base_dir: &Path, account: AccountNum, creds: &CredentialFile) -> usize {
     let dirs = scan_config_dirs(base_dir, account);
-    let new_token = creds.claude_ai_oauth.access_token.expose_secret();
+    let new_token = creds
+        .expect_anthropic()
+        .claude_ai_oauth
+        .access_token
+        .expose_secret();
     let mut updated = 0;
 
     for dir in &dirs {
@@ -63,7 +67,13 @@ pub fn fan_out_credentials(base_dir: &Path, account: AccountNum, creds: &Credent
 
         // Skip if already in sync
         if let Ok(existing) = credentials::load(&live_path) {
-            if existing.claude_ai_oauth.access_token.expose_secret() == new_token {
+            if existing
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret()
+                == new_token
+            {
                 debug!(dir = %dir.display(), "already in sync, skipping");
                 continue;
             }
@@ -74,13 +84,35 @@ pub fn fan_out_credentials(base_dir: &Path, account: AccountNum, creds: &Credent
         // from the existing live credentials to prevent CC from
         // falling back to Sonnet ("subscription contamination").
         let mut write_creds = creds.clone();
-        if write_creds.claude_ai_oauth.subscription_type.is_none() {
+        if write_creds
+            .expect_anthropic()
+            .claude_ai_oauth
+            .subscription_type
+            .is_none()
+        {
             if let Ok(existing) = credentials::load(&live_path) {
-                if existing.claude_ai_oauth.subscription_type.is_some() {
-                    write_creds.claude_ai_oauth.subscription_type =
-                        existing.claude_ai_oauth.subscription_type;
-                    write_creds.claude_ai_oauth.rate_limit_tier =
-                        existing.claude_ai_oauth.rate_limit_tier;
+                if existing
+                    .expect_anthropic()
+                    .claude_ai_oauth
+                    .subscription_type
+                    .is_some()
+                {
+                    write_creds
+                        .expect_anthropic_mut()
+                        .claude_ai_oauth
+                        .subscription_type = existing
+                        .expect_anthropic()
+                        .claude_ai_oauth
+                        .subscription_type
+                        .clone();
+                    write_creds
+                        .expect_anthropic_mut()
+                        .claude_ai_oauth
+                        .rate_limit_tier = existing
+                        .expect_anthropic()
+                        .claude_ai_oauth
+                        .rate_limit_tier
+                        .clone();
                 }
             }
         }
@@ -172,13 +204,13 @@ pub fn clear_broker_failed(base_dir: &Path, account: AccountNum) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{CredentialFile, OAuthPayload};
+    use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
     use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn make_creds(access: &str, refresh: &str) -> CredentialFile {
-        CredentialFile {
+        CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(access.into()),
                 refresh_token: RefreshToken::new(refresh.into()),
@@ -189,7 +221,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        }
+        })
     }
 
     fn setup_config_dir(base: &Path, n: u16) -> PathBuf {
@@ -250,7 +282,10 @@ mod tests {
         assert_eq!(updated, 1);
         let live = credentials::load(&config.join(".credentials.json")).unwrap();
         assert_eq!(
-            live.claude_ai_oauth.access_token.expose_secret(),
+            live.expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "new-access"
         );
     }

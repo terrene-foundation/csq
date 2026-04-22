@@ -118,6 +118,65 @@ term-<pid>/.gemini/                      (effective state dir under GEMINI_CLI_H
 
 **Why the API key is never in `.env`:** `google-gemini/gemini-cli#21744` shows that if ANY `.env` exists in the `$CWD → ancestors → $GEMINI_CLI_HOME → $HOME` discovery chain, the first file found short-circuits the lookup. csq injects `GEMINI_API_KEY` directly into the spawned child process environment. No `.env` files are written or relied upon by csq.
 
+#### 7.2.3.1 Event-delivery contract (FROZEN — PR-G0)
+
+Gemini is the first surface where the CLI (csq-cli) emits runtime events to the daemon without requiring the daemon to be running in order to spawn the child (INV-P02 inverted — ADR-G09). This subsection pins the socket-path resolution, connect-timeout, drop-on-unavailable, and NDJSON fallback-durability rules that every emitter MUST follow. Locked by PR-G0 so PR-G2a (capture module) and PR-G3 (daemon consumer) implement against a stable contract.
+
+**Socket path resolution (same discipline as spec 04 §4.2.5 layer 3):**
+
+```
+if $XDG_RUNTIME_DIR is set and is a directory:
+    socket = $XDG_RUNTIME_DIR/csq.sock
+else:
+    socket = ~/.claude/accounts/csq.sock
+```
+
+Resolution is identical to the daemon's `bind()` path. If the daemon binds the first path, csq-cli connects to the first path; if the daemon fell back to the second, csq-cli falls back to the second. A platform-path helper (`platform::paths::daemon_socket()`) is the single source of truth — emitter call sites MUST NOT hard-code either path.
+
+**Non-blocking connect, 50 ms ceiling:**
+
+Emitter issues `UnixStream::connect(path)` wrapped in `tokio::time::timeout(Duration::from_millis(50), ...)`. On timeout OR `ConnectionRefused` OR `NotFound`, the emitter does NOT retry, does NOT backoff, and does NOT block the spawn. The 50 ms bound is a hard ceiling: spawn latency is user-visible and Gemini's design tenet is "daemon absence MUST NOT degrade spawn-time UX."
+
+**Drop-on-unavailable semantics:**
+
+When IPC is unavailable, the emitter:
+
+1. Writes the event to `gemini-events-<slot>.ndjson` (durability floor — see spec 05 §5.8).
+2. Emits one structured log record at `warn` with fixed-vocabulary fields:
+   ```
+   error_kind = "gemini_event_ipc_unavailable"
+   slot       = <u16>
+   event_type = "counter_increment" | "rate_limited" | "effective_model_observed" | "tos_guard_tripped"
+   reason     = "connect_timeout" | "connection_refused" | "socket_missing"
+   ```
+   No event payload in the log (payload contains no secrets per spec 05 §5.8, but the log stays lean for signal-to-noise).
+3. Returns `Ok(())`. The emitter MUST NOT return an error to the spawn path — a failed emit is a successful drop, not a spawn failure.
+
+**NDJSON is the durability floor, not a fallback:**
+
+The NDJSON log is written on EVERY event, regardless of IPC success (C-CR2 design tenet: "single-writer-to-quota.json preserved via CLI-durable event log"). IPC is the same-session latency path; the log is the durability path. The daemon drains NDJSON on startup and reconnect (spec 05 §5.8); duplicate delivery is prevented by per-event UUIDs reconciled against the daemon's in-memory applied-event set.
+
+**Emitter MUST NOT block on:**
+
+- Filesystem growth of `gemini-events-<slot>.ndjson` (bounded by spec 05 §5.8 drain cadence, daemon responsibility).
+- Daemon restart (log survives daemon-down windows by design).
+- Peer-credential rejection (daemon's `SO_PEERCRED` layer — if rejected, same handling as timeout: drop + log + NDJSON).
+
+**Test fixtures (PR-G0 docs-only; implementation tests in PR-G2a/PR-G3):**
+
+- `socket_path_prefers_xdg_runtime_dir_when_set`
+- `socket_path_falls_back_to_accounts_dir_when_xdg_unset`
+- `connect_timeout_respects_50ms_ceiling_wall_clock` (guard against sleep-loop regressions)
+- `emit_returns_ok_when_daemon_down` (NDJSON write verified, no error propagated)
+- `emit_writes_ndjson_even_when_ipc_succeeds` (durability floor invariant)
+
+**Cross-references:**
+
+- spec 05 §5.8 — NDJSON durability contract (file layout, O_APPEND + fsync, drain semantics).
+- spec 04 §4.2.5 — daemon socket layers 1–3 (the emitter assumes layer 3 path resolution).
+- rules/security.md rule 7 — daemon IPC three-layer security (emitter inherits).
+- journal 0067 H7 — origin of this subsection (event-delivery contract pinning).
+
 ## 7.3 Per-surface login and setup
 
 ### 7.3.1 `Surface::ClaudeCode` (Anthropic)
@@ -493,3 +552,4 @@ These are items that MUST be resolved (verified or decided) before the first Cod
 - 2026-04-22 — 1.0.2 — OPEN-C01 RESOLVED via direct openai/codex source read. Finding: `cli_auth_credentials_store = "file"` does NOT disable in-process refresh; codex refreshes on-expiry regardless. INV-P01 re-framed to "scheduled pre-expiry refresher" with 2h safety margin (matches spec 04 INV-06 Anthropic pattern). INV-P02 rationale refined accordingly. Clock-skew mitigation added. Gemini /analyze phase completed (workspaces/gemini/01-analysis/) — no spec 07 changes required; Gemini inherits the abstraction unchanged. Journaled in workspaces/codex/journal/0004 and workspaces/gemini/journal/0001.
 - 2026-04-22 — 1.1.0 — PR-C1.5: §7.4 expanded with frozen quota.json v2 schema subsection 7.4.1 (mandatory + optional fields, example mixed-surface file, compatibility matrix), §7.4.2 cross-stream consumer test names, §7.4.3 migration semantics summary. Minor bump because schema is a cross-stream contract; adding it is additive to existing text but promotes the shape from prose to specification. Consumed by PR-B8 (v2.0.1 dual-read), PR-C6 (v2.1 write flip), PR-G3 (v2.2 Gemini counter). Journal 0067 H1.
 - 2026-04-22 — 1.1.1 — PR-VP-final red-team reconciliation. Shape of §7.4.1 Gemini counter fields reconciled with spec 05 §5.8 — `counter` and `rate_limit` promoted from flat scalars to nested structs (`CounterState` / `RateLimitState`) to preserve Gemini retry-state fields (`reset_at`, `last_retry_delay_s`, `last_quota_metric`) that the flat shape discarded. `effective_model_first_seen_at` added at AccountQuota level. `extras: Option<Value>` escape-hatch field added so surfaces (notably Codex `wham/usage`) can stash unmigrated payload fragments without forcing schema v3. `schema_version > 2` handling changed from hard-error to degrade-to-empty + WARN for rollback UX. §7.4.2 test list expanded from 6 to 8 canonical tests (5' degradation, 7 key validation, 8 extras round-trip). Consumed by PR-VP-Group1-code (PR-B8 schema revision). Journal 0067 R1/R2/R3/R5/R6.
+- 2026-04-22 — 1.2.0 — PR-G0: §7.2.3.1 "Event-delivery contract" added. Pins socket-path resolution (shared with spec 04 §4.2.5 layer 3 via `platform::paths::daemon_socket()`), 50 ms non-blocking connect ceiling, drop-on-unavailable semantics with fixed-vocabulary structured log, NDJSON-as-durability-floor invariant, and the emitter-MUST-NOT-block rules. Consumed by PR-G2a (capture.rs emitter) and PR-G3 (daemon drain). Journal 0067 H7.

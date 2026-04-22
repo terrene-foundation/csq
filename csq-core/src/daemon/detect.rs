@@ -338,6 +338,16 @@ mod tests {
 
     #[test]
     fn detect_missing_pid_file_is_not_running() {
+        // Windows: hold the env-var mutex for the duration of this
+        // test to prevent the other two LOCALAPPDATA-setting tests
+        // (`detect_windows_live_pid_but_no_pipe_is_stale`,
+        // `detect_windows_live_daemon_returns_healthy`) from
+        // clobbering LOCALAPPDATA mid-assertion.
+        #[cfg(windows)]
+        let _env_guard = WINDOWS_ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let dir = TempDir::new().unwrap();
 
         // pid_file_path() uses platform-specific storage:
@@ -436,6 +446,20 @@ mod tests {
     /// but never manifested until new tests changed parallel timing.
     #[cfg(unix)]
     static SOCKET_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes the three Windows tests that mutate the
+    /// process-global `LOCALAPPDATA` env var. `pid_file_path(base_dir)`
+    /// on Windows resolves to `%LOCALAPPDATA%\csq\csq-daemon.pid` and
+    /// IGNORES `base_dir`, so two concurrent tests each calling
+    /// `std::env::set_var("LOCALAPPDATA", ...)` with their own TempDir
+    /// race — one test's `set_var` clobbers another's, and that test's
+    /// subsequent `detect_daemon` reads the wrong directory (producing
+    /// `NotRunning` instead of `Stale`). PR-C8 (#179) surfaced this on
+    /// Windows CI; analogous to the Linux `SOCKET_TEST_MUTEX` fix
+    /// (e6bfadc). Pre-existing latent race; new tests changed the
+    /// parallel scheduling order enough to expose it.
+    #[cfg(windows)]
+    static WINDOWS_ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(unix)]
     #[tokio::test]
@@ -536,6 +560,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn detect_windows_live_pid_but_no_pipe_is_stale() {
+        let _env_guard = WINDOWS_ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let dir = TempDir::new().unwrap();
         // On Windows, pid_file_path uses %LOCALAPPDATA%\csq\ by default.
         // Override so the test is isolated.
@@ -563,8 +591,16 @@ mod tests {
     /// Windows: a live daemon on the named pipe returns Healthy.
     #[cfg(windows)]
     #[tokio::test]
+    // Serializing via the module-level env-test mutex is the point —
+    // every `.await` below runs inside the guard but no other code
+    // path acquires this mutex, so there's no lock-contention hazard.
+    #[allow(clippy::await_holding_lock)]
     async fn detect_windows_live_daemon_returns_healthy() {
         use crate::daemon::server_windows;
+
+        let _env_guard = WINDOWS_ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let dir = TempDir::new().unwrap();
         unsafe {

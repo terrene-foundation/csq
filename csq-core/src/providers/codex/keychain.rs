@@ -81,6 +81,14 @@ pub fn purge_residue() -> Result<bool, String> {
 
 /// Invocation outcome of a `security` CLI call, parameterised so the
 /// probe/purge state machines are unit-testable without shelling out.
+///
+/// Gated on `macos || test` because on non-macOS production builds
+/// `probe_residue` / `purge_residue` short-circuit to
+/// `Unsupported` / `Ok(false)` and never reach this classifier.
+/// `#[allow(dead_code)]` keeps the `#[cfg]` explicit without forcing
+/// clippy's `dead_code` lint to flag the seam on Linux clippy runs.
+#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SecurityExit {
     /// `security` returned exit 0 — entry present / deletion succeeded.
@@ -97,7 +105,9 @@ pub(crate) enum SecurityExit {
 /// Rejects empty strings (which `security` treats as a wildcard
 /// matching the first generic-password entry) and anything not shaped
 /// like a reverse-DNS keychain service name. Origin: PR-C3b security
-/// review M3.
+/// review M3. Gated on `macos || test` for the same reason as
+/// [`SecurityExit`].
+#[cfg(any(target_os = "macos", test))]
 fn validate_service_name(service: &str) -> Result<(), &'static str> {
     if service.is_empty() {
         return Err("keychain service name must not be empty");
@@ -120,6 +130,7 @@ fn validate_service_name(service: &str) -> Result<(), &'static str> {
 /// satisfies [`validate_service_name`]; a bad shape maps to
 /// [`ProbeResult::ProbeFailed`] so the login path falls through to
 /// the "could not probe" warn branch rather than mis-classifying.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn probe_residue_with(
     service: &str,
     spawn: impl FnOnce(&str) -> SecurityExit,
@@ -138,6 +149,7 @@ pub(crate) fn probe_residue_with(
 /// [`run_security_delete`]. Invalid service names hard-error so a
 /// buggy caller cannot trick the guard into deleting an unrelated
 /// keychain item.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn purge_residue_with(
     service: &str,
     spawn: impl FnOnce(&str) -> SecurityExit,
@@ -300,6 +312,6 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn non_macos_purge_is_noop() {
-        assert_eq!(purge_residue().unwrap(), false);
+        assert!(!purge_residue().unwrap());
     }
 }

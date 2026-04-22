@@ -396,11 +396,37 @@ fn spawn_codex_device_auth(config_dir: &Path) -> Result<ExitStatus> {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::os::unix::process::ExitStatusExt;
     use tempfile::TempDir;
 
     fn acc(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
+    }
+
+    // `ExitStatus` has no stable cross-platform constructor; pull the
+    // right `ExitStatusExt` per target so PR-C3b's tests compile on
+    // both Unix (Ubuntu / macOS CI) and Windows (Windows CI).
+    #[cfg(unix)]
+    fn fake_success() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(unix)]
+    fn fake_failure() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(1 << 8)
+    }
+
+    #[cfg(windows)]
+    fn fake_success() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn fake_failure() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(1)
     }
 
     /// Writes a valid Codex auth.json into `config_dir/auth.json`, as
@@ -423,14 +449,6 @@ mod tests {
             serde_json::to_string_pretty(&body).unwrap(),
         )
         .unwrap();
-    }
-
-    fn fake_success() -> ExitStatus {
-        ExitStatus::from_raw(0)
-    }
-
-    fn fake_failure() -> ExitStatus {
-        ExitStatus::from_raw(1 << 8)
     }
 
     #[test]

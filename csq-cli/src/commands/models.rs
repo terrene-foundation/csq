@@ -1,6 +1,7 @@
 //! `csq models list [provider]` — list models. `csq models switch <provider> <model>` — switch.
 
 use anyhow::{anyhow, Result};
+use csq_core::providers::catalog::ModelConfigTarget;
 use csq_core::providers::{self, ModelCatalog};
 use serde::Serialize;
 use std::path::Path;
@@ -101,16 +102,24 @@ pub fn handle_switch(
     model_query: &str,
     slot: Option<csq_core::types::AccountNum>,
     pull_if_missing: bool,
+    force: bool,
 ) -> Result<()> {
-    providers::get_provider(provider_id)
+    let provider = providers::get_provider(provider_id)
         .ok_or_else(|| anyhow!("unknown provider: {provider_id}"))?;
 
-    // Resolve the target model id. For Ollama, the "catalog" is
-    // whatever the user has pulled locally — accept any non-empty
-    // id verbatim and, when `pull_if_missing` is set, fetch it
-    // via `ollama pull` before writing. For keyed providers
-    // (Claude, MiniMax, Z.AI) keep the curated catalog so a typo
-    // doesn't brick the slot.
+    // Resolve the target model id. Three strategies by provider:
+    //
+    // - **Ollama** — the "catalog" is whatever the user has pulled
+    //   locally. Accept any non-empty id verbatim; when
+    //   `pull_if_missing` is set, fetch via `ollama pull`.
+    // - **Codex** — FR-CLI-04: the Codex default ships in the
+    //   catalog, but users can switch to any gpt-*/o*/codex-* model
+    //   OpenAI exposes on their subscription. Accept catalog
+    //   matches silently; accept non-catalog ids ONLY when `--force`
+    //   is set, because uncached models risk shipping a model id
+    //   the user's plan doesn't accept.
+    // - **Keyed providers (Claude / MiniMax / Z.AI)** — keep the
+    //   curated catalog so a typo can't brick the slot.
     let model_id: String = if provider_id == "ollama" {
         let trimmed = model_query.trim();
         if trimmed.is_empty() {
@@ -120,6 +129,8 @@ pub fn handle_switch(
             ensure_ollama_model_pulled(trimmed)?;
         }
         trimmed.to_string()
+    } else if provider_id == "codex" {
+        resolve_codex_model(model_query, force)?
     } else {
         let catalog = ModelCatalog::default_catalog();
         let m = catalog.find(model_query).ok_or_else(|| {
@@ -140,32 +151,92 @@ pub fn handle_switch(
         m.id.clone()
     };
 
-    // Target selection: slot-bound `config-N/settings.json` vs the
-    // global profile file. Ollama slot bindings and MM/Z.AI slot
-    // bindings both live in `config-N/settings.json` and should
-    // be retargeted there directly — modifying the global profile
-    // wouldn't affect the slot.
-    if let Some(slot_num) = slot {
-        write_slot_model(base_dir, slot_num, &model_id)?;
-        println!(
-            "Switched {} model on slot {} to {}",
-            provider_id, slot_num, model_id
-        );
-    } else {
-        let mut settings = providers::settings::load_settings(base_dir, provider_id)?;
-        settings.set_model(&model_id);
-        providers::settings::save_settings(base_dir, &settings)?;
-        let display_name = ModelCatalog::default_catalog()
-            .find(&model_id)
-            .map(|m| format!(" ({})", m.name))
-            .unwrap_or_default();
-        println!(
-            "Switched {} model to {}{}",
-            provider_id, model_id, display_name
-        );
+    // INV-P06 write-path dispatch by `ModelConfigTarget`.
+    //
+    // - EnvInSettingsJson → `config-<N>/settings.json` `env.ANTHROPIC_MODEL`
+    //   (and all MODEL_KEYS siblings), or the global profile when no slot.
+    // - TomlModelKey → `config-<N>/config.toml` `model = "..."` via
+    //   `providers::codex::surface::write_config_toml`. No global
+    //   profile path for Codex — the model is a per-slot config.toml
+    //   concept and the provider has no settings-codex.json file.
+    match provider.model_config {
+        ModelConfigTarget::EnvInSettingsJson => {
+            if let Some(slot_num) = slot {
+                write_slot_model(base_dir, slot_num, &model_id)?;
+                println!(
+                    "Switched {} model on slot {} to {}",
+                    provider_id, slot_num, model_id
+                );
+            } else {
+                let mut settings = providers::settings::load_settings(base_dir, provider_id)?;
+                settings.set_model(&model_id);
+                providers::settings::save_settings(base_dir, &settings)?;
+                let display_name = ModelCatalog::default_catalog()
+                    .find(&model_id)
+                    .map(|m| format!(" ({})", m.name))
+                    .unwrap_or_default();
+                println!(
+                    "Switched {} model to {}{}",
+                    provider_id, model_id, display_name
+                );
+            }
+        }
+        ModelConfigTarget::TomlModelKey => {
+            let slot_num = slot.ok_or_else(|| {
+                anyhow!(
+                    "--slot is required for {provider_id} — model lives in \
+                     config-<slot>/config.toml, there is no global profile"
+                )
+            })?;
+            providers::codex::surface::write_config_toml(base_dir, slot_num, &model_id)
+                .map_err(|e| anyhow!("failed to write config.toml for slot {slot_num}: {e}"))?;
+            println!(
+                "Switched {} model on slot {} to {}",
+                provider_id, slot_num, model_id
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Resolves a user-supplied Codex model query to a concrete model id.
+///
+/// Catalog match wins; otherwise `--force` must be set to accept an
+/// arbitrary OpenAI model id. Empty input is always rejected. This
+/// mirrors the Ollama "user space" model for catalog-less providers
+/// while keeping the default path (catalog hit) typo-resistant.
+fn resolve_codex_model(query: &str, force: bool) -> Result<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("model id must not be empty"));
+    }
+
+    // Catalog hit is the happy path for csq-curated models.
+    let catalog = ModelCatalog::default_catalog();
+    if let Some(m) = catalog.find(trimmed) {
+        if m.provider == "codex" {
+            return Ok(m.id.clone());
+        }
+    }
+
+    // Also accept the provider's own `default_model` literal — it's
+    // always a valid Codex id even if ModelCatalog hasn't enumerated it.
+    if let Some(p) = providers::get_provider("codex") {
+        if trimmed == p.default_model {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    if force {
+        return Ok(trimmed.to_string());
+    }
+
+    Err(anyhow!(
+        "uncached codex model `{trimmed}` — pass `--force` to accept an \
+         arbitrary OpenAI model id (csq does not validate it against your \
+         ChatGPT subscription entitlements)"
+    ))
 }
 
 /// Rewrites every `ANTHROPIC_*_MODEL` key in
@@ -319,7 +390,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // `pull_if_missing = false` so the test never calls the
         // `ollama` binary (may not exist on CI).
-        handle_switch(dir.path(), "ollama", "qwen3:latest", None, false).unwrap();
+        handle_switch(dir.path(), "ollama", "qwen3:latest", None, false, false).unwrap();
 
         let path = dir.path().join("settings-ollama.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -337,7 +408,15 @@ mod tests {
         let slot = AccountNum::try_from(5u16).unwrap();
         bind_provider_to_slot(dir.path(), "ollama", slot, None, None).unwrap();
 
-        handle_switch(dir.path(), "ollama", "gpt-oss:20b", Some(slot), false).unwrap();
+        handle_switch(
+            dir.path(),
+            "ollama",
+            "gpt-oss:20b",
+            Some(slot),
+            false,
+            false,
+        )
+        .unwrap();
 
         // Slot's settings.json carries the new model across every
         // MODEL_KEYS entry.
@@ -362,7 +441,7 @@ mod tests {
     fn switch_ollama_slot_errors_when_not_bound() {
         let dir = TempDir::new().unwrap();
         let slot = AccountNum::try_from(9u16).unwrap();
-        let err = handle_switch(dir.path(), "ollama", "gemma4", Some(slot), false)
+        let err = handle_switch(dir.path(), "ollama", "gemma4", Some(slot), false, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not bound"), "got: {err}");
@@ -371,7 +450,7 @@ mod tests {
     #[test]
     fn switch_ollama_empty_model_rejected() {
         let dir = TempDir::new().unwrap();
-        let err = handle_switch(dir.path(), "ollama", "   ", None, false)
+        let err = handle_switch(dir.path(), "ollama", "   ", None, false, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not be empty"), "got: {err}");
@@ -382,7 +461,7 @@ mod tests {
     #[test]
     fn switch_claude_still_uses_catalog() {
         let dir = TempDir::new().unwrap();
-        handle_switch(dir.path(), "claude", "opus", None, false).unwrap();
+        handle_switch(dir.path(), "claude", "opus", None, false, false).unwrap();
 
         let path = dir.path().join("settings.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -396,9 +475,16 @@ mod tests {
     #[test]
     fn switch_claude_rejects_unknown_model() {
         let dir = TempDir::new().unwrap();
-        let err = handle_switch(dir.path(), "claude", "nonexistent-model", None, false)
-            .unwrap_err()
-            .to_string();
+        let err = handle_switch(
+            dir.path(),
+            "claude",
+            "nonexistent-model",
+            None,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unknown model"), "got: {err}");
     }
 
@@ -457,7 +543,7 @@ mod tests {
         let slot = AccountNum::try_from(7u16).unwrap();
         bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
 
-        handle_switch(dir.path(), "mm", "m2", Some(slot), false).unwrap();
+        handle_switch(dir.path(), "mm", "m2", Some(slot), false, false).unwrap();
 
         let slot_path = dir.path().join("config-7/settings.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&slot_path).unwrap()).unwrap();
@@ -469,5 +555,125 @@ mod tests {
             model.contains("MiniMax"),
             "alias `m2` should resolve to the catalog's MiniMax id, got: {model}"
         );
+    }
+
+    // ── PR-C7 Codex TomlModelKey dispatch ──────────────────
+
+    #[test]
+    fn switch_codex_default_model_writes_config_toml_on_slot() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(4u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+        let default = csq_core::providers::get_provider("codex")
+            .unwrap()
+            .default_model;
+        handle_switch(dir.path(), "codex", default, Some(slot), false, false).unwrap();
+
+        let toml =
+            std::fs::read_to_string(dir.path().join(format!("config-{slot}/config.toml"))).unwrap();
+        assert!(
+            toml.contains(&format!("model = \"{default}\"")),
+            "expected model line for {default}, got: {toml}"
+        );
+        assert!(
+            toml.contains("cli_auth_credentials_store = \"file\""),
+            "expected cli_auth_credentials_store directive, got: {toml}"
+        );
+    }
+
+    #[test]
+    fn switch_codex_arbitrary_model_requires_force() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+
+        let err = handle_switch(
+            dir.path(),
+            "codex",
+            "gpt-5-turbo-ultra-plus",
+            Some(slot),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--force"), "got: {err}");
+        assert!(err.contains("uncached"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_codex_arbitrary_model_accepted_with_force() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(6u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+
+        handle_switch(
+            dir.path(),
+            "codex",
+            "gpt-5-turbo-ultra-plus",
+            Some(slot),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let toml =
+            std::fs::read_to_string(dir.path().join(format!("config-{slot}/config.toml"))).unwrap();
+        assert!(
+            toml.contains("model = \"gpt-5-turbo-ultra-plus\""),
+            "got: {toml}"
+        );
+    }
+
+    #[test]
+    fn switch_codex_requires_slot() {
+        let dir = TempDir::new().unwrap();
+        let default = csq_core::providers::get_provider("codex")
+            .unwrap()
+            .default_model;
+        let err = handle_switch(dir.path(), "codex", default, None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--slot is required"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_codex_empty_model_rejected() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(8u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+        let err = handle_switch(dir.path(), "codex", "   ", Some(slot), false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_codex_rewrite_preserves_auth_store_directive() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+
+        let default = csq_core::providers::get_provider("codex")
+            .unwrap()
+            .default_model;
+        handle_switch(dir.path(), "codex", default, Some(slot), false, false).unwrap();
+        handle_switch(
+            dir.path(),
+            "codex",
+            "gpt-6-preview",
+            Some(slot),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let toml =
+            std::fs::read_to_string(dir.path().join(format!("config-{slot}/config.toml"))).unwrap();
+        assert!(
+            toml.contains("cli_auth_credentials_store = \"file\""),
+            "got: {toml}"
+        );
+        assert!(toml.contains("model = \"gpt-6-preview\""), "got: {toml}");
     }
 }

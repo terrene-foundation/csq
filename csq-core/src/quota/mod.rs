@@ -282,4 +282,292 @@ mod tests {
         assert!(qf.get(1).is_some());
         assert_eq!(qf.get(1).unwrap().updated_at, 123.0);
     }
+
+    // ── §7.4.2 canonical consumer tests (PR-B8) ──────────────────────────
+
+    /// 1. Parse v1 file unchanged — legacy file reads exactly as before spec 07.
+    #[test]
+    fn parses_v1_file_unchanged() {
+        // Arrange — v1 shape: no schema_version, no surface/kind, classic fields.
+        let json = r#"{
+            "accounts": {
+                "1": {
+                    "five_hour": {"used_percentage": 42.0, "resets_at": 4102444800},
+                    "seven_day": {"used_percentage": 8.0, "resets_at": 4102444800},
+                    "updated_at": 1775722800.0
+                }
+            }
+        }"#;
+
+        // Act
+        let qf: QuotaFile = serde_json::from_str(json).unwrap();
+
+        // Assert
+        assert_eq!(
+            qf.schema_version, 1,
+            "missing schema_version must default to 1"
+        );
+        let account = qf.accounts.get("1").expect("account 1 must parse");
+        assert_eq!(
+            account.surface, "claude-code",
+            "v1 surface must default to claude-code"
+        );
+        assert_eq!(
+            account.kind, "utilization",
+            "v1 kind must default to utilization"
+        );
+        assert_eq!(account.five_hour.as_ref().unwrap().used_percentage, 42.0);
+        assert_eq!(account.seven_day.as_ref().unwrap().used_percentage, 8.0);
+        // All Gemini-reserved optional fields must be None
+        assert!(account.counter.is_none());
+        assert!(account.rate_limit.is_none());
+        assert!(account.resets_at_tz.is_none());
+        assert!(account.selected_model.is_none());
+        assert!(account.effective_model.is_none());
+        assert!(account.mismatch_count_today.is_none());
+        assert!(account.is_downgrade.is_none());
+    }
+
+    /// 2. Parse v2 file with Claude-only accounts — migrated v1 with explicit fields.
+    #[test]
+    fn parses_v2_file_with_claude_only_accounts() {
+        // Arrange
+        let json = r#"{
+            "schema_version": 2,
+            "accounts": {
+                "1": {
+                    "surface": "claude-code",
+                    "kind": "utilization",
+                    "five_hour": {"used_percentage": 42.0, "resets_at": 4102444800},
+                    "seven_day": {"used_percentage": 8.0, "resets_at": 4102444800},
+                    "updated_at": 1775722800.0
+                }
+            }
+        }"#;
+
+        // Act
+        let qf: QuotaFile = serde_json::from_str(json).unwrap();
+
+        // Assert
+        assert_eq!(qf.schema_version, 2);
+        let account = qf.accounts.get("1").expect("account 1 must parse");
+        assert_eq!(account.surface, "claude-code");
+        assert_eq!(account.kind, "utilization");
+        assert_eq!(account.five_hour.as_ref().unwrap().used_percentage, 42.0);
+        assert_eq!(account.seven_day.as_ref().unwrap().used_percentage, 8.0);
+        // No Gemini fields on a claude-code account
+        assert!(account.counter.is_none());
+        assert!(account.resets_at_tz.is_none());
+    }
+
+    /// 3. Parse v2 file with mixed surfaces — the spec §7.4.1 example file.
+    #[test]
+    fn parses_v2_file_with_mixed_surfaces() {
+        // Arrange — exact example from spec §7.4.1
+        let json = r#"{
+            "schema_version": 2,
+            "accounts": {
+                "1": {
+                    "surface": "claude-code",
+                    "kind": "utilization",
+                    "five_hour": {"used_percentage": 42.0, "resets_at": 1775726400},
+                    "seven_day": {"used_percentage": 8.0, "resets_at": 1776196800},
+                    "rate_limits": null,
+                    "updated_at": 1775722800.0
+                },
+                "2": {
+                    "surface": "codex",
+                    "kind": "utilization",
+                    "five_hour": {"used_percentage": 18.0, "resets_at": 1775726400},
+                    "seven_day": null,
+                    "rate_limits": null,
+                    "updated_at": 1775722800.0
+                },
+                "3": {
+                    "surface": "gemini",
+                    "kind": "counter",
+                    "updated_at": 1775722800.0,
+                    "counter": 42,
+                    "rate_limit": 1000,
+                    "resets_at_tz": "America/Los_Angeles",
+                    "selected_model": "gemini-2.5-pro",
+                    "effective_model": "gemini-2.5-pro",
+                    "mismatch_count_today": 0,
+                    "is_downgrade": false
+                }
+            }
+        }"#;
+
+        // Act
+        let qf: QuotaFile = serde_json::from_str(json).unwrap();
+
+        // Assert — account 1 (claude-code)
+        assert_eq!(qf.schema_version, 2);
+        let a1 = qf.accounts.get("1").expect("account 1");
+        assert_eq!(a1.surface, "claude-code");
+        assert_eq!(a1.kind, "utilization");
+        assert_eq!(a1.five_hour.as_ref().unwrap().used_percentage, 42.0);
+
+        // Assert — account 2 (codex)
+        let a2 = qf.accounts.get("2").expect("account 2");
+        assert_eq!(a2.surface, "codex");
+        assert_eq!(a2.kind, "utilization");
+        assert_eq!(a2.five_hour.as_ref().unwrap().used_percentage, 18.0);
+        assert!(a2.seven_day.is_none());
+
+        // Assert — account 3 (gemini counter)
+        let a3 = qf.accounts.get("3").expect("account 3");
+        assert_eq!(a3.surface, "gemini");
+        assert_eq!(a3.kind, "counter");
+        assert_eq!(a3.counter, Some(42));
+        assert_eq!(a3.rate_limit, Some(1000));
+        assert_eq!(a3.resets_at_tz.as_deref(), Some("America/Los_Angeles"));
+        assert_eq!(a3.selected_model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(a3.effective_model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(a3.mismatch_count_today, Some(0));
+        assert_eq!(a3.is_downgrade, Some(false));
+    }
+
+    /// 4. Parse v2 file missing optional Gemini fields — null-defaults applied without panic.
+    #[test]
+    fn parses_v2_file_missing_optional_gemini_fields() {
+        // Arrange — Gemini account with surface/kind but no counter fields
+        let json = r#"{
+            "schema_version": 2,
+            "accounts": {
+                "5": {
+                    "surface": "gemini",
+                    "kind": "counter",
+                    "updated_at": 1775722800.0
+                }
+            }
+        }"#;
+
+        // Act
+        let qf: QuotaFile = serde_json::from_str(json).unwrap();
+
+        // Assert
+        let a5 = qf.accounts.get("5").expect("account 5");
+        assert_eq!(a5.surface, "gemini");
+        assert_eq!(a5.kind, "counter");
+        // All optional Gemini fields default to None without panic
+        assert!(a5.counter.is_none());
+        assert!(a5.rate_limit.is_none());
+        assert!(a5.resets_at_tz.is_none());
+        assert!(a5.selected_model.is_none());
+        assert!(a5.effective_model.is_none());
+        assert!(a5.mismatch_count_today.is_none());
+        assert!(a5.is_downgrade.is_none());
+    }
+
+    /// 5. Parse v2 file with schema_version=3 errors with actionable message.
+    #[test]
+    fn parses_v2_file_with_schema_version_3_errors() {
+        use crate::error::ConfigError;
+        use tempfile::TempDir;
+
+        // Arrange — write a file with schema_version 3
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("quota.json");
+        let json = r#"{"schema_version":3,"accounts":{}}"#;
+        std::fs::write(&path, json).unwrap();
+
+        // Act — load_state must enforce the version range
+        let result = super::state::load_state(dir.path());
+
+        // Assert — must be an error containing "schema_version" and "3"/"newer"
+        assert!(result.is_err(), "schema_version 3 must be rejected");
+        let err = result.unwrap_err();
+        match &err {
+            ConfigError::InvalidJson { reason, .. } => {
+                assert!(
+                    reason.contains("schema_version"),
+                    "error must mention schema_version, got: {reason}"
+                );
+                assert!(
+                    reason.contains("3") || reason.contains("newer"),
+                    "error must name the version or 'newer', got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidJson, got: {other:?}"),
+        }
+    }
+
+    /// 6. Round-trip v2 → save → load identical — no drift across the write path.
+    #[test]
+    fn round_trip_v2_load_save_identical() {
+        use tempfile::TempDir;
+
+        // Arrange — construct a v2 file with one Claude and one Gemini account
+        let dir = TempDir::new().unwrap();
+        let mut original = QuotaFile {
+            schema_version: 2,
+            accounts: std::collections::HashMap::new(),
+        };
+        original.set(
+            1,
+            AccountQuota {
+                surface: "claude-code".into(),
+                kind: "utilization".into(),
+                five_hour: Some(UsageWindow {
+                    used_percentage: 42.0,
+                    resets_at: 4_102_444_800,
+                }),
+                seven_day: Some(UsageWindow {
+                    used_percentage: 8.0,
+                    resets_at: 4_102_444_800,
+                }),
+                updated_at: 1_775_722_800.0,
+                ..Default::default()
+            },
+        );
+        original.set(
+            3,
+            AccountQuota {
+                surface: "gemini".into(),
+                kind: "counter".into(),
+                updated_at: 1_775_722_800.0,
+                counter: Some(42),
+                rate_limit: Some(1000),
+                resets_at_tz: Some("America/Los_Angeles".into()),
+                selected_model: Some("gemini-2.5-pro".into()),
+                effective_model: Some("gemini-2.5-pro".into()),
+                mismatch_count_today: Some(0),
+                is_downgrade: Some(false),
+                ..Default::default()
+            },
+        );
+
+        // Act — save, then reload
+        super::state::save_state(dir.path(), &original).unwrap();
+        let reloaded = super::state::load_state(dir.path()).unwrap();
+
+        // Assert — schema_version and per-account fields round-trip stably
+        assert_eq!(reloaded.schema_version, original.schema_version);
+
+        let a1_orig = original.accounts.get("1").unwrap();
+        let a1_reload = reloaded.accounts.get("1").unwrap();
+        assert_eq!(a1_reload.surface, a1_orig.surface);
+        assert_eq!(a1_reload.kind, a1_orig.kind);
+        assert_eq!(
+            a1_reload.five_hour.as_ref().unwrap().used_percentage,
+            a1_orig.five_hour.as_ref().unwrap().used_percentage
+        );
+        assert_eq!(
+            a1_reload.seven_day.as_ref().unwrap().used_percentage,
+            a1_orig.seven_day.as_ref().unwrap().used_percentage
+        );
+
+        let a3_orig = original.accounts.get("3").unwrap();
+        let a3_reload = reloaded.accounts.get("3").unwrap();
+        assert_eq!(a3_reload.surface, a3_orig.surface);
+        assert_eq!(a3_reload.kind, a3_orig.kind);
+        assert_eq!(a3_reload.counter, a3_orig.counter);
+        assert_eq!(a3_reload.rate_limit, a3_orig.rate_limit);
+        assert_eq!(a3_reload.resets_at_tz, a3_orig.resets_at_tz);
+        assert_eq!(a3_reload.selected_model, a3_orig.selected_model);
+        assert_eq!(a3_reload.effective_model, a3_orig.effective_model);
+        assert_eq!(a3_reload.mismatch_count_today, a3_orig.mismatch_count_today);
+        assert_eq!(a3_reload.is_downgrade, a3_orig.is_downgrade);
+    }
 }

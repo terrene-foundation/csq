@@ -173,6 +173,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 label: a.label,
                 source: match a.source {
                     AccountSource::Anthropic => "anthropic".into(),
+                    AccountSource::Codex => "codex".into(),
                     AccountSource::ThirdParty { .. } => "third_party".into(),
                     AccountSource::Manual => "manual".into(),
                 },

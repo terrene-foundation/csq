@@ -190,6 +190,165 @@ pub fn create_handle_dir(
     Ok(handle_dir)
 }
 
+/// Creates an ephemeral Codex handle directory `term-<pid>` under
+/// `base_dir` for `Surface::Codex`.
+///
+/// Per spec 07 §7.2.2 the Codex handle dir carries a distinct symlink
+/// set from Anthropic:
+///
+/// - `.csq-account` → `config-<N>/.csq-account`
+/// - `auth.json` → `credentials/codex-<N>.json` (canonical-direct;
+///   Codex's auth.json IS the credential file)
+/// - `config.toml` → `config-<N>/config.toml` (daemon-writable; model
+///   + `cli_auth_credentials_store` mode)
+/// - `sessions` → `config-<N>/codex-sessions/` (per-account persistent
+///   transcripts, per INV-P04 carveout)
+/// - `history.jsonl` → `config-<N>/codex-history.jsonl` (per-account
+///   persistent history)
+///
+/// Plus an ephemeral `log/` directory (per-terminal, ignored by the
+/// sweeper) and a `.live-pid` marker.
+///
+/// Unlike [`create_handle_dir`] (Anthropic), this function does NOT:
+/// - Symlink `SHARED_ITEMS` to `~/.claude` — Codex reads `CODEX_HOME`
+///   and has no dependency on the Claude home directory.
+/// - Materialize `settings.json` / `.claude.json` — Codex configuration
+///   lives in `config.toml`, which is already a per-account symlink.
+///
+/// # Invariant — `pid` MUST equal the caller's `std::process::id()`
+///
+/// Same contract as [`create_handle_dir`]: the sweeper relies on this
+/// to avoid racing creates against live handle dirs. See the
+/// [`create_handle_dir`] docstring for the full rationale.
+///
+/// # Errors
+///
+/// - If `config-<account>` does not exist (Codex slot not provisioned —
+///   PR-C3b `csq login --provider codex` must run first).
+/// - If the canonical credential file `credentials/codex-<N>.json`
+///   does not exist (same reason — login has not completed).
+/// - If the handle dir already exists with a live PID (refuses to
+///   remove — identical semantics to the Anthropic path).
+/// - On any I/O failure.
+pub fn create_handle_dir_codex(
+    base_dir: &Path,
+    account: AccountNum,
+    pid: u32,
+) -> Result<PathBuf, CredentialError> {
+    let config_dir = base_dir.join(format!("config-{}", account));
+    if !config_dir.is_dir() {
+        return Err(CredentialError::Corrupt {
+            path: config_dir,
+            reason: format!(
+                "config-{account} does not exist — run `csq login {account} --provider codex` first"
+            ),
+        });
+    }
+
+    let canonical_cred = base_dir
+        .join("credentials")
+        .join(format!("codex-{account}.json"));
+    if !canonical_cred.exists() {
+        return Err(CredentialError::Corrupt {
+            path: canonical_cred,
+            reason: format!(
+                "credentials/codex-{account}.json does not exist — \
+                 Codex slot {account} has not completed login"
+            ),
+        });
+    }
+
+    let handle_dir = base_dir.join(format!("term-{}", pid));
+
+    // Same orphan-detection semantics as create_handle_dir — only
+    // remove a stale handle dir whose recorded PID is dead or absent.
+    if handle_dir.exists() {
+        let live_pid_path = handle_dir.join(".live-pid");
+        let recorded_pid: Option<u32> = std::fs::read_to_string(&live_pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+
+        if let Some(recorded) = recorded_pid {
+            if is_pid_alive(recorded) {
+                return Err(CredentialError::Corrupt {
+                    path: handle_dir.clone(),
+                    reason: format!(
+                        "handle dir term-{pid} is in use by live PID {recorded}. \
+                         Refusing to remove. If you believe this is stale, stop \
+                         the process and rerun."
+                    ),
+                });
+            }
+        }
+
+        warn!(
+            pid,
+            recorded = ?recorded_pid,
+            "codex handle dir already exists with dead or missing PID — removing orphan"
+        );
+        std::fs::remove_dir_all(&handle_dir).map_err(|e| CredentialError::Io {
+            path: handle_dir.clone(),
+            source: e,
+        })?;
+    }
+
+    std::fs::create_dir(&handle_dir).map_err(|e| CredentialError::Io {
+        path: handle_dir.clone(),
+        source: e,
+    })?;
+
+    // Codex symlink set per spec 07 §7.2.2. Sources are either
+    // `config-<N>/<item>` or `credentials/codex-<N>.json` depending
+    // on the item — auth.json symlinks canonical-direct.
+    let codex_links: &[(&str, PathBuf)] = &[
+        (".csq-account", config_dir.join(".csq-account")),
+        ("auth.json", canonical_cred.clone()),
+        ("config.toml", config_dir.join("config.toml")),
+        ("sessions", config_dir.join("codex-sessions")),
+        ("history.jsonl", config_dir.join("codex-history.jsonl")),
+    ];
+
+    for (name, target) in codex_links {
+        let link = handle_dir.join(name);
+        // Only symlink items whose target exists OR is a known-expected
+        // persistent state dir/file. `codex-sessions/` and
+        // `codex-history.jsonl` may legitimately be absent on first
+        // spawn — codex-cli creates them lazily. Skip those silently.
+        if !target.exists() && target.symlink_metadata().is_err() {
+            debug!(
+                item = name,
+                target = %target.display(),
+                "codex symlink target does not exist yet; skipping"
+            );
+            continue;
+        }
+        create_symlink(target, &link).map_err(|e| CredentialError::Io {
+            path: link.clone(),
+            source: e,
+        })?;
+        debug!(item = name, "linked codex item");
+    }
+
+    // Ephemeral per-terminal log dir. Codex-cli writes per-session
+    // logs here; the sweeper removes it along with the handle dir.
+    let log_dir = handle_dir.join("log");
+    std::fs::create_dir(&log_dir).map_err(|e| CredentialError::Io {
+        path: log_dir,
+        source: e,
+    })?;
+
+    markers::write_live_pid(&handle_dir, pid)?;
+
+    info!(
+        pid,
+        account = %account,
+        surface = "codex",
+        path = %handle_dir.display(),
+        "codex handle dir created"
+    );
+    Ok(handle_dir)
+}
+
 /// Writes `handle_dir/settings.json` as a real file by deep-merging
 /// `claude_home/settings.json` (base) with `config_dir/settings.json`
 /// (overlay).
@@ -3046,5 +3205,234 @@ mod tests {
                 "{name} must be a file"
             );
         }
+    }
+
+    // ── create_handle_dir_codex (PR-C3a) ───────────────────────────────
+
+    fn setup_codex_slot(base: &Path, account: u16) -> PathBuf {
+        // Create config-<N> with the Codex-specific bits: marker,
+        // config.toml, codex-sessions dir, codex-history.jsonl file.
+        let config = base.join(format!("config-{account}"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(".csq-account"), account.to_string()).unwrap();
+        std::fs::write(config.join("config.toml"), "[model]\nname = \"o1\"\n").unwrap();
+        std::fs::create_dir_all(config.join("codex-sessions")).unwrap();
+        std::fs::write(config.join("codex-history.jsonl"), "").unwrap();
+
+        // Canonical credential file that auth.json will symlink to.
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join(format!("codex-{account}.json")),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"at","refresh_token":"rt","id_token":"it","account_id":"uuid"}}"#,
+        )
+        .unwrap();
+
+        config
+    }
+
+    #[test]
+    fn create_handle_dir_codex_populates_codex_symlink_set() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 2);
+
+        let account = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir_codex(base, account, 88888).unwrap();
+
+        assert!(handle.exists());
+        assert_eq!(handle.file_name().unwrap().to_str().unwrap(), "term-88888");
+
+        #[cfg(unix)]
+        {
+            // Every Codex symlink in the set should land and resolve
+            // to its spec-defined target.
+            let auth = handle.join("auth.json");
+            assert!(auth.symlink_metadata().unwrap().file_type().is_symlink());
+            let target = std::fs::read_link(&auth).unwrap();
+            assert!(
+                target.ends_with("credentials/codex-2.json"),
+                "auth.json target: {:?}",
+                target
+            );
+
+            let csq_acc = handle.join(".csq-account");
+            assert!(csq_acc.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(std::fs::read_link(&csq_acc)
+                .unwrap()
+                .ends_with("config-2/.csq-account"));
+
+            let cfg = handle.join("config.toml");
+            assert!(cfg.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(std::fs::read_link(&cfg)
+                .unwrap()
+                .ends_with("config-2/config.toml"));
+
+            let sessions = handle.join("sessions");
+            assert!(sessions
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(std::fs::read_link(&sessions)
+                .unwrap()
+                .ends_with("config-2/codex-sessions"));
+
+            let hist = handle.join("history.jsonl");
+            assert!(hist.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(std::fs::read_link(&hist)
+                .unwrap()
+                .ends_with("config-2/codex-history.jsonl"));
+        }
+
+        // Ephemeral per-terminal log dir is a real directory, not a symlink.
+        let log = handle.join("log");
+        assert!(log.is_dir());
+        #[cfg(unix)]
+        assert!(!log.symlink_metadata().unwrap().file_type().is_symlink());
+
+        // .live-pid contains the supplied PID.
+        let pid_str = std::fs::read_to_string(handle.join(".live-pid")).unwrap();
+        assert_eq!(pid_str.trim(), "88888");
+    }
+
+    #[test]
+    fn create_handle_dir_codex_does_not_materialize_settings_or_claude_json() {
+        // Codex handle dirs MUST NOT carry settings.json or
+        // .claude.json — those are Anthropic-specific (PR-C3a
+        // docstring). Confirm they are absent after creation.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 3);
+
+        let account = AccountNum::try_from(3u16).unwrap();
+        let handle = create_handle_dir_codex(base, account, 88889).unwrap();
+
+        assert!(
+            !handle.join("settings.json").exists(),
+            "Codex handle dir must not carry settings.json"
+        );
+        assert!(
+            !handle.join(".claude.json").exists(),
+            "Codex handle dir must not carry .claude.json"
+        );
+        assert!(
+            !handle.join(".credentials.json").exists(),
+            "Codex handle dir must not carry Anthropic-shaped .credentials.json"
+        );
+    }
+
+    #[test]
+    fn create_handle_dir_codex_refuses_when_config_dir_missing() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(5u16).unwrap();
+        let result = create_handle_dir_codex(dir.path(), account, 1);
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("config-5"),
+                    "error must name the missing config dir: {reason}"
+                );
+                assert!(
+                    reason.contains("login"),
+                    "error must hint at `csq login ... --provider codex`: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for missing config-N, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_handle_dir_codex_refuses_when_canonical_credential_missing() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        // Provision config-<N> but NOT the canonical credential file.
+        let config = base.join("config-6");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(".csq-account"), "6").unwrap();
+        std::fs::write(config.join("config.toml"), "").unwrap();
+
+        let account = AccountNum::try_from(6u16).unwrap();
+        let result = create_handle_dir_codex(base, account, 1);
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("codex-6.json"),
+                    "error must name the missing canonical file: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for missing canonical, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_handle_dir_codex_refuses_live_pid_collision() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 7);
+
+        let account = AccountNum::try_from(7u16).unwrap();
+        // Pre-create a handle dir with a PID that is definitely alive
+        // — use our own PID. The function must refuse rather than
+        // clobber it.
+        let own_pid = std::process::id();
+        let handle = base.join(format!("term-{own_pid}"));
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".live-pid"), own_pid.to_string()).unwrap();
+
+        let result = create_handle_dir_codex(base, account, own_pid);
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("in use by live PID"),
+                    "error must refuse live-pid collision: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for live pid collision, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_handle_dir_codex_tolerates_missing_sessions_and_history() {
+        // codex-sessions/ and codex-history.jsonl may be absent on
+        // first spawn — codex-cli creates them lazily. The function
+        // must silently skip those symlinks rather than erroring.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let config = base.join("config-8");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(".csq-account"), "8").unwrap();
+        std::fs::write(config.join("config.toml"), "").unwrap();
+        // Deliberately DO NOT create codex-sessions/ or codex-history.jsonl.
+
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("codex-8.json"),
+            r#"{"tokens":{"access_token":"at"}}"#,
+        )
+        .unwrap();
+
+        let account = AccountNum::try_from(8u16).unwrap();
+        let handle = create_handle_dir_codex(base, account, 88880).expect("should succeed");
+
+        assert!(handle.exists());
+        // Required symlinks present:
+        assert!(handle.join("auth.json").symlink_metadata().is_ok());
+        assert!(handle.join("config.toml").symlink_metadata().is_ok());
+        assert!(handle.join(".csq-account").symlink_metadata().is_ok());
+        // Optional symlinks absent (targets didn't exist):
+        assert!(
+            !handle.join("sessions").exists()
+                && handle.join("sessions").symlink_metadata().is_err(),
+            "sessions symlink must be skipped when target is absent"
+        );
+        assert!(
+            !handle.join("history.jsonl").exists()
+                && handle.join("history.jsonl").symlink_metadata().is_err(),
+            "history.jsonl symlink must be skipped when target is absent"
+        );
+        // log/ is always created fresh.
+        assert!(handle.join("log").is_dir());
     }
 }

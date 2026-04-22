@@ -312,6 +312,53 @@ pub fn repoint_handle_dir(
         });
     }
 
+    // VP-final F3: pre-flight check to prevent mixed-state handle dirs.
+    //
+    // The rename loop has a "silently continue" path for missing items (the `if
+    // !new_target.exists() && new_target.symlink_metadata().is_err()` branch).
+    // When the CURRENT handle dir has a symlink for `item` but the NEW config
+    // does not have the corresponding target, the loop removes the old symlink
+    // without creating a new one — leaving the handle dir in a mixed-state where
+    // one symlink is gone and the others still point at the old config. CC then
+    // reads a stale or missing identity marker.
+    //
+    // Pre-flight guards the ONE item that is unconditionally required in EVERY
+    // config dir — Anthropic or 3P: `.csq-account`. Without it csq cannot
+    // determine which account the handle dir is on after the swap, and the
+    // daemon's auto-rotate loop will skip the handle dir on every subsequent
+    // tick (sees no marker → skips). All other items may legitimately be absent
+    // (e.g. `.credentials.json` is absent for 3P slots that use API keys via
+    // `env.ANTHROPIC_AUTH_TOKEN`; `.current-account` and `.quota-cursor` are
+    // created lazily). Only `.csq-account` is structurally required in all cases.
+    {
+        let csq_account_target = new_config.join(".csq-account");
+        if !csq_account_target.exists() && csq_account_target.symlink_metadata().is_err() {
+            return Err(CredentialError::Corrupt {
+                path: csq_account_target,
+                reason: format!(
+                    "repoint target missing .csq-account in {} — repoint aborted to prevent \
+                     mixed-state handle dir",
+                    new_config.display()
+                ),
+            });
+        }
+    }
+
+    // VP-final F4: serialize concurrent swap + auto-rotate via a per-handle-dir
+    // flock. Without this, two callers — e.g. `csq swap` in the terminal AND the
+    // daemon's auto-rotate tick — can interleave rename operations and leave the
+    // handle dir pointing at two different config-N dirs simultaneously.
+    //
+    // `.swap.lock` lives inside the handle dir so it is automatically cleaned up
+    // when the handle dir is swept. `lock_file` blocks until the lock is available
+    // (blocking, not try_lock) so the slower caller is serialized, not dropped.
+    let lock_path = handle_dir.join(".swap.lock");
+    let _swap_guard =
+        crate::platform::lock::lock_file(&lock_path).map_err(|e| CredentialError::Corrupt {
+            path: lock_path.clone(),
+            reason: format!("repoint lock acquisition failed: {e}"),
+        })?;
+
     // Atomic repoint: create temp symlink then rename over existing
     for item in ACCOUNT_BOUND_ITEMS {
         let new_target = new_config.join(item);
@@ -2807,6 +2854,154 @@ mod tests {
             second_content.contains("cmd+s"),
             "user custom bindings must not be overwritten"
         );
+    }
+
+    // ── VP-final F3: pre-flight existence guard ───────────────────────────
+
+    /// Regression guard: VP-final F3.
+    ///
+    /// `repoint_handle_dir` must refuse to start the rename loop when the
+    /// `.csq-account` marker is absent from the target `config-<N>` directory.
+    /// Without it csq cannot determine which account the handle dir is on after
+    /// the swap. The old "silently continue" path would remove the existing
+    /// `.csq-account` symlink without creating a new one.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_aborts_when_target_config_missing_csq_account() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        // Config-1: complete
+        setup_config_dir(base, 1);
+        // Config-2: intentionally missing .csq-account (the required marker)
+        let config_2 = base.join("config-2");
+        std::fs::create_dir_all(&config_2).unwrap();
+        // NOT writing .csq-account — this is the missing item under test
+        std::fs::write(config_2.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(config_2.join("settings.json"), "{}").unwrap();
+        std::fs::write(config_2.join(".claude.json"), "{}").unwrap();
+
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 55551).unwrap();
+
+        // Attempt to repoint to account 2 — should fail because .csq-account
+        // is missing from config-2, preventing a mixed-state handle dir.
+        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+
+        assert!(
+            result.is_err(),
+            "repoint must return Err when target config is missing .csq-account"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(".csq-account"),
+            "error must name the missing item, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("mixed-state") || err_msg.contains("repoint aborted"),
+            "error must describe the abort reason, got: {err_msg}"
+        );
+
+        // Handle dir must still be bound to account 1 (no partial repoint)
+        assert_eq!(
+            markers::read_csq_account(&handle),
+            Some(account1),
+            "handle dir must remain on account 1 after aborted repoint"
+        );
+    }
+
+    // ── VP-final F4: concurrent swap serialization ────────────────────────
+
+    /// Regression guard: VP-final F4.
+    ///
+    /// Two threads both calling `repoint_handle_dir` on the SAME handle dir
+    /// but with DIFFERENT targets must produce a consistent final state:
+    /// all 4 symlinks must point at the SAME config-<N> dir (whichever
+    /// thread won the lock). Without the flock the two threads can interleave
+    /// rename operations, leaving the handle dir in a mixed-state where
+    /// `.credentials.json` points at config-2 but `.csq-account` still
+    /// points at config-3.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_serializes_concurrent_writers() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        // Create three accounts: handle starts on 1, threads race to set 2 vs 3
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        setup_config_dir(dir.path(), 3);
+
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let account3 = AccountNum::try_from(3u16).unwrap();
+
+        let handle = create_handle_dir(dir.path(), &claude_home, account1, 55552).unwrap();
+
+        // Barrier: both threads enter repoint_handle_dir at the same time
+        let barrier = Arc::new(Barrier::new(2));
+
+        let base_a = base.clone();
+        let claude_a = claude_home.clone();
+        let handle_a = handle.clone();
+        let barrier_a = barrier.clone();
+        let t1 = thread::spawn(move || {
+            barrier_a.wait();
+            repoint_handle_dir(&base_a, &claude_a, &handle_a, account2)
+        });
+
+        let base_b = base.clone();
+        let claude_b = claude_home.clone();
+        let handle_b = handle.clone();
+        let barrier_b = barrier.clone();
+        let t2 = thread::spawn(move || {
+            barrier_b.wait();
+            repoint_handle_dir(&base_b, &claude_b, &handle_b, account3)
+        });
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        // Both must succeed (no panic, no I/O error from interleaving)
+        assert!(r1.is_ok(), "thread 1 repoint failed: {:?}", r1);
+        assert!(r2.is_ok(), "thread 2 repoint failed: {:?}", r2);
+
+        // The handle dir must be in a CONSISTENT state: all symlinks point
+        // at the SAME config-<N>. Read the account marker to determine winner.
+        let final_account = markers::read_csq_account(&handle)
+            .expect("handle dir must have a readable .csq-account after concurrent repoint");
+
+        // Verify every symlink that EXISTS in the handle dir resolves to the
+        // winner's config dir. Optional items (.current-account, .quota-cursor)
+        // may be absent if they were never created in config-<N> — skip those.
+        // Required items (.credentials.json, .csq-account) must be consistent.
+        let winner_config = base.join(format!("config-{}", final_account));
+        for item in ACCOUNT_BOUND_ITEMS {
+            let link = handle.join(item);
+            // If the item is absent, it was never created in either config dir —
+            // skip. This handles optional items that don't exist yet.
+            if link.symlink_metadata().is_err() {
+                continue;
+            }
+            let resolved = std::fs::read_link(&link).unwrap_or_else(|e| {
+                panic!("{item} link exists but read_link failed: {e}");
+            });
+            assert!(
+                resolved.starts_with(&winner_config),
+                "{item} points at {} but winner config is {} — mixed-state handle dir \
+                 (concurrent repoint without flock would allow this)",
+                resolved.display(),
+                winner_config.display()
+            );
+        }
     }
 
     #[test]

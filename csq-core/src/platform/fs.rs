@@ -33,6 +33,35 @@ pub fn secure_file(path: &Path) -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// Sets file permissions to owner-only read (0o400) on Unix.
+///
+/// Sibling of [`secure_file`] for files that should be immutable outside of a
+/// narrow refresh/write window — primarily canonical credential files
+/// (`credentials/codex-<N>.json`, `credentials/<N>.json`). The refresh flow
+/// acquires the per-account mutex, flips to 0o600 via [`secure_file`],
+/// writes via [`atomic_replace`], then calls this helper to flip back to
+/// 0o400 before releasing the mutex. Derived from spec 07 INV-P08
+/// (credential mode-flip mutex coordination) + workspaces/codex/01-analysis
+/// risk-analysis §2 R7 / ADR-C13.
+///
+/// No-op on Windows — ACL defaults produce read/write for the owner, and
+/// Windows has no standard notion of "read-only but not readable-by-others"
+/// at the POSIX mode level. The same security posture is achieved on
+/// Windows via DACLs set at file-creation time in the credential writer.
+pub fn secure_file_readonly(path: &Path) -> Result<(), PlatformError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o400);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Atomically replaces `target` with `tmp_path`.
 ///
 /// On Unix this is a single `rename(2)` call (atomic on the same filesystem).
@@ -181,6 +210,73 @@ mod tests {
         assert!(secure_file(&path).is_err());
         #[cfg(windows)]
         assert!(secure_file(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_file_readonly_sets_400() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("canonical-cred.json");
+        fs::write(&path, b"\"token\":\"...\"").unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+
+        secure_file_readonly(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
+    /// Canonical credential-file lifecycle (spec 07 INV-P08):
+    /// 0o400 → flip to 0o600 for write → write → flip back to 0o400.
+    #[cfg(unix)]
+    #[test]
+    fn secure_file_roundtrip_400_600_400() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("creds.json");
+        fs::write(&path, b"initial").unwrap();
+
+        secure_file_readonly(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+
+        // Begin refresh window — flip to writable.
+        secure_file(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Refresh writes.
+        fs::write(&path, b"refreshed").unwrap();
+
+        // Close refresh window — flip back to read-only.
+        secure_file_readonly(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
+    #[test]
+    fn secure_file_readonly_nonexistent_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nope.json");
+        #[cfg(unix)]
+        assert!(secure_file_readonly(&path).is_err());
+        #[cfg(windows)]
+        assert!(secure_file_readonly(&path).is_ok());
     }
 
     #[test]

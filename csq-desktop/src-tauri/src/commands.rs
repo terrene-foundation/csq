@@ -230,9 +230,14 @@ pub fn swap_account(base_dir: String, target: u16) -> Result<String, String> {
         .first()
         .ok_or_else(|| format!("no active session for account {target}"))?;
 
-    rotation::swap_to(&base, config_dir, account)
-        .map(|r| format!("Swapped to account {}", r.account))
-        .map_err(|e| e.to_string())
+    rotation::swap_to(
+        &base,
+        config_dir,
+        account,
+        csq_core::providers::catalog::Surface::ClaudeCode,
+    )
+    .map(|r| format!("Swapped to account {}", r.account))
+    .map_err(|e| e.to_string())
 }
 
 /// Renames an account's display label in profiles.json.
@@ -507,9 +512,14 @@ pub fn swap_session(base_dir: String, config_dir: String, target: u16) -> Result
     }
 
     let account = AccountNum::try_from(target).map_err(|e| format!("invalid account: {e}"))?;
-    rotation::swap_to(&base_canon, &config_canon, account)
-        .map(|r| format!("Swapped {} to account {}", name, r.account))
-        .map_err(|e| e.to_string())
+    rotation::swap_to(
+        &base_canon,
+        &config_canon,
+        account,
+        csq_core::providers::catalog::Surface::ClaudeCode,
+    )
+    .map(|r| format!("Swapped {} to account {}", name, r.account))
+    .map_err(|e| e.to_string())
 }
 
 /// Returns whether the csq daemon is running.

@@ -534,7 +534,12 @@ fn perform_tray_swap(base: &Path, account: AccountNum) -> TraySwapResult {
         }
     };
 
-    match rotation::swap_to(base, &target_dir, account) {
+    match rotation::swap_to(
+        base,
+        &target_dir,
+        account,
+        csq_core::providers::catalog::Surface::ClaudeCode,
+    ) {
         Ok(res) => {
             log::info!(
                 "tray swap ok: account {} -> {}",

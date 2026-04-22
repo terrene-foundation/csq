@@ -38,6 +38,7 @@
 
 use crate::accounts::markers;
 use crate::accounts::AccountSource;
+use crate::providers::catalog::Surface;
 use crate::quota::state as quota_state;
 use crate::rotation::config as rotation_config;
 use crate::session::handle_dir::repoint_handle_dir;
@@ -149,16 +150,21 @@ async fn run_loop(
     }
 }
 
-/// Same-surface filter for auto-rotation candidates.
+/// Same-surface filter for auto-rotation candidates (INV-P11).
 ///
-/// v2.0.1: trivially accepts every candidate because all existing
-/// providers are Surface::ClaudeCode. Codex PR-C1 (v2.1) replaces this
-/// with a real Surface enum check per spec 07 INV-P11. Keeping this as
-/// a named function (rather than inline) makes the flip a one-line
-/// change without restructuring the rotator.
-const fn same_surface_as_active(_candidate: AccountNum) -> bool {
-    // TODO(PR-C1): replace with Surface enum dispatch per spec 07 INV-P11
-    true
+/// Auto-rotation must NEVER cross surfaces — a handle-dir bound to a
+/// `Surface::ClaudeCode` account cannot be silently rotated to a
+/// `Surface::Codex` account because the two surfaces execute different
+/// CLI binaries with different `HOME`-like env contracts. Cross-surface
+/// rotation is explicitly a `csq swap` action (journal 0067 H3; spec 07
+/// INV-P11).
+///
+/// PR-C1 flip: pre-C1 this function trivially accepted every candidate
+/// (all providers were `Surface::ClaudeCode`). Now that `Surface::Codex`
+/// is a reachable variant via the catalog stub, this function enforces
+/// the invariant against a concrete surface comparison.
+fn same_surface_as_active(active_surface: Surface, candidate_surface: Surface) -> bool {
+    active_surface == candidate_surface
 }
 
 /// Returns `true` if the account currently bound to `handle_dir` is a 3P slot.
@@ -412,12 +418,25 @@ fn find_target(
         .chain(std::iter::once(current.get()))
         .collect();
 
+    // Determine the current terminal's surface so the same-surface filter
+    // (INV-P11) can reject cross-surface candidates. If discovery doesn't
+    // return a record for the current account — which happens for handle
+    // dirs pointing at an account that has since been deleted — fall back
+    // to `Surface::ClaudeCode`. This default is safe in v2.1 because the
+    // only other surface (`Codex`) is not yet reachable through real
+    // login flows; PR-C3 will ensure Codex accounts are in discovery
+    // output before it becomes observable.
+    let active_surface = accounts
+        .iter()
+        .find(|a| a.id == current.get())
+        .map(|a| a.surface)
+        .unwrap_or(Surface::ClaudeCode);
+
     // Collect candidates: has credentials, Anthropic source only (VP-final R1
     // CRITICAL: exclude 3P slots — stale credentials/N.json from a prior OAuth
     // binding can co-exist with a 3P settings.json; rotating to that slot would
     // point Anthropic OAuth tokens at a 3P endpoint via env.ANTHROPIC_BASE_URL),
-    // not current, not excluded, passes the same-surface filter (stub: always
-    // true pre-PR-C1).
+    // not current, not excluded, AND passes the same-surface filter (INV-P11).
     //
     // NOTE: `discover_anthropic` classifies slots with `credentials/N.json` as
     // `AccountSource::Anthropic` even when `config-N/settings.json` also sets
@@ -441,8 +460,9 @@ fn find_target(
             if handle_dir_is_3p(base_dir, num) {
                 return None;
             }
-            // Surface filter: PR-C1 will replace this with a real check.
-            if !same_surface_as_active(num) {
+            // INV-P11: same-surface filter. Auto-rotation never crosses
+            // surfaces; that's an explicit `csq swap` operation.
+            if !same_surface_as_active(active_surface, a.surface) {
                 return None;
             }
             let pct = quota
@@ -889,21 +909,23 @@ mod tests {
         );
     }
 
+    /// PR-C1: `same_surface_as_active` now does a real `Surface == Surface`
+    /// comparison (INV-P11). Same-surface accepts; cross-surface rejects.
     #[test]
-    fn same_surface_stub_always_true_pre_c1() {
-        // Regression guard: same_surface_as_active must return true for any
-        // account number until Codex PR-C1 flips it to a real Surface enum
-        // check. If this test fails, it means PR-C1 landed without this test
-        // being updated — verify the Surface filter is correct before removing.
-        let acc = AccountNum::try_from(5u16).unwrap();
-        assert!(
-            same_surface_as_active(acc),
-            "same_surface_as_active should return true for all accounts pre-PR-C1"
-        );
-        let acc1 = AccountNum::try_from(1u16).unwrap();
-        assert!(same_surface_as_active(acc1));
-        let acc7 = AccountNum::try_from(7u16).unwrap();
-        assert!(same_surface_as_active(acc7));
+    fn same_surface_filter_accepts_matching_surface() {
+        assert!(same_surface_as_active(
+            Surface::ClaudeCode,
+            Surface::ClaudeCode
+        ));
+        assert!(same_surface_as_active(Surface::Codex, Surface::Codex));
+    }
+
+    /// INV-P11 negative path: cross-surface rotation MUST be rejected —
+    /// auto-rotation never crosses surfaces; that's a `csq swap` action.
+    #[test]
+    fn same_surface_filter_rejects_cross_surface() {
+        assert!(!same_surface_as_active(Surface::ClaudeCode, Surface::Codex));
+        assert!(!same_surface_as_active(Surface::Codex, Surface::ClaudeCode));
     }
 
     #[test]

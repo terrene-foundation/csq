@@ -29,6 +29,7 @@ use crate::accounts::markers;
 use crate::credentials::{self, file};
 use crate::error::{CredentialError, CsqError};
 use crate::platform::lock;
+use crate::providers::catalog::Surface;
 use crate::types::AccountNum;
 use std::path::Path;
 use tracing::{debug, warn};
@@ -38,13 +39,36 @@ use tracing::{debug, warn};
 /// Reads canonical credentials for `target`, writes them to
 /// `config_dir/.credentials.json` (atomic), and updates markers.
 ///
+/// `surface` identifies which upstream CLI the target account belongs
+/// to. Only `Surface::ClaudeCode` is supported on this code path in
+/// v2.1 — Codex swaps go through a dedicated flow landed by PR-C7.
+/// The surface parameter exists NOW so this function can refuse non-
+/// ClaudeCode swaps explicitly rather than silently accessing the
+/// `claude_ai_oauth` credential layout that doesn't match other
+/// surfaces (spec 07 INV-P10, journal 0067 H3).
+///
 /// Preserves `.quota-cursor` (NOT deleted during swap).
 /// Best-effort keychain write.
 pub fn swap_to(
     base_dir: &Path,
     config_dir: &Path,
     target: AccountNum,
+    surface: Surface,
 ) -> Result<SwapResult, CsqError> {
+    // INV-P10 structural guard: this swap path is ClaudeCode-specific.
+    // A Codex swap would access `auth.json` / `config.toml` rather than
+    // the `claude_ai_oauth` credential file, and would need its own
+    // atomic-replace + handle-dir symlink sequence. Fail fast rather
+    // than silently corrupting Codex state.
+    if surface != Surface::ClaudeCode {
+        return Err(CsqError::Credential(CredentialError::InvalidAccount(
+            format!(
+                "swap_to: surface {surface} not supported on this path \
+                 (v2.1 ClaudeCode only; Codex swap lands in PR-C7)"
+            ),
+        )));
+    }
+
     let canonical_path = file::canonical_path(base_dir, target);
 
     // Acquire the per-account refresh lock. This is the same lock
@@ -61,6 +85,11 @@ pub fn swap_to(
     // the value from the existing live credentials. Without this,
     // swapping to such an account causes CC to lose its Max tier and
     // fall back to Sonnet — the "subscription contamination" bug.
+    //
+    // This guard is ClaudeCode-specific: only Anthropic OAuth
+    // credentials carry subscriptionType / rateLimitTier. Enforced
+    // structurally by the early-return above — this block is
+    // unreachable for other surfaces.
     if creds.claude_ai_oauth.subscription_type.is_none() {
         let live_path_check = config_dir.join(".credentials.json");
         if let Ok(existing) = credentials::load(&live_path_check) {
@@ -163,7 +192,7 @@ mod tests {
         let creds = make_creds("at-3", "rt-3");
         credentials::save(&file::canonical_path(dir.path(), target), &creds).unwrap();
 
-        let result = swap_to(dir.path(), &config, target).unwrap();
+        let result = swap_to(dir.path(), &config, target, Surface::ClaudeCode).unwrap();
         assert_eq!(result.account, target);
 
         // Live file written
@@ -189,7 +218,7 @@ mod tests {
         // Set up canonical and swap
         let creds = make_creds("at-1", "rt-1");
         credentials::save(&file::canonical_path(dir.path(), target), &creds).unwrap();
-        swap_to(dir.path(), &config, target).unwrap();
+        swap_to(dir.path(), &config, target, Surface::ClaudeCode).unwrap();
 
         // Cursor must still exist
         assert!(cursor_path.exists());
@@ -206,7 +235,7 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
         let target = AccountNum::try_from(9u16).unwrap();
 
-        let result = swap_to(dir.path(), &config, target);
+        let result = swap_to(dir.path(), &config, target, Surface::ClaudeCode);
         assert!(result.is_err());
     }
 
@@ -263,7 +292,7 @@ mod tests {
 
         // swap_to should block on the lock, then read the FRESH
         // canonical that the refresher wrote.
-        let result = swap_to(dir.path(), &config, target).unwrap();
+        let result = swap_to(dir.path(), &config, target, Surface::ClaudeCode).unwrap();
         assert_eq!(result.account, target);
 
         // The live file must contain the FRESH token, not the stale one.
@@ -275,5 +304,33 @@ mod tests {
         );
 
         refresher.join().unwrap();
+    }
+
+    /// PR-C1 INV-P10: swap_to on this path is ClaudeCode-only. Passing a
+    /// non-ClaudeCode surface MUST fail fast rather than silently
+    /// accessing a `claude_ai_oauth` credential layout that doesn't
+    /// apply. Codex swap ships through a dedicated flow in PR-C7.
+    #[test]
+    fn swap_to_refuses_non_claude_code_surface() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-5");
+        std::fs::create_dir_all(&config).unwrap();
+        let target = AccountNum::try_from(5u16).unwrap();
+
+        // Plant a valid ClaudeCode canonical so the failure is visibly
+        // the surface-guard early-return, not a missing-file error.
+        let creds = make_creds("at-5", "rt-5");
+        credentials::save(&file::canonical_path(dir.path(), target), &creds).unwrap();
+
+        let result = swap_to(dir.path(), &config, target, Surface::Codex);
+        assert!(
+            result.is_err(),
+            "swap_to must refuse Surface::Codex in v2.1"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("codex"),
+            "error must mention the rejected surface: {err_msg}"
+        );
     }
 }

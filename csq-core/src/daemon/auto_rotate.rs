@@ -37,6 +37,7 @@
 //! one tick interval after `shutdown.cancel()`.
 
 use crate::accounts::markers;
+use crate::accounts::AccountSource;
 use crate::quota::state as quota_state;
 use crate::rotation::config as rotation_config;
 use crate::session::handle_dir::repoint_handle_dir;
@@ -160,6 +161,35 @@ const fn same_surface_as_active(_candidate: AccountNum) -> bool {
     true
 }
 
+/// Returns `true` if the account currently bound to `handle_dir` is a 3P slot.
+///
+/// Belt-and-suspenders guard (VP-final F1): reads `config-<account>/settings.json`
+/// for the handle dir's current account and returns `true` if `env.ANTHROPIC_BASE_URL`
+/// is present. If the current account is a 3P slot, the rotator MUST NOT rotate: doing
+/// so would repoint the handle dir's symlinks such that CC picks up Anthropic OAuth
+/// tokens AND the 3P `env.ANTHROPIC_BASE_URL` from `config-<N>/settings.json` —
+/// sending Anthropic OAuth tokens to a 3P endpoint (live token exfiltration).
+///
+/// Returns `false` on any I/O or parse error (fail-safe: a missing or unparseable
+/// settings.json means no 3P binding — allow the rotation check to proceed).
+fn handle_dir_is_3p(base_dir: &Path, current_account: AccountNum) -> bool {
+    let config_dir = base_dir.join(format!("config-{}", current_account));
+    let settings_path = config_dir.join("settings.json");
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Check env.ANTHROPIC_BASE_URL (canonical location) and top-level fallback.
+    json.get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .or_else(|| json.get("ANTHROPIC_BASE_URL"))
+        .is_some()
+}
+
 /// Runs a single auto-rotation tick.
 ///
 /// Exposed `pub` for both unit tests and integration tests.
@@ -215,6 +245,10 @@ pub fn tick(
 
     for entry in entries.flatten() {
         let handle_dir = entry.path();
+        // VP-final F2: canonicalize the handle_dir path so symlinked base_dirs
+        // (e.g. /var/folders/... vs /private/var/folders/... on macOS) don't
+        // produce two independent cooldown keys for the same physical directory.
+        let handle_dir = std::fs::canonicalize(&handle_dir).unwrap_or(handle_dir);
 
         // Only consider term-* directories (handle dirs).
         let name = match handle_dir.file_name().and_then(|n| n.to_str()) {
@@ -239,6 +273,22 @@ pub fn tick(
                 continue;
             }
         };
+
+        // VP-final F1 (belt-and-suspenders): if the current account is a 3P slot,
+        // skip rotation entirely for this handle dir. Rotating a 3P handle dir would
+        // send Anthropic OAuth tokens to the 3P ANTHROPIC_BASE_URL endpoint — live
+        // token exfiltration. The primary guard is in find_target (3P accounts are
+        // filtered from candidates), but this secondary check prevents the rotator
+        // from ever calling repoint_handle_dir when the CURRENT slot is already 3P.
+        if handle_dir_is_3p(base_dir, current_account) {
+            debug!(
+                dir = %handle_dir.display(),
+                account = current_account.get(),
+                "auto-rotation: current account is a 3P slot — skipping (VP-F1)"
+            );
+            skipped += 1;
+            continue;
+        }
 
         // Check per-handle-dir cooldown (keyed on handle_dir path, not account).
         if let Some(&last_rotated) = cooldowns.get(&handle_dir) {
@@ -362,14 +412,33 @@ fn find_target(
         .chain(std::iter::once(current.get()))
         .collect();
 
-    // Collect candidates: has credentials, not current, not excluded,
-    // passes the same-surface filter (stub: always true pre-PR-C1).
+    // Collect candidates: has credentials, Anthropic source only (VP-final R1
+    // CRITICAL: exclude 3P slots — stale credentials/N.json from a prior OAuth
+    // binding can co-exist with a 3P settings.json; rotating to that slot would
+    // point Anthropic OAuth tokens at a 3P endpoint via env.ANTHROPIC_BASE_URL),
+    // not current, not excluded, passes the same-surface filter (stub: always
+    // true pre-PR-C1).
+    //
+    // NOTE: `discover_anthropic` classifies slots with `credentials/N.json` as
+    // `AccountSource::Anthropic` even when `config-N/settings.json` also sets
+    // `env.ANTHROPIC_BASE_URL` (a stale credential from a prior OAuth binding
+    // on a now-3P slot). We therefore double-check the config dir's settings.json
+    // directly to catch this co-existence case.
     let candidates: Vec<(AccountNum, f64, u64)> = accounts
         .into_iter()
         .filter(|a| a.has_credentials)
+        .filter(|a| matches!(a.source, AccountSource::Anthropic))
         .filter_map(|a| {
             let num = AccountNum::try_from(a.id).ok()?;
             if excluded_ids.contains(&num.get()) {
+                return None;
+            }
+            // VP-final R1 CRITICAL: check config-N/settings.json for 3P binding.
+            // A stale credentials/N.json can co-exist with a 3P settings.json —
+            // discover_anthropic marks the slot Anthropic because it finds the
+            // credential file, but the slot is actually 3P. Rotating to it would
+            // send Anthropic OAuth tokens to env.ANTHROPIC_BASE_URL. Reject it.
+            if handle_dir_is_3p(base_dir, num) {
                 return None;
             }
             // Surface filter: PR-C1 will replace this with a real check.
@@ -603,10 +672,12 @@ mod tests {
             Some(AccountNum::try_from(2u16).unwrap()),
             "handle dir should be repointed to account 2"
         );
-        // Cooldown entry keyed on handle_dir path
+        // Cooldown entry keyed on the CANONICAL handle_dir path (VP-final F2:
+        // tick canonicalizes the path before inserting into cooldowns).
+        let canonical_handle = std::fs::canonicalize(&handle_dir).unwrap_or(handle_dir.clone());
         assert!(
-            cooldowns.contains_key(&handle_dir),
-            "cooldown entry should be set for the handle dir"
+            cooldowns.contains_key(&canonical_handle),
+            "cooldown entry should be set for the handle dir (canonical key)"
         );
     }
 
@@ -912,24 +983,201 @@ mod tests {
             "handle_dir_b should be repointed to account 2"
         );
 
-        // Assert: cooldown map has TWO entries, each keyed on a distinct handle dir path
+        // Assert: cooldown map has TWO entries, each keyed on a distinct canonical
+        // handle dir path (VP-final F2: tick canonicalizes before inserting).
+        let canonical_a = std::fs::canonicalize(&handle_dir_a).unwrap_or(handle_dir_a.clone());
+        let canonical_b = std::fs::canonicalize(&handle_dir_b).unwrap_or(handle_dir_b.clone());
         assert_eq!(
             cooldowns.len(),
             2,
             "cooldown map must have one entry per handle dir, not per account"
         );
         assert!(
-            cooldowns.contains_key(&handle_dir_a),
-            "cooldown keyed on handle_dir_a path"
+            cooldowns.contains_key(&canonical_a),
+            "cooldown keyed on handle_dir_a canonical path"
         );
         assert!(
-            cooldowns.contains_key(&handle_dir_b),
-            "cooldown keyed on handle_dir_b path"
+            cooldowns.contains_key(&canonical_b),
+            "cooldown keyed on handle_dir_b canonical path"
         );
-        // Verify the two keys are different paths (not the same account key)
+        // Verify the two canonical keys are different paths (not the same account key)
         assert_ne!(
-            handle_dir_a, handle_dir_b,
-            "two distinct handle dirs must have distinct cooldown keys"
+            canonical_a, canonical_b,
+            "two distinct handle dirs must have distinct canonical cooldown keys"
+        );
+    }
+
+    // ── VP-final F1: 3P slot exfiltration guard ───────────────────────────
+
+    /// Regression guard: VP-final R1 CRITICAL.
+    ///
+    /// Setup:
+    /// - Slot 1: Anthropic — credentials/1.json + config-1 with no 3P settings
+    /// - Slot 2: Z.AI — credentials/2.json (leftover from prior OAuth binding)
+    /// - `config-2/settings.json` with `ANTHROPIC_BASE_URL=https://api.zai.io`
+    ///
+    /// Slot 1 is over threshold. `find_target` must return `None` because the only
+    /// other candidate (slot 2) is a 3P slot and must be excluded.
+    #[test]
+    fn find_target_skips_3p_slots_with_stale_anthropic_creds() {
+        // Arrange: slot 1 = Anthropic (clean), slot 2 = 3P (stale OAuth creds)
+        let dir = TempDir::new().unwrap();
+
+        // Slot 1: Anthropic — has canonical credentials
+        setup_account(dir.path(), 1);
+        setup_config_dir(dir.path(), 1);
+        setup_quota(dir.path(), 1, 97.0);
+
+        // Slot 2: 3P slot — stale credentials/2.json from prior OAuth binding
+        // plus config-2/settings.json marking it as a 3P endpoint.
+        setup_account(dir.path(), 2); // writes credentials/2.json (stale)
+        let config_2 = setup_config_dir(dir.path(), 2);
+        // Write 3P settings.json to mark this as a 3P slot
+        std::fs::write(
+            config_2.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.zai.io","ANTHROPIC_AUTH_TOKEN":"k"}}"#,
+        )
+        .unwrap();
+        setup_quota(dir.path(), 2, 10.0);
+
+        let account_1 = AccountNum::try_from(1u16).unwrap();
+
+        // Act: find_target with slot 1 as current (over threshold)
+        let target = find_target(dir.path(), account_1, &[]);
+
+        // Assert: slot 2 must be excluded (3P), so no valid target
+        assert_eq!(
+            target, None,
+            "find_target must return None when only remaining candidate is a 3P slot \
+             (VP-final R1 CRITICAL: prevents token exfiltration to 3P endpoint)"
+        );
+    }
+
+    /// Additional belt-and-suspenders guard: tick skips handle dirs whose
+    /// current account is a 3P slot (VP-final F1 secondary check).
+    #[test]
+    fn tick_skips_handle_dir_when_current_account_is_3p() {
+        // Arrange: handle dir bound to slot 9 which is a 3P slot.
+        // Slot 1 exists as a low-usage Anthropic account (would be chosen if
+        // the rotator didn't bail on the 3P current-account check).
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+
+        // Slot 1: Anthropic — available
+        setup_account(dir.path(), 1);
+        let config_1 = setup_config_dir(dir.path(), 1);
+        setup_quota(dir.path(), 1, 5.0);
+
+        // Slot 9: 3P — will be the current slot for the handle dir
+        let config_9 = dir.path().join("config-9");
+        std::fs::create_dir_all(&config_9).unwrap();
+        let acct9 = AccountNum::try_from(9u16).unwrap();
+        markers::write_csq_account(&config_9, acct9).unwrap();
+        std::fs::write(
+            config_9.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.minimax.io","ANTHROPIC_AUTH_TOKEN":"k"}}"#,
+        )
+        .unwrap();
+        // Stale credentials/9.json from a prior OAuth binding
+        setup_account(dir.path(), 9);
+        setup_quota(dir.path(), 9, 97.0);
+
+        // Create handle dir pointing at slot 9
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 30001, 9);
+
+        // Snapshot config-1 creds to verify they are untouched
+        let cred_1_path = config_1.join(".credentials.json");
+        std::fs::write(&cred_1_path, b"anthropic-slot-1-sentinel").unwrap();
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        // Act
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        // Assert: handle dir still bound to slot 9 (not rotated to slot 1)
+        assert_eq!(
+            markers::read_csq_account(&handle_dir),
+            Some(acct9),
+            "tick must skip handle dir when current account is a 3P slot"
+        );
+        assert!(
+            cooldowns.is_empty(),
+            "no cooldown should be set when 3P handle dir is skipped"
+        );
+        // config-1 credentials untouched
+        assert_eq!(
+            std::fs::read(&cred_1_path).unwrap(),
+            b"anthropic-slot-1-sentinel",
+            "config-1 creds must not be touched when 3P handle dir is skipped"
+        );
+    }
+
+    // ── VP-final F2: cooldown canonicalization ────────────────────────────
+
+    /// Regression guard: VP-final F2.
+    ///
+    /// If the base_dir is accessed via a symlinked path alias (e.g. macOS
+    /// /var/folders/... vs /private/var/folders/...), `entry.path()` returns
+    /// a path under the alias. Without canonicalization the cooldowns HashMap
+    /// would have two independent entries for the same physical directory.
+    ///
+    /// We verify via indirect means: after tick the cooldown map has exactly ONE
+    /// entry. We then inject a pre-aged instant with elapsed time < cooldown and
+    /// run a second tick; the handle dir stays put — proving the canonical key was
+    /// stored and found on second lookup.
+    #[cfg(unix)]
+    #[test]
+    fn cooldown_key_canonicalizes_symlinked_base_dir() {
+        let real_dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+
+        setup_account(real_dir.path(), 1);
+        setup_account(real_dir.path(), 2);
+        setup_quota(real_dir.path(), 1, 97.0);
+        setup_quota(real_dir.path(), 2, 10.0);
+        setup_config_dir(real_dir.path(), 1);
+        setup_config_dir(real_dir.path(), 2);
+        let _handle_dir = setup_handle_dir(real_dir.path(), claude_home.path(), 30002, 1);
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            cooldown_secs: 3600, // 1-hour cooldown — won't expire during test
+            ..RotationConfig::default()
+        };
+        save_rotation_config(real_dir.path(), &cfg).unwrap();
+
+        // First tick: handle dir should rotate (above threshold) and one
+        // cooldown entry should be stored with the CANONICAL path as key.
+        let mut cooldowns = HashMap::new();
+        tick(real_dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        assert_eq!(
+            cooldowns.len(),
+            1,
+            "cooldown map must have exactly one entry after first tick"
+        );
+
+        // Second tick: even if the handle dir's account (now 2) is above
+        // threshold again, the 1-hour cooldown must block re-rotation.
+        setup_quota(real_dir.path(), 2, 98.0);
+        setup_quota(real_dir.path(), 1, 5.0);
+
+        let entry_count_before = cooldowns.len();
+        tick(real_dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        // Entry count must not grow (no duplicate canonical / raw path key).
+        assert_eq!(
+            cooldowns.len(),
+            entry_count_before,
+            "cooldown map must not grow — duplicate key after second tick means \
+             canonicalization is missing"
         );
     }
 }

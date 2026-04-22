@@ -113,6 +113,15 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                 oauth_store: Some(Arc::clone(&oauth_store)),
             };
 
+            // PR-C4: clamp Codex invariants before any subsystem starts.
+            // Pass 1 flips canonical credentials/codex-N.json to 0o400
+            // (INV-P08); Pass 2 rewrites config-N/config.toml when its
+            // `cli_auth_credentials_store = "file"` directive has drifted
+            // (INV-P03). Both passes are surface-scoped to Codex and
+            // mutex-coordinated with the refresher (INV-P09), so they're
+            // safe to run before `spawn_refresher`.
+            let _reconcile_summary = daemon::run_reconciler(&base_dir_for_runtime);
+
             match daemon::serve(&sock_path, router_state).await {
                 Ok((server, server_join)) => {
                     tracing::info!("IPC server bound at {}", sock_path.display());
@@ -124,10 +133,18 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                     // token (cancelled via `server.shutdown()`
                     // below) — the outer token drives the other
                     // two subsystems.
+                    // Codex refresh transport — same Node-subprocess
+                    // wrapper but returns the response `Date` header so
+                    // the broker can emit `clock_skew_detected` per
+                    // spec 07 §7.5 INV-P01 (PR-C4).
+                    let http_post_codex: daemon::HttpPostFnCodex =
+                        Arc::new(|url: &str, body: &str| http::post_json_node_with_date(url, body));
+
                     let refresher = daemon::spawn_refresher(
                         base_dir_for_runtime.clone(),
                         Arc::clone(&refresh_cache),
                         http_post,
+                        http_post_codex,
                         shutdown.clone(),
                     );
 

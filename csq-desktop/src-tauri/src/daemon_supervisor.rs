@@ -43,7 +43,9 @@ use tokio_util::sync::CancellationToken;
 #[cfg(unix)]
 use csq_core::accounts::AccountInfo;
 #[cfg(unix)]
-use csq_core::daemon::{server as daemon_server, HttpGetFn, HttpPostFn, HttpPostProbeFn, TtlCache};
+use csq_core::daemon::{
+    server as daemon_server, HttpGetFn, HttpPostFn, HttpPostFnCodex, HttpPostProbeFn, TtlCache,
+};
 #[cfg(unix)]
 use csq_core::http;
 #[cfg(unix)]
@@ -319,6 +321,10 @@ async fn run_daemon(
     // subprocess transport — its OpenSSL fingerprint passes
     // Cloudflare. Falls back to reqwest if no JS runtime found.
     let http_post: HttpPostFn = Arc::new(|url: &str, body: &str| http::post_json_node(url, body));
+    // PR-C4: Codex refresh transport returns body + Date header so the
+    // broker can emit `clock_skew_detected` per spec 07 §7.5 INV-P01.
+    let http_post_codex: HttpPostFnCodex =
+        Arc::new(|url: &str, body: &str| http::post_json_node_with_date(url, body));
     let http_get: HttpGetFn = Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
         http::get_bearer_node(url, token, headers)
     });
@@ -333,6 +339,11 @@ async fn run_daemon(
         base_dir: Arc::new(base_dir.to_path_buf()),
         oauth_store: Some(Arc::clone(&oauth_store)),
     };
+
+    // PR-C4: reconciler clamps Codex invariants (canonical 0o400 +
+    // config.toml `cli_auth_credentials_store = "file"`) before any
+    // subsystem touches them. Mutex-coordinated with the refresher.
+    let _reconcile_summary = daemon::run_reconciler(base_dir);
 
     // Bind the Unix socket first. If bind fails (e.g. another
     // daemon owns it despite the PidFile acquire — shouldn't
@@ -350,6 +361,7 @@ async fn run_daemon(
         base_dir.to_path_buf(),
         Arc::clone(&refresh_cache),
         http_post,
+        http_post_codex,
         shutdown.clone(),
     );
     let usage_poller = daemon::spawn_usage_poller(

@@ -30,6 +30,7 @@ pub mod lifecycle;
 pub mod paths;
 pub mod pid;
 pub mod refresher;
+pub mod startup_reconciler;
 pub mod usage_poller;
 
 // `server` contains the cross-platform router, RouterState, request
@@ -49,7 +50,10 @@ pub use lifecycle::{status_of, stop_daemon, DaemonStatus};
 pub use paths::pipe_name;
 pub use paths::{pid_file_path, socket_path};
 pub use pid::PidFile;
-pub use refresher::{spawn as spawn_refresher, HttpPostFn, RefreshStatus, RefresherHandle};
+pub use refresher::{
+    spawn as spawn_refresher, HttpPostFn, HttpPostFnCodex, RefreshStatus, RefresherHandle,
+};
+pub use startup_reconciler::{run_reconciler, ReconcileSummary};
 pub use usage_poller::{spawn as spawn_usage_poller, HttpGetFn, HttpPostProbeFn, PollerHandle};
 
 #[cfg(unix)]

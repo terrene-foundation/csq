@@ -611,10 +611,12 @@ mod tests {
     }
 
     /// 6. Round-trip v2 in-memory -> save -> load preserves Gemini fields.
-    ///    Per VP-final R6: v2.0.1 writer forces schema_version=1 on disk;
-    ///    test asserts (a) schema_version on disk is 1, (b) nested Gemini fields survive.
+    ///    Per PR-C6: the v2.1 writer now stamps schema_version=2 on disk
+    ///    (previously forced to 1 under VP-final R6 while v2.0.1 shook out
+    ///    the read path). Test asserts (a) schema_version on disk is 2,
+    ///    (b) nested Gemini fields survive.
     #[test]
-    fn round_trip_v2_read_via_v1_write_preserves_gemini_fields() {
+    fn round_trip_v2_read_via_v2_write_preserves_gemini_fields() {
         use tempfile::TempDir;
 
         // Arrange -- construct in-memory with schema_version=2 + nested Gemini fields
@@ -671,13 +673,13 @@ mod tests {
         super::state::save_state(dir.path(), &original).unwrap();
         let reloaded = super::state::load_state(dir.path()).unwrap();
 
-        // Assert (a): schema_version on disk is 1 (v2.0.1 write-path gate per R6)
+        // Assert (a): schema_version on disk is 2 (PR-C6 write-path flip)
         let raw = std::fs::read_to_string(dir.path().join("quota.json")).unwrap();
         let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
             on_disk["schema_version"].as_u64(),
-            Some(1),
-            "v2.0.1 writer must force schema_version=1 on disk"
+            Some(2),
+            "v2.1 writer (PR-C6) must stamp schema_version=2 on disk"
         );
 
         // Assert (b): nested Gemini fields survive the round-trip via serde defaults

@@ -1,8 +1,10 @@
 //! Credential file I/O — load, save, and canonical save with mirroring.
 
+use super::mutex::AccountMutexTable;
 use super::CredentialFile;
 use crate::error::CredentialError;
-use crate::platform::fs::{atomic_replace, secure_file};
+use crate::platform::fs::{atomic_replace, secure_file, secure_file_readonly};
+use crate::providers::catalog::Surface;
 use crate::types::AccountNum;
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -77,8 +79,13 @@ pub fn save(path: &Path, creds: &CredentialFile) -> Result<(), CredentialError> 
     Ok(())
 }
 
-/// Saves credentials to both canonical (`credentials/N.json`) and
-/// live (`config-N/.credentials.json`) paths atomically.
+/// Saves credentials to both canonical and live paths for the
+/// [`Surface::ClaudeCode`] surface.
+///
+/// Thin wrapper over [`save_canonical_for`] that preserves the
+/// pre-PR-C2a 3-argument signature for the ~70 existing call sites
+/// that are Anthropic-only today. New Codex writers MUST call
+/// [`save_canonical_for`] directly with [`Surface::Codex`].
 ///
 /// If the canonical write succeeds but the live write fails, a warning
 /// is logged but the error is not propagated — the canonical file is
@@ -88,10 +95,63 @@ pub fn save_canonical(
     account: AccountNum,
     creds: &CredentialFile,
 ) -> Result<(), CredentialError> {
-    let canonical = canonical_path(base_dir, account);
+    save_canonical_for(base_dir, account, creds, Surface::ClaudeCode)
+}
+
+/// Surface-dispatched canonical write.
+///
+/// Per spec 07 INV-P08 / INV-P09 (PR-C2a):
+///
+/// 1. Acquires the per-`(Surface, AccountNum)` write mutex from the
+///    process-global [`AccountMutexTable`]. Serialises concurrent
+///    writers within one process; cross-process serialisation is the
+///    flock'd `refresh-lock` path in [`crate::broker::check`].
+/// 2. Writes the canonical file atomically (atomic_replace + 0o600
+///    via [`secure_file`], identical to [`save`]).
+/// 3. For [`Surface::Codex`] only, flips the canonical file to 0o400
+///    after the write — the canonical Codex credential file lives at
+///    0o400 outside narrow refresh windows per INV-P08. Anthropic
+///    canonicals stay at 0o600 (unchanged behaviour).
+/// 4. Writes the live mirror into the account's `config-<N>/` dir.
+///    Mirror failures are logged with a fixed-vocabulary tag and
+///    swallowed; the canonical is authoritative.
+///
+/// The 0o600-first-then-0o400 ordering matters on POSIX: `atomic_replace`
+/// overwrites the target's inode, so the newly-written tmp file's mode
+/// (set by [`secure_file`] before rename) is what lands on disk. A
+/// prior-file-at-0o400 state is therefore not a writability obstacle.
+/// The post-write flip to 0o400 is the active INV-P08 guarantee.
+pub fn save_canonical_for(
+    base_dir: &Path,
+    account: AccountNum,
+    creds: &CredentialFile,
+    surface: Surface,
+) -> Result<(), CredentialError> {
+    let slot_mutex = AccountMutexTable::global().get_or_insert(surface, account);
+    let _guard = slot_mutex.lock().expect("per-account write mutex poisoned");
+
+    let canonical = canonical_path_for(base_dir, account, surface);
     save(&canonical, creds)?;
 
-    let live = live_path(base_dir, account);
+    if surface == Surface::Codex {
+        // INV-P08: Codex canonical lives at 0o400 between refresh windows.
+        // Tolerate a missing platform-fs helper on non-unix via the helper's
+        // own no-op Windows branch.
+        if let Err(e) = secure_file_readonly(&canonical) {
+            warn!(
+                account = %account,
+                surface = %surface,
+                error_kind = "canonical_mode_flip_failed",
+                "failed to flip canonical credential file to 0o400 after write"
+            );
+            return Err(CredentialError::Io {
+                path: canonical,
+                source: std::io::Error::other(e.to_string()),
+            });
+        }
+    }
+
+    let live = live_path_for(base_dir, account, surface);
     if let Err(e) = save(&live, creds) {
         // Journal 0063 L2 / PR-B2 — fixed error-kind tag per security.md Rule 2.
         // Was `error = %e` which formats CredentialError's Display; while
@@ -109,6 +169,7 @@ pub fn save_canonical(
         };
         warn!(
             account = %account,
+            surface = %surface,
             error_kind = kind,
             "failed to mirror credentials to live config dir (canonical save succeeded)"
         );
@@ -117,18 +178,54 @@ pub fn save_canonical(
     Ok(())
 }
 
-/// Returns the canonical credential file path: `{base_dir}/credentials/{N}.json`
+/// Returns the canonical credential file path for the
+/// [`Surface::ClaudeCode`] surface: `{base_dir}/credentials/{N}.json`.
+///
+/// Thin wrapper over [`canonical_path_for`] preserving the pre-PR-C2a
+/// 2-argument signature for existing Anthropic-only call sites.
 pub fn canonical_path(base_dir: &Path, account: AccountNum) -> PathBuf {
-    base_dir
-        .join("credentials")
-        .join(format!("{}.json", account))
+    canonical_path_for(base_dir, account, Surface::ClaudeCode)
 }
 
-/// Returns the live credential file path: `{base_dir}/config-{N}/.credentials.json`
+/// Surface-dispatched canonical credential file path.
+///
+/// | Surface     | Path                                       |
+/// |-------------|--------------------------------------------|
+/// | ClaudeCode  | `{base_dir}/credentials/{N}.json`          |
+/// | Codex       | `{base_dir}/credentials/codex-{N}.json`    |
+///
+/// The Codex path shape is fixed by spec 07 §7.2.2.
+pub fn canonical_path_for(base_dir: &Path, account: AccountNum, surface: Surface) -> PathBuf {
+    let filename = match surface {
+        Surface::ClaudeCode => format!("{}.json", account),
+        Surface::Codex => format!("codex-{}.json", account),
+    };
+    base_dir.join("credentials").join(filename)
+}
+
+/// Returns the live credential file path for the [`Surface::ClaudeCode`]
+/// surface: `{base_dir}/config-{N}/.credentials.json`.
+///
+/// Thin wrapper over [`live_path_for`] preserving the pre-PR-C2a
+/// 2-argument signature for existing Anthropic-only call sites.
 pub fn live_path(base_dir: &Path, account: AccountNum) -> PathBuf {
-    base_dir
-        .join(format!("config-{}", account))
-        .join(".credentials.json")
+    live_path_for(base_dir, account, Surface::ClaudeCode)
+}
+
+/// Surface-dispatched live-mirror credential file path.
+///
+/// | Surface     | Path (inside `config-{N}/`)  |
+/// |-------------|------------------------------|
+/// | ClaudeCode  | `.credentials.json`          |
+/// | Codex       | `codex-auth.json`            |
+///
+/// The Codex path shape is fixed by spec 07 §7.2.2.
+pub fn live_path_for(base_dir: &Path, account: AccountNum, surface: Surface) -> PathBuf {
+    let filename = match surface {
+        Surface::ClaudeCode => ".credentials.json",
+        Surface::Codex => "codex-auth.json",
+    };
+    base_dir.join(format!("config-{}", account)).join(filename)
 }
 
 #[cfg(test)]
@@ -279,5 +376,185 @@ mod tests {
 
         assert_eq!(reserialized["futureTopLevel"], "hello");
         assert_eq!(reserialized["claudeAiOauth"]["futureField"], 42);
+    }
+
+    // ── PR-C2a tests: surface-param paths + mutex + mode-flip ──────────
+
+    #[test]
+    fn canonical_path_for_claude_code_matches_legacy() {
+        let base = Path::new("/base");
+        let account = AccountNum::try_from(3u16).unwrap();
+        assert_eq!(
+            canonical_path_for(base, account, Surface::ClaudeCode),
+            canonical_path(base, account)
+        );
+    }
+
+    #[test]
+    fn canonical_path_for_codex_prefixes_filename() {
+        let base = Path::new("/base");
+        let account = AccountNum::try_from(3u16).unwrap();
+        assert_eq!(
+            canonical_path_for(base, account, Surface::Codex),
+            PathBuf::from("/base/credentials/codex-3.json")
+        );
+    }
+
+    #[test]
+    fn live_path_for_claude_code_matches_legacy() {
+        let base = Path::new("/base");
+        let account = AccountNum::try_from(4u16).unwrap();
+        assert_eq!(
+            live_path_for(base, account, Surface::ClaudeCode),
+            live_path(base, account)
+        );
+    }
+
+    #[test]
+    fn live_path_for_codex_is_codex_auth_json() {
+        let base = Path::new("/base");
+        let account = AccountNum::try_from(4u16).unwrap();
+        assert_eq!(
+            live_path_for(base, account, Surface::Codex),
+            PathBuf::from("/base/config-4/codex-auth.json")
+        );
+    }
+
+    #[test]
+    fn save_canonical_claude_code_matches_save_canonical_for() {
+        // Both paths must write to the same files for Surface::ClaudeCode.
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(5u16).unwrap();
+
+        save_canonical(dir.path(), account, &sample_creds()).unwrap();
+        assert!(canonical_path(dir.path(), account).exists());
+        assert!(live_path(dir.path(), account).exists());
+
+        // Overwrite via explicit surface form — same paths are hit.
+        save_canonical_for(dir.path(), account, &sample_creds(), Surface::ClaudeCode).unwrap();
+        assert!(canonical_path_for(dir.path(), account, Surface::ClaudeCode).exists());
+    }
+
+    #[test]
+    fn save_canonical_for_codex_writes_codex_prefixed_paths() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(6u16).unwrap();
+
+        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+
+        let canonical = canonical_path_for(dir.path(), account, Surface::Codex);
+        let live = live_path_for(dir.path(), account, Surface::Codex);
+        assert!(
+            canonical.exists(),
+            "codex canonical must land at {canonical:?}"
+        );
+        assert!(live.exists(), "codex live mirror must land at {live:?}");
+        assert_eq!(
+            canonical.file_name().unwrap().to_str().unwrap(),
+            "codex-6.json"
+        );
+        assert_eq!(
+            live.file_name().unwrap().to_str().unwrap(),
+            "codex-auth.json"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_canonical_for_claude_code_leaves_canonical_at_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(2u16).unwrap();
+
+        save_canonical_for(dir.path(), account, &sample_creds(), Surface::ClaudeCode).unwrap();
+
+        let canonical = canonical_path_for(dir.path(), account, Surface::ClaudeCode);
+        let mode = std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "ClaudeCode canonical must remain at 0o600 (no mode-flip)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_canonical_for_codex_leaves_canonical_at_0o400() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(8u16).unwrap();
+
+        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+
+        let canonical = canonical_path_for(dir.path(), account, Surface::Codex);
+        let mode = std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o400,
+            "Codex canonical must be flipped to 0o400 after write (INV-P08)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_canonical_for_codex_round_trip_400_write_400() {
+        // INV-P08 round-trip: canonical sits at 0o400; a subsequent write
+        // must succeed despite the prior mode and leave the file at 0o400.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(9u16).unwrap();
+
+        // First write: file lands at 0o400.
+        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+        let canonical = canonical_path_for(dir.path(), account, Surface::Codex);
+        assert_eq!(
+            std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
+            0o400,
+        );
+
+        // Second write: atomic_replace must still succeed even though the
+        // prior file is 0o400 (non-writable). This verifies the writer
+        // does not rely on the prior mode being 0o600.
+        save_canonical_for(dir.path(), account, &sample_creds(), Surface::Codex).unwrap();
+        assert_eq!(
+            std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
+            0o400,
+            "second Codex write must end at 0o400",
+        );
+    }
+
+    #[test]
+    fn save_canonical_for_concurrent_writers_produce_valid_file() {
+        // The per-account mutex serialises writers. All threads must
+        // complete without error and the final file must be well-formed
+        // (fully written, not truncated mid-replace).
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(11u16).unwrap();
+        let base = Arc::new(dir.path().to_path_buf());
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let base = Arc::clone(&base);
+                thread::spawn(move || {
+                    save_canonical_for(&base, account, &sample_creds(), Surface::ClaudeCode)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().expect("write must succeed under mutex");
+        }
+
+        let canonical = canonical_path(&base, account);
+        // File must be parseable JSON — no torn writes.
+        let loaded = load(&canonical).expect("post-write canonical must parse");
+        assert_eq!(
+            loaded.claude_ai_oauth.access_token.expose_secret(),
+            "sk-ant-oat01-test"
+        );
     }
 }

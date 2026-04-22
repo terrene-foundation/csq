@@ -29,6 +29,12 @@ pub fn cursor_path(config_dir: &Path) -> PathBuf {
 /// Loads quota state from disk, auto-clearing expired windows.
 ///
 /// Returns an empty QuotaFile if the file doesn't exist.
+///
+/// VP-final R3: schema_version > 2 degrades to QuotaFile::empty() + WARN
+/// instead of hard-erroring. This preserves rollback UX.
+///
+/// VP-final R5: account keys that are not valid u16 decimal strings are
+/// rejected with ConfigError::InvalidJson naming the bad key.
 pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
     let path = quota_path(base_dir);
     let mut quota_file = match std::fs::read_to_string(&path) {
@@ -38,16 +44,31 @@ pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
                     path: path.clone(),
                     reason: e.to_string(),
                 })?;
-            // v2.0.1 tolerates schema_version 1 (absent/default) and 2. Reject newer.
+            // VP-final R3: tolerate schema_version 1 (absent/default) and 2.
+            // schema_version > 2 degrades to empty + WARN (not a hard error).
             if parsed.schema_version > 2 {
-                return Err(ConfigError::InvalidJson {
-                    path: path.clone(),
-                    reason: format!(
-                        "quota.json schema_version {} is newer than this csq binary supports \
-                         (max 2). Refusing to read to prevent data corruption. Upgrade csq.",
-                        parsed.schema_version
-                    ),
-                });
+                tracing::warn!(
+                    path = %path.display(),
+                    schema_version = parsed.schema_version,
+                    error_kind = "schema_version_newer",
+                    "quota.json schema_version {} is newer than this csq binary supports. \
+                     Degrading to empty quota state. Upgrade csq to preserve existing quota data.",
+                    parsed.schema_version
+                );
+                return Ok(QuotaFile::empty());
+            }
+            // VP-final R5: validate that every account key is a valid u16.
+            for key in parsed.accounts.keys() {
+                if key.parse::<u16>().is_err() {
+                    return Err(ConfigError::InvalidJson {
+                        path: path.clone(),
+                        reason: format!(
+                            "quota.json account key '{}' is not a valid u16 account number. \
+                             Keys must match the AccountNum newtype (1..999).",
+                            key
+                        ),
+                    });
+                }
             }
             parsed
         }
@@ -68,9 +89,14 @@ pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
 }
 
 /// Saves quota state to disk with atomic write.
+///
+/// VP-final R6: always writes schema_version = 1 regardless of in-memory value.
 pub fn save_state(base_dir: &Path, quota_file: &QuotaFile) -> Result<(), ConfigError> {
     let path = quota_path(base_dir);
-    let json = serde_json::to_string_pretty(quota_file).map_err(|e| ConfigError::InvalidJson {
+    // Force schema_version=1 on disk (R6: dual-read / single-write contract).
+    let mut to_save = quota_file.clone();
+    to_save.schema_version = 1;
+    let json = serde_json::to_string_pretty(&to_save).map_err(|e| ConfigError::InvalidJson {
         path: path.clone(),
         reason: format!("serialization: {e}"),
     })?;
@@ -129,14 +155,12 @@ pub fn write_cursor(config_dir: &Path, hash: &str) -> Result<(), ConfigError> {
 /// Updates quota for an account from a CC rate_limits payload.
 ///
 /// **Test-only.** Production quota writes go through the daemon's usage
-/// poller, which polls Anthropic's `/api/oauth/usage` directly per account.
-/// Terminal-sourced rate_limits (CC statusline JSON) MUST NOT be written
-/// to quota.json — see `rules/account-terminal-separation.md`.
+/// poller, which polls Anthropic's /api/oauth/usage directly per account.
 ///
 /// Uses file locking on quota.json to prevent concurrent corruption.
 /// Uses payload-hash cursor to reject stale data (after swap).
 ///
-/// Returns `true` if quota was updated, `false` if skipped (stale/duplicate).
+/// Returns true if quota was updated, false if skipped (stale/duplicate).
 #[cfg(test)]
 pub fn update_quota(
     base_dir: &Path,
@@ -241,7 +265,7 @@ mod tests {
         qf.set(
             1,
             AccountQuota {
-                // resets_at in the past → will be cleared on load
+                // resets_at in the past will be cleared on load
                 five_hour: Some(UsageWindow {
                     used_percentage: 100.0,
                     resets_at: 1000,

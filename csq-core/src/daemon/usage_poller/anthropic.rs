@@ -275,8 +275,8 @@ pub(crate) fn write_usage_to_quota(
         AccountQuota {
             five_hour: usage.five_hour.clone(),
             seven_day: usage.seven_day.clone(),
-            rate_limits: None,
             updated_at: now,
+            ..Default::default()
         },
     );
 

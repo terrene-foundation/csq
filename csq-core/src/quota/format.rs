@@ -408,8 +408,7 @@ mod tests {
                 used_percentage: 15.0,
                 resets_at: 9999999999,
             }),
-            rate_limits: None,
-            updated_at: 0.0,
+            ..Default::default()
         };
         let s = statusline_str(
             AccountNum::try_from(3u16).unwrap(),
@@ -428,9 +427,7 @@ mod tests {
                 used_percentage: 0.0,
                 resets_at: 9999999999,
             }),
-            seven_day: None,
-            rate_limits: None,
-            updated_at: 0.0,
+            ..Default::default()
         };
         let s = statusline_str(
             AccountNum::try_from(1u16).unwrap(),
@@ -502,8 +499,7 @@ mod tests {
                 used_percentage: 15.0,
                 resets_at: 9999999999,
             }),
-            rate_limits: None,
-            updated_at: 0.0,
+            ..Default::default()
         }
     }
 

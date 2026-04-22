@@ -166,9 +166,7 @@ mod tests {
                     used_percentage: pct,
                     resets_at: 9999999999,
                 }),
-                seven_day: None,
-                rate_limits: None,
-                updated_at: 0.0,
+                ..Default::default()
             },
         );
         state::save_state(base, &quota).unwrap();

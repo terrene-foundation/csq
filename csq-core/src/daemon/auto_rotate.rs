@@ -458,9 +458,7 @@ mod tests {
                     // during the load cycle. Year 2100 = 4102444800 seconds.
                     resets_at: 4_102_444_800,
                 }),
-                seven_day: None,
-                rate_limits: None,
-                updated_at: 0.0,
+                ..Default::default()
             },
         );
         quota_state::save_state(base, &quota).unwrap();

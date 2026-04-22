@@ -105,8 +105,8 @@ pub(crate) fn write_zai_quota(
         AccountQuota {
             five_hour: zai.five_hour.clone(),
             seven_day: zai.seven_day.clone(),
-            rate_limits: None,
             updated_at: now,
+            ..Default::default()
         },
     );
 

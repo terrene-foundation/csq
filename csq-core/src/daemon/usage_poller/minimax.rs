@@ -146,8 +146,8 @@ pub(crate) fn write_minimax_quota(
         AccountQuota {
             five_hour: mm.five_hour.clone(),
             seven_day: mm.seven_day.clone(),
-            rate_limits: None,
             updated_at: now,
+            ..Default::default()
         },
     );
 

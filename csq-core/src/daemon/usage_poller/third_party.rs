@@ -466,9 +466,9 @@ pub(crate) fn write_3p_usage_to_quota(
         account_id,
         AccountQuota {
             five_hour,
-            seven_day: None,
             rate_limits: Some(rate_limits.clone()),
             updated_at: now,
+            ..Default::default()
         },
     );
 
@@ -973,7 +973,6 @@ mod tests {
                     used_percentage: 40.0,
                     resets_at: 4_102_444_800,
                 }),
-                seven_day: None,
                 rate_limits: Some(RateLimitData {
                     requests_limit: Some(1000),
                     requests_remaining: Some(800),
@@ -983,6 +982,7 @@ mod tests {
                     output_tokens_limit: Some(50000),
                 }),
                 updated_at: 100.0,
+                ..Default::default()
             },
         );
 

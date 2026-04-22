@@ -806,7 +806,10 @@ mod tests {
         // Raw capture exists and is redacted.
         let raw = std::fs::read_to_string(raw_capture_path(dir.path())).unwrap();
         assert!(raw.contains("plus"));
-        assert!(!raw.contains("REDACTED-user-id") == false); // contains the redaction sentinel
+        assert!(
+            raw.contains("REDACTED-user-id"),
+            "raw capture must contain the PII redaction sentinel"
+        );
     }
 
     #[tokio::test]

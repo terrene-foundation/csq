@@ -1167,13 +1167,13 @@ mod tests {
 
     #[tokio::test]
     async fn accounts_route_lists_discovered_accounts() {
-        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
         let dir = TempDir::new().unwrap();
 
         // Install a valid credentials/1.json so discover_anthropic picks it up.
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("at".into()),
                 refresh_token: RefreshToken::new("rt".into()),
@@ -1184,7 +1184,7 @@ mod tests {
                 extra: Default::default(),
             },
             extra: Default::default(),
-        };
+        });
         let num = AccountNum::try_from(1u16).unwrap();
         credentials::save(
             &crate::credentials::file::canonical_path(dir.path(), num),
@@ -1268,7 +1268,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_status_all_returns_only_accounts_in_cache() {
-        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::daemon::refresher::RefreshStatus;
         use crate::types::{AccessToken, RefreshToken};
 
@@ -1277,7 +1277,7 @@ mod tests {
         // Install account 1 and account 2, but only populate the
         // cache for account 1.
         for id in [1u16, 2] {
-            let creds = CredentialFile {
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
                 claude_ai_oauth: OAuthPayload {
                     access_token: AccessToken::new("at".into()),
                     refresh_token: RefreshToken::new("rt".into()),
@@ -1288,7 +1288,7 @@ mod tests {
                     extra: Default::default(),
                 },
                 extra: Default::default(),
-            };
+            });
             let num = AccountNum::try_from(id).unwrap();
             credentials::save(
                 &crate::credentials::file::canonical_path(dir.path(), num),
@@ -1501,12 +1501,12 @@ mod tests {
         // discovery were re-running, the second call would see
         // an empty list, but the cache should still return the
         // pre-deletion state until the TTL elapses.
-        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
         let dir = TempDir::new().unwrap();
         let num = AccountNum::try_from(1u16).unwrap();
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("at".into()),
                 refresh_token: RefreshToken::new("rt".into()),
@@ -1517,7 +1517,7 @@ mod tests {
                 extra: Default::default(),
             },
             extra: Default::default(),
-        };
+        });
         let cred_path = credentials::file::canonical_path(dir.path(), num);
         credentials::save(&cred_path, &creds).unwrap();
 
@@ -1549,12 +1549,12 @@ mod tests {
 
     #[tokio::test]
     async fn accounts_handler_cache_expires_after_ttl() {
-        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
         let dir = TempDir::new().unwrap();
         let num = AccountNum::try_from(1u16).unwrap();
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("at".into()),
                 refresh_token: RefreshToken::new("rt".into()),
@@ -1565,7 +1565,7 @@ mod tests {
                 extra: Default::default(),
             },
             extra: Default::default(),
-        };
+        });
         let cred_path = credentials::file::canonical_path(dir.path(), num);
         credentials::save(&cred_path, &creds).unwrap();
 
@@ -1602,13 +1602,13 @@ mod tests {
         // cache — not just accounts_handler. Two calls in a row
         // must hit the cache on the second even if the underlying
         // filesystem changed.
-        use crate::credentials::{self, CredentialFile, OAuthPayload};
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::daemon::refresher::RefreshStatus;
         use crate::types::{AccessToken, RefreshToken};
 
         let dir = TempDir::new().unwrap();
         let num = AccountNum::try_from(1u16).unwrap();
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("at".into()),
                 refresh_token: RefreshToken::new("rt".into()),
@@ -1619,7 +1619,7 @@ mod tests {
                 extra: Default::default(),
             },
             extra: Default::default(),
-        };
+        });
         let cred_path = credentials::file::canonical_path(dir.path(), num);
         credentials::save(&cred_path, &creds).unwrap();
 

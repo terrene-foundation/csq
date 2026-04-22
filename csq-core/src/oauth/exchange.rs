@@ -50,7 +50,7 @@
 //!    scopes. It is safe to hand straight to
 //!    [`crate::credentials::save`].
 
-use crate::credentials::{CredentialFile, OAuthPayload};
+use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
 use crate::error::{redact_tokens, OAuthError};
 use crate::oauth::constants::{OAUTH_CLIENT_ID, OAUTH_SCOPES, OAUTH_TOKEN_URL};
 use crate::oauth::pkce::CodeVerifier;
@@ -237,7 +237,7 @@ where
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let credential = CredentialFile {
+    let credential = CredentialFile::Anthropic(AnthropicCredentialFile {
         claude_ai_oauth: OAuthPayload {
             access_token: AccessToken::new(response.access_token),
             refresh_token: RefreshToken::new(response.refresh_token),
@@ -256,7 +256,7 @@ where
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
-    };
+    });
 
     Ok(credential)
 }
@@ -350,11 +350,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            creds.claude_ai_oauth.access_token.expose_secret(),
+            creds
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "sk-ant-oat01-new"
         );
         assert_eq!(
-            creds.claude_ai_oauth.refresh_token.expose_secret(),
+            creds
+                .expect_anthropic()
+                .claude_ai_oauth
+                .refresh_token
+                .expose_secret(),
             "sk-ant-ort01-new"
         );
         // expires_at should be roughly now + 18000s in millis
@@ -362,13 +370,20 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let diff = creds.claude_ai_oauth.expires_at.saturating_sub(now_ms);
+        let diff = creds
+            .expect_anthropic()
+            .claude_ai_oauth
+            .expires_at
+            .saturating_sub(now_ms);
         assert!(
             (17_000_000..=19_000_000).contains(&diff),
             "expires_at should be ~18000s from now, diff={diff}ms"
         );
         // Scopes should match our constant, not the response
-        assert_eq!(creds.claude_ai_oauth.scopes.len(), OAUTH_SCOPES.len());
+        assert_eq!(
+            creds.expect_anthropic().claude_ai_oauth.scopes.len(),
+            OAUTH_SCOPES.len()
+        );
     }
 
     #[test]
@@ -384,7 +399,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let diff = creds.claude_ai_oauth.expires_at.saturating_sub(now_ms);
+        let diff = creds
+            .expect_anthropic()
+            .claude_ai_oauth
+            .expires_at
+            .saturating_sub(now_ms);
         // Default is 18000s, so ~18_000_000 ms
         assert!(diff >= 17_000_000);
     }
@@ -402,10 +421,14 @@ mod tests {
 
         let creds = exchange_code("code", &test_verifier(), "uri", mock_ok(response)).unwrap();
         // Must exactly match OAUTH_SCOPES, not the response string
-        for (want, got) in OAUTH_SCOPES.iter().zip(creds.claude_ai_oauth.scopes.iter()) {
+        for (want, got) in OAUTH_SCOPES
+            .iter()
+            .zip(creds.expect_anthropic().claude_ai_oauth.scopes.iter())
+        {
             assert_eq!(want, got);
         }
         assert!(!creds
+            .expect_anthropic()
             .claude_ai_oauth
             .scopes
             .iter()

@@ -10,13 +10,13 @@ use csq_core::credentials::keychain::service_name;
 use csq_core::credentials::refresh::{
     merge_refresh, refresh_token, RefreshResponse, TOKEN_ENDPOINT,
 };
-use csq_core::credentials::{CredentialFile, OAuthPayload};
+use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
 use csq_core::types::{AccessToken, AccountNum, RefreshToken};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
 fn sample_creds() -> CredentialFile {
-    CredentialFile {
+    CredentialFile::Anthropic(AnthropicCredentialFile {
         claude_ai_oauth: OAuthPayload {
             access_token: AccessToken::new("sk-ant-oat01-integration-test".into()),
             refresh_token: RefreshToken::new("sk-ant-ort01-integration-test".into()),
@@ -33,7 +33,7 @@ fn sample_creds() -> CredentialFile {
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
-    }
+    })
 }
 
 // ── Keychain service name parity ──────────────────────────────────────
@@ -103,12 +103,20 @@ fn full_credential_round_trip() {
     // Load and verify values
     let loaded = load(&path).unwrap();
     assert_eq!(
-        loaded.claude_ai_oauth.access_token.expose_secret(),
+        loaded
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret(),
         "sk-ant-oat01-integration-test"
     );
-    assert_eq!(loaded.claude_ai_oauth.scopes.len(), 5);
+    assert_eq!(loaded.expect_anthropic().claude_ai_oauth.scopes.len(), 5);
     assert_eq!(
-        loaded.claude_ai_oauth.subscription_type.as_deref(),
+        loaded
+            .expect_anthropic()
+            .claude_ai_oauth
+            .subscription_type
+            .as_deref(),
         Some("max")
     );
 }
@@ -164,11 +172,19 @@ fn refresh_merge_preserves_all_metadata() {
 
     // Tokens updated
     assert_eq!(
-        merged.claude_ai_oauth.access_token.expose_secret(),
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret(),
         "sk-ant-oat01-refreshed-new"
     );
     assert_eq!(
-        merged.claude_ai_oauth.refresh_token.expose_secret(),
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .refresh_token
+            .expose_secret(),
         "sk-ant-ort01-refreshed-new"
     );
 
@@ -177,19 +193,27 @@ fn refresh_merge_preserves_all_metadata() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    assert!(merged.claude_ai_oauth.expires_at > now_ms);
-    assert!(merged.claude_ai_oauth.expires_at < now_ms + 20_000_000);
+    assert!(merged.expect_anthropic().claude_ai_oauth.expires_at > now_ms);
+    assert!(merged.expect_anthropic().claude_ai_oauth.expires_at < now_ms + 20_000_000);
 
     // Metadata preserved
     assert_eq!(
-        merged.claude_ai_oauth.subscription_type.as_deref(),
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .subscription_type
+            .as_deref(),
         Some("max")
     );
     assert_eq!(
-        merged.claude_ai_oauth.rate_limit_tier.as_deref(),
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .rate_limit_tier
+            .as_deref(),
         Some("default_claude_max_20x")
     );
-    assert_eq!(merged.claude_ai_oauth.scopes.len(), 5);
+    assert_eq!(merged.expect_anthropic().claude_ai_oauth.scopes.len(), 5);
 }
 
 #[test]
@@ -246,8 +270,16 @@ fn canonical_save_creates_correct_directory_structure() {
     let c_loaded = load(&canonical).unwrap();
     let l_loaded = load(&live).unwrap();
     assert_eq!(
-        c_loaded.claude_ai_oauth.access_token.expose_secret(),
-        l_loaded.claude_ai_oauth.access_token.expose_secret()
+        c_loaded
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret(),
+        l_loaded
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret()
     );
 }
 
@@ -266,7 +298,7 @@ fn concurrent_credential_saves() {
             let path = Arc::clone(&path);
             thread::spawn(move || {
                 for j in 0..50 {
-                    let creds = CredentialFile {
+                    let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
                         claude_ai_oauth: OAuthPayload {
                             access_token: AccessToken::new(format!("t{i}_{j}")),
                             refresh_token: RefreshToken::new(format!("r{i}_{j}")),
@@ -277,7 +309,7 @@ fn concurrent_credential_saves() {
                             extra: HashMap::new(),
                         },
                         extra: HashMap::new(),
-                    };
+                    });
                     let _ = save(&path, &creds);
                 }
             })
@@ -292,6 +324,7 @@ fn concurrent_credential_saves() {
     let loaded = load(&path).unwrap();
     assert!(
         loaded
+            .expect_anthropic()
             .claude_ai_oauth
             .access_token
             .expose_secret()

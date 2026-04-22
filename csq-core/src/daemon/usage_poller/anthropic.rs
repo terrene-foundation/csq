@@ -68,6 +68,7 @@ pub(crate) async fn tick(
         // when the blocking task completes. Never logged or stored in
         // long-lived collections. Acceptable per security.md rule 8.
         let token = creds
+            .expect_anthropic()
             .claude_ai_oauth
             .access_token
             .expose_secret()
@@ -288,7 +289,9 @@ pub(crate) fn write_usage_to_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{self, file as cred_file, CredentialFile, OAuthPayload};
+    use crate::credentials::{
+        self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
+    };
     use crate::quota::state as quota_state;
     use crate::types::{AccessToken, AccountNum, RefreshToken};
     use std::collections::HashMap;
@@ -299,7 +302,7 @@ mod tests {
 
     fn install_account(base: &std::path::Path, account: u16) {
         let num = AccountNum::try_from(account).unwrap();
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("sk-ant-oat01-test-token".into()),
                 refresh_token: RefreshToken::new("sk-ant-ort01-test-refresh".into()),
@@ -310,7 +313,7 @@ mod tests {
                 extra: Default::default(),
             },
             extra: Default::default(),
-        };
+        });
         credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
     }
 

@@ -136,7 +136,7 @@ pub fn compose_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{self, CredentialFile, OAuthPayload};
+    use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::quota::{AccountQuota, QuotaFile, UsageWindow};
     use crate::types::{AccessToken, RefreshToken};
     use std::collections::HashMap;
@@ -144,7 +144,7 @@ mod tests {
 
     fn setup(base: &Path, account: u16, pct: f64) {
         let target = AccountNum::try_from(account).unwrap();
-        let creds = CredentialFile {
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(format!("at-{account}")),
                 refresh_token: RefreshToken::new(format!("rt-{account}")),
@@ -155,7 +155,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        };
+        });
         credentials::save(&credentials::file::canonical_path(base, target), &creds).unwrap();
 
         let mut quota = state::load_state(base).unwrap_or_else(|_| QuotaFile::empty());

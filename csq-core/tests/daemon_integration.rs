@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-use csq_core::credentials::{self, CredentialFile, OAuthPayload};
+use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
 use csq_core::daemon::{
     cache::TtlCache,
     client::{http_get_unix, http_get_unix_with_timeout, http_post_unix},
@@ -37,7 +37,7 @@ fn make_router_state(base: &Path) -> RouterState {
 
 fn install_creds(base: &Path, account: u16) {
     let num = AccountNum::try_from(account).unwrap();
-    let creds = CredentialFile {
+    let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
         claude_ai_oauth: OAuthPayload {
             access_token: AccessToken::new(format!("at-{account}")),
             refresh_token: RefreshToken::new(format!("rt-{account}")),
@@ -48,7 +48,7 @@ fn install_creds(base: &Path, account: u16) {
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
-    };
+    });
     credentials::save(
         &csq_core::credentials::file::canonical_path(base, num),
         &creds,

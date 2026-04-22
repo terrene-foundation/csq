@@ -34,7 +34,11 @@ pub fn backsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     // Resolve account: RT match first, then marker fallback
     let account = identity::match_refresh_token(
         base_dir,
-        live_creds.claude_ai_oauth.refresh_token.expose_secret(),
+        live_creds
+            .expect_anthropic()
+            .claude_ai_oauth
+            .refresh_token
+            .expose_secret(),
     )
     .or_else(|| markers::read_csq_account(config_dir));
 
@@ -81,10 +85,10 @@ pub fn backsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     };
     let canonical_expires = canonical_existing
         .as_ref()
-        .map(|c| c.claude_ai_oauth.expires_at)
+        .map(|c| c.expect_anthropic().claude_ai_oauth.expires_at)
         .unwrap_or(0);
 
-    if live_creds.claude_ai_oauth.expires_at <= canonical_expires {
+    if live_creds.expect_anthropic().claude_ai_oauth.expires_at <= canonical_expires {
         debug!(account = %account, "backsync: live is not newer, skipping");
         return Ok(false);
     }
@@ -102,13 +106,35 @@ pub fn backsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     // hours. Preserve canonical's value when live is None.
     let mut to_save = live_creds.clone();
     if let Some(existing) = canonical_existing.as_ref() {
-        if to_save.claude_ai_oauth.subscription_type.is_none() {
-            to_save.claude_ai_oauth.subscription_type =
-                existing.claude_ai_oauth.subscription_type.clone();
+        if to_save
+            .expect_anthropic()
+            .claude_ai_oauth
+            .subscription_type
+            .is_none()
+        {
+            to_save
+                .expect_anthropic_mut()
+                .claude_ai_oauth
+                .subscription_type = existing
+                .expect_anthropic()
+                .claude_ai_oauth
+                .subscription_type
+                .clone();
         }
-        if to_save.claude_ai_oauth.rate_limit_tier.is_none() {
-            to_save.claude_ai_oauth.rate_limit_tier =
-                existing.claude_ai_oauth.rate_limit_tier.clone();
+        if to_save
+            .expect_anthropic()
+            .claude_ai_oauth
+            .rate_limit_tier
+            .is_none()
+        {
+            to_save
+                .expect_anthropic_mut()
+                .claude_ai_oauth
+                .rate_limit_tier = existing
+                .expect_anthropic()
+                .claude_ai_oauth
+                .rate_limit_tier
+                .clone();
         }
     }
 
@@ -141,17 +167,29 @@ pub fn pullsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     let live_expires = match credentials::load(&live_path) {
         Ok(c) => {
             // Skip if same access token (already in sync)
-            if c.claude_ai_oauth.access_token.expose_secret()
-                == canonical_creds.claude_ai_oauth.access_token.expose_secret()
+            if c.expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret()
+                == canonical_creds
+                    .expect_anthropic()
+                    .claude_ai_oauth
+                    .access_token
+                    .expose_secret()
             {
                 return Ok(false);
             }
-            c.claude_ai_oauth.expires_at
+            c.expect_anthropic().claude_ai_oauth.expires_at
         }
         Err(_) => 0, // no live file — canonical is newer
     };
 
-    if canonical_creds.claude_ai_oauth.expires_at <= live_expires {
+    if canonical_creds
+        .expect_anthropic()
+        .claude_ai_oauth
+        .expires_at
+        <= live_expires
+    {
         debug!(account = %account, "pullsync: canonical is not newer, skipping");
         return Ok(false);
     }
@@ -165,14 +203,14 @@ pub fn pullsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{CredentialFile, OAuthPayload};
+    use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, AccountNum, RefreshToken};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn make_creds(access: &str, refresh: &str, expires_at: u64) -> CredentialFile {
-        CredentialFile {
+        CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(access.into()),
                 refresh_token: RefreshToken::new(refresh.into()),
@@ -183,7 +221,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        }
+        })
     }
 
     fn setup_backsync(
@@ -218,7 +256,10 @@ mod tests {
 
         let acct = AccountNum::try_from(1u16).unwrap();
         let canonical = credentials::load(&file::canonical_path(dir.path(), acct)).unwrap();
-        assert_eq!(canonical.claude_ai_oauth.expires_at, 2000);
+        assert_eq!(
+            canonical.expect_anthropic().claude_ai_oauth.expires_at,
+            2000
+        );
     }
 
     #[test]
@@ -231,7 +272,10 @@ mod tests {
 
         let acct = AccountNum::try_from(2u16).unwrap();
         let canonical = credentials::load(&file::canonical_path(dir.path(), acct)).unwrap();
-        assert_eq!(canonical.claude_ai_oauth.expires_at, 2000);
+        assert_eq!(
+            canonical.expect_anthropic().claude_ai_oauth.expires_at,
+            2000
+        );
     }
 
     #[test]
@@ -256,8 +300,14 @@ mod tests {
 
         // Canonical has Max.
         let mut canonical = make_creds("at-canonical", "rt-5", 1000);
-        canonical.claude_ai_oauth.subscription_type = Some("max".to_string());
-        canonical.claude_ai_oauth.rate_limit_tier = Some("tier_4".to_string());
+        canonical
+            .expect_anthropic_mut()
+            .claude_ai_oauth
+            .subscription_type = Some("max".to_string());
+        canonical
+            .expect_anthropic_mut()
+            .claude_ai_oauth
+            .rate_limit_tier = Some("tier_4".to_string());
         credentials::save(&file::canonical_path(dir.path(), acct), &canonical).unwrap();
 
         // Live is fresh (newer expires_at) but subscription fields
@@ -267,7 +317,11 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
         markers::write_csq_account(&config, acct).unwrap();
         let live = make_creds("at-live-fresh", "rt-5", 2000);
-        assert!(live.claude_ai_oauth.subscription_type.is_none());
+        assert!(live
+            .expect_anthropic()
+            .claude_ai_oauth
+            .subscription_type
+            .is_none());
         credentials::save(&config.join(".credentials.json"), &live).unwrap();
 
         // Act
@@ -277,14 +331,20 @@ mod tests {
         // Assert: expires_at updated (freshness carried over) AND
         // subscription_type/rate_limit_tier preserved from canonical.
         let post = credentials::load(&file::canonical_path(dir.path(), acct)).unwrap();
-        assert_eq!(post.claude_ai_oauth.expires_at, 2000);
+        assert_eq!(post.expect_anthropic().claude_ai_oauth.expires_at, 2000);
         assert_eq!(
-            post.claude_ai_oauth.subscription_type.as_deref(),
+            post.expect_anthropic()
+                .claude_ai_oauth
+                .subscription_type
+                .as_deref(),
             Some("max"),
             "subscription_type must be preserved when live has None"
         );
         assert_eq!(
-            post.claude_ai_oauth.rate_limit_tier.as_deref(),
+            post.expect_anthropic()
+                .claude_ai_oauth
+                .rate_limit_tier
+                .as_deref(),
             Some("tier_4"),
             "rate_limit_tier must be preserved when live has None"
         );
@@ -299,21 +359,29 @@ mod tests {
         let acct = AccountNum::try_from(6u16).unwrap();
 
         let mut canonical = make_creds("at-canonical", "rt-6", 1000);
-        canonical.claude_ai_oauth.subscription_type = Some("max".to_string());
+        canonical
+            .expect_anthropic_mut()
+            .claude_ai_oauth
+            .subscription_type = Some("max".to_string());
         credentials::save(&file::canonical_path(dir.path(), acct), &canonical).unwrap();
 
         let config = dir.path().join("config-6");
         std::fs::create_dir_all(&config).unwrap();
         markers::write_csq_account(&config, acct).unwrap();
         let mut live = make_creds("at-live", "rt-6", 2000);
-        live.claude_ai_oauth.subscription_type = Some("pro".to_string());
+        live.expect_anthropic_mut()
+            .claude_ai_oauth
+            .subscription_type = Some("pro".to_string());
         credentials::save(&config.join(".credentials.json"), &live).unwrap();
 
         backsync(&config, dir.path()).unwrap();
 
         let post = credentials::load(&file::canonical_path(dir.path(), acct)).unwrap();
         assert_eq!(
-            post.claude_ai_oauth.subscription_type.as_deref(),
+            post.expect_anthropic()
+                .claude_ai_oauth
+                .subscription_type
+                .as_deref(),
             Some("pro"),
             "live's Some value must win over canonical's when present"
         );
@@ -340,7 +408,11 @@ mod tests {
 
         let updated = credentials::load(&config.join(".credentials.json")).unwrap();
         assert_eq!(
-            updated.claude_ai_oauth.access_token.expose_secret(),
+            updated
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "at-new"
         );
     }
@@ -417,7 +489,11 @@ mod tests {
             std::fs::create_dir_all(&config).unwrap();
             markers::write_csq_account(&config, acct).unwrap();
             let live = make_creds("at-live-new", "rt-7", 9999);
-            assert!(live.claude_ai_oauth.subscription_type.is_none());
+            assert!(live
+                .expect_anthropic()
+                .claude_ai_oauth
+                .subscription_type
+                .is_none());
             credentials::save(&config.join(".credentials.json"), &live).unwrap();
 
             // Act
@@ -460,8 +536,11 @@ mod tests {
 
             // Live has subscription_type "max" — must be preserved in canonical.
             let mut live = make_creds("at-live-8", "rt-8", 5000);
-            live.claude_ai_oauth.subscription_type = Some("max".to_string());
-            live.claude_ai_oauth.rate_limit_tier = Some("tier_4".to_string());
+            live.expect_anthropic_mut()
+                .claude_ai_oauth
+                .subscription_type = Some("max".to_string());
+            live.expect_anthropic_mut().claude_ai_oauth.rate_limit_tier =
+                Some("tier_4".to_string());
             credentials::save(&config.join(".credentials.json"), &live).unwrap();
 
             // Act
@@ -476,12 +555,20 @@ mod tests {
             let canonical_path = file::canonical_path(dir.path(), acct);
             let written = credentials::load(&canonical_path).unwrap();
             assert_eq!(
-                written.claude_ai_oauth.subscription_type.as_deref(),
+                written
+                    .expect_anthropic()
+                    .claude_ai_oauth
+                    .subscription_type
+                    .as_deref(),
                 Some("max"),
                 "Max tier from live must be preserved in newly-written canonical"
             );
             assert_eq!(
-                written.claude_ai_oauth.rate_limit_tier.as_deref(),
+                written
+                    .expect_anthropic()
+                    .claude_ai_oauth
+                    .rate_limit_tier
+                    .as_deref(),
                 Some("tier_4"),
                 "rate_limit_tier from live must be preserved in newly-written canonical"
             );

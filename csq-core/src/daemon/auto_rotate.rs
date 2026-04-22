@@ -505,7 +505,9 @@ fn find_target(
 mod tests {
     use super::*;
     use crate::accounts::markers;
-    use crate::credentials::{self, file as cred_file, CredentialFile, OAuthPayload};
+    use crate::credentials::{
+        self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
+    };
     use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
     use crate::rotation::config::{save as save_rotation_config, RotationConfig};
     use crate::session::handle_dir::create_handle_dir;
@@ -516,7 +518,7 @@ mod tests {
     // ── helpers ──────────────────────────────────────────────────────────
 
     fn make_creds(access: &str, refresh: &str) -> CredentialFile {
-        CredentialFile {
+        CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(access.into()),
                 refresh_token: RefreshToken::new(refresh.into()),
@@ -527,7 +529,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        }
+        })
     }
 
     fn setup_account(base: &Path, account: u16) {

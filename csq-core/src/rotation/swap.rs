@@ -90,19 +90,38 @@ pub fn swap_to(
     // credentials carry subscriptionType / rateLimitTier. Enforced
     // structurally by the early-return above — this block is
     // unreachable for other surfaces.
-    if creds.claude_ai_oauth.subscription_type.is_none() {
+    if creds
+        .expect_anthropic()
+        .claude_ai_oauth
+        .subscription_type
+        .is_none()
+    {
         let live_path_check = config_dir.join(".credentials.json");
         if let Ok(existing) = credentials::load(&live_path_check) {
-            if existing.claude_ai_oauth.subscription_type.is_some() {
+            if existing
+                .expect_anthropic()
+                .claude_ai_oauth
+                .subscription_type
+                .is_some()
+            {
                 warn!(
                     account = %target,
                     "canonical credentials missing subscriptionType; \
                      preserving from existing live credentials"
                 );
-                creds.claude_ai_oauth.subscription_type =
-                    existing.claude_ai_oauth.subscription_type.clone();
-                creds.claude_ai_oauth.rate_limit_tier =
-                    existing.claude_ai_oauth.rate_limit_tier.clone();
+                creds
+                    .expect_anthropic_mut()
+                    .claude_ai_oauth
+                    .subscription_type = existing
+                    .expect_anthropic()
+                    .claude_ai_oauth
+                    .subscription_type
+                    .clone();
+                creds.expect_anthropic_mut().claude_ai_oauth.rate_limit_tier = existing
+                    .expect_anthropic()
+                    .claude_ai_oauth
+                    .rate_limit_tier
+                    .clone();
             } else {
                 warn!(
                     account = %target,
@@ -121,8 +140,16 @@ pub fn swap_to(
         warn!(error = %e, "swap verification read failed");
         e
     })?;
-    if verify.claude_ai_oauth.access_token.expose_secret()
-        != creds.claude_ai_oauth.access_token.expose_secret()
+    if verify
+        .expect_anthropic()
+        .claude_ai_oauth
+        .access_token
+        .expose_secret()
+        != creds
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret()
     {
         return Err(CsqError::Credential(CredentialError::Corrupt {
             path: live_path.clone(),
@@ -147,7 +174,7 @@ pub fn swap_to(
     debug!(account = %target, "swap complete");
     Ok(SwapResult {
         account: target,
-        expires_at_ms: creds.claude_ai_oauth.expires_at,
+        expires_at_ms: creds.expect_anthropic().claude_ai_oauth.expires_at,
     })
 }
 
@@ -161,13 +188,13 @@ pub struct SwapResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::{CredentialFile, OAuthPayload};
+    use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
     use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn make_creds(access: &str, refresh: &str) -> CredentialFile {
-        CredentialFile {
+        CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(access.into()),
                 refresh_token: RefreshToken::new(refresh.into()),
@@ -178,7 +205,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        }
+        })
     }
 
     #[test]
@@ -197,7 +224,13 @@ mod tests {
 
         // Live file written
         let live = credentials::load(&config.join(".credentials.json")).unwrap();
-        assert_eq!(live.claude_ai_oauth.access_token.expose_secret(), "at-3");
+        assert_eq!(
+            live.expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
+            "at-3"
+        );
 
         // Markers written
         assert_eq!(markers::read_csq_account(&config), Some(target));
@@ -298,7 +331,10 @@ mod tests {
         // The live file must contain the FRESH token, not the stale one.
         let live = credentials::load(&config.join(".credentials.json")).unwrap();
         assert_eq!(
-            live.claude_ai_oauth.access_token.expose_secret(),
+            live.expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "fresh-token",
             "C5 regression: swap_to must read post-refresh canonical, not stale"
         );

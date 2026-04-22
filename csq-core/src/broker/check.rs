@@ -61,7 +61,11 @@ where
     };
 
     // Check if token needs refresh
-    if !creds.claude_ai_oauth.is_expired_within(REFRESH_WINDOW_SECS) {
+    if !creds
+        .expect_anthropic()
+        .claude_ai_oauth
+        .is_expired_within(REFRESH_WINDOW_SECS)
+    {
         return Ok(BrokerResult::Valid);
     }
 
@@ -88,7 +92,11 @@ where
             return Err(CsqError::Credential(e));
         }
     };
-    if !creds.claude_ai_oauth.is_expired_within(REFRESH_WINDOW_SECS) {
+    if !creds
+        .expect_anthropic()
+        .claude_ai_oauth
+        .is_expired_within(REFRESH_WINDOW_SECS)
+    {
         debug!(account = %account, "another process refreshed already, returning Valid");
         drop(guard);
         return Ok(BrokerResult::Valid);
@@ -197,6 +205,7 @@ where
     let canonical_path = file::canonical_path(base_dir, account);
     let original = credentials::load(&canonical_path)?;
     let original_rt = original
+        .expect_anthropic()
         .claude_ai_oauth
         .refresh_token
         .expose_secret()
@@ -212,7 +221,11 @@ where
             Err(_) => continue,
         };
 
-        let live_rt = live.claude_ai_oauth.refresh_token.expose_secret();
+        let live_rt = live
+            .expect_anthropic()
+            .claude_ai_oauth
+            .refresh_token
+            .expose_secret();
         if live_rt == original_rt {
             continue; // Same dead RT, skip
         }
@@ -260,7 +273,9 @@ where
 /// the recovery path.
 fn restore_if_not_downgraded(canonical_path: &Path, original: &CredentialFile) {
     if let Ok(current) = credentials::load(canonical_path) {
-        if current.claude_ai_oauth.expires_at > original.claude_ai_oauth.expires_at {
+        if current.expect_anthropic().claude_ai_oauth.expires_at
+            > original.expect_anthropic().claude_ai_oauth.expires_at
+        {
             debug!("skipping recovery restore: canonical is newer than original snapshot");
             return;
         }
@@ -284,7 +299,7 @@ fn is_rate_limited(e: &CsqError) -> bool {
 mod tests {
     use super::*;
     use crate::accounts::markers;
-    use crate::credentials::{CredentialFile, OAuthPayload};
+    use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -292,7 +307,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_creds(access: &str, refresh: &str, expires_at: u64) -> CredentialFile {
-        CredentialFile {
+        CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(access.into()),
                 refresh_token: RefreshToken::new(refresh.into()),
@@ -303,7 +318,7 @@ mod tests {
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
-        }
+        })
     }
 
     fn mock_refresh_success(_url: &str, _body: &str) -> Result<Vec<u8>, String> {
@@ -345,7 +360,11 @@ mod tests {
         // Verify canonical was updated
         let updated = credentials::load(&file::canonical_path(dir.path(), account)).unwrap();
         assert_eq!(
-            updated.claude_ai_oauth.access_token.expose_secret(),
+            updated
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "at-refreshed"
         );
     }
@@ -411,11 +430,17 @@ mod tests {
         let a = credentials::load(&config_a.join(".credentials.json")).unwrap();
         let b = credentials::load(&config_b.join(".credentials.json")).unwrap();
         assert_eq!(
-            a.claude_ai_oauth.access_token.expose_secret(),
+            a.expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "at-refreshed"
         );
         assert_eq!(
-            b.claude_ai_oauth.access_token.expose_secret(),
+            b.expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
             "at-refreshed"
         );
     }

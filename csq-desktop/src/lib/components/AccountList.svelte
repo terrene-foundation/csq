@@ -67,8 +67,11 @@
   let loading = $state(true);
   let modalOpen = $state(false);
   let reauthSlot = $state<number | null>(null);
-  // Ollama-slot model-change modal. `null` = closed; number = slot id.
-  let changeModelSlot = $state<number | null>(null);
+  // Slot model-change modal. `null` = closed. Carries the slot id
+  // AND the slot's surface so the modal can branch between the
+  // Ollama `ollama list` path and the Codex `list_codex_models`
+  // path (PR-C8).
+  let changeModelSlot = $state<{ id: number; surface: string } | null>(null);
   // Two-tap remove: the first click on the × button arms the
   // confirmation; the second click on the same card commits. Tapping
   // any other card or letting the auto-disarm timer fire resets it.
@@ -408,6 +411,27 @@
             {:else}
               <span class="account-label" role="button" tabindex="0" ondblclick={(e) => startRename(account, e)} title="Double-click to rename">{account.label}</span>
             {/if}
+            {#if account.surface && account.surface !== 'claude-code'}
+              <!--
+                Button instead of span because the badge is
+                keyboard-focusable per PR-C8 acceptance criteria —
+                svelte a11y lint flags `tabindex=0` on non-interactive
+                elements. The badge is non-actioning (onclick is a
+                no-op that stops propagation so the card swap does
+                not fire), which matches a `role="status"` read-only
+                status indicator semantically.
+              -->
+              <button
+                type="button"
+                class="surface-badge"
+                class:surface-codex={account.surface === 'codex'}
+                role="status"
+                aria-label={`Upstream surface: ${account.surface}`}
+                data-testid="surface-badge"
+                title={`Upstream surface: ${account.surface}. Cross-surface swap replaces the process (INV-P05).`}
+                onclick={(e) => e.stopPropagation()}
+              >{account.surface}</button>
+            {/if}
             <TokenBadge status={account.token_status} expiresSecs={account.expires_in_secs} />
           </div>
           {#if account.last_refresh_error}
@@ -448,14 +472,16 @@
             Re-auth
           </button>
         {/if}
-        {#if account.provider_id === 'ollama'}
+        {#if account.provider_id === 'ollama' || account.surface === 'codex'}
           <button
             class="change-model-btn"
             onclick={(e) => {
               e.stopPropagation();
-              changeModelSlot = account.id;
+              changeModelSlot = { id: account.id, surface: account.surface };
             }}
-            title="Switch which local Ollama model this slot uses"
+            title={account.surface === 'codex'
+              ? 'Switch which Codex model this slot spawns'
+              : 'Switch which local Ollama model this slot uses'}
           >
             Change model
           </button>
@@ -479,7 +505,8 @@
 
 <ChangeModelModal
   isOpen={changeModelSlot !== null}
-  slot={changeModelSlot ?? 0}
+  slot={changeModelSlot?.id ?? 0}
+  surface={changeModelSlot?.surface ?? 'claude-code'}
   onClose={() => { changeModelSlot = null; }}
   onChanged={() => fetchAccounts()}
 />
@@ -653,6 +680,26 @@
   }
   .account-id { font-weight: 700; font-size: 0.85rem; color: var(--text-secondary); }
   .account-label { flex: 1; font-weight: 500; cursor: text; }
+  .surface-badge {
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: help;
+  }
+  .surface-badge:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .surface-badge.surface-codex {
+    background: rgba(16, 163, 127, 0.15);
+    color: #10a37f;
+    border: 1px solid rgba(16, 163, 127, 0.4);
+  }
   .rename-input {
     flex: 1;
     font: inherit;

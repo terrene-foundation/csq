@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { homeDir, join } from '@tauri-apps/api/path';
 
@@ -37,6 +38,19 @@
     state: string;
     account: number;
     expires_in_secs: number;
+  }
+
+  // PR-C8 — Codex device-auth flow types.
+  interface CodexStartLoginView {
+    account: number;
+    tos_required: boolean;
+    /// "absent" | "present" | "unsupported" | "probe_failed"
+    keychain: string;
+    awaiting_keychain_decision: boolean;
+  }
+  interface CodexDeviceCode {
+    user_code: string;
+    verification_url: string;
   }
 
   // ── Local state ───────────────────────────────────────────
@@ -88,6 +102,19 @@
         selectedModel: string;
         submitting: boolean;
         error: string | null;
+      }
+    // ── Codex device-auth flow (PR-C8) ─────────────────────────
+    | { kind: 'codex-tos'; account: number }
+    | {
+        kind: 'codex-keychain-prompt';
+        account: number;
+      }
+    | {
+        kind: 'codex-running';
+        account: number;
+        /// Populated by the `codex-device-code` event when the
+        /// subprocess emits it; null until then.
+        deviceCode: CodexDeviceCode | null;
       }
     | { kind: 'success'; message: string }
     | { kind: 'error'; message: string };
@@ -187,6 +214,11 @@
     // The slot picker gates every flow that writes `config-<N>/` —
     // OAuth (credentials) AND keyless (settings.json with a provider
     // env block). Only the global bearer-key flow is slot-free.
+    if (provider.id === 'codex') {
+      if (slotError) return;
+      await startCodexFlow(chosenSlot);
+      return;
+    }
     if (provider.auth_type === 'oauth') {
       if (slotError) return; // disabled in UI but defend in JS too
       await startClaudeOAuth(chosenSlot);
@@ -371,8 +403,124 @@
     }
   }
 
+  // ── Codex device-auth flow (PR-C8) ────────────────────────
+  //
+  // Four backend calls drive this flow:
+  //
+  // 1. `start_codex_login` — pre-check: returns tos_required +
+  //    keychain state. No side effects beyond the probe.
+  // 2. `acknowledge_codex_tos` — records the disclosure click.
+  // 3. `complete_codex_login` — drives `codex login --device-auth`.
+  //    Spawns the subprocess, emits `codex-device-code` events as
+  //    soon as the verification URL + code are visible, blocks
+  //    until the process exits, then relocates auth.json to
+  //    `credentials/codex-<N>.json`.
+  //
+  // The `codex-device-code` event carries `{ user_code,
+  // verification_url }`. We open the URL in the user's browser
+  // AND show the code so they can type it on the OpenAI page.
+  let codexDeviceCodeUnlisten: UnlistenFn | null = null;
+
+  async function startCodexFlow(account: number) {
+    try {
+      const baseDir = await getBaseDir();
+      const pre = await invoke<CodexStartLoginView>('start_codex_login', {
+        baseDir,
+        account,
+      });
+      if (pre.tos_required) {
+        step = { kind: 'codex-tos', account };
+        return;
+      }
+      if (pre.awaiting_keychain_decision) {
+        step = { kind: 'codex-keychain-prompt', account };
+        return;
+      }
+      await runCodexLogin(account, false);
+    } catch (e) {
+      step = { kind: 'error', message: `Codex pre-check failed: ${e}` };
+    }
+  }
+
+  async function acknowledgeCodexTos() {
+    if (step.kind !== 'codex-tos') return;
+    const account = step.account;
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('acknowledge_codex_tos', { baseDir });
+      // Re-run the pre-check so the keychain decision is surfaced
+      // even if the user has acknowledged ToS before in a prior
+      // session — a new keychain entry may have appeared since.
+      await startCodexFlow(account);
+    } catch (e) {
+      step = { kind: 'error', message: `Could not record acknowledgement: ${e}` };
+    }
+  }
+
+  async function resolveCodexKeychain(purgeKeychain: boolean) {
+    if (step.kind !== 'codex-keychain-prompt') return;
+    await runCodexLogin(step.account, purgeKeychain);
+  }
+
+  async function runCodexLogin(account: number, purgeKeychain: boolean) {
+    step = { kind: 'codex-running', account, deviceCode: null };
+
+    // Subscribe BEFORE invoke so a fast backend cannot race the
+    // event listener registration — otherwise the very first
+    // device-code emission would be dropped. Matches the
+    // pull_ollama_model pattern (R2 in ChangeModelModal).
+    if (codexDeviceCodeUnlisten) {
+      codexDeviceCodeUnlisten();
+      codexDeviceCodeUnlisten = null;
+    }
+    codexDeviceCodeUnlisten = await listen<CodexDeviceCode>(
+      'codex-device-code',
+      async (e) => {
+        if (step.kind === 'codex-running' && step.account === account) {
+          step = { ...step, deviceCode: e.payload };
+          // Best-effort open the verification URL. User can still
+          // copy the URL from the UI if the open fails (e.g.
+          // default browser missing).
+          try {
+            await openUrl(e.payload.verification_url);
+          } catch (_) {
+            /* fall through — user can click the link in the UI */
+          }
+        }
+      },
+    );
+
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('complete_codex_login', {
+        baseDir,
+        account,
+        purgeKeychain,
+      });
+      onAccountAdded();
+      step = {
+        kind: 'success',
+        message: `Codex account ${account} added successfully.`,
+      };
+    } catch (e) {
+      step = { kind: 'error', message: String(e) };
+    } finally {
+      if (codexDeviceCodeUnlisten) {
+        codexDeviceCodeUnlisten();
+        codexDeviceCodeUnlisten = null;
+      }
+    }
+  }
+
   // ── Close behavior ────────────────────────────────────────
   async function handleClose() {
+    // Drop any in-flight Codex device-code subscription so a late
+    // event from an aborted login cannot slam the modal back into
+    // `codex-running` after the user closed it.
+    if (codexDeviceCodeUnlisten) {
+      codexDeviceCodeUnlisten();
+      codexDeviceCodeUnlisten = null;
+    }
     onClose();
   }
 </script>
@@ -592,6 +740,86 @@
               {step.submitting ? 'Saving…' : 'Save key'}
             </button>
           </div>
+        {:else if step.kind === 'codex-tos'}
+          <p class="lede">Codex authentication — disclosure</p>
+          <p class="hint">
+            Signing in to slot #{step.account} consumes
+            <strong>ChatGPT-subscription quota</strong> from your OpenAI account.
+            Your Codex sessions run on OpenAI's infrastructure; csq only
+            orchestrates the login and tracks quota locally.
+          </p>
+          <p class="hint">
+            Surface-specific session state (sessions, history) does
+            <strong>not transfer</strong> between Codex and Claude Code terminals —
+            <code>csq swap</code> across surfaces starts a fresh session on the
+            target surface.
+          </p>
+          <p class="hint">
+            csq will pre-seed <code>config-{step.account}/config.toml</code> with
+            <code>cli_auth_credentials_store = "file"</code> so the OAuth token
+            lives on disk instead of the system keychain (spec 07 §7.3.3).
+          </p>
+          <div class="actions">
+            <button class="secondary" onclick={() => (step = { kind: 'picker' })}>Cancel</button>
+            <button
+              class="primary"
+              data-testid="codex-tos-accept"
+              onclick={acknowledgeCodexTos}
+            >
+              I understand — continue
+            </button>
+          </div>
+        {:else if step.kind === 'codex-keychain-prompt'}
+          <p class="lede">Existing Codex keychain entry found</p>
+          <p class="hint">
+            macOS has a <code>com.openai.codex</code> keychain entry from a
+            prior <code>codex login</code>. csq needs the file-backed auth store,
+            so we'll purge it before proceeding.
+          </p>
+          <p class="hint">
+            The credentials csq provisions for slot #{step.account} go to
+            <code>credentials/codex-{step.account}.json</code> (file, 0o400),
+            not the keychain.
+          </p>
+          <div class="actions">
+            <button class="secondary" onclick={() => (step = { kind: 'picker' })}>Cancel</button>
+            <button
+              class="primary"
+              onclick={() => resolveCodexKeychain(true)}
+            >
+              Purge and continue
+            </button>
+          </div>
+        {:else if step.kind === 'codex-running'}
+          <p class="lede">
+            Signing in to Codex account #{step.account}…
+          </p>
+          {#if step.deviceCode}
+            <p class="hint">
+              Open the verification page and enter the code shown below:
+            </p>
+            <div class="device-code-panel">
+              <div class="device-code">{step.deviceCode.user_code}</div>
+              <a
+                class="device-code-url"
+                href={step.deviceCode.verification_url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >{step.deviceCode.verification_url}</a>
+            </div>
+            <p class="hint">
+              The browser should already be open. If not, click the URL above.
+            </p>
+          {:else}
+            <p class="hint">
+              Launching <code>codex login --device-auth</code>… waiting for
+              codex-cli to surface the device code.
+            </p>
+          {/if}
+          <p class="hint">
+            Once you finish the OpenAI sign-in page, this window will update
+            automatically. Do not close it.
+          </p>
         {:else if step.kind === 'success'}
           <div class="success-banner">{step.message}</div>
           <div class="actions">
@@ -813,5 +1041,29 @@
     padding: 0.55rem 0.7rem;
     color: #4caf50;
     font-size: 0.9rem;
+  }
+  .device-code-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    align-items: center;
+    padding: 0.85rem;
+    margin: 0.5rem 0;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .device-code {
+    font-family: ui-monospace, monospace;
+    font-size: 1.4rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+  }
+  .device-code-url {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    word-break: break-all;
+    text-align: center;
   }
 </style>

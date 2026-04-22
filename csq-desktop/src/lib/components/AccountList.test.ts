@@ -237,4 +237,59 @@ describe("AccountList", () => {
       expect.objectContaining({ account: 1 }),
     );
   });
+
+  // ── PR-C8 surface badge ──────────────────────────────────────
+
+  it("does not render surface badge for claude-code slots", async () => {
+    const { container } = render(AccountList);
+    await settle();
+    const badges = container.querySelectorAll('[data-testid="surface-badge"]');
+    expect(badges.length).toBe(0);
+  });
+
+  it("renders keyboard-focusable surface badge for Codex slots", async () => {
+    const codexAccount = {
+      ...ACCOUNT_1,
+      id: 3,
+      label: "codex-3",
+      source: "codex",
+      surface: "codex",
+    };
+    setupMocks({ get_accounts: [codexAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const badge = container.querySelector(
+      '[data-testid="surface-badge"]',
+    ) as HTMLElement | null;
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent?.trim()).toBe("codex");
+    // Keyboard-focusable — matches the PR-C8 acceptance criterion.
+    // A `<button>` element is implicitly focusable (no tabindex
+    // attribute needed); svelte a11y lint flags `tabindex=0` on a
+    // non-interactive span, so we use a native button styled as a
+    // badge instead. Verify focusability via the element's tagName.
+    expect(badge?.tagName.toLowerCase()).toBe("button");
+    // aria-label carries the surface for screen readers.
+    expect(badge?.getAttribute("aria-label")).toContain("codex");
+    // role=status so the badge is announced as a live region on
+    // surface transitions (cross-surface swap feedback).
+    expect(badge?.getAttribute("role")).toBe("status");
+  });
+
+  it("shows Change model button on Codex slots even without provider_id", async () => {
+    const codexAccount = {
+      ...ACCOUNT_1,
+      id: 4,
+      label: "codex-4",
+      source: "codex",
+      surface: "codex",
+      provider_id: null,
+    };
+    setupMocks({ get_accounts: [codexAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const btn = container.querySelector(".change-model-btn");
+    expect(btn).not.toBeNull();
+    expect(btn?.textContent).toContain("Change model");
+  });
 });

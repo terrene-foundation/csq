@@ -29,6 +29,11 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: (...args: unknown[]) => mockOpenUrl(...args),
 }));
 
+const mockListen = vi.fn();
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (...args: unknown[]) => mockListen(...args),
+}));
+
 import AddAccountModal from "./AddAccountModal.svelte";
 
 // ── Fixtures ───────────────────────────────────────────────────────
@@ -55,6 +60,14 @@ const OLLAMA_PROVIDER = {
   auth_type: "none" as const,
   default_base_url: "http://localhost:11434",
   default_model: "gemma4",
+};
+
+const CODEX_PROVIDER = {
+  id: "codex",
+  name: "Codex",
+  auth_type: "oauth" as const,
+  default_base_url: "https://chatgpt.com",
+  default_model: "gpt-5.4",
 };
 
 let mockResponses: Record<string, unknown> = {};
@@ -94,6 +107,8 @@ describe("AddAccountModal", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockOpenUrl.mockReset();
+    mockListen.mockReset();
+    mockListen.mockResolvedValue(() => {}); // returns an unlisten fn
     setupMocks();
   });
 
@@ -430,5 +445,117 @@ describe("AddAccountModal", () => {
     await tick();
     expect(container.textContent).toContain("Could not load providers");
     expect(container.textContent).toContain("backend crashed");
+  });
+
+  // ── PR-C8 Codex flow ────────────────────────────────────────
+
+  async function settle(n = 8) {
+    for (let i = 0; i < n; i++) await tick();
+  }
+
+  it("shows ToS disclosure when Codex picked and marker absent", async () => {
+    setupMocks({
+      list_providers: [ANTHROPIC_PROVIDER, CODEX_PROVIDER],
+      start_codex_login: {
+        account: 3,
+        tos_required: true,
+        keychain: "absent",
+        awaiting_keychain_decision: false,
+      },
+    });
+    const { container } = renderModal();
+    await settle();
+
+    const codexCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Codex")) as
+      | HTMLButtonElement
+      | undefined;
+    expect(codexCard).toBeDefined();
+    await fireEvent.click(codexCard!);
+    await settle();
+
+    expect(container.textContent).toContain("disclosure");
+    expect(container.textContent).toContain("ChatGPT-subscription quota");
+    const acceptBtn = container.querySelector(
+      '[data-testid="codex-tos-accept"]',
+    );
+    expect(acceptBtn).not.toBeNull();
+  });
+
+  it("skips ToS disclosure when marker already present", async () => {
+    // Back-to-back Codex picks: first call reports tos_required=true, user
+    // acknowledges, then the re-run reports tos_required=false +
+    // keychain=absent so the flow transitions straight into
+    // `codex-running`.
+    let startCount = 0;
+    setupMocks({
+      list_providers: [CODEX_PROVIDER],
+      start_codex_login: undefined,
+      acknowledge_codex_tos: null,
+      complete_codex_login: { account: 3, label: "codex-3" },
+    });
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_codex_login") {
+        startCount += 1;
+        const tos_required = startCount === 1;
+        return Promise.resolve({
+          account: 3,
+          tos_required,
+          keychain: "absent",
+          awaiting_keychain_decision: false,
+        });
+      }
+      return Promise.resolve(mockResponses[cmd]);
+    });
+
+    const { container } = renderModal();
+    await settle();
+
+    const codexCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Codex")) as HTMLButtonElement;
+    await fireEvent.click(codexCard);
+    await settle();
+
+    // First click surfaced the ToS screen; acknowledging should
+    // bypass it on the immediate re-run.
+    const accept = container.querySelector(
+      '[data-testid="codex-tos-accept"]',
+    ) as HTMLButtonElement;
+    expect(accept).not.toBeNull();
+    await fireEvent.click(accept);
+    await settle();
+
+    // After acknowledgement the modal is in `codex-running`.
+    expect(container.textContent).toContain("Signing in to Codex account");
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "acknowledge_codex_tos",
+      expect.any(Object),
+    );
+  });
+
+  it("shows keychain purge prompt when residue is present", async () => {
+    setupMocks({
+      list_providers: [CODEX_PROVIDER],
+      acknowledge_codex_tos: null,
+      start_codex_login: {
+        account: 3,
+        tos_required: false,
+        keychain: "present",
+        awaiting_keychain_decision: true,
+      },
+    });
+    const { container } = renderModal();
+    await settle();
+
+    const codexCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Codex")) as HTMLButtonElement;
+    await fireEvent.click(codexCard);
+    await settle();
+
+    expect(container.textContent).toContain("Existing Codex keychain entry");
+    expect(container.textContent).toContain("Purge and continue");
   });
 });

@@ -902,6 +902,12 @@ pub fn run() {
             commands::set_slot_model,
             commands::pull_ollama_model,
             commands::cancel_ollama_pull,
+            // PR-C8 — Codex desktop UI
+            commands::start_codex_login,
+            commands::complete_codex_login,
+            commands::list_codex_models,
+            commands::acknowledge_codex_tos,
+            commands::set_codex_slot_model,
             commands::list_sessions,
             commands::swap_session,
             commands::get_autostart_enabled,

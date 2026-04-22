@@ -10,8 +10,11 @@
 //! P01–P11 (daemon prerequisite, mode-flip coordination, pre-seed
 //! ordering).
 
+pub mod desktop_login;
 pub mod keychain;
 pub mod login;
+pub mod models;
 pub mod surface;
+pub mod tos;
 
 pub use login::{perform, LoginOutcome};

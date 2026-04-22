@@ -50,6 +50,12 @@ enum Command {
     Swap {
         /// Account number to swap to
         account: u16,
+        /// Bypass the cross-surface confirmation prompt (INV-P05).
+        /// Same-surface swaps never prompt; this flag only affects
+        /// the Anthropic ↔ Codex crossing where the conversation
+        /// would not transfer.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Show status of all accounts
@@ -214,14 +220,14 @@ enum ModelsCmd {
     },
     /// Switch the active model for a provider
     Switch {
-        /// Provider ID (claude, mm, zai, ollama)
+        /// Provider ID (claude, mm, zai, ollama, codex)
         provider: String,
         /// Model ID or alias
         model: String,
-        /// Retarget a slot's `config-N/settings.json` instead of
-        /// the global profile file. Required when the slot was
-        /// bound via `csq setkey <provider> --slot N` — editing
-        /// the global profile wouldn't affect the slot.
+        /// Retarget a slot's `config-N/settings.json` (ClaudeCode) or
+        /// `config-N/config.toml` (Codex) instead of the global
+        /// profile file. Required for Codex — the model lives on
+        /// a per-slot config.toml and there is no global profile.
         #[arg(long)]
         slot: Option<u16>,
         /// For keyless providers (Ollama): when the chosen model
@@ -231,6 +237,13 @@ enum ModelsCmd {
         /// for a machine you'll `ollama pull` on later).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         pull_if_missing: bool,
+        /// For catalog-less providers (Codex): accept a model id
+        /// that isn't in csq's curated catalog. csq doesn't
+        /// validate the id against your ChatGPT subscription —
+        /// passing a model your plan doesn't include will surface
+        /// as a runtime codex-cli error on first call. FR-CLI-04.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -277,10 +290,10 @@ fn main() -> Result<()> {
             };
             commands::run::handle(&base_dir, account_num, profile.as_deref(), &rest)
         }
-        Command::Swap { account } => {
+        Command::Swap { account, yes } => {
             let account_num = AccountNum::try_from(account)
                 .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
-            commands::swap::handle(&base_dir, account_num)
+            commands::swap::handle(&base_dir, account_num, yes)
         }
         Command::Status => commands::status::handle(&base_dir, json),
         Command::Suggest => commands::suggest::handle(&base_dir),
@@ -325,6 +338,7 @@ fn main() -> Result<()> {
                     model,
                     slot,
                     pull_if_missing,
+                    force,
                 } => {
                     let slot = match slot {
                         Some(n) => Some(
@@ -339,6 +353,7 @@ fn main() -> Result<()> {
                         &model,
                         slot,
                         pull_if_missing,
+                        force,
                     )
                 }
             }

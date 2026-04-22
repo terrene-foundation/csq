@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// RFC 6749 §5.2 standard OAuth error-type strings.
+/// OAuth error-type strings (RFC 6749 §5.2 + RFC 8628 §3.5 device-auth).
 ///
 /// These are a fixed, spec-defined vocabulary of category names. They carry
 /// no secrets — they identify the error class, not the credential. Keeping
@@ -14,12 +14,23 @@ use thiserror::Error;
 /// crafts a response body whose `error` field reads `"invalid_scope"`, the
 /// returned pointer is into the compile-time constant, not into the
 /// attacker-controlled string.
+///
+/// RFC 8628 device-auth error strings (`authorization_pending`, `slow_down`,
+/// `access_denied`, `expired_token`) added per PR-C00 (Codex surface gates
+/// journals 0005..0010) in preparation for `codex login --device-auth` flow
+/// surfaced by PR-C3.
 pub(crate) static OAUTH_ERROR_TYPES: &[&str] = &[
+    // RFC 6749 §5.2
     "invalid_request",
     "invalid_grant",
     "invalid_scope",
     "unauthorized_client",
     "unsupported_grant_type",
+    // RFC 8628 §3.5 (device-auth)
+    "authorization_pending",
+    "slow_down",
+    "access_denied",
+    "expired_token",
 ];
 
 /// Extracts an RFC 6749 §5.2 OAuth error-type string from a JSON response
@@ -80,25 +91,59 @@ fn is_hex_char(c: char) -> bool {
 /// apply a minimum-length guard to them.
 const KNOWN_TOKEN_PREFIXES: &[&str] = &["sk-ant-oat01-", "sk-ant-ort01-"];
 
+/// Prefix-with-minimum-body token classes.
+///
+/// Each entry is `(prefix, min_body_chars)`. A token matches when the prefix
+/// appears in the input AND is followed by at least `min_body_chars` valid
+/// key-body characters (`[A-Za-z0-9\-_]`). The threshold avoids false
+/// positives on short strings that happen to start with a matching prefix
+/// (e.g. `rt_queue_size`, `sk-dev`).
+///
+/// - `sk-*` (≥20 body) — Anthropic API keys `sk-ant-api03-*`, Z.AI, MiniMax,
+///   and other OpenAI-style providers.
+/// - `sess-*` (≥20 body) — OpenAI session-cookie format (reserved; not
+///   observed in auth.json but present in other OpenAI surfaces per
+///   redteam H6 / PR-C00 plan §3.3).
+/// - `rt_*` (≥20 body) — Codex refresh tokens. Observed in live
+///   `~/.codex/auth.json` post PR-C00 re-login (journal 0010): 90-char
+///   total length, `rt_` prefix + 87-char base64url body.
+const TOKEN_PREFIXES_WITH_BODY: &[(&str, usize)] = &[("sk-", 20), ("sess-", 20), ("rt_", 20)];
+
+/// Minimum length of each JWT segment's body after its header prefix.
+///
+/// Real-world JWTs (OpenAI id_token / access_token observed in
+/// `~/.codex/auth.json` per journal 0010) have segments hundreds of chars
+/// long. 17 is a safe floor — any JWT shorter than 20 chars per segment is
+/// not a real token and is unlikely to survive upstream verification.
+const JWT_SEGMENT_MIN_BODY: usize = 17;
+
 /// Replaces token-like strings with [REDACTED].
 ///
-/// Three patterns are covered:
+/// Four patterns are covered:
 ///
 /// 1. **Known OAuth prefixes** (`sk-ant-oat01-`, `sk-ant-ort01-`): always
 ///    redacted, regardless of body length.  These are Anthropic OAuth
 ///    access/refresh token prefixes; any occurrence in a string is a real
 ///    credential.
 ///
-/// 2. **Generic `sk-*` keys** — `sk-` followed by ≥20 API-key body characters
-///    (`[A-Za-z0-9\-_]`).  Covers `sk-ant-api03-*` (Anthropic API keys) and
-///    3P keys from Z.AI, MiniMax, OpenAI-style providers.  Strings shorter than
-///    20 chars after the `sk-` prefix are NOT redacted to avoid false positives
-///    on error codes and short labels.
+/// 2. **Prefix-with-body tokens** — prefixes in [`TOKEN_PREFIXES_WITH_BODY`]
+///    followed by at least the class's minimum body length. Covers `sk-*`
+///    (Anthropic + 3P API keys), `sess-*` (OpenAI session tokens), and `rt_*`
+///    (Codex refresh tokens). Short strings like `sk-short` or `rt_queue_size`
+///    are left intact.
 ///
 /// 3. **Long bare hex strings** — ≥32 consecutive hex digits (`[0-9a-fA-F]`).
 ///    Covers 3P API keys that are raw 128-bit (32-char) or longer hex tokens.
 ///    Shorter runs (e.g. git SHAs in log messages, short error codes) are left
 ///    intact.
+///
+/// 4. **JWT triple-segment** — `eyJ<b64url>+.eyJ<b64url>+.<b64url>+` where
+///    each segment body is ≥[`JWT_SEGMENT_MIN_BODY`] chars. Covers OpenAI
+///    Codex access_token and id_token (both JWTs per journal 0010 live
+///    capture). The `eyJ` prefix is the base64url encoding of `{"` — any
+///    JWT header or payload opens with a JSON object and therefore this
+///    prefix. The three-segment `.`-delimited structure pins the match to
+///    actual JWTs.
 ///
 /// Exposed `pub` so modules outside this file can redact user-facing
 /// error strings before they reach tracing, the IPC cache, or error
@@ -106,8 +151,6 @@ const KNOWN_TOKEN_PREFIXES: &[&str] = &["sk-ant-oat01-", "sk-ant-ort01-"];
 /// errors that may echo a fragment of the OAuth form body on
 /// malformed response bodies.
 pub fn redact_tokens(s: &str) -> String {
-    // Minimum body length (after "sk-") for the generic sk-* pattern.
-    const SK_MIN_BODY: usize = 20;
     // Minimum length of a bare hex run treated as a secret.
     const HEX_MIN_LEN: usize = 32;
 
@@ -132,40 +175,108 @@ pub fn redact_tokens(s: &str) -> String {
 
     while i < len {
         let byte_i = char_byte_offsets[i];
+        // Word-boundary guard: prefix patterns (1, 2, 4) only match when the
+        // preceding char is NOT a key-body char. Prevents false positives
+        // where a prefix string appears mid-word (e.g. `rt_` inside
+        // `signature_part_long_enough_to_match`).
+        let word_boundary = i == 0 || !is_key_char(chars[i - 1]);
 
         // --- Pattern 1: known OAuth token prefixes (always redact) ---
         let mut matched_known = false;
-        for prefix in KNOWN_TOKEN_PREFIXES {
-            let plen = prefix.len();
-            if byte_i + plen <= s.len() && &s[byte_i..byte_i + plen] == *prefix {
-                // Consume until a delimiter or end of string.
-                let mut j = i + prefix.chars().count();
-                while j < len && is_key_char(chars[j]) {
-                    j += 1;
+        if word_boundary {
+            for prefix in KNOWN_TOKEN_PREFIXES {
+                let plen = prefix.len();
+                if byte_i + plen <= s.len() && &s[byte_i..byte_i + plen] == *prefix {
+                    // Consume until a delimiter or end of string.
+                    let mut j = i + prefix.chars().count();
+                    while j < len && is_key_char(chars[j]) {
+                        j += 1;
+                    }
+                    out.push_str("[REDACTED]");
+                    i = j;
+                    matched_known = true;
+                    break;
                 }
-                out.push_str("[REDACTED]");
-                i = j;
-                matched_known = true;
-                break;
             }
         }
         if matched_known {
             continue;
         }
 
-        // --- Pattern 2: generic sk-* key (minimum body length required) ---
-        if i + 2 < len && chars[i] == 's' && chars[i + 1] == 'k' && chars[i + 2] == '-' {
-            let span_start = i;
-            let mut j = i + 3; // advance past "sk-"
+        // --- Pattern 2: prefix-with-body tokens (sk-*, sess-*, rt_*) ---
+        let mut matched_prefixed = false;
+        if word_boundary {
+            for (prefix, min_body) in TOKEN_PREFIXES_WITH_BODY {
+                let plen_bytes = prefix.len();
+                let plen_chars = prefix.chars().count();
+                if byte_i + plen_bytes > s.len() {
+                    continue;
+                }
+                if &s[byte_i..byte_i + plen_bytes] != *prefix {
+                    continue;
+                }
+                let mut j = i + plen_chars;
+                while j < len && is_key_char(chars[j]) {
+                    j += 1;
+                }
+                let body_len = j - (i + plen_chars);
+                if body_len >= *min_body {
+                    out.push_str("[REDACTED]");
+                    i = j;
+                    matched_prefixed = true;
+                    break;
+                }
+            }
+        }
+        if matched_prefixed {
+            continue;
+        }
+
+        // --- Pattern 4: JWT triple-segment (`eyJ<b64url>+.eyJ<b64url>+.<b64url>+`) ---
+        // Three base64url segments separated by dots; each segment body
+        // must be ≥ JWT_SEGMENT_MIN_BODY chars. Placed BEFORE hex because
+        // an `eyJ...` prefix would otherwise be partially consumed by the
+        // hex-match (first char `e` is a valid hex digit).
+        if word_boundary
+            && i + 3 <= len
+            && chars[i] == 'e'
+            && chars[i + 1] == 'y'
+            && chars[i + 2] == 'J'
+        {
+            let seg1_body_start = i + 3;
+            let mut j = seg1_body_start;
             while j < len && is_key_char(chars[j]) {
                 j += 1;
             }
-            // Body = everything after the initial "sk-".
-            let body_len = j - (span_start + 3);
-            if body_len >= SK_MIN_BODY {
-                out.push_str("[REDACTED]");
-                i = j;
-                continue;
+            let seg1_body_len = j - seg1_body_start;
+            // Must have first dot AND second `eyJ` AND body length.
+            if seg1_body_len >= JWT_SEGMENT_MIN_BODY
+                && j < len
+                && chars[j] == '.'
+                && j + 4 <= len
+                && chars[j + 1] == 'e'
+                && chars[j + 2] == 'y'
+                && chars[j + 3] == 'J'
+            {
+                let seg2_body_start = j + 4;
+                let mut k = seg2_body_start;
+                while k < len && is_key_char(chars[k]) {
+                    k += 1;
+                }
+                let seg2_body_len = k - seg2_body_start;
+                if seg2_body_len >= JWT_SEGMENT_MIN_BODY && k < len && chars[k] == '.' {
+                    let seg3_start = k + 1;
+                    let mut m = seg3_start;
+                    while m < len && is_key_char(chars[m]) {
+                        m += 1;
+                    }
+                    let seg3_len = m - seg3_start;
+                    if seg3_len >= JWT_SEGMENT_MIN_BODY + 3 {
+                        out.push_str("[REDACTED]");
+                        i = m;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -227,7 +338,9 @@ impl From<CsqError> for String {
             CsqError::Credential(CredentialError::InvalidAccount(_)) => {
                 format!("INVALID_INPUT: {e}")
             }
-            CsqError::Broker(BrokerError::RefreshTokenInvalid { .. }) => {
+            CsqError::Broker(BrokerError::RefreshTokenInvalid { .. })
+            | CsqError::Broker(BrokerError::CodexTokenExpired { .. })
+            | CsqError::Broker(BrokerError::CodexRefreshReused { .. }) => {
                 format!("LOGIN_REQUIRED: {e}")
             }
             CsqError::OAuth(OAuthError::StateMismatch) => format!("CSRF_ERROR: {e}"),
@@ -251,6 +364,8 @@ impl From<CsqError> for String {
 /// - `"broker_token_invalid"` — upstream rejected the refresh
 ///   token (`invalid_grant`), needs re-login
 /// - `"broker_other"` — broker error that isn't the above
+/// - `"codex_refresh_reused"` — OpenAI `refresh_token_reused`, needs re-login
+/// - `"codex_token_expired"` — OpenAI `token_expired`, needs re-login
 /// - `"config"` — local config file error
 /// - `"credential"` — reading/writing credential file on disk
 /// - `"daemon"` — daemon lifecycle error
@@ -263,6 +378,8 @@ pub fn error_kind_tag(e: &CsqError) -> &'static str {
         CsqError::Platform(_) => "platform",
         CsqError::Broker(BrokerError::RefreshTokenInvalid { .. }) => "broker_token_invalid",
         CsqError::Broker(BrokerError::RefreshFailed { .. }) => "broker_refresh_failed",
+        CsqError::Broker(BrokerError::CodexTokenExpired { .. }) => "codex_token_expired",
+        CsqError::Broker(BrokerError::CodexRefreshReused { .. }) => "codex_refresh_reused",
         CsqError::Broker(_) => "broker_other",
         CsqError::OAuth(_) => "oauth",
         CsqError::Daemon(_) => "daemon",
@@ -327,6 +444,27 @@ pub enum BrokerError {
 
     #[error("recovery failed for account {account}: tried {tried} siblings")]
     RecoveryFailed { account: u16, tried: usize },
+
+    /// Codex OAuth returned `code: "token_expired"`.
+    ///
+    /// Distinguished from generic [`RefreshTokenInvalid`] because OpenAI's
+    /// `/oauth/token` endpoint emits this specific code when the submitted
+    /// refresh token's signature or expiry has lapsed, which differs
+    /// semantically from a reused-refresh-token scenario. Surfaces specific
+    /// UI text ("your Codex session has expired — run `codex login`")
+    /// instead of the generic re-login prompt. Journal 0009 / 0010.
+    #[error("codex token expired for account {account} (re-login required)")]
+    CodexTokenExpired { account: u16 },
+
+    /// Codex OAuth returned `code: "refresh_token_reused"`.
+    ///
+    /// OpenAI rotates refresh tokens on each successful refresh; using a
+    /// previously-consumed refresh token triggers this specific error code.
+    /// Surfaces specific UI text identifying the "single-use token already
+    /// consumed" scenario rather than the generic re-login prompt.
+    /// Journal 0009 / 0010.
+    #[error("codex refresh token reused for account {account} (re-login required)")]
+    CodexRefreshReused { account: u16 },
 }
 
 #[derive(Error, Debug)]
@@ -402,6 +540,22 @@ mod tests {
         let err = BrokerError::RefreshTokenInvalid { account: 3 };
         assert!(format!("{err}").contains("account 3"));
         assert!(format!("{err}").contains("re-login"));
+    }
+
+    #[test]
+    fn codex_token_expired_tag_and_ipc_mapping() {
+        let e = CsqError::Broker(BrokerError::CodexTokenExpired { account: 7 });
+        assert_eq!(error_kind_tag(&e), "codex_token_expired");
+        let ipc: String = e.into();
+        assert!(ipc.starts_with("LOGIN_REQUIRED:"));
+    }
+
+    #[test]
+    fn codex_refresh_reused_tag_and_ipc_mapping() {
+        let e = CsqError::Broker(BrokerError::CodexRefreshReused { account: 7 });
+        assert_eq!(error_kind_tag(&e), "codex_refresh_reused");
+        let ipc: String = e.into();
+        assert!(ipc.starts_with("LOGIN_REQUIRED:"));
     }
 
     #[test]
@@ -555,6 +709,104 @@ mod tests {
         assert_eq!(redact_tokens(""), "");
     }
 
+    // --- Codex-specific redactor patterns (PR-C0, journal 0010) ---
+
+    /// Codex refresh tokens use the `rt_` prefix (observed in
+    /// `~/.codex/auth.json` post re-login).
+    #[test]
+    fn redact_tokens_codex_rt_prefix() {
+        let input = "refresh=rt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let output = redact_tokens(input);
+        assert_eq!(output, "refresh=[REDACTED]");
+    }
+
+    /// Short `rt_` strings (e.g. variable names in logs) must NOT be redacted.
+    #[test]
+    fn redact_tokens_short_rt_not_redacted() {
+        let input = "rt_queue_size value exceeded";
+        let output = redact_tokens(input);
+        assert_eq!(output, input);
+    }
+
+    /// OpenAI `sess-*` session tokens (plan §3.3 prefix).
+    #[test]
+    fn redact_tokens_codex_sess_prefix() {
+        let input = "cookie=sess-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let output = redact_tokens(input);
+        assert_eq!(output, "cookie=[REDACTED]");
+    }
+
+    /// JWT triple-segment (Codex id_token / access_token format per
+    /// journal 0010).
+    #[test]
+    fn redact_tokens_jwt_triple_segment() {
+        let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.abcdefghijklmnopqrstuvwxyz";
+        let output = redact_tokens(input);
+        assert_eq!(output, "Authorization: Bearer [REDACTED]");
+    }
+
+    /// Realistic long JWT (simulates ~2000-char OpenAI id_token).
+    #[test]
+    fn redact_tokens_long_jwt() {
+        let seg1 = "a".repeat(400);
+        let seg2 = "b".repeat(400);
+        let seg3 = "c".repeat(64);
+        let jwt = format!("eyJ{seg1}.eyJ{seg2}.{seg3}");
+        let input = format!("token={jwt}");
+        let output = redact_tokens(&input);
+        assert_eq!(output, "token=[REDACTED]");
+    }
+
+    /// Two-segment `eyJ.eyJ` (malformed JWT — no signature) is NOT redacted
+    /// via the JWT pattern. It may still trip other patterns (e.g. hex) but
+    /// the JWT pattern specifically requires all three segments.
+    #[test]
+    fn redact_tokens_two_segment_eyj_not_matched_as_jwt() {
+        // Use long-but-non-hex body to avoid pattern-3 false match.
+        let seg1 = "z".repeat(40);
+        let seg2 = "z".repeat(40);
+        let input = format!("header=eyJ{seg1}.eyJ{seg2}");
+        let output = redact_tokens(&input);
+        // Unchanged — no third segment
+        assert_eq!(output, input);
+    }
+
+    /// Single-segment `eyJ` is NOT redacted — could be any base64url string
+    /// that happens to start with `eyJ` (e.g. encoded data in logs).
+    #[test]
+    fn redact_tokens_single_segment_eyj_not_matched() {
+        let input = "prefix=eyJhbGciOiJIUzI1NiJ9 no dots here";
+        let output = redact_tokens(input);
+        assert_eq!(output, input);
+    }
+
+    /// JWT mid-sentence: surrounding text must survive.
+    ///
+    /// Uses segment bodies ≥ `JWT_SEGMENT_MIN_BODY` so the pattern fires;
+    /// realistic OpenAI id_tokens have seg bodies in the hundreds of chars,
+    /// not the test-minimum 17.
+    #[test]
+    fn redact_tokens_jwt_mid_sentence() {
+        let input = "upstream said: eyJhbGciOiJIUzI1NiJ9XXX.eyJpc3MiOiJjc3EifQYYYY.ZZZZsignaturebytesgohere and then more text";
+        let output = redact_tokens(input);
+        assert_eq!(output, "upstream said: [REDACTED] and then more text");
+    }
+
+    /// Multiple distinct token classes in one string redact independently.
+    #[test]
+    fn redact_tokens_mixed_codex_and_anthropic() {
+        let jwt = format!(
+            "eyJ{}.eyJ{}.{}",
+            "a".repeat(30),
+            "b".repeat(30),
+            "c".repeat(30)
+        );
+        let input =
+            format!("codex-access={jwt} anthropic-oat=sk-ant-oat01-XXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+        let output = redact_tokens(&input);
+        assert_eq!(output, "codex-access=[REDACTED] anthropic-oat=[REDACTED]");
+    }
+
     // --- extract_oauth_error_type ---
 
     /// Each allowlisted entry round-trips: parsing a JSON body whose `error`
@@ -628,6 +880,22 @@ mod tests {
         let result = extract_oauth_error_type(body);
         // Assert
         assert_eq!(result, None);
+    }
+
+    /// RFC 8628 device-auth error strings (added in PR-C0 for Codex) MUST be
+    /// in the allowlist and round-trip correctly.
+    #[test]
+    fn extract_oauth_error_type_accepts_rfc8628_device_strings() {
+        for device_err in [
+            "authorization_pending",
+            "slow_down",
+            "access_denied",
+            "expired_token",
+        ] {
+            let body = format!(r#"{{"error":"{device_err}"}}"#);
+            let result = extract_oauth_error_type(&body);
+            assert_eq!(result, Some(device_err));
+        }
     }
 
     /// The returned `&str` must be pointer-equal to the entry in

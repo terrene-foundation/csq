@@ -65,6 +65,11 @@ enum Command {
     Login {
         /// Account number to login as
         account: u16,
+        /// Which provider to login as. `claude` (default) runs the
+        /// Anthropic OAuth flow; `codex` runs the Codex device-auth
+        /// flow (spec 07 §7.3.3).
+        #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
+        provider: String,
     },
 
     /// Remove an account: deletes credentials, config dir, and profile entry.
@@ -280,10 +285,10 @@ fn main() -> Result<()> {
         Command::Status => commands::status::handle(&base_dir, json),
         Command::Suggest => commands::suggest::handle(&base_dir),
         Command::Statusline => commands::statusline::handle(&base_dir),
-        Command::Login { account } => {
+        Command::Login { account, provider } => {
             let account_num = AccountNum::try_from(account)
                 .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
-            commands::login::handle(&base_dir, account_num)
+            commands::login::handle(&base_dir, account_num, &provider)
         }
         Command::Logout { account, yes } => {
             let account_num = AccountNum::try_from(account)

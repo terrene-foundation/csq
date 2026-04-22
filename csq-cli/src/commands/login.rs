@@ -43,10 +43,26 @@ use std::process::Command;
 #[cfg(unix)]
 use csq_core::daemon::{self, DaemonClientError, DetectResult};
 
-/// Entry point invoked from `main.rs`. Prefers the shell-out to
-/// `claude auth login` (same UX as running CC directly); falls back
-/// to the daemon paste-code path when `claude` is unavailable.
-pub fn handle(base_dir: &Path, account: AccountNum) -> Result<()> {
+/// Entry point invoked from `main.rs`. Dispatches on `provider`:
+///
+/// * `"claude"` (default) — Anthropic OAuth flow. Prefers shell-out
+///   to `claude auth login` (same UX as running CC directly); falls
+///   back to the daemon paste-code path when `claude` is unavailable.
+/// * `"codex"` — Codex device-auth flow per spec 07 §7.3.3 (PR-C3b).
+///   Shells out to `codex login --device-auth` under an isolated
+///   `CODEX_HOME`, probes the macOS keychain for residue, relocates
+///   the resulting auth.json to `credentials/codex-<N>.json`.
+pub fn handle(base_dir: &Path, account: AccountNum, provider: &str) -> Result<()> {
+    match provider {
+        "codex" => return handle_codex(base_dir, account),
+        "claude" | "" => {}
+        other => {
+            return Err(anyhow!(
+                "unknown --provider {other:?} — supported: claude, codex"
+            ));
+        }
+    }
+
     if csq_core::accounts::login::find_claude_binary().is_some() {
         return handle_direct(base_dir, account);
     }
@@ -65,6 +81,21 @@ pub fn handle(base_dir: &Path, account: AccountNum) -> Result<()> {
             "`claude` binary not found on PATH — install Claude Code and re-run `csq login {account}`"
         ))
     }
+}
+
+/// `--provider codex` dispatch. Thin wrapper around
+/// `csq_core::providers::codex::login::perform` — the orchestration
+/// (keychain probe, config.toml pre-seed, `codex login --device-auth`
+/// shell-out, canonical relocation) lives in csq-core so the desktop
+/// Add Account modal can call the same helper in a future PR.
+fn handle_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
+    let _outcome = csq_core::providers::codex::perform(base_dir, account)
+        .with_context(|| format!("codex device-auth login for account {account}"))?;
+    // `perform` has already printed a human-readable success line.
+    // Nothing else to do here — PR-C3c will wire daemon registration
+    // (refresher filter + usage poller) once `broker_codex_check`
+    // lands in PR-C4.
+    Ok(())
 }
 
 // `which_claude` was inlined and replaced by

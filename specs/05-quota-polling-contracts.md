@@ -191,9 +191,9 @@ On 2026-04-12 the daemon's usage poller stopped firing after the 12:17 UTC tick.
 
 These fixes live in the implementation scope of the upgrade that lands specs 01-04. They do not require architecture changes, only hardening.
 
-## 5.7 Codex `/backend-api/wham/usage` (PROPOSED — schema pending live capture)
+## 5.7 Codex `/backend-api/wham/usage` (VERIFIED 2026-04-22 — see journal 0010)
 
-**Status:** PROPOSED. Endpoint is undocumented; response schema must be captured on first live call in a Codex-provisioned environment. This section locks down what we know; the schema block below is placeholder until verified.
+**Status:** VERIFIED. Live capture against a real Codex plus-plan account on 2026-04-22 (journal 0010) pinned the response shape. Schema block below is the observed shape with PII values redacted.
 
 **Request:**
 
@@ -210,22 +210,67 @@ Transport considerations:
 - **Node subprocess transport REQUIRED** (PR-C00 OPEN-C04 resolution, workspaces/codex/journal/0007). reqwest/rustls is body-stripped by Cloudflare on both `chatgpt.com/backend-api/*` and `auth.openai.com/oauth/token`: status 401 + `cf-ray` header present, but response body reduced to `{"error": {}, "status": 401}` instead of the full `{"error": {"message": "...", "code": "token_expired"}}` that curl and Node return. Same failure class as Anthropic (journal csq-v2/0056). Codex polling uses the Node bridge at `csq-core/src/http/codex.rs` (added in PR-C0.5) — same runtime as the Anthropic bridge; no new dependency.
 - Per-call timeout: 30s (inherits §5.6).
 
-**Response shape (placeholder, TO BE VERIFIED):**
+**Response shape (VERIFIED, PII redacted):**
 
 ```json
 {
-  "five_hour": { "utilization": 42.0, "resets_at": "2026-04-22T20:00:00Z" },
-  "seven_day": { "utilization": 15.0, "resets_at": "2026-04-28T00:00:00Z" }
+  "user_id": "<PII: opaque UUID — redact>",
+  "account_id": "<PII: opaque UUID — redact>",
+  "email": "<PII: user email — redact>",
+  "plan_type": "plus",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+      "used_percent": 0.0,
+      "limit_window_seconds": 18000,
+      "reset_after_seconds": 18000,
+      "reset_at": 1776856630
+    },
+    "secondary_window": {
+      "used_percent": 0.0,
+      "limit_window_seconds": 604800,
+      "reset_after_seconds": 604800,
+      "reset_at": 1777443430
+    }
+  },
+  "code_review_rate_limit": null,
+  "additional_rate_limits": null,
+  "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "0",
+    "approx_local_messages": [0, 0],
+    "approx_cloud_messages": [0, 0]
+  },
+  "spend_control": { "reached": false },
+  "rate_limit_reached_type": null,
+  "promo": null,
+  "referral_beacon": null
 }
 ```
 
-The real shape may differ — confirmed via openai/codex issue #15281 that the field set is richer than what `codex /status` surfaces. First live capture becomes the authority.
+**Field-to-quota mapping:**
+
+| Source field                                                                                                  | quota.json destination               | Notes                                                             |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ----------------------------------------------------------------- |
+| `rate_limit.primary_window.used_percent`                                                                      | `utilization_5h` (f64 in [0,100])    | 5h window (18000s observed). **Already a %, not 0-1.**            |
+| `rate_limit.primary_window.reset_at`                                                                          | `resets_at_5h` (Unix epoch)          | Preferred — absolute beats relative.                              |
+| `rate_limit.secondary_window.used_percent`                                                                    | `utilization_7d` (f64 in [0,100])    | 7d window (604800s observed).                                     |
+| `rate_limit.secondary_window.reset_at`                                                                        | `resets_at_7d` (Unix epoch)          |                                                                   |
+| `plan_type`                                                                                                   | `extras.plan_type` (Option<String>)  | UI label only; not used in quota math.                            |
+| `rate_limit.allowed` / `.limit_reached`                                                                       | derived fields / LOGIN-NEEDED signal | Drives UX messaging, not utilization.                             |
+| `user_id` / `account_id` / `email`                                                                            | **REDACTED — never persisted**       | PR-C0 redactor extension targets exactly these 3 keys.            |
+| `credits.*` / `spend_control.*`                                                                               | (ignored)                            | PAYG / billing metadata; out of scope for v2.1 quota.             |
+| `code_review_rate_limit` / `additional_rate_limits` / `rate_limit_reached_type` / `promo` / `referral_beacon` | (optional, parsed tolerantly)        | Null on healthy plus-plan account; parser accepts null-or-object. |
 
 **Parse contract:**
 
-- Versioned parser emits `QuotaKind::Utilization` with value in `[0, 100]` on known schema.
-- Unknown shape → `QuotaKind::Unknown`; raw body persisted to `accounts/codex-wham-drift.json` (cap 64 KB; redactor runs before write) for bug-report attachment.
-- Status codes MUST be enumerated from observation (OPEN-C05, new gap): what does wham/usage return for over-quota, suspended, or throttled accounts? Defer until observed; dispatch mapping documented as errors land.
+- Versioned parser emits TWO `QuotaKind::Utilization` values per poll — one per window — with values in `[0.0, 100.0]`.
+- `reset_after_seconds` vs `reset_at` clock-skew sanity check: if absolute(reset_at - now - reset_after_seconds) > 5s, log `clock_skew_warning` (informational; does not fail the poll).
+- Unknown shape → `QuotaKind::Unknown`; raw body persisted to `accounts/codex-wham-drift.json` (cap 64 KB; **PII redactor MUST run before write** — strip `user_id`, `account_id`, `email` keys regardless of drift) for bug-report attachment.
+- Status codes: 200 = schema parsed. 401 `token_expired` → refresher retry (INV-P01). 429 body shape not yet captured — parser treats unknown status-5xx/4xx bodies as `QuotaKind::Unknown`; follow-up journal after natural 429 observation.
 
 **Write invariants (inherits §5.5):**
 
@@ -449,3 +494,4 @@ Drain runs under the daemon's per-slot mutex (same mutex that guards `quota.json
 - 2026-04-22 — 1.2.1 — PR-VP-final red-team R1 reconciliation. §5.8 counter-state example reconciled with spec 07 §7.4.1: added `cap` field inside `rate_limit` struct so the 429 `quotaValue` has a home; added cross-reference note that field definitions are owned by spec 07 §7.4.1 to prevent future drift. No behaviour change; shape-compatible with the updated spec 07 1.1.1 frozen schema. Journal 0067 R1.
 - 2026-04-22 — 1.3.0 — PR-G0: §5.8.1 "CLI-durable NDJSON event log" added. Pins file layout (`gemini-events-<slot>.ndjson`, 0600), event envelope (`v`, `id` UUIDv7, `ts`, `slot`, `surface`, `kind`, `payload`), write discipline (`O_APPEND` + `sync_data`), drain discipline (per-slot fcntl lock + UUIDv7 dedup + atomic truncate-after-drain), durability guarantees (zero-loss for sync'd events across daemon-down + daemon-crash), retention cap (10 MiB emitter-side circuit breaker), and security invariants (0600 + redactor + gitignore). Write-invariants bullet in §5.8 updated: "events are dropped" → "events are durable via NDJSON" per C-CR2. Consumed by PR-G2a emitter and PR-G3 drain. Journal 0067 C-CR2.
 - 2026-04-22 — 1.3.1 — PR-C00: §5.7 transport note replaced. OPEN-C04 RESOLVED — reqwest body-stripped by Cloudflare; Codex polling uses the Node subprocess bridge (`csq-core/src/http/codex.rs`, PR-C0.5). Schema block retains PROPOSED status pending live `wham/usage` capture (journal 0008 GAP — blocked by this session's probe-induced refresh_token burn; unblocks after user runs `codex login` once). Cross-refs journal 0007.
+- 2026-04-22 — 1.3.2 — PR-C00-followup: §5.7 schema captured live post-re-login (journal 0010). Status flipped PROPOSED → VERIFIED. Placeholder `five_hour`/`seven_day` object replaced with observed 12-top-level-key shape: `rate_limit.primary_window` (5h, 18000s) + `rate_limit.secondary_window` (7d, 604800s) each with `used_percent` (0-100, not 0-1) + `reset_at` (Unix epoch) + `reset_after_seconds` (countdown) + `limit_window_seconds`. `plan_type` surfaces as UI-only extras. Three PII fields (`user_id`/`account_id`/`email`) MUST be redacted before drift-capture write; PR-C0 redactor extension pinned to these specific keys. `credits.*` / `spend_control.*` / `code_review_rate_limit` / `additional_rate_limits` / `rate_limit_reached_type` / `promo` / `referral_beacon` enumerated as out-of-scope or null-tolerant. Parser emits TWO `QuotaKind::Utilization` values per poll. 429 body shape remains uncaptured (natural-rate-limit observation follow-up). Field-to-quota mapping table added. Journal 0010 resolves journal 0008 GAP.

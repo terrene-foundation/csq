@@ -278,9 +278,23 @@ pub(crate) async fn tick(
 ) {
     info!("refresher tick starting");
 
-    // Discover all Anthropic accounts. (Third-party accounts do not
-    // have refresh tokens; the usage poller in M8.5 handles them.)
+    // Discover all refreshable accounts across surfaces.
+    //
+    // - `discover_anthropic`: Claude OAuth slots (refreshed via
+    //   `broker_check`).
+    // - `discover_codex`: Codex OAuth slots (PR-C3a primitive). Per
+    //   journal 0013 + spec 07 §7.5 INV-P01, the daemon must OWN
+    //   refresh cadence for Codex (2h pre-expiry); PR-C4 wires
+    //   `broker_codex_check`. Until then, Codex slots are iterated
+    //   but skipped inside the loop so telemetry sees them and
+    //   cooldowns / caches keep aligned keys, without us trying to
+    //   call Anthropic-only `broker_check` on a Codex credential
+    //   shape (which would panic on `expect_anthropic`).
+    //
+    // Third-party providers (MiniMax, Z.AI, Ollama) are bearer-keyed
+    // and have no refresh token; the usage poller handles them.
     let mut accounts = discovery::discover_anthropic(base_dir);
+    accounts.extend(discovery::discover_codex(base_dir));
 
     // Cap fanout per tick. See MAX_ACCOUNTS_PER_TICK docstring.
     if accounts.len() > MAX_ACCOUNTS_PER_TICK {
@@ -301,7 +315,24 @@ pub(crate) async fn tick(
     // condition and extends the rate-limit window.
     let mut rate_limited_this_tick = false;
 
+    let mut skipped_codex = 0usize;
     for info in accounts {
+        // Codex slots are chained into the discovery list so telemetry
+        // sees them (per journal 0015 — PR-C3c), but `broker_check`
+        // below is Anthropic-only and would panic on the Codex
+        // `CredentialFile` variant. Skip Codex slots with a fixed-
+        // vocabulary breadcrumb so PR-C4's `broker_codex_check` can
+        // drop in with one `match` arm.
+        if info.source == AccountSource::Codex {
+            skipped_codex += 1;
+            debug!(
+                account = info.id,
+                source = "codex",
+                "codex slot iterated; refresh deferred until PR-C4 broker_codex_check"
+            );
+            continue;
+        }
+
         if info.source != AccountSource::Anthropic || !info.has_credentials {
             continue;
         }
@@ -507,7 +538,10 @@ pub(crate) async fn tick(
         }
     }
 
-    info!(processed, skipped_cooldown, "refresher tick complete");
+    info!(
+        processed,
+        skipped_cooldown, skipped_codex, "refresher tick complete"
+    );
 }
 
 /// Re-export of the shared `error_kind_tag` so the refresher's
@@ -659,6 +693,33 @@ mod tests {
         credentials::save(&cred_file::live_path(base, num), &creds).unwrap();
     }
 
+    /// Installs a Codex-shape canonical credential file at
+    /// `credentials/codex-<N>.json`. Used by PR-C3c's iterate-and-skip
+    /// regression test — a tick that discovers this slot must NOT
+    /// invoke `broker_check` (which is Anthropic-only) against it.
+    fn install_codex_account(base: &std::path::Path, account: u16) {
+        use crate::credentials::{CodexCredentialFile, CodexTokensFile};
+        let num = AccountNum::try_from(account).unwrap();
+        let creds = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some("test-codex-acct".into()),
+                access_token: "eyJhbGciOiJIUzI1NiJ9.codex-at.sig".into(),
+                refresh_token: Some("rt_codex_test".into()),
+                id_token: Some("eyJhbGciOiJIUzI1NiJ9.codex-id.sig".into()),
+                extra: Default::default(),
+            },
+            last_refresh: Some("2026-04-22T00:00:00Z".into()),
+            extra: Default::default(),
+        });
+        credentials::save(
+            &cred_file::canonical_path_for(base, num, crate::providers::catalog::Surface::Codex),
+            &creds,
+        )
+        .unwrap();
+    }
+
     /// Mock HTTP closure that always succeeds and counts calls.
     fn counting_success(counter: Arc<AtomicU32>) -> HttpPostFn {
         Arc::new(move |_url: &str, _body: &str| {
@@ -691,6 +752,64 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert!(cache.is_empty());
+    }
+
+    /// PR-C3c regression: a tick that discovers a Codex slot MUST NOT
+    /// call `broker_check` on it (broker_check is Anthropic-only and
+    /// would panic on the Codex `CredentialFile` variant via
+    /// `expect_anthropic`). The iterate-and-skip design lets PR-C4
+    /// land `broker_codex_check` with one `match` arm in the same
+    /// loop.
+    #[tokio::test]
+    async fn tick_iterates_codex_slot_without_calling_broker_check() {
+        let dir = TempDir::new().unwrap();
+        install_codex_account(dir.path(), 4);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "broker_check must not be invoked for Codex slots until PR-C4"
+        );
+        assert!(
+            cache.get(&4).is_none(),
+            "no cache entry should be written for a skipped Codex slot"
+        );
+    }
+
+    /// PR-C3c regression: a mixed tick (Anthropic + Codex) still
+    /// refreshes the Anthropic slot. The Codex-skip must not swallow
+    /// an Anthropic refresh that would have happened on its own.
+    #[tokio::test]
+    async fn tick_refreshes_anthropic_alongside_skipped_codex() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0); // expired Anthropic slot → triggers refresh
+        install_codex_account(dir.path(), 4); // Codex slot → skipped
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cache, &cooldowns, &backoffs).await;
+
+        assert!(
+            counter.load(Ordering::SeqCst) >= 1,
+            "Anthropic slot must still refresh even when a Codex slot is present"
+        );
+        assert!(cache.get(&1).is_some(), "Anthropic cache entry expected");
+        assert!(
+            cache.get(&4).is_none(),
+            "Codex cache entry must not be written this PR"
+        );
     }
 
     #[tokio::test]

@@ -83,10 +83,23 @@ mod tests {
 /// Where an account was discovered from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountSource {
-    /// Anthropic OAuth account (credentials/N.json).
+    /// Anthropic OAuth account (`credentials/N.json`).
     Anthropic,
-    /// Third-party provider (settings-*.json).
+    /// OpenAI Codex OAuth account (`credentials/codex-N.json`). Added
+    /// in PR-C3a for the v2.1 Codex surface.
+    Codex,
+    /// Third-party provider (`settings-*.json`).
     ThirdParty { provider: String },
-    /// Manually configured (dashboard-accounts.json).
+    /// Manually configured (`dashboard-accounts.json`).
     Manual,
+}
+
+impl AccountSource {
+    /// Whether the source implies the daemon's OAuth refresher owns
+    /// token-rotation cadence for this account. Used by the refresher
+    /// to filter out non-refreshable accounts (3P API keys, manually
+    /// configured rows) — spec 07 INV-P01.
+    pub fn has_oauth_refresh(&self) -> bool {
+        matches!(self, AccountSource::Anthropic | AccountSource::Codex)
+    }
 }

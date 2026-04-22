@@ -35,6 +35,18 @@ pub fn discover_all(base_dir: &Path) -> Vec<AccountInfo> {
         }
     }
 
+    // Priority 1b (PR-C3a): Codex OAuth accounts. Slot numbers are
+    // disjoint from Anthropic by filename prefix (`codex-<N>.json` vs
+    // `<N>.json`), but the shared `AccountInfo.id` namespace still
+    // deduplicates — first source wins. Landing Codex here (before 3P
+    // per-slot) matches the OAuth-first priority established for
+    // Anthropic.
+    for info in discover_codex(base_dir) {
+        if seen.insert(info.id, ()).is_none() {
+            accounts.push(info);
+        }
+    }
+
     // Priority 2: Per-slot third-party bindings. These occupy real
     // numbered slots (e.g. 9 = MiniMax, 10 = Z.AI) and should appear
     // in the dashboard alongside OAuth accounts 1-8.
@@ -371,6 +383,94 @@ pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
                 has_credentials: true,
             });
         }
+    }
+
+    accounts.sort_by_key(|a| a.id);
+    accounts
+}
+
+/// Discovers Codex OAuth accounts.
+///
+/// Walks `{base_dir}/credentials/codex-<N>.json` (PR-C2a canonical
+/// path for `Surface::Codex`) and yields one [`AccountInfo`] per
+/// credentials file that parses as a valid Codex variant.
+///
+/// Files that parse as the Anthropic variant (i.e. a misplaced
+/// `claudeAiOauth` shape at a `codex-N.json` path) are logged at WARN
+/// and skipped — the filename encodes surface, and a shape mismatch
+/// indicates operator error or a broken write path.
+///
+/// Unlike [`discover_anthropic`], there is no live-fallback pass from
+/// `config-N/codex-auth.json` — Codex accounts are always provisioned
+/// canonical-first by the daemon's OAuth flow (PR-C3b). A missing
+/// canonical file indicates the slot was never logged in.
+///
+/// Label is currently the slot number (`"codex-<N>"`) because Codex
+/// does not ship with a lightweight profile file (no `profiles.json`
+/// equivalent for Codex). Email-style labels arrive in a future PR
+/// once `id_token` claim decoding is wired in.
+pub fn discover_codex(base_dir: &Path) -> Vec<AccountInfo> {
+    let creds_dir = base_dir.join("credentials");
+    let entries = match std::fs::read_dir(&creds_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut accounts = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Only `codex-<N>.json` files — skip Anthropic `<N>.json` and
+        // any unexpected filename shape.
+        let Some(num_str) = stem.strip_prefix("codex-") else {
+            continue;
+        };
+        let id: u16 = match num_str.parse() {
+            Ok(n) if (1..=999).contains(&n) => n,
+            _ => continue,
+        };
+
+        let has_credentials = match credentials::load(&path) {
+            Ok(cf) => {
+                // Filename said Codex — payload must match. If it
+                // doesn't, skip with a fixed-vocabulary log tag so
+                // an operator can trace a broken write path without
+                // any risk of token leakage.
+                if cf.codex().is_none() {
+                    warn!(
+                        path = %path.display(),
+                        error_kind = "codex_discovery_wrong_variant",
+                        "skipping codex-<N>.json whose payload is not the Codex variant"
+                    );
+                    continue;
+                }
+                true
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping invalid codex credential file"
+                );
+                false
+            }
+        };
+
+        accounts.push(AccountInfo {
+            id,
+            label: format!("codex-{id}"),
+            source: AccountSource::Codex,
+            surface: Surface::Codex,
+            method: "oauth".into(),
+            has_credentials,
+        });
     }
 
     accounts.sort_by_key(|a| a.id);
@@ -980,6 +1080,7 @@ mod tests {
             .iter()
             .map(|a| match &a.source {
                 AccountSource::Anthropic => "Anthropic",
+                AccountSource::Codex => "Codex",
                 AccountSource::ThirdParty { provider } => provider.as_str(),
                 AccountSource::Manual => "Manual",
             })
@@ -988,5 +1089,159 @@ mod tests {
             providers,
             vec!["Anthropic", "Anthropic", "Anthropic", "MiniMax", "Z.AI"]
         );
+    }
+
+    // ── discover_codex (PR-C3a) ────────────────────────────────────────
+
+    fn write_codex_cred(dir: &Path, account: u16) {
+        use crate::credentials::{CodexCredentialFile, CodexTokensFile};
+        let creds = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some(format!("uuid-{account}")),
+                access_token: format!("eyJaccess.codex-{account}.sig"),
+                refresh_token: Some(format!("rt_codex_{account}")),
+                id_token: Some(format!("eyJid.codex-{account}.sig")),
+                extra: HashMap::new(),
+            },
+            last_refresh: Some("2026-04-22T00:00:00Z".into()),
+            extra: HashMap::new(),
+        });
+        let path = dir
+            .join("credentials")
+            .join(format!("codex-{account}.json"));
+        credentials::save(&path, &creds).unwrap();
+    }
+
+    #[test]
+    fn discover_codex_finds_codex_prefixed_credential_files() {
+        let dir = TempDir::new().unwrap();
+        write_codex_cred(dir.path(), 1);
+        write_codex_cred(dir.path(), 3);
+
+        let accounts = discover_codex(dir.path());
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].id, 1);
+        assert_eq!(accounts[0].source, AccountSource::Codex);
+        assert_eq!(accounts[0].surface, Surface::Codex);
+        assert_eq!(accounts[0].method, "oauth");
+        assert!(accounts[0].has_credentials);
+        assert_eq!(accounts[0].label, "codex-1");
+        assert_eq!(accounts[1].id, 3);
+    }
+
+    #[test]
+    fn discover_codex_ignores_anthropic_credential_files() {
+        // An Anthropic-shaped file at `credentials/<N>.json` must not
+        // be yielded by discover_codex — filename prefix is the gate.
+        let dir = TempDir::new().unwrap();
+        write_cred(dir.path(), 1);
+        write_cred(dir.path(), 7);
+        // And a Codex file to verify we still find it.
+        write_codex_cred(dir.path(), 4);
+
+        let accounts = discover_codex(dir.path());
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, 4);
+    }
+
+    #[test]
+    fn discover_codex_skips_wrong_variant_payload() {
+        // A `codex-<N>.json` file whose content is actually the
+        // Anthropic shape must be skipped (logged at WARN) — not
+        // silently treated as a valid Codex account.
+        let dir = TempDir::new().unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        // Write an Anthropic-shape JSON at a codex-prefixed path.
+        std::fs::write(
+            creds_dir.join("codex-5.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"sk-ant-ort01-y","expiresAt":1000,"scopes":[]}}"#,
+        )
+        .unwrap();
+
+        let accounts = discover_codex(dir.path());
+        assert!(
+            accounts.is_empty(),
+            "codex-N.json with Anthropic payload must be skipped: {accounts:?}"
+        );
+    }
+
+    #[test]
+    fn discover_codex_skips_invalid_json() {
+        let dir = TempDir::new().unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("codex-1.json"), "not json").unwrap();
+
+        let accounts = discover_codex(dir.path());
+        assert_eq!(accounts.len(), 1);
+        assert!(!accounts[0].has_credentials);
+    }
+
+    #[test]
+    fn discover_codex_rejects_out_of_range_slot_numbers() {
+        let dir = TempDir::new().unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        // Write codex-0.json and codex-1000.json with valid payloads.
+        use crate::credentials::{CodexCredentialFile, CodexTokensFile};
+        let sample = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: None,
+                access_token: "t".into(),
+                refresh_token: None,
+                id_token: None,
+                extra: HashMap::new(),
+            },
+            last_refresh: None,
+            extra: HashMap::new(),
+        });
+        credentials::save(&creds_dir.join("codex-0.json"), &sample).unwrap();
+        credentials::save(&creds_dir.join("codex-1000.json"), &sample).unwrap();
+
+        let accounts = discover_codex(dir.path());
+        assert!(
+            accounts.is_empty(),
+            "codex slot numbers outside 1..=999 must be rejected: {accounts:?}"
+        );
+    }
+
+    #[test]
+    fn discover_codex_empty_dir_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let accounts = discover_codex(dir.path());
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn discover_all_includes_codex_accounts() {
+        let dir = TempDir::new().unwrap();
+        write_cred(dir.path(), 1);
+        write_codex_cred(dir.path(), 2);
+
+        let accounts = discover_all(dir.path());
+        let ids: Vec<u16> = accounts.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(accounts[0].source, AccountSource::Anthropic);
+        assert_eq!(accounts[1].source, AccountSource::Codex);
+    }
+
+    #[test]
+    fn discover_all_anthropic_wins_over_codex_on_same_slot() {
+        // Unusual but possible: if `credentials/3.json` AND
+        // `credentials/codex-3.json` both exist, Anthropic wins via
+        // priority-1 discovery. The Codex entry for slot 3 is dropped.
+        let dir = TempDir::new().unwrap();
+        write_cred(dir.path(), 3);
+        write_codex_cred(dir.path(), 3);
+
+        let accounts = discover_all(dir.path());
+        let slot_3: Vec<_> = accounts.iter().filter(|a| a.id == 3).collect();
+        assert_eq!(slot_3.len(), 1);
+        assert_eq!(slot_3[0].source, AccountSource::Anthropic);
     }
 }

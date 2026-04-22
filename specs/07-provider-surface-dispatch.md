@@ -171,7 +171,119 @@ Amends spec 05 — new sections are added there (§5.7 Codex, §5.8 Gemini), thi
 | `Codex`      | Utilization | `https://chatgpt.com/backend-api/wham/usage`              | Daemon-owned, versioned parser, spec 05 §5.7 |
 | `Gemini`     | Counter     | Client-side counter + 429 `RESOURCE_EXHAUSTED` parse      | Daemon-owned, spec 05 §5.8                   |
 
-`quota.json` gains a `schema_version: 2` field and per-account `surface` + `kind` tags. Daemon startup runs a one-shot v1→v2 migration that stamps all existing records with `surface: "claude-code"` and `kind: "utilization"`.
+### 7.4.1 `quota.json` schema v2 (FROZEN — PR-C1.5)
+
+This subsection is the authoritative contract for the quota.json v2 shape. PR-B8 (v2.0.1 dual-read), PR-C6 (v2.1 write-path flip), and PR-G3 (v2.2 Gemini event-driven consumer) all implement against this schema. Changes after freeze require a new section with a superseding revision stamp — no silent drift.
+
+**Frozen 2026-04-22 by PR-C1.5** (journal 0067 H1: quota schema is a design-once cross-stream collision; freeze before either Codex or Gemini code is implemented, land the reader in v2.0.1 as shakedown).
+
+#### Top-level
+
+| Field            | Type                        | Required in v2 | Notes                                                               |
+| ---------------- | --------------------------- | -------------- | ------------------------------------------------------------------- |
+| `schema_version` | `u32`                       | Yes (= `2`)    | Absent → v1. Unknown value → reader errors with actionable message. |
+| `accounts`       | `map<string, AccountQuota>` | Yes            | Keyed by account number as decimal string (unchanged from v1).      |
+
+#### `AccountQuota` — mandatory fields
+
+| Field        | Type     | Default on missing     | Applies to   | Notes                                                                                                    |
+| ------------ | -------- | ---------------------- | ------------ | -------------------------------------------------------------------------------------------------------- |
+| `surface`    | `string` | `"claude-code"`        | all surfaces | Allowed: `"claude-code"` / `"codex"` / `"gemini"`.                                                       |
+| `kind`       | `string` | `"utilization"`        | all surfaces | Allowed: `"utilization"` / `"counter"` / `"unknown"`. `"unknown"` is the schema-drift degradation state. |
+| `updated_at` | `f64`    | (required, no default) | all surfaces | Unchanged from v1 (Unix epoch seconds, fractional).                                                      |
+
+#### `AccountQuota` — utilization fields (existing v1 shape, retained)
+
+Used by `Surface::ClaudeCode` and `Surface::Codex`. Unchanged from v1:
+
+| Field         | Type             | Default on missing | Notes                                                   |
+| ------------- | ---------------- | ------------------ | ------------------------------------------------------- |
+| `five_hour`   | `UsageWindow?`   | `null`             | `{ used_percentage: f64, resets_at: u64 }`.             |
+| `seven_day`   | `UsageWindow?`   | `null`             | Same shape as `five_hour`.                              |
+| `rate_limits` | `RateLimitData?` | `null`             | 3P response-header data (MM / Z.AI). Unchanged from v1. |
+
+#### `AccountQuota` — counter fields (NEW, reserved for `Surface::Gemini`)
+
+All optional. Serialization: `#[serde(default, skip_serializing_if = "Option::is_none")]`. Readers that encounter these fields on a non-Gemini account MUST NOT error — they simply ignore them.
+
+| Field                  | Type      | Default on missing | Semantics                                                                                                  |
+| ---------------------- | --------- | ------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `counter`              | `u64?`    | `null`             | Requests the CLI has issued this `resets_at_tz` day. Reset at midnight America/Los_Angeles (spec 05 §5.8). |
+| `rate_limit`           | `u64?`    | `null`             | Daily cap if known. Source: `RESOURCE_EXHAUSTED` 429 body `quotaValue` field.                              |
+| `resets_at_tz`         | `string?` | `null`             | IANA TZ identifier of reset cadence (always `"America/Los_Angeles"` for Gemini; absent elsewhere).         |
+| `selected_model`       | `string?` | `null`             | Model the user requested (as written in `settings.json model.name`).                                       |
+| `effective_model`      | `string?` | `null`             | Model Gemini actually used (per-response `modelVersion` field, spec 05 §5.8).                              |
+| `mismatch_count_today` | `u32?`    | `null`             | Count of responses where `effective_model != selected_model`. Reset at midnight LA.                        |
+| `is_downgrade`         | `bool?`   | `null`             | Derived: `true` when `mismatch_count_today >= DOWNGRADE_DEBOUNCE` (config knob, default 3).                |
+
+#### `QuotaKind::Unknown` degradation
+
+When a surface parser hits schema drift (new field it doesn't recognise in an upstream response, or a circuit-breaker-exceeded sequence of 5xx responses), the record's `kind` becomes `"unknown"` and utilization/counter fields stay at their last-known values. Statusline consumers render `quota: unknown` rather than a stale number. Recovery: next successful poll with recognised schema flips kind back to `"utilization"` or `"counter"`.
+
+#### Example v2 file (mixed surfaces)
+
+```json
+{
+  "schema_version": 2,
+  "accounts": {
+    "1": {
+      "surface": "claude-code",
+      "kind": "utilization",
+      "five_hour": { "used_percentage": 42.0, "resets_at": 1775726400 },
+      "seven_day": { "used_percentage": 8.0, "resets_at": 1776196800 },
+      "rate_limits": null,
+      "updated_at": 1775722800.0
+    },
+    "2": {
+      "surface": "codex",
+      "kind": "utilization",
+      "five_hour": { "used_percentage": 18.0, "resets_at": 1775726400 },
+      "seven_day": null,
+      "rate_limits": null,
+      "updated_at": 1775722800.0
+    },
+    "3": {
+      "surface": "gemini",
+      "kind": "counter",
+      "updated_at": 1775722800.0,
+      "counter": 42,
+      "rate_limit": 1000,
+      "resets_at_tz": "America/Los_Angeles",
+      "selected_model": "gemini-2.5-pro",
+      "effective_model": "gemini-2.5-pro",
+      "mismatch_count_today": 0,
+      "is_downgrade": false
+    }
+  }
+}
+```
+
+#### Compatibility matrix
+
+| Writer \ Reader    | v1 reader (pre-B8)                                                   | v2.0.1 dual-read (B8+) | v2 writer (C6+)                                    |
+| ------------------ | -------------------------------------------------------------------- | ---------------------- | -------------------------------------------------- |
+| v1 file (legacy)   | OK                                                                   | OK (defaults applied)  | N/A                                                |
+| v2 file (C6+)      | OK — extra fields ignored via `#[serde(default)]` on the unit struct | OK                     | OK                                                 |
+| schema_version > 2 | errors — "file written by newer csq, refusing"                       | errors — same          | errors — refuses writing over incompatible version |
+
+PR-B8 (v2.0.1) is the shakedown ship. It adds v2 READ with all fields optional-tolerant and continues to WRITE v1. v2.1 PR-C6 flips the write path.
+
+### 7.4.2 Cross-stream consumer tests (PR-C1.5 gate)
+
+The following regression tests are the contract that PR-B8 (v2.0.1), PR-C6 (v2.1), PR-G3 (v2.2) all satisfy against this frozen schema:
+
+1. **Parse v1 file unchanged** — legacy file reads exactly as before this spec revision.
+2. **Parse v2 file with Claude-only accounts** — migrated v1 with `schema_version=2` and `surface="claude-code"` fields explicit.
+3. **Parse v2 file with mixed surfaces** — the example above round-trips byte-identical.
+4. **Parse v2 file missing optional Gemini fields** — null-defaults applied without panic.
+5. **Parse v2 file with schema_version=3** — errors with actionable message.
+6. **Round-trip v2 → save → load identical** — no drift.
+
+These test names are canonical; PR-B8 / PR-C6 / PR-G3 implementations use the same names for traceability.
+
+### 7.4.3 Migration semantics (summarises §7.6.2 below)
+
+On the v2.1 release that flips write path, daemon startup: (a) reads quota.json, (b) if `schema_version` is absent or `1`, stamps every account with `surface="claude-code"`, `kind="utilization"`, sets top-level `schema_version=2`, (c) atomically replaces the file. Idempotent, crash-safe (atomic rename). v2.0.1's PR-B8 dual-read means a v2.1 daemon starting against a v1 file never encounters a parse error — it simply migrates.
 
 ## 7.5 Invariants
 
@@ -335,3 +447,4 @@ These are items that MUST be resolved (verified or decided) before the first Cod
 - 2026-04-21 — 1.0.0 — Initial draft, introduced for Codex + Gemini integration. Derived from research + red team findings in this session (see workspaces/codex/04-validate/, workspaces/gemini/04-validate/ when populated). References openai/codex#10332, #15502; google-gemini/gemini-cli#21744.
 - 2026-04-21 — 1.0.1 — /analyze phase for Codex surface completed (workspaces/codex/01-analysis/). Added INV-P08 (credential mode-flip mutex coordination), INV-P09 (per-account mutex lifecycle), INV-P10 (cross-surface swap cleanup), INV-P11 (auto-rotation refuses cross-surface). Added §7.7 Open preconditions OPEN-C01..C04 as PR-gating verifications. Spec ordering numbering shift: former §7.7 "What this spec does NOT cover" becomes §7.8; former §7.8 "Cross-references" becomes §7.9. Journaled in workspaces/codex/journal/0001.
 - 2026-04-22 — 1.0.2 — OPEN-C01 RESOLVED via direct openai/codex source read. Finding: `cli_auth_credentials_store = "file"` does NOT disable in-process refresh; codex refreshes on-expiry regardless. INV-P01 re-framed to "scheduled pre-expiry refresher" with 2h safety margin (matches spec 04 INV-06 Anthropic pattern). INV-P02 rationale refined accordingly. Clock-skew mitigation added. Gemini /analyze phase completed (workspaces/gemini/01-analysis/) — no spec 07 changes required; Gemini inherits the abstraction unchanged. Journaled in workspaces/codex/journal/0004 and workspaces/gemini/journal/0001.
+- 2026-04-22 — 1.1.0 — PR-C1.5: §7.4 expanded with frozen quota.json v2 schema subsection 7.4.1 (mandatory + optional fields, example mixed-surface file, compatibility matrix), §7.4.2 cross-stream consumer test names, §7.4.3 migration semantics summary. Minor bump because schema is a cross-stream contract; adding it is additive to existing text but promotes the shape from prose to specification. Consumed by PR-B8 (v2.0.1 dual-read), PR-C6 (v2.1 write flip), PR-G3 (v2.2 Gemini counter). Journal 0067 H1.

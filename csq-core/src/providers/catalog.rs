@@ -1,15 +1,101 @@
-//! Provider catalog — skeletons for Claude, MiniMax, Z.AI, Ollama.
+//! Provider catalog — skeletons for Claude, MiniMax, Z.AI, Ollama, Codex.
+//!
+//! **Surface** is the architectural dispatch axis introduced in PR-C1 per
+//! spec 07 §7.1.1. It tags each provider with the upstream CLI binary
+//! (Claude Code vs `codex` vs `gemini`) and controls per-surface
+//! behaviour across the daemon, handle-dir, rotation, and refresher
+//! paths. See journal 0067 H3 + workspaces/codex/journal/0001.
 
 use serde::{Deserialize, Serialize};
+
+/// Upstream CLI surface the provider speaks to.
+///
+/// Dispatch for refresh cadence, handle-dir symlink set, usage-poller
+/// endpoint, rotation semantics, and quota schema all key off this.
+///
+/// Current values:
+/// - `ClaudeCode` — `claude` CLI. Covers Anthropic (OAuth), MiniMax
+///   (Bearer), Z.AI (Bearer), Ollama (keyless). Shares handle-dir model
+///   (spec 02) + `CLAUDE_CONFIG_DIR` env contract.
+/// - `Codex` — `codex` CLI (OpenAI ChatGPT subscription). OAuth
+///   refresh via `auth.openai.com`; quota via `wham/usage`; handle-dir
+///   uses `CODEX_HOME` (OPEN-C02 RESOLVED POSITIVE, journal 0005).
+///
+/// Reserved for future: `Gemini` (per workspaces/gemini plan §PR-G1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Surface {
+    /// Claude Code CLI (`claude`). Default for backward compatibility
+    /// with serialized state that predates PR-C1 — existing quota.json
+    /// and account snapshots without a `surface` field deserialize to
+    /// `ClaudeCode`.
+    #[default]
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
+    /// OpenAI Codex CLI (`codex`). v2.1 Codex surface — see
+    /// `workspaces/codex/02-plans/01-implementation-plan.md`.
+    #[serde(rename = "codex")]
+    Codex,
+}
+
+impl std::fmt::Display for Surface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Surface::ClaudeCode => write!(f, "claude-code"),
+            Surface::Codex => write!(f, "codex"),
+        }
+    }
+}
+
+/// Where the surface stores the user's model selection.
+///
+/// Controls how `csq models switch` rewrites the effective model for
+/// a provider. Determined by how the upstream CLI reads its model
+/// config — Anthropic+3P store in `settings.json` environment
+/// variables; Codex stores in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelConfigTarget {
+    /// Model written to `env.ANTHROPIC_MODEL` inside a settings.json
+    /// file. Applies to Anthropic (OAuth CC), MiniMax, Z.AI, Ollama.
+    EnvInSettingsJson,
+    /// Model written to the `model = "..."` key at the root of
+    /// `config.toml`. Applies to Codex.
+    TomlModelKey,
+}
+
+/// Shape of the quota signal the surface exposes.
+///
+/// Per spec 07 §7.4 and spec 05 §5.7 / §5.8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuotaKind {
+    /// Percentage (0-100) plus reset timestamp per window. Two windows
+    /// (5h + 7d) for Anthropic + Codex per §5.1 and §5.7.
+    Utilization,
+    /// Spawn-counter + 429 rate-limit parse (Gemini pattern). Event-
+    /// driven; no polling endpoint. See spec 05 §5.8.
+    Counter,
+    /// Surface declines to expose quota (e.g. keyless Ollama) or the
+    /// signal is currently unavailable (schema drift / circuit-breaker).
+    Unknown,
+}
 
 /// A provider definition with defaults for new profiles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
-    /// Short identifier (e.g., "claude", "mm", "zai", "ollama").
+    /// Short identifier (e.g., "claude", "mm", "zai", "ollama", "codex").
     pub id: &'static str,
     /// Display name.
     pub name: &'static str,
-    /// Auth type: "oauth" (Claude), "bearer" (MiniMax, Z.AI), "none" (Ollama).
+    /// Upstream CLI surface (PR-C1). Default `ClaudeCode` for serialized
+    /// state that predates the surface split.
+    #[serde(default)]
+    pub surface: Surface,
+    /// Where the model selection lives (settings.json env vs config.toml key).
+    #[serde(default = "default_model_config_target")]
+    pub model_config: ModelConfigTarget,
+    /// Quota signal shape.
+    #[serde(default = "default_quota_kind")]
+    pub quota_kind: QuotaKind,
+    /// Auth type: "oauth" (Claude, Codex), "bearer" (MiniMax, Z.AI), "none" (Ollama).
     pub auth_type: AuthType,
     /// Environment variable for the API key (or None for keyless).
     pub key_env_var: Option<&'static str>,
@@ -37,6 +123,14 @@ pub struct Provider {
     pub default_auth_token: Option<&'static str>,
 }
 
+const fn default_model_config_target() -> ModelConfigTarget {
+    ModelConfigTarget::EnvInSettingsJson
+}
+
+const fn default_quota_kind() -> QuotaKind {
+    QuotaKind::Utilization
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthType {
     OAuth,
@@ -49,6 +143,9 @@ pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "claude",
         name: "Claude",
+        surface: Surface::ClaudeCode,
+        model_config: ModelConfigTarget::EnvInSettingsJson,
+        quota_kind: QuotaKind::Utilization,
         auth_type: AuthType::OAuth,
         key_env_var: Some("ANTHROPIC_API_KEY"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
@@ -63,6 +160,9 @@ pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "mm",
         name: "MiniMax",
+        surface: Surface::ClaudeCode,
+        model_config: ModelConfigTarget::EnvInSettingsJson,
+        quota_kind: QuotaKind::Utilization,
         auth_type: AuthType::Bearer,
         key_env_var: Some("ANTHROPIC_AUTH_TOKEN"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
@@ -79,6 +179,9 @@ pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "zai",
         name: "Z.AI",
+        surface: Surface::ClaudeCode,
+        model_config: ModelConfigTarget::EnvInSettingsJson,
+        quota_kind: QuotaKind::Utilization,
         auth_type: AuthType::Bearer,
         key_env_var: Some("ANTHROPIC_AUTH_TOKEN"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
@@ -95,6 +198,9 @@ pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "ollama",
         name: "Ollama",
+        surface: Surface::ClaudeCode,
+        model_config: ModelConfigTarget::EnvInSettingsJson,
+        quota_kind: QuotaKind::Unknown,
         auth_type: AuthType::None,
         key_env_var: None,
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
@@ -107,6 +213,31 @@ pub const PROVIDERS: &[Provider] = &[
         ),
         timeout_secs: 120,
         default_auth_token: Some("ollama"),
+    },
+    // v2.1 Codex stub. Full orchestration lands in PR-C3 (login) + PR-C4
+    // (refresher) + PR-C5 (wham/usage poller). The entry here exists so
+    // `Surface::Codex` is reachable via `get_provider("codex")` for the
+    // Surface-enum regression tests landed with PR-C1 and for PR-C2's
+    // credential-file surface dispatch. `settings_filename` is Codex-
+    // irrelevant — Codex writes to `config.toml`, not a settings.json —
+    // but the field is required by the Provider struct shape; value is
+    // unique to satisfy `settings_filenames_unique` test.
+    Provider {
+        id: "codex",
+        name: "Codex",
+        surface: Surface::Codex,
+        model_config: ModelConfigTarget::TomlModelKey,
+        quota_kind: QuotaKind::Utilization,
+        auth_type: AuthType::OAuth,
+        key_env_var: None,
+        base_url_env_var: None,
+        default_base_url: Some("https://chatgpt.com"),
+        default_model: "gpt-5.4",
+        validation_endpoint: None, // Validated via wham/usage post-refresh in PR-C5
+        settings_filename: "codex-config.toml",
+        system_primer: None,
+        timeout_secs: 30,
+        default_auth_token: None,
     },
 ];
 
@@ -189,5 +320,68 @@ mod tests {
             PROVIDERS.len(),
             "settings filenames must be unique"
         );
+    }
+
+    // ── PR-C1 regressions ────────────────────────────────────────
+
+    /// Surface enum roundtrips through serde JSON using the
+    /// `#[serde(rename = ...)]` wire names.
+    #[test]
+    fn surface_serde_wire_names() {
+        let cc = serde_json::to_string(&Surface::ClaudeCode).unwrap();
+        let cx = serde_json::to_string(&Surface::Codex).unwrap();
+        assert_eq!(cc, "\"claude-code\"");
+        assert_eq!(cx, "\"codex\"");
+        let back_cc: Surface = serde_json::from_str(&cc).unwrap();
+        let back_cx: Surface = serde_json::from_str(&cx).unwrap();
+        assert_eq!(back_cc, Surface::ClaudeCode);
+        assert_eq!(back_cx, Surface::Codex);
+    }
+
+    /// Default is `Surface::ClaudeCode` so serialized state predating
+    /// PR-C1 deserializes cleanly without a `surface` field.
+    #[test]
+    fn surface_default_is_claude_code() {
+        let s: Surface = Default::default();
+        assert_eq!(s, Surface::ClaudeCode);
+    }
+
+    /// Codex stub provider is present and correctly tagged. PR-C2+
+    /// extends it with real credential plumbing; for now the catalog
+    /// entry just needs to exist so downstream code can call
+    /// `get_provider("codex")`.
+    #[test]
+    fn codex_stub_provider_present() {
+        let p = get_provider("codex").expect("codex provider should be registered");
+        assert_eq!(p.surface, Surface::Codex);
+        assert_eq!(p.model_config, ModelConfigTarget::TomlModelKey);
+        assert_eq!(p.quota_kind, QuotaKind::Utilization);
+        assert_eq!(p.auth_type, AuthType::OAuth);
+    }
+
+    /// All four pre-existing providers must remain `Surface::ClaudeCode`
+    /// after the PR-C1 tagging pass.
+    #[test]
+    fn claude_code_providers_retain_surface() {
+        for id in ["claude", "mm", "zai", "ollama"] {
+            let p = get_provider(id).expect(id);
+            assert_eq!(
+                p.surface,
+                Surface::ClaudeCode,
+                "provider {id} must be ClaudeCode"
+            );
+        }
+    }
+
+    /// `ModelConfigTarget::TomlModelKey` is reserved for Codex per
+    /// spec 07 §7.3.3 — no other provider writes models via config.toml.
+    #[test]
+    fn toml_model_key_used_only_by_codex() {
+        let toml_providers: Vec<&str> = PROVIDERS
+            .iter()
+            .filter(|p| p.model_config == ModelConfigTarget::TomlModelKey)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(toml_providers, vec!["codex"]);
     }
 }

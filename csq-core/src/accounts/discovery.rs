@@ -6,6 +6,7 @@
 use super::profiles;
 use super::{AccountInfo, AccountSource};
 use crate::credentials;
+use crate::providers::catalog::Surface;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::warn;
@@ -184,6 +185,7 @@ pub fn discover_per_slot_third_party(base_dir: &Path) -> Vec<AccountInfo> {
             source: AccountSource::ThirdParty {
                 provider: provider_name.to_string(),
             },
+            surface: Surface::ClaudeCode,
             method: "api_key".into(),
             has_credentials: has_token,
         });
@@ -257,6 +259,7 @@ pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
                 id,
                 label: email,
                 source: AccountSource::Anthropic,
+                surface: Surface::ClaudeCode,
                 method: "oauth".into(),
                 has_credentials,
             });
@@ -363,6 +366,7 @@ pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
                 id,
                 label: email,
                 source: AccountSource::Anthropic,
+                surface: Surface::ClaudeCode,
                 method: "oauth".into(),
                 has_credentials: true,
             });
@@ -406,6 +410,7 @@ pub fn discover_third_party(base_dir: &Path) -> Vec<AccountInfo> {
                         source: AccountSource::ThirdParty {
                             provider: provider.to_string(),
                         },
+                        surface: Surface::ClaudeCode,
                         method: "api_key".into(),
                         has_credentials: true,
                     });
@@ -710,6 +715,7 @@ mod tests {
             id: 100,
             label: "Manual Account".into(),
             source: AccountSource::Manual,
+            surface: Surface::ClaudeCode,
             method: "api_key".into(),
             has_credentials: true,
         };
@@ -731,6 +737,7 @@ mod tests {
             id: 1,
             label: "Manual Duplicate".into(),
             source: AccountSource::Manual,
+            surface: Surface::ClaudeCode,
             method: "manual".into(),
             has_credentials: false,
         };

@@ -42,7 +42,12 @@ pub fn handle(base_dir: &Path, target: AccountNum) -> Result<()> {
         );
 
         let validated = super::validated_config_dir(base_dir)?;
-        let result = rotation::swap_to(base_dir, &validated, target)?;
+        let result = rotation::swap_to(
+            base_dir,
+            &validated,
+            target,
+            csq_core::providers::catalog::Surface::ClaudeCode,
+        )?;
 
         let expires_in_min = (result.expires_at_ms / 1000).saturating_sub(
             std::time::SystemTime::now()

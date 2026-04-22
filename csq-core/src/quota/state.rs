@@ -99,12 +99,16 @@ pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
 
 /// Saves quota state to disk with atomic write.
 ///
-/// VP-final R6: always writes schema_version = 1 regardless of in-memory value.
+/// PR-C6 (v2.1.0): write path now emits `schema_version = 2` with
+/// `surface` + `kind` fields on every record. PR-B8 (v2.0.1) read path
+/// tolerates both v1 and v2, so a v2 file written here remains readable
+/// if the user rolls back to v2.0.1. See spec 07 §7.4 + §7.6.2 and
+/// journal 0018.
 pub fn save_state(base_dir: &Path, quota_file: &QuotaFile) -> Result<(), ConfigError> {
     let path = quota_path(base_dir);
-    // Force schema_version=1 on disk (R6: dual-read / single-write contract).
+    // Write schema_version=2 on disk (PR-C6 write-path flip).
     let mut to_save = quota_file.clone();
-    to_save.schema_version = 1;
+    to_save.schema_version = 2;
     let json = serde_json::to_string_pretty(&to_save).map_err(|e| ConfigError::InvalidJson {
         path: path.clone(),
         reason: format!("serialization: {e}"),
@@ -127,6 +131,97 @@ pub fn save_state(base_dir: &Path, quota_file: &QuotaFile) -> Result<(), ConfigE
     })?;
 
     Ok(())
+}
+
+/// Outcome of a quota.json v1→v2 migration attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// No `quota.json` existed at `base_dir` — nothing to migrate. The
+    /// next write by a v2 poller will create a v2 file directly.
+    NoFile,
+    /// File exists and already carries `schema_version >= 2` — no
+    /// rewrite performed.
+    AlreadyV2 { schema_version: u32 },
+    /// File existed at `schema_version < 2` and was rewritten in place
+    /// with `schema_version = 2`. `account_count` is the number of
+    /// account records that survived the read (expired windows are
+    /// dropped by `load_state::clear_expired` before the rewrite).
+    Migrated { account_count: usize },
+}
+
+/// Idempotently migrates a v1 `quota.json` to the v2 shape.
+///
+/// Runs at daemon startup, BEFORE `spawn_refresher` / `spawn_usage_poller`,
+/// so live writers never race the migration. Steps:
+///
+/// 1. Peek at the raw file to read `schema_version`. If ≥ 2, return
+///    [`MigrationOutcome::AlreadyV2`] without touching the file.
+/// 2. Otherwise call [`load_state`] — serde defaults fill in
+///    `surface = "claude-code"` and `kind = "utilization"` on every
+///    record that was written by a v1 poller.
+/// 3. Call [`save_state`], which now stamps `schema_version = 2` per
+///    the PR-C6 write-path flip.
+///
+/// Crash-safety: [`save_state`] writes via `unique_tmp_path` +
+/// `secure_file` + `atomic_replace`. A SIGKILL between tmp write and
+/// rename leaves the original `quota.json` intact; the next daemon
+/// start retries the migration against the unchanged v1 file. A
+/// SIGKILL after rename leaves the new v2 file in place; subsequent
+/// starts see `AlreadyV2` and no-op.
+///
+/// Idempotent: repeat calls against the same file produce no disk I/O
+/// after the first successful migration.
+///
+/// Non-destructive: the round-trip preserves every account's
+/// `updated_at`, `rate_limits`, `extras`, and all nested Gemini
+/// reserved fields (`counter` / `rate_limit` / etc.) via
+/// `#[serde(default)]`. The only intentional drop is windows whose
+/// `resets_at` is already in the past (handled by `clear_expired`
+/// inside `load_state`).
+pub fn migrate_v1_to_v2_if_needed(base_dir: &Path) -> Result<MigrationOutcome, ConfigError> {
+    let path = quota_path(base_dir);
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) if !c.trim().is_empty() => c,
+        Ok(_) => return Ok(MigrationOutcome::NoFile),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MigrationOutcome::NoFile),
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path,
+                reason: format!("read: {e}"),
+            })
+        }
+    };
+
+    // Peek at schema_version without committing to the typed QuotaFile
+    // shape — a v2-only field added later must not cause the peek to
+    // panic. Missing/unparseable version is treated as 1.
+    let raw: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| ConfigError::InvalidJson {
+            path: path.clone(),
+            reason: format!("peek: {e}"),
+        })?;
+    let schema_version = raw
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+
+    if schema_version >= 2 {
+        tracing::debug!(schema_version, "quota.json already at v2 — migration no-op");
+        return Ok(MigrationOutcome::AlreadyV2 { schema_version });
+    }
+
+    // load_state fills `surface` / `kind` defaults for every account and
+    // drops expired windows; save_state writes v2 atomically.
+    let parsed = load_state(base_dir)?;
+    let account_count = parsed.accounts.len();
+    save_state(base_dir, &parsed)?;
+
+    tracing::info!(
+        account_count,
+        "quota.json migrated v1 → v2 (schema_version 2, surface/kind stamped)"
+    );
+    Ok(MigrationOutcome::Migrated { account_count })
 }
 
 /// Computes a deterministic hash of a rate_limits payload for cursor comparison.
@@ -345,6 +440,164 @@ mod tests {
         // Second call with same payload: cursor rejects
         let second = update_quota(dir.path(), &config, account, &payload).unwrap();
         assert!(!second);
+    }
+
+    // ─── PR-C6 migration tests ────────────────────────────────────
+
+    fn write_raw_quota_json(base_dir: &Path, json: &str) {
+        let path = quota_path(base_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, json).unwrap();
+    }
+
+    #[test]
+    fn migrate_no_file_returns_no_file_outcome() {
+        let dir = TempDir::new().unwrap();
+        let out = migrate_v1_to_v2_if_needed(dir.path()).unwrap();
+        assert_eq!(out, MigrationOutcome::NoFile);
+        assert!(!quota_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn migrate_v1_file_rewrites_as_v2() {
+        let dir = TempDir::new().unwrap();
+        // Pure v1 shape: no schema_version, no surface, no kind.
+        let v1 = r#"{
+            "accounts": {
+                "1": {
+                    "five_hour": {"used_percentage": 42.0, "resets_at": 4102444800},
+                    "seven_day": {"used_percentage": 10.0, "resets_at": 4102444900},
+                    "updated_at": 100.0
+                }
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), v1);
+
+        let out = migrate_v1_to_v2_if_needed(dir.path()).unwrap();
+        assert_eq!(out, MigrationOutcome::Migrated { account_count: 1 });
+
+        // Re-read the raw file and confirm schema_version=2 + surface/kind
+        // are now physically present.
+        let raw = std::fs::read_to_string(quota_path(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["schema_version"].as_u64(), Some(2));
+        let acct = &value["accounts"]["1"];
+        assert_eq!(acct["surface"].as_str(), Some("claude-code"));
+        assert_eq!(acct["kind"].as_str(), Some("utilization"));
+        // Non-destructive: the original utilization + resets_at survived.
+        assert_eq!(acct["five_hour"]["used_percentage"].as_f64(), Some(42.0));
+        assert_eq!(acct["five_hour"]["resets_at"].as_u64(), Some(4102444800));
+        assert_eq!(acct["updated_at"].as_f64(), Some(100.0));
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let v1 = r#"{
+            "accounts": {
+                "2": {
+                    "five_hour": {"used_percentage": 5.0, "resets_at": 4102444800},
+                    "updated_at": 50.0
+                }
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), v1);
+
+        // First call migrates.
+        let first = migrate_v1_to_v2_if_needed(dir.path()).unwrap();
+        assert!(matches!(first, MigrationOutcome::Migrated { .. }));
+
+        // Capture the post-migration file bytes.
+        let after_first = std::fs::read_to_string(quota_path(dir.path())).unwrap();
+
+        // Second call must be a no-op (AlreadyV2) AND must not touch the file.
+        let second = migrate_v1_to_v2_if_needed(dir.path()).unwrap();
+        assert_eq!(second, MigrationOutcome::AlreadyV2 { schema_version: 2 });
+
+        let after_second = std::fs::read_to_string(quota_path(dir.path())).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "idempotent migration must not rewrite the file"
+        );
+    }
+
+    #[test]
+    fn migrate_preserves_extras_and_counter_fields() {
+        let dir = TempDir::new().unwrap();
+        // A v1-ish file that already carries Gemini-reserved fields and
+        // an `extras` escape hatch (e.g. a pre-migration write from a
+        // Codex prototype build). Migration must not drop them.
+        let v1_with_extras = r#"{
+            "accounts": {
+                "7": {
+                    "five_hour": {"used_percentage": 8.0, "resets_at": 4102444800},
+                    "updated_at": 60.0,
+                    "counter": {"requests_today": 42, "resets_at_tz": "America/Los_Angeles"},
+                    "extras": {"codex_plan": "team", "nested": {"x": 42}}
+                }
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), v1_with_extras);
+
+        let out = migrate_v1_to_v2_if_needed(dir.path()).unwrap();
+        assert_eq!(out, MigrationOutcome::Migrated { account_count: 1 });
+
+        let raw = std::fs::read_to_string(quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
+        assert_eq!(
+            v["accounts"]["7"]["counter"]["requests_today"].as_u64(),
+            Some(42)
+        );
+        assert_eq!(
+            v["accounts"]["7"]["extras"]["codex_plan"].as_str(),
+            Some("team")
+        );
+        assert_eq!(
+            v["accounts"]["7"]["extras"]["nested"]["x"].as_i64(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn migrate_empty_file_returns_no_file() {
+        let dir = TempDir::new().unwrap();
+        write_raw_quota_json(dir.path(), "   \n  ");
+        let out = migrate_v1_to_v2_if_needed(dir.path()).unwrap();
+        // Whitespace-only content is treated as "nothing to migrate"
+        // — save_state would have created a schema_version=1 empty
+        // file which is still "absent" for migration purposes.
+        assert_eq!(out, MigrationOutcome::NoFile);
+    }
+
+    #[test]
+    fn migrate_malformed_schema_version_propagates_error() {
+        let dir = TempDir::new().unwrap();
+        // schema_version as a string — the peek falls back to v1 and
+        // load_state's typed parse rejects the non-u32 value. Migration
+        // returns an error rather than silently rewriting a corrupt
+        // file; the operator must fix or delete the bad file.
+        let weird = r#"{
+            "schema_version": "not-a-number",
+            "accounts": {
+                "3": {"updated_at": 0.0}
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), weird);
+        assert!(migrate_v1_to_v2_if_needed(dir.path()).is_err());
+    }
+
+    #[test]
+    fn save_state_stamps_schema_version_two() {
+        let dir = TempDir::new().unwrap();
+        let qf = QuotaFile::empty();
+        save_state(dir.path(), &qf).unwrap();
+
+        let raw = std::fs::read_to_string(quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
     }
 
     #[test]

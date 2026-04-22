@@ -10,6 +10,11 @@
     id: number;
     label: string;
     source: string;
+    /// "claude-code" | "codex" — the upstream CLI surface the
+    /// slot spawns. PR-C6. Distinct from `source` (which tracks
+    /// the credential *origin*): a 3P provider slot has
+    /// `source="third_party"` but `surface="claude-code"`.
+    surface: string;
     has_credentials: boolean;
     five_hour_pct: number;
     five_hour_resets_in: number | null;

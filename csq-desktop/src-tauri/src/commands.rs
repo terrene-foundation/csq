@@ -25,8 +25,13 @@ use tauri_plugin_autostart::ManagerExt;
 pub struct AccountView {
     pub id: u16,
     pub label: String,
-    /// "anthropic" | "third_party" | "manual"
+    /// "anthropic" | "codex" | "third_party" | "manual"
     pub source: String,
+    /// Upstream CLI surface binding: "claude-code" | "codex".
+    /// Added PR-C6 so the dashboard can badge codex-backed slots
+    /// without inferring from `source` (Anthropic → claude-code,
+    /// Codex → codex, ThirdParty / Manual → claude-code).
+    pub surface: String,
     pub has_credentials: bool,
     pub five_hour_pct: f64,
     pub five_hour_resets_in: Option<i64>,
@@ -177,6 +182,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                     AccountSource::ThirdParty { .. } => "third_party".into(),
                     AccountSource::Manual => "manual".into(),
                 },
+                surface: a.surface.to_string(),
                 has_credentials: a.has_credentials,
                 five_hour_pct: q.map(|q| q.five_hour_pct()).unwrap_or(0.0),
                 five_hour_resets_in: q.and_then(|q| {
@@ -1770,5 +1776,73 @@ mod tests {
         assert_eq!(view.state, "state123");
         assert_eq!(view.account, 5);
         assert_eq!(view.expires_in_secs, 600);
+    }
+
+    // ── PR-C6 surface field tests ──────────────────────────────
+
+    /// AccountView exposes the `surface` field and never leaks
+    /// credential material. This is the Tauri IPC audit per
+    /// `tauri-commands.md` MUST Rule 3.
+    #[test]
+    fn account_view_serializes_surface_without_secrets() {
+        let v = AccountView {
+            id: 1,
+            label: "Work".into(),
+            source: "anthropic".into(),
+            surface: "claude-code".into(),
+            has_credentials: true,
+            five_hour_pct: 0.0,
+            five_hour_resets_in: None,
+            seven_day_pct: 0.0,
+            seven_day_resets_in: None,
+            updated_at: 0.0,
+            token_status: "healthy".into(),
+            expires_in_secs: None,
+            last_refresh_error: None,
+            provider_id: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains(r#""surface":"claude-code""#));
+        // Structural audit: no token / secret field names may appear
+        // as JSON keys in the serialized payload — AccountView IS the
+        // IPC contract and mistakes here leak to every dashboard
+        // consumer. Match on the quoted-key shape to avoid false
+        // positives against `has_credentials` (which is a boolean
+        // status field, not a credential payload).
+        for forbidden_key in [
+            r#""access_token":"#,
+            r#""refresh_token":"#,
+            r#""id_token":"#,
+            r#""api_key":"#,
+            r#""openai_api_key":"#,
+        ] {
+            assert!(
+                !json.contains(forbidden_key),
+                "AccountView IPC payload must not expose `{forbidden_key}` field"
+            );
+        }
+    }
+
+    #[test]
+    fn account_view_surface_codex_variant_roundtrips() {
+        let v = AccountView {
+            id: 3,
+            label: "codex-3".into(),
+            source: "codex".into(),
+            surface: "codex".into(),
+            has_credentials: true,
+            five_hour_pct: 10.0,
+            five_hour_resets_in: Some(3600),
+            seven_day_pct: 5.0,
+            seven_day_resets_in: Some(86_400),
+            updated_at: 1_775_722_800.0,
+            token_status: "healthy".into(),
+            expires_in_secs: Some(7200),
+            last_refresh_error: None,
+            provider_id: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains(r#""source":"codex""#));
+        assert!(json.contains(r#""surface":"codex""#));
     }
 }

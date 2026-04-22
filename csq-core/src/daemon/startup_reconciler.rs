@@ -68,6 +68,14 @@ pub struct ReconcileSummary {
     /// Number of `config.toml` files rewritten because the directive
     /// was missing or had drifted to a non-`"file"` value.
     pub config_tomls_repaired: usize,
+    /// PR-C6: whether a v1→v2 `quota.json` migration ran this start.
+    /// `None` means no file existed (fresh install); `Some(false)` means
+    /// the file was already at v2; `Some(true)` means the reconciler
+    /// rewrote it atomically from v1 to v2.
+    pub quota_migrated: Option<bool>,
+    /// Number of account records that survived the v1→v2 quota migration
+    /// (0 if no migration ran).
+    pub quota_accounts_migrated: usize,
 }
 
 /// Runs the reconciler synchronously. Safe to call before
@@ -80,14 +88,60 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     let mut summary = ReconcileSummary::default();
     pass1_codex_credential_mode(base_dir, &mut summary);
     pass2_codex_config_toml(base_dir, &mut summary);
+    pass3_quota_v1_to_v2(base_dir, &mut summary);
     info!(
         codex_credentials_seen = summary.codex_credentials_seen,
         codex_credentials_repaired = summary.codex_credentials_repaired,
         config_tomls_seen = summary.config_tomls_seen,
         config_tomls_repaired = summary.config_tomls_repaired,
+        quota_migrated = ?summary.quota_migrated,
+        quota_accounts_migrated = summary.quota_accounts_migrated,
         "startup reconciler complete"
     );
     summary
+}
+
+/// Pass 3 — PR-C6 quota v1→v2 migration.
+///
+/// Runs BEFORE any poller starts writing, so live writers never race
+/// the migration. Idempotent: an already-v2 file is left untouched.
+/// Atomic: a SIGKILL between tmp write and rename leaves the original
+/// v1 file intact and the next daemon start re-runs the migration.
+///
+/// Non-fatal on error: a corrupt file is logged but does not crash
+/// the daemon. The usage poller will still write new quota records
+/// (with schema_version=2) after starting, replacing the corrupt
+/// file on first successful write.
+fn pass3_quota_v1_to_v2(base_dir: &Path, summary: &mut ReconcileSummary) {
+    use crate::quota::state::{migrate_v1_to_v2_if_needed, MigrationOutcome};
+    match migrate_v1_to_v2_if_needed(base_dir) {
+        Ok(MigrationOutcome::NoFile) => {
+            summary.quota_migrated = None;
+        }
+        Ok(MigrationOutcome::AlreadyV2 { schema_version }) => {
+            debug!(
+                schema_version,
+                "pass 3 quota v1→v2: file already at v2, skipping"
+            );
+            summary.quota_migrated = Some(false);
+        }
+        Ok(MigrationOutcome::Migrated { account_count }) => {
+            info!(
+                account_count,
+                "pass 3 quota v1→v2: rewrote quota.json with schema_version=2"
+            );
+            summary.quota_migrated = Some(true);
+            summary.quota_accounts_migrated = account_count;
+        }
+        Err(e) => {
+            warn!(
+                error_kind = "quota_migration_failed",
+                error = %e,
+                "pass 3 quota v1→v2: migration error — leaving file as-is; next poller write will overwrite"
+            );
+            summary.quota_migrated = None;
+        }
+    }
 }
 
 fn pass1_codex_credential_mode(base_dir: &Path, summary: &mut ReconcileSummary) {
@@ -541,5 +595,73 @@ mod tests {
         let s = run_reconciler(dir.path());
         assert_eq!(s.codex_credentials_seen, 0);
         assert_eq!(s.config_tomls_seen, 0);
+    }
+
+    // ─── PR-C6 pass 3 tests ───────────────────────────────────────
+
+    #[test]
+    fn pass3_no_quota_file_reports_none() {
+        let dir = TempDir::new().unwrap();
+        let s = run_reconciler(dir.path());
+        assert_eq!(s.quota_migrated, None);
+        assert_eq!(s.quota_accounts_migrated, 0);
+    }
+
+    #[test]
+    fn pass3_migrates_v1_to_v2_and_reports_count() {
+        let dir = TempDir::new().unwrap();
+        let v1 = r#"{
+            "accounts": {
+                "5": {
+                    "five_hour": {"used_percentage": 20.0, "resets_at": 4102444800},
+                    "updated_at": 123.0
+                }
+            }
+        }"#;
+        std::fs::write(dir.path().join("quota.json"), v1).unwrap();
+
+        let s = run_reconciler(dir.path());
+        assert_eq!(s.quota_migrated, Some(true));
+        assert_eq!(s.quota_accounts_migrated, 1);
+
+        // Confirm on-disk rewrite
+        let raw = std::fs::read_to_string(dir.path().join("quota.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
+        assert_eq!(v["accounts"]["5"]["surface"].as_str(), Some("claude-code"));
+    }
+
+    #[test]
+    fn pass3_already_v2_file_reports_false() {
+        let dir = TempDir::new().unwrap();
+        // Write a real v2 file via save_state so it matches the exact
+        // on-disk shape the writer produces.
+        let mut qf = crate::quota::QuotaFile::empty();
+        qf.set(
+            1,
+            crate::quota::AccountQuota {
+                five_hour: Some(crate::quota::UsageWindow {
+                    used_percentage: 50.0,
+                    resets_at: 4_102_444_800,
+                }),
+                updated_at: 100.0,
+                ..Default::default()
+            },
+        );
+        crate::quota::state::save_state(dir.path(), &qf).unwrap();
+
+        let s = run_reconciler(dir.path());
+        assert_eq!(s.quota_migrated, Some(false));
+        assert_eq!(s.quota_accounts_migrated, 0);
+    }
+
+    #[test]
+    fn pass3_corrupt_file_does_not_crash_reconciler() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("quota.json"), "this is not json").unwrap();
+        // Must not panic; summary reports migrated=None (treated as
+        // no-viable-migration; the poller will overwrite on next write).
+        let s = run_reconciler(dir.path());
+        assert_eq!(s.quota_migrated, None);
     }
 }

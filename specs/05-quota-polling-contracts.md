@@ -290,12 +290,16 @@ OPEN-G03 (new gap): exact field positions in 2026-04 need live verification. Par
 
 **Counter state in `quota.json`:**
 
+Field definitions and authoritative shape are owned by spec 07 §7.4.1. This section shows the Gemini-specific instantiation; spec 07 is the contract. The `schema_version: 2` top-level field lives at the root of `quota.json`, not per-account.
+
 ```json
 {
+  "schema_version": 2,
   "accounts": {
     "5": {
       "surface": "gemini",
       "kind": "counter",
+      "updated_at": 1745332320,
       "counter": {
         "requests_today": 237,
         "resets_at_tz": "America/Los_Angeles",
@@ -305,19 +309,20 @@ OPEN-G03 (new gap): exact field positions in 2026-04 need live verification. Par
         "active": false,
         "reset_at": null,
         "last_retry_delay_s": null,
-        "last_quota_metric": null
+        "last_quota_metric": null,
+        "cap": null
       },
       "selected_model": "gemini-3-pro-preview",
       "effective_model": "gemini-2.5-pro",
       "effective_model_first_seen_at": "2026-04-22T14:12:00Z",
       "mismatch_count_today": 3,
-      "is_downgrade": true,
-      "updated_at": 1745332320,
-      "schema_version": 2
+      "is_downgrade": true
     }
   }
 }
 ```
+
+Note the `cap` field inside `rate_limit` (populated from `RESOURCE_EXHAUSTED` body `quotaValue`) — reconciled with spec 07 §7.4.1 per VP-final red-team R1 (2026-04-22). Prior revisions of §5.8 flattened `cap` to a top-level `rate_limit: u64` which conflicted with the nested retry-state shape documented here.
 
 **Write invariants (inherits §5.5):**
 
@@ -358,3 +363,4 @@ OPEN-G03 (new gap): exact field positions in 2026-04 need live verification. Par
 - 2026-04-12 — 1.0.0 — Initial draft. Sections 5.2-5.4 pending Playwright investigation. Section 5.6 documents the 2026-04-12 poller hang and mandates supervisor + per-call timeout fixes.
 - 2026-04-13 — 1.1.0 — Sections 5.3 and 5.4 corrected per journal 0032: MiniMax GroupId is optional, Z.AI API key works (JWT not required), MiniMax usage_count = remaining not consumed. Both fixes shipped in PRs #79 and #80.
 - 2026-04-22 — 1.2.0 — Added §5.7 (Codex `/backend-api/wham/usage`, PROPOSED — schema pending live capture) and §5.8 (Gemini counter + 429 parse, event-driven). Former §5.7 "Cross-references" renumbered to §5.9. Both new sections ship as PROPOSED status until live response capture verifies schema; escalation to VERIFIED follows the spec-05 pattern set by MiniMax (§5.3) and Z.AI (§5.4) via journal 0032 — never commit to a verbatim response shape without observation. Journaled in workspaces/codex/journal/0004 and workspaces/gemini/journal/0002.
+- 2026-04-22 — 1.2.1 — PR-VP-final red-team R1 reconciliation. §5.8 counter-state example reconciled with spec 07 §7.4.1: added `cap` field inside `rate_limit` struct so the 429 `quotaValue` has a home; added cross-reference note that field definitions are owned by spec 07 §7.4.1 to prevent future drift. No behaviour change; shape-compatible with the updated spec 07 1.1.1 frozen schema. Journal 0067 R1.

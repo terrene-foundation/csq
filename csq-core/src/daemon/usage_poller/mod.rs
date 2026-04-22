@@ -51,6 +51,7 @@
 //!   `RefreshStatus` cache + credential files).
 
 pub mod anthropic;
+pub mod codex;
 pub mod minimax;
 pub mod third_party;
 pub mod zai;
@@ -164,6 +165,10 @@ pub fn spawn_with_config(
     // don't collide with Anthropic account IDs in the same range.
     let cooldowns_3p: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let backoffs_3p: Arc<Mutex<HashMap<u16, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Codex-surface circuit-breaker state lives per-account and is
+    // independent of the Anthropic cooldown/backoff maps so codex's
+    // 5-fail threshold cannot interfere with Anthropic's 429 handling.
+    let codex_breakers: codex::BreakerMap = Arc::new(Mutex::new(HashMap::new()));
 
     let join = tokio::spawn(async move {
         // Supervised run loop: restarts on panic with exponential
@@ -181,6 +186,7 @@ pub fn spawn_with_config(
                 backoffs: Arc::clone(&backoffs),
                 cooldowns_3p: Arc::clone(&cooldowns_3p),
                 backoffs_3p: Arc::clone(&backoffs_3p),
+                codex_breakers: Arc::clone(&codex_breakers),
                 shutdown: shutdown.clone(),
                 interval,
                 interval_3p,
@@ -232,6 +238,8 @@ struct RunLoopConfig {
     /// prevent ID collision with Anthropic accounts in the same range.
     cooldowns_3p: Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs_3p: Arc<Mutex<HashMap<u16, u32>>>,
+    /// Circuit-breaker state keyed per-Codex-account.
+    codex_breakers: codex::BreakerMap,
     shutdown: CancellationToken,
     interval: Duration,
     interval_3p: Duration,
@@ -261,6 +269,7 @@ async fn run_loop(cfg: RunLoopConfig) {
         use tracing::debug;
         debug!("usage poller heartbeat — tick starting");
         anthropic::tick(&cfg.base_dir, &cfg.http_get, &cfg.cooldowns, &cfg.backoffs).await;
+        codex::tick(&cfg.base_dir, &cfg.http_get, &cfg.codex_breakers).await;
 
         if last_3p_tick.elapsed() >= cfg.interval_3p {
             third_party::tick_3p(

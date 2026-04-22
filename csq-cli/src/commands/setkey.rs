@@ -7,7 +7,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::third_party;
-use csq_core::providers::catalog::AuthType;
+use csq_core::credentials::file as cred_file;
+use csq_core::providers::catalog::{AuthType, Surface};
 use csq_core::types::AccountNum;
 use csq_core::{http, providers};
 use std::io::Read;
@@ -17,6 +18,11 @@ use std::path::Path;
 /// under 2 KiB; 4096 is generous and bounds interactive input.
 const MAX_KEY_LEN: usize = 4096;
 
+/// FR-CLI-05 exit code: `csq setkey` targets a slot already bound to
+/// Codex (OAuth device-auth). Distinct from the default anyhow-mapped
+/// `1` so scripts can detect the "wrong provider for this slot" case.
+const EXIT_CODE_CODEX_SLOT: i32 = 2;
+
 pub fn handle(
     base_dir: &Path,
     provider_id: &str,
@@ -25,6 +31,17 @@ pub fn handle(
 ) -> Result<()> {
     let provider = providers::get_provider(provider_id)
         .ok_or_else(|| anyhow!("unknown provider: {provider_id}"))?;
+
+    // FR-CLI-05: refuse if the target slot is already bound to Codex.
+    // `csq setkey` writes an API-key-backed provider into a slot's
+    // settings.json / canonical file; overwriting a Codex-bound slot
+    // would leave `credentials/codex-<N>.json` orphaned AND destroy
+    // a live OAuth session the user probably still wants.
+    if let Some(msg) = check_codex_slot_conflict(base_dir, slot, provider) {
+        eprintln!("{}", msg.headline);
+        eprintln!("{}", msg.hint);
+        std::process::exit(EXIT_CODE_CODEX_SLOT);
+    }
 
     // Keyless providers (Ollama) take no user-supplied key. Writing
     // the settings file is enough — CC only needs the base URL, model,
@@ -87,6 +104,55 @@ pub fn handle(
     }
 
     Ok(())
+}
+
+/// Whether slot `N` is currently backed by a Codex canonical
+/// credential file. Uses [`std::fs::symlink_metadata`] rather than
+/// [`Path::exists`] so a dangling symlink at the canonical path is
+/// detected as "bound" — refusing a setkey against it is the safer
+/// posture because the dangling link can later be repaired back to a
+/// valid Codex credential. A pure filesystem check that does not
+/// read the file or parse its contents. Origin: PR-C3b security
+/// review L2.
+fn is_codex_bound_slot(base_dir: &Path, slot: AccountNum) -> bool {
+    let path = cred_file::canonical_path_for(base_dir, slot, Surface::Codex);
+    std::fs::symlink_metadata(&path).is_ok()
+}
+
+/// Two-line refusal message for the FR-CLI-05 guard. Structured so
+/// tests can assert the wording without having to re-capture stderr,
+/// and so a future desktop-UI consumer can render the two lines in
+/// different type weights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexSlotConflict {
+    headline: String,
+    hint: String,
+}
+
+/// Returns [`Some`] with the FR-CLI-05 refusal message iff the target
+/// slot is bound to Codex AND the requested provider is not itself
+/// Codex (the only provider that should ever touch a Codex slot).
+/// Returns [`None`] otherwise — the normal write path proceeds.
+fn check_codex_slot_conflict(
+    base_dir: &Path,
+    slot: Option<AccountNum>,
+    provider: &providers::Provider,
+) -> Option<CodexSlotConflict> {
+    let slot = slot?;
+    if !is_codex_bound_slot(base_dir, slot) {
+        return None;
+    }
+    if provider.surface == Surface::Codex {
+        return None;
+    }
+    Some(CodexSlotConflict {
+        headline: format!(
+            "Codex slots use OAuth device-auth, not API keys — run `csq login {slot} --provider codex`"
+        ),
+        hint: format!(
+            "(slot {slot} is currently bound to Codex; run `csq logout {slot}` first to rebind to another provider)"
+        ),
+    })
 }
 
 /// Keyless (Ollama) branch: writes the provider settings file (or
@@ -323,6 +389,137 @@ fn read_hidden_line() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn acc(n: u16) -> AccountNum {
+        AccountNum::try_from(n).unwrap()
+    }
+
+    #[test]
+    fn is_codex_bound_slot_detects_canonical_file() {
+        let dir = TempDir::new().unwrap();
+        let slot = acc(4);
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+
+        // Before any Codex file exists, the slot is not Codex-bound.
+        assert!(!is_codex_bound_slot(dir.path(), slot));
+
+        // `credentials/codex-4.json` → slot is Codex-bound.
+        std::fs::write(creds_dir.join("codex-4.json"), b"{}").unwrap();
+        assert!(is_codex_bound_slot(dir.path(), slot));
+    }
+
+    #[test]
+    fn is_codex_bound_slot_ignores_anthropic_canonical() {
+        let dir = TempDir::new().unwrap();
+        let slot = acc(5);
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+
+        // Only `<N>.json` — Anthropic shape — exists. Not Codex-bound.
+        std::fs::write(creds_dir.join("5.json"), b"{}").unwrap();
+        assert!(!is_codex_bound_slot(dir.path(), slot));
+    }
+
+    fn codex_bind(dir: &Path, slot: AccountNum) {
+        let creds_dir = dir.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join(format!("codex-{}.json", slot)), b"{}").unwrap();
+    }
+
+    #[test]
+    fn fr_cli_05_refuses_setkey_mm_on_codex_slot() {
+        let dir = TempDir::new().unwrap();
+        let slot = acc(4);
+        codex_bind(dir.path(), slot);
+
+        let mm = providers::get_provider("mm").expect("mm is registered");
+        let conflict = check_codex_slot_conflict(dir.path(), Some(slot), mm).expect(
+            "setkey mm on a Codex-bound slot must return the refusal message per FR-CLI-05",
+        );
+
+        assert!(
+            conflict
+                .headline
+                .contains("OAuth device-auth, not API keys"),
+            "headline must use FR-CLI-05 wording: {}",
+            conflict.headline
+        );
+        assert!(
+            conflict.headline.contains("csq login 4 --provider codex"),
+            "headline must name the slot + escape hatch: {}",
+            conflict.headline
+        );
+        assert!(
+            conflict.hint.contains("csq logout 4"),
+            "hint must point at the rebind workflow: {}",
+            conflict.hint
+        );
+    }
+
+    #[test]
+    fn fr_cli_05_allows_setkey_mm_on_anthropic_slot() {
+        let dir = TempDir::new().unwrap();
+        let mm = providers::get_provider("mm").unwrap();
+        assert_eq!(
+            check_codex_slot_conflict(dir.path(), Some(acc(4)), mm),
+            None,
+            "no codex canonical → setkey proceeds"
+        );
+    }
+
+    #[test]
+    fn fr_cli_05_allows_setkey_without_slot() {
+        // Global writes (no --slot) do not touch any canonical
+        // credential file and are therefore unaffected by FR-CLI-05.
+        let dir = TempDir::new().unwrap();
+        codex_bind(dir.path(), acc(4));
+        let mm = providers::get_provider("mm").unwrap();
+        assert_eq!(check_codex_slot_conflict(dir.path(), None, mm), None);
+    }
+
+    #[test]
+    fn fr_cli_05_allows_codex_provider_on_codex_slot() {
+        // A hypothetical future `setkey codex` for an OAI API-key
+        // (non-subscription) path would itself be a Codex-surface
+        // write — it must not be blocked by FR-CLI-05.
+        let dir = TempDir::new().unwrap();
+        let slot = acc(4);
+        codex_bind(dir.path(), slot);
+        let codex = providers::get_provider("codex").unwrap();
+        assert_eq!(
+            check_codex_slot_conflict(dir.path(), Some(slot), codex),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fr_cli_05_treats_dangling_symlink_as_bound() {
+        // Origin: PR-C3b security review L2. `Path::exists` follows
+        // symlinks; a dangling `credentials/codex-N.json` symlink
+        // would report not-bound and let setkey proceed. The guard
+        // now uses `symlink_metadata` so the dangling-link case
+        // refuses — the user can repair the link and retry.
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let slot = acc(6);
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        symlink(
+            dir.path().join("nowhere.json"),
+            creds_dir.join("codex-6.json"),
+        )
+        .unwrap();
+
+        assert!(is_codex_bound_slot(dir.path(), slot));
+        let mm = providers::get_provider("mm").unwrap();
+        assert!(
+            check_codex_slot_conflict(dir.path(), Some(slot), mm).is_some(),
+            "dangling Codex symlink must still refuse setkey"
+        );
+    }
 
     fn run_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
         let mut key = Vec::new();

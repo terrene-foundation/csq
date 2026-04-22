@@ -1,6 +1,7 @@
 //! Provider management — API key storage, model catalog, key validation.
 
 pub mod catalog;
+pub mod codex;
 pub mod models;
 pub mod ollama;
 pub mod settings;

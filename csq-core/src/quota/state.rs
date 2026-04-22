@@ -57,14 +57,23 @@ pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
                 );
                 return Ok(QuotaFile::empty());
             }
-            // VP-final R5: validate that every account key is a valid u16.
+            // VP-final R5 + round-2 L1: validate that every account key is a
+            // valid AccountNum (1..=999), not just any u16. Round 1 R5 accepted
+            // "0" and "1000"; round 2 tightened to the newtype contract so
+            // orphan entries can't accumulate in quota.json through
+            // hand-edits or future-schema corruption.
             for key in parsed.accounts.keys() {
-                if key.parse::<u16>().is_err() {
+                let ok = key
+                    .parse::<u16>()
+                    .ok()
+                    .and_then(|n| crate::types::AccountNum::try_from(n).ok())
+                    .is_some();
+                if !ok {
                     return Err(ConfigError::InvalidJson {
                         path: path.clone(),
                         reason: format!(
-                            "quota.json account key '{}' is not a valid u16 account number. \
-                             Keys must match the AccountNum newtype (1..999).",
+                            "quota.json account key '{}' is not a valid AccountNum \
+                             (expected decimal 1..=999).",
                             key
                         ),
                     });

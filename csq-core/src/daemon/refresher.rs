@@ -985,9 +985,23 @@ mod tests {
         // keep the backoff — this is what happens when the base
         // cooldown (10min) elapses but the backoff-scaled cooldown
         // (20min) has not.
-        let just_past_base = Instant::now()
-            .checked_sub(FAILURE_COOLDOWN + Duration::from_secs(1))
-            .expect("clock should be far enough from boot");
+        //
+        // On Windows CI runners freshly booted, `Instant::now()` can be
+        // closer to the monotonic epoch than FAILURE_COOLDOWN (10min).
+        // `checked_sub` returns None in that case; the test skips
+        // rather than panicking. Mirrors the sibling
+        // `tick_success_clears_cooldown` guard introduced in 439b802.
+        let just_past_base =
+            match Instant::now().checked_sub(FAILURE_COOLDOWN + Duration::from_secs(1)) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "SKIP tick_rate_limit_increases_backoff: Instant::now() too close \
+                     to boot to simulate an expired cooldown"
+                    );
+                    return;
+                }
+            };
         cooldowns.lock().unwrap().insert(1, just_past_base);
 
         // With backoff=2, the effective cooldown is 20min. 10min+1s

@@ -1,49 +1,41 @@
-# Session Notes — csq alpha.9→alpha.13: five handle-dir fixes + update pipeline fixed
+# Session Notes — 2026-04-23 — PR-C8 shipped (v2.1 Codex chain desktop-complete)
+
+PR-C8 (desktop Codex UI) complete. With PR-C5/C6/C7 already merged earlier in the day, v2.1 Codex-surface is fully user-facing across CLI + desktop. Only PR-C9 redteam + release notes remain before v2.1.0 cut.
+
+Workspace tests 1123 → 1178 (+55). Vitest 94 → 100 (+6). Clippy + fmt clean. svelte-check 0 errors / 0 warnings.
 
 ## Read These Files First (in order)
 
-1. `workspaces/csq-v2/journal/0044-DECISION-alpha-9-handle-dir-settings-merge.md` — settings.json materialized as real file (not symlink) by merging user global + slot overlay. Fixes statusLine/bypassPermissions vanishing under csq run.
-2. `workspaces/csq-v2/journal/0045-DISCOVERY-alpha-10-swap-stale-claude-json.md` — csq swap now atomically rewrites .claude.json so CC doesn't display pre-swap account's cached quota state.
-3. `workspaces/csq-v2/journal/0047-DISCOVERY-alpha-12-update-check-three-bugs.md` — /releases/latest skipped prereleases, compare_versions was lexicographic on alpha.N, GitHub list order unreliable. All three fixed with client-side semver sort.
-4. `workspaces/csq-v2/journal/0048-DISCOVERY-alpha-13-statusline-script-delivery-gap.md` — statusline-quota.sh never deployed by install.sh; now delivered alongside binary.
-5. `csq-core/src/session/handle_dir.rs` — `materialize_handle_settings` + `materialize_handle_claude_json` + `rebuild_claude_json_for_swap`. The core of alpha.9+10.
-6. `csq-core/src/update/github.rs` — `compare_prerelease` (SemVer §11 numeric segments), `/releases?per_page=30` + client-side sort.
+1. `workspaces/codex/journal/0020-DECISION-pr-c8-desktop-codex-ui.md` — full decision record + alternatives + For Discussion items + residual-risk resolutions (R1-R4).
+2. `workspaces/codex/02-plans/01-implementation-plan.md` §PR-C9a/b/c — the remaining redteam rounds + release notes.
+3. `specs/07-provider-surface-dispatch.md` §7.3.3 (Codex login sequence), §7.5 invariants — PR-C8 implements the desktop half of §7.3.3.
+4. `csq-core/src/providers/codex/{tos,models,desktop_login}.rs` — the three new modules backing PR-C8.
+5. `csq-desktop/src-tauri/src/commands.rs` — five new Tauri commands (start_codex_login, complete_codex_login, list_codex_models, acknowledge_codex_tos, set_codex_slot_model).
+6. `csq-desktop/src/lib/components/{AddAccountModal,ChangeModelModal,AccountList}.svelte` — frontend additions (ToS disclosure, Codex picker, surface badge).
 
 ## Accomplished
 
-- **alpha.9** (PR #102): handle-dir settings.json materialized via deep-merge. Killed apiKeyHelper bug at source. 6 new tests.
-- **alpha.10** (PR #103): csq swap rewrites .claude.json atomically, preserving session-scoped projects. 2 new tests.
-- **alpha.11** (PR #104): live-only discovery fallback + in-tick canonical resurrection + forensic breadcrumbs + csq doctor resurrection summary. 9 new tests. **NOTE**: hypothesis was wrong — affected machine had all canonicals present. Real cause of 8h re-auth was no daemon running (desktop app not launched). Code is additive/harmless but untested in anger.
-- **alpha.12** (PR #105): update check fixed — /releases?per_page=30 + semver-aware prerelease compare + client-side sort. 8 new tests.
-- **alpha.13** (PRs #106+#107): statusline-quota.sh handle-dir compat + install.sh/csq update install now deploy the script. Validated: csq update install from alpha.12→13 worked end-to-end on user's other machine.
-- **Total**: 719 tests passing, clippy clean, fmt clean. 5 journal entries (0044-0048). 7 PRs merged.
+- **PR-C8** (this PR) — desktop Codex UI. Three new csq-core modules (tos + models + desktop_login), five new Tauri commands, four new Svelte panels (codex-tos, codex-keychain-prompt, codex-running in AddAccountModal; codex-picker in ChangeModelModal), surface badge in AccountList. +55 Rust tests + 6 Vitest tests. All zero-tolerance residuals (R1-R4) resolved in-session.
+- Prior three PRs (PR-C5 #176, PR-C6 #177, PR-C7 #178) already merged earlier in the day.
 
 ## Outstanding
 
-- [ ] **Desktop app auto-updater** — Tauri `tauri-plugin-updater` for self-update + trigger CLI update + statusline script. User explicitly requested. Alpha.14 priority.
-- [ ] **Standalone daemon** (`csq daemon start/stop/status`) — root cause of 8h re-auth was no desktop app → no daemon → no refresh. CLI-only users need a background daemon. Now must-have.
-- [ ] **csq doctor false negatives** — (a) Daemon: check socket not just PID file; (b) Settings: statusline check too strict (requires literal "csq" in command).
-- [ ] **csq doctor broker_failed surface** — read `broker_failed_*` sentinels, print stuck slots with `csq login N` hint.
-- [ ] **Spec 02 update** — settings.json listed under account-bound symlinks but alpha.9 moved it to materialized.
-- [ ] **Uncommitted**: `0041-…md`, `0043-…md`, `0048-…md`, `csq-desktop/fix-dmg.sh`, `.claude/scheduled_tasks.lock`.
-- [ ] **Carried forward**: Anthropic OAuth cutover (blocked on client-id), same-email duplicate-slot badge, GH Actions v5 bump, Windows desktop smoke test.
+- [ ] **Admin-merge PR-C8** once CI confirms 6/6 green.
+- [ ] **PR-C9a/b/c** — redteam rounds + release notes (next session).
+- [ ] **INV-P05 spec amendment** — journal 0019 Q1 proposes "Same-surface ClaudeCode repoints; Codex always exec-replaces." Still needs user approval before editing `specs/07-provider-surface-dispatch.md`.
+- [ ] **Follow-up PR-C3c M1** — move `verify_codex_canonical_is_regular_file` from CLI into `create_handle_dir_codex` so desktop inherits it.
+- [ ] **Operational** — `rm -rf "/Applications/Code Session Quota.app.alpha.4.bak"` + `rm -rf ~/.codex.bak-1776836710/`.
 
-## Oversight — Verify Before Starting
+## Oversight — Verify Before Starting (Next Session)
 
-- [ ] `git log --oneline -5` — HEAD includes `becb6dd` (PR #107 merge).
-- [ ] `csq --version` → `csq 2.0.0-alpha.13`.
-- [ ] `cargo test --workspace` — 719 tests, all ok.
-- [ ] `gh release view v2.0.0-alpha.13 --json assets --jq '.assets | length'` → `16`.
-
-## Oversight — Verify After Completing
-
-- [ ] `cargo test --workspace` — no regressions.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` — zero.
-- [ ] `cargo fmt --all -- --check` — zero drift.
-- [ ] If touching update/github.rs: `compare_versions("2.0.0-alpha.20", "2.0.0-alpha.9")` must return Greater.
-- [ ] If touching handle_dir.rs: `csq run 1` then `csq swap 5` mid-session — verify CC uses slot 5's quota.
+- [ ] `git log --oneline -4` — HEAD should be the PR-C8 merge.
+- [ ] `cargo test --workspace` — 1178 passing, 0 failing.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [ ] `grep -rn 'pub fn start_codex_login' csq-desktop/` — command present.
+- [ ] `grep -n 'surface-badge' csq-desktop/src/lib/components/AccountList.svelte` — badge present.
 
 ## Blockers
 
-1. **Desktop updater** needs Tauri plugin config + signing key. Apple Developer ID still missing.
-2. **Standalone daemon** needs decision: launchd plist vs long-running `csq daemon start`.
+- **Apple Developer cert** (L1), **Windows EV cert** (L3) — unchanged, not PR-C8 blockers.
+- **Codex test account** — end-to-end device-code validation on real codex-cli will require a fresh `codex login` cycle (device-code flows are one-shot); deferred to PR-C9 redteam.
+- **Cross-surface swap on Windows** — platform follow-up (needs Win32 JobObjects); out of PR-C8 scope (tracked as known limitation in journal 0019).

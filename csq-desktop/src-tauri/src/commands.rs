@@ -1471,6 +1471,327 @@ pub fn open_release_page(state: State<'_, AppState>, app: AppHandle) -> Result<(
         .map_err(|e| format!("failed to open release page: {e}"))
 }
 
+// ── Codex desktop commands (PR-C8) ───────────────────────────────
+//
+// Four commands driving the Codex surface Add Account + Change Model
+// flows. Every command validates at the IPC boundary and delegates
+// the real work to csq-core's `providers::codex` module. No token
+// material ever enters a return type (IPC audit is in `tests` below
+// — extends the PR-C6 `account_view_serializes_surface_without_secrets`
+// forbidden-key harness to every new `Serialize` struct).
+
+/// Fires the pre-check step of a Codex Add Account flow: surfaces
+/// whether the user must first acknowledge the Codex terms-of-service
+/// disclosure and whether a stale `com.openai.codex` keychain entry
+/// would conflict with the file-backed auth store csq requires.
+///
+/// No filesystem writes beyond the keychain probe. The caller
+/// resolves both preconditions and then invokes
+/// [`complete_codex_login`].
+#[tauri::command]
+pub async fn start_codex_login(
+    base_dir: String,
+    account: u16,
+) -> Result<csq_core::providers::codex::desktop_login::StartLoginView, String> {
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+    let base = PathBuf::from(&base_dir);
+    tokio::task::spawn_blocking(move || {
+        csq_core::providers::codex::desktop_login::start_login(
+            &base,
+            account_num,
+            csq_core::providers::codex::keychain::probe_residue,
+        )
+        .map_err(|e| format!("{e:#}"))
+    })
+    .await
+    .map_err(|e| format!("start_codex_login task failed: {e}"))?
+}
+
+/// Completes a Codex Add Account flow after the UI has resolved the
+/// ToS and keychain prompts. Emits `codex-device-code` events with
+/// `{ verification_url, user_code }` payloads so the Svelte modal can
+/// render the code the user types on ChatGPT's verification page.
+///
+/// Blocks until `codex login --device-auth` exits (normally minutes,
+/// capped by codex-cli's own internal timeout). On success, relocates
+/// the freshly-written `auth.json` to `credentials/codex-<N>.json`
+/// with 0o400 and fires an `invalidate-cache` to the daemon so the
+/// dashboard sees the new slot on its next poll tick.
+#[tauri::command]
+pub async fn complete_codex_login(
+    app: AppHandle,
+    base_dir: String,
+    account: u16,
+    purge_keychain: bool,
+) -> Result<csq_core::providers::codex::desktop_login::CompleteLoginView, String> {
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+    let base = PathBuf::from(&base_dir);
+    let app_for_task = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = csq_core::providers::codex::desktop_login::complete_login(
+            &base,
+            account_num,
+            purge_keychain,
+            csq_core::providers::codex::keychain::purge_residue,
+            |config_dir, on_code| spawn_codex_device_auth_piped(config_dir, on_code, &app_for_task),
+            |info| {
+                let _ = app_for_task.emit("codex-device-code", &info);
+            },
+        )
+        .map_err(|e| format!("{e:#}"))?;
+
+        // Best-effort: kick daemon cache invalidation so the dashboard
+        // sees the new slot immediately rather than waiting for the
+        // 5s discovery tick.
+        #[cfg(unix)]
+        {
+            let sock = csq_core::daemon::socket_path(&base);
+            if sock.exists() {
+                let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+            }
+        }
+
+        Ok::<_, String>(result)
+    })
+    .await
+    .map_err(|e| format!("complete_codex_login task failed: {e}"))?
+}
+
+/// Production `codex login --device-auth` spawn. Captures stdout +
+/// stderr line-by-line; feeds each line through
+/// [`csq_core::providers::codex::desktop_login::parse_device_code_line`]
+/// to detect the device-code payload; when found, invokes `on_code`
+/// so [`complete_codex_login`] can forward it to the UI.
+///
+/// Also emits `codex-login-progress` events with raw stdout/stderr
+/// lines (scrubbed of anything token-shaped via the core redactor)
+/// so the modal can show a log tail for debugging auth failures —
+/// same ergonomic pattern as `ollama-pull-progress` in
+/// [`pull_ollama_model`].
+fn spawn_codex_device_auth_piped(
+    config_dir: &std::path::Path,
+    on_code: &mut dyn FnMut(csq_core::providers::codex::desktop_login::DeviceCodeInfo),
+    app: &AppHandle,
+) -> anyhow::Result<std::process::ExitStatus> {
+    use csq_core::error::redact_tokens;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(csq_core::providers::codex::surface::CLI_BINARY)
+        .args(["login", "--device-auth"])
+        .env(
+            csq_core::providers::codex::surface::HOME_ENV_VAR,
+            config_dir,
+        )
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "spawn `{} login --device-auth`: {e} — is codex-cli installed and on PATH?",
+                csq_core::providers::codex::surface::CLI_BINARY
+            )
+        })?;
+
+    // Spawn one thread per pipe so a slow consumer on stderr does
+    // not block stdout (where the device code lives). Each thread
+    // parses lines, emits a progress event, and forwards any
+    // device-code payload to the caller via a shared channel.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let (tx, rx) =
+        std::sync::mpsc::channel::<csq_core::providers::codex::desktop_login::DeviceCodeInfo>();
+
+    let reader = |stream: Option<Box<dyn std::io::Read + Send>>,
+                  tag: &'static str,
+                  app: AppHandle,
+                  tx: std::sync::mpsc::Sender<
+        csq_core::providers::codex::desktop_login::DeviceCodeInfo,
+    >| {
+        let stream = match stream {
+            Some(s) => s,
+            None => return None,
+        };
+        Some(std::thread::spawn(move || {
+            let buf = BufReader::new(stream);
+            for line in buf.lines().map_while(|l| l.ok()) {
+                let scrubbed = redact_tokens(&line);
+                let _ = app.emit(
+                    "codex-login-progress",
+                    serde_json::json!({ "stream": tag, "line": scrubbed }),
+                );
+                if let Some(info) =
+                    csq_core::providers::codex::desktop_login::parse_device_code_line(&line)
+                {
+                    let _ = tx.send(info);
+                }
+            }
+        }))
+    };
+
+    // `stdout` / `stderr` are `ChildStdout`/`ChildStderr` — box them
+    // to a trait-object so the closure signature matches.
+    let stdout_t = reader(
+        stdout.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        "stdout",
+        app.clone(),
+        tx.clone(),
+    );
+    let stderr_t = reader(
+        stderr.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        "stderr",
+        app.clone(),
+        tx.clone(),
+    );
+
+    // Forwarder thread: drain the channel until both pipes close.
+    // Drop the final tx clone so the channel EOFs when readers exit.
+    drop(tx);
+    let mut seen_code: Option<csq_core::providers::codex::desktop_login::DeviceCodeInfo> = None;
+    while let Ok(info) = rx.recv() {
+        if seen_code.is_none() {
+            seen_code = Some(info.clone());
+            on_code(info);
+        }
+    }
+
+    let status = child.wait()?;
+    if let Some(t) = stdout_t {
+        let _ = t.join();
+    }
+    if let Some(t) = stderr_t {
+        let _ = t.join();
+    }
+    Ok(status)
+}
+
+/// Returns the Codex models list. Consults (in order) the on-disk
+/// cache, a live fetch to `https://chatgpt.com/backend-api/codex/models`
+/// with a 1.5s timeout via the Node transport, and finally the
+/// bundled cold-start list. Never returns an empty list.
+///
+/// Requires a Codex account to be already authenticated — the live
+/// fetch uses that account's access token as a Bearer. If no Codex
+/// slot exists, only the cache and bundled fallback are consulted.
+#[tauri::command]
+pub async fn list_codex_models(
+    base_dir: String,
+) -> Result<csq_core::providers::codex::models::CodexModelList, String> {
+    let base = PathBuf::from(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+    tokio::task::spawn_blocking(move || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let base_for_cache = base.clone();
+        let base_for_write = base.clone();
+        let base_for_fetch = base.clone();
+        let list = csq_core::providers::codex::models::list_models_with(
+            move || csq_core::providers::codex::models::read_cache(&base_for_cache, now),
+            move || fetch_codex_models_live(&base_for_fetch),
+            move |list| {
+                let _ = csq_core::providers::codex::models::write_cache(&base_for_write, list);
+            },
+            now,
+        );
+        Ok::<_, String>(list)
+    })
+    .await
+    .map_err(|e| format!("list_codex_models task failed: {e}"))?
+}
+
+/// Live fetcher used by [`list_codex_models`]. Picks the lowest-numbered
+/// Codex account slot, reads its access token, and issues a Bearer
+/// GET against `chatgpt.com/backend-api/codex/models`. Returns the
+/// raw response body on HTTP 200; any other status is a fetch
+/// failure, surfacing as a fall-through to the bundled list.
+fn fetch_codex_models_live(base_dir: &std::path::Path) -> Result<Vec<u8>, String> {
+    // Discover Codex slots. If none, nothing to fetch with.
+    let accounts = csq_core::accounts::discovery::discover_all(base_dir);
+    let codex_account = accounts
+        .iter()
+        .find(|a| a.surface == csq_core::providers::catalog::Surface::Codex)
+        .ok_or_else(|| "no codex account provisioned".to_string())?;
+
+    // Read that account's canonical credential file.
+    let codex_num = AccountNum::try_from(codex_account.id)
+        .map_err(|e| format!("bad codex account number {}: {e}", codex_account.id))?;
+    let canonical = csq_core::credentials::file::canonical_path_for(
+        base_dir,
+        codex_num,
+        csq_core::providers::catalog::Surface::Codex,
+    );
+    let creds = csq_core::credentials::load(&canonical)
+        .map_err(|e| format!("load codex credentials: {e}"))?;
+    let token = creds
+        .codex()
+        .ok_or_else(|| "credentials at canonical path are not codex-shape".to_string())?
+        .tokens
+        .access_token
+        .clone();
+
+    let url = "https://chatgpt.com/backend-api/codex/models";
+    let extra_headers: &[(&str, &str)] = &[("User-Agent", "csq-desktop/codex-models")];
+    let (status, body) =
+        csq_core::http::get_bearer_node(url, &token, extra_headers).map_err(|e| e.to_string())?;
+    if status != 200 {
+        return Err(format!("codex/models returned HTTP {status}"));
+    }
+    Ok(body)
+}
+
+/// Writes `model = "<id>"` into the Codex slot's `config.toml`.
+/// Mirrors the `csq models switch codex <id>` CLI path (PR-C7) —
+/// uses `providers::codex::surface::write_config_toml` so the
+/// `cli_auth_credentials_store = "file"` directive (INV-P03) is
+/// preserved. `--force` semantics are handled at the UI — the
+/// desktop picker only surfaces ids from `list_codex_models`, and
+/// custom ids are an explicit override.
+#[tauri::command]
+pub fn set_codex_slot_model(
+    app: AppHandle,
+    base_dir: String,
+    slot: u16,
+    model: String,
+) -> Result<(), String> {
+    let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("model must not be empty".into());
+    }
+    let base = PathBuf::from(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+    csq_core::providers::codex::surface::write_config_toml(&base, slot_num, &model)
+        .map_err(|e| format!("write codex config.toml: {e}"))?;
+    let _ = app.emit(
+        "slot-model-changed",
+        serde_json::json!({ "slot": slot, "model": model, "surface": "codex" }),
+    );
+    Ok(())
+}
+
+/// Records that the user has read and acknowledged the Codex
+/// terms-of-service disclosure. Writes
+/// `accounts/codex-tos-accepted.json` at 0o600. Idempotent.
+#[tauri::command]
+pub fn acknowledge_codex_tos(base_dir: String) -> Result<(), String> {
+    let base = PathBuf::from(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+    csq_core::providers::codex::tos::acknowledge(&base)
+        .map(|_| ())
+        .map_err(|e| format!("acknowledge codex tos: {e}"))
+}
+
 // ── Unit tests ──────────────────────────────────────────────────
 //
 // Tests the input-validation and mapping logic that runs before
@@ -1821,6 +2142,174 @@ mod tests {
                 "AccountView IPC payload must not expose `{forbidden_key}` field"
             );
         }
+    }
+
+    // ── PR-C8 Codex command IPC contract ───────────────────────
+    //
+    // Structural audit on every new Serialize type per
+    // `tauri-commands.md` MUST Rule 3. Extends the PR-C6 forbidden-key
+    // harness so token material cannot leak through the Codex login
+    // pre-check or models response.
+
+    #[test]
+    fn codex_start_login_view_has_no_secret_keys() {
+        let v = csq_core::providers::codex::desktop_login::StartLoginView {
+            account: 7,
+            tos_required: true,
+            keychain: "absent".into(),
+            awaiting_keychain_decision: false,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        for forbidden in [
+            r#""access_token":"#,
+            r#""refresh_token":"#,
+            r#""id_token":"#,
+            r#""api_key":"#,
+            r#""openai_api_key":"#,
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "StartLoginView IPC payload must not expose `{forbidden}` field"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_complete_login_view_has_no_secret_keys() {
+        let v = csq_core::providers::codex::desktop_login::CompleteLoginView {
+            account: 5,
+            label: "codex-5/abc".into(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        for forbidden in [
+            r#""access_token":"#,
+            r#""refresh_token":"#,
+            r#""id_token":"#,
+            r#""api_key":"#,
+            r#""openai_api_key":"#,
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "CompleteLoginView IPC payload must not expose `{forbidden}` field"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_device_code_info_has_no_secret_keys() {
+        let v = csq_core::providers::codex::desktop_login::DeviceCodeInfo {
+            user_code: "ABCD-EFGH".into(),
+            verification_url: "https://chat.openai.com/codex/verify".into(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        for forbidden in [
+            r#""access_token":"#,
+            r#""refresh_token":"#,
+            r#""id_token":"#,
+            r#""api_key":"#,
+            r#""openai_api_key":"#,
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "DeviceCodeInfo event payload must not expose `{forbidden}` field"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_model_list_has_no_secret_keys() {
+        let v = csq_core::providers::codex::models::bundled();
+        let json = serde_json::to_string(&v).unwrap();
+        for forbidden in [
+            r#""access_token":"#,
+            r#""refresh_token":"#,
+            r#""id_token":"#,
+            r#""api_key":"#,
+            r#""openai_api_key":"#,
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "CodexModelList IPC payload must not expose `{forbidden}` field"
+            );
+        }
+    }
+
+    // ── acknowledge_codex_tos validation ──────────────────────
+
+    #[tokio::test]
+    async fn acknowledge_codex_tos_rejects_missing_base_dir() {
+        let err = acknowledge_codex_tos("/nonexistent/csq-base".into()).unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn acknowledge_codex_tos_writes_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
+        assert!(csq_core::providers::codex::tos::is_acknowledged(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_codex_tos_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
+        acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
+        assert!(csq_core::providers::codex::tos::is_acknowledged(dir.path()));
+    }
+
+    // ── start_codex_login validation ──────────────────────────
+
+    #[tokio::test]
+    async fn start_codex_login_rejects_invalid_account() {
+        let err = start_codex_login("/tmp".into(), 0).await.unwrap_err();
+        assert!(err.contains("invalid account"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_codex_login_returns_tos_required_when_marker_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let view = start_codex_login(dir.path().to_string_lossy().into_owned(), 2)
+            .await
+            .unwrap();
+        assert_eq!(view.account, 2);
+        assert!(
+            view.tos_required,
+            "fresh base_dir has no marker → tos_required must be true"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_codex_login_returns_tos_not_required_after_acknowledge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
+        let view = start_codex_login(dir.path().to_string_lossy().into_owned(), 2)
+            .await
+            .unwrap();
+        assert!(!view.tos_required);
+    }
+
+    // ── list_codex_models validation ──────────────────────────
+
+    #[tokio::test]
+    async fn list_codex_models_rejects_missing_base_dir() {
+        let err = list_codex_models("/nonexistent/csq-base".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_codex_models_falls_back_to_bundled_when_no_account() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let list = list_codex_models(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            list.source,
+            csq_core::providers::codex::models::ModelSource::Bundled,
+            "no Codex account → bundled fallback"
+        );
+        assert!(!list.models.is_empty(), "bundled list must never be empty");
     }
 
     #[test]

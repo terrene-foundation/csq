@@ -28,11 +28,29 @@
   interface Props {
     isOpen: boolean;
     slot: number;
+    /// Upstream CLI surface binding for the slot. Drives the
+    /// source-of-models branch inside the modal — `claude-code`
+    /// stays on the Ollama `ollama list` path; `codex` swaps to
+    /// the `list_codex_models` + cache + `set_codex_slot_model`
+    /// path. Default `claude-code` keeps legacy callers working.
+    surface?: string;
     onClose: () => void;
     onChanged: () => void;
   }
 
-  let { isOpen, slot, onClose, onChanged }: Props = $props();
+  let { isOpen, slot, surface = 'claude-code', onClose, onChanged }: Props = $props();
+
+  // PR-C8 types for the Codex branch.
+  interface CodexModel {
+    id: string;
+    label: string;
+  }
+  interface CodexModelList {
+    models: CodexModel[];
+    /// "live" | "cached" | "bundled"
+    source: string;
+    fetched_at: number;
+  }
 
   type ModalState =
     | { kind: 'loading' }
@@ -43,6 +61,17 @@
         custom: string;
         error: string | null;
         submitting: boolean;
+      }
+    // PR-C8 — Codex branch. The source hint is rendered next to the
+    // picker ("Cached 3m ago", "Live", "Cold-start") so users know
+    // whether the list is fresh.
+    | {
+        kind: 'codex-picker';
+        list: CodexModelList;
+        selected: string;
+        custom: string;
+        submitting: boolean;
+        error: string | null;
       }
     | { kind: 'pulling'; model: string; lines: string[] }
     | { kind: 'applying'; model: string }
@@ -63,11 +92,26 @@
     return await join(home, '.claude', 'accounts');
   }
 
+  /// Formats a Unix-epoch seconds value as "Nm ago" / "Nh ago" for
+  /// the Codex model list freshness hint. Called only from the
+  /// template so we don't need reactivity on it.
+  function formatFetchedAgo(epochSecs: number): string {
+    const now = Math.floor(Date.now() / 1000);
+    const delta = Math.max(0, now - epochSecs);
+    if (delta < 60) return `${delta}s`;
+    if (delta < 3600) return `${Math.floor(delta / 60)}m`;
+    return `${Math.floor(delta / 3600)}h`;
+  }
+
   /// Shared fetch-installed-list helper used by both onMount and
   /// the modal-reopen effect. Takes a cancellation flag so stale
   /// resolutions (modal closed mid-request, then reopened) don't
   /// overwrite a fresh `loading` modalState.
   async function loadInstalled(isCancelled: () => boolean) {
+    if (surface === 'codex') {
+      await loadCodexModels(isCancelled);
+      return;
+    }
     try {
       const installed = await invoke<string[]>('list_ollama_models');
       if (isCancelled()) return;
@@ -82,6 +126,57 @@
     } catch (e) {
       if (isCancelled()) return;
       modalState = { kind: 'error', message: `Could not list models: ${e}` };
+    }
+  }
+
+  /// Codex path — fetch via `list_codex_models` (cached + bundled
+  /// fallback in the backend; this frontend only renders the result).
+  /// Guaranteed non-empty per the Rust invariant so an empty models
+  /// array is treated as a fatal UI bug rather than "no models."
+  async function loadCodexModels(isCancelled: () => boolean) {
+    try {
+      const baseDir = await getBaseDir();
+      const list = await invoke<CodexModelList>('list_codex_models', { baseDir });
+      if (isCancelled()) return;
+      if (!list.models || list.models.length === 0) {
+        modalState = {
+          kind: 'error',
+          message: 'Codex models response was empty (backend invariant violated)',
+        };
+        return;
+      }
+      modalState = {
+        kind: 'codex-picker',
+        list,
+        selected: list.models[0]!.id,
+        custom: '',
+        submitting: false,
+        error: null,
+      };
+    } catch (e) {
+      if (isCancelled()) return;
+      modalState = { kind: 'error', message: `Could not load Codex models: ${e}` };
+    }
+  }
+
+  async function submitCodex() {
+    if (modalState.kind !== 'codex-picker' || modalState.submitting) return;
+    const current = modalState;
+    const customTrimmed = current.custom.trim();
+    const target = customTrimmed !== '' ? customTrimmed : current.selected;
+    if (!target) {
+      modalState = { ...current, error: 'Pick a model or enter a custom id', submitting: false };
+      return;
+    }
+
+    modalState = { ...current, submitting: true, error: null };
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('set_codex_slot_model', { baseDir, slot, model: target });
+      modalState = { kind: 'done', model: target };
+      onChanged();
+    } catch (e) {
+      modalState = { kind: 'error', message: String(e) };
     }
   }
 
@@ -254,13 +349,68 @@
   <div class="backdrop" onclick={close} onkeydown={(e) => { if (e.key === 'Escape') close(); }} role="button" tabindex="-1">
     <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="change-model-title" tabindex="-1">
       <header>
-        <h2 id="change-model-title">Change Ollama model</h2>
+        <h2 id="change-model-title">
+          {surface === 'codex' ? 'Change Codex model' : 'Change Ollama model'}
+        </h2>
         <button class="close" onclick={close} aria-label="Close">×</button>
       </header>
 
       <div class="body">
         {#if modalState.kind === 'loading'}
           <p class="hint">Loading installed models…</p>
+        {:else if modalState.kind === 'codex-picker'}
+          <p class="lede">Retarget slot #{slot} to a different Codex model.</p>
+          <p class="hint" data-testid="codex-source">
+            {#if modalState.list.source === 'live'}
+              Live — fetched from <code>chatgpt.com/backend-api/codex/models</code>.
+            {:else if modalState.list.source === 'cached'}
+              Cached {formatFetchedAgo(modalState.list.fetched_at)} ago.
+            {:else}
+              Cold-start list (offline). Live refresh will update on the
+              next open if the endpoint is reachable.
+            {/if}
+          </p>
+          <label class="field">
+            <span>Model</span>
+            <select
+              bind:value={modalState.selected}
+              disabled={modalState.custom.trim() !== '' || modalState.submitting}
+            >
+              {#each modalState.list.models as m (m.id)}
+                <option value={m.id}>{m.label}</option>
+              {/each}
+            </select>
+            <span class="hint">
+              csq writes <code>model = "&lt;id&gt;"</code> into
+              <code>config-{slot}/config.toml</code> atomically, preserving
+              the <code>cli_auth_credentials_store = "file"</code> directive
+              (INV-P03).
+            </span>
+          </label>
+          <label class="field">
+            <span>…or custom model id</span>
+            <input
+              type="text"
+              bind:value={modalState.custom}
+              placeholder="e.g. gpt-5.5"
+              autocomplete="off"
+              spellcheck="false"
+              disabled={modalState.submitting}
+            />
+            <span class="hint">
+              Anything Codex accepts on your subscription. csq does not
+              validate against ChatGPT entitlements (FR-CLI-04).
+            </span>
+          </label>
+          {#if modalState.error}
+            <div class="error-banner">{modalState.error}</div>
+          {/if}
+          <div class="actions">
+            <button class="secondary" onclick={close} disabled={modalState.submitting}>Cancel</button>
+            <button class="primary" onclick={submitCodex} disabled={modalState.submitting}>
+              {modalState.submitting ? 'Applying…' : 'Apply'}
+            </button>
+          </div>
         {:else if modalState.kind === 'picker'}
           <p class="lede">Retarget slot #{slot} to a different Ollama model.</p>
 

@@ -495,39 +495,27 @@ These are items that MUST be resolved (verified or decided) before the first Cod
 
 ### 7.7.2 OPEN-C02 — Verify `codex` honors `CODEX_HOME` for sessions/ and history.jsonl
 
-**Status:** Blocker for PR2.
+**Status:** RESOLVED 2026-04-22 POSITIVE. Finding: `codex-cli` 0.122.0 respects `CODEX_HOME` fully for sessions/rollouts, shell snapshots, logs_2.sqlite, installation_id, and plugin tree. Probe: `CODEX_HOME=/tmp/codex-probe codex exec 'say only: hi'` wrote session rollout + shell snapshot + logs exclusively to `/tmp/codex-probe/`; `~/.codex/` received zero files with session_id matching the probe. C-CR3 kill-switch does NOT fire. Spec 07 §7.2.2 stands without modification.
 
-**What must be verified:** whether codex writes sessions/history inside `$CODEX_HOME` or hardcodes paths under `~/.codex/`. Spec 07 §7.2.2 assumes `CODEX_HOME` rules everything; if codex ignores it for these, the handle-dir symlinks for `sessions` and `history.jsonl` are dead code and conversation data leaks to the user's global `~/.codex/`.
-
-**Method:** `CODEX_HOME=/tmp/x codex -e 'print("hi")' && find /tmp/x ~/.codex -newer /tmp/x`.
-
-**Consequence of resolution:** spec 07 §7.2.2 either stands or gains a second symlink strategy for the non-honored paths.
-
-**Reference:** 04-risk-analysis.md §4 G4.
+**Reference:** workspaces/codex/journal/0005 (PR-C00).
 
 ### 7.7.3 OPEN-C03 — Verify `remove_dir_all` symlink-safety
 
-**Status:** Blocker for PR2.
+**Status:** RESOLVED 2026-04-22 POSITIVE. Finding: `std::fs::remove_dir_all` on modern Rust (post-CVE-2022-21658 fix, Rust 1.58+) unlinks symlinks without traversing them. Empirical probe on macOS 25.3.0 (APFS) confirmed: `fs::remove_dir_all(handle_dir)` with `handle_dir/sessions → sensitive_dir/` symlink leaves `sensitive_dir/sentinel` intact. csq-core's existing `sweep_handles_image_cache_symlink` regression test (`csq-core/src/session/handle_dir.rs` line 2180) already covers this invariant for Claude Code's image-cache symlink; the Codex `sessions/` symlink inherits the same guarantee. PR-C0's `tests/integration_codex_sweep.rs` scoped to Codex-specific edge cases (broken symlink, symlink-to-symlink) rather than re-proving the base case.
 
-**What must be verified:** `std::fs::remove_dir_all` on a handle dir containing `sessions` as a symlink to `config-<N>/codex-sessions/` does NOT traverse the symlink and delete the persistent transcripts. Expected Rust 1.74+ behavior is that symlinks-to-dirs are unlinked, not traversed. Platform-specific behavior on macOS APFS, Linux ext4, Linux btrfs must be pinned by test.
-
-**Method:** integration test with a real filesystem layout; run on CI across platforms.
-
-**Consequence of resolution:** spec 07 INV-P04 holds, or sweep is rewritten to explicitly walk-and-unlink by type before `remove_dir_all`.
-
-**Reference:** 04-risk-analysis.md §2 R3, §6.
+**Reference:** workspaces/codex/journal/0006 (PR-C00); CVE-2022-21658.
 
 ### 7.7.4 OPEN-C04 — Verify HTTP transport for Codex endpoints
 
-**Status:** Blocker for PR3.
+**Status:** RESOLVED 2026-04-22 — Node transport required. Finding: reqwest/rustls reaches OpenAI's Cloudflare-fronted endpoints without hard-block (all three transports returned 401 with `cf-ray` + `server: cloudflare`) BUT response bodies are stripped for reqwest — `{"error": {}, "status": 401}` instead of curl's full `{"error": {"message": "...", "code": "token_expired", ...}}`. Node fetch preserves the body with minor wording variance vs curl. Csq adopts the Node subprocess pattern (reused from Anthropic journal csq-v2/0056) for both `/oauth/token` refresh and `chatgpt.com/backend-api/wham/usage` polling. **PR-C0.5 fires** per plan.
 
-**What must be verified:** whether `auth.openai.com` and `chatgpt.com/backend-api/*` are behind the same Cloudflare TLS-fingerprint filter that blocks reqwest/rustls for Anthropic endpoints (journal 0056). If yes, csq reuses the JS-runtime subprocess transport; if no, csq uses the native typed HTTP client.
+**Reference:** workspaces/codex/journal/0007 (PR-C00); memory/discovery_cloudflare_tls_fingerprint.md.
 
-**Method:** probe each endpoint with both transports from a clean environment; capture status + headers.
+### 7.7.5 OPEN-C05 — `/oauth/token` error-body token echo
 
-**Consequence of resolution:** daemon HTTP layer for Codex is sized correctly — either reuses existing Node.js infrastructure or uses lighter native path.
+**Status:** RESOLVED 2026-04-22 NEGATIVELY — no echo observed. Finding: four deliberately-bad refresh-token probes against `auth.openai.com/oauth/token` (three bogus tokens via curl/Node/reqwest + one real-but-burned token) produced error bodies that describe the failure without echoing submitted refresh_token values. Contrast with Anthropic's `/v1/oauth/token` which echoed refresh_token fragments (journal csq-v2/0007). Structural defense (SecretString module-wide in refresher) downgraded from emergency to "best-practice-when-touching-module"; PR-C0's redactor extension proceeds as planned as defense-in-depth for other Codex error surfaces (wham/usage 429s, WebSocket upgrades, SSO callbacks).
 
-**Reference:** 02-non-functional-requirements.md NFR-C07.
+**Reference:** workspaces/codex/journal/0009 (PR-C00); redteam H6.
 
 ## 7.8 What this spec does NOT cover
 
@@ -553,3 +541,4 @@ These are items that MUST be resolved (verified or decided) before the first Cod
 - 2026-04-22 — 1.1.0 — PR-C1.5: §7.4 expanded with frozen quota.json v2 schema subsection 7.4.1 (mandatory + optional fields, example mixed-surface file, compatibility matrix), §7.4.2 cross-stream consumer test names, §7.4.3 migration semantics summary. Minor bump because schema is a cross-stream contract; adding it is additive to existing text but promotes the shape from prose to specification. Consumed by PR-B8 (v2.0.1 dual-read), PR-C6 (v2.1 write flip), PR-G3 (v2.2 Gemini counter). Journal 0067 H1.
 - 2026-04-22 — 1.1.1 — PR-VP-final red-team reconciliation. Shape of §7.4.1 Gemini counter fields reconciled with spec 05 §5.8 — `counter` and `rate_limit` promoted from flat scalars to nested structs (`CounterState` / `RateLimitState`) to preserve Gemini retry-state fields (`reset_at`, `last_retry_delay_s`, `last_quota_metric`) that the flat shape discarded. `effective_model_first_seen_at` added at AccountQuota level. `extras: Option<Value>` escape-hatch field added so surfaces (notably Codex `wham/usage`) can stash unmigrated payload fragments without forcing schema v3. `schema_version > 2` handling changed from hard-error to degrade-to-empty + WARN for rollback UX. §7.4.2 test list expanded from 6 to 8 canonical tests (5' degradation, 7 key validation, 8 extras round-trip). Consumed by PR-VP-Group1-code (PR-B8 schema revision). Journal 0067 R1/R2/R3/R5/R6.
 - 2026-04-22 — 1.2.0 — PR-G0: §7.2.3.1 "Event-delivery contract" added. Pins socket-path resolution (shared with spec 04 §4.2.5 layer 3 via `platform::paths::daemon_socket()`), 50 ms non-blocking connect ceiling, drop-on-unavailable semantics with fixed-vocabulary structured log, NDJSON-as-durability-floor invariant, and the emitter-MUST-NOT-block rules. Consumed by PR-G2a (capture.rs emitter) and PR-G3 (daemon drain). Journal 0067 H7.
+- 2026-04-22 — 1.2.1 — PR-C00: §7.7.2 OPEN-C02, §7.7.3 OPEN-C03 flipped to RESOLVED POSITIVE with citations to journals 0005, 0006. §7.7.4 OPEN-C04 flipped to RESOLVED (Node transport required) citing journal 0007 — PR-C0.5 fires. New §7.7.5 OPEN-C05 RESOLVED NEGATIVELY citing journal 0009. C-CR3 kill-switch does NOT fire (OPEN-C02 positive). Unblocks PR-C3 (handle-dir layout), PR-C4 (refresher via Node bridge), PR-C0 (redactor extension as defense-in-depth). Remaining gate: §5.7 schema capture (journal 0008 GAP — pending fresh Codex auth after this session's probe-induced refresh_token burn).

@@ -49,12 +49,36 @@ pub fn backsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     let canonical_path = file::canonical_path(base_dir, account);
     let lock_path = canonical_path.with_extension("lock");
 
+    // Ensure the credentials directory exists before acquiring the lock
+    // file — backsync may be the first writer for a newly-provisioned
+    // account where credentials/N.json has never been written yet.
+    if let Some(parent) = canonical_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     // Acquire per-canonical lock
     let _guard = lock::lock_file(&lock_path)?;
 
     // Re-read canonical inside lock (monotonicity guard AND
     // subscription-metadata preservation source, journal 0063 P1-1).
-    let canonical_existing = credentials::load(&canonical_path).ok();
+    //
+    // VP-H2 (HIGH): distinguish NotFound from Corrupt. Previously `.ok()`
+    // collapsed both into None. If the canonical file is CORRUPT (not
+    // merely absent), we must NOT overwrite it with a live token that may
+    // carry `subscription_type: None` — that is the exact Max-tier-loss
+    // bug PR-B5 guards against. Abort backsync instead.
+    let canonical_existing = match credentials::load(&canonical_path) {
+        Ok(c) => Some(c),
+        Err(crate::error::CredentialError::NotFound { .. }) => None,
+        Err(_e) => {
+            tracing::warn!(
+                account = %account,
+                error_kind = "backsync_canonical_corrupt",
+                "backsync aborting: canonical credential file unreadable, refusing to overwrite"
+            );
+            return Ok(false);
+        }
+    };
     let canonical_expires = canonical_existing
         .as_ref()
         .map(|c| c.claude_ai_oauth.expires_at)
@@ -364,5 +388,103 @@ mod tests {
 
         let synced = pullsync(&config, dir.path()).unwrap();
         assert!(!synced);
+    }
+    // ── VP-H2: distinguish Corrupt from NotFound in backsync ─────────
+
+    /// VP-H2 (HIGH): when the canonical credential file is CORRUPT (exists
+    /// on disk but is not valid JSON), backsync MUST abort rather than
+    /// overwrite it with a live token that may carry `subscription_type:
+    /// None`. Overwriting would silently strip the Max tier.
+    ///
+    /// Contract: returns `Ok(false)` AND the malformed canonical file is
+    /// untouched on disk (still contains the original garbage bytes).
+    #[test]
+    fn backsync_aborts_when_canonical_is_corrupt() {
+        {
+            // Arrange
+            let dir = TempDir::new().unwrap();
+            let acct = AccountNum::try_from(7u16).unwrap();
+
+            // Write a MALFORMED canonical credential file.
+            let canonical_path = file::canonical_path(dir.path(), acct);
+            std::fs::create_dir_all(canonical_path.parent().unwrap()).unwrap();
+            let corrupt_bytes = b"{{ this is NOT valid json !!!";
+            std::fs::write(&canonical_path, corrupt_bytes).unwrap();
+
+            // Live is valid but subscription_type is None — the token state that
+            // would cause Max-tier loss if backsync were allowed to overwrite.
+            let config = dir.path().join("config-7");
+            std::fs::create_dir_all(&config).unwrap();
+            markers::write_csq_account(&config, acct).unwrap();
+            let live = make_creds("at-live-new", "rt-7", 9999);
+            assert!(live.claude_ai_oauth.subscription_type.is_none());
+            credentials::save(&config.join(".credentials.json"), &live).unwrap();
+
+            // Act
+            let result = backsync(&config, dir.path());
+
+            // Assert — backsync returns Ok(false), NOT an error.
+            assert!(
+                matches!(result, Ok(false)),
+                "backsync must return Ok(false) when canonical is corrupt, got: {{result:?}}"
+            );
+
+            // The canonical file must still contain the original corrupt bytes.
+            let on_disk = std::fs::read(&canonical_path).unwrap();
+            assert_eq!(
+                on_disk, corrupt_bytes,
+                "corrupt canonical file must not be overwritten by backsync"
+            );
+        }
+    }
+
+    /// VP-H2 (HIGH): when the canonical credential file is simply ABSENT
+    /// (NotFound, not corrupt), backsync must proceed normally and write
+    /// the canonical from live — preserving any subscription tier live
+    /// carries.
+    ///
+    /// This test verifies the NotFound arm does NOT trigger the abort path.
+    #[test]
+    fn backsync_proceeds_when_canonical_is_notfound() {
+        {
+            // Arrange
+            let dir = TempDir::new().unwrap();
+            let acct = AccountNum::try_from(8u16).unwrap();
+
+            // No canonical file — directory does not exist yet.
+            // backsync creates the credentials dir before locking so the
+            // lock_file call does not fail with NotFound.
+            let config = dir.path().join("config-8");
+            std::fs::create_dir_all(&config).unwrap();
+            markers::write_csq_account(&config, acct).unwrap();
+
+            // Live has subscription_type "max" — must be preserved in canonical.
+            let mut live = make_creds("at-live-8", "rt-8", 5000);
+            live.claude_ai_oauth.subscription_type = Some("max".to_string());
+            live.claude_ai_oauth.rate_limit_tier = Some("tier_4".to_string());
+            credentials::save(&config.join(".credentials.json"), &live).unwrap();
+
+            // Act
+            let result = backsync(&config, dir.path());
+
+            // Assert — backsync ran successfully and wrote the canonical.
+            assert!(
+                matches!(result, Ok(true)),
+                "backsync must return Ok(true) when canonical is absent, got: {{result:?}}"
+            );
+
+            let canonical_path = file::canonical_path(dir.path(), acct);
+            let written = credentials::load(&canonical_path).unwrap();
+            assert_eq!(
+                written.claude_ai_oauth.subscription_type.as_deref(),
+                Some("max"),
+                "Max tier from live must be preserved in newly-written canonical"
+            );
+            assert_eq!(
+                written.claude_ai_oauth.rate_limit_tier.as_deref(),
+                Some("tier_4"),
+                "rate_limit_tier from live must be preserved in newly-written canonical"
+            );
+        }
     }
 }

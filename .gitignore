@@ -18,6 +18,12 @@ config-*/
 gemini-events-*.ndjson
 gemini-events-*.corrupt.*
 
+# Codex wham/usage raw + drift captures (PII-redacted on write but the
+# diffs would still surface user_id / account_id / email shape drift
+# across sessions; captures live only on the operator's machine).
+accounts/codex-wham-raw.json
+accounts/codex-wham-drift.json
+
 # Rust build artifacts
 target/
 

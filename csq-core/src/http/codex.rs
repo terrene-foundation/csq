@@ -472,7 +472,10 @@ fn parse_refresh_response(_status: u16, bytes: &[u8]) -> Result<CodexTokens, Cod
     Err(CodexHttpError::MalformedResponse { status: 0 })
 }
 
-fn parse_wham_response(status: u16, bytes: &[u8]) -> Result<WhamSnapshot, CodexHttpError> {
+pub(crate) fn parse_wham_response(
+    status: u16,
+    bytes: &[u8],
+) -> Result<WhamSnapshot, CodexHttpError> {
     if status == 200 {
         if let Ok(snap) = serde_json::from_slice::<WhamSnapshot>(bytes) {
             return Ok(snap);

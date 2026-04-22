@@ -24,6 +24,8 @@
 //!   leak the request body (which contains the refresh token) into
 //!   error messages. The caller sees only a sanitized reason.
 
+pub mod codex;
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;

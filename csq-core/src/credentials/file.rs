@@ -93,9 +93,23 @@ pub fn save_canonical(
 
     let live = live_path(base_dir, account);
     if let Err(e) = save(&live, creds) {
+        // Journal 0063 L2 / PR-B2 — fixed error-kind tag per security.md Rule 2.
+        // Was `error = %e` which formats CredentialError's Display; while
+        // Display shouldn't carry tokens today, emitting `{e}` here ties log
+        // content to error struct shape, so a future Display refactor that
+        // embeds upstream payload fragments (e.g. include the invalid JSON
+        // slice for Corrupt variants) could silently regress this log site.
+        // Fixed-vocabulary tag is forward-safe and matches the mirror-write
+        // failure mode one-to-one.
+        let kind = match &e {
+            CredentialError::Io { .. } => "mirror_write_io",
+            CredentialError::Corrupt { .. } => "mirror_write_corrupt",
+            CredentialError::NotFound { .. } => "mirror_write_not_found",
+            _ => "mirror_write_other",
+        };
         warn!(
             account = %account,
-            error = %e,
+            error_kind = kind,
             "failed to mirror credentials to live config dir (canonical save succeeded)"
         );
     }

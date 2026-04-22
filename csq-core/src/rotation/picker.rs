@@ -139,9 +139,7 @@ mod tests {
                     used_percentage: five_hour_pct,
                     resets_at,
                 }),
-                seven_day: None,
-                rate_limits: None,
-                updated_at: 0.0,
+                ..Default::default()
             },
         );
         quota_state::save_state(base, &quota).unwrap();

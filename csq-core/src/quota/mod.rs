@@ -10,12 +10,21 @@ use std::collections::HashMap;
 /// Top-level quota file. Maps account numbers (as strings) to usage data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaFile {
+    /// Schema version. v1 files (pre-PR-C6) omit this and default to 1.
+    /// v2 files (post-PR-C6) set this to 2. Unknown values error on parse.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub accounts: HashMap<String, AccountQuota>,
+}
+
+fn default_schema_version() -> u32 {
+    1
 }
 
 impl QuotaFile {
     pub fn empty() -> Self {
         Self {
+            schema_version: 1,
             accounts: HashMap::new(),
         }
     }
@@ -34,12 +43,76 @@ impl QuotaFile {
 /// Usage data for a single account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountQuota {
+    // ── v2 mandatory-with-default ───────────────────────────────────────────
+    /// Surface that produced this quota record.
+    /// Defaults to `"claude-code"` on v1 files (field absent).
+    /// Allowed: `"claude-code"` | `"codex"` | `"gemini"`.
+    #[serde(default = "default_surface")]
+    pub surface: String,
+    /// Quota kind: `"utilization"` (Anthropic/Codex) | `"counter"` (Gemini)
+    /// | `"unknown"` (schema-drift degradation state).
+    /// Defaults to `"utilization"` on v1 files (field absent).
+    #[serde(default = "default_kind")]
+    pub kind: String,
+
+    // ── v1 utilization fields (unchanged) ──────────────────────────────────
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
     /// Rate-limit data from 3P providers (extracted from response headers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limits: Option<RateLimitData>,
     pub updated_at: f64,
+
+    // ── v2 Gemini-reserved counter fields (all optional) ───────────────────
+    /// Requests issued by the CLI this `resets_at_tz` day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter: Option<u64>,
+    /// Daily cap if known (from RESOURCE_EXHAUSTED 429 body).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<u64>,
+    /// IANA TZ identifier of reset cadence (e.g. `"America/Los_Angeles"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_tz: Option<String>,
+    /// Model the user requested (as written in settings.json model.name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_model: Option<String>,
+    /// Model Gemini actually used (per-response modelVersion field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    /// Count of responses where effective_model != selected_model today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatch_count_today: Option<u32>,
+    /// Derived: true when mismatch_count_today >= DOWNGRADE_DEBOUNCE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_downgrade: Option<bool>,
+}
+
+fn default_surface() -> String {
+    "claude-code".into()
+}
+
+fn default_kind() -> String {
+    "utilization".into()
+}
+
+impl Default for AccountQuota {
+    fn default() -> Self {
+        Self {
+            surface: default_surface(),
+            kind: default_kind(),
+            five_hour: None,
+            seven_day: None,
+            rate_limits: None,
+            updated_at: 0.0,
+            counter: None,
+            rate_limit: None,
+            resets_at_tz: None,
+            selected_model: None,
+            effective_model: None,
+            mismatch_count_today: None,
+            is_downgrade: None,
+        }
+    }
 }
 
 /// Rate-limit data extracted from `anthropic-ratelimit-*` response headers.
@@ -148,8 +221,8 @@ mod tests {
                 used_percentage: 50.0,
                 resets_at: 2000,
             }),
-            rate_limits: None,
             updated_at: 500.0,
+            ..Default::default()
         };
 
         quota.clear_expired(1500); // 5h expired, 7d not
@@ -171,8 +244,8 @@ mod tests {
                 used_percentage: 50.0,
                 resets_at: 10000,
             }),
-            rate_limits: None,
             updated_at: 500.0,
+            ..Default::default()
         };
 
         quota.clear_expired(1000);
@@ -187,9 +260,7 @@ mod tests {
                 used_percentage: 94.0,
                 resets_at: 5000,
             }),
-            seven_day: None,
-            rate_limits: None,
-            updated_at: 0.0,
+            ..Default::default()
         };
 
         assert_eq!(quota.five_hour_pct(), 94.0);
@@ -204,10 +275,8 @@ mod tests {
         qf.set(
             1,
             AccountQuota {
-                five_hour: None,
-                seven_day: None,
-                rate_limits: None,
                 updated_at: 123.0,
+                ..Default::default()
             },
         );
         assert!(qf.get(1).is_some());

@@ -270,15 +270,13 @@ mod tests {
         q.set(
             n,
             AccountQuota {
-                five_hour: None,
                 // resets_at deliberately in the year 2100 so
                 // clear_expired() doesn't null the window mid-test.
                 seven_day: Some(UsageWindow {
                     used_percentage: pct_7d,
                     resets_at: 4_102_444_800,
                 }),
-                rate_limits: None,
-                updated_at: 0.0,
+                ..Default::default()
             },
         );
         quota_state::save_state(base, &q).unwrap();

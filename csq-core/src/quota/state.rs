@@ -32,11 +32,25 @@ pub fn cursor_path(config_dir: &Path) -> PathBuf {
 pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
     let path = quota_path(base_dir);
     let mut quota_file = match std::fs::read_to_string(&path) {
-        Ok(content) if !content.trim().is_empty() => serde_json::from_str::<QuotaFile>(&content)
-            .map_err(|e| ConfigError::InvalidJson {
-                path: path.clone(),
-                reason: e.to_string(),
-            })?,
+        Ok(content) if !content.trim().is_empty() => {
+            let parsed: QuotaFile =
+                serde_json::from_str(&content).map_err(|e| ConfigError::InvalidJson {
+                    path: path.clone(),
+                    reason: e.to_string(),
+                })?;
+            // v2.0.1 tolerates schema_version 1 (absent/default) and 2. Reject newer.
+            if parsed.schema_version > 2 {
+                return Err(ConfigError::InvalidJson {
+                    path: path.clone(),
+                    reason: format!(
+                        "quota.json schema_version {} is newer than this csq binary supports \
+                         (max 2). Refusing to read to prevent data corruption. Upgrade csq.",
+                        parsed.schema_version
+                    ),
+                });
+            }
+            parsed
+        }
         _ => QuotaFile::empty(),
     };
 
@@ -160,8 +174,8 @@ pub fn update_quota(
         AccountQuota {
             five_hour,
             seven_day,
-            rate_limits: None,
             updated_at: now,
+            ..Default::default()
         },
     );
 
@@ -209,9 +223,8 @@ mod tests {
                     used_percentage: 42.5,
                     resets_at: 9999999999,
                 }),
-                seven_day: None,
-                rate_limits: None,
                 updated_at: 100.0,
+                ..Default::default()
             },
         );
 
@@ -233,9 +246,7 @@ mod tests {
                     used_percentage: 100.0,
                     resets_at: 1000,
                 }),
-                seven_day: None,
-                rate_limits: None,
-                updated_at: 0.0,
+                ..Default::default()
             },
         );
         save_state(dir.path(), &qf).unwrap();

@@ -6,10 +6,12 @@
 
 pub mod file;
 pub mod keychain;
+pub mod mutex;
 pub mod refresh;
 
-pub use file::{load, save, save_canonical};
+pub use file::{load, save, save_canonical, save_canonical_for};
 pub use keychain::service_name;
+pub use mutex::AccountMutexTable;
 
 use crate::types::{AccessToken, RefreshToken};
 use serde::{Deserialize, Serialize};

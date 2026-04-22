@@ -440,10 +440,11 @@ On the v2.1 release that flips write path, daemon startup: (a) reads quota.json,
 
 **INV-P09: Per-account refresh mutex lifecycle is tied to slot provisioning.**
 
-- Per-account `tokio::sync::Mutex` instances live in `DashMap<(Surface, AccountNum), Arc<Mutex<()>>>`.
-- `csq login N --provider <surface>` allocates the mutex on first provisioning.
-- `csq logout N` MUST acquire the mutex (serializing any in-progress refresh), delete the credential file, then remove the mutex entry from the DashMap.
+- Per-account mutex instances live in `Mutex<HashMap<(Surface, AccountNum), Arc<Mutex<()>>>>` — exposed via `crate::credentials::mutex::AccountMutexTable` (PR-C2a, commit landing on `feat/codex-pr-c2a-*`).
+- `csq login N --provider <surface>` allocates the mutex on first provisioning (via `AccountMutexTable::get_or_insert`).
+- `csq logout N` MUST acquire the mutex (serializing any in-progress refresh), delete the credential file, then remove the mutex entry from the table (via `AccountMutexTable::remove`).
 - Memory is not leaked across logout/login cycles. Keyed on `(Surface, AccountNum)` prevents slot-9-Codex and slot-9-Anthropic from sharing a lock. Derived from ADR-C14.
+- **Deviation (logged)** — PR-C2a ships `std::sync::Mutex` rather than `tokio::sync::Mutex` (prior draft), and a `Mutex<HashMap<...>>` rather than `DashMap<...>` (prior draft). Every current consumer ([`credentials::file::save_canonical_for`]) is synchronous and holds the guard across a bounded atomic rename, not across an `await`. A sync mutex is sufficient and keeps the write path sync; the outer `Mutex<HashMap>` avoids a `dashmap` crate dependency for a map of O(slots × surfaces) ≈ O(20) entries. PR-C4 (daemon Codex refresher) may add an async-safe variant if refresher critical sections grow `.await` points. See workspaces/codex/journal/0012.
 
 **INV-P10: Cross-surface swap cleans up the source handle dir before exec.**
 

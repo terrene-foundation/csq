@@ -57,15 +57,41 @@ pub fn tos_marker_path(base_dir: &Path) -> PathBuf {
 /// Returns `true` when the user has acknowledged the current Codex
 /// ToS version. Absence, wrong version, or a malformed marker all
 /// return `false` — the UI re-prompts in every case.
+///
+/// Journal 0021 finding M9: distinguishes `NotFound` (expected on
+/// first run — silent) from other I/O errors (permissions, disk
+/// full, corrupt fs) which are logged at WARN so an operator can
+/// see why every ToS prompt loops. Behavior is unchanged — still
+/// `false` on any read failure — but diagnostics are no longer
+/// silent.
 pub fn is_acknowledged(base_dir: &Path) -> bool {
     let path = tos_marker_path(base_dir);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error_kind = "codex_tos_marker_read_failed",
+                error = %e,
+                "cannot read Codex ToS marker — treating as not acknowledged \
+                 (check filesystem permissions and disk space)"
+            );
+            return false;
+        }
     };
-    let Ok(parsed) = serde_json::from_str::<TosMarker>(&raw) else {
-        return false;
-    };
-    parsed.version == CURRENT_TOS_VERSION
+    match serde_json::from_str::<TosMarker>(&raw) {
+        Ok(parsed) => parsed.version == CURRENT_TOS_VERSION,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error_kind = "codex_tos_marker_parse_failed",
+                error = %e,
+                "Codex ToS marker is malformed — treating as not acknowledged"
+            );
+            false
+        }
+    }
 }
 
 /// Atomically writes the ToS marker at the current version with an

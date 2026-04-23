@@ -421,7 +421,16 @@
   // AND show the code so they can type it on the OpenAI page.
   let codexDeviceCodeUnlisten: UnlistenFn | null = null;
 
-  async function startCodexFlow(account: number) {
+  // Journal 0021 finding 14: listener-registration race. If the user
+  // closes the modal while `await listen()` is still resolving,
+  // `codexDeviceCodeUnlisten` is null in `handleClose`, so there is
+  // nothing to unregister — and when `listen()` finally resolves,
+  // the live handler installs on a closed modal. This flag lets the
+  // post-resolve guard detect "already closed" and unregister
+  // immediately.
+  let codexListenerClosed = false;
+
+  async function startCodexFlow(account: number, tosRetry: boolean = false) {
     try {
       const baseDir = await getBaseDir();
       const pre = await invoke<CodexStartLoginView>('start_codex_login', {
@@ -429,6 +438,20 @@
         account,
       });
       if (pre.tos_required) {
+        if (tosRetry) {
+          // Journal 0021 finding M2: the caller already tried to
+          // acknowledge once. A second `tos_required` means the
+          // marker write didn't stick — probably a disk/permissions
+          // problem. Surface an error instead of recursing
+          // (pre-fix: `acknowledgeCodexTos` → `startCodexFlow` →
+          // `acknowledgeCodexTos` → …infinite async recursion).
+          step = {
+            kind: 'error',
+            message:
+              'ToS marker did not persist after acknowledgement — check base-dir permissions and disk space',
+          };
+          return;
+        }
         step = { kind: 'codex-tos', account };
         return;
       }
@@ -451,7 +474,13 @@
       // Re-run the pre-check so the keychain decision is surfaced
       // even if the user has acknowledged ToS before in a prior
       // session — a new keychain entry may have appeared since.
-      await startCodexFlow(account);
+      //
+      // Journal 0021 finding M2: pass `_tosRetry=true` so if the
+      // backend still reports `tos_required` (stale read / race /
+      // broken disk), we surface an error rather than recurse
+      // indefinitely. One retry is enough — a second `tos_required`
+      // after acknowledge means the marker write didn't stick.
+      await startCodexFlow(account, /* tosRetry */ true);
     } catch (e) {
       step = { kind: 'error', message: `Could not record acknowledgement: ${e}` };
     }
@@ -464,6 +493,7 @@
 
   async function runCodexLogin(account: number, purgeKeychain: boolean) {
     step = { kind: 'codex-running', account, deviceCode: null };
+    codexListenerClosed = false;
 
     // Subscribe BEFORE invoke so a fast backend cannot race the
     // event listener registration — otherwise the very first
@@ -473,7 +503,7 @@
       codexDeviceCodeUnlisten();
       codexDeviceCodeUnlisten = null;
     }
-    codexDeviceCodeUnlisten = await listen<CodexDeviceCode>(
+    const unlistenFn = await listen<CodexDeviceCode>(
       'codex-device-code',
       async (e) => {
         if (step.kind === 'codex-running' && step.account === account) {
@@ -489,6 +519,17 @@
         }
       },
     );
+
+    // Journal 0021 finding 14: if the modal was closed while
+    // `await listen()` was resolving, `handleClose` has already
+    // run but had null to unregister. Check the flag here —
+    // if closed, drop the handler immediately so no late event
+    // can touch a disposed modal.
+    if (codexListenerClosed) {
+      unlistenFn();
+      return;
+    }
+    codexDeviceCodeUnlisten = unlistenFn;
 
     try {
       const baseDir = await getBaseDir();
@@ -514,6 +555,13 @@
 
   // ── Close behavior ────────────────────────────────────────
   async function handleClose() {
+    // Journal 0021 finding 13 + 14: flag the listener as "closed"
+    // BEFORE dropping the unlisten handle. If `await listen()` is
+    // still in-flight at this moment (race), its post-resolve guard
+    // in `runCodexLogin` will see `codexListenerClosed` and drop
+    // the handler immediately on its side.
+    codexListenerClosed = true;
+
     // Drop any in-flight Codex device-code subscription so a late
     // event from an aborted login cannot slam the modal back into
     // `codex-running` after the user closed it.
@@ -521,6 +569,25 @@
       codexDeviceCodeUnlisten();
       codexDeviceCodeUnlisten = null;
     }
+
+    // Journal 0021 finding 6: kill the running codex subprocess so
+    // it does not orphan for the minutes-long device-auth window.
+    // Best-effort — the backend treats a no-op (no child running)
+    // as success. Runs BEFORE the step reset so the invoke is not
+    // cancelled by a state change.
+    try {
+      await invoke('cancel_codex_login');
+    } catch (_) {
+      /* best-effort — ignore */
+    }
+
+    // Journal 0021 finding 13: reset `step` to 'picker' so a late
+    // `codex-device-code` delivery (e.g. a Tauri event bus race)
+    // does NOT satisfy the `step.kind === 'codex-running'` guard in
+    // the listener closure and slam the modal back into the running
+    // state after it was closed.
+    step = { kind: 'picker' };
+
     onClose();
   }
 </script>

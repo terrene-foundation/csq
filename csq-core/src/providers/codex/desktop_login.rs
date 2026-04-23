@@ -156,8 +156,13 @@ where
         match purge() {
             Ok(_) => {}
             Err(e) => {
+                // Journal 0021 finding M4: the `security` CLI's
+                // stderr echoes service names and adjacent keychain
+                // bytes on some failure modes — route through
+                // `redact_tokens` before surfacing to the caller.
+                let redacted = redact_tokens(&e);
                 return Err(anyhow!(
-                    "could not purge com.openai.codex keychain entry: {e} — delete it manually with `security delete-generic-password -s com.openai.codex` and retry"
+                    "could not purge com.openai.codex keychain entry: {redacted} — delete it manually with `security delete-generic-password -s com.openai.codex` and retry"
                 ));
             }
         }
@@ -213,6 +218,12 @@ where
             reason = %redacted,
             "could not persist codex canonical credential"
         );
+        // R4 cleanup (journal 0021 finding 15): scrub the raw
+        // auth.json before returning. The canonical save failed, so
+        // the retry path expects `written` to be absent — if we
+        // leave it on disk, live access+refresh tokens sit readable
+        // between the failed attempt and the next one.
+        scrub_and_remove_written(&written, account, "save_failed");
         return Err(anyhow!(
             "could not write credentials/codex-{}.json — check `credentials/` permissions and retry",
             account
@@ -220,19 +231,7 @@ where
     }
 
     // Cleanup: secure_file + unlink the raw auth.json codex wrote.
-    let _ = crate::platform::fs::secure_file(&written);
-    if let Err(e) = std::fs::remove_file(&written) {
-        if let Ok(meta) = std::fs::metadata(&written) {
-            let zeros = vec![0u8; meta.len() as usize];
-            let _ = std::fs::write(&written, &zeros);
-        }
-        tracing::error!(
-            account = %account,
-            error_kind = "codex_desktop_login_raw_auth_json_remove_failed",
-            error = %e,
-            "failed to remove raw auth.json after relocation; content overwritten best-effort"
-        );
-    }
+    scrub_and_remove_written(&written, account, "post_save");
 
     // Step 6: marker + profile entry.
     markers::write_csq_account(&config_dir, account)
@@ -285,16 +284,34 @@ pub fn parse_device_code_line(line: &str) -> Option<DeviceCodeInfo> {
 }
 
 fn is_device_code_shape(token: &str) -> bool {
-    // OpenAI device codes are 8 uppercase alphanumerics plus optional
-    // dash (`XXXX-XXXX`). Restrict to that shape to avoid matching
-    // arbitrary 8-character stderr tokens.
-    let stripped: String = token.chars().filter(|c| *c != '-').collect();
-    if stripped.len() < 6 || stripped.len() > 16 {
+    // Journal 0021 finding M1: narrow to EXACTLY `XXXX-XXXX` (8
+    // alphanumerics with a mandatory single dash in the middle).
+    // Pre-C9a allowed 6-16 uppercase/digit chars which matched
+    // common help-output tokens like `NOTICE`, `WARNING`, `FATAL7`,
+    // `ID-ABCDE` and would false-positive on routine stderr.
+    //
+    // OpenAI device codes have the observed shape `ABCD-EFGH` —
+    // 4 uppercase alphanumerics + '-' + 4 uppercase alphanumerics.
+    // Rejecting everything else closes the false-positive surface
+    // entirely at negligible cost to future codex-cli shape drift
+    // (adding a new code shape would require a deliberate opt-in).
+    let bytes = token.as_bytes();
+    if bytes.len() != 9 {
         return false;
     }
-    stripped
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    if bytes[4] != b'-' {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        if i == 4 {
+            continue; // the dash
+        }
+        let c = b as char;
+        if !(c.is_ascii_uppercase() || c.is_ascii_digit()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Formats the profiles.json label for a newly-logged-in Codex slot.
@@ -308,6 +325,82 @@ pub(crate) fn format_label(account: AccountNum, account_id_hint: Option<&str>) -
             format!("codex-{}/{}", account, prefix)
         }
         _ => format!("codex-{}", account),
+    }
+}
+
+/// Scrubs and removes the raw `auth.json` that codex-cli wrote into
+/// `config-<N>/`. Called from two sites: after a successful
+/// `save_canonical_for` (expected cleanup) AND from the
+/// `save_canonical_for` error branch (R4 cleanup — journal 0021
+/// finding 15; without this the live access+refresh tokens persist
+/// on disk between failed attempts).
+///
+/// Best-effort with three layers of defense in this order:
+///   1. `secure_file`: chmod 0o600 so only the owner can read.
+///   2. `remove_file`: the common case — unlink on APFS/ext4 moves
+///      to unused.
+///   3. On remove failure: open+truncate+zero-write+fsync to ensure
+///      the token bytes are overwritten even if the inode lingers.
+///      Uses a fixed 64 KiB zero buffer (codex auth.json is ~8 KiB
+///      in practice) instead of `meta.len()` which could race a
+///      file-grow between the metadata read and the write. Retry
+///      `remove_file` after the zero-write.
+///
+/// `context` is an operator-readable tag ("post_save" | "save_failed")
+/// so the fixed-vocabulary log line distinguishes which call site
+/// originated the cleanup.
+fn scrub_and_remove_written(written: &Path, account: AccountNum, context: &'static str) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    if !written.exists() {
+        return;
+    }
+    let _ = crate::platform::fs::secure_file(written);
+
+    if let Err(remove_err) = std::fs::remove_file(written) {
+        // Fallback: truncate + fixed zero-fill + fsync + retry remove.
+        // Fixed-size zero buffer avoids the race where `meta.len()`
+        // is read before a concurrent write grows the file.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(written)
+        {
+            Ok(mut f) => {
+                // Write 64 KiB of zeros — comfortably larger than
+                // any real auth.json. Errors are swallowed: this is
+                // best-effort scrubbing.
+                let zeros = [0u8; 64 * 1024];
+                let _ = f.write_all(&zeros);
+                let _ = f.flush();
+                let _ = f.seek(SeekFrom::Start(0));
+                let _ = f.sync_all();
+            }
+            Err(open_err) => {
+                tracing::error!(
+                    account = %account,
+                    error_kind = "codex_desktop_login_raw_auth_json_truncate_failed",
+                    context = context,
+                    remove_error = %remove_err,
+                    open_error = %open_err,
+                    "failed to truncate raw auth.json after remove failure"
+                );
+            }
+        }
+        // Retry remove after the zero-write — the original
+        // `remove_file` failure might have been transient
+        // (e.g. EBUSY on a fresh fd).
+        if let Err(second_remove_err) = std::fs::remove_file(written) {
+            tracing::error!(
+                account = %account,
+                error_kind = "codex_desktop_login_raw_auth_json_remove_failed",
+                context = context,
+                first_error = %remove_err,
+                second_error = %second_remove_err,
+                "failed to remove raw auth.json after zero-fill fallback; \
+                 content is zeroed but inode still present"
+            );
+        }
     }
 }
 
@@ -678,11 +771,126 @@ mod tests {
         assert!(parse_device_code_line(line).is_none());
     }
 
+    /// Journal 0021 finding M1: narrow `is_device_code_shape` to
+    /// exactly `XXXX-XXXX`. The prior 6-16-char predicate would
+    /// match routine stderr tokens like `NOTICE`, `WARNING`,
+    /// `FATAL7`, `ID-ABCDE`. This test pins the refusal.
+    #[test]
+    fn parse_device_code_line_rejects_help_output_shapes() {
+        // URL + a mixed-case status word — would have matched the
+        // pre-fix 6-16 predicate for `FATAL7`, `NOTICE`.
+        assert!(parse_device_code_line("See https://foo NOTICE: connection").is_none());
+        assert!(parse_device_code_line("https://foo WARNING please").is_none());
+        assert!(parse_device_code_line("https://foo FATAL7").is_none());
+        // An ID-like token with a dash but wrong segment lengths.
+        assert!(parse_device_code_line("Visit https://foo code ID-ABCDE").is_none());
+        // No dash.
+        assert!(parse_device_code_line("https://foo ABCDEFGH").is_none());
+        // Dash in the wrong position.
+        assert!(parse_device_code_line("https://foo AB-CDEFGH").is_none());
+        // Too long.
+        assert!(parse_device_code_line("https://foo ABCDE-FGHIJ").is_none());
+    }
+
+    #[test]
+    fn is_device_code_shape_accepts_exactly_xxxx_dash_xxxx() {
+        assert!(is_device_code_shape("ABCD-EFGH"));
+        assert!(is_device_code_shape("1234-5678"));
+        assert!(is_device_code_shape("A1B2-C3D4"));
+    }
+
+    #[test]
+    fn is_device_code_shape_rejects_anything_else() {
+        assert!(!is_device_code_shape(""));
+        assert!(!is_device_code_shape("ABCD"));
+        assert!(!is_device_code_shape("ABCD-"));
+        assert!(!is_device_code_shape("-EFGH"));
+        assert!(!is_device_code_shape("ABCD-EFG"));
+        assert!(!is_device_code_shape("ABCDE-FGHI"));
+        assert!(!is_device_code_shape("ABCD_EFGH"));
+        assert!(!is_device_code_shape("abcd-efgh"));
+        assert!(!is_device_code_shape("ABCD-EFGH-IJKL"));
+    }
+
     #[test]
     fn parse_device_code_line_tolerates_trailing_punctuation_on_url() {
         let line = "See https://chat.openai.com/codex/verify, then enter ABCD-EFGH.";
         let info = parse_device_code_line(line).unwrap();
         assert!(!info.verification_url.ends_with(','));
         assert_eq!(info.user_code, "ABCD-EFGH");
+    }
+
+    // ── R4 scrub regression (journal 0021 finding 15) ─────────
+
+    /// If `save_canonical_for` fails AFTER codex has written
+    /// `auth.json`, the raw auth.json MUST be removed before the
+    /// error returns. Otherwise live access+refresh tokens sit on
+    /// disk between the failed attempt and the next retry.
+    ///
+    /// We simulate save failure by making the `credentials/`
+    /// directory read-only before the login runs. The spawn closure
+    /// writes a stub auth.json; `credentials::save` then fails on
+    /// the atomic rename into the read-only dir; the scrub helper
+    /// removes the raw auth.json before the Err returns.
+    #[cfg(unix)]
+    #[test]
+    fn complete_login_scrubs_written_auth_json_when_canonical_save_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        tos::acknowledge(dir.path()).unwrap();
+
+        // Pre-create credentials/ and make it read-only so the
+        // atomic_replace inside save_canonical_for fails.
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::set_permissions(
+            &creds_dir,
+            std::fs::Permissions::from_mode(0o500), // r-x, no write
+        )
+        .unwrap();
+
+        let account = acc(21);
+        let written = surface::written_auth_json_path(dir.path(), account);
+
+        let result = complete_login(
+            dir.path(),
+            account,
+            false,
+            || Ok(false),
+            |config_dir, _| {
+                stub_codex_auth_json(config_dir, "id");
+                Ok(fake_success())
+            },
+            |_| {},
+        );
+
+        // Must return Err — the canonical save fails on the
+        // read-only dir.
+        assert!(
+            result.is_err(),
+            "expected Err when credentials/ is read-only, got: {result:?}"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        // The outward-facing message is operator-readable and does
+        // NOT echo tokens — the same guarantee we assert in
+        // `complete_login_redacts_malformed_auth_json_tokens`.
+        assert!(
+            !err_msg.contains("rt_"),
+            "no raw refresh prefix may appear in the error: {err_msg}"
+        );
+
+        // Restore permissions so TempDir cleanup works.
+        std::fs::set_permissions(&creds_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Invariant: the raw auth.json that codex wrote MUST be
+        // gone (R4 fix). Pre-fix this file would sit on disk at
+        // whatever mode codex-cli wrote, with live tokens in it.
+        assert!(
+            !written.exists(),
+            "raw auth.json at {} must be scrubbed after save_canonical_for failure \
+             (journal 0021 finding 15)",
+            written.display()
+        );
     }
 }

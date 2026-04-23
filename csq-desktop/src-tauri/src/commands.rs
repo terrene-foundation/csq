@@ -1517,9 +1517,27 @@ pub async fn start_codex_login(
 /// the freshly-written `auth.json` to `credentials/codex-<N>.json`
 /// with 0o400 and fires an `invalidate-cache` to the daemon so the
 /// dashboard sees the new slot on its next poll tick.
+///
+/// # Idempotency + concurrency (journal 0021 finding 8)
+///
+/// This command is NOT idempotent mid-flight: a second concurrent call
+/// for the same `account` returns `Err("codex login already in progress
+/// for slot N")` rather than racing the first call. The rejection is
+/// observed via `AppState.codex_login_child` — if the slot is already
+/// populated we refuse. Once the first call completes (success or
+/// failure), the slot is cleared and a retry is allowed.
+///
+/// # Cancellation (journal 0021 finding 6)
+///
+/// The running child process is registered in
+/// `AppState.codex_login_child` so a later [`cancel_codex_login`] can
+/// SIGKILL it from the modal's close/unmount handler. Without this the
+/// subprocess orphans for the minutes-long device-auth window after
+/// the user closes the modal.
 #[tauri::command]
 pub async fn complete_codex_login(
     app: AppHandle,
+    state: State<'_, AppState>,
     base_dir: String,
     account: u16,
     purge_keychain: bool,
@@ -1527,27 +1545,86 @@ pub async fn complete_codex_login(
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
     let base = PathBuf::from(&base_dir);
     let app_for_task = app.clone();
+
+    // Journal 0021 finding 8: refuse concurrent invocations for any
+    // account. codex-cli writes to a single `CODEX_HOME/auth.json`
+    // and multiple spawns would race both the subprocess itself and
+    // the post-login `save_canonical_for` + `remove_file` sequence.
+    {
+        let slot_guard = state
+            .codex_login_child
+            .lock()
+            .map_err(|_| "codex login slot poisoned")?;
+        if slot_guard.is_some() {
+            return Err(format!(
+                "codex login already in progress (slot {account}) — \
+                 cancel the running flow before starting a new one"
+            ));
+        }
+    }
+
+    let child_slot = state.codex_login_child.clone();
+    let child_slot_for_cleanup = child_slot.clone();
+
     tokio::task::spawn_blocking(move || {
         let result = csq_core::providers::codex::desktop_login::complete_login(
             &base,
             account_num,
             purge_keychain,
             csq_core::providers::codex::keychain::purge_residue,
-            |config_dir, on_code| spawn_codex_device_auth_piped(config_dir, on_code, &app_for_task),
+            |config_dir, on_code| {
+                spawn_codex_device_auth_piped(config_dir, on_code, &app_for_task, &child_slot)
+            },
             |info| {
-                let _ = app_for_task.emit("codex-device-code", &info);
+                // Journal 0021 finding 4: emit_to("main") so a
+                // secondary window (tray/settings) cannot subscribe
+                // to the one-time user_code.
+                let _ = app_for_task.emit_to("main", "codex-device-code", &info);
             },
         )
-        .map_err(|e| format!("{e:#}"))?;
+        // Journal 0021 finding M3: pass the full anyhow chain
+        // through `redact_tokens` before it reaches the renderer.
+        // Defense-in-depth — inner call sites already redact, but
+        // a future `.context(...)` that omits redaction would leak
+        // without this outer wrapper.
+        .map_err(|e| csq_core::error::redact_tokens(&format!("{e:#}")));
+
+        // Always clear the child slot once we exit, regardless of
+        // result. The slot is cleared inside
+        // `spawn_codex_device_auth_piped`'s exit path already, but
+        // do it here too so an early error (pre-spawn) cannot leave
+        // a stale slot entry.
+        {
+            if let Ok(mut slot) = child_slot_for_cleanup.lock() {
+                *slot = None;
+            }
+        }
+
+        let result = result?;
 
         // Best-effort: kick daemon cache invalidation so the dashboard
         // sees the new slot immediately rather than waiting for the
-        // 5s discovery tick.
+        // 5s discovery tick. Journal 0021 finding M6: the HTTP POST
+        // over the Unix socket has NO client-side timeout — a hung
+        // daemon would block the spawn_blocking thread. We wrap in
+        // a coarse 500ms deadline enforced by a worker thread. If
+        // the daemon doesn't answer in 500ms the dashboard catches
+        // up on its next 5s discovery tick.
         #[cfg(unix)]
         {
             let sock = csq_core::daemon::socket_path(&base);
             if sock.exists() {
-                let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+                // Fire-and-forget style: spawn a short-lived worker
+                // that does the blocking call; a timer on the main
+                // thread bounds the wait. Whichever finishes first
+                // wins; the other side is dropped on return.
+                let (tx, rx) = std::sync::mpsc::channel();
+                let sock_copy = sock.clone();
+                std::thread::spawn(move || {
+                    let r = csq_core::daemon::http_post_unix(&sock_copy, "/api/invalidate-cache");
+                    let _ = tx.send(r);
+                });
+                let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
             }
         }
 
@@ -1555,6 +1632,32 @@ pub async fn complete_codex_login(
     })
     .await
     .map_err(|e| format!("complete_codex_login task failed: {e}"))?
+}
+
+/// Cancels an in-flight `codex login --device-auth` by killing the
+/// child process. No-op when no login is running — the modal's close
+/// handler calls this unconditionally, and the frontend treats a
+/// successful cancel as "return to picker".
+///
+/// Mirrors [`cancel_ollama_pull`] — SIGKILL via `Child::kill`; the
+/// reader threads see EOF on piped stdout/stderr and exit; the
+/// waiting `spawn_blocking` task returns a non-success status and
+/// the frontend sees a generic failure banner.
+#[tauri::command]
+pub fn cancel_codex_login(state: State<'_, AppState>) -> Result<(), String> {
+    let handle_opt = {
+        let slot = state
+            .codex_login_child
+            .lock()
+            .map_err(|_| "codex login slot poisoned")?;
+        slot.clone()
+    };
+    let Some(handle) = handle_opt else {
+        return Ok(());
+    };
+    let mut child = handle.lock().map_err(|_| "codex login child poisoned")?;
+    let _ = child.kill();
+    Ok(())
 }
 
 /// Production `codex login --device-auth` spawn. Captures stdout +
@@ -1568,16 +1671,33 @@ pub async fn complete_codex_login(
 /// so the modal can show a log tail for debugging auth failures —
 /// same ergonomic pattern as `ollama-pull-progress` in
 /// [`pull_ollama_model`].
+///
+/// # PR-C9a hardening (journal 0021)
+///
+/// - Device-code parse runs on the **scrubbed** line (finding 2) so a
+///   malicious codex-cli that prints a synthetic code alongside a
+///   token cannot trick the parser into forwarding a fake code.
+/// - The BufReader is bounded at 64 KiB per line (finding 3) so
+///   codex-cli cannot OOM the process by emitting an unbounded line.
+///   Lines that exceed the cap are emitted as `[line truncated]`.
+/// - The device-code channel is `sync_channel(4)` + early-exit after
+///   the first code (finding M7) so a banner repetition cannot fill
+///   memory.
+/// - The child process is registered in the shared `child_slot`
+///   (finding 6) so `cancel_codex_login` can kill it.
+/// - `child.wait()` runs BEFORE joining the reader threads (finding
+///   7) so a stuck reader cannot deadlock the forwarder.
 fn spawn_codex_device_auth_piped(
     config_dir: &std::path::Path,
     on_code: &mut dyn FnMut(csq_core::providers::codex::desktop_login::DeviceCodeInfo),
     app: &AppHandle,
+    child_slot: &Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<std::process::Child>>>>>,
 ) -> anyhow::Result<std::process::ExitStatus> {
     use csq_core::error::redact_tokens;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new(csq_core::providers::codex::surface::CLI_BINARY)
+    let child = Command::new(csq_core::providers::codex::surface::CLI_BINARY)
         .args(["login", "--device-auth"])
         .env(
             csq_core::providers::codex::surface::HOME_ENV_VAR,
@@ -1594,20 +1714,36 @@ fn spawn_codex_device_auth_piped(
             )
         })?;
 
-    // Spawn one thread per pipe so a slow consumer on stderr does
-    // not block stdout (where the device code lives). Each thread
-    // parses lines, emits a progress event, and forwards any
-    // device-code payload to the caller via a shared channel.
+    let mut child = child;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let child_arc = Arc::new(std::sync::Mutex::new(child));
 
-    let (tx, rx) =
-        std::sync::mpsc::channel::<csq_core::providers::codex::desktop_login::DeviceCodeInfo>();
+    // Register for cancel. Overwrite any stale entry defensively —
+    // `complete_codex_login`'s pre-check rejects concurrent callers,
+    // but a panicked prior run could leave a ghost entry.
+    {
+        let mut slot = child_slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child slot poisoned"))?;
+        *slot = Some(child_arc.clone());
+    }
 
+    // Bounded channel — pathological codex-cli banner repetition
+    // cannot fill memory. `sync_channel(4)` lets four codes queue
+    // (unlikely in practice; the forwarder exits after the first).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<
+        csq_core::providers::codex::desktop_login::DeviceCodeInfo,
+    >(4);
+
+    // Reader factory. Only the stdout reader feeds the parser; stderr
+    // emits progress only. This narrows the parse trust boundary:
+    // stderr lines are never interpreted as device codes.
     let reader = |stream: Option<Box<dyn std::io::Read + Send>>,
                   tag: &'static str,
+                  parse: bool,
                   app: AppHandle,
-                  tx: std::sync::mpsc::Sender<
+                  tx: std::sync::mpsc::SyncSender<
         csq_core::providers::codex::desktop_login::DeviceCodeInfo,
     >| {
         let stream = match stream {
@@ -1615,55 +1751,129 @@ fn spawn_codex_device_auth_piped(
             None => return None,
         };
         Some(std::thread::spawn(move || {
-            let buf = BufReader::new(stream);
-            for line in buf.lines().map_while(|l| l.ok()) {
-                let scrubbed = redact_tokens(&line);
+            // 64 KiB per-line cap. Manual read_until beats
+            // BufReader::lines() which allocates unboundedly.
+            const LINE_CAP: usize = 64 * 1024;
+            let mut buf = BufReader::new(stream);
+            let mut line_bytes: Vec<u8> = Vec::with_capacity(1024);
+            loop {
+                line_bytes.clear();
+                // Take the reader limited to the cap to prevent
+                // unbounded allocation per line.
+                let n = {
+                    let mut limited = (&mut buf).take((LINE_CAP + 1) as u64);
+                    limited
+                        .read_until(b'\n', &mut line_bytes)
+                        .unwrap_or_default()
+                };
+                if n == 0 {
+                    break;
+                }
+                // If the line exceeded LINE_CAP (still no newline),
+                // drop the rest of that line from the underlying
+                // reader and emit a truncation marker instead of
+                // the raw bytes.
+                let truncated = line_bytes.len() > LINE_CAP;
+                if truncated {
+                    // Drain the rest of the physical line so the
+                    // next iteration sees a fresh start. Best-effort.
+                    let mut sink = Vec::new();
+                    let _ = (&mut buf)
+                        .take((1 << 20) as u64)
+                        .read_until(b'\n', &mut sink);
+                }
+                let raw_line = if truncated {
+                    "[line truncated]".to_string()
+                } else {
+                    // Strip trailing newline for cleaner display.
+                    let bytes = if line_bytes.last() == Some(&b'\n') {
+                        &line_bytes[..line_bytes.len() - 1]
+                    } else {
+                        &line_bytes[..]
+                    };
+                    String::from_utf8_lossy(bytes).to_string()
+                };
+                let scrubbed = redact_tokens(&raw_line);
                 let _ = app.emit(
                     "codex-login-progress",
                     serde_json::json!({ "stream": tag, "line": scrubbed }),
                 );
-                if let Some(info) =
-                    csq_core::providers::codex::desktop_login::parse_device_code_line(&line)
-                {
-                    let _ = tx.send(info);
+                // Device-code parse runs on the SCRUBBED string and
+                // ONLY for stdout (trust boundary narrowing — journal
+                // 0021 finding 2).
+                if parse && !truncated {
+                    if let Some(info) =
+                        csq_core::providers::codex::desktop_login::parse_device_code_line(&scrubbed)
+                    {
+                        // try_send so a full channel does not block
+                        // the reader thread. Drop extra codes.
+                        let _ = tx.try_send(info);
+                    }
                 }
             }
         }))
     };
 
-    // `stdout` / `stderr` are `ChildStdout`/`ChildStderr` — box them
-    // to a trait-object so the closure signature matches.
     let stdout_t = reader(
         stdout.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
         "stdout",
+        true, // parse device-code on stdout only
         app.clone(),
         tx.clone(),
     );
     let stderr_t = reader(
         stderr.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
         "stderr",
+        false, // stderr is progress-only; never parse
         app.clone(),
         tx.clone(),
     );
 
-    // Forwarder thread: drain the channel until both pipes close.
-    // Drop the final tx clone so the channel EOFs when readers exit.
+    // Drop the forwarder's tx clone so rx.recv() returns Err once
+    // both readers drop theirs (on pipe EOF / child exit).
     drop(tx);
-    let mut seen_code: Option<csq_core::providers::codex::desktop_login::DeviceCodeInfo> = None;
+
+    // Forwarder: fire on_code for the FIRST code, drain subsequent
+    // sends into the void. We do not `break` — draining keeps reader
+    // threads from blocking on a full bounded channel.
+    let mut seen_code = false;
     while let Ok(info) = rx.recv() {
-        if seen_code.is_none() {
-            seen_code = Some(info.clone());
+        if !seen_code {
+            seen_code = true;
             on_code(info);
         }
     }
 
-    let status = child.wait()?;
+    // Journal 0021 finding 7: wait on the child BEFORE joining
+    // reader threads. A stuck reader thread would deadlock .join()
+    // forever otherwise. After child exit, the OS closes pipes and
+    // the reader threads see EOF.
+    let status = {
+        let mut guard = child_arc
+            .lock()
+            .map_err(|_| anyhow::anyhow!("codex login child poisoned"))?;
+        guard.wait()?
+    };
+
+    // Explicit drops so the pipe fds close if the kernel didn't
+    // already do it (belt-and-suspenders).
+    drop(child_arc);
+
     if let Some(t) = stdout_t {
         let _ = t.join();
     }
     if let Some(t) = stderr_t {
         let _ = t.join();
     }
+
+    // Clear slot now that the subprocess is fully reaped.
+    {
+        let mut slot = child_slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child slot poisoned"))?;
+        *slot = None;
+    }
+
     Ok(status)
 }
 
@@ -1753,6 +1963,16 @@ fn fetch_codex_models_live(base_dir: &std::path::Path) -> Result<Vec<u8>, String
 /// preserved. `--force` semantics are handled at the UI — the
 /// desktop picker only surfaces ids from `list_codex_models`, and
 /// custom ids are an explicit override.
+///
+/// # Surface verification (journal 0021 finding 9)
+///
+/// Refuses when the target slot is not a Codex slot. Without this
+/// check, a renderer passing a ClaudeCode slot number would cause
+/// `write_config_toml` to seed a `config-<N>/config.toml` into an
+/// Anthropic slot's directory — poisoning surface classification
+/// because `config.toml` is a Codex-unique marker in the handle-dir
+/// model (spec 07 §7.2.2). We verify via `discover_all` which
+/// includes both ClaudeCode and Codex slots.
 #[tauri::command]
 pub fn set_codex_slot_model(
     app: AppHandle,
@@ -1769,6 +1989,32 @@ pub fn set_codex_slot_model(
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
+
+    // Journal 0021 finding 9: verify surface before writing.
+    // `write_config_toml` does not verify the destination slot's
+    // surface; it would silently poison an Anthropic slot with
+    // Codex config.toml if called on the wrong slot.
+    let accounts = csq_core::accounts::discovery::discover_all(&base);
+    let slot_info = accounts.iter().find(|a| a.id == slot);
+    match slot_info {
+        Some(info) if info.surface == csq_core::providers::catalog::Surface::Codex => {
+            // ok
+        }
+        Some(info) => {
+            return Err(format!(
+                "slot {slot} is not a Codex slot (surface = {:?}) — \
+                 use set_slot_model for ClaudeCode slots",
+                info.surface
+            ));
+        }
+        None => {
+            return Err(format!(
+                "slot {slot} does not exist or has no credentials — \
+                 run `csq login {slot} --provider codex` first"
+            ));
+        }
+    }
+
     csq_core::providers::codex::surface::write_config_toml(&base, slot_num, &model)
         .map_err(|e| format!("write codex config.toml: {e}"))?;
     let _ = app.emit(
@@ -2099,7 +2345,53 @@ mod tests {
         assert_eq!(view.expires_in_secs, 600);
     }
 
-    // ── PR-C6 surface field tests ──────────────────────────────
+    // ── PR-C9a (journal 0021 finding 5) — IPC audit: whitelist, not blacklist ─
+
+    /// Recursively collect every object key under `v`. The JSON is an
+    /// arbitrary `serde_json::Value`; this walks nested objects +
+    /// arrays so flatten / nested-struct shapes are inspected too.
+    fn collect_json_keys(v: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, sub) in map {
+                    out.insert(k.clone());
+                    collect_json_keys(sub, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for sub in arr {
+                    collect_json_keys(sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whitelist audit helper — fails if `actual` contains any key
+    /// not in `expected`. Pre-PR-C9a the IPC tests blacklisted a
+    /// fixed set of token-shaped keys (`access_token`, etc.), but
+    /// that list missed Codex-specific shapes (`sess-*`, `rt_*`,
+    /// `OPENAI_API_KEY` with caps, `account_id`, `tokens`). A
+    /// whitelist closes that gap: any future field addition that
+    /// accidentally includes a token must be explicitly added to
+    /// `expected`, forcing the author to see the audit.
+    #[track_caller]
+    fn assert_ipc_keys_whitelisted<T: serde::Serialize>(value: &T, expected: &[&str]) {
+        let json = serde_json::to_value(value).expect("serialize");
+        let mut actual: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_json_keys(&json, &mut actual);
+        let expected_set: std::collections::HashSet<String> =
+            expected.iter().map(|s| (*s).to_string()).collect();
+        let extra: Vec<&String> = actual.difference(&expected_set).collect();
+        assert!(
+            extra.is_empty(),
+            "IPC payload contains non-whitelisted keys {:?}. \
+             Audit the type — if the new field is safe, add it to the \
+             whitelist explicitly. Whitelist (not blacklist) is mandatory \
+             per journal 0021 finding 5.",
+            extra
+        );
+    }
 
     /// AccountView exposes the `surface` field and never leaks
     /// credential material. This is the Tauri IPC audit per
@@ -2124,114 +2416,111 @@ mod tests {
         };
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains(r#""surface":"claude-code""#));
-        // Structural audit: no token / secret field names may appear
-        // as JSON keys in the serialized payload — AccountView IS the
-        // IPC contract and mistakes here leak to every dashboard
-        // consumer. Match on the quoted-key shape to avoid false
-        // positives against `has_credentials` (which is a boolean
-        // status field, not a credential payload).
-        for forbidden_key in [
-            r#""access_token":"#,
-            r#""refresh_token":"#,
-            r#""id_token":"#,
-            r#""api_key":"#,
-            r#""openai_api_key":"#,
-        ] {
-            assert!(
-                !json.contains(forbidden_key),
-                "AccountView IPC payload must not expose `{forbidden_key}` field"
-            );
-        }
+        // Whitelist the full set of AccountView fields. Any future
+        // addition must be added here explicitly so an author must
+        // see the audit when introducing a field.
+        assert_ipc_keys_whitelisted(
+            &v,
+            &[
+                "id",
+                "label",
+                "source",
+                "surface",
+                "has_credentials",
+                "five_hour_pct",
+                "five_hour_resets_in",
+                "seven_day_pct",
+                "seven_day_resets_in",
+                "updated_at",
+                "token_status",
+                "expires_in_secs",
+                "last_refresh_error",
+                "provider_id",
+            ],
+        );
     }
 
     // ── PR-C8 Codex command IPC contract ───────────────────────
     //
     // Structural audit on every new Serialize type per
-    // `tauri-commands.md` MUST Rule 3. Extends the PR-C6 forbidden-key
-    // harness so token material cannot leak through the Codex login
-    // pre-check or models response.
+    // `tauri-commands.md` MUST Rule 3. Journal 0021 finding 5 flips
+    // the blacklist harness to a per-struct whitelist so a future
+    // `#[serde(flatten)] extra: CodexCredentials` slip is caught.
 
     #[test]
-    fn codex_start_login_view_has_no_secret_keys() {
+    fn codex_start_login_view_keys_whitelisted() {
         let v = csq_core::providers::codex::desktop_login::StartLoginView {
             account: 7,
             tos_required: true,
             keychain: "absent".into(),
             awaiting_keychain_decision: false,
         };
-        let json = serde_json::to_string(&v).unwrap();
-        for forbidden in [
-            r#""access_token":"#,
-            r#""refresh_token":"#,
-            r#""id_token":"#,
-            r#""api_key":"#,
-            r#""openai_api_key":"#,
-        ] {
-            assert!(
-                !json.contains(forbidden),
-                "StartLoginView IPC payload must not expose `{forbidden}` field"
-            );
-        }
+        assert_ipc_keys_whitelisted(
+            &v,
+            &[
+                "account",
+                "tos_required",
+                "keychain",
+                "awaiting_keychain_decision",
+            ],
+        );
     }
 
     #[test]
-    fn codex_complete_login_view_has_no_secret_keys() {
+    fn codex_complete_login_view_keys_whitelisted() {
         let v = csq_core::providers::codex::desktop_login::CompleteLoginView {
             account: 5,
             label: "codex-5/abc".into(),
         };
-        let json = serde_json::to_string(&v).unwrap();
-        for forbidden in [
-            r#""access_token":"#,
-            r#""refresh_token":"#,
-            r#""id_token":"#,
-            r#""api_key":"#,
-            r#""openai_api_key":"#,
-        ] {
-            assert!(
-                !json.contains(forbidden),
-                "CompleteLoginView IPC payload must not expose `{forbidden}` field"
-            );
-        }
+        assert_ipc_keys_whitelisted(&v, &["account", "label"]);
     }
 
     #[test]
-    fn codex_device_code_info_has_no_secret_keys() {
+    fn codex_device_code_info_keys_whitelisted() {
         let v = csq_core::providers::codex::desktop_login::DeviceCodeInfo {
             user_code: "ABCD-EFGH".into(),
             verification_url: "https://chat.openai.com/codex/verify".into(),
         };
-        let json = serde_json::to_string(&v).unwrap();
-        for forbidden in [
-            r#""access_token":"#,
-            r#""refresh_token":"#,
-            r#""id_token":"#,
-            r#""api_key":"#,
-            r#""openai_api_key":"#,
-        ] {
-            assert!(
-                !json.contains(forbidden),
-                "DeviceCodeInfo event payload must not expose `{forbidden}` field"
-            );
-        }
+        assert_ipc_keys_whitelisted(&v, &["user_code", "verification_url"]);
     }
 
     #[test]
-    fn codex_model_list_has_no_secret_keys() {
+    fn codex_model_list_keys_whitelisted() {
         let v = csq_core::providers::codex::models::bundled();
-        let json = serde_json::to_string(&v).unwrap();
-        for forbidden in [
-            r#""access_token":"#,
-            r#""refresh_token":"#,
-            r#""id_token":"#,
-            r#""api_key":"#,
-            r#""openai_api_key":"#,
-        ] {
-            assert!(
-                !json.contains(forbidden),
-                "CodexModelList IPC payload must not expose `{forbidden}` field"
-            );
+        // CodexModelList = { models: [CodexModelEntry], source, fetched_at }
+        // CodexModelEntry = { id, label }
+        assert_ipc_keys_whitelisted(
+            &v,
+            &[
+                // top-level
+                "models",
+                "source",
+                "fetched_at",
+                // per-entry
+                "id",
+                "label",
+            ],
+        );
+    }
+
+    /// Regression: a hypothetical flatten slip would introduce
+    /// keys like `access_token` or `tokens` into the IPC payload.
+    /// The whitelist helper must flag any extra key — this test
+    /// synthesizes that scenario by serializing a tuple struct
+    /// with a token-shaped field and asserting the helper complains.
+    #[test]
+    #[should_panic(expected = "non-whitelisted keys")]
+    fn whitelist_helper_panics_on_extra_key() {
+        #[derive(serde::Serialize)]
+        struct Leak {
+            account: u32,
+            access_token: String, // would-be leak
         }
+        let v = Leak {
+            account: 1,
+            access_token: "sk-ant-oat01-dangerous".into(),
+        };
+        assert_ipc_keys_whitelisted(&v, &["account"]);
     }
 
     // ── acknowledge_codex_tos validation ──────────────────────
@@ -2333,5 +2622,117 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains(r#""source":"codex""#));
         assert!(json.contains(r#""surface":"codex""#));
+    }
+
+    // ── PR-C9a journal 0021 — set_codex_slot_model surface verification ─
+
+    /// Journal 0021 finding 9: `set_codex_slot_model` must refuse when
+    /// the target slot is not a Codex slot. Without this the command
+    /// would write a `config.toml` into a ClaudeCode slot's directory,
+    /// poisoning surface classification (config.toml is a Codex-unique
+    /// marker per spec 07 §7.2.2). This test pins the refusal — we do
+    /// NOT need a Tauri runtime because the early refusal returns
+    /// before `app.emit` runs; the fn signature takes `AppHandle` but
+    /// we synthesize the rejection path without entering the emit.
+    ///
+    /// Structural: we can't easily fake an `AppHandle` in a unit test,
+    /// so we drive this through the core-level path — seeding a
+    /// ClaudeCode slot via the same setup the test helpers use and
+    /// asserting that `discover_all` classifies it as ClaudeCode.
+    /// The command itself is exercised at higher-level integration
+    /// tests but this pins the discovery classification that the
+    /// command's refusal key-reads.
+    #[test]
+    fn set_codex_slot_model_guards_classification_via_discover_all() {
+        use csq_core::accounts::discovery;
+        use csq_core::providers::catalog::Surface;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Seed a ClaudeCode slot (credentials/5.json).
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(
+            creds_dir.join("5.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"sk-ant-ort01-y","expiresAt":9999999999999,"scopes":[]}}"#,
+        )
+        .unwrap();
+
+        let accounts = discovery::discover_all(dir.path());
+        let slot_5 = accounts
+            .iter()
+            .find(|a| a.id == 5)
+            .expect("slot 5 must be discoverable");
+        assert_eq!(
+            slot_5.surface,
+            Surface::ClaudeCode,
+            "slot 5 seeded as ClaudeCode → set_codex_slot_model must refuse it"
+        );
+    }
+
+    /// Happy-path classification: a seeded Codex slot MUST be
+    /// classified as `Surface::Codex` by `discover_all`, which is
+    /// the key lookup `set_codex_slot_model` uses. Without this the
+    /// refusal would fire on valid Codex slots too.
+    #[test]
+    fn set_codex_slot_model_allows_codex_slot_via_discover_all() {
+        use csq_core::accounts::discovery;
+        use csq_core::providers::catalog::Surface;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        // Minimal Codex credential shape.
+        std::fs::write(
+            creds_dir.join("codex-7.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"eyJacc","refresh_token":"rt_x","id_token":"eyJid","account_id":"uuid"},"last_refresh":"2026-04-22T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let accounts = discovery::discover_all(dir.path());
+        let slot_7 = accounts
+            .iter()
+            .find(|a| a.id == 7)
+            .expect("slot 7 must be discoverable");
+        assert_eq!(
+            slot_7.surface,
+            Surface::Codex,
+            "Codex slot 7 must classify as Surface::Codex so set_codex_slot_model accepts it"
+        );
+    }
+
+    // ── PR-C9a journal 0021 finding 2 — device-code parse is on scrubbed line ─
+
+    /// Pins the trust-boundary narrowing: if a codex-cli process
+    /// substitution prints `"Go to https://legit enter FOOB-AR23 sk-ant-oat01-bad"`
+    /// the scrubber removes `sk-ant-oat01-bad` — but more importantly,
+    /// the parse runs on the scrubbed line, so any token-shaped
+    /// substring that the parser might otherwise mis-extract is
+    /// already replaced. This test pins `redact_tokens` behaviour for
+    /// the typical Codex-adjacent token shapes.
+    #[test]
+    fn redact_tokens_strips_sk_ant_and_rt_and_jwt_shapes() {
+        use csq_core::error::redact_tokens;
+        // rt_* requires ≥20 body chars per TOKEN_PREFIXES_WITH_BODY in
+        // csq-core error.rs — this reflects real Codex refresh tokens
+        // which are 87-char base64url bodies (journal 0010).
+        let raw =
+            "Visit https://chatgpt.com/auth/device code FOOB-AR23 token=sk-ant-oat01-abcdef1234 \
+                   eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3OCJ9.sigPaddingLongEnough \
+                   rt_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
+        let scrubbed = redact_tokens(raw);
+        assert!(
+            !scrubbed.contains("sk-ant-oat01-abcdef1234"),
+            "sk-ant-* token must be redacted: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("rt_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"),
+            "rt_* refresh shape must be redacted (≥20 body): {scrubbed}"
+        );
+        // The device-code substring must survive — we rely on this
+        // to still pass through to the parser.
+        assert!(
+            scrubbed.contains("FOOB-AR23"),
+            "device-code shape must survive redaction: {scrubbed}"
+        );
     }
 }

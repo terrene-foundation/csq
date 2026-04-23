@@ -7,6 +7,8 @@
 pub mod fs;
 pub mod lock;
 pub mod process;
+#[cfg(test)]
+pub mod test_env;
 
 /// Target platform, detected at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

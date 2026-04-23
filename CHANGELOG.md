@@ -2,6 +2,69 @@
 
 All notable changes to csq are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbering follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026-04-23
+
+Codex as a first-class second surface alongside ClaudeCode: device-auth login, central token refresh, live `wham/usage` polling, in-flight `csq swap` between Codex slots, cross-surface swap with confirm-prompt + clean handover, and a desktop UI with Terms-of-Service disclosure. Quota schema writer flips v1 → v2; v2.0.1 dual-read keeps downgrade compatible.
+
+See `docs/releases/v2.1.0.md` for the full release notes including the surface dispatch architecture, two redteam convergence rounds, the M10 same-surface Codex repoint decision, the M-CDX-1 ordering invariant, the Windows caveat carry-over, and migration & compatibility notes.
+
+### Added
+
+- Codex surface across `discovery`, `auto_rotate`, `rotation::swap_to`, `daemon::refresher`, and `usage_poller`. `Surface::ClaudeCode` and `Surface::Codex` enums replace the prior implicit Anthropic-only assumption.
+- `csq login N --provider codex` CLI flow + desktop AddAccountModal Codex panels (codex-tos, codex-keychain-prompt, codex-running, codex-picker in ChangeModelModal). Five new Tauri commands: `start_codex_login`, `complete_codex_login`, `list_codex_models`, `acknowledge_codex_tos`, `set_codex_slot_model`. Plus `cancel_codex_login` from the round-1 hardening.
+- Daemon Codex refresher (`broker_codex_check` + `HttpPostFnCodex`), surface-dispatched `tick`, startup reconciler (INV-P08 mode flip + INV-P03 config.toml drift), Windows H2 gate (`require_daemon_healthy` cross-platform + named-pipe surface-dispatch integration test).
+- `usage_poller/codex.rs` parses live `wham/usage` per journal 0010 schema (5h primary + 7d secondary rate-limit windows; `used_percent` is 0–100). Circuit breaker 5-fail → 15min → 80min cap. Raw-body capture to `accounts/codex-wham-raw.json` (0600, redactor-first). STABLE per journal 0010 capture.
+- `quota.json` schema_version 2 writer (PR-C6). Nested `CounterState` / `RateLimitState` per spec 07 §7.4.1 + `extras: Option<serde_json::Value>` escape hatch. Idempotent v1 → v2 migration on first daemon tick.
+- `csq swap` cross-surface dispatch (PR-C7). INV-P05 confirm prompt (`--yes` bypasses), INV-P10 rename-source-to-tombstone, then `exec` the target binary. Same-surface Codex routes to the new in-flight `repoint_handle_dir_codex` (M10).
+- `csq models switch <slot> <model>` Codex dispatch — Codex slots route to a `TomlModelKey` writer that updates `config.toml`.
+- New `csq-core/src/platform/test_env.rs` shared cross-module mutex for env-var-mutating tests.
+- Surface badge in AccountList per slot.
+- `repoint_handle_dir_codex` for in-flight same-surface Codex swap (M10 / journal 0023). codex-cli re-stats `auth.json` before each API call so the next request authenticates as the new slot; UNIX open-after-rename keeps in-flight session fds valid until close.
+- `RouteKind` + `route()` pure dispatcher helper in `csq-cli/src/commands/swap.rs` with three-way matrix unit tests (L-CDX-3, journal 0024).
+
+### Changed
+
+- Auto-rotate is **ClaudeCode-only by design** in v2.1 (CRITICAL fix in journal 0021). `find_target` short-circuits when the current account's surface is not ClaudeCode; `repoint_handle_dir` adds a belt-and-suspenders refusal for Codex-shape handle dirs.
+- IPC payload audit flipped from blacklist to per-struct **whitelist** via `assert_ipc_keys_whitelisted` helper (round 1).
+- `app.emit` for `codex-device-code` narrowed to `app.emit_to("main", ...)` so the device code does not broadcast to every window.
+- `csq swap` cross-surface path uses atomic `rename` to a `.sweep-tombstone-swap-<pid>-<nanos>` sibling instead of `remove_dir_all`, closing the Ctrl-C signal-window race and preserving open fds for the running surface process.
+- `repoint_handle_dir_codex` `codex_links` slice rewrites credential (`auth.json`) BEFORE marker (`.csq-account`) so a mid-loop rename failure cannot leave the marker pointing at slot N+1 while the credential still resolves to slot N (M-CDX-1 / journal 0024).
+
+### Fixed
+
+- `is_device_code_shape` narrowed to exactly `XXXX-XXXX` (8 alphanumerics + mandatory middle dash); regression tests pin acceptance and rejection patterns.
+- `acknowledgeCodexTos` recursion guard via `tosRetry` parameter — second `tos_required` returns a user-facing error instead of looping.
+- `complete_codex_login` outer `.map_err` re-redacts via `redact_tokens` so the full anyhow chain is sanitized at the IPC boundary.
+- Keychain purge errors wrapped in `redact_tokens` before formatting.
+- Raw-auth-json wipe uses a fixed 64 KiB zero buffer + `O_WRONLY|O_TRUNC` + `sync_all`; retries `remove_file` after zero-write.
+- `/api/invalidate-cache` HTTP POST wrapped in 500ms `recv_timeout` so a hung daemon cannot block the calling `spawn_blocking` thread indefinitely.
+- `mpsc::channel(unbounded)` in the codex device-auth piped reader converted to `sync_channel(4)` with `try_send` so banner repetition cannot fill memory; forwarder drains all codes but only fires `on_code` for the first.
+- `tos::is_acknowledged` distinguishes `NotFound` (silent) from other `io::Error` kinds (logged at WARN with named error_kind tags).
+- `complete_login_scrubs_written_auth_json_when_canonical_save_fails` regression — extracted `scrub_and_remove_written` helper called from BOTH success cleanup AND `save_canonical_for` error branch.
+- `set_codex_slot_model` consults `discover_all` and refuses non-Codex slots with a named error.
+- Codex surface guard in `repoint_handle_dir_codex` requires BOTH `auth.json` AND `config.toml` AND each must be a symlink (L-CDX-1 / journal 0024).
+- `csq swap` Codex→Codex no longer silently `exec`-replaces the running codex process (M10 / journal 0023). Prior behaviour dropped the user's conversation with no warning.
+
+### Platform notes
+
+- **Windows.** Codex on Windows is **not supported** in v2.1 — Codex slots require a running daemon (INV-P02), and the daemon supervisor still short-circuits per v2.0.1's PR-VP-C1a (the `windows-daemon` Cargo feature is default-off pending PR-VP-C1b). Same-surface Codex swap on Windows is also untested per L-CDX-2 (the `repoint_handle_dir_codex` regression tests are all `#[cfg(unix)]`, matching the existing ClaudeCode `repoint_handle_dir` path's status). Both repoint paths will be audited together when the Windows port workstream lands.
+- **macOS / Linux.** Full Codex support; carries over the v2.0.1 macOS ad-hoc signature and Linux daemon socket layout.
+
+### Deferred to v2.1.x or v2.2
+
+- PR-VP-C1b — Windows daemon flag flip.
+- L-CDX-2 — same-surface Codex swap on Windows behaviour audit (paired with the Windows port).
+- `RepointStrategy` trait extraction — re-evaluate at N=3 surfaces.
+- IPC whitelist proc-macro — re-evaluate if a second IPC slip materializes past the unit-test harness.
+
+---
+
+## [2.0.1] — 2026-04-22
+
+Safety patch on v2.0.0. One CRITICAL credential-handling risk fixed (auto-rotation routing Anthropic OAuth tokens through 3P endpoints under a narrow but reachable mix of OAuth + 3P bindings on the same slot), four HIGH correctness bugs, nine MED/LOW hardening items. Adds READ tolerance for the v2 quota.json schema that v2.1 writes (dual-read; v2.0.1 continues to write v1).
+
+See `docs/releases/v2.0.1.md` for the full red-team finding inventory (journal 0067), structural rotation fix (PR-A1 / journal 0064), credential-sync guards (PR-B7 / journal 0068), and quota schema shakedown (PR-C1.5 / VP-final).
+
 ## [2.0.0] — 2026-04-22
 
 First stable release of the Rust rewrite. Retires the v1.x bash + Python stack.
@@ -65,3 +128,5 @@ Initial multi-provider session manager for Claude Code. Bash + Python implementa
 [2.0.0]: https://github.com/terrene-foundation/csq/releases/tag/v2.0.0
 [1.1.0]: https://github.com/terrene-foundation/csq/releases/tag/v1.1.0
 [1.0.0]: https://github.com/terrene-foundation/csq/releases/tag/v1.0.0
+[2.0.1]: https://github.com/terrene-foundation/csq/releases/tag/v2.0.1
+[2.1.0]: https://github.com/terrene-foundation/csq/releases/tag/v2.1.0

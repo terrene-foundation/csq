@@ -664,19 +664,30 @@ pub fn repoint_handle_dir_codex(
         });
     }
 
-    // Surface guard: refuse to repoint a non-Codex handle dir. The
-    // identifying marker of a Codex handle dir is the presence of an
-    // `auth.json` symlink (Codex-unique per spec 07 §7.2.2). If absent,
-    // this is either a ClaudeCode handle dir or a corrupted one — fail
-    // closed rather than overlay Codex symlinks onto the wrong shape.
-    if handle_dir.join("auth.json").symlink_metadata().is_err() {
-        return Err(CredentialError::Corrupt {
-            path: handle_dir.to_path_buf(),
-            reason: "handle dir is not Codex-shaped (missing auth.json symlink). \
-                     `repoint_handle_dir_codex` only operates on Codex handle dirs; \
-                     for ClaudeCode use `repoint_handle_dir`."
-                .into(),
-        });
+    // Surface guard (PR-C9b L-CDX-1): refuse to repoint a non-Codex handle dir.
+    // Codex-shape requires BOTH `auth.json` AND `config.toml` to be present
+    // AND each must be a symlink — not a regular file or directory. The
+    // dual-marker check matches the inverse guard in `repoint_handle_dir`
+    // (which scans both items); the is_symlink check rejects planted
+    // regular files that would otherwise pass `symlink_metadata().is_ok()`
+    // and trip the rename loop into overwriting attacker-controlled state.
+    for codex_item in ["auth.json", "config.toml"] {
+        let probe = handle_dir.join(codex_item);
+        let is_symlink = probe
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_symlink {
+            return Err(CredentialError::Corrupt {
+                path: handle_dir.to_path_buf(),
+                reason: format!(
+                    "handle dir is not Codex-shaped: '{codex_item}' is missing or \
+                     not a symlink. `repoint_handle_dir_codex` only operates on \
+                     Codex handle dirs (spec 07 §7.2.2 symlink set); for ClaudeCode \
+                     use `repoint_handle_dir`."
+                ),
+            });
+        }
     }
 
     let new_config = base_dir.join(format!("config-{}", target));
@@ -736,9 +747,19 @@ pub fn repoint_handle_dir_codex(
     // `config-<N>/<item>` or `credentials/codex-<N>.json` depending on
     // the item — auth.json symlinks canonical-direct, the rest go
     // through config-<N>.
+    //
+    // PR-C9b M-CDX-1: order matters under partial-failure. Credential
+    // (`auth.json`) MUST be rewritten BEFORE the marker (`.csq-account`).
+    // If a mid-loop rename fails (ENOSPC, EROFS, transient I/O), the
+    // marker must not flip to slot N+1 while `auth.json` still resolves
+    // to slot N's tokens — that mismatch causes silent quota-attribution
+    // drift in the daemon (which polls `/api/oauth/usage` keyed on the
+    // marker) and trips the F3 `.csq-account` mismatch guard on the next
+    // swap. ClaudeCode's `ACCOUNT_BOUND_ITEMS` follows the same
+    // invariant: `.credentials.json` first, `.csq-account` second.
     let codex_links: &[(&str, PathBuf)] = &[
-        (".csq-account", new_config.join(".csq-account")),
         ("auth.json", canonical_cred.clone()),
+        (".csq-account", new_config.join(".csq-account")),
         ("config.toml", new_config.join("config.toml")),
         ("sessions", new_config.join("codex-sessions")),
         ("history.jsonl", new_config.join("codex-history.jsonl")),
@@ -3940,6 +3961,129 @@ mod tests {
                 );
             }
             other => panic!("expected Corrupt for missing marker, got: {other:?}"),
+        }
+    }
+
+    // ── PR-C9b round 2 fixes ──────────────────────────────────────────
+
+    /// M-CDX-1 regression: the credential symlink (`auth.json`) MUST be
+    /// rewritten BEFORE the marker (`.csq-account`) inside the rename
+    /// loop. Otherwise a mid-loop I/O failure could flip the marker to
+    /// the new slot while `auth.json` still resolved to the old slot's
+    /// tokens — silent quota-attribution drift in the daemon plus a
+    /// trip on the F3 mismatch guard at the next swap. This test pins
+    /// the static `codex_links` slice ordering by introspecting the
+    /// post-repoint mtime relationship — the file with the LATER mtime
+    /// was written last, so we assert `.csq-account` mtime ≥ `auth.json`
+    /// mtime (NEVER the inverse).
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_writes_credential_before_marker() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 21);
+        setup_codex_slot(base, 22);
+
+        let from = AccountNum::try_from(21u16).unwrap();
+        let to = AccountNum::try_from(22u16).unwrap();
+        let handle = create_handle_dir_codex(base, from, 70021).unwrap();
+
+        // Sleep enough to make sub-nanosecond mtime ordering observable
+        // even on filesystems with coarse mtime resolution (e.g. HFS+
+        // 1s; APFS 1ns; ext4 1ns; some tempfs 1us).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        repoint_handle_dir_codex(base, &handle, to).unwrap();
+
+        let auth_meta = std::fs::symlink_metadata(handle.join("auth.json")).unwrap();
+        let marker_meta = std::fs::symlink_metadata(handle.join(".csq-account")).unwrap();
+
+        // Ordering invariant: marker is written AT OR AFTER credential.
+        // Use ctime (inode-change time, reflects the rename) for the
+        // strictest check; mtime is the symlink's own mtime which
+        // matches ctime under rename-replace semantics.
+        let auth_ctime = (auth_meta.ctime(), auth_meta.ctime_nsec());
+        let marker_ctime = (marker_meta.ctime(), marker_meta.ctime_nsec());
+        assert!(
+            marker_ctime >= auth_ctime,
+            "M-CDX-1: .csq-account ctime ({:?}) must be >= auth.json ctime ({:?}) — \
+             credential must be written before marker so a mid-loop failure cannot \
+             leave the marker pointing at a slot whose credential is still the old one",
+            marker_ctime,
+            auth_ctime,
+        );
+    }
+
+    /// L-CDX-1 regression: the surface guard MUST refuse a handle dir
+    /// where `auth.json` is a regular file (not a symlink). The pre-fix
+    /// guard accepted any `symlink_metadata().is_ok()` entry, which
+    /// would let a planted file slip past and trigger the rename loop
+    /// to overwrite attacker-controlled state.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_refuses_when_auth_json_is_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 31);
+        setup_codex_slot(base, 32);
+
+        // Build a handle dir manually with `auth.json` as a regular file
+        // and `config.toml` as a regular file too — both Codex-unique
+        // markers present but neither is a symlink.
+        let handle = base.join("term-70031");
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(handle.join("auth.json"), b"planted, not a symlink").unwrap();
+        std::fs::write(handle.join("config.toml"), b"planted, not a symlink").unwrap();
+
+        let to = AccountNum::try_from(32u16).unwrap();
+        let result = repoint_handle_dir_codex(base, &handle, to);
+
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("not a symlink") || reason.contains("Codex-shaped"),
+                    "L-CDX-1: error must name the non-symlink marker: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for regular-file marker, got: {other:?}"),
+        }
+
+        // Planted files MUST still exist — guard refused before any rename.
+        assert_eq!(
+            std::fs::read(handle.join("auth.json")).unwrap(),
+            b"planted, not a symlink",
+            "guard must refuse before touching the planted file"
+        );
+    }
+
+    /// L-CDX-1 regression: the dual-marker check requires BOTH
+    /// `auth.json` AND `config.toml`. A handle dir with only `auth.json`
+    /// (corrupted partial-create) MUST be refused.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_refuses_when_config_toml_symlink_missing() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 41);
+        setup_codex_slot(base, 42);
+
+        let from = AccountNum::try_from(41u16).unwrap();
+        let to = AccountNum::try_from(42u16).unwrap();
+        let handle = create_handle_dir_codex(base, from, 70041).unwrap();
+
+        // Strip the `config.toml` symlink to simulate a corrupted handle dir.
+        std::fs::remove_file(handle.join("config.toml")).unwrap();
+
+        let result = repoint_handle_dir_codex(base, &handle, to);
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("config.toml"),
+                    "L-CDX-1: error must name the missing config.toml: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for missing config.toml, got: {other:?}"),
         }
     }
 }

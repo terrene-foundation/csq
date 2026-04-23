@@ -60,24 +60,46 @@ impl SourceHandle {
     }
 }
 
+/// Pure dispatch decision for `handle()`. Extracted as a free function
+/// (PR-C9b L-CDX-3) so the routing matrix is unit-testable without the
+/// env-var + filesystem setup that `handle()` requires. Any future
+/// refactor of the dispatcher MUST keep `route()` in lockstep — the
+/// `route_*` unit tests pin the matrix.
+#[derive(Debug, PartialEq, Eq)]
+enum RouteKind {
+    /// Source + target both ClaudeCode (Anthropic or 3P). In-flight
+    /// symlink repoint; no exec, no tombstone.
+    SameSurfaceClaudeCode,
+    /// Source + target both Codex. In-flight symlink repoint via the
+    /// Codex-aware mirror (M10 / journal 0023). No exec, no tombstone.
+    SameSurfaceCodex,
+    /// Source ≠ target surface. INV-P05 confirm + INV-P10 tombstone +
+    /// `exec` of the target binary. Conversation does not transfer.
+    CrossSurface,
+}
+
+fn route(source: Surface, target: Surface) -> RouteKind {
+    match (source, target) {
+        (Surface::ClaudeCode, Surface::ClaudeCode) => RouteKind::SameSurfaceClaudeCode,
+        (Surface::Codex, Surface::Codex) => RouteKind::SameSurfaceCodex,
+        _ => RouteKind::CrossSurface,
+    }
+}
+
 /// PR-C7 entry point. `yes` bypasses the cross-surface confirmation
 /// prompt (INV-P05 `--yes`).
 pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     let source = detect_source_handle()?;
     let target_surface = resolve_target_surface(base_dir, target)?;
 
-    match (source.surface(), target_surface) {
-        // Same-surface ClaudeCode: in-flight symlink repoint.
-        (Surface::ClaudeCode, Surface::ClaudeCode) => {
+    match route(source.surface(), target_surface) {
+        RouteKind::SameSurfaceClaudeCode => {
             same_surface_claude_code(base_dir, source.path(), target)
         }
-        // Same-surface Codex: in-flight symlink repoint via the
-        // Codex-aware mirror. M10 / journal 0023 — was previously
-        // routed to cross_surface_exec, which silently dropped the
-        // conversation by `exec`-replacing the running codex process.
-        (Surface::Codex, Surface::Codex) => same_surface_codex(base_dir, source.path(), target),
-        // Cross-surface only.
-        _ => cross_surface_exec(base_dir, source, target, target_surface, yes),
+        RouteKind::SameSurfaceCodex => same_surface_codex(base_dir, source.path(), target),
+        RouteKind::CrossSurface => {
+            cross_surface_exec(base_dir, source, target, target_surface, yes)
+        }
     }
 }
 
@@ -433,6 +455,44 @@ mod tests {
         assert_eq!(ch.surface(), Surface::ClaudeCode);
         let cx = SourceHandle::Codex(PathBuf::from("/x/term-2"));
         assert_eq!(cx.surface(), Surface::Codex);
+    }
+
+    // ── PR-C9b L-CDX-3 — dispatcher routing matrix ────────────────────
+
+    /// Pinning: ClaudeCode→ClaudeCode MUST stay on the same-surface
+    /// in-flight repoint path.
+    #[test]
+    fn route_claudecode_to_claudecode_is_same_surface_claudecode() {
+        assert_eq!(
+            route(Surface::ClaudeCode, Surface::ClaudeCode),
+            RouteKind::SameSurfaceClaudeCode
+        );
+    }
+
+    /// Pinning: Codex→Codex MUST stay on the same-surface in-flight
+    /// repoint path (M10 / journal 0023). Regression guard against any
+    /// future refactor that re-routes through cross_surface_exec and
+    /// silently drops the user's conversation again.
+    #[test]
+    fn route_codex_to_codex_is_same_surface_codex() {
+        assert_eq!(
+            route(Surface::Codex, Surface::Codex),
+            RouteKind::SameSurfaceCodex
+        );
+    }
+
+    /// Pinning: any cross-surface combination MUST take the exec-replace
+    /// path (INV-P05 confirm + INV-P10 tombstone + exec).
+    #[test]
+    fn route_cross_surface_is_cross_surface() {
+        assert_eq!(
+            route(Surface::ClaudeCode, Surface::Codex),
+            RouteKind::CrossSurface
+        );
+        assert_eq!(
+            route(Surface::Codex, Surface::ClaudeCode),
+            RouteKind::CrossSurface
+        );
     }
 
     // ── PR-C9a journal 0021 finding 10 — rename-to-tombstone ─

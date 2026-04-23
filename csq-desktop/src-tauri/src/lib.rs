@@ -127,6 +127,13 @@ pub struct AppState {
     /// on normal exit; populated for the duration of any
     /// live `ollama pull`.
     pub ollama_pull_child: Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
+    /// Running `codex login --device-auth` child. Mirrors
+    /// `ollama_pull_child` — see `pull_ollama_model` doc for the
+    /// rationale on the `Arc<Mutex<Option<Arc<Mutex<Child>>>>>`
+    /// shape. PR-C9a journal 0021 finding 6: the desktop Codex
+    /// UI's modal-close must kill the subprocess so it does not
+    /// orphan for the minutes-long codex-cli device-auth window.
+    pub codex_login_child: Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
 }
 
 /// Maximum length of an account label shown in the tray.
@@ -905,6 +912,7 @@ pub fn run() {
             // PR-C8 — Codex desktop UI
             commands::start_codex_login,
             commands::complete_codex_login,
+            commands::cancel_codex_login,
             commands::list_codex_models,
             commands::acknowledge_codex_tos,
             commands::set_codex_slot_model,
@@ -1000,6 +1008,7 @@ pub fn run() {
                 daemon_supervisor: Mutex::new(supervisor),
                 update_cache: Mutex::new(None),
                 ollama_pull_child: Arc::new(Mutex::new(None)),
+                codex_login_child: Arc::new(Mutex::new(None)),
             });
 
             // ── Background update check ────────────────────────

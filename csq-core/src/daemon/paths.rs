@@ -192,6 +192,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_prefers_xdg_runtime_dir() {
+        // Journal 0021 finding 11: acquire the shared env-test mutex
+        // so this test does not race `detect::*` tests that also
+        // mutate XDG_RUNTIME_DIR.
+        let _env_guard = crate::platform::test_env::lock();
         // Save + restore env to avoid poisoning other tests.
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: tests are single-threaded for env var access; we
@@ -234,19 +238,31 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_socket_path_is_pipe() {
-        let base = Path::new(r"C:\Users\testuser\AppData\Local\csq");
+        // Journal 0021 finding 12: save + restore USERNAME under the
+        // shared env-test mutex so this test does not poison later
+        // tests that read USERNAME.
+        let _env_guard = crate::platform::test_env::lock();
+        let saved = std::env::var("USERNAME").ok();
         std::env::set_var("USERNAME", "winuser");
+        let base = Path::new(r"C:\Users\testuser\AppData\Local\csq");
         let p = socket_path(base);
         let s = p.to_string_lossy();
         assert!(
             s.starts_with(r"\\.\pipe\"),
             "Windows socket_path should be a named pipe: {s}"
         );
+        match saved {
+            Some(v) => std::env::set_var("USERNAME", v),
+            None => std::env::remove_var("USERNAME"),
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_falls_back_without_xdg_runtime_dir() {
+        // Journal 0021 finding 11: acquire the shared env-test
+        // mutex (same reason as `linux_prefers_xdg_runtime_dir`).
+        let _env_guard = crate::platform::test_env::lock();
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
 

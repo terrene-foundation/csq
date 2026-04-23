@@ -395,6 +395,31 @@ pub fn tick(
 /// Additionally filters out any accounts in `exclude_accounts`. If the
 /// first candidate is in the exclusion list, we iterate until we find
 /// one that isn't — or return None if no eligible account exists.
+///
+/// # v2.1 scope (PR-C9a round-1 CRITICAL fix, journal 0021)
+///
+/// Auto-rotate is **ClaudeCode-only** in v2.1. Pre-C9a this function
+/// used [`discovery::discover_anthropic`], which returned no records for
+/// Codex handle dirs — `active_surface` then fell back to
+/// `Surface::ClaudeCode`, the same-surface filter admitted ClaudeCode
+/// candidates, and the rotator called [`repoint_handle_dir`] on a Codex
+/// handle dir, corrupting the live codex process (INV-P11 violation).
+///
+/// The fix is two-part:
+///
+/// 1. Use [`discovery::discover_all`] so Codex slots contribute an
+///    `AccountInfo` with `surface = Surface::Codex` and `active_surface`
+///    is resolved correctly.
+/// 2. Short-circuit (return `None`) if the current account's surface is
+///    not `ClaudeCode`. Codex rotation, if ever added, requires an
+///    exec-replace pathway (journal 0019 §Q1 INV-P05 amendment, pending
+///    human approval) that the repoint-based rotator cannot deliver —
+///    so the explicit refusal here is the correct v2.1 semantics.
+///
+/// Belt-and-suspenders: [`repoint_handle_dir`] also refuses to act on a
+/// Codex-shape handle dir (presence of `auth.json` / `config.toml` /
+/// `sessions` symlinks), so any future caller that forgets the
+/// surface check is caught before symlinks are rewritten.
 fn find_target(
     base_dir: &Path,
     current: AccountNum,
@@ -403,7 +428,7 @@ fn find_target(
     use crate::accounts::discovery;
     use crate::quota::state as qs;
 
-    let accounts = discovery::discover_anthropic(base_dir);
+    let accounts = discovery::discover_all(base_dir);
     let quota = qs::load_state(base_dir).ok()?;
 
     // Build a combined exclusion set: current + user list.
@@ -419,18 +444,34 @@ fn find_target(
         .collect();
 
     // Determine the current terminal's surface so the same-surface filter
-    // (INV-P11) can reject cross-surface candidates. If discovery doesn't
-    // return a record for the current account — which happens for handle
-    // dirs pointing at an account that has since been deleted — fall back
-    // to `Surface::ClaudeCode`. This default is safe in v2.1 because the
-    // only other surface (`Codex`) is not yet reachable through real
-    // login flows; PR-C3 will ensure Codex accounts are in discovery
-    // output before it becomes observable.
+    // (INV-P11) can reject cross-surface candidates. `discover_all`
+    // includes Codex slots, so a Codex handle dir yields an accurate
+    // `Surface::Codex` value here rather than falling back to ClaudeCode.
+    //
+    // Fallback to `Surface::ClaudeCode` still applies when discovery
+    // returns NO record for the current account (orphaned handle dir
+    // pointing at a deleted slot). In that case the caller has bigger
+    // problems and the rotator's behaviour is moot — the repoint will
+    // fail on the missing config-<N> dir downstream regardless.
     let active_surface = accounts
         .iter()
         .find(|a| a.id == current.get())
         .map(|a| a.surface)
         .unwrap_or(Surface::ClaudeCode);
+
+    // v2.1 scope: auto-rotate is ClaudeCode-only. If the current handle
+    // dir is bound to a Codex slot (or any future non-ClaudeCode surface),
+    // refuse to rotate. Cross-surface Codex↔Codex rotation requires an
+    // exec-replace pathway that the repoint-based rotator cannot provide.
+    if active_surface != Surface::ClaudeCode {
+        debug!(
+            current = current.get(),
+            surface = ?active_surface,
+            "auto-rotation: current account is non-ClaudeCode surface, skipping \
+             (v2.1 scope: Codex rotation requires explicit csq swap)"
+        );
+        return None;
+    }
 
     // Collect candidates: has credentials, Anthropic source only (VP-final R1
     // CRITICAL: exclude 3P slots — stale credentials/N.json from a prior OAuth
@@ -1202,6 +1243,185 @@ mod tests {
             entry_count_before,
             "cooldown map must not grow — duplicate key after second tick means \
              canonicalization is missing"
+        );
+    }
+
+    // ── PR-C9a CRITICAL: auto-rotate must never fire on a Codex handle dir ─
+
+    /// Builds a minimal Codex slot on disk: `credentials/codex-<N>.json`,
+    /// `config-<N>/.csq-account`, and `config-<N>/config.toml` (required by
+    /// `create_handle_dir_codex` so the symlink set contains the Codex
+    /// shape that `repoint_handle_dir`'s guard watches for).
+    fn setup_codex_slot(base: &Path, account: u16) {
+        use crate::credentials::{CodexCredentialFile, CodexTokensFile};
+        let acct = AccountNum::try_from(account).unwrap();
+
+        let creds = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some(format!("uuid-{account}")),
+                access_token: format!("eyJaccess.codex-{account}.sig"),
+                refresh_token: Some(format!("rt_codex_{account}")),
+                id_token: Some(format!("eyJid.codex-{account}.sig")),
+                extra: HashMap::new(),
+            },
+            last_refresh: Some("2026-04-22T00:00:00Z".into()),
+            extra: HashMap::new(),
+        });
+        let cred_path = base
+            .join("credentials")
+            .join(format!("codex-{account}.json"));
+        credentials::save(&cred_path, &creds).unwrap();
+
+        let config_dir = base.join(format!("config-{account}"));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        markers::write_csq_account(&config_dir, acct).unwrap();
+        // Minimal config.toml so create_handle_dir_codex's symlink target
+        // exists (create_handle_dir_codex silently skips missing targets,
+        // but the Codex-shape guard in repoint_handle_dir keys on
+        // `auth.json` and `config.toml` existing as symlinks).
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "cli_auth_credentials_store = \"file\"\nmodel = \"gpt-5.4\"\n",
+        )
+        .unwrap();
+    }
+
+    /// Regression guard: journal 0021 finding 1 (CRITICAL).
+    ///
+    /// A handle dir bound to a Codex slot MUST NOT be rotated by the
+    /// auto-rotater. Pre-fix, `find_target` used `discover_anthropic`,
+    /// so `active_surface` fell back to `Surface::ClaudeCode` for a
+    /// Codex-bound handle dir; same-surface filter admitted ClaudeCode
+    /// candidates; repoint_handle_dir then corrupted the Codex handle
+    /// dir's ACCOUNT_BOUND_ITEMS while leaving the Codex symlinks
+    /// (`auth.json`, `config.toml`, `sessions`, `history.jsonl`) pointing
+    /// at the old config-<N>. This test pins the fix: a Codex handle dir
+    /// under quota pressure MUST NOT be rotated, regardless of how
+    /// tempting the ClaudeCode candidates look.
+    #[cfg(unix)]
+    #[test]
+    fn auto_rotate_refuses_to_rotate_codex_handle_dir() {
+        use crate::session::handle_dir::create_handle_dir_codex;
+
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+
+        // Codex slot 5, "over threshold" by any reasonable reading of
+        // the 5h window: populate quota.json so the tick DOES think it
+        // should rotate (i.e. pre-fix it would have tried).
+        setup_codex_slot(dir.path(), 5);
+        setup_quota(dir.path(), 5, 99.0);
+
+        // Tempting ClaudeCode candidate at slot 1 (low usage). Pre-fix
+        // the rotator would have picked this one.
+        setup_account(dir.path(), 1);
+        setup_config_dir(dir.path(), 1);
+        setup_quota(dir.path(), 1, 5.0);
+
+        // Create a Codex handle dir bound to slot 5.
+        let acct5 = AccountNum::try_from(5u16).unwrap();
+        let handle_dir = create_handle_dir_codex(dir.path(), acct5, 40001).unwrap();
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        // Act
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        // Assert 1: the handle dir is still bound to slot 5 via its
+        // .csq-account symlink. (In the Codex handle-dir layout,
+        // `.csq-account` symlinks to `config-<N>/.csq-account`.)
+        let marker = markers::read_csq_account(&handle_dir);
+        assert_eq!(
+            marker,
+            Some(acct5),
+            "Codex handle dir MUST NOT be rotated by auto-rotate \
+             (v2.1 scope: Codex requires explicit csq swap)"
+        );
+
+        // Assert 2: no cooldown entry was recorded (the skip happened
+        // before the repoint attempt).
+        assert!(
+            cooldowns.is_empty(),
+            "no cooldown entry should be set when tick skips a Codex handle dir"
+        );
+
+        // Assert 3: the Codex symlink set is intact — `auth.json`,
+        // `config.toml` still present (would have been left dangling
+        // pre-fix if repoint had rewritten the ClaudeCode-shape items).
+        assert!(
+            handle_dir.join("auth.json").symlink_metadata().is_ok(),
+            "Codex auth.json symlink must survive the tick"
+        );
+        assert!(
+            handle_dir.join("config.toml").symlink_metadata().is_ok(),
+            "Codex config.toml symlink must survive the tick"
+        );
+    }
+
+    /// Regression guard: journal 0021 finding 1 second half.
+    ///
+    /// `find_target` must return `None` for a Codex current account
+    /// regardless of what candidates exist. Before the fix, a Codex
+    /// current account falling back to `Surface::ClaudeCode` would
+    /// let same-surface filter admit Claude slots.
+    #[test]
+    fn find_target_returns_none_for_codex_current_account() {
+        let dir = TempDir::new().unwrap();
+
+        // Codex slot 3 as the current account.
+        setup_codex_slot(dir.path(), 3);
+        setup_quota(dir.path(), 3, 99.0);
+
+        // Tempting ClaudeCode candidate at slot 1.
+        setup_account(dir.path(), 1);
+        setup_config_dir(dir.path(), 1);
+        setup_quota(dir.path(), 1, 5.0);
+
+        let acct3 = AccountNum::try_from(3u16).unwrap();
+        let target = find_target(dir.path(), acct3, &[]);
+
+        assert_eq!(
+            target, None,
+            "find_target MUST return None when current account is non-ClaudeCode \
+             (auto-rotate is ClaudeCode-only in v2.1)"
+        );
+    }
+
+    /// Regression guard: Codex slot must not be picked as a ClaudeCode
+    /// rotation target. Prior to PR-C9a, `discover_anthropic` excluded
+    /// Codex — but the fix switches `find_target` to `discover_all`,
+    /// which now includes Codex accounts. This test pins the invariant
+    /// that the same-surface filter correctly drops Codex candidates
+    /// when the current handle dir is on ClaudeCode.
+    #[test]
+    fn find_target_skips_codex_candidates_for_claudecode_current() {
+        let dir = TempDir::new().unwrap();
+
+        // Current: ClaudeCode slot 1 (over threshold).
+        setup_account(dir.path(), 1);
+        setup_config_dir(dir.path(), 1);
+        setup_quota(dir.path(), 1, 99.0);
+
+        // Only candidate: Codex slot 2 (would be tempting if ClaudeCode
+        // candidates were missing).
+        setup_codex_slot(dir.path(), 2);
+        setup_quota(dir.path(), 2, 5.0);
+
+        let acct1 = AccountNum::try_from(1u16).unwrap();
+        let target = find_target(dir.path(), acct1, &[]);
+
+        assert_eq!(
+            target, None,
+            "Codex candidate must not be picked for a ClaudeCode handle dir \
+             (INV-P11 same-surface filter)"
         );
     }
 }

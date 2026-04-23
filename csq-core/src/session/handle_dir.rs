@@ -463,6 +463,41 @@ pub fn repoint_handle_dir(
         });
     }
 
+    // PR-C9a CRITICAL belt-and-suspenders (journal 0021 finding 1): refuse
+    // to rewrite ACCOUNT_BOUND_ITEMS on a handle dir whose symlink set is
+    // Codex-shaped. `repoint_handle_dir` only touches the Anthropic
+    // `ACCOUNT_BOUND_ITEMS` (`.credentials.json`, `.csq-account`,
+    // `.current-account`, `.quota-cursor`) — on a Codex handle dir those
+    // items are absent or orthogonal to the real Codex symlinks
+    // (`auth.json`, `config.toml`, `sessions`, `history.jsonl`, per spec
+    // 07 §7.2.2), so a repoint would leave the Codex symlinks pointing at
+    // the old `config-<N>` while rewriting only the ClaudeCode-shape
+    // markers. The primary guard lives in `auto_rotate::find_target` (v2.1
+    // auto-rotate is ClaudeCode-only), but this secondary guard catches
+    // any future caller that forgets the surface check before invoking
+    // repoint.
+    //
+    // Narrowed to items that are **Codex-unique**. `sessions` and
+    // `history.jsonl` are not unique — `SHARED_ITEMS` (see
+    // `session::isolation`) includes them on ClaudeCode handle dirs as
+    // symlinks into `~/.claude/`. Only `auth.json` and `config.toml` are
+    // Codex-exclusive markers.
+    let codex_unique_items = ["auth.json", "config.toml"];
+    for codex_item in codex_unique_items {
+        let probe = handle_dir.join(codex_item);
+        if probe.symlink_metadata().is_ok() {
+            return Err(CredentialError::Corrupt {
+                path: handle_dir.to_path_buf(),
+                reason: format!(
+                    "handle dir contains Codex-unique symlink '{codex_item}'. \
+                     `repoint_handle_dir` is the Anthropic repoint path and \
+                     must not run on Codex handle dirs. Codex rotation requires \
+                     an explicit `csq swap` exec-replace (spec 07 §7.5 INV-P05)."
+                ),
+            });
+        }
+    }
+
     let new_config = base_dir.join(format!("config-{}", target));
     if !new_config.is_dir() {
         return Err(CredentialError::Corrupt {
@@ -577,6 +612,178 @@ pub fn repoint_handle_dir(
     rebuild_claude_json_for_swap(&new_config, handle_dir);
 
     info!(account = %target, handle = %handle_dir.display(), "handle dir repointed");
+    Ok(())
+}
+
+/// Atomically repoints the Codex symlinks in a Codex handle dir to
+/// point at a new `config-<target>` directory.
+///
+/// Counterpart to [`repoint_handle_dir`] for the Codex surface. The
+/// Codex symlink set per spec 07 §7.2.2 is:
+/// - `.csq-account` → `config-<N>/.csq-account`
+/// - `auth.json` → `credentials/codex-<N>.json` (canonical-direct)
+/// - `config.toml` → `config-<N>/config.toml`
+/// - `sessions` → `config-<N>/codex-sessions`
+/// - `history.jsonl` → `config-<N>/codex-history.jsonl`
+///
+/// In-flight semantics are identical to the ClaudeCode path: codex-cli
+/// re-stats `auth.json` before every API call, so the next request
+/// after `csq swap` resolves through the new symlink. UNIX
+/// open-after-rename semantics keep any open fds into the old
+/// `codex-sessions/` valid until the holding process closes them — a
+/// session in flight continues writing to its existing session file via
+/// the old fd, while any new open (`codex resume`, a new session) hits
+/// the new slot. This matches the ClaudeCode model and replaces the
+/// prior `exec`-replace path that silently dropped the user's
+/// conversation (M10, journal 0023).
+///
+/// # Errors
+///
+/// - If the handle dir is not a `term-<pid>` dir
+/// - If the handle dir is not Codex-shaped (missing `auth.json` symlink)
+/// - If `config-<target>` doesn't exist
+/// - If the new slot is missing `.csq-account` (mixed-state guard)
+/// - If `credentials/codex-<target>.json` doesn't exist
+/// - On any I/O failure during repoint
+pub fn repoint_handle_dir_codex(
+    base_dir: &Path,
+    handle_dir: &Path,
+    target: AccountNum,
+) -> Result<(), CredentialError> {
+    let dir_name = handle_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !dir_name.starts_with("term-") {
+        return Err(CredentialError::Corrupt {
+            path: handle_dir.to_path_buf(),
+            reason: format!(
+                "expected term-<pid> handle dir, got {dir_name}. \
+                 Run `csq run {target}` to launch with handle-dir isolation."
+            ),
+        });
+    }
+
+    // Surface guard: refuse to repoint a non-Codex handle dir. The
+    // identifying marker of a Codex handle dir is the presence of an
+    // `auth.json` symlink (Codex-unique per spec 07 §7.2.2). If absent,
+    // this is either a ClaudeCode handle dir or a corrupted one — fail
+    // closed rather than overlay Codex symlinks onto the wrong shape.
+    if handle_dir.join("auth.json").symlink_metadata().is_err() {
+        return Err(CredentialError::Corrupt {
+            path: handle_dir.to_path_buf(),
+            reason: "handle dir is not Codex-shaped (missing auth.json symlink). \
+                     `repoint_handle_dir_codex` only operates on Codex handle dirs; \
+                     for ClaudeCode use `repoint_handle_dir`."
+                .into(),
+        });
+    }
+
+    let new_config = base_dir.join(format!("config-{}", target));
+    if !new_config.is_dir() {
+        return Err(CredentialError::Corrupt {
+            path: new_config,
+            reason: format!("config-{target} does not exist"),
+        });
+    }
+
+    // Pre-flight mirror of `repoint_handle_dir`'s VP-final F3: the
+    // `.csq-account` marker is structurally required in the target slot.
+    // Without it csq cannot determine the post-swap account and the
+    // daemon's auto-rotate / sweep loops would skip the handle dir on
+    // every tick. Refuse before any rename so the handle dir cannot end
+    // up half-pointed at the old slot.
+    let csq_account_target = new_config.join(".csq-account");
+    if !csq_account_target.exists() && csq_account_target.symlink_metadata().is_err() {
+        return Err(CredentialError::Corrupt {
+            path: csq_account_target,
+            reason: format!(
+                "repoint target missing .csq-account in {} — repoint aborted to prevent \
+                 mixed-state handle dir",
+                new_config.display()
+            ),
+        });
+    }
+
+    // The canonical Codex credential file is required for `auth.json`
+    // to resolve. Codex auth.json symlinks canonical-direct (NOT
+    // through `config-<N>`) per spec 07 §7.2.2.
+    let canonical_cred = base_dir
+        .join("credentials")
+        .join(format!("codex-{target}.json"));
+    if !canonical_cred.exists() {
+        return Err(CredentialError::Corrupt {
+            path: canonical_cred,
+            reason: format!(
+                "credentials/codex-{target}.json does not exist — \
+                 Codex slot {target} has not completed login. Run \
+                 `csq login {target} --provider codex` first."
+            ),
+        });
+    }
+
+    // Per-handle flock (mirrors ClaudeCode VP-final F4) so concurrent
+    // swaps cannot interleave renames into a split state. The lock
+    // file lives inside the handle dir so it is reaped with the dir.
+    let lock_path = handle_dir.join(".swap.lock");
+    let _swap_guard =
+        crate::platform::lock::lock_file(&lock_path).map_err(|e| CredentialError::Corrupt {
+            path: lock_path.clone(),
+            reason: format!("repoint lock acquisition failed: {e}"),
+        })?;
+
+    // Codex symlink set per spec 07 §7.2.2. Sources are either
+    // `config-<N>/<item>` or `credentials/codex-<N>.json` depending on
+    // the item — auth.json symlinks canonical-direct, the rest go
+    // through config-<N>.
+    let codex_links: &[(&str, PathBuf)] = &[
+        (".csq-account", new_config.join(".csq-account")),
+        ("auth.json", canonical_cred.clone()),
+        ("config.toml", new_config.join("config.toml")),
+        ("sessions", new_config.join("codex-sessions")),
+        ("history.jsonl", new_config.join("codex-history.jsonl")),
+    ];
+
+    for (name, new_target) in codex_links {
+        let link_path = handle_dir.join(name);
+        let tmp_path = handle_dir.join(format!("{name}.swap-tmp"));
+
+        // `codex-sessions/` and `codex-history.jsonl` may legitimately
+        // be absent in the new slot if the user has never used codex
+        // on that account — codex-cli creates them lazily. Mirror
+        // create_handle_dir_codex: skip the symlink AND remove any
+        // existing one so we do not leave a dangling-link orphan
+        // pointed at the old slot.
+        if !new_target.exists() && new_target.symlink_metadata().is_err() {
+            if link_path.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(&link_path);
+            }
+            continue;
+        }
+
+        // Stage at temp path + atomic rename-over the live link
+        // (matches ClaudeCode INV-04 swap semantics: codex-cli sees
+        // either the pre-swap or post-swap symlink, never a half-state).
+        if tmp_path.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        create_symlink(new_target, &tmp_path).map_err(|e| CredentialError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        std::fs::rename(&tmp_path, &link_path).map_err(|e| CredentialError::Io {
+            path: link_path.clone(),
+            source: e,
+        })?;
+        debug!(item = name, account = %target, "repointed codex symlink");
+    }
+
+    info!(
+        account = %target,
+        handle = %handle_dir.display(),
+        surface = "codex",
+        "codex handle dir repointed"
+    );
     Ok(())
 }
 
@@ -3434,5 +3641,305 @@ mod tests {
         );
         // log/ is always created fresh.
         assert!(handle.join("log").is_dir());
+    }
+
+    // ── PR-C9a CRITICAL belt-and-suspenders: repoint refuses Codex-shape ──
+
+    /// Regression guard: journal 0021 finding 1 belt-and-suspenders.
+    ///
+    /// `repoint_handle_dir` is the ClaudeCode repoint path. It touches
+    /// `ACCOUNT_BOUND_ITEMS` (`.credentials.json`, `.csq-account`,
+    /// `.current-account`, `.quota-cursor`) only — if called on a Codex
+    /// handle dir it would rewrite those Anthropic-shape markers while
+    /// leaving the real Codex symlinks (`auth.json`, `config.toml`,
+    /// `sessions`, `history.jsonl` per spec 07 §7.2.2) pointing at the
+    /// old `config-<N>`. The primary guard lives in
+    /// `auto_rotate::find_target`, but this secondary refusal catches
+    /// any caller that forgets the surface check.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_refuses_codex_shape_handle_dir() {
+        use crate::credentials::{CodexCredentialFile, CodexTokensFile, CredentialFile};
+        use crate::types::AccountNum;
+
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Codex slot 5 with canonical credentials + config.toml.
+        let codex_account = AccountNum::try_from(5u16).unwrap();
+        let codex_creds = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some("uuid-5".into()),
+                access_token: "eyJaccess.codex-5.sig".into(),
+                refresh_token: Some("rt_codex_5".into()),
+                id_token: Some("eyJid.codex-5.sig".into()),
+                extra: std::collections::HashMap::new(),
+            },
+            last_refresh: Some("2026-04-22T00:00:00Z".into()),
+            extra: std::collections::HashMap::new(),
+        });
+        crate::credentials::save(&base.join("credentials").join("codex-5.json"), &codex_creds)
+            .unwrap();
+        let codex_config = base.join("config-5");
+        std::fs::create_dir_all(&codex_config).unwrap();
+        markers::write_csq_account(&codex_config, codex_account).unwrap();
+        std::fs::write(
+            codex_config.join("config.toml"),
+            "cli_auth_credentials_store = \"file\"\nmodel = \"gpt-5.4\"\n",
+        )
+        .unwrap();
+
+        // A plausible ClaudeCode target dir (doesn't matter whether it's
+        // valid; the guard refuses before new_config is inspected).
+        let target_config = base.join("config-1");
+        std::fs::create_dir_all(&target_config).unwrap();
+        let target_account = AccountNum::try_from(1u16).unwrap();
+        markers::write_csq_account(&target_config, target_account).unwrap();
+
+        // Create a Codex handle dir.
+        let handle = create_handle_dir_codex(base, codex_account, 70001).unwrap();
+
+        // Precondition: handle dir has Codex-shape symlinks.
+        assert!(
+            handle.join("auth.json").symlink_metadata().is_ok(),
+            "test precondition: auth.json symlink exists"
+        );
+        assert!(
+            handle.join("config.toml").symlink_metadata().is_ok(),
+            "test precondition: config.toml symlink exists"
+        );
+
+        // Act: attempt to repoint to target slot 1.
+        let result = repoint_handle_dir(base, claude_home.path(), &handle, target_account);
+
+        // Assert: refused with a clear error.
+        assert!(
+            result.is_err(),
+            "repoint_handle_dir MUST refuse a Codex-shape handle dir"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Codex-unique")
+                || err_msg.contains("auth.json")
+                || err_msg.contains("config.toml"),
+            "error must name the Codex-unique item that triggered the refusal: {err_msg}"
+        );
+
+        // Assert: Codex symlinks are intact (the guard refused without
+        // touching anything).
+        assert!(
+            handle.join("auth.json").symlink_metadata().is_ok(),
+            "auth.json symlink must survive the refused repoint"
+        );
+        assert!(
+            handle.join("config.toml").symlink_metadata().is_ok(),
+            "config.toml symlink must survive the refused repoint"
+        );
+    }
+
+    // ── repoint_handle_dir_codex (M10 / journal 0023) ──────────────────
+
+    /// Happy path: repointing a Codex handle dir from slot A → slot B
+    /// rewrites every Codex symlink to the new slot atomically. Mirrors
+    /// the spec 07 §7.2.2 symlink set: `.csq-account`, `auth.json`,
+    /// `config.toml`, `sessions`, `history.jsonl`.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_repoints_codex_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Provision two Codex slots.
+        setup_codex_slot(base, 4);
+        setup_codex_slot(base, 9);
+
+        // Create the handle dir bound to slot 4.
+        let from = AccountNum::try_from(4u16).unwrap();
+        let to = AccountNum::try_from(9u16).unwrap();
+        let handle = create_handle_dir_codex(base, from, 70010).unwrap();
+
+        // Precondition: handle dir is bound to slot 4.
+        assert!(std::fs::read_link(handle.join("auth.json"))
+            .unwrap()
+            .ends_with("credentials/codex-4.json"));
+        assert!(std::fs::read_link(handle.join("config.toml"))
+            .unwrap()
+            .ends_with("config-4/config.toml"));
+
+        // Act: repoint to slot 9.
+        repoint_handle_dir_codex(base, &handle, to).expect("repoint must succeed");
+
+        // Assert: every Codex symlink now points at slot 9.
+        assert!(std::fs::read_link(handle.join(".csq-account"))
+            .unwrap()
+            .ends_with("config-9/.csq-account"));
+        assert!(std::fs::read_link(handle.join("auth.json"))
+            .unwrap()
+            .ends_with("credentials/codex-9.json"));
+        assert!(std::fs::read_link(handle.join("config.toml"))
+            .unwrap()
+            .ends_with("config-9/config.toml"));
+        assert!(std::fs::read_link(handle.join("sessions"))
+            .unwrap()
+            .ends_with("config-9/codex-sessions"));
+        assert!(std::fs::read_link(handle.join("history.jsonl"))
+            .unwrap()
+            .ends_with("config-9/codex-history.jsonl"));
+
+        // No exec-replace happened: the handle dir survives in-place.
+        assert!(
+            handle.exists(),
+            "handle dir must remain after in-flight repoint"
+        );
+        // No tombstone was created (the cross-surface path's signature).
+        let tombstone_count = std::fs::read_dir(base)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".sweep-tombstone-")
+            })
+            .count();
+        assert_eq!(
+            tombstone_count, 0,
+            "same-surface Codex repoint MUST NOT create a sweep tombstone (M10)"
+        );
+    }
+
+    /// Surface guard: a ClaudeCode-shape handle dir (no `auth.json`
+    /// symlink) must be refused with a clear error. Symmetry with the
+    /// existing `repoint_handle_dir_refuses_codex_shape_handle_dir`
+    /// guard for the inverse direction.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_refuses_non_codex_handle_dir() {
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Provision a ClaudeCode slot and target Codex slot.
+        setup_config_dir(base, 1);
+        setup_codex_slot(base, 2);
+
+        // Create a ClaudeCode handle dir.
+        let cc_account = AccountNum::try_from(1u16).unwrap();
+        let codex_account = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, claude_home.path(), cc_account, 70011).unwrap();
+
+        // Precondition: handle dir has NO auth.json (ClaudeCode shape).
+        assert!(handle.join("auth.json").symlink_metadata().is_err());
+
+        // Act: attempt Codex repoint on ClaudeCode handle dir.
+        let result = repoint_handle_dir_codex(base, &handle, codex_account);
+
+        // Assert: refused with a clear error naming the missing marker.
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("auth.json") || reason.contains("Codex-shaped"),
+                    "error must name the missing Codex marker: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for non-Codex handle dir, got: {other:?}"),
+        }
+    }
+
+    /// Refuses non-`term-<pid>` source paths (legacy `config-N` or
+    /// arbitrary dirs). Codex never had a pre-handle-dir layout, so a
+    /// non-`term-` source is always a misuse.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_refuses_non_handle_dir_source() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 5);
+
+        // A `config-N` directory is not a handle dir.
+        let bogus = base.join("config-5");
+        let target = AccountNum::try_from(5u16).unwrap();
+
+        let result = repoint_handle_dir_codex(base, &bogus, target);
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("term-"),
+                    "error must mention the required term-<pid> shape: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for non-handle source, got: {other:?}"),
+        }
+    }
+
+    /// Refuses repointing when the canonical credential file for the
+    /// target slot is missing (login has not completed). Without the
+    /// canonical file, `auth.json` would symlink to a dangling path
+    /// and codex-cli would fail on the next API call.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_refuses_when_canonical_credential_missing() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Source slot 6 fully provisioned.
+        setup_codex_slot(base, 6);
+        // Target slot 7: provision config-7 + .csq-account but DELETE the
+        // canonical credential file.
+        setup_codex_slot(base, 7);
+        std::fs::remove_file(base.join("credentials").join("codex-7.json")).unwrap();
+
+        let from = AccountNum::try_from(6u16).unwrap();
+        let to = AccountNum::try_from(7u16).unwrap();
+        let handle = create_handle_dir_codex(base, from, 70012).unwrap();
+
+        let result = repoint_handle_dir_codex(base, &handle, to);
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("codex-7.json"),
+                    "error must name the missing canonical credential file: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for missing canonical, got: {other:?}"),
+        }
+
+        // Source symlinks must be untouched (refusal happens pre-flight).
+        assert!(std::fs::read_link(handle.join("auth.json"))
+            .unwrap()
+            .ends_with("credentials/codex-6.json"));
+    }
+
+    /// Refuses repointing when the target slot is missing the
+    /// `.csq-account` marker. Without it the daemon's auto-rotate /
+    /// sweep loops cannot identify the account post-swap. Mirrors the
+    /// VP-final F3 guard on the ClaudeCode path.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_refuses_when_target_missing_csq_account() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        setup_codex_slot(base, 11);
+        setup_codex_slot(base, 12);
+        // Strip .csq-account from target slot 12.
+        std::fs::remove_file(base.join("config-12").join(".csq-account")).unwrap();
+
+        let from = AccountNum::try_from(11u16).unwrap();
+        let to = AccountNum::try_from(12u16).unwrap();
+        let handle = create_handle_dir_codex(base, from, 70013).unwrap();
+
+        let result = repoint_handle_dir_codex(base, &handle, to);
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains(".csq-account"),
+                    "error must name the missing marker: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt for missing marker, got: {other:?}"),
+        }
     }
 }

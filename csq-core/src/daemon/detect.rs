@@ -338,6 +338,14 @@ mod tests {
 
     #[test]
     fn detect_missing_pid_file_is_not_running() {
+        // Journal 0021 finding 11: acquire the SHARED env-test mutex
+        // so this test serializes with `paths.rs` tests that also
+        // mutate XDG_RUNTIME_DIR (Linux) / USERNAME (Windows). The
+        // module-local `WINDOWS_ENV_TEST_MUTEX` only protects against
+        // races among the three detect.rs Windows tests; it does not
+        // cover cross-module races.
+        let _shared_env_guard = crate::platform::test_env::lock();
+
         // Windows: hold the env-var mutex for the duration of this
         // test to prevent the other two LOCALAPPDATA-setting tests
         // (`detect_windows_live_pid_but_no_pipe_is_stale`,
@@ -560,6 +568,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn detect_windows_live_pid_but_no_pipe_is_stale() {
+        // Shared cross-module mutex first (journal 0021 finding 11/12).
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _env_guard = WINDOWS_ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -598,6 +608,8 @@ mod tests {
     async fn detect_windows_live_daemon_returns_healthy() {
         use crate::daemon::server_windows;
 
+        // Shared cross-module mutex first (journal 0021 finding 11/12).
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _env_guard = WINDOWS_ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|p| p.into_inner());

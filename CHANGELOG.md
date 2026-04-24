@@ -2,6 +2,28 @@
 
 All notable changes to csq are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbering follows [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-04-25
+
+Minor release on v2.1.1. Two backwards-compatible onboarding improvements reported against fresh WSL installs: `csq status` now shows every configured surface (was Anthropic-only), and `csq install` + `csq run` pre-emptively detect the two failure modes behind `SessionStart:startup hook error` / `node:internal/modules/cjs/loader:1143`.
+
+See `docs/releases/v2.2.0.md` for the full release notes.
+
+### Added
+
+- `csq_core::platform::env_check` — hook-environment preflight module. `run_preflight(claude_home, cwd)` parses both global and project `settings.json` hook blocks, resolves every hook command's script path (with `$CLAUDE_PROJECT_DIR` / `~` expansion), verifies existence, and for `.js` scripts also resolves every `require("./relative")` target against node's standard extension set (`.js`, `.cjs`, `.mjs`, `.json`, `index.js`). Emits `EnvIssue::NodeMissingForHooks`, `::HookScriptMissing`, or `::HookRelativeRequireMissing` with full path context. `detect_linux_flavor()` classifies WSL / Debian / RedHat / Arch / Other from `/proc/version` + `/etc/os-release`; `node_install_hint()` returns the right package-manager one-liner per platform.
+- `csq install` runs the preflight after settings patching. On Linux flavors where csq knows the install command, prompts `[y/N]` before running `sudo apt` / `dnf` / `pacman`. macOS / Windows / unknown flavors print the hint only.
+- `csq run` runs the same preflight at the top of `handle()`, stderr-only and non-blocking — mid-session launches are never stranded.
+- `AccountStatus` gains `source: AccountSource` and `surface: Surface` fields (both with `#[serde(default)]`) so third-party and Codex rows carry enough context for surface-aware rendering.
+- README Troubleshooting entry for the `loader:1143` error string with per-platform fix commands.
+
+### Changed
+
+- `csq-core::quota::status::show_status` now calls `discovery::discover_all` instead of `discover_anthropic`. The daemon's `GET /api/accounts` (via `cached_discovery` in `daemon::server`) makes the same switch, so the daemon-delegated path and the direct path both enumerate every configured surface. Previously both were Anthropic-only.
+- `AccountStatus::format_line` renders a surface tag after the label — `[codex]` for Codex OAuth rows, `[<provider>]` for third-party rows (e.g. `[minimax]`, `[zai]`, `[ollama]`), `[manual]` for manually configured rows. Anthropic OAuth rows render an empty tag so existing `csq status` output is byte-identical for Anthropic-only setups.
+- `AccountStatus::format_line` skips the `5h:— / 7d:—` quota suffix for surfaces csq does not poll (third-party + manual) and renders `(api-key)` instead, so "no polling" is distinguishable from "no data yet".
+
+---
+
 ## [2.1.1] — 2026-04-24
 
 Patch release on v2.1.0 closing two on-disk-artifact migration gaps reported the day after the v2.1.0 cut. No new features, no schema changes, no behavior change for fresh installs.

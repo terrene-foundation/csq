@@ -76,6 +76,13 @@ pub struct ReconcileSummary {
     /// Number of account records that survived the v1→v2 quota migration
     /// (0 if no migration ran).
     pub quota_accounts_migrated: usize,
+    /// Issue #184: number of 3P settings files inspected for the
+    /// legacy `apiKeyHelper` field (`config-N/settings.json` +
+    /// `settings-*.json`).
+    pub api_key_helper_files_seen: usize,
+    /// Issue #184: number of 3P settings files actually rewritten to
+    /// strip the legacy `apiKeyHelper`.
+    pub api_key_helper_files_migrated: usize,
 }
 
 /// Runs the reconciler synchronously. Safe to call before
@@ -89,6 +96,7 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     pass1_codex_credential_mode(base_dir, &mut summary);
     pass2_codex_config_toml(base_dir, &mut summary);
     pass3_quota_v1_to_v2(base_dir, &mut summary);
+    pass4_strip_legacy_api_key_helper(base_dir, &mut summary);
     info!(
         codex_credentials_seen = summary.codex_credentials_seen,
         codex_credentials_repaired = summary.codex_credentials_repaired,
@@ -96,9 +104,23 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
         config_tomls_repaired = summary.config_tomls_repaired,
         quota_migrated = ?summary.quota_migrated,
         quota_accounts_migrated = summary.quota_accounts_migrated,
+        api_key_helper_files_seen = summary.api_key_helper_files_seen,
+        api_key_helper_files_migrated = summary.api_key_helper_files_migrated,
         "startup reconciler complete"
     );
     summary
+}
+
+/// Pass 4 — issue #184: strip the legacy `apiKeyHelper` field from
+/// 3P settings files written by pre-alpha.8 csq.
+///
+/// Idempotent + safe to run on every daemon start. See
+/// `crate::daemon::migrate_legacy_api_key_helper` for the migration
+/// semantics, both-present strip predicate, and unit tests.
+fn pass4_strip_legacy_api_key_helper(base_dir: &Path, summary: &mut ReconcileSummary) {
+    let r = crate::daemon::migrate_legacy_api_key_helper::run(base_dir);
+    summary.api_key_helper_files_seen = r.files_seen;
+    summary.api_key_helper_files_migrated = r.files_migrated;
 }
 
 /// Pass 3 — PR-C6 quota v1→v2 migration.

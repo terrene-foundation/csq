@@ -1,6 +1,8 @@
 //! `csq install` — set up the `~/.claude/accounts` directory and patch settings.
 
 use anyhow::{anyhow, Context, Result};
+use csq_core::platform::env_check::{self, EnvIssue};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 pub fn handle() -> Result<()> {
@@ -89,6 +91,28 @@ pub fn handle() -> Result<()> {
         }
     }
 
+    // Environment preflight: node runtime + configured hook scripts.
+    // Runs AFTER settings patching so a newly-added global statusLine
+    // does not trip the scan, and BEFORE the "installed successfully"
+    // banner so the user sees issues as part of install output.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let issues = env_check::run_preflight(&claude_home, &cwd);
+    if !issues.is_empty() {
+        println!();
+        report_env_issues(&issues);
+        // Consent-gated node install for the first NodeMissing issue.
+        // `csq run` later warns without prompting; install is the one
+        // interactive surface where prompting is appropriate.
+        if issues
+            .iter()
+            .any(|i| matches!(i, EnvIssue::NodeMissingForHooks { .. }))
+        {
+            if let Err(e) = maybe_install_node_with_consent() {
+                eprintln!("  (node install skipped: {e})");
+            }
+        }
+    }
+
     println!();
     println!("csq installed successfully.");
     println!();
@@ -97,6 +121,97 @@ pub fn handle() -> Result<()> {
     println!("  2. Run `csq status` to verify");
     println!("  3. Run `csq run 1` to start a Claude Code session");
 
+    Ok(())
+}
+
+/// Prints a human-readable block for every environment issue detected
+/// by [`env_check::run_preflight`]. Format mirrors `csq doctor` so the
+/// two commands feel consistent.
+fn report_env_issues(issues: &[EnvIssue]) {
+    println!("Environment check:");
+    for issue in issues {
+        match issue {
+            EnvIssue::NodeMissingForHooks { hook_count } => {
+                println!("  ! node / bun not found, but {hook_count} hook command(s) are");
+                println!("    configured. Claude Code will emit");
+                println!("    'SessionStart:startup hook error' on every launch.");
+                println!("    Fix: {}", env_check::node_install_hint());
+            }
+            EnvIssue::HookScriptMissing {
+                script_path,
+                referenced_from,
+            } => {
+                println!("  ! hook script not found: {}", script_path.display());
+                println!("    declared in: {}", referenced_from.display());
+                println!("    Fix: restore the script, or remove the hook from settings.");
+            }
+            EnvIssue::HookRelativeRequireMissing {
+                script_path,
+                missing_sibling,
+            } => {
+                println!(
+                    "  ! hook require fails: {} expects {}",
+                    script_path.display(),
+                    missing_sibling.display()
+                );
+                println!("    This is the node:internal/modules/cjs/loader:1143 error — the");
+                println!("    top-level hook was materialized without its sibling modules.");
+                println!("    Fix: copy the full scripts/hooks/ tree (including lib/).");
+            }
+        }
+    }
+}
+
+/// Detects whether node can be auto-installed via a single package-
+/// manager command and, with user consent, runs it. Called only when
+/// at least one [`EnvIssue::NodeMissingForHooks`] is present.
+///
+/// Never runs sudo silently. Prompts `[y/N]` and skips on any answer
+/// other than `y`/`Y`. Stdin piped from a script that doesn't answer
+/// defaults to "no" because `read_line` returns empty on EOF.
+fn maybe_install_node_with_consent() -> Result<()> {
+    let hint = env_check::node_install_hint();
+    // Only auto-run on platforms where we know the exact command.
+    // For macOS without brew, or Windows, or unknown Linux flavors,
+    // we print the hint and let the user run it themselves.
+    let runnable = hint.starts_with("sudo apt")
+        || hint.starts_with("sudo dnf")
+        || hint.starts_with("sudo pacman");
+    if !runnable {
+        println!(
+            "    Run this command yourself to install node:\n      {}",
+            hint
+        );
+        return Ok(());
+    }
+
+    print!("    Run `{}` now? [y/N]: ", hint);
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    if io::stdin().lock().read_line(&mut answer).is_err() {
+        return Err(anyhow!("could not read stdin"));
+    }
+    let trimmed = answer.trim();
+    if !trimmed.eq_ignore_ascii_case("y") && !trimmed.eq_ignore_ascii_case("yes") {
+        println!("    Skipped. Install manually when ready:\n      {}", hint);
+        return Ok(());
+    }
+
+    // Parse the hint back into argv. Every hint we auto-run starts
+    // with `sudo <pm> install` or `sudo pacman -S` and has a known
+    // shape — a whitespace split is sufficient.
+    let tokens: Vec<&str> = hint.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(anyhow!("empty install hint"));
+    }
+    let status = std::process::Command::new(tokens[0])
+        .args(&tokens[1..])
+        .status()
+        .with_context(|| format!("failed to run {hint}"))?;
+    if !status.success() {
+        return Err(anyhow!("install exited with status {:?}", status.code()));
+    }
+    println!("    ✓ node install completed");
     Ok(())
 }
 

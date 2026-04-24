@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::{discovery, markers, AccountSource};
 use csq_core::broker::fanout::is_broker_failed;
 use csq_core::credentials::{self, file};
+use csq_core::platform::env_check::{self, EnvIssue};
 use csq_core::providers::catalog::Surface;
 use csq_core::providers::codex::surface as codex_surface;
 use csq_core::session;
@@ -25,6 +26,12 @@ pub fn handle(
     rest: &[String],
 ) -> Result<()> {
     let claude_home = super::claude_home()?;
+
+    // Environment preflight — warn (non-blocking) about configured
+    // hooks that will fail after we exec `claude`. Users on fresh WSL
+    // most often hit this via `csq run`, not `csq install`, so we
+    // surface the same signal here without the interactive prompt.
+    run_env_preflight(&claude_home);
 
     // Resolve account number
     let account = resolve_account(base_dir, account)?;
@@ -452,6 +459,46 @@ fn resolve_account(base_dir: &Path, explicit: Option<AccountNum>) -> Result<Opti
             Err(anyhow!(msg))
         }
     }
+}
+
+/// Warn-only environment preflight invoked at the top of `handle`.
+///
+/// Prints to stderr so it shows up during exec without polluting
+/// parseable stdout. Never blocks — users have already decided to
+/// launch; mid-session interactive prompts would strand them.
+fn run_env_preflight(claude_home: &Path) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let issues = env_check::run_preflight(claude_home, &cwd);
+    if issues.is_empty() {
+        return;
+    }
+    eprintln!("csq: environment issues detected before launch:");
+    for issue in &issues {
+        match issue {
+            EnvIssue::NodeMissingForHooks { hook_count } => {
+                eprintln!("  ! node / bun not found, but {hook_count} hook command(s) configured.");
+                eprintln!("    Claude Code will emit 'SessionStart:startup hook error' on launch.");
+                eprintln!("    Fix: {}", env_check::node_install_hint());
+            }
+            EnvIssue::HookScriptMissing { script_path, .. } => {
+                eprintln!("  ! hook script not found: {}", script_path.display());
+            }
+            EnvIssue::HookRelativeRequireMissing {
+                script_path,
+                missing_sibling,
+            } => {
+                eprintln!(
+                    "  ! hook require fails: {} expects {}",
+                    script_path.display(),
+                    missing_sibling.display()
+                );
+                eprintln!(
+                    "    (this is node:internal/modules/cjs/loader:1143 — sibling modules missing)"
+                );
+            }
+        }
+    }
+    eprintln!();
 }
 
 fn exec_claude(rest: &[String]) -> Result<()> {

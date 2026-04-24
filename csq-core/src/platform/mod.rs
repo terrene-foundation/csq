@@ -4,6 +4,7 @@
 //! detection. Each submodule uses `cfg(target_os)` to select the correct
 //! implementation at compile time.
 
+pub mod env_check;
 pub mod fs;
 pub mod lock;
 pub mod process;

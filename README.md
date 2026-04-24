@@ -705,6 +705,15 @@ No VS Code extension or plugin is needed. Install csq once via the regular insta
 
 **Symlinks fail on Windows** -- csq uses directory junctions (`mklink /J`) on Windows, which don't need admin privileges. If junction creation fails, csq falls back to copying.
 
+**`SessionStart:startup hook error` / `node:internal/modules/cjs/loader:1143`** -- Claude Code is trying to execute a hook declared in your project or global `settings.json`, and either (a) Node.js is not installed or (b) the hook script was copied without its sibling `./lib/` modules. `csq install` and `csq run` now preflight both conditions and print the exact fix. Manual checks:
+
+- **WSL / Debian / Ubuntu**: `sudo apt install -y nodejs`
+- **Fedora / RHEL**: `sudo dnf install -y nodejs`
+- **macOS (with Homebrew)**: `brew install node`
+- **Windows**: `winget install OpenJS.NodeJS` or download from <https://nodejs.org>
+
+If node is installed and you still see `loader:1143`, the hook script in your project (commonly `scripts/hooks/session-start.js`) has a `require("./lib/...")` whose target is missing. Restore the full `scripts/hooks/` tree from the project template, or remove the `hooks` block from the offending `settings.json`.
+
 ## Uninstall
 
 ```bash

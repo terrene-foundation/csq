@@ -213,11 +213,15 @@ async fn cached_discovery(
     // Cold path: run discovery on a blocking worker. Concurrent
     // callers may both land here (bounded dogpile); see
     // DISCOVERY_CACHE_MAX_AGE docstring.
+    //
+    // Uses `discover_all` so Codex + third-party (MiniMax/Z.AI/
+    // Ollama) + manual slots are visible to /api/accounts
+    // consumers (statusline, `csq status`, Tauri dashboard). Prior
+    // to this change the route returned Anthropic-only and the
+    // CLI rendered an incomplete view for mixed setups.
     let base_for_task = Arc::clone(&base_dir);
     let accounts =
-        match tokio::task::spawn_blocking(move || discovery::discover_anthropic(&base_for_task))
-            .await
-        {
+        match tokio::task::spawn_blocking(move || discovery::discover_all(&base_for_task)).await {
             Ok(a) => a,
             Err(_join_err) => {
                 // JoinError may include a panic payload — do NOT

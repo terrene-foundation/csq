@@ -1,6 +1,6 @@
-# Provider Integration — csq v2.0
+# Provider Integration — csq v2.1
 
-Quick reference for how csq discovers, authenticates, and polls third-party providers alongside Anthropic accounts.
+Quick reference for how csq discovers, authenticates, and polls Anthropic + Codex + third-party providers across the surface-dispatch architecture.
 
 ## Provider Catalog
 
@@ -130,6 +130,51 @@ CC caches server-side A/B test flags from Anthropic's GrowthBook service in each
 ### Don't try to "fix" loopback
 
 Both csq v1.x and csq v2 had loopback OAuth flows. Both are now dead. Don't reintroduce a loopback callback listener — Anthropic's client_id registration rejects it. Delegate to `claude auth login` or use paste-code.
+
+## Codex Surface (v2.1, journals 0001-0010, 0023)
+
+csq v2.1 added Codex (OpenAI's CLI) as a first-class second surface alongside ClaudeCode. The two surfaces are dispatched via `Surface::ClaudeCode` and `Surface::Codex` enums in `csq-core/src/providers/catalog.rs`. Surface classification is the input to every routing decision (`auto_rotate::find_target`, `csq swap` dispatcher, `daemon::refresher::tick`, `usage_poller::dispatch`). v2.1 auto-rotate is **ClaudeCode-only by design** — `find_target` short-circuits on non-ClaudeCode current account.
+
+### Auth flow: device-auth, not paste-code
+
+Codex uses OAuth device-auth via codex-cli (`codex login --device-auth`), not the Anthropic paste-code flow. csq spawns codex-cli as a subprocess, parses the device code from the scrubbed-line stdout (`is_device_code_shape` matches exactly `XXXX-XXXX`), surfaces it in the desktop UI, and waits for codex-cli to complete. Subprocess hardening (PR-C9a finding 2-7): bounded BufReader (64 KiB), `mpsc::sync_channel(4)`, `child.wait()` BEFORE `.join()` on reader threads, `cancel_codex_login` Tauri command, re-entrancy guard.
+
+### Canonical credential layout
+
+| File                                                         | Purpose                                                               | Mode     |
+| ------------------------------------------------------------ | --------------------------------------------------------------------- | -------- |
+| `credentials/codex-<N>.json`                                 | Canonical credential file (refresh tokens, access token, account_id)  | 0o400 \* |
+| `config-<N>/config.toml`                                     | Codex configuration; MUST contain `cli_auth_credentials_store="file"` | 0o600    |
+| `config-<N>/codex-sessions/`                                 | Per-account persistent session state                                  | 0o700    |
+| `config-<N>/codex-history.jsonl`                             | Per-account command history                                           | 0o600    |
+| `term-<pid>/auth.json` (symlink)                             | Resolves canonical-direct to `credentials/codex-<N>.json`             | symlink  |
+| `term-<pid>/{config.toml,sessions,history.jsonl}` (symlinks) | Resolve to `config-<N>/...`                                           | symlinks |
+
+\* `0o400` between refresh windows (INV-P08); the daemon refresher flips to `0o600` for the write then back to `0o400` under per-account mutex. The startup reconciler's `pass1_codex_credential_mode` repairs any drift from a SIGKILL mid-flip.
+
+`auth.json` symlinks **canonical-direct** (NOT through `config-<N>`) per spec 07 §7.2.2. The other items symlink through `config-<N>`. This asymmetry matters for `csq swap` Codex→Codex: the rename loop in `repoint_handle_dir_codex` MUST rewrite `auth.json` BEFORE `.csq-account` so a mid-loop failure cannot leave the marker pointing at slot N+1 while the credential still resolves to slot N (M-CDX-1, journal 0024).
+
+### Same-surface Codex swap is in-flight (M10, journal 0023)
+
+`csq swap` Codex→Codex routes through `same_surface_codex` → `repoint_handle_dir_codex`, mirroring the ClaudeCode in-flight repoint. UNIX open-after-rename keeps in-flight session fds valid until close; codex-cli re-stats `auth.json` before each API call so the next request authenticates as the new slot. Pre-PR-C9a behavior was to take the cross-surface `exec`-replace path, silently dropping the conversation — that's the M10 bug fixed in v2.1.0.
+
+The dispatcher routing matrix is unit-tested via the extracted `route(src, tgt) -> RouteKind` helper (`csq-cli/src/commands/swap.rs`, L-CDX-3). Any future refactor that re-routes `(Codex, Codex)` through `cross_surface_exec` fails `route_codex_to_codex_is_same_surface_codex` at `cargo test` time.
+
+### Usage polling: `wham/usage`, not `/api/oauth/usage`
+
+Codex usage lives at `https://chatgpt.com/backend-api/wham/usage` (NOT Anthropic's `/api/oauth/usage`). Live schema captured in journal 0010: two-window rate-limit (5h primary + 7d secondary, parallel to Anthropic's structure); `used_percent` is `0-100`, NOT `0-1` (same gotcha as Anthropic). PII at the top level (`user_id`, `account_id`, `email`) requires redaction before any logging or fixture capture.
+
+`usage_poller/codex.rs` writes raw bodies to `accounts/codex-wham-raw.json` (0o600, redactor-first) for forensic drift detection. Circuit breaker: 5 consecutive failures → 15min initial backoff → 80min cap.
+
+### Transport: Node.js subprocess (journal 0007)
+
+Same Cloudflare TLS-fingerprint issue as Anthropic — reqwest/rustls is JA3/JA4-blocked. Codex endpoints route through the existing Node.js subprocess transport pattern from journal 0056. Reuses `csq-core/src/http/` handlers with Codex-specific endpoint URLs.
+
+### Cross-surface swap
+
+`csq swap` between ClaudeCode ↔ Codex slots takes the `cross_surface_exec` path: INV-P05 confirm prompt (`--yes` bypasses) → INV-P10 atomic rename of source handle dir to `.sweep-tombstone-swap-<pid>-<nanos>` (preserves open fds for the running surface; daemon sweep reaps the tombstone on next tick) → `exec` the target binary. Conversation does not transfer.
+
+Windows: `cross_surface_exec` is `#[cfg(unix)]` (uses `std::os::unix::process::CommandExt`). Cross-surface swap on Windows is not supported in v2.1.
 
 ## Settings File Structure
 

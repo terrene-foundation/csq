@@ -1,18 +1,37 @@
-# Daemon Architecture — csq v2.0
+# Daemon Architecture — csq v2.1
 
 Quick reference for the background daemon's subsystem design, invariants, and security model.
 
 ## Subsystem Overview
 
-| Subsystem        | File                               | Interval   | Output                                                  |
-| ---------------- | ---------------------------------- | ---------- | ------------------------------------------------------- |
-| Token refresher  | `daemon/refresher.rs`              | 5 min      | `RefreshStatus` cache + credential files                |
-| Anthropic poller | `daemon/usage_poller.rs` tick()    | 5 min      | `quota.json`                                            |
-| 3P poller        | `daemon/usage_poller.rs` tick_3p() | 15 min     | `quota.json` (with `RateLimitData`)                     |
-| Auto-rotator     | `daemon/auto_rotate.rs`            | 30s        | Atomic swap via `rotation::swap_to`                     |
-| Handle-dir sweep | `session/handle_dir.rs`            | 60s        | Removes orphan `term-*` dirs + preserves `image-cache/` |
-| Update check     | `update::auto_update_bg`           | 24h cache  | Stderr notice on new release                            |
-| HTTP server      | `daemon/server.rs`                 | on-request | JSON over Unix socket                                   |
+| Subsystem          | File                               | Interval   | Output                                                  |
+| ------------------ | ---------------------------------- | ---------- | ------------------------------------------------------- |
+| Startup reconciler | `daemon/startup_reconciler.rs`     | once       | Pass1-4: clamps invariants before any subsystem starts  |
+| Token refresher    | `daemon/refresher.rs`              | 5 min      | `RefreshStatus` cache + credential files (per-surface)  |
+| Anthropic poller   | `daemon/usage_poller.rs` tick()    | 5 min      | `quota.json` (schema_v2)                                |
+| Codex poller       | `daemon/usage_poller/codex.rs`     | 5 min      | `quota.json` + `codex-wham-raw.json` forensic capture   |
+| 3P poller          | `daemon/usage_poller.rs` tick_3p() | 15 min     | `quota.json` (with `RateLimitData`)                     |
+| Auto-rotator       | `daemon/auto_rotate.rs`            | 30s        | ClaudeCode-only (INV-P11); refuses Codex handle dirs    |
+| Handle-dir sweep   | `session/handle_dir.rs`            | 60s        | Removes orphan `term-*` dirs + preserves `image-cache/` |
+| Update check       | `update::auto_update_bg`           | 24h cache  | Stderr notice on new release                            |
+| HTTP server        | `daemon/server.rs`                 | on-request | JSON over Unix socket                                   |
+
+## Startup Reconciler (PR-C4 + later)
+
+`run_reconciler(base_dir)` runs synchronously before any subsystem starts and clamps invariants the running daemon later relies on. Four passes:
+
+| Pass | Function                            | Scope | What it does                                                                                  |
+| ---- | ----------------------------------- | ----- | --------------------------------------------------------------------------------------------- |
+| 1    | `pass1_codex_credential_mode`       | Codex | Flips `credentials/codex-<N>.json` from 0o600 back to 0o400 (INV-P08; per-account mutex)      |
+| 2    | `pass2_codex_config_toml`           | Codex | Rewrites `config-<N>/config.toml` if `cli_auth_credentials_store = "file"` is missing/drifted |
+| 3    | `pass3_quota_v1_to_v2`              | Quota | Idempotent schema v1 → v2 migration of `quota.json` (PR-C6, ships with v2.1)                  |
+| 4    | `pass4_strip_legacy_api_key_helper` | 3P    | Issue #184: strips legacy `apiKeyHelper` from `config-N/settings.json` + `settings-*.json`    |
+
+Outcome counters surface via `ReconcileSummary` (asserted in unit tests; logged at INFO on completion).
+
+**Pass-4 strip predicate is unambiguous-bug:** rewrites only when BOTH `apiKeyHelper` AND `env.ANTHROPIC_AUTH_TOKEN` are present (csq itself never wrote any other shape; user-authored helper scripts at the same key without an env token are preserved). Atomic via `unique_tmp_path` + `secure_file` (clamps to 0o600) + `atomic_replace`. Per `security.md` §5a, every failure branch removes the umask-default tmp file before propagating the error so a partial migration never leaves a token-bearing file at world-readable perms. Mtime is preserved on no-op so CC's mtime-driven re-stat (spec 01 §1.4) doesn't fire for nothing.
+
+The reconciler is the canonical home for **on-disk artifact migrations**. New migrations should land as additional `passN` functions following the same shape: idempotent, mtime-preserving on no-op, structured-logged with `error_kind = "migrate_*"` per file rewrite, retire after a 3-month telemetry window confirms zero hits.
 
 **Removed 2026-04-11** (see journal 0020): `daemon/oauth_callback.rs` was a TCP listener on `127.0.0.1:8420` serving `/oauth/callback` for the v1 loopback OAuth flow. Anthropic retired loopback for this client_id — the module and its ~1000 LOC are gone. OAuth now uses the paste-code flow via `/api/login/{N}` + `POST /api/oauth/exchange` on the Unix socket.
 
@@ -84,13 +103,13 @@ Anthropic accounts (IDs 1-999) and 3P accounts (synthetic IDs 901, 902) use **se
 
 Every network-touching function takes an injectable closure for testability:
 
-| Function               | Closure type                                          | Production impl (Anthropic)    | Production impl (3P)           |
-| ---------------------- | ----------------------------------------------------- | ------------------------------ | ------------------------------ |
-| `refresh_token`        | `HttpPostFn`                                          | `http::post_json_node`         | n/a                            |
-| `poll_anthropic_usage` | `HttpGetFn`                                           | `http::get_bearer_node`        | n/a                            |
-| `poll_3p_usage`        | `HttpPostProbeFn`                                     | n/a                            | `http::post_json_with_headers` |
-| `exchange_code`        | `FnOnce(url, body) -> Result<Vec<u8>>`                | `http::post_json_node`         | n/a                            |
-| `validate_key`         | `FnOnce(url, headers, body) -> Result<(u16, String)>` | n/a                            | `http::post_json_probe`        |
+| Function               | Closure type                                          | Production impl (Anthropic) | Production impl (3P)           |
+| ---------------------- | ----------------------------------------------------- | --------------------------- | ------------------------------ |
+| `refresh_token`        | `HttpPostFn`                                          | `http::post_json_node`      | n/a                            |
+| `poll_anthropic_usage` | `HttpGetFn`                                           | `http::get_bearer_node`     | n/a                            |
+| `poll_3p_usage`        | `HttpPostProbeFn`                                     | n/a                         | `http::post_json_with_headers` |
+| `exchange_code`        | `FnOnce(url, body) -> Result<Vec<u8>>`                | `http::post_json_node`      | n/a                            |
+| `validate_key`         | `FnOnce(url, headers, body) -> Result<(u16, String)>` | n/a                         | `http::post_json_probe`        |
 
 **Anthropic endpoints use Node.js subprocess transport** (journal 0056). Cloudflare JA3/JA4 TLS fingerprinting blocks `reqwest`/`rustls`. The `_node` functions shell out to `node`, piping request bodies via stdin. 3P endpoints use `reqwest` — they don't have Cloudflare's fingerprinting.
 

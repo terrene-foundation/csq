@@ -2,6 +2,24 @@
 
 All notable changes to csq are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbering follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] — 2026-04-24
+
+Patch release on v2.1.0 closing two on-disk-artifact migration gaps reported the day after the v2.1.0 cut. No new features, no schema changes, no behavior change for fresh installs.
+
+See `docs/releases/v2.1.1.md` for the full release notes.
+
+### Fixed
+
+- **#184** — daemon-startup migration to strip legacy `apiKeyHelper` from 3P settings written by pre-alpha.8 csq. The field was the provider's `system_primer` string serialized into a key CC interprets as a shell command; affected slots emitted `apiKeyHelper failed: exited 127` plus an auth-conflict warning on every CC launch. The write paths were hardened in alpha.8 but on-disk artifacts on upgraded machines were never cleaned up. New `pass4` in the daemon's startup reconciler walks `<base_dir>/config-<N>/settings.json` and `<base_dir>/settings-*.json` and strips `apiKeyHelper` only when both `apiKeyHelper` AND `env.ANTHROPIC_AUTH_TOKEN` are present (the unambiguous legacy-bug signature; user-authored helper scripts alone are preserved). Atomic + 0o600 + idempotent + mtime-preserving on no-op.
+- **#185** — `csq install` now walks per-terminal handle dirs at `~/.claude/accounts/term-*/settings.json` alongside the existing `config-<N>/settings.json` walk. Pre-install terminals carrying the stale `bash ~/.claude/accounts/statusline-quota.sh` wrapper no longer silently lose their statusline when `cleanup_v1_artifacts` renames the wrapper to `.bak`. Install summary line now reports both per-slot and per-handle migrations on separate lines.
+
+### Changed
+
+- `ReconcileSummary` gains two counter fields (`api_key_helper_files_seen`, `api_key_helper_files_migrated`) for telemetry / `csq doctor`.
+- `csq install` extracts the per-file statusline-strip work into a shared `strip_legacy_statusline_from_file` helper used by both `migrate_per_slot_statuslines` and the new `migrate_handle_dir_statuslines`.
+
+---
+
 ## [2.1.0] — 2026-04-23
 
 Codex as a first-class second surface alongside ClaudeCode: device-auth login, central token refresh, live `wham/usage` polling, in-flight `csq swap` between Codex slots, cross-surface swap with confirm-prompt + clean handover, and a desktop UI with Terms-of-Service disclosure. Quota schema writer flips v1 → v2; v2.0.1 dual-read keeps downgrade compatible.
@@ -130,3 +148,4 @@ Initial multi-provider session manager for Claude Code. Bash + Python implementa
 [1.0.0]: https://github.com/terrene-foundation/csq/releases/tag/v1.0.0
 [2.0.1]: https://github.com/terrene-foundation/csq/releases/tag/v2.0.1
 [2.1.0]: https://github.com/terrene-foundation/csq/releases/tag/v2.1.0
+[2.1.1]: https://github.com/terrene-foundation/csq/releases/tag/v2.1.1

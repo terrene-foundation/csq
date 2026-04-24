@@ -27,6 +27,7 @@ pub mod client;
 pub mod client_windows;
 pub mod detect;
 pub mod lifecycle;
+pub mod migrate_legacy_api_key_helper;
 pub mod paths;
 pub mod pid;
 pub mod refresher;

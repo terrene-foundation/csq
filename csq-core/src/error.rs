@@ -107,7 +107,15 @@ const KNOWN_TOKEN_PREFIXES: &[&str] = &["sk-ant-oat01-", "sk-ant-ort01-"];
 /// - `rt_*` (≥20 body) — Codex refresh tokens. Observed in live
 ///   `~/.codex/auth.json` post PR-C00 re-login (journal 0010): 90-char
 ///   total length, `rt_` prefix + 87-char base64url body.
-const TOKEN_PREFIXES_WITH_BODY: &[(&str, usize)] = &[("sk-", 20), ("sess-", 20), ("rt_", 20)];
+///
+/// - `AIza*` (≥30 body) — Google AI Studio API keys. Observed shape is
+///   `AIza` + 35 base64url body chars (39 total). The 30-char floor
+///   distinguishes a real key from short test fixtures while still
+///   matching legitimate keys; Google's documented format does not vary
+///   the length so a tighter floor is safe. Added by PR-G2a per the
+///   security-reviewer hook-error-leakage inventory (§5).
+const TOKEN_PREFIXES_WITH_BODY: &[(&str, usize)] =
+    &[("sk-", 20), ("sess-", 20), ("rt_", 20), ("AIza", 30)];
 
 /// Minimum length of each JWT segment's body after its header prefix.
 ///
@@ -153,6 +161,16 @@ const JWT_SEGMENT_MIN_BODY: usize = 17;
 pub fn redact_tokens(s: &str) -> String {
     // Minimum length of a bare hex run treated as a secret.
     const HEX_MIN_LEN: usize = 32;
+
+    // Pre-process: collapse any PEM block to `[REDACTED]` BEFORE the
+    // per-char scan. PEM blocks span multiple lines; the per-char loop
+    // below cannot detect them in one pass without significant rework.
+    // Vertex SA JSON contains a `private_key` field whose value is a
+    // PEM block; logging that field with `format!("{e}")` would leak
+    // the private key end-to-end. Added by PR-G2a per security-reviewer
+    // §5 ("Vertex SA path" row).
+    let pem_stripped = redact_pem_blocks(s);
+    let s = pem_stripped.as_str();
 
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len();
@@ -299,6 +317,65 @@ pub fn redact_tokens(s: &str) -> String {
         i += 1;
     }
 
+    out
+}
+
+/// Replaces every `-----BEGIN <tag>-----...-----END <tag>-----` block
+/// in `s` with `[REDACTED]`. Multi-line aware. The opening and closing
+/// dash-strings are NOT redacted on their own — they are common in
+/// non-secret contexts (markdown headings, ASCII art) — only the full
+/// block with both markers triggers redaction.
+///
+/// Intentionally permissive on the tag (we accept any `-----BEGIN X-----`
+/// for any reasonable X) because PEM types proliferate (`PRIVATE KEY`,
+/// `RSA PRIVATE KEY`, `EC PRIVATE KEY`, `OPENSSH PRIVATE KEY`,
+/// `CERTIFICATE`, etc.) and the failure mode is leaking a key, not
+/// leaking a certificate.
+///
+/// Called from [`redact_tokens`] as a pre-processing step. Public so
+/// the test module can exercise it directly.
+pub fn redact_pem_blocks(s: &str) -> String {
+    const BEGIN_MARKER: &str = "-----BEGIN ";
+    const END_MARKER: &str = "-----END ";
+    if !s.contains(BEGIN_MARKER) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0;
+    while cursor < s.len() {
+        let rest = &s[cursor..];
+        let begin_idx = match rest.find(BEGIN_MARKER) {
+            Some(i) => i,
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        // Emit text before the BEGIN marker as-is.
+        out.push_str(&rest[..begin_idx]);
+        let after_begin = &rest[begin_idx..];
+        // Find the matching END marker after the BEGIN. We accept any
+        // line ending after the END tag's `-----`.
+        let end_idx = match after_begin.find(END_MARKER) {
+            Some(i) => i,
+            None => {
+                // Unterminated PEM block. Redact the rest defensively
+                // — half a private key is still half too much in a log.
+                out.push_str("[REDACTED]");
+                break;
+            }
+        };
+        // Advance past the END marker AND the closing `-----` and the
+        // line break (if any) so the trailing dashes don't leak.
+        let after_end = &after_begin[end_idx + END_MARKER.len()..];
+        let close_dash_idx = after_end.find("-----");
+        let consumed_after_end = match close_dash_idx {
+            Some(i) => i + 5, // length of "-----"
+            None => after_end.len(),
+        };
+        out.push_str("[REDACTED]");
+        cursor += begin_idx + end_idx + END_MARKER.len() + consumed_after_end;
+    }
     out
 }
 
@@ -725,6 +802,95 @@ mod tests {
     fn redact_tokens_short_rt_not_redacted() {
         let input = "rt_queue_size value exceeded";
         let output = redact_tokens(input);
+        assert_eq!(output, input);
+    }
+
+    /// PR-G2a: Google AI Studio API keys (`AIza` + 35 chars).
+    #[test]
+    fn redact_tokens_google_aiza_key() {
+        // Google's documented key shape: AIza + 35 base64url chars.
+        let input = "x-goog-api-key: AIzaSyTESTKEY1234567890_abcdefgh-IJKLM";
+        let output = redact_tokens(input);
+        assert_eq!(output, "x-goog-api-key: [REDACTED]");
+    }
+
+    /// PR-G2a: short `AIza` strings (under the 30-char body floor)
+    /// must NOT be redacted — they are not real keys and matching
+    /// them would create false positives in error fixtures and test
+    /// data that uses the prefix illustratively.
+    #[test]
+    fn redact_tokens_short_aiza_not_redacted() {
+        let input = "see also AIzaShortNotReal";
+        let output = redact_tokens(input);
+        assert_eq!(output, input);
+    }
+
+    /// PR-G2a: `AIza` mid-word must NOT trigger redaction (word
+    /// boundary guard from the existing redactor design).
+    #[test]
+    fn redact_tokens_aiza_mid_word_not_redacted() {
+        let input = "module_AIza_internal_helper_name_long_enough";
+        let output = redact_tokens(input);
+        assert_eq!(output, input);
+    }
+
+    /// PR-G2a: PEM block (Vertex SA JSON private_key field). One of
+    /// the worst leak modes — a stack-trace `format!("{e}")` near a
+    /// JSON parse error containing a PEM block would otherwise dump
+    /// the entire signing key. Multi-line aware.
+    #[test]
+    fn redact_tokens_pem_private_key_block() {
+        let input = "parse error: \"private_key\": \"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEF\nAASCBKcwggSjAgEAAoIBAQ\n-----END PRIVATE KEY-----\\n\"";
+        let output = redact_tokens(input);
+        assert!(
+            output.contains("[REDACTED]"),
+            "PEM block must be redacted: {output}"
+        );
+        assert!(
+            !output.contains("MIIEvQIBADANBgkqhkiG"),
+            "key body must not appear in output: {output}"
+        );
+        assert!(
+            !output.contains("-----BEGIN"),
+            "BEGIN marker must not survive: {output}"
+        );
+    }
+
+    /// PR-G2a: PEM with the `RSA PRIVATE KEY` tag (legacy format)
+    /// must also redact. Permissive tag matching catches every PEM
+    /// type without enumerating them.
+    #[test]
+    fn redact_tokens_pem_rsa_private_key_block() {
+        let input = "key: -----BEGIN RSA PRIVATE KEY-----\nABCDEF\n-----END RSA PRIVATE KEY-----";
+        let output = redact_tokens(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("ABCDEF"));
+    }
+
+    /// PR-G2a: an unterminated PEM block — defensive redaction. We
+    /// would rather over-redact a malformed log line than leak half
+    /// a key.
+    #[test]
+    fn redact_tokens_pem_unterminated_block_redacted() {
+        let input = "leaked: -----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n[truncated]";
+        let output = redact_tokens(input);
+        assert!(!output.contains("MIIEvQ"));
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    /// PR-G2a: text containing "-----BEGIN" without a PAIRED PEM
+    /// shape (no END marker AND no tag) should not be aggressively
+    /// redacted. This documents the chosen behaviour: presence of
+    /// `-----BEGIN ` + space implies an attempted PEM, so we redact;
+    /// presence of `------BEGIN` (six dashes) or `-----BEGIN-` (no
+    /// space) does not.
+    #[test]
+    fn redact_tokens_text_without_pem_shape_passes_through() {
+        let input = "section -----BEGINNING----- of file";
+        let output = redact_tokens(input);
+        // The "-----BEGINNING-----" string has no following space
+        // after BEGIN, so the BEGIN_MARKER `"-----BEGIN "` does NOT
+        // match. Expect pass-through.
         assert_eq!(output, input);
     }
 

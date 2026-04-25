@@ -8,6 +8,7 @@ pub mod env_check;
 pub mod fs;
 pub mod lock;
 pub mod process;
+pub mod secret;
 #[cfg(test)]
 pub mod test_env;
 

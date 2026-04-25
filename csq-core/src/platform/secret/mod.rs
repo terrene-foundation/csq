@@ -1,0 +1,365 @@
+//! Encryption-at-rest primitive for Gemini API keys (PR-G2a).
+//!
+//! Gemini differs from Anthropic / Codex in two ways that matter for
+//! credential handling:
+//!
+//! 1. **No OAuth lifecycle.** AI Studio API keys (`AIza*`) are
+//!    long-lived, never auto-rotated, and revoked only by the user
+//!    visiting `aistudio.google.com/apikey`. A quietly stolen key
+//!    exfiltrates Gemini quota for weeks before the user notices the
+//!    bill. There is no server-side `invalid_grant` backstop the way
+//!    Anthropic refresh tokens have.
+//! 2. **Vertex SA JSON** is signing material against the customer's
+//!    GCP project — far worse than an API key if leaked.
+//!
+//! csq's existing same-user threat model is INADEQUATE here. This
+//! module raises the bar: secrets at rest are protected by the
+//! platform's native keychain when present, and refuse-to-operate
+//! when not (with explicit `CSQ_SECRET_BACKEND=file` opt-in for
+//! headless / WSL deployments).
+//!
+//! # Design source
+//!
+//! - `workspaces/gemini/02-plans/01-implementation-plan.md` PR-G2a
+//! - rust-desktop-specialist + security-reviewer joint design (this
+//!   session) reconciled where they conflicted in favor of the
+//!   security-reviewer's tighter posture on auto-fallback
+//! - `.claude/rules/security.md` §1, §2, §5 (no secrets in logs,
+//!   atomic writes, fail-closed on backend hangs)
+//!
+//! # Sole ownership
+//!
+//! This module is sole-owned by Gemini per H8 in the plan — Codex
+//! does NOT use it. Codex's auth artefact is a `CodexCredentialFile`
+//! written via the existing `credentials/file.rs` + `secure_file`
+//! pipeline. Adding `platform::secret` to Codex would change Codex's
+//! threat model retroactively and is explicitly out of scope.
+
+use crate::types::AccountNum;
+use secrecy::SecretString;
+use std::time::Duration;
+
+pub mod audit;
+pub mod in_memory;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+/// Maximum time any single backend operation may block. The vault is
+/// called from the daemon hot path (usage poller, spawn pre-flight)
+/// and a hung D-Bus / locked-keychain prompt MUST NOT pin those
+/// callers. Hard timeout at the trait boundary; backends are
+/// responsible for honouring it.
+pub const VAULT_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Logical identifier for a stored secret. csq is multi-account +
+/// multi-surface; the (surface, account) pair is the addressable
+/// unit. `surface` is a `&'static str` rather than the [`Surface`]
+/// enum so PR-G2a can land before PR-G1 ships the enum variant —
+/// PR-G2a uses a const placeholder `"gemini"`, PR-G2b flips to
+/// `Surface::as_str()`.
+///
+/// [`Surface`]: crate::providers::catalog::Surface
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotKey {
+    /// Surface tag — currently always `"gemini"` until PR-G2b wires
+    /// the [`Surface`] enum through.
+    pub surface: &'static str,
+    /// Account slot (1..MAX_ACCOUNTS). The newtype already validates
+    /// the range so backends can format it into native key names
+    /// without further checks.
+    pub account: AccountNum,
+}
+
+impl SlotKey {
+    /// Renders the canonical native-keychain key string. macOS
+    /// keychain `service` field, Linux Secret Service `attribute`,
+    /// Windows Credential Manager `target_name` — same string on
+    /// every platform so a future migration tool can correlate.
+    ///
+    /// Format: `csq.<surface>.<account>` — e.g. `csq.gemini.3`. The
+    /// `csq.` prefix namespaces against unrelated keychain entries.
+    pub fn native_name(&self) -> String {
+        format!("csq.{}.{}", self.surface, self.account.get())
+    }
+}
+
+/// Errors raised by [`Vault`] operations. Every variant maps to a
+/// user-actionable IPC string via [`From<SecretError> for String`] —
+/// per `rules/tauri-commands.md` §6, no opaque "secret error" tag is
+/// acceptable. Reason fields are caller-supplied descriptive
+/// strings, NOT upstream API bodies, so they do not pose a
+/// token-leakage risk; the redactor is still defence-in-depth.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    /// No secret stored for the given slot. Distinct from
+    /// `BackendUnavailable` so the UI can prompt provisioning rather
+    /// than show a backend warning.
+    #[error("no secret stored for {surface} slot {account}")]
+    NotFound { surface: &'static str, account: u16 },
+    /// The backend refused the operation explicitly (macOS user
+    /// clicked "Deny" on the keychain prompt; Linux Secret Service
+    /// access policy denied). Distinct from `Locked` so the UI text
+    /// can prompt the right remediation.
+    #[error("permission denied by secret backend: {reason}")]
+    PermissionDenied { reason: String },
+    /// Backend is reachable but the underlying store is locked
+    /// (macOS login keychain not yet unlocked; Linux Secret Service
+    /// collection auto-locked on screensaver). Caller may retry with
+    /// backoff; csq daemon MUST NOT prompt for keychain unlock from
+    /// background contexts (phishing-grade prompt).
+    #[error("secret backend is locked")]
+    Locked,
+    /// macOS first-write requires user authorization (keychain
+    /// prompt). Distinct from `PermissionDenied` because the user
+    /// has not yet been asked — UI should prompt them to interact
+    /// with the OS dialog.
+    #[error("backend requires user authorization to proceed")]
+    AuthorizationRequired,
+    /// Native backend is not present on the host (Linux without
+    /// Secret Service AND `CSQ_SECRET_BACKEND` not set to `file`;
+    /// Windows daemon running as `LocalSystem` / DPAPI unavailable).
+    /// Refuse-to-operate posture per security review §3.
+    #[error("secret backend unavailable: {reason}")]
+    BackendUnavailable { reason: String },
+    /// AEAD encryption failed — almost always indicates a logic bug
+    /// (nonce reuse, key derivation failure). Distinct from I/O so
+    /// the audit log entry classifies it differently.
+    #[error("encryption failed: {reason}")]
+    EncryptionFailed { reason: String },
+    /// AEAD authentication tag mismatch on read — ciphertext was
+    /// corrupted, the wrong passphrase was used, or the key
+    /// derivation salt was tampered with. Caller MUST treat the
+    /// stored secret as unrecoverable and prompt re-provisioning.
+    #[error("decryption failed — stored secret is unrecoverable")]
+    DecryptionFailed,
+    /// Caller-supplied secret is rejected (empty, too long, fails
+    /// shape validation done by the backend layer).
+    #[error("invalid secret format: {reason}")]
+    InvalidKey { reason: String },
+    /// Backend exceeded [`VAULT_OP_TIMEOUT`]. Treated as transient
+    /// by callers — usage poller backs off, spawn refuses with
+    /// retry-after.
+    #[error("secret backend operation timed out")]
+    Timeout,
+    /// Underlying I/O failure (file backend disk full, audit log
+    /// write failure). The path is included so the user can
+    /// diagnose; never includes the secret content.
+    #[error("secret store I/O error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl SecretError {
+    /// Fixed-vocabulary tag for structured logging — per
+    /// `security.md` §2 every `warn!`/`error!` call near vault
+    /// operations MUST use a tag, not `%e` formatting.
+    pub fn error_kind_tag(&self) -> &'static str {
+        match self {
+            SecretError::NotFound { .. } => "vault_not_found",
+            SecretError::PermissionDenied { .. } => "vault_permission_denied",
+            SecretError::Locked => "vault_locked",
+            SecretError::AuthorizationRequired => "vault_authorization_required",
+            SecretError::BackendUnavailable { .. } => "vault_backend_unavailable",
+            SecretError::EncryptionFailed { .. } => "vault_encryption_failed",
+            SecretError::DecryptionFailed => "vault_decryption_failed",
+            SecretError::InvalidKey { .. } => "vault_invalid_key",
+            SecretError::Timeout => "vault_timeout",
+            SecretError::Io { .. } => "vault_io_error",
+        }
+    }
+}
+
+/// Encryption-at-rest primitive for per-slot secrets.
+///
+/// All methods MUST honour [`VAULT_OP_TIMEOUT`]. All methods that
+/// surface secret material do so as [`SecretString`] so the value
+/// cannot accidentally appear in `Debug` / `Display` / `Serialize`
+/// output. Implementors MUST NOT cache decrypted material across
+/// calls — each `get` re-reads from the backing store.
+pub trait Vault: Send + Sync {
+    /// Stores `secret` at `slot`, overwriting any existing value.
+    /// Atomic on every backend — partial writes are not observable
+    /// to a concurrent reader.
+    fn set(&self, slot: SlotKey, secret: &SecretString) -> Result<(), SecretError>;
+
+    /// Reads the secret at `slot`, returning a fresh
+    /// [`SecretString`]. The returned value is the caller's to drop;
+    /// implementors do NOT retain a reference. Returns
+    /// [`SecretError::NotFound`] if no secret was previously stored.
+    fn get(&self, slot: SlotKey) -> Result<SecretString, SecretError>;
+
+    /// Removes the secret at `slot`. Idempotent: deleting a
+    /// non-existent slot returns `Ok(())`, not `NotFound`. The
+    /// distinction matters for cleanup paths that want to drop a
+    /// slot without first checking existence.
+    fn delete(&self, slot: SlotKey) -> Result<(), SecretError>;
+
+    /// Enumerates the account numbers that have a secret stored
+    /// under the given `surface`. Returns account numbers only —
+    /// never returns secret material or any function of it (length,
+    /// prefix, hash). The audit-log signature requires this tight
+    /// invariant.
+    fn list_slots(&self, surface: &'static str) -> Result<Vec<AccountNum>, SecretError>;
+
+    /// Backend identifier for audit logging and `csq doctor`
+    /// diagnostics. e.g. `"macos-keychain"`, `"linux-file-aes"`,
+    /// `"in-memory"`. NOT exposed via Tauri IPC — diagnostic only.
+    fn backend_id(&self) -> &'static str;
+}
+
+/// Selects the right [`Vault`] implementation for the current
+/// platform. Returns `BackendUnavailable` when the native primitive
+/// is absent and the user has not opted into the file fallback via
+/// `CSQ_SECRET_BACKEND=file`. Refuse-to-operate is the default per
+/// security review §3 — silent fallback is BLOCKED.
+///
+/// Backend selection precedence:
+///
+/// 1. `CSQ_SECRET_BACKEND` env var (when set to `keychain` or
+///    `file`) — explicit override for testing and headless deploys.
+/// 2. Compile-time platform default (macOS Keychain, Linux Secret
+///    Service, Windows DPAPI).
+/// 3. Refuse with `BackendUnavailable` if the platform default is
+///    unreachable and no override is set.
+pub fn open_default_vault() -> Result<Box<dyn Vault>, SecretError> {
+    let override_kind = std::env::var("CSQ_SECRET_BACKEND").ok();
+    match override_kind.as_deref() {
+        Some("file") => Err(SecretError::BackendUnavailable {
+            reason: "file backend not yet implemented (PR-G2a.2)".into(),
+        }),
+        Some("in-memory") if cfg!(any(test, feature = "secret-in-memory")) => {
+            Ok(Box::new(in_memory::InMemoryVault::new()))
+        }
+        Some(other) if other != "auto" && other != "keychain" => {
+            Err(SecretError::BackendUnavailable {
+                reason: format!("unknown CSQ_SECRET_BACKEND value: {other}"),
+            })
+        }
+        _ => open_native_default(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_native_default() -> Result<Box<dyn Vault>, SecretError> {
+    Ok(Box::new(macos::MacosKeychainVault::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn open_native_default() -> Result<Box<dyn Vault>, SecretError> {
+    // PR-G2a ships the trait + macOS backend. Linux Secret Service
+    // and the explicit file fallback land in PR-G2a.2 — see plan §M3
+    // for the split rationale (separate security review per backend).
+    Err(SecretError::BackendUnavailable {
+        reason: "Linux Secret Service backend lands in PR-G2a.2; \
+                 set CSQ_SECRET_BACKEND=file when the file backend ships"
+            .into(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn open_native_default() -> Result<Box<dyn Vault>, SecretError> {
+    // PR-G2a ships the trait + macOS backend. Windows DPAPI /
+    // Credential Manager lands in PR-G2a.3.
+    Err(SecretError::BackendUnavailable {
+        reason: "Windows Credential Manager backend lands in PR-G2a.3".into(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(n: u16) -> SlotKey {
+        SlotKey {
+            surface: "gemini",
+            account: AccountNum::try_from(n).unwrap(),
+        }
+    }
+
+    #[test]
+    fn slot_key_native_name_format() {
+        assert_eq!(slot(3).native_name(), "csq.gemini.3");
+        assert_eq!(slot(999).native_name(), "csq.gemini.999");
+    }
+
+    #[test]
+    fn error_kind_tag_distinct_per_variant() {
+        // Tags must be unique so log queries can disambiguate. This
+        // catches accidental tag duplication when adding new
+        // variants.
+        let tags = [
+            SecretError::NotFound {
+                surface: "gemini",
+                account: 1,
+            }
+            .error_kind_tag(),
+            SecretError::PermissionDenied { reason: "x".into() }.error_kind_tag(),
+            SecretError::Locked.error_kind_tag(),
+            SecretError::AuthorizationRequired.error_kind_tag(),
+            SecretError::BackendUnavailable { reason: "x".into() }.error_kind_tag(),
+            SecretError::EncryptionFailed { reason: "x".into() }.error_kind_tag(),
+            SecretError::DecryptionFailed.error_kind_tag(),
+            SecretError::InvalidKey { reason: "x".into() }.error_kind_tag(),
+            SecretError::Timeout.error_kind_tag(),
+            SecretError::Io {
+                path: "/tmp/x".into(),
+                source: std::io::Error::other("test"),
+            }
+            .error_kind_tag(),
+        ];
+        let unique: std::collections::HashSet<_> = tags.iter().collect();
+        assert_eq!(unique.len(), tags.len(), "tag collision: {tags:?}");
+        // Every tag prefixed with "vault_" so log queries can
+        // trivially filter to vault events.
+        for t in tags {
+            assert!(t.starts_with("vault_"), "missing vault_ prefix: {t}");
+        }
+    }
+
+    #[test]
+    fn error_display_messages_are_actionable() {
+        // Per rules/tauri-commands.md §6 — every error variant must
+        // produce a user-readable message, not "INTERNAL_ERROR".
+        let cases = [
+            SecretError::NotFound {
+                surface: "gemini",
+                account: 1,
+            }
+            .to_string(),
+            SecretError::Locked.to_string(),
+            SecretError::AuthorizationRequired.to_string(),
+            SecretError::Timeout.to_string(),
+        ];
+        for msg in cases {
+            assert!(!msg.is_empty());
+            assert!(!msg.to_ascii_lowercase().contains("internal_error"));
+            assert!(!msg.to_ascii_lowercase().contains("unknown error"));
+        }
+    }
+
+    #[test]
+    fn open_default_vault_rejects_unknown_backend_value() {
+        // Save and restore so we don't pollute siblings.
+        let prev = std::env::var("CSQ_SECRET_BACKEND").ok();
+        std::env::set_var("CSQ_SECRET_BACKEND", "made-up-backend");
+        let result = open_default_vault();
+        match prev {
+            Some(v) => std::env::set_var("CSQ_SECRET_BACKEND", v),
+            None => std::env::remove_var("CSQ_SECRET_BACKEND"),
+        }
+        assert!(matches!(
+            result,
+            Err(SecretError::BackendUnavailable { .. })
+        ));
+    }
+}

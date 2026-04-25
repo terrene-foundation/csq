@@ -27,7 +27,7 @@
 //! decide whether to add an entitlement file or fall back to the
 //! `security` CLI for the CLI binary's writes.
 
-use super::{SecretError, SlotKey, Vault};
+use super::{run_with_timeout, SecretError, SlotKey, Vault};
 use crate::types::AccountNum;
 use secrecy::{ExposeSecret, SecretString};
 use security_framework::passwords::{
@@ -64,42 +64,54 @@ impl Vault for MacosKeychainVault {
                 reason: "secret must not be empty".into(),
             });
         }
+        // Move owned values into the worker so the closure outlives
+        // the calling stack frame and the Keychain syscall is bounded
+        // by `VAULT_OP_TIMEOUT` per the trait contract.
         let service = slot.native_name();
-        let bytes = secret.expose_secret().as_bytes();
-        // `set_generic_password` overwrites if present; if the item
-        // doesn't exist it creates it. No separate update path needed.
-        set_generic_password(&service, KEYCHAIN_ACCOUNT, bytes).map_err(map_sf_error)
+        let bytes: Vec<u8> = secret.expose_secret().as_bytes().to_vec();
+        run_with_timeout("csq-vault-keychain", move || {
+            // `set_generic_password` overwrites if present; if the
+            // item doesn't exist it creates it. No separate update
+            // path needed.
+            set_generic_password(&service, KEYCHAIN_ACCOUNT, &bytes).map_err(map_sf_error)
+        })
     }
 
     fn get(&self, slot: SlotKey) -> Result<SecretString, SecretError> {
         let service = slot.native_name();
-        match get_generic_password(&service, KEYCHAIN_ACCOUNT) {
-            Ok(bytes) => {
-                // SAFETY note: `bytes` is owned here. Convert via
-                // String::from_utf8 — a non-UTF-8 Gemini key would
-                // be a data corruption signal (AIza* keys are ASCII;
-                // Vertex SA paths are filesystem paths, also ASCII
-                // in practice).
-                let s = String::from_utf8(bytes).map_err(|_| SecretError::DecryptionFailed)?;
-                Ok(SecretString::new(s.into()))
+        let surface_static = slot.surface;
+        let account = slot.account.get();
+        run_with_timeout("csq-vault-keychain", move || {
+            match get_generic_password(&service, KEYCHAIN_ACCOUNT) {
+                Ok(bytes) => {
+                    // Non-UTF-8 secret is a corruption signal — Gemini
+                    // keys are ASCII (AIza*) and Vertex SA paths are
+                    // filesystem paths.
+                    let s = String::from_utf8(bytes).map_err(|_| SecretError::InvalidKey {
+                        reason: "stored Keychain secret is not valid UTF-8".into(),
+                    })?;
+                    Ok(SecretString::new(s.into()))
+                }
+                Err(e) => Err(map_sf_error_for_read_static(e, surface_static, account)),
             }
-            Err(e) => Err(map_sf_error_for_read(e, slot)),
-        }
+        })
     }
 
     fn delete(&self, slot: SlotKey) -> Result<(), SecretError> {
         let service = slot.native_name();
-        match delete_generic_password(&service, KEYCHAIN_ACCOUNT) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Idempotent contract: NotFound on delete is OK.
-                if is_not_found(&e) {
-                    Ok(())
-                } else {
-                    Err(map_sf_error(e))
+        run_with_timeout("csq-vault-keychain", move || {
+            match delete_generic_password(&service, KEYCHAIN_ACCOUNT) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Idempotent contract: NotFound on delete is OK.
+                    if is_not_found(&e) {
+                        Ok(())
+                    } else {
+                        Err(map_sf_error(e))
+                    }
                 }
             }
-        }
+        })
     }
 
     fn list_slots(&self, surface: &'static str) -> Result<Vec<AccountNum>, SecretError> {
@@ -149,12 +161,16 @@ fn map_sf_error(e: security_framework::base::Error) -> SecretError {
 
 /// Read-path mapper that distinguishes "no such item" (NotFound)
 /// from genuine backend errors. Other variants reuse `map_sf_error`.
-fn map_sf_error_for_read(e: security_framework::base::Error, slot: SlotKey) -> SecretError {
+/// Takes raw surface + account so the `get` worker thread can pass
+/// owned values without re-constructing a `SlotKey` (which would
+/// require borrowing).
+fn map_sf_error_for_read_static(
+    e: security_framework::base::Error,
+    surface: &'static str,
+    account: u16,
+) -> SecretError {
     if is_not_found(&e) {
-        return SecretError::NotFound {
-            surface: slot.surface,
-            account: slot.account.get(),
-        };
+        return SecretError::NotFound { surface, account };
     }
     map_sf_error(e)
 }

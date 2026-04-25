@@ -55,9 +55,58 @@ pub mod windows;
 /// Maximum time any single backend operation may block. The vault is
 /// called from the daemon hot path (usage poller, spawn pre-flight)
 /// and a hung D-Bus / locked-keychain prompt MUST NOT pin those
-/// callers. Hard timeout at the trait boundary; backends are
-/// responsible for honouring it.
+/// callers. Hard timeout at the trait boundary; backends honour it
+/// via either their own async runtime ([`linux::SecretServiceVault`])
+/// or the shared [`run_with_timeout`] helper ([`macos`] / [`windows`]).
 pub const VAULT_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs a synchronous backend operation on a dedicated worker thread
+/// and returns its result, or [`SecretError::Timeout`] if the call
+/// does not complete within [`VAULT_OP_TIMEOUT`]. The macOS Keychain
+/// and Windows Credential Manager APIs are blocking syscalls with no
+/// native timeout — the worker thread + bounded `recv_timeout`
+/// pattern enforces the trait contract uniformly.
+///
+/// On timeout the worker thread continues to completion and is left
+/// to detach naturally; the caller cannot wait on it without
+/// reintroducing the original hang. For the few-times-per-process
+/// vault call pattern this is acceptable. A genuinely hung backend
+/// (LSA service stuck, login keychain unresponsive) is degenerate;
+/// trading "occasional thread detach" for "daemon never hangs" is
+/// the correct posture for a credential-handling primitive
+/// (`security.md` §6 "fail-closed on Keychain/lock contention").
+///
+/// Compiled only on platforms whose backends actually call it
+/// (`macos` and `windows`); the Linux backend uses its own tokio-
+/// based `block_with_timeout` because the upstream crate is
+/// async-only.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn run_with_timeout<F, T>(thread_name: &'static str, op: F) -> Result<T, SecretError>
+where
+    F: FnOnce() -> Result<T, SecretError> + Send + 'static,
+    T: Send + 'static,
+{
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::sync_channel::<Result<T, SecretError>>(1);
+    std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            // `send` returns Err if the receiver dropped (timeout
+            // path). We discard that error; the caller has already
+            // surfaced `SecretError::Timeout`.
+            let _ = tx.send(op());
+        })
+        .map_err(|e| SecretError::BackendUnavailable {
+            reason: format!("vault worker thread spawn: {e}"),
+        })?;
+    match rx.recv_timeout(VAULT_OP_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(SecretError::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(SecretError::BackendUnavailable {
+            reason: "vault worker thread panicked before producing a result".into(),
+        }),
+    }
+}
 
 /// Logical identifier for a stored secret. csq is multi-account +
 /// multi-surface; the (surface, account) pair is the addressable
@@ -125,8 +174,9 @@ pub enum SecretError {
     AuthorizationRequired,
     /// Native backend is not present on the host (Linux without
     /// Secret Service AND `CSQ_SECRET_BACKEND` not set to `file`;
-    /// Windows daemon running as `LocalSystem` / DPAPI unavailable).
-    /// Refuse-to-operate posture per security review §3.
+    /// Windows daemon running as `LocalSystem` so DPAPI binding is
+    /// the wrong scope). Refuse-to-operate posture per security
+    /// review §3.
     #[error("secret backend unavailable: {reason}")]
     BackendUnavailable { reason: String },
     /// AEAD encryption failed — almost always indicates a logic bug
@@ -295,16 +345,7 @@ fn open_native_default(override_kind: Option<&str>) -> Result<Box<dyn Vault>, Se
 
 #[cfg(target_os = "windows")]
 fn open_native_default(override_kind: Option<&str>) -> Result<Box<dyn Vault>, SecretError> {
-    match override_kind {
-        Some("file") => Err(SecretError::BackendUnavailable {
-            reason: "CSQ_SECRET_BACKEND=file is Linux-only — Windows uses DPAPI / Credential \
-                     Manager (PR-G2a.3)"
-                .into(),
-        }),
-        _ => Err(SecretError::BackendUnavailable {
-            reason: "Windows Credential Manager backend lands in PR-G2a.3".into(),
-        }),
-    }
+    windows::open_windows_default(override_kind)
 }
 
 /// Resolves the canonical csq base dir (`~/.claude/accounts`) for the
@@ -492,21 +533,14 @@ mod tests {
         assert_eq!(v.backend_id(), "macos-keychain");
     }
 
-    /// Windows refuses both the `file` override and the unset case
-    /// (DPAPI lands in PR-G2a.3). The error message names PR-G2a.3
-    /// so tests don't drift past the dispatch contract before the
-    /// implementation arrives.
+    /// Windows refuses `CSQ_SECRET_BACKEND=file` regardless of
+    /// process posture — the file backend is Linux-only and DPAPI
+    /// is the canonical Windows primitive.
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_refuses_until_pr_g2a3() {
+    fn windows_refuses_file_override() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
-        std::env::remove_var("CSQ_SECRET_BACKEND");
-        match open_default_vault() {
-            Err(SecretError::BackendUnavailable { .. }) => {}
-            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
-            Ok(_) => panic!("expected BackendUnavailable, got Ok"),
-        }
         std::env::set_var("CSQ_SECRET_BACKEND", "file");
         match open_default_vault() {
             Err(SecretError::BackendUnavailable { reason }) => {
@@ -518,6 +552,27 @@ mod tests {
             Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
             Ok(_) => panic!("expected BackendUnavailable, got Ok"),
         }
+    }
+
+    /// Windows default (unset env) returns the Credential Manager
+    /// backend when the process is NOT running as `LocalSystem`. CI
+    /// runners and developer workstations both run as a normal user,
+    /// so this test path exercises the dispatch contract end-to-end.
+    /// Skipped at runtime if `is_running_as_local_system` returns
+    /// true (e.g. test harness launched by a SYSTEM service).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_returns_credential_manager_when_not_system() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::capture();
+        std::env::remove_var("CSQ_SECRET_BACKEND");
+        if windows::is_running_as_local_system() {
+            // Skip — LocalSystem refusal is exercised by the
+            // dedicated test below.
+            return;
+        }
+        let v = open_default_vault().expect("Windows default should return CredentialVault");
+        assert_eq!(v.backend_id(), "windows-credential-manager");
     }
 
     /// `unwrap_err` would not work on `Result<Box<dyn Vault>, ...>`

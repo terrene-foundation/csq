@@ -588,9 +588,18 @@ mod tests {
     //! intermittent failures.
 
     use super::*;
+    use crate::providers::catalog::Surface;
     use crate::types::AccountNum;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Surface tag for the only vault-using surface today. Resolved
+    /// from [`Surface::Gemini::as_str()`] so the file-vault fixtures
+    /// pivot automatically with any future Surface rename — no literal
+    /// `"gemini"` survives in test code per PR-G2b.
+    ///
+    /// [`Surface::Gemini::as_str()`]: crate::providers::catalog::Surface::as_str
+    const GEMINI: &str = Surface::Gemini.as_str();
 
     /// Serializes env-var manipulation across all tests in this
     /// module. `cargo test` runs tests in parallel; reading and
@@ -630,7 +639,7 @@ mod tests {
 
     fn slot(n: u16) -> SlotKey {
         SlotKey {
-            surface: "gemini",
+            surface: GEMINI,
             account: AccountNum::try_from(n).unwrap(),
         }
     }
@@ -687,7 +696,7 @@ mod tests {
         v.set(slot(2), &SecretString::new("second".into())).unwrap();
         let got = v.get(slot(2)).unwrap();
         assert_eq!(got.expose_secret(), "second");
-        let listed = v.list_slots("gemini").unwrap();
+        let listed = v.list_slots(GEMINI).unwrap();
         assert_eq!(listed.len(), 1, "set must overwrite, not append");
     }
 
@@ -710,7 +719,7 @@ mod tests {
         v.set(slot(2), &SecretString::new("y".into())).unwrap();
         v.set(slot(7), &SecretString::new("z".into())).unwrap();
         let nums: Vec<u16> = v
-            .list_slots("gemini")
+            .list_slots(GEMINI)
             .unwrap()
             .iter()
             .map(|a| a.get())
@@ -731,7 +740,7 @@ mod tests {
             &SecretString::new("f".into()),
         )
         .unwrap();
-        assert_eq!(v.list_slots("gemini").unwrap().len(), 1);
+        assert_eq!(v.list_slots(GEMINI).unwrap().len(), 1);
         assert_eq!(v.list_slots("future-surface").unwrap().len(), 1);
     }
 
@@ -743,7 +752,7 @@ mod tests {
         assert!(matches!(
             err,
             SecretError::NotFound {
-                surface: "gemini",
+                surface: GEMINI,
                 account: 7
             }
         ));
@@ -1036,7 +1045,7 @@ mod tests {
             Err(SecretError::NotFound { .. }) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
-        let listed = v.list_slots("gemini").unwrap();
+        let listed = v.list_slots(GEMINI).unwrap();
         assert!(listed.is_empty());
     }
 

@@ -35,8 +35,12 @@ use std::future::Future;
 use std::path::Path;
 use tokio::runtime::Builder as RtBuilder;
 
-/// Attribute key — the surface tag a slot belongs to (always
-/// `"gemini"` until PR-G2b extends to other surfaces).
+/// Attribute key — the surface tag a slot belongs to. Values come
+/// from [`crate::providers::catalog::Surface::as_str`]; today only
+/// `Surface::Gemini.as_str() == "gemini"` is reachable (no other
+/// surface uses the vault). Future surfaces serialize their own
+/// tag here and the existing collection's search code partitions
+/// by this attribute automatically.
 const ATTR_SURFACE: &str = "csq-surface";
 /// Attribute key — the account slot number rendered as decimal.
 const ATTR_ACCOUNT: &str = "csq-account";

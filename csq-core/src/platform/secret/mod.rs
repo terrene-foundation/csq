@@ -111,15 +111,22 @@ where
 /// Logical identifier for a stored secret. csq is multi-account +
 /// multi-surface; the (surface, account) pair is the addressable
 /// unit. `surface` is a `&'static str` rather than the [`Surface`]
-/// enum so PR-G2a can land before PR-G1 ships the enum variant —
-/// PR-G2a uses a const placeholder `"gemini"`, PR-G2b flips to
-/// `Surface::as_str()`.
+/// enum directly to keep `platform::secret` decoupled from the
+/// catalog layer — but every value MUST originate from
+/// [`Surface::as_str()`] (or the [`crate::providers::gemini::SURFACE_GEMINI`]
+/// alias). The wire string and the enum stay in lock-step.
 ///
 /// [`Surface`]: crate::providers::catalog::Surface
+/// [`Surface::as_str()`]: crate::providers::catalog::Surface::as_str
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlotKey {
-    /// Surface tag — currently always `"gemini"` until PR-G2b wires
-    /// the [`Surface`] enum through.
+    /// Surface tag — derived from [`Surface::as_str()`] on the
+    /// matching enum variant. Today only Gemini is reachable
+    /// (`Surface::Gemini.as_str() == "gemini"`); future surfaces with
+    /// vault-backed secrets will pivot here without touching the
+    /// `platform::secret` layer.
+    ///
+    /// [`Surface::as_str()`]: crate::providers::catalog::Surface::as_str
     pub surface: &'static str,
     /// Account slot (1..MAX_ACCOUNTS). The newtype already validates
     /// the range so backends can format it into native key names
@@ -366,7 +373,16 @@ fn default_base_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::catalog::Surface;
     use std::sync::Mutex;
+
+    /// Surface tag for the only surface currently using the vault.
+    /// Resolved from [`Surface::Gemini::as_str()`] so the test fixture
+    /// pivots automatically if the wire string ever changes — no
+    /// literal `"gemini"` survives in test code per PR-G2b.
+    ///
+    /// [`Surface::Gemini::as_str()`]: crate::providers::catalog::Surface::as_str
+    const GEMINI: &str = Surface::Gemini.as_str();
 
     /// Serializes env-var manipulation across tests in this module.
     /// `cargo test` runs in parallel; reading and writing process
@@ -396,9 +412,23 @@ mod tests {
 
     fn slot(n: u16) -> SlotKey {
         SlotKey {
-            surface: "gemini",
+            surface: GEMINI,
             account: AccountNum::try_from(n).unwrap(),
         }
+    }
+
+    /// Anchors the SlotKey wire-string contract inside `platform::secret`.
+    /// If `Surface::Gemini.as_str()` ever returns something other than
+    /// `"gemini"`, every SlotKey-using test pivots through this const
+    /// — but the persisted vault entries (`csq.gemini.<n>` keychain
+    /// service names, `csq-surface=gemini` Linux attributes,
+    /// `vault-audit.ndjson` `surface` field) DO NOT pivot. This test
+    /// is the early-warning that a Surface rename is also a vault
+    /// schema migration.
+    #[test]
+    fn gemini_const_matches_surface_enum_wire_name() {
+        assert_eq!(GEMINI, "gemini");
+        assert_eq!(GEMINI, Surface::Gemini.as_str());
     }
 
     #[test]
@@ -414,7 +444,7 @@ mod tests {
         // variants.
         let tags = [
             SecretError::NotFound {
-                surface: "gemini",
+                surface: GEMINI,
                 account: 1,
             }
             .error_kind_tag(),
@@ -447,7 +477,7 @@ mod tests {
         // produce a user-readable message, not "INTERNAL_ERROR".
         let cases = [
             SecretError::NotFound {
-                surface: "gemini",
+                surface: GEMINI,
                 account: 1,
             }
             .to_string(),

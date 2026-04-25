@@ -110,10 +110,19 @@ impl Vault for InMemoryVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::catalog::Surface;
+
+    /// Surface tag for the only vault-using surface today. Resolved
+    /// from [`Surface::Gemini::as_str()`] so the in-memory vault
+    /// fixtures pivot automatically with any future Surface rename —
+    /// no literal `"gemini"` survives in test code per PR-G2b.
+    ///
+    /// [`Surface::Gemini::as_str()`]: crate::providers::catalog::Surface::as_str
+    const GEMINI: &str = Surface::Gemini.as_str();
 
     fn slot(n: u16) -> SlotKey {
         SlotKey {
-            surface: "gemini",
+            surface: GEMINI,
             account: AccountNum::try_from(n).unwrap(),
         }
     }
@@ -144,7 +153,7 @@ mod tests {
         assert!(matches!(
             err,
             SecretError::NotFound {
-                surface: "gemini",
+                surface: GEMINI,
                 account: 7
             }
         ));
@@ -169,7 +178,7 @@ mod tests {
         v.set(slot(2), &SecretString::new("y".into())).unwrap();
         v.set(slot(7), &SecretString::new("z".into())).unwrap();
 
-        let slots = v.list_slots("gemini").unwrap();
+        let slots = v.list_slots(GEMINI).unwrap();
         let nums: Vec<u16> = slots.iter().map(|a| a.get()).collect();
         assert_eq!(nums, vec![2, 7, 10], "must be sorted ascending");
     }
@@ -188,7 +197,7 @@ mod tests {
             &SecretString::new("f".into()),
         )
         .unwrap();
-        let g = v.list_slots("gemini").unwrap();
+        let g = v.list_slots(GEMINI).unwrap();
         let f = v.list_slots("future-surface").unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(f.len(), 1);

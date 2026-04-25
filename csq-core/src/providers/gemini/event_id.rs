@@ -194,14 +194,21 @@ mod tests {
     }
 
     #[test]
-    fn ids_emitted_after_a_delay_sort_after_earlier_ids() {
-        // K-sortability is the whole point of v7 vs v4. An ID generated
-        // after a measurable delay must lex-compare > an earlier one.
-        // Using ms-resolution timestamps means a 5ms sleep suffices to
-        // guarantee the high bytes differ.
-        let earlier = new_uuidv7();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let later = new_uuidv7();
+    fn ids_with_higher_timestamp_sort_after_earlier_ones() {
+        // K-sortability is the whole point of v7 vs v4. Test the
+        // property deterministically via `pack_uuidv7_bytes` rather
+        // than via `new_uuidv7` + sleep — Windows's SystemTime is
+        // 15.6ms granular by default, so a 5ms sleep occasionally
+        // lands in the same millisecond and the test flakes
+        // (observed on windows-latest CI 2026-04-25). Using fixed
+        // timestamps tests the layout invariant directly with the
+        // same-prefix random payload so any difference comes from
+        // the timestamp bytes.
+        let rand = [0xAA; 10];
+        let earlier_bytes = pack_uuidv7_bytes(1_000_000_000_000, rand);
+        let later_bytes = pack_uuidv7_bytes(1_000_000_000_001, rand);
+        let earlier = encode_base32(&earlier_bytes);
+        let later = encode_base32(&later_bytes);
         assert!(
             later > earlier,
             "later id ({later}) must sort after earlier id ({earlier})"

@@ -1039,10 +1039,16 @@ mod tests {
         assert_eq!(acct.is_downgrade, Some(false));
     }
 
+    #[cfg(unix)]
     #[test]
     fn drain_slot_lock_contention_returns_specific_error() {
         // Two concurrent drains on the same slot — the second must
-        // surface LockContended, not block forever.
+        // surface LockContended, not block forever. Unix-only because
+        // Windows named mutexes are re-entrant WITHIN the same
+        // thread, which makes a single-thread same-process contention
+        // test unreliable on that platform (see platform::lock::imp
+        // doc-comment). Cross-process Windows behaviour is exercised
+        // by the integration tests that spawn a real daemon.
         let dir = TempDir::new().unwrap();
         let env = fresh_envelope(12, EventKind::CounterIncrement(EmptyPayload {}));
         append_event(dir.path(), &env).unwrap();

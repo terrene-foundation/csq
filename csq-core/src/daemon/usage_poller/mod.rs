@@ -176,7 +176,6 @@ pub fn spawn_with_config(
     // independent of the Anthropic cooldown/backoff maps so codex's
     // 5-fail threshold cannot interfere with Anthropic's 429 handling.
     let codex_breakers: codex::BreakerMap = Arc::new(Mutex::new(HashMap::new()));
-    let gemini_consumer = gemini_consumer;
 
     let join = tokio::spawn(async move {
         // Supervised run loop: restarts on panic with exponential

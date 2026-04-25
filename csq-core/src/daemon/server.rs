@@ -61,6 +61,7 @@
 
 use super::cache::TtlCache;
 use super::refresher::RefreshStatus;
+use super::usage_poller::gemini::GeminiConsumerState;
 use crate::accounts::{discovery, AccountInfo};
 use crate::credentials;
 use crate::error::{DaemonError, OAuthError};
@@ -116,6 +117,12 @@ pub struct RouterState {
     /// (tests, custom builds). In that case both `/api/login/{N}`
     /// and `/api/oauth/exchange` return 503.
     pub oauth_store: Option<Arc<OAuthStateStore>>,
+    /// Gemini event-consumer state — shared with the NDJSON drain
+    /// task so the live IPC route AND the drainer dedup against
+    /// the same applied-set and serialise quota writes through the
+    /// same per-process mutex (spec 05 §5.8.1 single-writer
+    /// invariant). Cloned cheaply (every field is an `Arc`).
+    pub gemini_consumer: GeminiConsumerState,
 }
 
 /// Maximum staleness for the discovery cache: 5 seconds.
@@ -180,6 +187,7 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/login/{id}", get(login_handler))
         .route("/api/oauth/exchange", post(oauth_exchange_handler))
         .route("/api/invalidate-cache", post(invalidate_cache_handler))
+        .route("/api/gemini/event", post(gemini_event_handler))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
 }
@@ -570,6 +578,161 @@ pub struct InvalidateCacheResponse {
     pub cleared: bool,
 }
 
+/// POST /api/gemini/event — accepts a single [`EventEnvelope`] from
+/// csq-cli and applies it to `quota.json`.
+///
+/// This is the **live IPC path** for Gemini events. The csq-cli
+/// emitter writes the event to its NDJSON log first (durability
+/// floor) then attempts this POST with a 50ms connect ceiling. The
+/// daemon dedups via `id`: if the same envelope arrives twice
+/// (live IPC + later NDJSON drain), only the first apply mutates
+/// `quota.json`. Per spec 05 §5.8.1.
+///
+/// Always returns 204 (no body) on accept-or-dedup; structured-log
+/// records the outcome via `error_kind` tags. On serialisation
+/// failure or invalid slot, returns 400 with a fixed-vocabulary
+/// error tag (no upstream body echoes — see security.md §2).
+async fn gemini_event_handler(
+    State(state): State<RouterState>,
+    Json(envelope): Json<crate::providers::gemini::capture::EventEnvelope>,
+) -> Result<StatusCode, (StatusCode, Json<GeminiEventError>)> {
+    use crate::providers::gemini::capture::{EVENT_SCHEMA_VERSION, EVENT_SURFACE_GEMINI};
+
+    if envelope.v != EVENT_SCHEMA_VERSION {
+        tracing::debug!(
+            error_kind = "gemini_event_unsupported_version",
+            v = envelope.v,
+            slot = envelope.slot,
+            "gemini IPC event with unsupported schema version"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(GeminiEventError {
+                error: "unsupported_version",
+            }),
+        ));
+    }
+
+    // PR-G3 redteam H1: reject envelopes claiming a non-Gemini
+    // surface. Without this gate, a same-UID caller could POST
+    // `surface: "anthropic"` and `apply_event` would clobber the
+    // Anthropic slot's row (forcing surface back to "gemini" and
+    // mutating counter/rate_limit fields the Anthropic UI doesn't
+    // expect). Same-UID threat-model bound is real but per
+    // zero-tolerance Rule 5 the cheap surface check closes it
+    // structurally.
+    if envelope.surface != EVENT_SURFACE_GEMINI {
+        tracing::warn!(
+            error_kind = "gemini_event_invalid_surface",
+            slot = envelope.slot,
+            received_surface = %envelope.surface,
+            "gemini IPC event with non-gemini surface tag refused"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(GeminiEventError {
+                error: "invalid_surface",
+            }),
+        ));
+    }
+
+    let slot = match crate::types::AccountNum::try_from(envelope.slot) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GeminiEventError {
+                    error: "invalid_slot",
+                }),
+            ));
+        }
+    };
+
+    let consumer = state.gemini_consumer.clone();
+    let base_dir = Arc::clone(&state.base_dir);
+    let result = tokio::task::spawn_blocking(move || {
+        let _q_guard = consumer
+            .quota_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut applied = consumer.applied.lock().unwrap_or_else(|p| p.into_inner());
+        if !applied.insert(envelope.id.clone()) {
+            return Ok::<bool, String>(false);
+        }
+        drop(applied);
+        let mut quota =
+            crate::quota::state::load_state(&base_dir).map_err(|e| format!("quota load: {e}"))?;
+        // PR-G3 redteam H2: structured-log when IPC creates a quota
+        // row for a previously-unseen slot. Same-UID caller can still
+        // do this (and we accept it — the live IPC path needs to work
+        // for newly-provisioned accounts before the discovery cache
+        // refreshes), but operators see the anomaly via log query.
+        let new_slot = !quota.accounts.contains_key(&slot.get().to_string());
+        if new_slot {
+            tracing::warn!(
+                error_kind = "gemini_event_first_time_slot",
+                slot = slot.get(),
+                "live IPC event for previously-unseen slot — verify provisioning"
+            );
+        }
+        let mut breakers = consumer.breakers.lock().unwrap_or_else(|p| p.into_inner());
+        let breaker = breakers.entry(slot.get()).or_default();
+        // PR-G3 redteam M3: IPC-source events do NOT count toward
+        // the schema-drift breaker — only csq-cli's NDJSON drain
+        // (which observed a real malformed response) trips it.
+        // Stops a same-UID caller from forcing kind=unknown via
+        // drift POSTs.
+        crate::daemon::usage_poller::gemini::apply_event_with_source(
+            &mut quota,
+            &envelope,
+            breaker,
+            crate::daemon::usage_poller::gemini::EventSource::Ipc,
+        );
+        crate::quota::state::save_state(&base_dir, &quota)
+            .map_err(|e| format!("quota save: {e}"))?;
+        Ok::<bool, String>(true)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_applied)) => Ok(StatusCode::NO_CONTENT),
+        Ok(Err(reason)) => {
+            tracing::warn!(
+                error_kind = "gemini_event_apply_failed",
+                slot = slot.get(),
+                reason = %reason,
+                "gemini IPC event apply failed"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(GeminiEventError {
+                    error: "apply_failed",
+                }),
+            ))
+        }
+        Err(_join) => {
+            tracing::warn!(
+                error_kind = "gemini_event_apply_panicked",
+                slot = slot.get(),
+                "gemini IPC event apply panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(GeminiEventError {
+                    error: "apply_panicked",
+                }),
+            ))
+        }
+    }
+}
+
+/// Error body for `POST /api/gemini/event`. Fixed-vocabulary tag —
+/// caller cannot trigger arbitrary strings here per security.md §2.
+#[derive(Debug, Clone, Serialize)]
+pub struct GeminiEventError {
+    pub error: &'static str,
+}
+
 /// Response body for `GET /api/accounts`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountsResponse {
@@ -913,6 +1076,7 @@ mod tests {
             discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            gemini_consumer: GeminiConsumerState::default(),
         }
     }
 
@@ -924,6 +1088,7 @@ mod tests {
             discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: None,
+            gemini_consumer: GeminiConsumerState::default(),
         }
     }
 
@@ -939,6 +1104,7 @@ mod tests {
             discovery_cache: Arc::new(TtlCache::new(discovery_ttl)),
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            gemini_consumer: GeminiConsumerState::default(),
         }
     }
 

@@ -45,8 +45,12 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # Gemini PR-G2a — encryption-at-rest primitives for the platform::secret
 # fallback path (Linux without Secret Service / explicit opt-in). RustCrypto
 # audited pure Rust; no FFI. argon2 is OWASP 2023 KDF; aes-gcm is the AEAD.
-# zeroize wipes secret material before drop. rpassword reads the fallback
-# passphrase without echo; only required when the file backend is active.
+# zeroize wipes secret material before drop.
 aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
+# Gemini PR-G2a.2 — Linux Secret Service / kwallet via D-Bus. The crate's
+# `rt-tokio-crypto-rust` feature picks tokio for the async runtime and
+# RustCrypto for session-key crypto so we keep the no-OpenSSL-FFI posture.
+# Linux-only — the crate itself does not compile on macOS / Windows.
+secret-service = { version = "4", default-features = false, features = ["rt-tokio-crypto-rust"] }

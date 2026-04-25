@@ -40,6 +40,7 @@ use secrecy::SecretString;
 use std::time::Duration;
 
 pub mod audit;
+pub mod file;
 pub mod in_memory;
 
 #[cfg(target_os = "macos")]
@@ -184,8 +185,20 @@ impl SecretError {
 /// All methods MUST honour [`VAULT_OP_TIMEOUT`]. All methods that
 /// surface secret material do so as [`SecretString`] so the value
 /// cannot accidentally appear in `Debug` / `Display` / `Serialize`
-/// output. Implementors MUST NOT cache decrypted material across
-/// calls — each `get` re-reads from the backing store.
+/// output.
+///
+/// # Caching contract
+///
+/// Implementors MUST NOT cache *decrypted secret cleartext* across
+/// calls — each `get` re-reads from the backing store and re-decrypts
+/// so the cleartext window is bounded to the duration of a single
+/// caller-held [`SecretString`]. Caching of *derived KDF master keys*
+/// (e.g. the Argon2id-derived AES key in
+/// [`file::FileVault`]) IS permitted: re-deriving on every call would
+/// add ~700ms of CPU per vault op at the chosen cost parameters and
+/// block the daemon hot path. The distinction is load-bearing — the
+/// derived key is one step removed from the secret material, while
+/// the cleartext is the secret itself.
 pub trait Vault: Send + Sync {
     /// Stores `secret` at `slot`, overwriting any existing value.
     /// Atomic on every backend — partial writes are not observable
@@ -225,59 +238,120 @@ pub trait Vault: Send + Sync {
 ///
 /// Backend selection precedence:
 ///
-/// 1. `CSQ_SECRET_BACKEND` env var (when set to `keychain` or
-///    `file`) — explicit override for testing and headless deploys.
+/// 1. `CSQ_SECRET_BACKEND` env var (when set to `keychain`, `file`,
+///    or `in-memory`) — explicit override for testing, headless
+///    deploys, or the Linux file fallback.
 /// 2. Compile-time platform default (macOS Keychain, Linux Secret
 ///    Service, Windows DPAPI).
 /// 3. Refuse with `BackendUnavailable` if the platform default is
 ///    unreachable and no override is set.
+///
+/// `CSQ_SECRET_BACKEND=file` is honoured ONLY on Linux — macOS and
+/// Windows have a native primitive and refusing here prevents an
+/// attacker (or an over-eager systemd unit) from quietly downgrading
+/// the threat model on a host that already has Keychain / DPAPI.
 pub fn open_default_vault() -> Result<Box<dyn Vault>, SecretError> {
     let override_kind = std::env::var("CSQ_SECRET_BACKEND").ok();
     match override_kind.as_deref() {
-        Some("file") => Err(SecretError::BackendUnavailable {
-            reason: "file backend not yet implemented (PR-G2a.2)".into(),
-        }),
         Some("in-memory") if cfg!(any(test, feature = "secret-in-memory")) => {
             Ok(Box::new(in_memory::InMemoryVault::new()))
         }
-        Some(other) if other != "auto" && other != "keychain" => {
-            Err(SecretError::BackendUnavailable {
-                reason: format!("unknown CSQ_SECRET_BACKEND value: {other}"),
-            })
-        }
-        _ => open_native_default(),
+        Some(other) if !is_known_override(other) => Err(SecretError::BackendUnavailable {
+            reason: format!("unknown CSQ_SECRET_BACKEND value: {other}"),
+        }),
+        // Known overrides (`auto`, `keychain`, `file`) and the unset
+        // case all flow into the platform native dispatch, which
+        // honours the override locally.
+        _ => open_native_default(override_kind.as_deref()),
     }
 }
 
+/// True for env values we route to the platform dispatch. Anything
+/// else gets a `BackendUnavailable` so a typo (`CSQ_SECRET_BACKEND=files`)
+/// fails loudly rather than silently falling through.
+fn is_known_override(value: &str) -> bool {
+    matches!(value, "auto" | "keychain" | "file" | "in-memory")
+}
+
 #[cfg(target_os = "macos")]
-fn open_native_default() -> Result<Box<dyn Vault>, SecretError> {
-    Ok(Box::new(macos::MacosKeychainVault::new()))
+fn open_native_default(override_kind: Option<&str>) -> Result<Box<dyn Vault>, SecretError> {
+    match override_kind {
+        Some("file") => Err(SecretError::BackendUnavailable {
+            reason: "CSQ_SECRET_BACKEND=file is Linux-only — macOS uses the native Keychain".into(),
+        }),
+        // `auto`, `keychain`, or unset all route to the keychain.
+        _ => Ok(Box::new(macos::MacosKeychainVault::new())),
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn open_native_default() -> Result<Box<dyn Vault>, SecretError> {
-    // PR-G2a ships the trait + macOS backend. Linux Secret Service
-    // and the explicit file fallback land in PR-G2a.2 — see plan §M3
-    // for the split rationale (separate security review per backend).
-    Err(SecretError::BackendUnavailable {
-        reason: "Linux Secret Service backend lands in PR-G2a.2; \
-                 set CSQ_SECRET_BACKEND=file when the file backend ships"
-            .into(),
-    })
+fn open_native_default(override_kind: Option<&str>) -> Result<Box<dyn Vault>, SecretError> {
+    // The file fallback writes its store next to the rest of csq's
+    // per-user state. `linux::open_linux_default` does the actual
+    // dispatch + bus probe.
+    let base_dir = default_base_dir();
+    linux::open_linux_default(&base_dir, override_kind)
 }
 
 #[cfg(target_os = "windows")]
-fn open_native_default() -> Result<Box<dyn Vault>, SecretError> {
-    // PR-G2a ships the trait + macOS backend. Windows DPAPI /
-    // Credential Manager lands in PR-G2a.3.
-    Err(SecretError::BackendUnavailable {
-        reason: "Windows Credential Manager backend lands in PR-G2a.3".into(),
-    })
+fn open_native_default(override_kind: Option<&str>) -> Result<Box<dyn Vault>, SecretError> {
+    match override_kind {
+        Some("file") => Err(SecretError::BackendUnavailable {
+            reason: "CSQ_SECRET_BACKEND=file is Linux-only — Windows uses DPAPI / Credential \
+                     Manager (PR-G2a.3)"
+                .into(),
+        }),
+        _ => Err(SecretError::BackendUnavailable {
+            reason: "Windows Credential Manager backend lands in PR-G2a.3".into(),
+        }),
+    }
+}
+
+/// Resolves the canonical csq base dir (`~/.claude/accounts`) for the
+/// file-vault store. Mirrors the convention used elsewhere in
+/// `platform::fs`. Falls back to the system tempdir if `$HOME` is
+/// unset — that is a degenerate environment but the file backend is
+/// already user-opt-in so refusing to start would be punitive.
+#[cfg(target_os = "linux")]
+fn default_base_dir() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".claude")
+            .join("accounts");
+    }
+    std::env::temp_dir().join("csq-vault")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env-var manipulation across tests in this module.
+    /// `cargo test` runs in parallel; reading and writing process
+    /// env without coordination produces flaky failures where one
+    /// test sees another's `CSQ_SECRET_BACKEND` value.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard restoring `CSQ_SECRET_BACKEND` on drop.
+    struct EnvGuard {
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                prev: std::env::var("CSQ_SECRET_BACKEND").ok(),
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("CSQ_SECRET_BACKEND", v),
+                None => std::env::remove_var("CSQ_SECRET_BACKEND"),
+            }
+        }
+    }
 
     fn slot(n: u16) -> SlotKey {
         SlotKey {
@@ -349,17 +423,121 @@ mod tests {
 
     #[test]
     fn open_default_vault_rejects_unknown_backend_value() {
-        // Save and restore so we don't pollute siblings.
-        let prev = std::env::var("CSQ_SECRET_BACKEND").ok();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::capture();
         std::env::set_var("CSQ_SECRET_BACKEND", "made-up-backend");
         let result = open_default_vault();
-        match prev {
-            Some(v) => std::env::set_var("CSQ_SECRET_BACKEND", v),
-            None => std::env::remove_var("CSQ_SECRET_BACKEND"),
-        }
         assert!(matches!(
             result,
             Err(SecretError::BackendUnavailable { .. })
         ));
+    }
+
+    #[test]
+    fn is_known_override_recognizes_documented_values() {
+        for v in ["auto", "keychain", "file", "in-memory"] {
+            assert!(is_known_override(v), "{v} must be a known override");
+        }
+        for v in ["", "Keychain", "files", "memory", "FILE"] {
+            assert!(!is_known_override(v), "{v} must NOT be a known override");
+        }
+    }
+
+    /// `CSQ_SECRET_BACKEND=file` MUST refuse on macOS — the user
+    /// already has a Keychain and silently downgrading to a less
+    /// protective backend would violate the security review §3
+    /// "no silent fallback" rule. The error message MUST name the
+    /// reason so the user can self-diagnose.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_refuses_file_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::capture();
+        std::env::set_var("CSQ_SECRET_BACKEND", "file");
+        match open_default_vault() {
+            Err(SecretError::BackendUnavailable { reason }) => {
+                assert!(
+                    reason.to_lowercase().contains("linux-only")
+                        || reason.to_lowercase().contains("keychain"),
+                    "reason must explain why the override is refused, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected BackendUnavailable, got Ok"),
+        }
+    }
+
+    /// macOS without any override (or with `keychain`/`auto`) MUST
+    /// route to the Keychain backend and succeed. Smoke check that
+    /// the dispatch wiring is intact — the keychain backend itself
+    /// has gated live tests in macos.rs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_returns_keychain_backend() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::capture();
+        std::env::remove_var("CSQ_SECRET_BACKEND");
+        let v = open_default_vault().expect("macos default should not fail");
+        assert_eq!(v.backend_id(), "macos-keychain");
+    }
+
+    /// `CSQ_SECRET_BACKEND=keychain` is a no-op alias on macOS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keychain_override_is_no_op() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::capture();
+        std::env::set_var("CSQ_SECRET_BACKEND", "keychain");
+        let v = open_default_vault().expect("keychain override should map to native");
+        assert_eq!(v.backend_id(), "macos-keychain");
+    }
+
+    /// Windows refuses both the `file` override and the unset case
+    /// (DPAPI lands in PR-G2a.3). The error message names PR-G2a.3
+    /// so tests don't drift past the dispatch contract before the
+    /// implementation arrives.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_refuses_until_pr_g2a3() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::capture();
+        std::env::remove_var("CSQ_SECRET_BACKEND");
+        match open_default_vault() {
+            Err(SecretError::BackendUnavailable { .. }) => {}
+            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected BackendUnavailable, got Ok"),
+        }
+        std::env::set_var("CSQ_SECRET_BACKEND", "file");
+        match open_default_vault() {
+            Err(SecretError::BackendUnavailable { reason }) => {
+                assert!(
+                    reason.to_lowercase().contains("linux-only"),
+                    "reason must explain why file is refused on Windows, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected BackendUnavailable, got Ok"),
+        }
+    }
+
+    /// `unwrap_err` would not work on `Result<Box<dyn Vault>, ...>`
+    /// because `Box<dyn Vault>` lacks `Debug`. Pattern-match instead.
+    /// Asserts the unknown-value path explicitly to mirror the
+    /// `is_known_override` test.
+    #[test]
+    fn open_default_vault_typo_surfaces_actionable_error() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::capture();
+        std::env::set_var("CSQ_SECRET_BACKEND", "files");
+        match open_default_vault() {
+            Err(SecretError::BackendUnavailable { reason }) => {
+                assert!(
+                    reason.contains("files"),
+                    "error must name the bad value so users can spot the typo, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected BackendUnavailable, got Ok"),
+        }
     }
 }

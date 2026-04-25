@@ -25,18 +25,30 @@ hyper.workspace = true
 hyper-util.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
+# Gemini PR-G2a.2 (Vault file fallback path). aes-gcm + argon2 are the
+# RustCrypto AEAD + KDF. zeroize wipes secret buffers before drop. None of
+# these add C FFI; all pure Rust audited by the RustCrypto collective. The
+# code path is platform-independent so the crypto crates live at the top
+# level — only the dispatch layer (open_default_vault on Linux) wires them
+# in. macOS + Windows builds compile the file backend module so unit tests
+# of the crypto stay portable, but `open_default_vault` refuses to route
+# there from non-Linux even when the env override is set.
+aes-gcm.workspace = true
+argon2.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true
-# Gemini PR-G2a (Vault file fallback path). aes-gcm + argon2 are the
-# RustCrypto AEAD + KDF. zeroize wipes secret buffers before drop. None of
-# these add C FFI; all pure Rust audited by the RustCrypto collective.
-aes-gcm.workspace = true
-argon2.workspace = true
-zeroize.workspace = true
+
+# Gemini PR-G2a.2 (Linux Secret Service backend). D-Bus client; the
+# `rt-tokio-crypto-rust` feature picks tokio + RustCrypto for the session
+# transport key exchange, matching the rest of csq-core. Linux-only — the
+# crate is unbuildable on macOS / Windows.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service.workspace = true
 
 # Windows-only: low-level syscalls for session discovery (PEB
 # walking via NtQueryInformationProcess + ReadProcessMemory). The

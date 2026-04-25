@@ -648,6 +648,27 @@ async fn gemini_event_handler(
         }
     };
 
+    // PR-G4a — H2 resolution. PR-G3 deferred this gate because no
+    // binding marker existed yet; PR-G4a writes
+    // `credentials/gemini-<N>.json` from `csq setkey gemini`, so
+    // the daemon can now authoritatively reject IPC traffic for an
+    // unprovisioned slot. Single `symlink_metadata` syscall per
+    // event — no JSON parse, no vault touch — keeps the live IPC
+    // hot path under its 50 ms budget per spec 07 §7.2.3.1.
+    if !crate::providers::gemini::provisioning::is_gemini_bound_slot(&state.base_dir, slot) {
+        tracing::warn!(
+            error_kind = "gemini_event_unbound_slot",
+            slot = slot.get(),
+            "gemini IPC event for slot with no binding marker — refusing 404"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(GeminiEventError {
+                error: "slot_not_provisioned",
+            }),
+        ));
+    }
+
     let consumer = state.gemini_consumer.clone();
     let base_dir = Arc::clone(&state.base_dir);
     let result = tokio::task::spawn_blocking(move || {

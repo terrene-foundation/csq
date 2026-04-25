@@ -22,6 +22,7 @@ use csq_core::oauth::OAuthStateStore;
 use csq_core::providers::gemini::capture::{
     EmptyPayload, EventEnvelope, EventKind, RateLimitedPayload,
 };
+use csq_core::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
 use csq_core::quota::state as quota_state;
 use csq_core::types::{AccessToken, AccountNum, RefreshToken};
 use std::collections::HashMap;
@@ -29,6 +30,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// PR-G4a: every live-IPC happy-path test now must provision the
+/// slot before posting events — the H2 gate refuses unprovisioned
+/// slots with 404. Mirrors what `csq setkey gemini --slot N` does
+/// on the binding marker (the vault entry is unused by the IPC
+/// path so the test does not touch it).
+fn provision_gemini_slot(base: &Path, slot: u16) {
+    let n = AccountNum::try_from(slot).unwrap();
+    let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
+    write_binding(base, n, &binding).unwrap();
+}
 
 fn make_router_state(base: &Path) -> RouterState {
     RouterState {
@@ -249,6 +261,7 @@ async fn client_connect_fails_after_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gemini_event_live_ipc_increments_counter() {
     let dir = TempDir::new().unwrap();
+    provision_gemini_slot(dir.path(), 3);
     let envelope = EventEnvelope::new(
         AccountNum::try_from(3u16).unwrap(),
         EventKind::CounterIncrement(EmptyPayload {}),
@@ -275,6 +288,7 @@ async fn gemini_event_live_ipc_increments_counter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gemini_event_live_ipc_rate_limited_populates_state() {
     let dir = TempDir::new().unwrap();
+    provision_gemini_slot(dir.path(), 5);
     let envelope = EventEnvelope::new(
         AccountNum::try_from(5u16).unwrap(),
         EventKind::RateLimited(RateLimitedPayload {
@@ -310,6 +324,7 @@ async fn gemini_event_live_ipc_then_ndjson_drain_does_not_double_count() {
     use csq_core::providers::gemini::capture::append_event;
 
     let dir = TempDir::new().unwrap();
+    provision_gemini_slot(dir.path(), 6);
     let envelope = EventEnvelope::new(
         AccountNum::try_from(6u16).unwrap(),
         EventKind::CounterIncrement(EmptyPayload {}),
@@ -394,5 +409,39 @@ async fn gemini_event_live_ipc_rejects_non_gemini_surface() {
     assert!(
         qf.get(1).is_none(),
         "no quota row should exist for rejected event"
+    );
+}
+
+/// PR-G4a — H2 resolution: IPC handler refuses 404 for slots
+/// without a binding marker. PR-G3 deferred this gate (structured
+/// log only) because no marker existed yet; PR-G4a's `csq setkey
+/// gemini` writes `credentials/gemini-<N>.json`, so the daemon
+/// can now distinguish "provisioned" from "phantom".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_event_live_ipc_rejects_event_for_unprovisioned_slot() {
+    let dir = TempDir::new().unwrap();
+    // Note: NO `provision_gemini_slot` call — the slot is unbound.
+    let envelope = EventEnvelope::new(
+        AccountNum::try_from(11u16).unwrap(),
+        EventKind::CounterIncrement(EmptyPayload {}),
+    );
+    let body = serde_json::to_string(&envelope).unwrap();
+
+    with_server(dir.path(), |sock| async move {
+        let resp = http_post_unix_json(&sock, "/api/gemini/event", &body).unwrap();
+        assert_eq!(resp.status, 404, "unprovisioned slot must 404");
+        assert!(
+            resp.body.contains("slot_not_provisioned"),
+            "fixed-vocabulary tag expected: {}",
+            resp.body
+        );
+    })
+    .await;
+
+    // Quota.json must NOT have been mutated.
+    let qf = quota_state::load_state(dir.path()).unwrap();
+    assert!(
+        qf.get(11).is_none(),
+        "no quota row should exist for unprovisioned slot"
     );
 }

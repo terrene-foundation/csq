@@ -8,9 +8,13 @@
 use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::third_party;
 use csq_core::credentials::file as cred_file;
+use csq_core::platform::secret::{self, SecretError, SlotKey};
 use csq_core::providers::catalog::{AuthType, Surface};
+use csq_core::providers::gemini::provisioning::{self, AuthMode, GeminiBinding, ProvisionError};
+use csq_core::providers::gemini::SURFACE_GEMINI;
 use csq_core::types::AccountNum;
 use csq_core::{http, providers};
+use secrecy::SecretString;
 use std::io::Read;
 use std::path::Path;
 
@@ -104,6 +108,164 @@ pub fn handle(
     }
 
     Ok(())
+}
+
+/// `csq setkey gemini --slot N [--vertex-sa-json PATH]`
+///
+/// Per FR-G-CLI-01..03:
+///
+/// - **AI Studio API-key mode** — no `--key` flag; the key is read
+///   from stdin (TTY hidden, piped) and stored in the
+///   platform-native secret vault. The marker file
+///   `credentials/gemini-<N>.json` records `auth.mode=api_key`.
+///   Plaintext NEVER touches `config-<N>/`, argv, or shell history.
+/// - **Vertex SA mode** — `--vertex-sa-json /abs/path/sa.json`.
+///   The path is validated (regular file, ≤ 64 KiB, not a symlink)
+///   and stored in the marker. The vault is unused.
+///
+/// `csq setkey gemini` refuses to overwrite a slot already bound to
+/// Codex (FR-CLI-05 parity) or Anthropic OAuth — re-binding from
+/// another surface requires `csq logout <N>` first.
+pub fn handle_gemini(
+    base_dir: &Path,
+    slot: AccountNum,
+    vertex_sa_json: Option<&Path>,
+) -> Result<()> {
+    refuse_if_slot_bound_to_other_surface(base_dir, slot)?;
+
+    if let Some(sa_path) = vertex_sa_json {
+        return provision_vertex(base_dir, slot, sa_path);
+    }
+
+    provision_api_key(base_dir, slot)
+}
+
+/// FR-CLI-05 parity for Gemini: refuse to clobber a slot that is
+/// already bound to Codex (OAuth device-auth) or Anthropic OAuth.
+/// The user has to `csq logout <N>` first.
+fn refuse_if_slot_bound_to_other_surface(base_dir: &Path, slot: AccountNum) -> Result<()> {
+    if is_codex_bound_slot(base_dir, slot) {
+        return Err(anyhow!(
+            "slot {slot} is bound to Codex — run `csq logout {slot}` to rebind to Gemini"
+        ));
+    }
+    let anthropic_canonical = cred_file::canonical_path_for(base_dir, slot, Surface::ClaudeCode);
+    if std::fs::symlink_metadata(&anthropic_canonical).is_ok() {
+        return Err(anyhow!(
+            "slot {slot} is bound to Claude (Anthropic OAuth) — run `csq logout {slot}` to rebind to Gemini"
+        ));
+    }
+    Ok(())
+}
+
+/// AI Studio API-key provisioning. Reads the key interactively (or
+/// from a piped stdin), validates shape, writes to the vault, then
+/// writes the binding marker. Never touches the vault on validation
+/// failure so a bad key cannot leave a stub credential behind.
+fn provision_api_key(base_dir: &Path, slot: AccountNum) -> Result<()> {
+    let key = read_key_interactive().context("failed to read Gemini API key from stdin")?;
+    if key.is_empty() {
+        return Err(anyhow!("key is empty"));
+    }
+    if !key.starts_with("AIza") {
+        // AI Studio keys all start with `AIza` per Google's public
+        // docs. A non-prefixed key is almost certainly a paste
+        // mistake; refuse rather than write a guaranteed-rejected
+        // entry to the vault.
+        return Err(anyhow!(
+            "expected an AI Studio API key (prefix `AIza`); got {} bytes — for Vertex AI, use --vertex-sa-json instead",
+            key.len()
+        ));
+    }
+
+    let vault = secret::open_default_vault().map_err(map_vault_error)?;
+    let slot_key = SlotKey {
+        surface: SURFACE_GEMINI,
+        account: slot,
+    };
+    vault
+        .set(slot_key, &SecretString::new(key.clone().into()))
+        .map_err(map_vault_error)?;
+
+    let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
+    if let Err(e) = provisioning::write_binding(base_dir, slot, &binding) {
+        // Marker write failed — roll back the vault entry so the
+        // operator can retry without a half-bound state.
+        let _ = vault.delete(slot_key);
+        return Err(map_provision_error(e));
+    }
+
+    println!(
+        "Provisioned Gemini slot {} (AI Studio API key, fingerprint: {}…{})",
+        slot,
+        &key[..4.min(key.len())],
+        &key[key.len().saturating_sub(4)..]
+    );
+    println!("  Launch with: csq run {}", slot);
+    Ok(())
+}
+
+/// Vertex SA provisioning. The path is canonicalised and validated
+/// (regular file, ≤ 64 KiB, not a symlink) BEFORE the marker is
+/// written so a half-bound state cannot result. The JSON itself is
+/// not parsed — gemini-cli does that on first call.
+fn provision_vertex(base_dir: &Path, slot: AccountNum, sa_path: &Path) -> Result<()> {
+    let canon = provisioning::validate_vertex_sa_path(sa_path).map_err(map_provision_error)?;
+    let binding = GeminiBinding::new(
+        AuthMode::VertexSa {
+            path: canon.clone(),
+        },
+        "auto",
+    );
+    provisioning::write_binding(base_dir, slot, &binding).map_err(map_provision_error)?;
+
+    println!(
+        "Provisioned Gemini slot {} (Vertex SA: {})",
+        slot,
+        canon.display()
+    );
+    println!("  Launch with: csq run {}", slot);
+    Ok(())
+}
+
+/// Maps a [`SecretError`] to user-actionable text per
+/// `rules/tauri-commands.md` §6 (no opaque "vault error" tag).
+fn map_vault_error(e: SecretError) -> anyhow::Error {
+    match e {
+        SecretError::BackendUnavailable { reason } => {
+            anyhow!("secret vault unavailable: {reason}")
+        }
+        SecretError::Locked => anyhow!("secret vault is locked — unlock the OS keychain and retry"),
+        SecretError::AuthorizationRequired => {
+            anyhow!("secret vault requires authorisation — approve the keychain prompt and retry")
+        }
+        SecretError::PermissionDenied { reason } => {
+            anyhow!("secret vault denied access: {reason}")
+        }
+        SecretError::Timeout => anyhow!("secret vault timed out — retry shortly"),
+        SecretError::InvalidKey { reason } => anyhow!("invalid Gemini key: {reason}"),
+        other => anyhow!("vault error ({}): {other}", other.error_kind_tag()),
+    }
+}
+
+/// Maps a [`ProvisionError`] to user-actionable text. Vault paths
+/// inside this enum re-use [`map_vault_error`].
+fn map_provision_error(e: ProvisionError) -> anyhow::Error {
+    match e {
+        ProvisionError::Vault(v) => map_vault_error(v),
+        ProvisionError::VertexSaInvalid { path, reason } => {
+            anyhow!("--vertex-sa-json {} rejected: {reason}", path.display())
+        }
+        ProvisionError::Malformed { path, reason } => {
+            anyhow!("binding marker {} is corrupt: {reason}", path.display())
+        }
+        ProvisionError::Io { path, source } => {
+            anyhow!("provisioning I/O at {}: {source}", path.display())
+        }
+        ProvisionError::AtomicReplace { path, reason } => {
+            anyhow!("atomic write at {}: {reason}", path.display())
+        }
+    }
 }
 
 /// Whether slot `N` is currently backed by a Codex canonical

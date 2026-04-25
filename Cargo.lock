@@ -972,6 +972,7 @@ dependencies = [
  "csq-core",
  "dirs 5.0.1",
  "libc",
+ "secrecy",
  "serde",
  "serde_json",
  "tempfile",

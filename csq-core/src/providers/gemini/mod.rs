@@ -51,6 +51,7 @@ pub mod capture;
 pub mod event_id;
 pub mod keyfile;
 pub mod probe;
+pub mod provisioning;
 pub mod settings;
 pub mod spawn;
 pub mod tos_guard;

@@ -35,14 +35,33 @@ pub enum Surface {
     /// `workspaces/codex/02-plans/01-implementation-plan.md`.
     #[serde(rename = "codex")]
     Codex,
+    /// Google Gemini CLI (`gemini`). v2.3 Gemini surface — API-key only
+    /// (NO OAuth subscription rerouting per Google ToS); event-driven
+    /// quota via CLI-durable NDJSON event log; encryption-at-rest via
+    /// `platform::secret::Vault`. See
+    /// `workspaces/gemini/02-plans/01-implementation-plan.md`.
+    #[serde(rename = "gemini")]
+    Gemini,
+}
+
+impl Surface {
+    /// Stable string representation matching the `serde rename` tag.
+    /// Use this everywhere a `&'static str` for the surface tag is
+    /// needed (e.g. `platform::secret::SlotKey::surface`,
+    /// `error::error_kind_tag`) — replaces the const placeholder
+    /// `SURFACE_GEMINI` from PR-G2a.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Surface::ClaudeCode => "claude-code",
+            Surface::Codex => "codex",
+            Surface::Gemini => "gemini",
+        }
+    }
 }
 
 impl std::fmt::Display for Surface {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Surface::ClaudeCode => write!(f, "claude-code"),
-            Surface::Codex => write!(f, "codex"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -51,7 +70,8 @@ impl std::fmt::Display for Surface {
 /// Controls how `csq models switch` rewrites the effective model for
 /// a provider. Determined by how the upstream CLI reads its model
 /// config — Anthropic+3P store in `settings.json` environment
-/// variables; Codex stores in `config.toml`.
+/// variables; Codex stores in `config.toml`; Gemini reads `model.name`
+/// from `~/.gemini/settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelConfigTarget {
     /// Model written to `env.ANTHROPIC_MODEL` inside a settings.json
@@ -60,6 +80,10 @@ pub enum ModelConfigTarget {
     /// Model written to the `model = "..."` key at the root of
     /// `config.toml`. Applies to Codex.
     TomlModelKey,
+    /// Model written to the `model.name` key in `settings.json` for
+    /// the Gemini CLI. Distinct from `EnvInSettingsJson` because
+    /// Gemini reads a top-level `model.name` field, not an env block.
+    GeminiSettingsModelName,
 }
 
 /// Shape of the quota signal the surface exposes.
@@ -239,6 +263,46 @@ pub const PROVIDERS: &[Provider] = &[
         timeout_secs: 30,
         default_auth_token: None,
     },
+    // v2.3 Gemini stub. Surface dispatch lands here in PR-G1; the
+    // spawn pipeline lands in PR-G2b; the NDJSON event log + daemon
+    // consumer in PR-G3; CLI surface dispatch in PR-G4; desktop UI
+    // in PR-G5. The entry exists so `Surface::Gemini` is reachable
+    // via `get_provider("gemini")` for the dispatch-contract tests.
+    //
+    // `auth_type` is `None` because the API key never flows through
+    // an env var or a Provider field — `csq setkey gemini` writes
+    // the key directly into the platform::secret Vault, and the
+    // Vault is read at spawn time. The Provider catalog's `key_env_var`
+    // contract (read from env at spawn) does not apply to Gemini.
+    Provider {
+        id: "gemini",
+        name: "Gemini",
+        surface: Surface::Gemini,
+        model_config: ModelConfigTarget::GeminiSettingsModelName,
+        quota_kind: QuotaKind::Counter,
+        // Auth shape is "Vault-backed API key" — orthogonal to the
+        // existing OAuth / Bearer / None taxonomy. Mark as None so
+        // `providers_with_keys()` does NOT yield Gemini (the existing
+        // env-var key flow does not apply); add a separate predicate
+        // (`providers_using_vault`) for the new Vault-backed path.
+        auth_type: AuthType::None,
+        key_env_var: None,
+        base_url_env_var: None,
+        default_base_url: Some("https://generativelanguage.googleapis.com"),
+        default_model: "gemini-2.5-pro",
+        // Gemini ToS guard EP4 forbids relying on a documented
+        // validation endpoint URL — silent-downgrade detection lives
+        // in csq-cli stderr wrapping per spec 07 §7.2.3.
+        validation_endpoint: None,
+        // Gemini reads its config from `~/.gemini/settings.json`
+        // (system path), not from a csq-managed file. The field is
+        // required by the struct shape; value uniquely identifies the
+        // Gemini entry to satisfy `settings_filenames_unique`.
+        settings_filename: "gemini-settings.json",
+        system_primer: None,
+        timeout_secs: 30,
+        default_auth_token: None,
+    },
 ];
 
 /// Looks up a provider by ID.
@@ -383,5 +447,107 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(toml_providers, vec!["codex"]);
+    }
+
+    // ── PR-G1 regressions ────────────────────────────────────────
+
+    /// Surface::Gemini round-trips through serde with the documented
+    /// kebab-case wire name.
+    #[test]
+    fn surface_gemini_serde_wire_name() {
+        let json = serde_json::to_string(&Surface::Gemini).unwrap();
+        assert_eq!(json, "\"gemini\"");
+        let back: Surface = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Surface::Gemini);
+    }
+
+    /// Surface::as_str matches the serde rename on every variant — so
+    /// any path that hand-formats the surface tag (audit log,
+    /// SlotKey, error_kind_tag) sees the exact same string the wire
+    /// format produces.
+    #[test]
+    fn surface_as_str_matches_serde_wire_name() {
+        for variant in [Surface::ClaudeCode, Surface::Codex, Surface::Gemini] {
+            let serde_form = serde_json::to_string(&variant).unwrap();
+            let trimmed = serde_form.trim_matches('"');
+            assert_eq!(
+                trimmed,
+                variant.as_str(),
+                "as_str() must match serde wire name for {variant:?}"
+            );
+        }
+    }
+
+    /// `Display` writes the same string as `as_str()`. Catches the
+    /// regression where someone updates `as_str` and forgets to
+    /// update `Display` (or vice-versa).
+    #[test]
+    fn surface_display_matches_as_str() {
+        for variant in [Surface::ClaudeCode, Surface::Codex, Surface::Gemini] {
+            assert_eq!(format!("{variant}"), variant.as_str());
+        }
+    }
+
+    /// Gemini stub provider is registered and correctly tagged for
+    /// PR-G1's dispatch contract: API-key only path (auth_type =
+    /// None), event-driven quota (QuotaKind::Counter), Vault-backed
+    /// model writer (GeminiSettingsModelName).
+    #[test]
+    fn gemini_stub_provider_present_and_tagged() {
+        let p = get_provider("gemini").expect("gemini provider should be registered");
+        assert_eq!(p.surface, Surface::Gemini);
+        assert_eq!(p.model_config, ModelConfigTarget::GeminiSettingsModelName);
+        assert_eq!(p.quota_kind, QuotaKind::Counter);
+        // Vault-backed key flow: auth_type stays None so
+        // `providers_with_keys()` does not yield Gemini (the env-var
+        // key flow does not apply).
+        assert_eq!(p.auth_type, AuthType::None);
+        assert!(
+            p.key_env_var.is_none(),
+            "Gemini key MUST NOT be env-sourced"
+        );
+    }
+
+    /// `providers_with_keys()` must NOT yield Gemini — the existing
+    /// "key from env var" predicate would mis-route Gemini through
+    /// the env path otherwise.
+    #[test]
+    fn providers_with_keys_excludes_gemini() {
+        let with_keys: Vec<&str> = providers_with_keys().map(|p| p.id).collect();
+        assert!(
+            !with_keys.contains(&"gemini"),
+            "Gemini key flows via Vault, not env — must not appear in providers_with_keys"
+        );
+    }
+
+    /// `ModelConfigTarget::GeminiSettingsModelName` is reserved for
+    /// the Gemini surface — no other provider writes to
+    /// `~/.gemini/settings.json model.name`.
+    #[test]
+    fn gemini_settings_model_name_used_only_by_gemini() {
+        let providers: Vec<&str> = PROVIDERS
+            .iter()
+            .filter(|p| p.model_config == ModelConfigTarget::GeminiSettingsModelName)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(providers, vec!["gemini"]);
+    }
+
+    /// Settings filenames remain unique after the Gemini stub lands —
+    /// regression for the existing `settings_filenames_unique` test
+    /// which would silently pass a duplicate if Gemini reused
+    /// `codex-config.toml` or `settings.json`.
+    #[test]
+    fn gemini_settings_filename_distinct_from_existing_providers() {
+        let gemini = get_provider("gemini").unwrap();
+        for other in PROVIDERS {
+            if other.id != "gemini" {
+                assert_ne!(
+                    other.settings_filename, gemini.settings_filename,
+                    "{} must not share settings_filename with gemini",
+                    other.id
+                );
+            }
+        }
     }
 }

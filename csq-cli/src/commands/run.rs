@@ -450,6 +450,7 @@ fn resolve_account(base_dir: &Path, explicit: Option<AccountNum>) -> Result<Opti
                 let surface_hint = match a.surface {
                     Surface::ClaudeCode => "",
                     Surface::Codex => " [codex]",
+                    Surface::Gemini => " [gemini]",
                 };
                 msg.push_str(&format!(
                     "  csq run {}  ({}){}\n",

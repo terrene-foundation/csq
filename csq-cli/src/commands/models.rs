@@ -195,6 +195,17 @@ pub fn handle_switch(
                 provider_id, slot_num, model_id
             );
         }
+        ModelConfigTarget::GeminiSettingsModelName => {
+            // PR-G1 stub: the Gemini model writer lands in PR-G4
+            // (csq-cli surface dispatch). Refuse with a clear error
+            // so a user who runs `csq models switch gemini-2.5-pro`
+            // before PR-G4 ships gets an actionable message instead
+            // of silent no-op or a panic.
+            return Err(anyhow!(
+                "{provider_id} model switching requires PR-G4 (csq-cli Gemini surface dispatch); \
+                 not yet implemented in this build"
+            ));
+        }
     }
 
     Ok(())

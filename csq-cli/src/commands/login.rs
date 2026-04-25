@@ -55,10 +55,19 @@ use csq_core::daemon::{self, DaemonClientError, DetectResult};
 pub fn handle(base_dir: &Path, account: AccountNum, provider: &str) -> Result<()> {
     match provider {
         "codex" => return handle_codex(base_dir, account),
+        // FR-G-CLI-06: Gemini has no OAuth login flow — API keys
+        // are provisioned via `csq setkey gemini --slot N`. Refuse
+        // here so an operator who guessed at the provider name
+        // gets a pointer to the right command.
+        "gemini" => {
+            return Err(anyhow!(
+                "gemini uses API keys; run `csq setkey gemini --slot {account}`"
+            ));
+        }
         "claude" | "" => {}
         other => {
             return Err(anyhow!(
-                "unknown --provider {other:?} — supported: claude, codex"
+                "unknown --provider {other:?} — supported: claude, codex, gemini"
             ));
         }
     }

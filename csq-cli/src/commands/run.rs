@@ -66,6 +66,23 @@ pub fn handle(
         return launch_codex(base_dir, account, rest);
     }
 
+    // Gemini dispatch (FR-G-CLI-03): if `credentials/gemini-<N>.json`
+    // exists, route to `launch_gemini`. Per spec 07 §7.5 INV-P02 is
+    // INVERTED for Gemini — no daemon prerequisite, no token
+    // refresh, no fanout. Single `symlink_metadata` check (same
+    // pattern as Codex above) so dispatch is one syscall and a
+    // dangling marker still routes here rather than silently
+    // falling through to a Claude launch.
+    let gemini_canonical = file::canonical_path_for(base_dir, account, Surface::Gemini);
+    if std::fs::symlink_metadata(&gemini_canonical).is_ok() {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for Gemini slots (slot {account} is Gemini, requested: {profile_id})"
+            ));
+        }
+        return launch_gemini(base_dir, &claude_home, account, rest);
+    }
+
     // Ensure config-N exists (permanent account home)
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)?;
@@ -353,6 +370,127 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
 /// `windows_health_check`), so the same DetectResult variants apply
 /// across Unix and Windows. This closes the journal 0015
 /// `#[cfg(not(unix))] Ok(())` carve-out.
+/// Launches gemini-cli for a Gemini-surface slot.
+///
+/// Spec 07 §7.2.3 / §7.5: Gemini does NOT require the daemon for
+/// spawn (INV-P02 inverted). The CLI talks directly to Google's
+/// API via `gemini-cli`; csq's role is to (a) keep the API key in
+/// the platform vault, (b) keep `selectedType=gemini-api-key` in
+/// `<handle_dir>/.gemini/settings.json` (EP1 drift detector), and
+/// (c) honour the 7-layer ToS guard. None of those need the daemon.
+///
+/// Handle dir layout for Gemini is minimal:
+///
+/// ```text
+/// term-<pid>/
+///   .csq-account             # marker file (diagnostic)
+///   .gemini/
+///     settings.json          # written by EP1 drift detector
+/// ```
+///
+/// No `.credentials.json` symlink (Gemini has no Anthropic OAuth
+/// path) and no `config-<N>/` housekeeping beyond what `setkey
+/// gemini` already wrote.
+fn launch_gemini(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    rest: &[String],
+) -> Result<()> {
+    use csq_core::platform::secret;
+    use csq_core::providers::gemini::spawn::spawn_gemini;
+
+    // Refuse symlink at the binding marker — same posture as
+    // `verify_codex_canonical_is_regular_file`. csq writes a
+    // regular file here; a symlink at this path is an external
+    // mutation that deserves an abort.
+    let binding_path = file::canonical_path_for(base_dir, account, Surface::Gemini);
+    let meta = std::fs::symlink_metadata(&binding_path).with_context(|| {
+        format!(
+            "stat {} — Gemini binding missing; run `csq setkey gemini --slot {account}` first",
+            binding_path.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing Gemini launch: {} is a symlink. csq only writes a regular file at this path; a symlink here means an external process mutated the credentials directory. Re-run `csq setkey gemini --slot {account}` to rewrite.",
+            binding_path.display()
+        ));
+    }
+
+    // Ensure ~/.claude/accounts exists. We do NOT create config-N/
+    // for Gemini — the binding marker lives in
+    // ~/.claude/accounts/credentials/, and the per-spawn settings
+    // file lives in the handle dir.
+    let accounts_root = claude_home.join("accounts");
+    std::fs::create_dir_all(&accounts_root).context("failed to create accounts root")?;
+
+    // Minimal handle dir: just the directory + .csq-account marker.
+    // The drift detector (EP1, called inside spawn_gemini) creates
+    // the .gemini/ subdir and writes settings.json.
+    let pid = std::process::id();
+    let handle_dir = base_dir.join(format!("term-{}", pid));
+    std::fs::create_dir_all(&handle_dir).with_context(|| {
+        format!(
+            "failed to create Gemini handle dir at {}",
+            handle_dir.display()
+        )
+    })?;
+    markers::write_csq_account(&handle_dir, account)
+        .context("failed to write .csq-account marker for Gemini handle dir")?;
+
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    // Open the platform-native vault. Failures here are
+    // user-actionable (locked keychain, missing libsecret) — surface
+    // via anyhow rather than panicking.
+    let vault = secret::open_default_vault().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        anyhow!("secret vault unavailable ({}): {e}", e.error_kind_tag())
+    })?;
+
+    println!("Launching gemini for account {} (term-{})...", account, pid);
+
+    // spawn_gemini either execs (Unix) and never returns, exits
+    // (Windows) and never returns, or errors — never produces an
+    // ok value. Map all error variants to anyhow so the binary
+    // surfaces a remediation message.
+    match spawn_gemini(
+        base_dir,
+        &handle_dir_abs,
+        account,
+        rest.to_vec(),
+        vault.as_ref(),
+    ) {
+        Ok(_never) => unreachable!("spawn_gemini returns Infallible on success"),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            Err(map_spawn_error(account, e))
+        }
+    }
+}
+
+/// Maps a [`SpawnError`] to user-actionable anyhow text.
+fn map_spawn_error(
+    account: AccountNum,
+    e: csq_core::providers::gemini::spawn::SpawnError,
+) -> anyhow::Error {
+    use csq_core::providers::gemini::spawn::SpawnError as S;
+    match e {
+        S::ShadowAuth { env_file, variable } => anyhow!(
+            "refusing Gemini spawn — `.env` at {} declares {} which would override the csq-injected key. Remove or rename the file before retrying.",
+            env_file.display(),
+            variable
+        ),
+        S::Probe(p) => anyhow!("Gemini drift detector failed: {p}"),
+        S::Provision(p) => anyhow!("Gemini provisioning state for slot {account} is unusable: {p}"),
+        S::Vault(v) => anyhow!(
+            "Gemini secret vault read failed ({}) for slot {account}: {v}",
+            v.error_kind_tag()
+        ),
+    }
+}
+
 fn require_daemon_healthy(base_dir: &Path) -> Result<()> {
     match daemon::detect_daemon(base_dir) {
         DetectResult::Healthy { .. } => Ok(()),

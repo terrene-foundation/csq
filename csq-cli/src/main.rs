@@ -208,6 +208,24 @@ enum SetkeyCmd {
         #[arg(long)]
         slot: Option<u16>,
     },
+    /// Gemini (AI Studio API key OR Vertex SA JSON path)
+    ///
+    /// The `--key` flag is intentionally absent per FR-G-CLI-03:
+    /// Gemini API keys are read from stdin only so they cannot
+    /// leak into process argv or shell history. Pipe the key, or
+    /// run `csq setkey gemini --slot N` interactively and paste
+    /// at the prompt.
+    Gemini {
+        /// Bind to slot N. Mandatory — Gemini lives per-slot;
+        /// there is no global `settings-gemini.json`.
+        #[arg(long)]
+        slot: u16,
+        /// Provision in Vertex AI mode by pointing at the SA JSON
+        /// file path. When set, no API-key prompt is shown.
+        /// Mutually exclusive with the AI Studio paste flow.
+        #[arg(long)]
+        vertex_sa_json: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -309,11 +327,29 @@ fn main() -> Result<()> {
             commands::logout::handle(&base_dir, account_num, yes)
         }
         Command::Setkey(sk) => {
+            // Gemini's setkey contract is distinct enough (no
+            // --key, mandatory --slot, optional --vertex-sa-json)
+            // that it dispatches through its own handler — see
+            // FR-G-CLI-01..03.
+            if let SetkeyCmd::Gemini {
+                slot,
+                vertex_sa_json,
+            } = sk
+            {
+                let slot_num = AccountNum::try_from(slot)
+                    .map_err(|e| anyhow::anyhow!("invalid --slot: {e}"))?;
+                return commands::setkey::handle_gemini(
+                    &base_dir,
+                    slot_num,
+                    vertex_sa_json.as_deref(),
+                );
+            }
             let (provider, key, slot) = match sk {
                 SetkeyCmd::Mm { key, slot } => ("mm", key, slot),
                 SetkeyCmd::Zai { key, slot } => ("zai", key, slot),
                 SetkeyCmd::Claude { key, slot } => ("claude", key, slot),
                 SetkeyCmd::Ollama { slot } => ("ollama", None, slot),
+                SetkeyCmd::Gemini { .. } => unreachable!("handled above"),
             };
             let slot = match slot {
                 Some(n) => Some(

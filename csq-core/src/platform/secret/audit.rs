@@ -14,7 +14,10 @@
 //! - `ts`: ISO-8601 UTC timestamp
 //! - `op`: `"set"` | `"get"` | `"delete"`
 //! - `slot`: account number (u16)
-//! - `surface`: `"gemini"`
+//! - `surface`: the [`Surface::as_str()`] tag of the surface owning
+//!   the slot — currently `"gemini"` (the only surface using the
+//!   vault). Future surfaces with vault-backed secrets serialize
+//!   their own [`Surface::as_str()`] value here.
 //! - `caller`: short symbolic tag (e.g. `"daemon::usage_poller"`)
 //! - `ok`: bool — whether the operation succeeded
 //! - `error_kind`: present only when `ok = false`; the
@@ -55,7 +58,11 @@ pub struct AuditEntry {
     pub ts: String,
     /// `"set"` | `"get"` | `"delete"`.
     pub op: &'static str,
-    /// Surface tag — currently always `"gemini"`.
+    /// Surface tag — derived from [`crate::providers::catalog::Surface::as_str`]
+    /// on the matching enum variant. Currently `"gemini"` is the only
+    /// reachable value (no other surface uses the vault); the field
+    /// stays `&'static str` to keep `platform::secret` decoupled from
+    /// the catalog layer per H8 in the implementation plan.
     pub surface: &'static str,
     /// Account slot number.
     pub slot: u16,
@@ -279,12 +286,21 @@ fn ymd_to_days(y: i64, m: u32, d: u32) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::catalog::Surface;
     use tempfile::TempDir;
+
+    /// Surface tag for the only vault-using surface today. Resolved
+    /// from [`Surface::Gemini::as_str()`] so the audit-log fixtures
+    /// pivot automatically with any future Surface rename — no literal
+    /// `"gemini"` survives in test code per PR-G2b.
+    ///
+    /// [`Surface::Gemini::as_str()`]: crate::providers::catalog::Surface::as_str
+    const GEMINI: &str = Surface::Gemini.as_str();
 
     #[test]
     fn append_creates_file_with_one_line() {
         let dir = TempDir::new().unwrap();
-        let entry = AuditEntry::ok("get", "gemini", 3, "daemon::usage_poller");
+        let entry = AuditEntry::ok("get", GEMINI, 3, "daemon::usage_poller");
         append(dir.path(), &entry).unwrap();
 
         let content = std::fs::read_to_string(audit_log_path(dir.path())).unwrap();
@@ -300,10 +316,10 @@ mod tests {
     fn err_entry_includes_error_kind_tag() {
         let dir = TempDir::new().unwrap();
         let err = SecretError::NotFound {
-            surface: "gemini",
+            surface: GEMINI,
             account: 5,
         };
-        let entry = AuditEntry::err("get", "gemini", 5, "daemon::usage_poller", &err);
+        let entry = AuditEntry::err("get", GEMINI, 5, "daemon::usage_poller", &err);
         append(dir.path(), &entry).unwrap();
         let content = std::fs::read_to_string(audit_log_path(dir.path())).unwrap();
         let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
@@ -318,7 +334,7 @@ mod tests {
         // if someone adds a `secret_len` or `secret_prefix` field
         // later, the test breaks loudly.
         let dir = TempDir::new().unwrap();
-        let entry = AuditEntry::ok("set", "gemini", 1, "tauri::gemini_provision");
+        let entry = AuditEntry::ok("set", GEMINI, 1, "tauri::gemini_provision");
         append(dir.path(), &entry).unwrap();
         let content = std::fs::read_to_string(audit_log_path(dir.path())).unwrap();
         // Not exhaustive but catches the obvious pattern. A more
@@ -337,7 +353,7 @@ mod tests {
         let old_entry = serde_json::json!({
             "ts": unix_to_iso8601(old_secs),
             "op": "get",
-            "surface": "gemini",
+            "surface": GEMINI,
             "slot": 1,
             "caller": "test",
             "ok": true
@@ -345,7 +361,7 @@ mod tests {
         let fresh_entry = serde_json::json!({
             "ts": unix_to_iso8601(now_secs()),
             "op": "get",
-            "surface": "gemini",
+            "surface": GEMINI,
             "slot": 2,
             "caller": "test",
             "ok": true

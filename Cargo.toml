@@ -42,3 +42,11 @@ base64 = "0.22"
 getrandom = "0.2"
 security-framework = "3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Gemini PR-G2a — encryption-at-rest primitives for the platform::secret
+# fallback path (Linux without Secret Service / explicit opt-in). RustCrypto
+# audited pure Rust; no FFI. argon2 is OWASP 2023 KDF; aes-gcm is the AEAD.
+# zeroize wipes secret material before drop. rpassword reads the fallback
+# passphrase without echo; only required when the file backend is active.
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }

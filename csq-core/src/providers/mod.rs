@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod codex;
+pub mod gemini;
 pub mod models;
 pub mod ollama;
 pub mod settings;

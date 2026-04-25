@@ -34,11 +34,18 @@
 //!
 //! # Out of scope for PR-G2a (deferred per implementation plan)
 //!
-//! - PR-G1: `Surface::Gemini` enum variant + dispatch wiring
-//! - PR-G2b: flip [`SURFACE_GEMINI`] placeholders to enum
 //! - PR-G3: NDJSON event log + daemon consumer + IPC types
 //! - PR-G4: csq-cli `setkey gemini` / `models switch` / `swap` paths
 //! - PR-G5: desktop UI (AddAccountModal, ChangeModelModal)
+//!
+//! # Resolved by PR-G1 (this build)
+//!
+//! - `Surface::Gemini` enum variant exists at
+//!   [`crate::providers::catalog::Surface::Gemini`]; the
+//!   [`SURFACE_GEMINI`] const now resolves to `Surface::Gemini.as_str()`
+//!   instead of a string literal.
+//! - Per-site dispatch (refresher skip, swap refusal, model-switch
+//!   refusal-with-message) is wired across the workspace.
 
 pub mod capture;
 pub mod keyfile;
@@ -48,13 +55,14 @@ pub mod spawn;
 pub mod tos_guard;
 
 /// Surface tag for [`platform::secret::SlotKey`] and audit-log
-/// entries. Const placeholder until PR-G1 ships
-/// `Surface::Gemini::as_str()` — the implementation plan explicitly
-/// uses this pattern (M3) so PR-G2a can land before the Surface
-/// enum extension.
+/// entries. Resolves to [`Surface::Gemini::as_str()`] now that PR-G1
+/// has shipped the enum variant; the placeholder shape is kept so
+/// existing PR-G2a call sites (`spawn`, `capture`, `keyfile`) do not
+/// need to import the enum directly.
 ///
 /// [`platform::secret::SlotKey`]: crate::platform::secret::SlotKey
-pub const SURFACE_GEMINI: &str = "gemini";
+/// [`Surface::Gemini::as_str()`]: crate::providers::catalog::Surface::as_str
+pub const SURFACE_GEMINI: &str = crate::providers::catalog::Surface::Gemini.as_str();
 
 /// The CLI binary name csq spawns. Centralized so the spawn-banning
 /// lint test can grep exactly one place for the string. Any future

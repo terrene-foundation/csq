@@ -194,12 +194,21 @@ pub fn canonical_path(base_dir: &Path, account: AccountNum) -> PathBuf {
 /// |-------------|--------------------------------------------|
 /// | ClaudeCode  | `{base_dir}/credentials/{N}.json`          |
 /// | Codex       | `{base_dir}/credentials/codex-{N}.json`    |
+/// | Gemini      | `{base_dir}/credentials/gemini-{N}.json`*  |
 ///
 /// The Codex path shape is fixed by spec 07 §7.2.2.
+///
+/// **Gemini caveat**: Gemini does NOT use a canonical credential
+/// file. The API key flows through `platform::secret::Vault` and the
+/// daemon refresher / credential writer skip the Gemini surface
+/// entirely. The path is returned for API symmetry only — calling
+/// `save` on it is a logic bug. PR-G2b will gate the writer call
+/// sites; for PR-G1 the path exists so the dispatch chain compiles.
 pub fn canonical_path_for(base_dir: &Path, account: AccountNum, surface: Surface) -> PathBuf {
     let filename = match surface {
         Surface::ClaudeCode => format!("{}.json", account),
         Surface::Codex => format!("codex-{}.json", account),
+        Surface::Gemini => format!("gemini-{}.json", account),
     };
     base_dir.join("credentials").join(filename)
 }
@@ -219,12 +228,17 @@ pub fn live_path(base_dir: &Path, account: AccountNum) -> PathBuf {
 /// |-------------|------------------------------|
 /// | ClaudeCode  | `.credentials.json`          |
 /// | Codex       | `codex-auth.json`            |
+/// | Gemini      | `.gemini-creds.json`*        |
 ///
 /// The Codex path shape is fixed by spec 07 §7.2.2.
+///
+/// **Gemini caveat**: same as [`canonical_path_for`] — Gemini does
+/// not use a live mirror; the path is returned for API symmetry only.
 pub fn live_path_for(base_dir: &Path, account: AccountNum, surface: Surface) -> PathBuf {
     let filename = match surface {
         Surface::ClaudeCode => ".credentials.json",
         Surface::Codex => "codex-auth.json",
+        Surface::Gemini => ".gemini-creds.json",
     };
     base_dir.join(format!("config-{}", account)).join(filename)
 }

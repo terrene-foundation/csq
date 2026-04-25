@@ -301,6 +301,11 @@ fn cross_surface_exec(
     match target_surface {
         Surface::Codex => exec_codex(base_dir, target, pid),
         Surface::ClaudeCode => exec_claude_code(base_dir, target, pid),
+        Surface::Gemini => Err(anyhow::anyhow!(
+            "swap to Gemini account is not supported in this build — \
+             cross-surface swap dispatch lands in PR-G4. \
+             Start a fresh Gemini session with `csq run <slot>` instead"
+        )),
     }
 }
 

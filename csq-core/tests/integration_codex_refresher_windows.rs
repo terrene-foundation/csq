@@ -111,6 +111,7 @@ async fn windows_named_pipe_surface_dispatch_refresher_cycle() {
         discovery_cache,
         base_dir: Arc::new(base.to_path_buf()),
         oauth_store: None,
+        gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
     };
     let (server_handle, server_join) = server_windows::serve(&pipe_name, state).await.unwrap();
 

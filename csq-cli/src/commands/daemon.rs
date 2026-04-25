@@ -106,11 +106,17 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
             // Router state: refresh cache + discovery cache +
             // base_dir + OAuth store. Arc'd so per-request
             // State clones stay cheap.
+            // Shared Gemini consumer state — same applied-set + quota
+            // mutex as the NDJSON drainer (PR-G3, spec 05 §5.8.1).
+            let gemini_consumer =
+                csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default();
+
             let router_state = daemon::server::RouterState {
                 cache: Arc::clone(&refresh_cache),
                 discovery_cache: Arc::clone(&discovery_cache),
                 base_dir: Arc::new(base_dir_for_runtime.clone()),
                 oauth_store: Some(Arc::clone(&oauth_store)),
+                gemini_consumer: gemini_consumer.clone(),
             };
 
             // PR-C4: clamp Codex invariants before any subsystem starts.
@@ -167,8 +173,20 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         base_dir_for_runtime.clone(),
                         http_get,
                         http_post_probe,
+                        gemini_consumer.clone(),
                         shutdown.clone(),
                     );
+
+                    // Gemini midnight-LA reset task — zeroes the
+                    // per-day request counter at midnight LA per
+                    // ADR-G05. Cancellation-aware via the shared
+                    // shutdown token.
+                    let gemini_midnight =
+                        tokio::spawn(csq_core::daemon::usage_poller::gemini::run_midnight_reset(
+                            base_dir_for_runtime.clone(),
+                            gemini_consumer.clone(),
+                            shutdown.clone(),
+                        ));
 
                     // Start the background auto-rotation loop (PR-A1).
                     // Walks term-<pid>/ handle dirs and calls
@@ -230,6 +248,20 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                         Ok(Ok(())) => tracing::info!("usage poller stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "usage poller task panicked"),
                         Err(_) => tracing::warn!("usage poller did not stop within 5s deadline"),
+                    }
+
+                    // Await the Gemini midnight-LA reset task with a
+                    // 5s deadline.
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), gemini_midnight)
+                        .await
+                    {
+                        Ok(Ok(())) => tracing::info!("gemini midnight reset stopped cleanly"),
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "gemini midnight reset task panicked")
+                        }
+                        Err(_) => {
+                            tracing::warn!("gemini midnight reset did not stop within 5s deadline")
+                        }
                     }
 
                     // Await the auto-rotation loop with a 5s deadline.

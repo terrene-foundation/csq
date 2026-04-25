@@ -52,6 +52,7 @@
 
 pub mod anthropic;
 pub mod codex;
+pub mod gemini;
 pub mod minimax;
 pub mod third_party;
 pub mod zai;
@@ -131,17 +132,21 @@ pub struct PollerHandle {
 /// Spawns the usage poller task on the current tokio runtime.
 ///
 /// Polls Anthropic accounts every 5 minutes and 3P accounts every
-/// 15 minutes, using separate transport closures for each.
+/// 15 minutes, using separate transport closures for each. Drains
+/// Gemini NDJSON event logs every Anthropic-tick (single shared
+/// state with the live IPC route — spec 05 §5.8.1).
 pub fn spawn(
     base_dir: PathBuf,
     http_get: HttpGetFn,
     http_post_probe: HttpPostProbeFn,
+    gemini_consumer: gemini::GeminiConsumerState,
     shutdown: CancellationToken,
 ) -> PollerHandle {
     spawn_with_config(
         base_dir,
         http_get,
         http_post_probe,
+        gemini_consumer,
         shutdown,
         POLL_INTERVAL,
         POLL_INTERVAL_3P,
@@ -150,10 +155,12 @@ pub fn spawn(
 }
 
 /// Like [`spawn`] but with explicit intervals + startup delay for testing.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_with_config(
     base_dir: PathBuf,
     http_get: HttpGetFn,
     http_post_probe: HttpPostProbeFn,
+    gemini_consumer: gemini::GeminiConsumerState,
     shutdown: CancellationToken,
     interval: Duration,
     interval_3p: Duration,
@@ -187,6 +194,7 @@ pub fn spawn_with_config(
                 cooldowns_3p: Arc::clone(&cooldowns_3p),
                 backoffs_3p: Arc::clone(&backoffs_3p),
                 codex_breakers: Arc::clone(&codex_breakers),
+                gemini_consumer: gemini_consumer.clone(),
                 shutdown: shutdown.clone(),
                 interval,
                 interval_3p,
@@ -240,6 +248,10 @@ struct RunLoopConfig {
     backoffs_3p: Arc<Mutex<HashMap<u16, u32>>>,
     /// Circuit-breaker state keyed per-Codex-account.
     codex_breakers: codex::BreakerMap,
+    /// Shared dedup + quota-mutex state for the Gemini consumer.
+    /// Drain runs every tick; the live IPC route in `server::router`
+    /// holds the same `quota_lock` so concurrent applies serialise.
+    gemini_consumer: gemini::GeminiConsumerState,
     shutdown: CancellationToken,
     interval: Duration,
     interval_3p: Duration,
@@ -270,6 +282,15 @@ async fn run_loop(cfg: RunLoopConfig) {
         debug!("usage poller heartbeat — tick starting");
         anthropic::tick(&cfg.base_dir, &cfg.http_get, &cfg.cooldowns, &cfg.backoffs).await;
         codex::tick(&cfg.base_dir, &cfg.http_get, &cfg.codex_breakers).await;
+        // Gemini drain: synchronous filesystem work, run on the
+        // blocking pool so it does not stall the async runtime when
+        // many slot files are present.
+        let base_dir_for_drain = cfg.base_dir.clone();
+        let gemini_state_for_drain = cfg.gemini_consumer.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            gemini::drain_all(&base_dir_for_drain, &gemini_state_for_drain);
+        })
+        .await;
 
         if last_3p_tick.elapsed() >= cfg.interval_3p {
             third_party::tick_3p(

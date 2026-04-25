@@ -316,6 +316,7 @@ mod tests {
             discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
             base_dir: Arc::new(std::path::PathBuf::from(r"C:\Temp\csq-test")),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
         }
     }
 

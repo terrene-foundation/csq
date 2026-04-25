@@ -333,11 +333,16 @@ async fn run_daemon(
             http::post_json_with_headers(url, headers, body)
         });
 
+    // Shared Gemini consumer state — same applied-set + quota mutex
+    // as the NDJSON drainer (PR-G3, spec 05 §5.8.1).
+    let gemini_consumer = csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default();
+
     let router_state = daemon_server::RouterState {
         cache: Arc::clone(&refresh_cache),
         discovery_cache: Arc::clone(&discovery_cache),
         base_dir: Arc::new(base_dir.to_path_buf()),
         oauth_store: Some(Arc::clone(&oauth_store)),
+        gemini_consumer: gemini_consumer.clone(),
     };
 
     // PR-C4: reconciler clamps Codex invariants (canonical 0o400 +
@@ -368,8 +373,15 @@ async fn run_daemon(
         base_dir.to_path_buf(),
         http_get,
         http_post_probe,
+        gemini_consumer.clone(),
         shutdown.clone(),
     );
+    // Gemini midnight-LA reset task (PR-G3, ADR-G05).
+    let gemini_midnight = tokio::spawn(csq_core::daemon::usage_poller::gemini::run_midnight_reset(
+        base_dir.to_path_buf(),
+        gemini_consumer.clone(),
+        shutdown.clone(),
+    ));
     // PR-A1: pass claude_home so the rotator can re-materialize
     // settings.json after each handle dir repoint. Reuse the same
     // dirs::home_dir() resolution the sweep uses. None → rotator no-op.
@@ -409,6 +421,7 @@ async fn run_daemon(
     // can't wedge app shutdown. The same 5s budget the CLI uses.
     let _ = tokio::time::timeout(Duration::from_secs(5), refresher.join).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), usage_poller.join).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), gemini_midnight).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), auto_rotator.join).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), sweep.join).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), server_join).await;

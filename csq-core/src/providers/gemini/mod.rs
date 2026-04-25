@@ -48,6 +48,7 @@
 //!   refusal-with-message) is wired across the workspace.
 
 pub mod capture;
+pub mod event_id;
 pub mod keyfile;
 pub mod probe;
 pub mod settings;

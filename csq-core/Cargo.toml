@@ -55,6 +55,13 @@ secret-service.workspace = true
 # `windows-sys` crate is a thin set of FFI bindings and is the same
 # dependency `tauri` and `tokio` already pull in on Windows, so no
 # new transitive graph.
+#
+# Gemini PR-G2a.3 adds two more feature groups so the secret module
+# can call Credential Manager (CredWriteW/CredReadW/CredDeleteW/
+# CredEnumerateW/CredFree) and refuse to start as `LocalSystem`
+# (TokenUser query + IsWellKnownSid). DPAPI binds to the user profile;
+# a daemon launched as SYSTEM would have a different DPAPI scope from
+# a user-launched CLI, breaking the multi-process credential view.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
@@ -62,6 +69,8 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
+    "Win32_Security",
+    "Win32_Security_Credentials",
 ] }
 
 [features]

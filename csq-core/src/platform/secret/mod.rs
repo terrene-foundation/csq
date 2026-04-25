@@ -75,6 +75,12 @@ pub const VAULT_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// trading "occasional thread detach" for "daemon never hangs" is
 /// the correct posture for a credential-handling primitive
 /// (`security.md` §6 "fail-closed on Keychain/lock contention").
+///
+/// Compiled only on platforms whose backends actually call it
+/// (`macos` and `windows`); the Linux backend uses its own tokio-
+/// based `block_with_timeout` because the upstream crate is
+/// async-only.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn run_with_timeout<F, T>(thread_name: &'static str, op: F) -> Result<T, SecretError>
 where
     F: FnOnce() -> Result<T, SecretError> + Send + 'static,

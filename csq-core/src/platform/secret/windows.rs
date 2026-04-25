@@ -377,7 +377,10 @@ fn map_error_code(operation: &'static str, code: u32) -> SecretError {
 /// the security boundary we are protecting).
 pub fn check_local_system_posture() -> Result<bool, SecretError> {
     let process = unsafe { GetCurrentProcess() };
-    let mut token: HANDLE = ptr::null_mut();
+    // `HANDLE` in windows-sys 0.52 is `isize`, not a raw pointer.
+    // 0 / `INVALID_HANDLE_VALUE` is the documented sentinel for an
+    // unopened handle.
+    let mut token: HANDLE = 0;
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         let code = unsafe { GetLastError() };
         return Err(SecretError::BackendUnavailable {
@@ -637,6 +640,8 @@ mod tests {
 
     #[test]
     fn open_windows_default_refuses_file_override() {
+        // `Box<dyn Vault>` is not `Debug` so we cannot use the
+        // `{other:?}` shorthand — explicit arms instead.
         match open_windows_default(Some("file")) {
             Err(SecretError::BackendUnavailable { reason }) => {
                 assert!(
@@ -644,7 +649,8 @@ mod tests {
                     "reason must explain why file is refused on Windows, got: {reason}"
                 );
             }
-            other => panic!("expected BackendUnavailable, got {other:?}"),
+            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected BackendUnavailable, got Ok"),
         }
     }
 
@@ -654,7 +660,8 @@ mod tests {
             Err(SecretError::BackendUnavailable { reason }) => {
                 assert!(reason.contains("typo"));
             }
-            other => panic!("expected BackendUnavailable, got {other:?}"),
+            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected BackendUnavailable, got Ok"),
         }
     }
 }

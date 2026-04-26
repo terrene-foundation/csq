@@ -77,6 +77,43 @@ impl ModelCatalog {
                         "glm-5".into(),
                     ],
                 },
+                // Gemini — static list per FR-G-UI-02 / ADR-G08.
+                // `auto` is handled as a literal in the
+                // `models switch gemini` branch, NOT as a catalog
+                // entry — it instructs gemini-cli to pick rather
+                // than pinning a specific id.
+                ModelInfo {
+                    id: "gemini-2.5-pro".into(),
+                    name: "Gemini 2.5 Pro".into(),
+                    provider: "gemini".into(),
+                    context_window: Some(2_000_000),
+                    output_limit: Some(8_192),
+                    aliases: vec!["pro".into(), "2.5-pro".into()],
+                },
+                ModelInfo {
+                    id: "gemini-2.5-flash".into(),
+                    name: "Gemini 2.5 Flash".into(),
+                    provider: "gemini".into(),
+                    context_window: Some(1_000_000),
+                    output_limit: Some(8_192),
+                    aliases: vec!["flash".into(), "2.5-flash".into()],
+                },
+                ModelInfo {
+                    id: "gemini-2.5-flash-lite".into(),
+                    name: "Gemini 2.5 Flash Lite".into(),
+                    provider: "gemini".into(),
+                    context_window: Some(1_000_000),
+                    output_limit: Some(8_192),
+                    aliases: vec!["flash-lite".into(), "2.5-flash-lite".into()],
+                },
+                ModelInfo {
+                    id: "gemini-3-pro-preview".into(),
+                    name: "Gemini 3 Pro (preview)".into(),
+                    provider: "gemini".into(),
+                    context_window: Some(2_000_000),
+                    output_limit: Some(8_192),
+                    aliases: vec!["3-pro-preview".into(), "3-pro".into()],
+                },
             ],
         }
     }

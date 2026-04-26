@@ -2,6 +2,23 @@
 
 All notable changes to csq are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbering follows [Semantic Versioning](https://semver.org/).
 
+## [2.3.1] — 2026-04-26
+
+Patch release on v2.3.0. Closes the desktop-side orphan-key risk that landed alongside the v2.3.0 Gemini surface, and rides one cosmetic csq-cli cleanup. No new features, no schema changes, no behavior change for users who never bind a Gemini account.
+
+See `docs/releases/v2.3.1.md` for the full release notes.
+
+### Fixed
+
+- **D7 — desktop "remove Gemini account" deletes the OS keychain entry.** v2.3.0's CLI `csq logout N` cleared the vault; the desktop `remove_account` Tauri command did not, leaving the `gemini/<slot>` entry orphaned in the OS keychain after a desktop-driven removal. New `csq_core::providers::gemini::provisioning::delete_api_key_from_vault(base_dir, slot, vault)` reads the binding marker, calls `vault.delete` for `ApiKey` slots, and is a no-op for `VertexSa` slots or absent markers. `remove_account` calls it before touching the marker; `LogoutError::NotConfigured` is treated as success when the Gemini marker was removed (covers Gemini-only slots with no `config-N/`). Four new csq-core unit tests + two new csq-desktop integration tests pin the regression. Total: 1475 Rust tests (was 1469).
+- **CI: `secret-in-memory` reachable in csq-desktop test builds.** `open_default_vault` gates the in-memory backend on `cfg!(any(test, feature = "secret-in-memory"))`, but `cfg!(test)` only fires when csq-core itself is being compiled with `--test`. csq-desktop's test build loads csq-core as a normal dep, so the gate was false on Linux + Windows runners (no OS keyring reachable) and the new D7 test fell through to `BackendUnavailable`. Fix: add `csq-core = { path = "...", features = ["secret-in-memory"] }` to csq-desktop's `[dev-dependencies]`. Cargo unifies features across `[dependencies]` and `[dev-dependencies]` of the same crate, so the in-memory backend is now reachable in `cargo test` builds and stays absent from `cargo build --release`.
+
+### Changed
+
+- **csq-cli — collapse Gemini orchestration to csq-core helpers.** `csq-cli/src/commands/setkey.rs::provision_api_key` now calls `csq_core::providers::gemini::provisioning::provision_api_key_via_vault` directly instead of re-implementing the vault-set + write-binding + rollback dance. `csq-cli/src/commands/models.rs::write_gemini_model_to_binding` now calls `set_model_name`. ~30 LOC of duplication collapsed; no behavior change. The `AIza` prefix guard, error mapping, and user-facing print output stay in csq-cli where they belong.
+
+---
+
 ## [2.3.0] — 2026-04-26
 
 Gemini as a first-class third surface alongside ClaudeCode and Codex: API-key provisioning (AI Studio paste or Vertex SA JSON path) under `platform::secret` encryption-at-rest, in-flight `csq swap` between Gemini slots, cross-surface swap with the existing v2.1.0 confirm + tombstone path, `csq run` that does not require a running daemon (a deliberate inversion of v2.1.0's INV-P02 for Codex), event-driven quota via a CLI-durable NDJSON event log, a 7-layer Terms-of-Service defense (EP1–EP7) pinned to gemini-cli 0.38.x, and a desktop UI mirroring the ClaudeCode and Codex flows. No schema migration; quota.json stays at v2.

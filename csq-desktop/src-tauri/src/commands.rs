@@ -3431,4 +3431,93 @@ mod tests {
             "remove_account for ClaudeCode slot must succeed: {result:?}"
         );
     }
+
+    /// D7 real-keychain smoke: drives the bind → remove flow against
+    /// the default `platform::secret` backend (macOS Keychain on this
+    /// host, libsecret on Linux, DPAPI/Cred-Manager on Windows).
+    ///
+    /// `#[ignore]` so it does not run in CI — the OS keychain may
+    /// require an unlocked login keychain or be unavailable on
+    /// headless runners. Invoke explicitly with:
+    ///
+    ///   cargo test --package csq-desktop-lib \
+    ///     remove_account_d7_real_keychain_smoke -- --ignored --nocapture
+    ///
+    /// Slot 99 is well above any realistic account count to avoid
+    /// clobbering live slots. If the test fails to clean up, the
+    /// stranded keychain entry can be removed manually with
+    /// `security delete-generic-password -s csq.gemini.99 -a csq`
+    /// (macOS).
+    #[test]
+    #[ignore]
+    fn remove_account_d7_real_keychain_smoke() {
+        use csq_core::platform::secret::{SecretError, SlotKey};
+        use csq_core::providers::gemini::provisioning::{
+            is_gemini_bound_slot, provision_api_key_via_vault,
+        };
+        use csq_core::providers::gemini::SURFACE_GEMINI;
+        use secrecy::SecretString;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let slot_num = AccountNum::try_from(99u16).unwrap();
+        let slot_key = SlotKey {
+            surface: SURFACE_GEMINI,
+            account: slot_num,
+        };
+
+        let vault = csq_core::platform::secret::open_default_vault()
+            .expect("default vault must open on this platform");
+
+        // Pre-condition: slot 99 must NOT exist in the vault. If it
+        // does, the previous run did not clean up — refuse to proceed
+        // rather than overwrite a real entry.
+        match vault.get(slot_key) {
+            Err(SecretError::NotFound { .. }) => {}
+            Err(e) => panic!("unexpected vault error during pre-check: {e:?}"),
+            Ok(_) => panic!(
+                "vault entry for slot 99 already exists — clean up with \
+                 `security delete-generic-password -s csq.gemini.99 -a csq` \
+                 (macOS) or the platform equivalent before re-running"
+            ),
+        }
+
+        let fake_key = SecretString::new("AIza-csq-d7-smoke-not-a-real-key".into());
+        provision_api_key_via_vault(base, slot_num, &fake_key, vault.as_ref())
+            .expect("provision_api_key_via_vault must succeed");
+
+        assert!(
+            is_gemini_bound_slot(base, slot_num),
+            "binding marker must exist after provisioning"
+        );
+        // Vault entry must exist (a fresh vault handle reads the same
+        // platform-native store).
+        let v2 = csq_core::platform::secret::open_default_vault().unwrap();
+        v2.get(slot_key)
+            .expect("vault must contain the provisioned key");
+
+        // Drive the desktop's remove path against the same base_dir.
+        let result = remove_account(base.to_string_lossy().into_owned(), 99);
+        assert!(result.is_ok(), "remove_account must succeed: {result:?}");
+
+        assert!(
+            !is_gemini_bound_slot(base, slot_num),
+            "binding marker must be removed by remove_account"
+        );
+
+        // Vault entry MUST be gone — re-open a fresh vault to bypass
+        // any per-instance caching and confirm the platform-native
+        // store no longer holds the slot.
+        let v3 = csq_core::platform::secret::open_default_vault().unwrap();
+        match v3.get(slot_key) {
+            Err(SecretError::NotFound { .. }) => {}
+            Err(e) => panic!("unexpected vault error during post-check: {e:?}"),
+            Ok(_) => panic!(
+                "D7 REGRESSION: vault entry for slot 99 still exists \
+                 after remove_account — `delete_api_key_from_vault` \
+                 path is broken. Manually clean with \
+                 `security delete-generic-password -s csq.gemini.99 -a csq`."
+            ),
+        }
+    }
 }

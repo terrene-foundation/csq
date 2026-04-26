@@ -304,6 +304,82 @@ pub fn validate_vertex_sa_path(path: &Path) -> Result<PathBuf, ProvisionError> {
     Ok(abs)
 }
 
+/// Deletes the API-key vault entry for a slot, if and only if the slot is
+/// currently bound in `ApiKey` mode.
+///
+/// - **ApiKey mode**: calls `vault.delete(slot_key)`. The vault contract
+///   guarantees `delete` is idempotent — a `NotFound` from the vault is
+///   treated as success (the key was already absent; the caller should
+///   still remove the binding marker).
+/// - **VertexSa mode**: no-op. Vertex SA slots hold no material in the
+///   vault — the credential is the SA JSON file at the path stored in the
+///   marker, which `logout_account` removes via `config-N/` deletion.
+/// - **Absent marker**: no-op. If the marker is missing the slot was
+///   never fully provisioned; no vault entry can exist.
+///
+/// Called by the desktop `remove_account` command BEFORE
+/// `logout_account` deletes the binding marker. The marker deletion
+/// by `logout_account` removes `credentials/gemini-<N>.json` as part
+/// of the `config-N/` recursive removal — the vault delete MUST happen
+/// first so the auth mode is still readable.
+///
+/// # Errors
+///
+/// Returns an error only when the vault is genuinely unavailable (not
+/// merely `NotFound`). Callers should map this to a fixed "vault
+/// unavailable" string per `security.md` MUST 2 — do NOT echo the
+/// raw `SecretError` body.
+pub fn delete_api_key_from_vault(
+    base_dir: &Path,
+    slot: AccountNum,
+    vault: &dyn Vault,
+) -> Result<(), SecretError> {
+    // Read the binding marker to determine the auth mode. Missing marker →
+    // slot was never fully bound → no vault entry to clean up.
+    let binding = match read_binding(base_dir, slot) {
+        Ok(b) => b,
+        Err(ProvisionError::Io { ref source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(());
+        }
+        // Malformed or unreadable marker: we cannot determine the auth
+        // mode, so attempt a best-effort vault delete. This is safe —
+        // `delete` is idempotent and the slot was going to be removed
+        // anyway. Prefer erring on the side of cleaning up over leaving
+        // a stale vault entry.
+        Err(_) => {
+            let slot_key = SlotKey {
+                surface: SURFACE_GEMINI,
+                account: slot,
+            };
+            return match vault.delete(slot_key) {
+                Ok(()) => Ok(()),
+                Err(SecretError::NotFound { .. }) => Ok(()),
+                Err(e) => Err(e),
+            };
+        }
+    };
+
+    // Only ApiKey slots have vault material.
+    match binding.auth {
+        AuthMode::ApiKey => {
+            let slot_key = SlotKey {
+                surface: SURFACE_GEMINI,
+                account: slot,
+            };
+            match vault.delete(slot_key) {
+                Ok(()) => Ok(()),
+                // Already absent — idempotent success.
+                Err(SecretError::NotFound { .. }) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+        // Vertex SA: credential is the SA JSON file, not in the vault.
+        AuthMode::VertexSa { .. } => Ok(()),
+    }
+}
+
 /// Removes the binding marker. Does NOT touch the vault entry —
 /// callers that want a full unbind invoke `Vault::delete` separately
 /// so the audit log emits both events distinctly.
@@ -865,5 +941,97 @@ mod tests {
     fn bound_surface_as_tag_is_stable() {
         assert_eq!(BoundSurface::ClaudeCode.as_tag(), "claude_code");
         assert_eq!(BoundSurface::Codex.as_tag(), "codex");
+    }
+
+    // ── delete_api_key_from_vault ────────────────────────────────────────────
+
+    /// D7 regression: provisioning via vault then calling
+    /// `delete_api_key_from_vault` must remove the vault entry so a
+    /// future `vault.get` returns `NotFound`. The binding marker is NOT
+    /// touched here — `logout_account` owns that via config-N removal.
+    #[test]
+    fn delete_api_key_from_vault_removes_vault_entry_for_api_key_slot() {
+        let dir = TempDir::new().unwrap();
+        let vault = InMemoryVault::new();
+        let key = SecretString::new("AIzaSyTEST_DELETE_D7_xxxxxxxxxxxxxxxxxxxxxx".into());
+
+        // Provision the slot (writes vault + marker).
+        provision_api_key_via_vault(dir.path(), slot(6), &key, &vault).unwrap();
+
+        // Confirm vault has the entry before delete.
+        assert!(vault
+            .get(SlotKey {
+                surface: SURFACE_GEMINI,
+                account: slot(6)
+            })
+            .is_ok());
+
+        // Delete the vault entry.
+        delete_api_key_from_vault(dir.path(), slot(6), &vault).unwrap();
+
+        // Vault entry must be gone.
+        let after = vault.get(SlotKey {
+            surface: SURFACE_GEMINI,
+            account: slot(6),
+        });
+        assert!(
+            matches!(after, Err(SecretError::NotFound { .. })),
+            "vault entry must be NotFound after delete_api_key_from_vault, got: {after:?}"
+        );
+
+        // Marker is still present — we only deleted the vault entry.
+        assert!(
+            is_gemini_bound_slot(dir.path(), slot(6)),
+            "binding marker must survive delete_api_key_from_vault"
+        );
+    }
+
+    /// Calling `delete_api_key_from_vault` on a VertexSa slot is a no-op
+    /// — no vault entry is ever written for Vertex SA mode.
+    #[test]
+    fn delete_api_key_from_vault_is_noop_for_vertex_sa_slot() {
+        let dir = TempDir::new().unwrap();
+        let vault = InMemoryVault::new();
+        let sa = dir.path().join("sa.json");
+        std::fs::write(&sa, br#"{"type":"service_account"}"#).unwrap();
+
+        provision_vertex_sa(dir.path(), slot(7), &sa).unwrap();
+
+        // No vault entry was created.
+        let before = vault.get(SlotKey {
+            surface: SURFACE_GEMINI,
+            account: slot(7),
+        });
+        assert!(matches!(before, Err(SecretError::NotFound { .. })));
+
+        // delete_api_key_from_vault on a VertexSa slot must succeed without
+        // touching anything.
+        delete_api_key_from_vault(dir.path(), slot(7), &vault).unwrap();
+    }
+
+    /// `delete_api_key_from_vault` on an absent marker (slot never bound)
+    /// must be a no-op and return Ok.
+    #[test]
+    fn delete_api_key_from_vault_is_noop_when_marker_absent() {
+        let dir = TempDir::new().unwrap();
+        let vault = InMemoryVault::new();
+        // No binding has been written for slot 8.
+        delete_api_key_from_vault(dir.path(), slot(8), &vault).unwrap();
+    }
+
+    /// Calling `delete_api_key_from_vault` twice on the same ApiKey slot
+    /// must be idempotent — second call returns Ok even though the vault
+    /// entry is already gone.
+    #[test]
+    fn delete_api_key_from_vault_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let vault = InMemoryVault::new();
+        let key = SecretString::new("AIzaSyTEST_IDEM_D7_xxxxxxxxxxxxxxxxxxxxxx".into());
+
+        provision_api_key_via_vault(dir.path(), slot(9), &key, &vault).unwrap();
+
+        delete_api_key_from_vault(dir.path(), slot(9), &vault).unwrap();
+        // Second call with vault entry already absent — must still be Ok.
+        delete_api_key_from_vault(dir.path(), slot(9), &vault).unwrap();
     }
 }

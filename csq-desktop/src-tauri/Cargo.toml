@@ -37,3 +37,4 @@ tauri-plugin-dialog = "2"
 
 [dev-dependencies]
 tempfile.workspace = true
+csq-core = { path = "../../csq-core", features = ["secret-in-memory"] }

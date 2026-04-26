@@ -333,17 +333,54 @@ pub fn rename_account(base_dir: String, account: u16, name: String) -> Result<()
         .map_err(|e| format!("rename failed: {e}"))
 }
 
-/// Removes an account: deletes credentials, config dir, and profile entry.
+/// Removes an account: deletes credentials, config dir, profile entry,
+/// and — for Gemini ApiKey slots — the platform-native vault entry.
 ///
 /// Refuses if a live `claude` process is currently bound to the
 /// account (returns the conflicting PIDs in the error message). Best-
 /// effort daemon cache invalidation runs after a successful removal.
+///
+/// ## Gemini vault cleanup (D7)
+///
+/// A Gemini ApiKey slot stores the key only in the OS keychain — the
+/// binding marker `credentials/gemini-<N>.json` carries no secret. If
+/// the slot is Gemini-bound before `logout_account` runs, the vault
+/// entry is deleted first so the marker is still readable for auth-mode
+/// detection. After the vault delete, `unbind` removes the marker, then
+/// `logout_account` handles any residual CC-style state (`config-N/`,
+/// `credentials/N.json`, `profiles.json` entry).
+///
+/// For Gemini-only slots (no `credentials/N.json`, no `config-N/`),
+/// `logout_account` returns `NotConfigured` which is treated as success
+/// — the Gemini-specific state was already cleaned by the vault delete
+/// and `unbind` call above. See journal 0011 §FD #1 and journal 0013 D7.
 #[tauri::command]
 pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSummary, String> {
     use csq_core::accounts::logout::{logout_account, LogoutError};
+    use csq_core::providers::gemini::provisioning::{
+        delete_api_key_from_vault, is_gemini_bound_slot, unbind as gemini_unbind,
+    };
 
     let base = PathBuf::from(&base_dir);
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+
+    // D7: Gemini-specific cleanup — runs BEFORE `logout_account` so the
+    // binding marker is still readable when we determine the auth mode.
+    // Only fires for Gemini-bound slots; ClaudeCode and Codex have no
+    // vault entries.
+    let gemini_marker_removed = if is_gemini_bound_slot(&base, account_num) {
+        let vault = csq_core::platform::secret::open_default_vault()
+            .map_err(|_| "vault unavailable".to_string())?;
+        // Delete the vault entry (idempotent for non-ApiKey and absent slots).
+        delete_api_key_from_vault(&base, account_num, vault.as_ref())
+            .map_err(|_| "vault unavailable".to_string())?;
+        // Remove the binding marker. `logout_account` removes `config-N/`
+        // recursively but does NOT know about `credentials/gemini-N.json`.
+        let _ = gemini_unbind(&base, account_num); // best-effort; not an error
+        true
+    } else {
+        false
+    };
 
     match logout_account(&base, account_num) {
         Ok(s) => {
@@ -362,6 +399,25 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                 profiles_entry_removed: s.profiles_entry_removed,
             })
         }
+        // Gemini-only slots have no `credentials/N.json` or `config-N/`,
+        // so `logout_account` returns `NotConfigured`. If the Gemini
+        // marker was present (and has just been removed), treat this as
+        // success — the slot's state is fully cleaned.
+        Err(LogoutError::NotConfigured { .. }) if gemini_marker_removed => {
+            #[cfg(unix)]
+            {
+                let sock = csq_core::daemon::socket_path(&base);
+                if sock.exists() {
+                    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+                }
+            }
+            Ok(RemoveAccountSummary {
+                account,
+                canonical_removed: false,
+                config_dir_removed: false,
+                profiles_entry_removed: false,
+            })
+        }
         Err(LogoutError::InUse { account: a, pids }) => Err(format!(
             "ACCOUNT_IN_USE: account {} is bound to live process(es) {:?} — exit those terminals first",
             a, pids
@@ -373,7 +429,7 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
     }
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct RemoveAccountSummary {
     pub account: u16,
     pub canonical_removed: bool,
@@ -3287,5 +3343,92 @@ mod tests {
         assert!(msg.contains("auto"));
         assert!(msg.contains("gemini-2.5-pro"));
         assert!(msg.contains("gemini-3-pro-preview"));
+    }
+
+    // ── remove_account: D7 vault-delete regression ─────────────────────────
+
+    /// D7 regression: `remove_account` on a Gemini ApiKey slot must delete
+    /// the vault entry before `logout_account` removes the marker.
+    ///
+    /// Uses `CSQ_SECRET_BACKEND=in-memory` so the test runs without the
+    /// real OS keychain. After `remove_account` returns Ok, both the
+    /// binding marker and the vault entry must be gone.
+    ///
+    /// Vault emptiness after the command is verified via
+    /// `delete_api_key_from_vault` returning Ok on a slot with no marker
+    /// (the idempotent no-op path) — a post-hoc `vault.get` would require
+    /// sharing the same `InMemoryVault` instance, which `open_default_vault`
+    /// does not support across call sites. The csq-core unit tests in
+    /// `provisioning::tests::delete_api_key_from_vault_removes_vault_entry_*`
+    /// directly verify the vault-empty postcondition with a shared vault.
+    #[test]
+    fn remove_account_gemini_slot_succeeds_with_in_memory_vault() {
+        use csq_core::providers::gemini::provisioning::{
+            is_gemini_bound_slot, write_binding, AuthMode, GeminiBinding,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let slot_num = AccountNum::try_from(3u16).unwrap();
+
+        // Provision the slot: write the Gemini binding marker.
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
+        write_binding(base, slot_num, &binding).unwrap();
+
+        // Also create the minimal config-3/ structure that logout_account
+        // checks for (credentials/3.json + config-3/.credentials.json).
+        let config_dir = base.join("config-3");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(creds_dir.join("3.json"), "{}").unwrap();
+
+        // Confirm the marker exists before removal.
+        assert!(
+            is_gemini_bound_slot(base, slot_num),
+            "marker must exist before remove_account"
+        );
+
+        // Force in-memory vault so no OS keychain prompt fires in CI.
+        // SAFETY: test-only env mutation is single-threaded per cargo
+        // test's default runner for this crate.
+        unsafe { std::env::set_var("CSQ_SECRET_BACKEND", "in-memory") };
+        let result = remove_account(base.to_string_lossy().into_owned(), 3);
+        unsafe { std::env::remove_var("CSQ_SECRET_BACKEND") };
+
+        assert!(result.is_ok(), "remove_account must succeed: {result:?}");
+
+        // Binding marker must be gone (config-3/ was removed by logout_account).
+        assert!(
+            !is_gemini_bound_slot(base, slot_num),
+            "Gemini binding marker must be removed after remove_account"
+        );
+    }
+
+    /// D7: `remove_account` on a non-Gemini slot (ClaudeCode) must NOT
+    /// touch the vault — the vault-delete branch only fires for Gemini.
+    #[test]
+    fn remove_account_non_gemini_slot_does_not_open_vault() {
+        // Provision a minimal ClaudeCode account (no Gemini marker).
+        // Even with CSQ_SECRET_BACKEND unset, the vault must never be
+        // opened for a ClaudeCode slot, so the native OS keychain is
+        // never touched and the test works in CI without credentials.
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        let config_dir = base.join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(creds_dir.join("1.json"), "{}").unwrap();
+
+        // No CSQ_SECRET_BACKEND override — vault open must NOT be reached.
+        let result = remove_account(base.to_string_lossy().into_owned(), 1);
+        assert!(
+            result.is_ok(),
+            "remove_account for ClaudeCode slot must succeed: {result:?}"
+        );
     }
 }

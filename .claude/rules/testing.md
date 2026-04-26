@@ -130,7 +130,46 @@ let http_get = |_url: &str, _token: &str| Ok((200, vec![]));
 
 **Why:** Type-checked transport injection is the entire point of the closure pattern. A mock that omits parameters or returns a different shape passes the test build but the type system never catches the contract drift, leaving a gap between what the test exercises and what production calls.
 
-### 6. Component Tests MUST Exercise the Production Mount Sequence
+### 6. Tests Mutating Process Env MUST Acquire `test_env::lock()`
+
+Any test that calls `std::env::set_var` or `std::env::remove_var` MUST acquire `crate::platform::test_env::lock()` first. The lock is a single coarse mutex shared across the workspace; without it, two tests in different modules can flip the same env var concurrently and one will see the other's value mid-flight.
+
+```rust
+// DO — shared lock first, then any in-module lock
+#[test]
+fn test_with_env_mutation() {
+    let _shared_env_guard = crate::platform::test_env::lock();
+    let _module_lock = ENV_LOCK.lock().unwrap(); // optional, additive
+    let prev = std::env::var("MY_VAR").ok();
+    std::env::set_var("MY_VAR", "test-value");
+    // ... assertions ...
+    match prev {
+        Some(v) => std::env::set_var("MY_VAR", v),
+        None => std::env::remove_var("MY_VAR"),
+    }
+}
+
+// DO NOT — in-module mutex does NOT serialize against other modules'
+// tests, which read or write the same vars
+#[test]
+fn racy_test() {
+    let _module_lock = ENV_LOCK.lock().unwrap();
+    std::env::set_var("MY_VAR", "test-value");
+    // … another test in a different module may flip MY_VAR mid-flight …
+}
+```
+
+**BLOCKED responses:**
+
+- "Cargo runs tests serially by default" — false; `cargo test` is multi-threaded by default. `--test-threads=1` is the opt-in for serial.
+- "This test only mutates `XDG_RUNTIME_DIR`, no other test cares" — wrong: any test that READS the env var (directly or via a library that reads it) races against your mutation.
+- "The in-module mutex is enough" — only if no test in any other module mutates or reads the same var.
+
+**Why:** PR #204 release/v2.3.1 Ubuntu CI failed with `expected Stale, got NotRunning` because `daemon::detect::tests::detect_live_pid_but_missing_socket_is_stale` only acquired its in-module `SOCKET_TEST_MUTEX`, while `daemon::paths::tests::linux_prefers_xdg_runtime_dir` mutated `XDG_RUNTIME_DIR` under `test_env::lock()`. The detect test wrote a PID file at `$XDG_RUNTIME_DIR/csq-daemon.pid`, the paths test then flipped `XDG_RUNTIME_DIR`, and the detect test's subsequent `pid_file_path()` call resolved to a different directory — file gone, `NotRunning` instead of `Stale`. Lock-order rule: shared mutex BEFORE any in-module mutex, every site, no exceptions (deadlock-prevention).
+
+Origin: journal 0021 finding 11 (introduced `test_env::lock`); reinforced by PR #205 (detect.rs fix) + this PR (workspace-wide audit + hardening).
+
+### 7. Component Tests MUST Exercise the Production Mount Sequence
 
 Tests for modal / dialog / popover components MUST NOT mount with the final `isOpen=true` state when production mounts them with `isOpen=false` and toggles later. At least one test per component MUST mount with the initial closed state, rerender to open, and assert both the IPC side-effect fires AND the post-open DOM renders.
 

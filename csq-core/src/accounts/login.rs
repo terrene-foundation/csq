@@ -265,8 +265,13 @@ mod tests {
         fs::write(&claude, "#!/bin/sh").unwrap();
         make_executable(&claude);
 
-        // SAFETY: tests in this crate run single-threaded by default
-        // for env vars; this test does not enable threads.
+        // Cross-module env-var mutex (`crate::platform::test_env`)
+        // serializes against any other test mutating PATH / HOME
+        // concurrently. PATH especially is read transitively by many
+        // libraries, so a parallel set_var elsewhere can flip what
+        // `find_claude_binary` sees mid-call.
+        let _shared_env_guard = crate::platform::test_env::lock();
+
         let prev_path = std::env::var_os("PATH");
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("PATH", dir.path());

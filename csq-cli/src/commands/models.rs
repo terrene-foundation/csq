@@ -131,6 +131,13 @@ pub fn handle_switch(
         trimmed.to_string()
     } else if provider_id == "codex" {
         resolve_codex_model(model_query, force)?
+    } else if provider_id == "gemini" && model_query.trim().eq_ignore_ascii_case("auto") {
+        // FR-G-CLI-04 special: `auto` is intentionally NOT in the
+        // catalog (it instructs gemini-cli to pick rather than
+        // pinning). Short-circuit before the catalog lookup so the
+        // suggestion fallback ("did you mean claude-opus...") does
+        // not surface a misleading rejection.
+        "auto".to_string()
     } else {
         let catalog = ModelCatalog::default_catalog();
         let m = catalog.find(model_query).ok_or_else(|| {
@@ -196,18 +203,88 @@ pub fn handle_switch(
             );
         }
         ModelConfigTarget::GeminiSettingsModelName => {
-            // PR-G1 stub: the Gemini model writer lands in PR-G4
-            // (csq-cli surface dispatch). Refuse with a clear error
-            // so a user who runs `csq models switch gemini-2.5-pro`
-            // before PR-G4 ships gets an actionable message instead
-            // of silent no-op or a panic.
-            return Err(anyhow!(
-                "{provider_id} model switching requires PR-G4 (csq-cli Gemini surface dispatch); \
-                 not yet implemented in this build"
-            ));
+            // FR-G-CLI-04: Gemini model lives in `binding.model_name`
+            // inside `credentials/gemini-<N>.json`. The drift
+            // detector (`reassert_api_key_selected_type`) writes
+            // it into `<handle_dir>/.gemini/settings.json` on every
+            // spawn, so the next `csq run <slot>` picks up the new
+            // model with no extra glue.
+            let slot_num = slot.ok_or_else(|| {
+                anyhow!(
+                    "--slot is required for {provider_id} — model lives \
+                     in the per-slot binding marker, there is no global profile"
+                )
+            })?;
+            // Resolve `auto` first (not in catalog); for everything
+            // else the catalog hit above already pinned the
+            // canonical `gemini-*` id. Validate that the resolved
+            // id is a Gemini model.
+            let resolved = resolve_gemini_model(model_query, &model_id)?;
+            write_gemini_model_to_binding(base_dir, slot_num, &resolved)?;
+            if resolved.ends_with("-preview") {
+                eprintln!(
+                    "warning: preview tier may silently downgrade — csq will flag the actual served model after the first call"
+                );
+            }
+            println!(
+                "Switched {} model on slot {} to {}",
+                provider_id, slot_num, resolved
+            );
         }
     }
 
+    Ok(())
+}
+
+/// Resolves a Gemini model query to a concrete model id (or the
+/// literal `"auto"`). The catalog has already been consulted by
+/// the caller for non-`auto` ids; this helper just adds the
+/// `auto` literal which is intentionally NOT in the catalog
+/// (it instructs gemini-cli to pick rather than pinning).
+///
+/// Returns the resolved id (one of: `auto`, `gemini-2.5-pro`,
+/// `gemini-2.5-flash`, `gemini-2.5-flash-lite`,
+/// `gemini-3-pro-preview`). Refuses anything else.
+fn resolve_gemini_model(query: &str, catalog_resolved: &str) -> Result<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("model id must not be empty"));
+    }
+    if trimmed.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
+    // Catalog already produced a canonical id (catalog `find` is
+    // case-insensitive). Pin the gemini-* prefix so a non-gemini
+    // model id passed in does not slip through the GeminiSettings
+    // dispatch path.
+    if !catalog_resolved.starts_with("gemini-") {
+        return Err(anyhow!(
+            "`{trimmed}` does not resolve to a Gemini model — supported: \
+             auto, pro, flash, flash-lite, 3-pro-preview, or a concrete \
+             `gemini-*` id"
+        ));
+    }
+    Ok(catalog_resolved.to_string())
+}
+
+/// Atomically updates `model_name` inside the slot's Gemini
+/// binding marker. The drift detector picks up the new value on
+/// the next `csq run <slot>` spawn.
+fn write_gemini_model_to_binding(
+    base_dir: &Path,
+    slot: csq_core::types::AccountNum,
+    model: &str,
+) -> Result<()> {
+    use csq_core::providers::gemini::provisioning::{read_binding, write_binding};
+    let mut binding = read_binding(base_dir, slot).map_err(|e| {
+        anyhow!(
+            "slot {slot} has no Gemini binding — run `csq setkey gemini --slot {slot}` first ({})",
+            e.error_kind_tag()
+        )
+    })?;
+    binding.model_name = model.to_string();
+    write_binding(base_dir, slot, &binding)
+        .map_err(|e| anyhow!("failed to update Gemini binding for slot {slot}: {e}"))?;
     Ok(())
 }
 
@@ -686,5 +763,177 @@ mod tests {
             "got: {toml}"
         );
         assert!(toml.contains("model = \"gpt-6-preview\""), "got: {toml}");
+    }
+
+    // ── Gemini paths (PR-G4b — FR-G-CLI-04) ───────────────
+
+    /// Provisions a fresh Gemini binding marker so the model-switch
+    /// path has something to update. Mirrors what
+    /// `csq setkey gemini --slot N` writes (vault entry omitted —
+    /// the writer never touches the vault).
+    fn provision_gemini_marker(base: &std::path::Path, slot: u16, model: &str) {
+        use csq_core::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
+        let n = AccountNum::try_from(slot).unwrap();
+        let binding = GeminiBinding::new(AuthMode::ApiKey, model);
+        write_binding(base, n, &binding).unwrap();
+    }
+
+    fn read_gemini_model(base: &std::path::Path, slot: u16) -> String {
+        use csq_core::providers::gemini::provisioning::read_binding;
+        let n = AccountNum::try_from(slot).unwrap();
+        read_binding(base, n).unwrap().model_name
+    }
+
+    /// Switching by alias (`pro`) writes `gemini-2.5-pro` into
+    /// the binding marker. Atomic write — verifies the next read
+    /// observes the change in full.
+    #[test]
+    fn switch_gemini_alias_pro_writes_canonical_id_to_marker() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "pro",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 4), "gemini-2.5-pro");
+    }
+
+    /// `auto` is intentionally NOT in the catalog (it tells gemini-cli
+    /// to pick rather than pinning). The model-switch path must accept
+    /// it as a literal AND write it verbatim to the binding.
+    #[test]
+    fn switch_gemini_auto_writes_literal_auto_to_marker() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "gemini-2.5-pro");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "auto",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 4), "auto");
+    }
+
+    /// Concrete `gemini-2.5-flash-lite` round-trips through the
+    /// catalog and lands in the marker unchanged.
+    #[test]
+    fn switch_gemini_concrete_flash_lite_writes_to_marker() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 7, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "gemini-2.5-flash-lite",
+            Some(AccountNum::try_from(7u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 7), "gemini-2.5-flash-lite");
+    }
+
+    /// Preview-tier id (`gemini-3-pro-preview`) is accepted; the CLI
+    /// surface emits a stderr warning, but the binding marker still
+    /// records the request verbatim.
+    #[test]
+    fn switch_gemini_preview_model_accepted_and_recorded() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 8, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "3-pro-preview",
+            Some(AccountNum::try_from(8u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 8), "gemini-3-pro-preview");
+    }
+
+    /// Unknown model id is refused with a `did you mean` suggestion
+    /// (catalog-driven via the existing `suggest` helper).
+    #[test]
+    fn switch_gemini_unknown_model_rejected() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        let err = handle_switch(
+            dir.path(),
+            "gemini",
+            "gemini-9000-overdrive",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown model"), "got: {err}");
+    }
+
+    /// `--slot` is mandatory for Gemini — no global Gemini profile
+    /// exists. Refuse with an actionable error.
+    #[test]
+    fn switch_gemini_without_slot_refused() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_switch(dir.path(), "gemini", "pro", None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--slot is required"), "got: {err}");
+    }
+
+    /// Slot with no Gemini binding marker refuses cleanly — points
+    /// the user at `csq setkey gemini --slot N` instead of writing
+    /// a half-bound state.
+    #[test]
+    fn switch_gemini_unprovisioned_slot_refused() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_switch(
+            dir.path(),
+            "gemini",
+            "pro",
+            Some(AccountNum::try_from(9u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("csq setkey gemini --slot 9"), "got: {err}");
+    }
+
+    /// FR-G-CLI-04: marker write is atomic. Concrete check — the
+    /// existing marker survives if the writer ever crashed mid-
+    /// rename. Simulates the post-condition: the marker file always
+    /// has 0o600 permissions and contains the new model.
+    #[cfg(unix)]
+    #[test]
+    fn switch_gemini_marker_remains_0o600_after_update() {
+        use csq_core::providers::gemini::provisioning::binding_path;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "flash",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        let path = binding_path(dir.path(), AccountNum::try_from(4u16).unwrap());
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "marker must stay 0o600 after model switch"
+        );
     }
 }

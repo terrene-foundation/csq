@@ -35,20 +35,25 @@ use csq_core::session::handle_dir;
 use csq_core::types::AccountNum;
 use std::path::{Path, PathBuf};
 
-/// One of the two env vars a csq-managed terminal sets pointing at its
-/// handle dir. Which one is set tells us the source surface without
-/// any on-disk introspection.
+/// One of the three env vars a csq-managed terminal sets pointing at
+/// its handle dir. Which one is set tells us the source surface
+/// without any on-disk introspection.
 enum SourceHandle {
     /// `CLAUDE_CONFIG_DIR` set → source is ClaudeCode (Anthropic or 3P).
     ClaudeCode(PathBuf),
     /// `CODEX_HOME` set → source is Codex.
     Codex(PathBuf),
+    /// `GEMINI_CLI_HOME` set → source is Gemini. PR-G4b: gemini-cli
+    /// does not re-read `GEMINI_API_KEY` mid-process, so even
+    /// same-surface Gemini→Gemini takes the exec-replace path
+    /// (handled via `RouteKind::CrossSurface` below).
+    Gemini(PathBuf),
 }
 
 impl SourceHandle {
     fn path(&self) -> &Path {
         match self {
-            Self::ClaudeCode(p) | Self::Codex(p) => p,
+            Self::ClaudeCode(p) | Self::Codex(p) | Self::Gemini(p) => p,
         }
     }
 
@@ -56,6 +61,7 @@ impl SourceHandle {
         match self {
             Self::ClaudeCode(_) => Surface::ClaudeCode,
             Self::Codex(_) => Surface::Codex,
+            Self::Gemini(_) => Surface::Gemini,
         }
     }
 }
@@ -106,10 +112,23 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
 // ─── Source-surface detection ────────────────────────────────────────
 
 fn detect_source_handle() -> Result<SourceHandle> {
-    // Both env vars may be set by a well-meaning parent shell. Prefer
-    // CODEX_HOME when it points at a csq-managed handle dir, because
-    // `csq run N` for a Codex slot explicitly sets CODEX_HOME and
-    // scrubs CLAUDE_CONFIG_DIR (run.rs strip_sensitive_env).
+    // Surface-specific env vars may all be set by a well-meaning
+    // parent shell. Probe in surface-specific order:
+    //   1. GEMINI_CLI_HOME — set ONLY by `csq run` for Gemini slots
+    //   2. CODEX_HOME — set by `csq run` for Codex slots
+    //   3. CLAUDE_CONFIG_DIR — set by `csq run` for Claude/3P slots
+    //
+    // Each `csq run` path scrubs the OTHER surfaces' env vars, so
+    // ordering only matters when a parent shell exports multiple of
+    // them by mistake. In that case the most-specific match wins:
+    // a handle dir that exists on disk under our base wins over a
+    // raw env var pointing somewhere else.
+    if let Ok(raw) = std::env::var("GEMINI_CLI_HOME") {
+        let p = PathBuf::from(&raw);
+        if is_term_handle_dir(&p) {
+            return Ok(SourceHandle::Gemini(p));
+        }
+    }
     if let Ok(raw) = std::env::var("CODEX_HOME") {
         let p = PathBuf::from(&raw);
         if is_term_handle_dir(&p) {
@@ -133,7 +152,7 @@ fn detect_source_handle() -> Result<SourceHandle> {
         ));
     }
     Err(anyhow!(
-        "neither CLAUDE_CONFIG_DIR nor CODEX_HOME is set — \
+        "none of CLAUDE_CONFIG_DIR / CODEX_HOME / GEMINI_CLI_HOME is set — \
          csq swap must run inside a csq-managed session"
     ))
 }
@@ -301,11 +320,7 @@ fn cross_surface_exec(
     match target_surface {
         Surface::Codex => exec_codex(base_dir, target, pid),
         Surface::ClaudeCode => exec_claude_code(base_dir, target, pid),
-        Surface::Gemini => Err(anyhow::anyhow!(
-            "swap to Gemini account is not supported in this build — \
-             cross-surface swap dispatch lands in PR-G4. \
-             Start a fresh Gemini session with `csq run <slot>` instead"
-        )),
+        Surface::Gemini => exec_gemini(base_dir, target, pid),
     }
 }
 
@@ -406,6 +421,97 @@ fn exec_claude_code(_base_dir: &Path, _target: AccountNum, _pid: u32) -> Result<
     ))
 }
 
+/// PR-G4b: cross-surface swap target is a Gemini slot. Mirrors
+/// `launch_gemini` in `commands/run.rs` — verifies the binding
+/// marker is a regular file, builds the minimal handle dir
+/// (`term-<pid>` + `.csq-account`), opens the platform-native
+/// vault, then `spawn_gemini`. The function returns only on
+/// failure (Unix `exec(2)` replaces the process on success).
+///
+/// **Why a duplicate of `launch_gemini`'s body**: both call sites
+/// are inside csq-cli and the dup is ~20 LOC. Factoring into
+/// csq-core would require introducing a new `gemini::session`
+/// module + a typed error enum; deferred until PR-G5 (desktop)
+/// becomes the third caller.
+#[cfg(unix)]
+fn exec_gemini(base_dir: &Path, target: AccountNum, pid: u32) -> Result<()> {
+    use csq_core::accounts::markers;
+    use csq_core::credentials::file as cred_file;
+    use csq_core::platform::secret;
+    use csq_core::providers::gemini::spawn::spawn_gemini;
+
+    // Refuse symlink at the binding marker — same posture as
+    // `verify_codex_canonical_is_regular_file`.
+    let binding_path = cred_file::canonical_path_for(base_dir, target, Surface::Gemini);
+    let meta = std::fs::symlink_metadata(&binding_path).map_err(|e| {
+        anyhow!(
+            "stat {} — Gemini binding missing for swap target {target}; run `csq setkey gemini --slot {target}` first ({e})",
+            binding_path.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing Gemini swap: {} is a symlink. csq only writes a regular file at this path; a symlink here means an external process mutated the credentials directory.",
+            binding_path.display()
+        ));
+    }
+
+    // Build the minimal handle dir + .csq-account marker. Drift
+    // detector populates `.gemini/settings.json` inside `spawn_gemini`.
+    let handle_dir = base_dir.join(format!("term-{}", pid));
+    std::fs::create_dir_all(&handle_dir).map_err(|e| {
+        anyhow!(
+            "failed to create Gemini handle dir at {} for swap target {target}: {e}",
+            handle_dir.display()
+        )
+    })?;
+    if let Err(e) = markers::write_csq_account(&handle_dir, target) {
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        return Err(anyhow!(
+            ".csq-account marker write failed for swap target {target}: {e}"
+        ));
+    }
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    let vault = secret::open_default_vault().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        anyhow!(
+            "Gemini vault unavailable for swap target {target} ({}): {e}",
+            e.error_kind_tag()
+        )
+    })?;
+
+    println!("Swapping to Gemini account {} (term-{})...", target, pid);
+
+    // spawn_gemini either execs (Unix) and never returns, or errors.
+    // The exec(2) lives inside spawn_gemini::execute_plan; this
+    // function only sees the failure return path.
+    match spawn_gemini(
+        base_dir,
+        &handle_dir_abs,
+        target,
+        Vec::new(),
+        vault.as_ref(),
+    ) {
+        Ok(_never) => unreachable!("spawn_gemini returns Infallible on success"),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            Err(anyhow!(
+                "Gemini swap exec failed after source handle dir was tombstoned — \
+                 re-run `csq run {target}` to relaunch. Error: {e}"
+            ))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn exec_gemini(_base_dir: &Path, _target: AccountNum, _pid: u32) -> Result<()> {
+    Err(anyhow!(
+        "cross-surface csq swap is Unix-only today. \
+         On Windows, exit the current surface and run `csq run <N>`."
+    ))
+}
+
 // ─── Daemon cache invalidation (unchanged from pre-PR-C7) ───────────
 
 /// Best-effort cache invalidation: POST /api/invalidate-cache to
@@ -498,6 +604,62 @@ mod tests {
             route(Surface::Codex, Surface::ClaudeCode),
             RouteKind::CrossSurface
         );
+    }
+
+    /// PR-G4b — Gemini → ClaudeCode is cross-surface (tombstone + exec).
+    #[test]
+    fn route_gemini_to_claudecode_is_cross_surface() {
+        assert_eq!(
+            route(Surface::Gemini, Surface::ClaudeCode),
+            RouteKind::CrossSurface
+        );
+    }
+
+    /// PR-G4b — ClaudeCode → Gemini is cross-surface.
+    #[test]
+    fn route_claudecode_to_gemini_is_cross_surface() {
+        assert_eq!(
+            route(Surface::ClaudeCode, Surface::Gemini),
+            RouteKind::CrossSurface
+        );
+    }
+
+    /// PR-G4b — Codex → Gemini is cross-surface.
+    #[test]
+    fn route_codex_to_gemini_is_cross_surface() {
+        assert_eq!(
+            route(Surface::Codex, Surface::Gemini),
+            RouteKind::CrossSurface
+        );
+    }
+
+    /// PR-G4b — Gemini → Codex is cross-surface.
+    #[test]
+    fn route_gemini_to_codex_is_cross_surface() {
+        assert_eq!(
+            route(Surface::Gemini, Surface::Codex),
+            RouteKind::CrossSurface
+        );
+    }
+
+    /// PR-G4b — Gemini → Gemini also takes the exec path because
+    /// gemini-cli does NOT re-read GEMINI_API_KEY mid-process.
+    /// Same-surface naming is misleading here; what we want is
+    /// "tombstone + exec" semantics so the new slot's vault key
+    /// reaches gemini-cli.
+    #[test]
+    fn route_gemini_to_gemini_is_cross_surface_path() {
+        assert_eq!(
+            route(Surface::Gemini, Surface::Gemini),
+            RouteKind::CrossSurface
+        );
+    }
+
+    /// PR-G4b — `SourceHandle::Gemini` reports `Surface::Gemini`.
+    #[test]
+    fn source_handle_gemini_surface_matches_variant() {
+        let g = SourceHandle::Gemini(PathBuf::from("/x/term-3"));
+        assert_eq!(g.surface(), Surface::Gemini);
     }
 
     // ── PR-C9a journal 0021 finding 10 — rename-to-tombstone ─

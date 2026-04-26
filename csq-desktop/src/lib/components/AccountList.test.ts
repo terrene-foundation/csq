@@ -292,4 +292,138 @@ describe("AccountList", () => {
     expect(btn).not.toBeNull();
     expect(btn?.textContent).toContain("Change model");
   });
+
+  // ── PR-G5 — Gemini surface rendering (FR-G-UI-03) ───────────
+
+  it("renders distinct surface-gemini badge for Gemini slots", async () => {
+    const geminiAccount = {
+      ...ACCOUNT_1,
+      id: 5,
+      label: "gemini-5",
+      source: "manual",
+      surface: "gemini",
+      provider_id: null,
+    };
+    setupMocks({ get_accounts: [geminiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const badge = container.querySelector(
+      '[data-testid="surface-badge"]',
+    ) as HTMLElement | null;
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent?.trim()).toBe("gemini");
+    expect(badge?.classList.contains("surface-gemini")).toBe(true);
+    // Codex CSS class MUST NOT also be applied — the chip color is
+    // distinct (Google blue vs OpenAI green).
+    expect(badge?.classList.contains("surface-codex")).toBe(false);
+  });
+
+  it("renders 'quota: n/a' for Gemini slot with no counter yet", async () => {
+    const geminiAccount = {
+      ...ACCOUNT_1,
+      id: 6,
+      label: "gemini-6",
+      surface: "gemini",
+      gemini_counter_today: null,
+      gemini_rate_limit_reset_at: null,
+      gemini_selected_model: null,
+      gemini_effective_model: null,
+    };
+    setupMocks({ get_accounts: [geminiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const na = container.querySelector('[data-testid="gemini-quota-na"]');
+    expect(na).not.toBeNull();
+    expect(na?.textContent).toContain("n/a");
+    // The synthesised 5h/7d UsageBar is suppressed for Gemini.
+    expect(container.querySelector(".usage-bars")).toBeNull();
+  });
+
+  it("renders counter when Gemini slot has requests today", async () => {
+    const geminiAccount = {
+      ...ACCOUNT_1,
+      id: 7,
+      label: "gemini-7",
+      surface: "gemini",
+      gemini_counter_today: 42,
+      gemini_rate_limit_reset_at: null,
+      gemini_selected_model: "gemini-2.5-pro",
+      gemini_effective_model: "gemini-2.5-pro",
+    };
+    setupMocks({ get_accounts: [geminiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const counter = container.querySelector('[data-testid="gemini-counter"]');
+    expect(counter).not.toBeNull();
+    expect(counter?.textContent).toContain("42");
+    expect(counter?.textContent).toContain("today");
+    // No downgrade chip when selected === effective.
+    expect(
+      container.querySelector('[data-testid="gemini-downgrade"]'),
+    ).toBeNull();
+  });
+
+  it("renders downgrade badge when selected_model != effective_model", async () => {
+    const geminiAccount = {
+      ...ACCOUNT_1,
+      id: 8,
+      label: "gemini-8",
+      surface: "gemini",
+      gemini_counter_today: 1,
+      gemini_rate_limit_reset_at: null,
+      gemini_selected_model: "gemini-3-pro-preview",
+      gemini_effective_model: "gemini-2.5-pro",
+    };
+    setupMocks({ get_accounts: [geminiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const downgrade = container.querySelector(
+      '[data-testid="gemini-downgrade"]',
+    );
+    expect(downgrade).not.toBeNull();
+    expect(downgrade?.textContent).toContain("gemini-3-pro-preview");
+    expect(downgrade?.textContent).toContain("gemini-2.5-pro");
+  });
+
+  it("renders rate-limit countdown when 429 is active", async () => {
+    // 30 minutes in the future.
+    const future = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const geminiAccount = {
+      ...ACCOUNT_1,
+      id: 9,
+      label: "gemini-9",
+      surface: "gemini",
+      gemini_counter_today: 237,
+      gemini_rate_limit_reset_at: future,
+      gemini_selected_model: "gemini-2.5-pro",
+      gemini_effective_model: "gemini-2.5-pro",
+    };
+    setupMocks({ get_accounts: [geminiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const rl = container.querySelector('[data-testid="gemini-rate-limit"]');
+    expect(rl).not.toBeNull();
+    expect(rl?.textContent).toContain("rate-limited");
+    expect(rl?.textContent).toMatch(/resets in \d+m/);
+    // Counter is hidden while rate-limited (the rate-limit message is
+    // the more actionable signal).
+    expect(
+      container.querySelector('[data-testid="gemini-counter"]'),
+    ).toBeNull();
+  });
+
+  it("shows Change model button on Gemini slots", async () => {
+    const geminiAccount = {
+      ...ACCOUNT_1,
+      id: 10,
+      label: "gemini-10",
+      surface: "gemini",
+    };
+    setupMocks({ get_accounts: [geminiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const btn = container.querySelector(".change-model-btn");
+    expect(btn).not.toBeNull();
+    expect(btn?.getAttribute("title")).toContain("Gemini");
+  });
 });

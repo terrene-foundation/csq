@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { openUrl } from '@tauri-apps/plugin-opener';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import { homeDir, join } from '@tauri-apps/api/path';
 
   // ── Props ─────────────────────────────────────────────────
@@ -116,6 +117,32 @@
         /// subprocess emits it; null until then.
         deviceCode: CodexDeviceCode | null;
       }
+    // ── Gemini API-key / Vertex SA flow (PR-G5) ────────────────
+    // FR-G-UI-01: ToS disclosure on first Gemini provisioning, then
+    // a two-tab panel (AI Studio paste / Vertex SA file picker).
+    // The residue path (when present) carries through both steps so
+    // the inline warning fires on the provision panel even if the
+    // user has already acknowledged the ToS in a prior session.
+    | {
+        kind: 'gemini-tos';
+        account: number;
+        /// Absolute path of `~/.gemini/oauth_creds.json` if present;
+        /// null otherwise. Drives the inline OAuth-residue warning.
+        residue: string | null;
+      }
+    | {
+        kind: 'gemini-provision';
+        account: number;
+        /// "api-key" | "vertex" — currently active tab.
+        mode: 'api-key' | 'vertex';
+        /// AI Studio API key paste buffer.
+        key: string;
+        /// Vertex SA absolute path. Empty until the user picks one.
+        vertexPath: string;
+        residue: string | null;
+        submitting: boolean;
+        error: string | null;
+      }
     | { kind: 'success'; message: string }
     | { kind: 'error'; message: string };
 
@@ -217,6 +244,11 @@
     if (provider.id === 'codex') {
       if (slotError) return;
       await startCodexFlow(chosenSlot);
+      return;
+    }
+    if (provider.id === 'gemini') {
+      if (slotError) return;
+      await startGeminiFlow(chosenSlot);
       return;
     }
     if (provider.auth_type === 'oauth') {
@@ -550,6 +582,152 @@
         codexDeviceCodeUnlisten();
         codexDeviceCodeUnlisten = null;
       }
+    }
+  }
+
+  // ── Gemini API-key / Vertex SA flow (PR-G5) ───────────────
+  //
+  // FR-G-UI-01: Disclosure-first, then provision. Two paths:
+  //
+  // 1. `gemini-tos` — disclosure panel. User clicks "Accept" →
+  //    `acknowledge_gemini_tos` writes the marker, then we drop into
+  //    `gemini-provision`. The OAuth-residue probe runs on entry so
+  //    the user sees the warning even before submitting (the residue
+  //    was the original reason ADR-G12 added the ToS guard).
+  //
+  // 2. `gemini-provision` — two-tab panel (AI Studio API key paste /
+  //    Vertex service account JSON). Submit invokes the appropriate
+  //    Tauri command (`gemini_provision_api_key` / `gemini_provision_vertex_sa`).
+  async function startGeminiFlow(account: number) {
+    try {
+      const baseDir = await getBaseDir();
+      // Probe ALWAYS — even if ToS was acknowledged in a prior
+      // session, the residue path may have appeared since.
+      let residue: string | null = null;
+      try {
+        residue = await invoke<string | null>('gemini_probe_tos_residue');
+      } catch (_) {
+        residue = null;
+      }
+      const acked = await invoke<boolean>('is_gemini_tos_acknowledged', { baseDir });
+      if (!acked) {
+        step = { kind: 'gemini-tos', account, residue };
+        return;
+      }
+      step = {
+        kind: 'gemini-provision',
+        account,
+        mode: 'api-key',
+        key: '',
+        vertexPath: '',
+        residue,
+        submitting: false,
+        error: null,
+      };
+    } catch (e) {
+      step = { kind: 'error', message: `Gemini pre-check failed: ${e}` };
+    }
+  }
+
+  async function acknowledgeGeminiTos() {
+    if (step.kind !== 'gemini-tos') return;
+    const account = step.account;
+    const residue = step.residue;
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('acknowledge_gemini_tos', { baseDir });
+      step = {
+        kind: 'gemini-provision',
+        account,
+        mode: 'api-key',
+        key: '',
+        vertexPath: '',
+        residue,
+        submitting: false,
+        error: null,
+      };
+    } catch (e) {
+      step = { kind: 'error', message: `Could not record acknowledgement: ${e}` };
+    }
+  }
+
+  function setGeminiMode(mode: 'api-key' | 'vertex') {
+    if (step.kind !== 'gemini-provision') return;
+    step = { ...step, mode, error: null };
+  }
+
+  /// Opens the OS file picker scoped to JSON files. Tauri-plugin-dialog
+  /// is gated by the `dialog:allow-open` capability — narrow enough
+  /// that the renderer can't save / message / ask. Returns the
+  /// absolute path the user picked, or null on cancel.
+  async function pickVertexFile() {
+    if (step.kind !== 'gemini-provision') return;
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: 'Vertex service account JSON', extensions: ['json'] }],
+      });
+      // openDialog returns string | string[] | null. We disabled
+      // multiple so the array case is impossible — narrow defensively.
+      const path = typeof picked === 'string' ? picked : null;
+      if (path) {
+        step = { ...step, vertexPath: path, error: null };
+      }
+    } catch (e) {
+      step = { ...step, error: `File picker failed: ${e}` };
+    }
+  }
+
+  async function submitGeminiApiKey() {
+    if (step.kind !== 'gemini-provision' || step.mode !== 'api-key') return;
+    const current = step;
+    const key = current.key.trim();
+    if (!key) {
+      step = { ...current, error: 'API key must not be empty' };
+      return;
+    }
+    step = { ...current, submitting: true, error: null };
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('gemini_provision_api_key', {
+        baseDir,
+        slot: current.account,
+        key,
+      });
+      onAccountAdded();
+      step = {
+        kind: 'success',
+        message: `Gemini account ${current.account} provisioned (AI Studio API key).`,
+      };
+    } catch (e) {
+      step = { ...current, submitting: false, error: String(e) };
+    }
+  }
+
+  async function submitGeminiVertexSa() {
+    if (step.kind !== 'gemini-provision' || step.mode !== 'vertex') return;
+    const current = step;
+    const path = current.vertexPath.trim();
+    if (!path) {
+      step = { ...current, error: 'Pick a Vertex service account JSON file' };
+      return;
+    }
+    step = { ...current, submitting: true, error: null };
+    try {
+      const baseDir = await getBaseDir();
+      const canonical = await invoke<string>('gemini_provision_vertex_sa', {
+        baseDir,
+        slot: current.account,
+        saPath: path,
+      });
+      onAccountAdded();
+      step = {
+        kind: 'success',
+        message: `Gemini account ${current.account} provisioned (Vertex SA: ${canonical}).`,
+      };
+    } catch (e) {
+      step = { ...current, submitting: false, error: String(e) };
     }
   }
 
@@ -887,6 +1065,161 @@
             Once you finish the OpenAI sign-in page, this window will update
             automatically. Do not close it.
           </p>
+        {:else if step.kind === 'gemini-tos'}
+          <!--
+            FR-G-UI-01: ToS disclosure — explicit acceptance is
+            required before any Gemini provisioning. Google's ToS
+            prohibits OAuth subscription rerouting through third-
+            party tools; csq guards against accidental fall-through
+            via the EP1–EP7 layered defence (see csq-core
+            providers/gemini/tos_guard.rs). Disclosure text mirrors
+            ADR-G01 / G12 wording.
+          -->
+          <p class="lede">Gemini provisioning — disclosure</p>
+          <p class="hint">
+            csq writes Gemini API keys to your platform-native vault
+            (<strong>Keychain</strong> on macOS, <strong>Secret Service</strong> on Linux,
+            <strong>DPAPI</strong> on Windows). Plaintext never touches the
+            <code>config-{step.account}/</code> directory.
+          </p>
+          <p class="hint">
+            Google's Gemini API Terms <strong>prohibit OAuth
+            subscription rerouting</strong> through third-party tools. csq is
+            an API-key-only client. Routing OAuth subscription quota
+            through csq would be a violation that may trigger Google
+            recertification on first offence and a permanent ban on
+            second. csq actively defends against this with a 7-layer
+            guard (see <code>tos_guard.rs</code>).
+          </p>
+          {#if step.residue}
+            <div class="error-banner" data-testid="gemini-residue-warning">
+              ⚠ A prior <code>gemini-cli</code> OAuth session was detected at
+              <code>{step.residue}</code>.
+              csq will <strong>not</strong> use it. The drift detector
+              re-asserts API-key mode on every spawn — but if you want to
+              avoid any risk of OAuth fall-through, delete that file
+              before continuing.
+            </div>
+          {/if}
+          <div class="actions">
+            <button class="secondary" onclick={() => (step = { kind: 'picker' })}>Cancel</button>
+            <button
+              class="primary"
+              data-testid="gemini-tos-accept"
+              onclick={acknowledgeGeminiTos}
+            >
+              I understand — continue
+            </button>
+          </div>
+        {:else if step.kind === 'gemini-provision'}
+          <p class="lede">Provision Gemini slot #{step.account}.</p>
+          {#if step.residue}
+            <!--
+              Residue warning persists from the ToS step into the
+              provision step so the user sees it again right before
+              entering credentials. The drift detector handles the
+              actual neutralisation; this banner is informational.
+            -->
+            <div class="warning-banner" data-testid="gemini-residue-warning">
+              ⚠ <code>{step.residue}</code> was found. csq's drift detector
+              re-asserts API-key mode on every spawn — Google ToS
+              forbids OAuth subscription rerouting and csq does not
+              use that file. Delete it manually if you prefer not
+              to keep it on disk.
+            </div>
+          {/if}
+          <div class="gemini-tabs" role="tablist" aria-label="Gemini auth mode">
+            <button
+              role="tab"
+              class="gemini-tab"
+              class:active={step.mode === 'api-key'}
+              aria-selected={step.mode === 'api-key'}
+              data-testid="gemini-tab-api-key"
+              onclick={() => setGeminiMode('api-key')}
+              disabled={step.submitting}
+            >AI Studio API key</button>
+            <button
+              role="tab"
+              class="gemini-tab"
+              class:active={step.mode === 'vertex'}
+              aria-selected={step.mode === 'vertex'}
+              data-testid="gemini-tab-vertex"
+              onclick={() => setGeminiMode('vertex')}
+              disabled={step.submitting}
+            >Vertex service account</button>
+          </div>
+          {#if step.mode === 'api-key'}
+            <p class="hint">
+              Paste an API key from
+              <a
+                href="https://aistudio.google.com/apikey"
+                target="_blank"
+                rel="noopener noreferrer"
+              >Google AI Studio</a>.
+              Keys start with <code>AIza</code>. The plaintext goes
+              straight to your platform vault and is not echoed back over
+              IPC.
+            </p>
+            <label class="field">
+              <span>API key</span>
+              <input
+                type="password"
+                bind:value={step.key}
+                placeholder="AIza…"
+                autocomplete="off"
+                spellcheck="false"
+                disabled={step.submitting}
+                data-testid="gemini-api-key-input"
+              />
+            </label>
+            {#if step.error}
+              <div class="error-banner">{step.error}</div>
+            {/if}
+            <div class="actions">
+              <button class="secondary" onclick={() => (step = { kind: 'picker' })} disabled={step.submitting}>Back</button>
+              <button
+                class="primary"
+                onclick={submitGeminiApiKey}
+                disabled={step.submitting || !step.key.trim()}
+                data-testid="gemini-api-key-submit"
+              >
+                {step.submitting ? 'Provisioning…' : 'Provision'}
+              </button>
+            </div>
+          {:else}
+            <p class="hint">
+              Pick a <strong>Vertex AI service account JSON</strong> file. csq
+              stores the absolute path (not the contents) in the binding
+              marker; gemini-cli reads the file at spawn time via
+              <code>GOOGLE_APPLICATION_CREDENTIALS</code>.
+            </p>
+            <div class="vertex-pick">
+              <button
+                type="button"
+                class="secondary"
+                onclick={pickVertexFile}
+                disabled={step.submitting}
+                data-testid="gemini-vertex-pick"
+              >Choose file…</button>
+              <code class="vertex-path" data-testid="gemini-vertex-path">
+                {step.vertexPath || '(no file selected)'}
+              </code>
+            </div>
+            {#if step.error}
+              <div class="error-banner">{step.error}</div>
+            {/if}
+            <div class="actions">
+              <button class="secondary" onclick={() => (step = { kind: 'picker' })} disabled={step.submitting}>Back</button>
+              <button
+                class="primary"
+                onclick={submitGeminiVertexSa}
+                disabled={step.submitting || !step.vertexPath.trim()}
+                data-testid="gemini-vertex-submit"
+              >
+                {step.submitting ? 'Provisioning…' : 'Provision'}
+              </button>
+            </div>
+          {/if}
         {:else if step.kind === 'success'}
           <div class="success-banner">{step.message}</div>
           <div class="actions">
@@ -1132,5 +1465,61 @@
     color: var(--text-secondary);
     word-break: break-all;
     text-align: center;
+  }
+
+  /* PR-G5 Gemini provision panel */
+  .warning-banner {
+    padding: 0.5rem 0.7rem;
+    background: rgba(217, 119, 6, 0.08);
+    border: 1px solid rgba(217, 119, 6, 0.4);
+    border-radius: 4px;
+    color: var(--orange, #d97706);
+    font-size: 0.8rem;
+    margin: 0.25rem 0;
+  }
+  .gemini-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin: 0.25rem 0 0.6rem 0;
+  }
+  .gemini-tab {
+    flex: 1;
+    padding: 0.45rem 0.7rem;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .gemini-tab:hover:not(:disabled) {
+    color: var(--text-primary);
+  }
+  .gemini-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .gemini-tab:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .vertex-pick {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.4rem 0;
+  }
+  .vertex-path {
+    flex: 1;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    padding: 0.3rem 0.5rem;
+    border-radius: 3px;
+    word-break: break-all;
+    min-height: 1.6rem;
   }
 </style>

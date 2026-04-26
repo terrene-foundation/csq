@@ -890,6 +890,11 @@ pub fn run() {
         // the app after a successful install.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Dialog plugin (PR-G5) — file picker for the Vertex SA JSON
+        // path in the AddAccountModal Gemini panel. The capability
+        // grants `dialog:allow-open` only (file open dialog), not
+        // `:default` which would also bundle save / message / ask.
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_accounts,
             commands::swap_account,
@@ -916,6 +921,13 @@ pub fn run() {
             commands::list_codex_models,
             commands::acknowledge_codex_tos,
             commands::set_codex_slot_model,
+            // PR-G5 — Gemini desktop UI
+            commands::is_gemini_tos_acknowledged,
+            commands::acknowledge_gemini_tos,
+            commands::gemini_probe_tos_residue,
+            commands::gemini_provision_api_key,
+            commands::gemini_provision_vertex_sa,
+            commands::gemini_switch_model,
             commands::list_sessions,
             commands::swap_session,
             commands::get_autostart_enabled,

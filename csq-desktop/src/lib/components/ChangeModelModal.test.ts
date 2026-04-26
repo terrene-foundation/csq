@@ -283,4 +283,100 @@ describe("ChangeModelModal", () => {
     mockInvoke.mockResolvedValueOnce(undefined); // set_slot_model after resolve
     resolvePull();
   });
+
+  // ── PR-G5 — Gemini picker (FR-G-UI-02) ─────────────────────
+
+  it("renders 5 canonical Gemini models with auto first when surface=gemini", async () => {
+    const { container } = renderModal({ surface: "gemini", slot: 7 });
+    await tick();
+    await tick();
+
+    const select = container.querySelector(
+      '[data-testid="gemini-model-select"]',
+    ) as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    const ids = Array.from(select.options).map((o) => o.value);
+    expect(ids).toEqual([
+      "auto",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
+      "gemini-3-pro-preview",
+    ]);
+    // Default selection is auto — matches the default the binding
+    // marker is provisioned with.
+    expect(select.value).toBe("auto");
+    // Synchronous load — no IPC fetch for the static list.
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "list_ollama_models",
+      expect.anything(),
+    );
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "list_codex_models",
+      expect.anything(),
+    );
+  });
+
+  it("shows preview-tier warning when gemini-3-pro-preview is selected", async () => {
+    const { container } = renderModal({ surface: "gemini", slot: 7 });
+    await tick();
+    await tick();
+
+    // No warning by default (auto selected).
+    expect(
+      container.querySelector('[data-testid="gemini-preview-warning"]'),
+    ).toBeNull();
+
+    const select = container.querySelector(
+      '[data-testid="gemini-model-select"]',
+    ) as HTMLSelectElement;
+    await fireEvent.change(select, {
+      target: { value: "gemini-3-pro-preview" },
+    });
+    await tick();
+
+    const warn = container.querySelector(
+      '[data-testid="gemini-preview-warning"]',
+    );
+    expect(warn).not.toBeNull();
+    expect(warn?.textContent).toContain("gemini-2.5-pro");
+  });
+
+  it("submits gemini_switch_model on Apply click", async () => {
+    const onChanged = vi.fn();
+    mockInvoke.mockResolvedValueOnce(undefined); // gemini_switch_model
+    const { container } = renderModal({
+      surface: "gemini",
+      slot: 7,
+      onChanged,
+    });
+    await tick();
+    await tick();
+
+    const select = container.querySelector(
+      '[data-testid="gemini-model-select"]',
+    ) as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "gemini-2.5-pro" } });
+    await tick();
+
+    const apply = container.querySelector(
+      '[data-testid="gemini-apply"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(apply);
+    await tick();
+    await tick();
+
+    expect(mockInvoke).toHaveBeenCalledWith("gemini_switch_model", {
+      baseDir: "/home/test/.claude/accounts",
+      slot: 7,
+      model: "gemini-2.5-pro",
+    });
+    expect(onChanged).toHaveBeenCalled();
+  });
+
+  it("renders 'Change Gemini model' header for surface=gemini", async () => {
+    const { getByText } = renderModal({ surface: "gemini", slot: 7 });
+    await tick();
+    expect(getByText("Change Gemini model")).toBeTruthy();
+  });
 });

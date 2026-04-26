@@ -70,6 +70,19 @@ const CODEX_PROVIDER = {
   default_model: "gpt-5.4",
 };
 
+const GEMINI_PROVIDER = {
+  id: "gemini",
+  name: "Gemini",
+  auth_type: "none" as const,
+  default_base_url: "https://generativelanguage.googleapis.com",
+  default_model: "gemini-2.5-pro",
+};
+
+const mockOpenDialog = vi.fn();
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: (...args: unknown[]) => mockOpenDialog(...args),
+}));
+
 let mockResponses: Record<string, unknown> = {};
 
 function setupMocks(overrides: Record<string, unknown> = {}) {
@@ -108,6 +121,7 @@ describe("AddAccountModal", () => {
     mockInvoke.mockReset();
     mockOpenUrl.mockReset();
     mockListen.mockReset();
+    mockOpenDialog.mockReset();
     mockListen.mockResolvedValue(() => {}); // returns an unlisten fn
     setupMocks();
   });
@@ -557,5 +571,203 @@ describe("AddAccountModal", () => {
 
     expect(container.textContent).toContain("Existing Codex keychain entry");
     expect(container.textContent).toContain("Purge and continue");
+  });
+
+  // ── PR-G5 Gemini flow ───────────────────────────────────────
+
+  it("shows ToS disclosure when Gemini picked and marker absent", async () => {
+    setupMocks({
+      list_providers: [ANTHROPIC_PROVIDER, GEMINI_PROVIDER],
+      gemini_probe_tos_residue: null,
+      is_gemini_tos_acknowledged: false,
+    });
+    const { container } = renderModal();
+    await settle();
+
+    const geminiCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Gemini")) as
+      | HTMLButtonElement
+      | undefined;
+    expect(geminiCard).toBeDefined();
+    await fireEvent.click(geminiCard!);
+    await settle();
+
+    expect(container.textContent).toContain("disclosure");
+    // Disclosure text wraps across lines — match the load-bearing
+    // phrase (OAuth + subscription) without pinning whitespace.
+    expect(container.textContent).toMatch(/OAuth\s+subscription/);
+    const acceptBtn = container.querySelector(
+      '[data-testid="gemini-tos-accept"]',
+    );
+    expect(acceptBtn).not.toBeNull();
+  });
+
+  it("shows residue warning on ToS panel when oauth_creds.json exists", async () => {
+    setupMocks({
+      list_providers: [GEMINI_PROVIDER],
+      gemini_probe_tos_residue: "/Users/test/.gemini/oauth_creds.json",
+      is_gemini_tos_acknowledged: false,
+    });
+    const { container } = renderModal();
+    await settle();
+
+    const geminiCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Gemini")) as HTMLButtonElement;
+    await fireEvent.click(geminiCard);
+    await settle();
+
+    const warning = container.querySelector(
+      '[data-testid="gemini-residue-warning"]',
+    );
+    expect(warning).not.toBeNull();
+    expect(warning?.textContent).toContain("oauth_creds.json");
+  });
+
+  it("skips ToS disclosure when marker already present", async () => {
+    setupMocks({
+      list_providers: [GEMINI_PROVIDER],
+      gemini_probe_tos_residue: null,
+      is_gemini_tos_acknowledged: true,
+    });
+    const { container } = renderModal();
+    await settle();
+
+    const geminiCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Gemini")) as HTMLButtonElement;
+    await fireEvent.click(geminiCard);
+    await settle();
+
+    // Should be on the provision panel, not the ToS panel.
+    expect(
+      container.querySelector('[data-testid="gemini-tos-accept"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="gemini-tab-api-key"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="gemini-tab-vertex"]'),
+    ).not.toBeNull();
+  });
+
+  it("submits gemini_provision_api_key on Provision click", async () => {
+    const onAccountAdded = vi.fn();
+    setupMocks({
+      list_providers: [GEMINI_PROVIDER],
+      gemini_probe_tos_residue: null,
+      is_gemini_tos_acknowledged: true,
+      gemini_provision_api_key: undefined,
+    });
+    const { container } = renderModal({ onAccountAdded });
+    await settle();
+
+    await fireEvent.click(
+      Array.from(container.querySelectorAll(".provider-card")).find((el) =>
+        el.textContent?.includes("Gemini"),
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    const input = container.querySelector(
+      '[data-testid="gemini-api-key-input"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(input, {
+      target: { value: "AIzaSyTEST_KEY_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    });
+    await tick();
+
+    const submit = container.querySelector(
+      '[data-testid="gemini-api-key-submit"]',
+    ) as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    await fireEvent.click(submit);
+    await settle();
+
+    expect(mockInvoke).toHaveBeenCalledWith("gemini_provision_api_key", {
+      baseDir: "/home/test/.claude/accounts",
+      slot: 3,
+      key: "AIzaSyTEST_KEY_xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    });
+    expect(onAccountAdded).toHaveBeenCalled();
+    expect(container.textContent).toContain("Gemini account 3 provisioned");
+  });
+
+  it("opens file dialog for Vertex SA tab and submits the picked path", async () => {
+    setupMocks({
+      list_providers: [GEMINI_PROVIDER],
+      gemini_probe_tos_residue: null,
+      is_gemini_tos_acknowledged: true,
+      gemini_provision_vertex_sa: "/abs/picked/sa.json",
+    });
+    mockOpenDialog.mockResolvedValueOnce("/abs/picked/sa.json");
+
+    const { container } = renderModal();
+    await settle();
+
+    await fireEvent.click(
+      Array.from(container.querySelectorAll(".provider-card")).find((el) =>
+        el.textContent?.includes("Gemini"),
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    // Switch to vertex tab.
+    const vertexTab = container.querySelector(
+      '[data-testid="gemini-tab-vertex"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(vertexTab);
+    await tick();
+
+    // File picker → mock returns the path.
+    const pickBtn = container.querySelector(
+      '[data-testid="gemini-vertex-pick"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(pickBtn);
+    await settle();
+
+    expect(mockOpenDialog).toHaveBeenCalled();
+    const pathDisplay = container.querySelector(
+      '[data-testid="gemini-vertex-path"]',
+    );
+    expect(pathDisplay?.textContent).toContain("/abs/picked/sa.json");
+
+    // Submit the vertex SA.
+    const submit = container.querySelector(
+      '[data-testid="gemini-vertex-submit"]',
+    ) as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    await fireEvent.click(submit);
+    await settle();
+
+    expect(mockInvoke).toHaveBeenCalledWith("gemini_provision_vertex_sa", {
+      baseDir: "/home/test/.claude/accounts",
+      slot: 3,
+      saPath: "/abs/picked/sa.json",
+    });
+    expect(container.textContent).toContain("Vertex SA: /abs/picked/sa.json");
+  });
+
+  it("disables api-key Provision button until key is non-empty", async () => {
+    setupMocks({
+      list_providers: [GEMINI_PROVIDER],
+      gemini_probe_tos_residue: null,
+      is_gemini_tos_acknowledged: true,
+    });
+    const { container } = renderModal();
+    await settle();
+
+    await fireEvent.click(
+      Array.from(container.querySelectorAll(".provider-card")).find((el) =>
+        el.textContent?.includes("Gemini"),
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    const submit = container.querySelector(
+      '[data-testid="gemini-api-key-submit"]',
+    ) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
   });
 });

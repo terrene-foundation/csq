@@ -2,6 +2,39 @@
 
 All notable changes to csq are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbering follows [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] — 2026-04-26
+
+Gemini as a first-class third surface alongside ClaudeCode and Codex: API-key provisioning (AI Studio paste or Vertex SA JSON path) under `platform::secret` encryption-at-rest, in-flight `csq swap` between Gemini slots, cross-surface swap with the existing v2.1.0 confirm + tombstone path, `csq run` that does not require a running daemon (a deliberate inversion of v2.1.0's INV-P02 for Codex), event-driven quota via a CLI-durable NDJSON event log, a 7-layer Terms-of-Service defense (EP1–EP7) pinned to gemini-cli 0.38.x, and a desktop UI mirroring the ClaudeCode and Codex flows. No schema migration; quota.json stays at v2.
+
+See `docs/releases/v2.3.0.md` for the full release notes.
+
+### Added
+
+- `Surface::Gemini` variant + dispatch wiring across `discovery`, `auto_rotate`, `rotation::swap_to`, `daemon::refresher`, `usage_poller`. Surface dispatch architecture from v2.1.0 extends to a third variant.
+- `csq_core::platform::secret` — encryption-at-rest primitive with five backends: `macos.rs` (Keychain via `security-framework`), `linux.rs` (Secret Service with AES-GCM file fallback), `windows.rs` (DPAPI + Credential Manager), `file.rs` (AES-GCM-only fallback for headless / CI / WSL-no-keyring environments), `in_memory.rs` (test-only). All five implement the same `SecretStore` trait; `audit.rs` carries the security-reviewer sign-off ledger.
+- `csq_core::providers::gemini` — full Gemini surface module: `provisioning.rs` (vault wiring + model orchestration), `spawn.rs` (`spawn_gemini` with EP2/EP3 pre-spawn guards), `tos_guard.rs` (EP4 stderr sentinel pinned to gemini-cli 0.38.x), `tos.rs` (per-slot ToS marker mirror of `codex/tos.rs`), `capture.rs` (NDJSON emitter with `O_APPEND` + `fsync`), `event_id.rs` (envelope ID minting), `keyfile.rs` (canonical path for at-rest secret artifacts).
+- `csq setkey gemini <slot> --from-stdin` — CLI provisioning. API key piped on stdin; never reaches argv; redacted by `error::redact_tokens` (now learns `AIza*` prefix).
+- `csq run` — Gemini surface dispatch via `discovery::discover_all`. Does not require a running daemon for Gemini slots (ADR-G09, INV-P02 inverted).
+- `csq swap` — cross-surface routing for Gemini slots; same-surface Gemini→Gemini repoints atomically; cross-surface follows v2.1.0 INV-P05 confirm + INV-P10 rename-source-to-tombstone + `exec`.
+- `csq models switch` — Gemini dispatch via `discover_all`; static catalog with 4 entries (`gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.0-flash-exp`, `gemini-1.5-pro`).
+- `accounts/gemini-events-<N>.ndjson` — per-slot event log, 0o600, gitignored, drained by daemon. Spec 07 §7.2.3.1 freezes the event-delivery contract: 50 ms non-blocking connect ceiling, drop-on-unavailable semantics, NDJSON-as-durability-floor invariant.
+- Daemon NDJSON consumer + live IPC route — drains every `gemini-events-<N>.ndjson` on startup and on each tick; advances `quota.json`; rotates corrupt logs to `gemini-events-<N>.corrupt.<unix_ms>` and starts fresh.
+- Desktop UI (PR-G5): AddAccountModal Gemini tab with two sub-tabs (AI Studio key paste / Vertex SA JSON file picker), ToS disclosure modal, inline OAuth-residue warning panel; ChangeModelModal static Gemini list with preview-tier downgrade warning; AccountCard surface badge + downgrade chip + "quota: n/a" rendering.
+- Six new Tauri commands: `is_gemini_tos_acknowledged`, `acknowledge_gemini_tos`, `gemini_probe_tos_residue`, `gemini_provision_api_key`, `gemini_provision_vertex_sa`, `gemini_switch_model`.
+
+### Changed
+
+- `error::redact_tokens` learns the `AIza*` prefix (Google API keys) alongside the existing `sk-ant-*` and long-hex coverage. Applied at every Gemini-adjacent error format site.
+- `dialog:allow-open` permission grant added to `csq-desktop/src-tauri/capabilities/default.json` (narrow, replaces no `:default` 3P plugin grants — capability audit per `rules/tauri-commands.md`).
+
+### Deferred
+
+- **D7 — vault-delete-on-unbind from desktop** (journal 0011 §FD #1, restated in 0013). CLI `csq logout` calls `vault.delete`; desktop "remove Gemini account" flow does not yet. Follow-up PR.
+- **csq-cli orchestration cleanup** (journal 0013). `setkey.rs::handle_gemini` and `models.rs::write_gemini_model_to_binding` carry ~30 LOC of contained duplication that collapses to single-source via `csq-core` helpers.
+- **`launch_gemini` / `exec_gemini` factoring** (journal 0012 §D4). 2 callers today; threshold is 3. Re-evaluate at v2.4 if a third caller appears.
+
+---
+
 ## [2.2.0] — 2026-04-25
 
 Minor release on v2.1.1. Two backwards-compatible onboarding improvements reported against fresh WSL installs: `csq status` now shows every configured surface (was Anthropic-only), and `csq install` + `csq run` pre-emptively detect the two failure modes behind `SessionStart:startup hook error` / `node:internal/modules/cjs/loader:1143`.

@@ -1,4 +1,17 @@
 //! Secure file operations: permissions and atomic replacement.
+//!
+//! THRESHOLD — secure-write pattern home.
+//! The canonical `unique_tmp_path → write → secure_file → atomic_replace`
+//! pipeline (with §5a tmp-cleanup on every failure branch) is currently
+//! documented in 4 places: `.claude/rules/security.md` §5a,
+//! `.claude/skills/daemon-architecture` migration-pattern subsection,
+//! `.claude/skills/provider-integration` Gemini provisioning subsection,
+//! and the in-source doc-blocks at `daemon/migrate_legacy_api_key_helper.rs`
+//! and `providers/gemini/provisioning.rs`. When a 5th subsystem adopts
+//! the pattern (e.g. Bedrock or Vertex provisioning), move the
+//! canonical doc into a doc-block on `unique_tmp_path` here per
+//! journal 0014 §FD #2 and journal 0073 §FD #2 so there is a single
+//! source of truth for the pipeline shape.
 
 use crate::error::PlatformError;
 use std::path::{Path, PathBuf};

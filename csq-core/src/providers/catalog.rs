@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize};
 ///   uses `CODEX_HOME` (OPEN-C02 RESOLVED POSITIVE, journal 0005).
 ///
 /// Reserved for future: `Gemini` (per workspaces/gemini plan §PR-G1).
+///
+/// THRESHOLD — when a 4th variant lands (Bedrock, Vertex AI, etc.),
+/// revisit journal 0014 §FD #1: the `provider-integration` skill is
+/// 335 lines covering the current 3 surfaces with quick-reference
+/// tables fronting the prose. At N=4 surfaces (or when any single
+/// surface section grows past ~150 lines on its own), reconsider
+/// either splitting the skill at the surface boundary or extracting
+/// the per-surface tables into sub-files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Surface {
     /// Claude Code CLI (`claude`). Default for backward compatibility

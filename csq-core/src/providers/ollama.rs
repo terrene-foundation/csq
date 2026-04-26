@@ -127,12 +127,15 @@ mod tests {
 
     #[test]
     fn find_ollama_bin_respects_env_override_when_file_exists() {
+        // Cargo runs tests in parallel; without the shared mutex,
+        // concurrent tests reading or mutating any env var (PATH, HOME,
+        // OLLAMA_BIN, …) race with this test's set_var. See
+        // `crate::platform::test_env`.
+        let _shared_env_guard = crate::platform::test_env::lock();
+
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_string_lossy().into_owned();
 
-        // Safety: tests in this crate run serially under `cargo test`
-        // by default for env-dependent cases, but we still scope the
-        // override and restore it rather than leaking state.
         let prev = std::env::var("OLLAMA_BIN").ok();
         std::env::set_var("OLLAMA_BIN", &path);
 
@@ -147,6 +150,8 @@ mod tests {
 
     #[test]
     fn find_ollama_bin_falls_through_when_override_points_at_nonexistent_file() {
+        let _shared_env_guard = crate::platform::test_env::lock();
+
         let prev = std::env::var("OLLAMA_BIN").ok();
         std::env::set_var("OLLAMA_BIN", "/nonexistent/ollama-binary-xyzzy");
 

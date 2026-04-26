@@ -604,7 +604,12 @@ mod tests {
     /// Serializes env-var manipulation across all tests in this
     /// module. `cargo test` runs tests in parallel; reading and
     /// writing process env without coordination produces flaky
-    /// failures where one test sees another's passphrase.
+    /// failures where one test sees another's passphrase. Tests
+    /// acquire `crate::platform::test_env::lock()` BEFORE this lock so
+    /// every env-mutating test in the workspace serializes against
+    /// every other (cross-module flakes manifest as one test seeing
+    /// another's PATH / HOME / XDG_RUNTIME_DIR mid-flight; the
+    /// per-module lock alone does not catch that).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// RAII guard that restores the env-var state on drop. Tests use
@@ -890,6 +895,7 @@ mod tests {
     /// the cipher, so this is the regression check.
     #[test]
     fn two_opens_use_distinct_salts() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         std::env::set_var(ENV_PASSPHRASE, "test-passphrase-for-salt-uniqueness-x");
@@ -911,6 +917,7 @@ mod tests {
     /// dispatch layer relies on.
     #[test]
     fn open_without_passphrase_returns_backend_unavailable() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         std::env::remove_var(ENV_PASSPHRASE);
@@ -927,6 +934,7 @@ mod tests {
     /// a deterministic key from a known salt schedule.
     #[test]
     fn open_with_empty_passphrase_returns_backend_unavailable() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         std::env::set_var(ENV_PASSPHRASE, "");
@@ -940,6 +948,7 @@ mod tests {
     /// Tests the file-read path including trailing-newline strip.
     #[test]
     fn open_with_passphrase_file_works_and_strips_newline() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         std::env::remove_var(ENV_PASSPHRASE);
@@ -966,6 +975,7 @@ mod tests {
     #[test]
     #[ignore = "exercises full Argon2id at production cost — run with --include-ignored"]
     fn full_argon2_round_trip() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         std::env::set_var(ENV_PASSPHRASE, "argon2-full-cost-passphrase-xyz");

@@ -17,19 +17,31 @@
 //!
 //! A per-variable map adds complexity (lazy init + entry acquisition
 //! under a meta-lock) that is not yet justified by the use case. The
-//! csq test suite mutates a small fixed set of variables:
+//! csq test suite mutates a small fixed set of variables; every test
+//! that touches one MUST acquire `lock()` first:
 //!
-//! - `XDG_RUNTIME_DIR` (Linux daemon path resolution)
-//! - `LOCALAPPDATA` (Windows daemon path resolution)
-//! - `USERNAME` (Windows named-pipe name derivation)
-//! - `CLAUDE_CONFIG_DIR` (statusline tests, has its own `ENV_MUTEX`)
-//! - `OLLAMA_BIN` (provider tests, single test with save+restore)
-//! - `PATH`, `HOME` (accounts::login tests, save+restore)
+//! | Variable                    | Mutator                                                     | In-module lock          |
+//! | --------------------------- | ----------------------------------------------------------- | ----------------------- |
+//! | `XDG_RUNTIME_DIR`           | `daemon::paths::tests::linux_prefers_xdg_runtime_dir`       | (none)                  |
+//! | `XDG_RUNTIME_DIR` (read)    | `daemon::detect::tests::detect_live_*` (Linux)              | `SOCKET_TEST_MUTEX`     |
+//! | `LOCALAPPDATA`, `USERNAME`  | `daemon::detect::tests::detect_windows_*`                   | `WINDOWS_ENV_TEST_MUTEX`|
+//! | `LOCALAPPDATA` (read)       | `daemon::paths::tests::windows_*`                           | (none)                  |
+//! | `CLAUDE_CONFIG_DIR`         | `csq-cli` statusline tests                                  | `ENV_MUTEX`             |
+//! | `OLLAMA_BIN`                | `providers::ollama::tests::find_ollama_bin_*`               | (none)                  |
+//! | `PATH`, `HOME`              | `accounts::login::tests::find_claude_binary_*`              | (none)                  |
+//! | `CSQ_SECRET_BACKEND`        | `platform::secret::tests::*`                                | `ENV_LOCK`              |
+//! | `CSQ_SECRET_PASSPHRASE*`    | `platform::secret::file::tests::*`                          | `ENV_LOCK`              |
 //!
 //! A single coarse mutex across all env-mutating tests serializes the
 //! handful of tests that touch process-global env without contention
 //! becoming a problem (all env-mutating tests together take < 1s in
 //! a normal run).
+//!
+//! Lock ordering: when a test holds both this shared mutex AND an
+//! in-module mutex, the shared mutex MUST be acquired FIRST. Otherwise
+//! pairs of tests that consistently choose opposite orders deadlock.
+//! All current call sites follow this order — `detect.rs:573, 613` is
+//! the canonical example.
 //!
 //! # Usage
 //!

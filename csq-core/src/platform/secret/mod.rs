@@ -387,7 +387,12 @@ mod tests {
     /// Serializes env-var manipulation across tests in this module.
     /// `cargo test` runs in parallel; reading and writing process
     /// env without coordination produces flaky failures where one
-    /// test sees another's `CSQ_SECRET_BACKEND` value.
+    /// test sees another's `CSQ_SECRET_BACKEND` value. Tests acquire
+    /// `crate::platform::test_env::lock()` BEFORE this lock so every
+    /// env-mutating test in the workspace serializes against every
+    /// other (cross-module flakes only manifest when one test reads
+    /// an env var another test mutates concurrently — the per-module
+    /// lock alone does not catch that).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// RAII guard restoring `CSQ_SECRET_BACKEND` on drop.
@@ -494,6 +499,7 @@ mod tests {
 
     #[test]
     fn open_default_vault_rejects_unknown_backend_value() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
         std::env::set_var("CSQ_SECRET_BACKEND", "made-up-backend");
@@ -522,6 +528,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_refuses_file_override() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
         std::env::set_var("CSQ_SECRET_BACKEND", "file");
@@ -545,6 +552,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_default_returns_keychain_backend() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
         std::env::remove_var("CSQ_SECRET_BACKEND");
@@ -556,6 +564,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_keychain_override_is_no_op() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
         std::env::set_var("CSQ_SECRET_BACKEND", "keychain");
@@ -569,6 +578,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_refuses_file_override() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
         std::env::set_var("CSQ_SECRET_BACKEND", "file");
@@ -593,6 +603,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_default_returns_credential_manager_when_not_system() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
         std::env::remove_var("CSQ_SECRET_BACKEND");
@@ -611,6 +622,7 @@ mod tests {
     /// `is_known_override` test.
     #[test]
     fn open_default_vault_typo_surfaces_actionable_error() {
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = EnvGuard::capture();
         std::env::set_var("CSQ_SECRET_BACKEND", "files");

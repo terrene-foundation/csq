@@ -8,10 +8,9 @@
 use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::third_party;
 use csq_core::credentials::file as cred_file;
-use csq_core::platform::secret::{self, SecretError, SlotKey};
+use csq_core::platform::secret::{self, SecretError};
 use csq_core::providers::catalog::{AuthType, Surface};
 use csq_core::providers::gemini::provisioning::{self, AuthMode, GeminiBinding, ProvisionError};
-use csq_core::providers::gemini::SURFACE_GEMINI;
 use csq_core::types::AccountNum;
 use csq_core::{http, providers};
 use secrecy::SecretString;
@@ -179,21 +178,13 @@ fn provision_api_key(base_dir: &Path, slot: AccountNum) -> Result<()> {
     }
 
     let vault = secret::open_default_vault().map_err(map_vault_error)?;
-    let slot_key = SlotKey {
-        surface: SURFACE_GEMINI,
-        account: slot,
-    };
-    vault
-        .set(slot_key, &SecretString::new(key.clone().into()))
-        .map_err(map_vault_error)?;
-
-    let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
-    if let Err(e) = provisioning::write_binding(base_dir, slot, &binding) {
-        // Marker write failed — roll back the vault entry so the
-        // operator can retry without a half-bound state.
-        let _ = vault.delete(slot_key);
-        return Err(map_provision_error(e));
-    }
+    provisioning::provision_api_key_via_vault(
+        base_dir,
+        slot,
+        &SecretString::new(key.clone().into()),
+        vault.as_ref(),
+    )
+    .map_err(map_provision_error)?;
 
     println!(
         "Provisioned Gemini slot {} (AI Studio API key, fingerprint: {}…{})",

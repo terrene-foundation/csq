@@ -476,6 +476,14 @@ mod tests {
     // path acquires this mutex.
     #[allow(clippy::await_holding_lock)]
     async fn detect_live_pid_but_missing_socket_is_stale() {
+        // Cross-module env-var mutex first — `paths::tests::linux_prefers_xdg_runtime_dir`
+        // mutates `XDG_RUNTIME_DIR`, and `pid_file_path` / `socket_path` resolve through
+        // that env var. Without this guard the paths test can flip the env mid-flight,
+        // so this test's pid_file_path() resolves to a different directory than the one
+        // it just wrote to → `NotRunning` instead of `Stale`. PR #204 surfaced this on
+        // Ubuntu CI (mac/Windows did not race because `paths::linux_prefers_xdg_runtime_dir`
+        // is `#[cfg(target_os = "linux")]`). Mirrors the Windows pattern below.
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         let pid_path = super::super::pid_file_path(dir.path());
@@ -510,6 +518,9 @@ mod tests {
     async fn detect_live_daemon_returns_healthy() {
         use crate::daemon::server;
 
+        // See sibling test for rationale — cross-module env-var mutex
+        // first to serialize against `paths::linux_prefers_xdg_runtime_dir`.
+        let _shared_env_guard = crate::platform::test_env::lock();
         let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         let pid_path = super::super::pid_file_path(dir.path());

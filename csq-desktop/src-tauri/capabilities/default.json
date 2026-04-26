@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window capabilities — narrowed for v2.0.0 (journal 0063 M2). Each permission is the minimum needed for a specific feature; opener is restricted to open-url so the renderer cannot open arbitrary filesystem paths or reveal items in the Finder.",
+  "description": "Main window capabilities — narrowed for v2.0.0 (journal 0063 M2). Each permission is the minimum needed for a specific feature; opener is restricted to open-url so the renderer cannot open arbitrary filesystem paths or reveal items in the Finder. dialog:allow-open scopes the Gemini Vertex SA file picker (PR-G5) — the renderer can show a file open dialog but cannot save, message, or ask via dialog.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -15,6 +15,7 @@
     "updater:allow-check",
     "updater:allow-download-and-install",
     "process:allow-restart",
-    "process:allow-exit"
+    "process:allow-exit",
+    "dialog:allow-open"
   ]
 }

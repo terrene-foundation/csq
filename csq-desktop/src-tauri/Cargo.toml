@@ -19,6 +19,7 @@ csq-core = { path = "../../csq-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+secrecy.workspace = true
 dirs.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -32,6 +33,7 @@ tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-dialog = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

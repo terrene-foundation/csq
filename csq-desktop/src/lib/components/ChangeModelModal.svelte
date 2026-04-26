@@ -52,6 +52,23 @@
     fetched_at: number;
   }
 
+  // PR-G5 — Gemini static list per FR-G-UI-02. The desktop submits
+  // canonical ids only; the matching boundary check on the Tauri
+  // side is `is_known_gemini_model`. `auto` is intentionally first
+  // because it's the default the binding marker is provisioned with.
+  interface GeminiModelEntry {
+    id: string;
+    label: string;
+    isPreview: boolean;
+  }
+  const GEMINI_MODELS: GeminiModelEntry[] = [
+    { id: 'auto', label: 'auto (let Gemini pick)', isPreview: false },
+    { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', isPreview: false },
+    { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', isPreview: false },
+    { id: 'gemini-2.5-flash-lite', label: 'gemini-2.5-flash-lite', isPreview: false },
+    { id: 'gemini-3-pro-preview', label: 'gemini-3-pro-preview', isPreview: true },
+  ];
+
   type ModalState =
     | { kind: 'loading' }
     | {
@@ -70,6 +87,15 @@
         list: CodexModelList;
         selected: string;
         custom: string;
+        submitting: boolean;
+        error: string | null;
+      }
+    // PR-G5 — Gemini branch. Static list — no IPC fetch — so this
+    // state is reachable synchronously inside loadInstalled.
+    | {
+        kind: 'gemini-picker';
+        models: GeminiModelEntry[];
+        selected: string;
         submitting: boolean;
         error: string | null;
       }
@@ -110,6 +136,19 @@
   async function loadInstalled(isCancelled: () => boolean) {
     if (surface === 'codex') {
       await loadCodexModels(isCancelled);
+      return;
+    }
+    if (surface === 'gemini') {
+      // Static list — no IPC required. The boundary check on
+      // submission is `is_known_gemini_model` in csq-core.
+      if (isCancelled()) return;
+      modalState = {
+        kind: 'gemini-picker',
+        models: GEMINI_MODELS,
+        selected: GEMINI_MODELS[0]!.id,
+        submitting: false,
+        error: null,
+      };
       return;
     }
     try {
@@ -174,6 +213,29 @@
       const baseDir = await getBaseDir();
       await invoke('set_codex_slot_model', { baseDir, slot, model: target });
       modalState = { kind: 'done', model: target };
+      onChanged();
+    } catch (e) {
+      modalState = { kind: 'error', message: String(e) };
+    }
+  }
+
+  async function submitGemini() {
+    if (modalState.kind !== 'gemini-picker' || modalState.submitting) return;
+    const current = modalState;
+    if (!current.selected) {
+      modalState = { ...current, error: 'Pick a model', submitting: false };
+      return;
+    }
+
+    modalState = { ...current, submitting: true, error: null };
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('gemini_switch_model', {
+        baseDir,
+        slot,
+        model: current.selected,
+      });
+      modalState = { kind: 'done', model: current.selected };
       onChanged();
     } catch (e) {
       modalState = { kind: 'error', message: String(e) };
@@ -350,7 +412,13 @@
     <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="change-model-title" tabindex="-1">
       <header>
         <h2 id="change-model-title">
-          {surface === 'codex' ? 'Change Codex model' : 'Change Ollama model'}
+          {#if surface === 'codex'}
+            Change Codex model
+          {:else if surface === 'gemini'}
+            Change Gemini model
+          {:else}
+            Change Ollama model
+          {/if}
         </h2>
         <button class="close" onclick={close} aria-label="Close">×</button>
       </header>
@@ -408,6 +476,55 @@
           <div class="actions">
             <button class="secondary" onclick={close} disabled={modalState.submitting}>Cancel</button>
             <button class="primary" onclick={submitCodex} disabled={modalState.submitting}>
+              {modalState.submitting ? 'Applying…' : 'Apply'}
+            </button>
+          </div>
+        {:else if modalState.kind === 'gemini-picker'}
+          <!--
+            FR-G-UI-02: Static Gemini list. The catalog is owned
+            client-side because it's small and frozen — desktop
+            submits canonical ids only, server-side validates with
+            `is_known_gemini_model`. Custom-id input is intentionally
+            absent (unlike the Codex picker) since aliases are a CLI
+            concern; desktop users pick from a dropdown of canonical
+            ids.
+          -->
+          <p class="lede">Retarget slot #{slot} to a different Gemini model.</p>
+          <p class="hint">
+            csq writes <code>model_name</code> into
+            <code>credentials/gemini-{slot}.json</code> atomically. The drift
+            detector picks up the change on the next <code>csq run {slot}</code>.
+          </p>
+          <label class="field">
+            <span>Model</span>
+            <select
+              bind:value={modalState.selected}
+              disabled={modalState.submitting}
+              data-testid="gemini-model-select"
+            >
+              {#each modalState.models as m (m.id)}
+                <option value={m.id}>{m.label}{m.isPreview ? ' (preview)' : ''}</option>
+              {/each}
+            </select>
+          </label>
+          {#if modalState.selected.endsWith('-preview')}
+            <div class="hint preview-warning" data-testid="gemini-preview-warning">
+              ⚠ Your tier may silently return <code>gemini-2.5-pro</code>. csq
+              will flag the actual served model on the AccountCard after the
+              first call.
+            </div>
+          {/if}
+          {#if modalState.error}
+            <div class="error-banner">{modalState.error}</div>
+          {/if}
+          <div class="actions">
+            <button class="secondary" onclick={close} disabled={modalState.submitting}>Cancel</button>
+            <button
+              class="primary"
+              onclick={submitGemini}
+              disabled={modalState.submitting}
+              data-testid="gemini-apply"
+            >
               {modalState.submitting ? 'Applying…' : 'Apply'}
             </button>
           </div>
@@ -546,6 +663,14 @@
     padding: 0.1em 0.35em;
     border-radius: 3px;
     font-size: 0.95em;
+  }
+  .hint.preview-warning {
+    margin-top: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid rgba(217, 119, 6, 0.4);
+    background: rgba(217, 119, 6, 0.08);
+    border-radius: 4px;
+    color: var(--orange, #d97706);
   }
   .field {
     display: flex;

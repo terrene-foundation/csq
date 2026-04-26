@@ -54,6 +54,7 @@ pub mod probe;
 pub mod provisioning;
 pub mod settings;
 pub mod spawn;
+pub mod tos;
 pub mod tos_guard;
 
 /// Surface tag for [`platform::secret::SlotKey`] and audit-log

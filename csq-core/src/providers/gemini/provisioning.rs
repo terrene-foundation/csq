@@ -42,9 +42,11 @@
 use crate::credentials::file::canonical_path_for;
 use crate::error::PlatformError;
 use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
-use crate::platform::secret::SecretError;
+use crate::platform::secret::{SecretError, SlotKey, Vault};
 use crate::providers::catalog::Surface;
+use crate::providers::gemini::SURFACE_GEMINI;
 use crate::types::AccountNum;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -314,6 +316,151 @@ pub fn unbind(base_dir: &Path, slot: AccountNum) -> Result<(), ProvisionError> {
     }
 }
 
+/// Surface a slot is currently bound to, when that surface is
+/// something other than Gemini. Returned by
+/// [`detect_other_surface_binding`] so a `setkey gemini` flow can
+/// refuse to silently overwrite an existing binding without an
+/// explicit `csq logout`. Mirrors FR-CLI-05 posture for parity with
+/// `setkey mm` / `setkey codex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundSurface {
+    /// Anthropic OAuth credentials at `credentials/<N>.json`.
+    ClaudeCode,
+    /// Codex OAuth credentials at `credentials/codex-<N>.json`.
+    Codex,
+}
+
+impl BoundSurface {
+    /// Stable lower-case tag for logs and UI labels (`"claude_code"`,
+    /// `"codex"`). The desktop renders this in the slot-conflict
+    /// refusal message.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            BoundSurface::ClaudeCode => "claude_code",
+            BoundSurface::Codex => "codex",
+        }
+    }
+}
+
+/// Returns `Some(...)` when slot `N` is currently bound to a
+/// non-Gemini surface — the caller MUST refuse rebinding without an
+/// explicit `csq logout N` first. Treats a dangling symlink as
+/// "bound" (same posture as [`is_gemini_bound_slot`]).
+///
+/// Codex is checked before ClaudeCode because Codex's marker file
+/// (`credentials/codex-<N>.json`) is namespaced and unambiguous,
+/// while the Anthropic path (`credentials/<N>.json`) is the original
+/// shape that pre-dates the multi-surface era — a stale Anthropic
+/// stub may exist on machines that also run Codex.
+pub fn detect_other_surface_binding(base_dir: &Path, slot: AccountNum) -> Option<BoundSurface> {
+    let codex_path = canonical_path_for(base_dir, slot, Surface::Codex);
+    if std::fs::symlink_metadata(&codex_path).is_ok() {
+        return Some(BoundSurface::Codex);
+    }
+    let claude_path = canonical_path_for(base_dir, slot, Surface::ClaudeCode);
+    if std::fs::symlink_metadata(&claude_path).is_ok() {
+        return Some(BoundSurface::ClaudeCode);
+    }
+    None
+}
+
+/// Orchestrates AI Studio API-key provisioning from a desktop or CLI
+/// caller. Sequence:
+///
+/// 1. `vault.set` writes the encrypted key under the canonical slot.
+/// 2. [`write_binding`] writes the `credentials/gemini-<N>.json`
+///    marker (api_key mode, `model_name = "auto"`).
+/// 3. On marker write failure, the vault entry is rolled back via
+///    `vault.delete` so the slot does not enter a half-bound state
+///    (vault has key, but no marker → `csq run N` would refuse and
+///    operator would see no obvious recovery path).
+///
+/// The caller is responsible for shape validation on `key` (e.g.
+/// `AIza` prefix, length bounds) and for refusing cross-surface
+/// conflicts via [`detect_other_surface_binding`] BEFORE invoking —
+/// this fn deliberately does NOT re-check those so it stays unit
+/// testable in isolation.
+pub fn provision_api_key_via_vault(
+    base_dir: &Path,
+    slot: AccountNum,
+    key: &SecretString,
+    vault: &dyn Vault,
+) -> Result<(), ProvisionError> {
+    let slot_key = SlotKey {
+        surface: SURFACE_GEMINI,
+        account: slot,
+    };
+    vault.set(slot_key, key)?;
+
+    let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
+    if let Err(e) = write_binding(base_dir, slot, &binding) {
+        let _ = vault.delete(slot_key);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Orchestrates Vertex SA provisioning. Validates the path
+/// (regular file, ≤ 64 KiB, not a symlink, canonicalised), then
+/// writes the binding marker with `model_name = "auto"`. Returns
+/// the canonical absolute path that ended up in the marker — desktop
+/// callers display this back to the user for confirmation.
+pub fn provision_vertex_sa(
+    base_dir: &Path,
+    slot: AccountNum,
+    sa_path: &Path,
+) -> Result<PathBuf, ProvisionError> {
+    let canon = validate_vertex_sa_path(sa_path)?;
+    let binding = GeminiBinding::new(
+        AuthMode::VertexSa {
+            path: canon.clone(),
+        },
+        "auto",
+    );
+    write_binding(base_dir, slot, &binding)?;
+    Ok(canon)
+}
+
+/// Atomically updates `model_name` inside the slot's binding marker.
+/// Returns [`ProvisionError::Io`] with `NotFound` if the slot has no
+/// Gemini binding (caller renders "run setkey gemini first"). The
+/// drift detector picks up the new value on the next `csq run` /
+/// session swap that hits this slot.
+pub fn set_model_name(
+    base_dir: &Path,
+    slot: AccountNum,
+    model: &str,
+) -> Result<(), ProvisionError> {
+    let mut binding = read_binding(base_dir, slot)?;
+    binding.model_name = model.to_string();
+    write_binding(base_dir, slot, &binding)
+}
+
+/// Static allowlist of model values the desktop UI's static picker
+/// may submit. Mirrors FR-G-UI-02's enumeration:
+///
+/// - `auto` — synthetic literal, instructs gemini-cli to pick.
+/// - `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
+///   — concrete catalog ids (see `providers::catalog`).
+/// - `gemini-3-pro-preview` — preview tier; the UI shows a downgrade
+///   warning when this is selected.
+///
+/// Used by the desktop `gemini_switch_model` command for boundary
+/// validation. CLI callers continue to go through the catalog
+/// (`models.rs::resolve_gemini_model`) which accepts user-friendly
+/// aliases (`pro`, `flash`); the desktop submits canonical ids only,
+/// so a tighter check is correct here.
+pub fn is_known_gemini_model(model: &str) -> bool {
+    matches!(
+        model,
+        "auto"
+            | "gemini-2.5-pro"
+            | "gemini-2.5-flash"
+            | "gemini-2.5-flash-lite"
+            | "gemini-3-pro-preview"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +668,202 @@ mod tests {
             }
             other => panic!("expected VertexSaInvalid, got {other:?}"),
         }
+    }
+
+    // ── PR-G5 desktop orchestration helpers ─────────────────────
+
+    use crate::platform::secret::in_memory::InMemoryVault;
+
+    fn write_marker_file(base: &Path, surface: Surface, slot_n: u16, body: &str) {
+        let path = canonical_path_for(base, slot(slot_n), surface);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+
+    #[test]
+    fn detect_other_surface_returns_none_when_no_bindings() {
+        let dir = TempDir::new().unwrap();
+        assert!(detect_other_surface_binding(dir.path(), slot(1)).is_none());
+    }
+
+    #[test]
+    fn detect_other_surface_returns_codex_when_codex_marker_present() {
+        let dir = TempDir::new().unwrap();
+        write_marker_file(dir.path(), Surface::Codex, 2, "{}");
+        assert_eq!(
+            detect_other_surface_binding(dir.path(), slot(2)),
+            Some(BoundSurface::Codex)
+        );
+    }
+
+    #[test]
+    fn detect_other_surface_returns_claude_code_when_only_claude_marker_present() {
+        let dir = TempDir::new().unwrap();
+        write_marker_file(dir.path(), Surface::ClaudeCode, 3, "{}");
+        assert_eq!(
+            detect_other_surface_binding(dir.path(), slot(3)),
+            Some(BoundSurface::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn detect_other_surface_prefers_codex_when_both_present() {
+        // The check order is Codex first, then ClaudeCode — if a slot
+        // has both markers (an inconsistent state) the desktop
+        // refusal message names Codex which is the more recent
+        // surface. Either tag is correct factually; this test pins
+        // the order so the UI message is deterministic.
+        let dir = TempDir::new().unwrap();
+        write_marker_file(dir.path(), Surface::Codex, 4, "{}");
+        write_marker_file(dir.path(), Surface::ClaudeCode, 4, "{}");
+        assert_eq!(
+            detect_other_surface_binding(dir.path(), slot(4)),
+            Some(BoundSurface::Codex)
+        );
+    }
+
+    #[test]
+    fn detect_other_surface_ignores_gemini_marker() {
+        // A slot already bound to Gemini is NOT another-surface — the
+        // caller checks `is_gemini_bound_slot` separately for the
+        // overwrite-without-confirm decision.
+        let dir = TempDir::new().unwrap();
+        let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
+        write_binding(dir.path(), slot(5), &binding).unwrap();
+        assert!(detect_other_surface_binding(dir.path(), slot(5)).is_none());
+    }
+
+    #[test]
+    fn provision_api_key_via_vault_writes_vault_and_marker() {
+        let dir = TempDir::new().unwrap();
+        let vault = InMemoryVault::new();
+        let key = SecretString::new("AIzaSyTEST_KEY_xxxxxxxxxxxxxxxxxxxxxxxxxx".into());
+
+        provision_api_key_via_vault(dir.path(), slot(6), &key, &vault).unwrap();
+
+        let stored = vault
+            .get(SlotKey {
+                surface: SURFACE_GEMINI,
+                account: slot(6),
+            })
+            .unwrap();
+        use secrecy::ExposeSecret;
+        assert_eq!(
+            stored.expose_secret(),
+            "AIzaSyTEST_KEY_xxxxxxxxxxxxxxxxxxxxxxxxxx"
+        );
+
+        let read = read_binding(dir.path(), slot(6)).unwrap();
+        assert_eq!(read.auth, AuthMode::ApiKey);
+        assert_eq!(read.model_name, "auto");
+    }
+
+    #[test]
+    fn provision_api_key_via_vault_rolls_back_on_marker_write_failure() {
+        // Trigger a write_binding failure by pointing base_dir at a
+        // non-existent ancestor that cannot be created (a regular
+        // file occupies the parent slot of `credentials/`).
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("credentials");
+        // Make `credentials` a regular file so create_dir_all fails.
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let vault = InMemoryVault::new();
+        let key = SecretString::new("AIzaSyROLLBACK_TEST_xxxxxxxxxxxxxxxxxxxxx".into());
+
+        let err = provision_api_key_via_vault(dir.path(), slot(7), &key, &vault).unwrap_err();
+        assert!(matches!(err, ProvisionError::Io { .. }));
+
+        // Vault entry must have been rolled back so a retry doesn't
+        // see a half-bound state.
+        let after = vault.get(SlotKey {
+            surface: SURFACE_GEMINI,
+            account: slot(7),
+        });
+        assert!(matches!(after, Err(SecretError::NotFound { .. })));
+    }
+
+    #[test]
+    fn provision_vertex_sa_writes_binding_with_canonical_path() {
+        let dir = TempDir::new().unwrap();
+        let sa = dir.path().join("sa.json");
+        std::fs::write(&sa, br#"{"type":"service_account"}"#).unwrap();
+
+        let canon = provision_vertex_sa(dir.path(), slot(8), &sa).unwrap();
+        assert!(canon.is_absolute());
+
+        let read = read_binding(dir.path(), slot(8)).unwrap();
+        match read.auth {
+            AuthMode::VertexSa { path } => {
+                assert_eq!(
+                    std::fs::canonicalize(&path).unwrap(),
+                    std::fs::canonicalize(&canon).unwrap()
+                );
+            }
+            other => panic!("expected VertexSa, got {other:?}"),
+        }
+        assert_eq!(read.model_name, "auto");
+    }
+
+    #[test]
+    fn provision_vertex_sa_rejects_missing_path_without_writing_marker() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nope.json");
+        let err = provision_vertex_sa(dir.path(), slot(9), &missing).unwrap_err();
+        assert!(matches!(err, ProvisionError::VertexSaInvalid { .. }));
+        assert!(!is_gemini_bound_slot(dir.path(), slot(9)));
+    }
+
+    #[test]
+    fn set_model_name_updates_existing_binding() {
+        let dir = TempDir::new().unwrap();
+        let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
+        write_binding(dir.path(), slot(10), &binding).unwrap();
+
+        set_model_name(dir.path(), slot(10), "gemini-3-pro-preview").unwrap();
+
+        let read = read_binding(dir.path(), slot(10)).unwrap();
+        assert_eq!(read.model_name, "gemini-3-pro-preview");
+        // Other fields preserved.
+        assert_eq!(read.auth, AuthMode::ApiKey);
+    }
+
+    #[test]
+    fn set_model_name_returns_not_found_when_slot_unbound() {
+        let dir = TempDir::new().unwrap();
+        let err = set_model_name(dir.path(), slot(11), "auto").unwrap_err();
+        match err {
+            ProvisionError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Io NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_known_gemini_model_accepts_static_list() {
+        assert!(is_known_gemini_model("auto"));
+        assert!(is_known_gemini_model("gemini-2.5-pro"));
+        assert!(is_known_gemini_model("gemini-2.5-flash"));
+        assert!(is_known_gemini_model("gemini-2.5-flash-lite"));
+        assert!(is_known_gemini_model("gemini-3-pro-preview"));
+    }
+
+    #[test]
+    fn is_known_gemini_model_rejects_aliases_and_unknown() {
+        // The desktop static picker submits canonical ids only —
+        // alias resolution is a CLI concern (`models.rs`).
+        assert!(!is_known_gemini_model("pro"));
+        assert!(!is_known_gemini_model("flash"));
+        assert!(!is_known_gemini_model("flash-lite"));
+        assert!(!is_known_gemini_model("3-pro-preview"));
+        assert!(!is_known_gemini_model(""));
+        assert!(!is_known_gemini_model("claude-opus"));
+    }
+
+    #[test]
+    fn bound_surface_as_tag_is_stable() {
+        assert_eq!(BoundSurface::ClaudeCode.as_tag(), "claude_code");
+        assert_eq!(BoundSurface::Codex.as_tag(), "codex");
     }
 }

@@ -10,10 +10,11 @@
     id: number;
     label: string;
     source: string;
-    /// "claude-code" | "codex" — the upstream CLI surface the
-    /// slot spawns. PR-C6. Distinct from `source` (which tracks
-    /// the credential *origin*): a 3P provider slot has
-    /// `source="third_party"` but `surface="claude-code"`.
+    /// "claude-code" | "codex" | "gemini" — the upstream CLI surface
+    /// the slot spawns. PR-C6 added codex; PR-G5 added gemini.
+    /// Distinct from `source` (the credential *origin*): a 3P
+    /// provider slot has `source="third_party"` but
+    /// `surface="claude-code"`.
     surface: string;
     has_credentials: boolean;
     five_hour_pct: number;
@@ -32,6 +33,39 @@
     /// for Anthropic OAuth slots. Used to branch UI on provider
     /// type (e.g. only Ollama slots get a "Change model" button).
     provider_id: string | null;
+    // ── PR-G5 — Gemini-specific quota fields ──────────────────
+    // None on non-Gemini slots; populated by the daemon's NDJSON
+    // event drain. The card renders these instead of the 5h/7d
+    // UsageBar when surface === "gemini".
+    /// Number of requests issued today, or null when no events
+    /// have drained yet (renders "quota: n/a").
+    gemini_counter_today?: number | null;
+    /// ISO-8601 UTC timestamp when the active 429 retry window
+    /// ends; null when no retry is active.
+    gemini_rate_limit_reset_at?: string | null;
+    /// Model the user pinned via the binding marker.
+    gemini_selected_model?: string | null;
+    /// Model Gemini actually served on the most recent response.
+    gemini_effective_model?: string | null;
+  }
+
+  /// Formats `gemini_rate_limit_reset_at` (ISO-8601 UTC) into a
+  /// human-readable countdown like "resets in 59m 58s". Returns the
+  /// empty string when the reset is in the past or the input is
+  /// malformed — the caller falls back to the counter view.
+  function formatGeminiResetCountdown(iso: string | null | undefined): string {
+    if (!iso) return '';
+    const ms = Date.parse(iso);
+    if (Number.isNaN(ms)) return '';
+    const remaining = Math.max(0, Math.floor((ms - Date.now()) / 1000));
+    if (remaining <= 0) return '';
+    if (remaining < 60) return `resets in ${remaining}s`;
+    const m = Math.floor(remaining / 60);
+    const s = remaining % 60;
+    if (m < 60) return `resets in ${m}m ${s}s`;
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return `resets in ${h}h ${mm}m`;
   }
 
   /// Maps the backend's fixed-vocabulary error tag to human text.
@@ -425,6 +459,7 @@
                 type="button"
                 class="surface-badge"
                 class:surface-codex={account.surface === 'codex'}
+                class:surface-gemini={account.surface === 'gemini'}
                 role="status"
                 aria-label={`Upstream surface: ${account.surface}`}
                 data-testid="surface-badge"
@@ -439,24 +474,57 @@
               ⚠ {formatRefreshError(account.last_refresh_error)}
             </div>
           {/if}
-          <div class="usage-bars">
-            <UsageBar label="5h" pct={account.five_hour_pct} />
-            <UsageBar label="7d" pct={account.seven_day_pct} />
-          </div>
-          {#if account.five_hour_resets_in || account.seven_day_resets_in}
-            <div class="reset-info">
-              {#if account.five_hour_resets_in}
-                <span>5h resets in {formatResetTime(account.five_hour_resets_in)}</span>
+          {#if account.surface === 'gemini'}
+            <!--
+              FR-G-UI-03: Gemini accounts render a counter / 429
+              countdown / "n/a" instead of the synthesised 5h / 7d
+              utilization bars — Google does NOT publish a usage
+              percentage for API-key accounts so any bar would be
+              fabricated. The downgrade chip lights up when the
+              served model differs from the user's selected model.
+            -->
+            <div class="gemini-quota" data-testid="gemini-quota">
+              {#if account.gemini_rate_limit_reset_at && formatGeminiResetCountdown(account.gemini_rate_limit_reset_at)}
+                <span class="gemini-rate-limit" data-testid="gemini-rate-limit">
+                  ⏳ rate-limited — {formatGeminiResetCountdown(account.gemini_rate_limit_reset_at)}
+                </span>
+              {:else if account.gemini_counter_today !== null && account.gemini_counter_today !== undefined}
+                <span class="gemini-counter" data-testid="gemini-counter">
+                  {account.gemini_counter_today} {account.gemini_counter_today === 1 ? 'request' : 'requests'} today
+                </span>
+              {:else}
+                <span class="gemini-quota-na" data-testid="gemini-quota-na">quota: n/a</span>
               {/if}
-              {#if account.seven_day_resets_in}
-                <span>
-                  7d resets in {formatResetTime(account.seven_day_resets_in)}
-                  {#if resetRank.has(account.id)}
-                    <span class="rank-badge">{resetRank.get(account.id)}</span>
-                  {/if}
+              {#if account.gemini_selected_model && account.gemini_effective_model && account.gemini_selected_model !== account.gemini_effective_model}
+                <span
+                  class="gemini-downgrade"
+                  data-testid="gemini-downgrade"
+                  title="Your tier returned a different model than the one you selected. Preview tiers may silently downgrade."
+                >
+                  ⚠ {account.gemini_selected_model} → {account.gemini_effective_model}
                 </span>
               {/if}
             </div>
+          {:else}
+            <div class="usage-bars">
+              <UsageBar label="5h" pct={account.five_hour_pct} />
+              <UsageBar label="7d" pct={account.seven_day_pct} />
+            </div>
+            {#if account.five_hour_resets_in || account.seven_day_resets_in}
+              <div class="reset-info">
+                {#if account.five_hour_resets_in}
+                  <span>5h resets in {formatResetTime(account.five_hour_resets_in)}</span>
+                {/if}
+                {#if account.seven_day_resets_in}
+                  <span>
+                    7d resets in {formatResetTime(account.seven_day_resets_in)}
+                    {#if resetRank.has(account.id)}
+                      <span class="rank-badge">{resetRank.get(account.id)}</span>
+                    {/if}
+                  </span>
+                {/if}
+              </div>
+            {/if}
           {/if}
         </button>
         {#if account.token_status === 'expired' || account.token_status === 'missing' || account.last_refresh_error}
@@ -472,7 +540,7 @@
             Re-auth
           </button>
         {/if}
-        {#if account.provider_id === 'ollama' || account.surface === 'codex'}
+        {#if account.provider_id === 'ollama' || account.surface === 'codex' || account.surface === 'gemini'}
           <button
             class="change-model-btn"
             onclick={(e) => {
@@ -481,7 +549,9 @@
             }}
             title={account.surface === 'codex'
               ? 'Switch which Codex model this slot spawns'
-              : 'Switch which local Ollama model this slot uses'}
+              : account.surface === 'gemini'
+                ? 'Switch which Gemini model this slot spawns'
+                : 'Switch which local Ollama model this slot uses'}
           >
             Change model
           </button>
@@ -699,6 +769,41 @@
     background: rgba(16, 163, 127, 0.15);
     color: #10a37f;
     border: 1px solid rgba(16, 163, 127, 0.4);
+  }
+  .surface-badge.surface-gemini {
+    /* Google blue (#4285F4) at the same low-saturation tint level as
+       the Codex green so the badge reads as a sibling. The downgrade
+       chip below uses an amber accent to stand apart from the
+       surface chip. */
+    background: rgba(66, 133, 244, 0.15);
+    color: #4285f4;
+    border: 1px solid rgba(66, 133, 244, 0.4);
+  }
+  .gemini-quota {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: baseline;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    font-family: var(--font-mono, ui-monospace, monospace);
+  }
+  .gemini-counter {
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+  .gemini-rate-limit {
+    color: var(--orange, #d97706);
+    font-weight: 500;
+  }
+  .gemini-quota-na {
+    color: var(--text-tertiary);
+    font-style: italic;
+  }
+  .gemini-downgrade {
+    color: var(--orange, #d97706);
+    font-size: 0.68rem;
+    cursor: help;
   }
   .rename-input {
     flex: 1;

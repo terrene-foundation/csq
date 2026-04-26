@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "csq-cli"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "csq-core"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "csq-desktop"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "csq-core",

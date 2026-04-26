@@ -275,17 +275,24 @@ fn write_gemini_model_to_binding(
     slot: csq_core::types::AccountNum,
     model: &str,
 ) -> Result<()> {
-    use csq_core::providers::gemini::provisioning::{read_binding, write_binding};
-    let mut binding = read_binding(base_dir, slot).map_err(|e| {
-        anyhow!(
-            "slot {slot} has no Gemini binding — run `csq setkey gemini --slot {slot}` first ({})",
-            e.error_kind_tag()
-        )
-    })?;
-    binding.model_name = model.to_string();
-    write_binding(base_dir, slot, &binding)
-        .map_err(|e| anyhow!("failed to update Gemini binding for slot {slot}: {e}"))?;
-    Ok(())
+    use csq_core::providers::gemini::provisioning::{set_model_name, ProvisionError};
+    set_model_name(base_dir, slot, model).map_err(|e| {
+        // `read_binding` inside `set_model_name` returns `ProvisionError::Io`
+        // with `ErrorKind::NotFound` when the marker is absent — translate to
+        // the actionable "run setkey first" message. All other errors (write
+        // failures, malformed marker) map to the generic update failure.
+        match &e {
+            ProvisionError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                anyhow!(
+                    "slot {slot} has no Gemini binding — run `csq setkey gemini --slot {slot}` first ({})",
+                    e.error_kind_tag()
+                )
+            }
+            _ => anyhow!("failed to update Gemini binding for slot {slot}: {e}"),
+        }
+    })
 }
 
 /// Resolves a user-supplied Codex model query to a concrete model id.

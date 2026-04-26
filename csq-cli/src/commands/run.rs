@@ -391,6 +391,14 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
 /// No `.credentials.json` symlink (Gemini has no Anthropic OAuth
 /// path) and no `config-<N>/` housekeeping beyond what `setkey
 /// gemini` already wrote.
+///
+/// THRESHOLD — D4 factoring trigger. Sibling: `exec_gemini` in
+/// `commands/swap.rs`. At N=2 callers the ~20 LOC duplication is
+/// cheaper than introducing a `csq_core::providers::gemini::session`
+/// module + typed error enum. When a 3rd caller surfaces (most
+/// likely the desktop spawn path landing inside csq-cli, or a
+/// future Bedrock launcher reusing the same shape), factor both
+/// bodies into csq-core. Both sites must be edited together.
 fn launch_gemini(
     base_dir: &Path,
     claude_home: &Path,

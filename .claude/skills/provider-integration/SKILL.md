@@ -1,6 +1,6 @@
-# Provider Integration — csq v2.1
+# Provider Integration — csq v2.3
 
-Quick reference for how csq discovers, authenticates, and polls Anthropic + Codex + third-party providers across the surface-dispatch architecture.
+Quick reference for how csq discovers, authenticates, and polls Anthropic + Codex + Gemini + third-party providers across the surface-dispatch architecture.
 
 ## Provider Catalog
 
@@ -175,6 +175,83 @@ Same Cloudflare TLS-fingerprint issue as Anthropic — reqwest/rustls is JA3/JA4
 `csq swap` between ClaudeCode ↔ Codex slots takes the `cross_surface_exec` path: INV-P05 confirm prompt (`--yes` bypasses) → INV-P10 atomic rename of source handle dir to `.sweep-tombstone-swap-<pid>-<nanos>` (preserves open fds for the running surface; daemon sweep reaps the tombstone on next tick) → `exec` the target binary. Conversation does not transfer.
 
 Windows: `cross_surface_exec` is `#[cfg(unix)]` (uses `std::os::unix::process::CommandExt`). Cross-surface swap on Windows is not supported in v2.1.
+
+## Gemini Surface (v2.3, journals 0001-0013)
+
+csq v2.3 added Gemini (Google's CLI) as a first-class third surface alongside ClaudeCode and Codex. Surface dispatch extends to `Surface::Gemini`; everything else (auto_rotate, swap, refresher, usage_poller) routes via `discovery::discover_all`. Two key inversions vs. Codex:
+
+- **API-key only, no OAuth** (ADR-G09). OAuth subscription rerouting is rejected per Google ToS — the 7-layer guard below actively prevents it. There is no disable knob (C-CR1).
+- **No daemon required for `csq run`** (INV-P02 inverted). Quota is event-driven via NDJSON, not polled. See `daemon-architecture` SKILL.md "Gemini NDJSON Event Log Consumer".
+
+### Auth: API-key paste or Vertex SA JSON
+
+`csq setkey gemini --slot N --from-stdin` and the desktop AddAccountModal both run a stdin-only provisioning flow. The API key never appears in argv, never lands in any structured log, and is redacted by `error::redact_tokens` (the redactor learns `AIza*` in v2.3 alongside the existing `sk-ant-*` and long-hex coverage).
+
+Two auth modes: **AI Studio API key** (validated to start with `AIza`; csq-cli `provision_api_key` rejects non-`AIza` paste mistakes BEFORE writing the vault) and **Vertex SA JSON path** (`provisioning::validate_vertex_sa_path` requires a regular file, ≤ 64 KiB, not a symlink). Canonical secret lands in `platform::secret` at namespace `gemini/<slot>`.
+
+### `csq-core` orchestration helpers (single-source for csq-cli + csq-desktop)
+
+| Helper                                      | What it does                                                                                         |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `provisioning::provision_api_key_via_vault` | atomic `vault.set` + `write_binding` with rollback on marker-write failure                           |
+| `provisioning::set_model_name`              | reads binding, mutates model field, atomic write                                                     |
+| `provisioning::is_known_gemini_model`       | static catalog check (4 entries: 2.5-pro, 2.5-flash, 2.0-flash-exp, 1.5-pro)                         |
+| `provisioning::delete_api_key_from_vault`   | reads binding to determine auth mode; `vault.delete` for ApiKey, no-op for VertexSa or absent marker |
+| `spawn::spawn_gemini`                       | EP2/EP3 pre-spawn guards + env scrub + exec                                                          |
+
+csq-cli (`commands/setkey.rs`, `commands/models.rs`) calls these helpers directly; csq-desktop's six Tauri commands (`gemini_provision_api_key`, `gemini_provision_vertex_sa`, `gemini_switch_model`, `gemini_probe_tos_residue`, `is_gemini_tos_acknowledged`, `acknowledge_gemini_tos`) wrap the same helpers. The desktop "remove account" path (`remove_account` Tauri command) calls `delete_api_key_from_vault` BEFORE touching the marker — closes the orphan-key risk that v2.3.1 (#203) patched after v2.3.0 shipped.
+
+### Canonical layout
+
+| Path                                           | Purpose                                                                              | Mode    |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------ | ------- |
+| `credentials/gemini-<N>.json`                  | Binding marker (auth mode + selected model). NOT a credential — vault holds the key. | 0o600   |
+| `accounts/.gemini-tos-acknowledged-<slot>`     | Per-slot ToS acknowledgement marker (mirrors `codex/tos.rs` shape)                   | 0o600   |
+| `accounts/gemini-events-<N>.ndjson`            | Per-slot CLI event log (drained by daemon — see daemon-architecture SKILL.md)        | 0o600   |
+| `accounts/gemini-events-<N>.corrupt.<unix_ms>` | Rotated event log on parse failure (forensic retention)                              | 0o600   |
+| `platform::secret` namespace `gemini/<slot>`   | At-rest secret (Keychain / Secret Service / Credential Manager / file)               | (vault) |
+
+### 7-layer Terms-of-Service defense (EP1–EP7)
+
+Active enforcement of Google's API-key-only requirement. C-CR1 mandates: no disable knob, no "EP4 is advisory" reclassification. Each layer is independent and all are mandatory.
+
+| Layer | Where it fires                          | What it checks                                                                                                                              |
+| ----- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| EP1   | `setkey gemini` / `gemini_provision_*`  | Refuses provisioning if `~/.gemini/oauth_creds.json` is present                                                                             |
+| EP2   | `spawn::spawn_gemini` pre-exec          | `reassert_api_key_selected_type(handle_dir)` — refuses if user-level `selectedType=oauth-personal` would override                           |
+| EP3   | `spawn::spawn_gemini` env build         | `Command::env_remove` drops `GOOGLE_APPLICATION_CREDENTIALS`, `GEMINI_API_KEY`, …                                                           |
+| EP4   | `tos_guard.rs` runtime stderr sentinel  | Substring scan of gemini-cli stderr for documented OAuth-rerouting markers, pinned to `gemini-cli 0.38.x` (whitelist regression test green) |
+| EP5   | `capture.rs` response-shape detector    | `modelVersion` mismatch flag against slot's selected model (REST + SSE)                                                                     |
+| EP6   | `spawn::spawn_gemini` `.env` scan       | Pre-spawn hard refusal on `$CWD/.env` containing `GEMINI_API_KEY=` / `GOOGLE_API_KEY=`                                                      |
+| EP7   | `csq logout` + desktop `remove_account` | `vault.delete(gemini/<slot>)` so secret never outlives slot                                                                                 |
+
+**Whitelist-pinning convention.** When gemini-cli ships a new minor that changes the EP4 marker strings, the regression test `whitelist_matches_pinned_minor_version` fails before any user can bypass the sentinel. Bump = updated whitelist OR refusal dialog (PR-G3); never silent fall-through.
+
+### `platform::secret` primitive (v2.3, generalized)
+
+Five backends behind one `SecretStore` trait, selectable via `CSQ_SECRET_BACKEND`:
+
+| Backend     | File                  | Used when                                                                                                |
+| ----------- | --------------------- | -------------------------------------------------------------------------------------------------------- |
+| `macos`     | `secret/macos.rs`     | macOS, default — `security-framework` Keychain                                                           |
+| `linux`     | `secret/linux.rs`     | Linux, default — Secret Service via D-Bus                                                                |
+| `file`      | `secret/file.rs`      | Linux opt-in / WSL-no-keyring fallback — AES-GCM-on-disk + Argon2id KDF + `CSQ_SECRET_PASSPHRASE[_FILE]` |
+| `windows`   | `secret/windows.rs`   | Windows, default — DPAPI + Credential Manager                                                            |
+| `in-memory` | `secret/in_memory.rs` | Tests only — gated `cfg!(any(test, feature = "secret-in-memory"))`                                       |
+
+**`secret-in-memory` feature flag is dev-deps-only** for downstream test builds (csq-desktop). `cfg!(test)` only fires when csq-core is itself compiled with `--test`; downstream test binaries load csq-core as a normal dep where `cfg!(test)` is false. csq-desktop's `[dev-dependencies]` therefore lists `csq-core = { path = "...", features = ["secret-in-memory"] }`. Cargo unifies features across `[dependencies]` and `[dev-dependencies]` of the same crate, so the in-memory backend is reachable in `cargo test` builds and stays absent from `cargo build --release` (PR #203 + v2.3.1 fix).
+
+`audit.rs` carries the security-reviewer sign-off ledger. Every backend implements: `set(SlotKey, &SecretString)`, `get(SlotKey) -> SecretString`, `delete(SlotKey)`, `list_keys() -> Vec<SlotKey>`. Errors map via `SecretError` (BackendUnavailable / Locked / AuthorizationRequired / NotFound / Timeout / Io / EncryptionFailed / DecryptionFailed / InvalidKey / PermissionDenied) — every variant has actionable UI text per `tauri-commands.md` §6.
+
+**Drop-vault-on-unbind invariant (D7, journal 0013):** any code path that removes a Gemini slot's binding marker MUST also call `vault.delete(SlotKey { surface: SURFACE_GEMINI, account: N })`. CLI `csq logout` does it via `delete_api_key_from_vault`; desktop `remove_account` does it via the same helper since v2.3.1.
+
+### Gemini cross-surface swap
+
+Same shape as Codex: same-surface Gemini→Gemini repoint atomically; cross-surface follows v2.1.0 INV-P05 confirm + INV-P10 rename-source-to-tombstone + `exec`. The dispatcher routing matrix (`csq-cli/src/commands/swap.rs::route`) extends to handle the Gemini RouteKind variant.
+
+### Static model catalog (no `/models` endpoint)
+
+`csq models switch <slot> <model>` for Gemini routes to a static 4-entry catalog. gemini-cli does not expose a `/models` endpoint analogous to claude-cli's, so new entries land in csq-core releases — `is_known_gemini_model` is the single source of truth.
 
 ## Settings File Structure
 

@@ -1,20 +1,21 @@
-# Daemon Architecture — csq v2.1
+# Daemon Architecture — csq v2.3
 
 Quick reference for the background daemon's subsystem design, invariants, and security model.
 
 ## Subsystem Overview
 
-| Subsystem          | File                               | Interval   | Output                                                  |
-| ------------------ | ---------------------------------- | ---------- | ------------------------------------------------------- |
-| Startup reconciler | `daemon/startup_reconciler.rs`     | once       | Pass1-4: clamps invariants before any subsystem starts  |
-| Token refresher    | `daemon/refresher.rs`              | 5 min      | `RefreshStatus` cache + credential files (per-surface)  |
-| Anthropic poller   | `daemon/usage_poller.rs` tick()    | 5 min      | `quota.json` (schema_v2)                                |
-| Codex poller       | `daemon/usage_poller/codex.rs`     | 5 min      | `quota.json` + `codex-wham-raw.json` forensic capture   |
-| 3P poller          | `daemon/usage_poller.rs` tick_3p() | 15 min     | `quota.json` (with `RateLimitData`)                     |
-| Auto-rotator       | `daemon/auto_rotate.rs`            | 30s        | ClaudeCode-only (INV-P11); refuses Codex handle dirs    |
-| Handle-dir sweep   | `session/handle_dir.rs`            | 60s        | Removes orphan `term-*` dirs + preserves `image-cache/` |
-| Update check       | `update::auto_update_bg`           | 24h cache  | Stderr notice on new release                            |
-| HTTP server        | `daemon/server.rs`                 | on-request | JSON over Unix socket                                   |
+| Subsystem             | File                               | Interval   | Output                                                  |
+| --------------------- | ---------------------------------- | ---------- | ------------------------------------------------------- |
+| Startup reconciler    | `daemon/startup_reconciler.rs`     | once       | Pass1-4: clamps invariants before any subsystem starts  |
+| Token refresher       | `daemon/refresher.rs`              | 5 min      | `RefreshStatus` cache + credential files (per-surface)  |
+| Anthropic poller      | `daemon/usage_poller.rs` tick()    | 5 min      | `quota.json` (schema_v2)                                |
+| Codex poller          | `daemon/usage_poller/codex.rs`     | 5 min      | `quota.json` + `codex-wham-raw.json` forensic capture   |
+| Gemini event consumer | `daemon/usage_poller/gemini.rs`    | per tick   | `quota.json` (drains CLI-written NDJSON event log)      |
+| 3P poller             | `daemon/usage_poller.rs` tick_3p() | 15 min     | `quota.json` (with `RateLimitData`)                     |
+| Auto-rotator          | `daemon/auto_rotate.rs`            | 30s        | ClaudeCode-only (INV-P11); refuses Codex/Gemini dirs    |
+| Handle-dir sweep      | `session/handle_dir.rs`            | 60s        | Removes orphan `term-*` dirs + preserves `image-cache/` |
+| Update check          | `update::auto_update_bg`           | 24h cache  | Stderr notice on new release                            |
+| HTTP server           | `daemon/server.rs`                 | on-request | JSON over Unix socket                                   |
 
 ## Startup Reconciler (PR-C4 + later)
 
@@ -34,6 +35,24 @@ Outcome counters surface via `ReconcileSummary` (asserted in unit tests; logged 
 The reconciler is the canonical home for **on-disk artifact migrations**. New migrations should land as additional `passN` functions following the same shape: idempotent, mtime-preserving on no-op, structured-logged with `error_kind = "migrate_*"` per file rewrite, retire after a 3-month telemetry window confirms zero hits.
 
 **Removed 2026-04-11** (see journal 0020): `daemon/oauth_callback.rs` was a TCP listener on `127.0.0.1:8420` serving `/oauth/callback` for the v1 loopback OAuth flow. Anthropic retired loopback for this client_id — the module and its ~1000 LOC are gone. OAuth now uses the paste-code flow via `/api/login/{N}` + `POST /api/oauth/exchange` on the Unix socket.
+
+## Gemini NDJSON Event Log Consumer (PR-G3, v2.3)
+
+Gemini quota is event-driven, not polled. The CLI writes one `accounts/gemini-events-<slot>.ndjson` per slot per session with `O_APPEND` + `fsync` after every record (durability floor — see spec 07 §7.2.3.1, frozen by PR-G0). The daemon's Gemini consumer drains those files on startup and on every tick, advances `quota.json`, and prunes drained records.
+
+**Why event-driven, not polled:** Gemini does not expose a per-account usage endpoint analogous to Anthropic's `/api/oauth/usage` or Codex's `wham/usage`. The CLI sees per-request token-count metadata; the daemon aggregates across slots. Reversing the data flow (CLI is producer, daemon is consumer) is the core inversion of this surface.
+
+**Event-delivery contract (frozen, spec 07 §7.2.3.1):**
+
+- Socket-path resolution: `$XDG_RUNTIME_DIR/csq.sock` or `~/.claude/accounts/csq.sock`, shared with `platform::paths::daemon_socket()`.
+- Non-blocking connect ceiling: 50 ms. Above this, the emitter drops to NDJSON-as-durability-floor (write to disk, do not block the spawn).
+- Drop-on-unavailable semantics: emitter MUST NOT block on the socket. Daemon-down → record lands on disk only; next daemon tick drains it.
+- File format: one JSON object per line, ASCII-only, `\n`-terminated, slot encoded in filename (NOT body), 0o600, gitignored. Records carry timestamp + event-kind + opaque payload — no API keys, no PII.
+- Corrupt log handling: rotate to `gemini-events-<slot>.corrupt.<unix_ms>` for forensic review and start fresh.
+
+The emitter (`csq-core/src/providers/gemini/capture.rs`) is the new security surface; the redactor (`error::redact_tokens`, learns the `AIza*` prefix in v2.3) covers the format-time path. **Single-writer-to-quota.json invariant preserved** — only the daemon writes quota; the CLI writes only NDJSON.
+
+**INV-P02 inversion:** Codex requires a running daemon for `csq run`; Gemini does not. With event-driven quota, the daemon is only needed for centralized aggregation, not for spawn. A fresh-install user can `setkey gemini N --from-stdin` and `csq run N` without any daemon supervision.
 
 ## Key Invariants
 

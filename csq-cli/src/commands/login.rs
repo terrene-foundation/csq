@@ -574,13 +574,30 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
         .status()
         .context("failed to spawn `claude auth login` — is Claude Code installed?")?;
 
-    if !status.success() {
+    handle_direct_post_subprocess(base_dir, account, &config_dir, status.success())?;
+    finalize(base_dir, account)
+}
+
+/// Post-subprocess work for [`handle_direct`]: capture credentials
+/// from keychain or file, persist them canonically, then write the
+/// `.csq-account` marker — in that order so a subprocess failure or
+/// credential-capture failure leaves no orphan marker on disk.
+///
+/// Extracted so REV-R1-02 / M8 can be regression-tested without
+/// spawning the real `claude` binary.
+fn handle_direct_post_subprocess(
+    base_dir: &Path,
+    account: AccountNum,
+    config_dir: &Path,
+    subprocess_succeeded: bool,
+) -> Result<()> {
+    if !subprocess_succeeded {
         // REV-R1-02 (M8): do NOT write the .csq-account marker
-        // before this point. The marker is the "this dir holds
-        // credentials for account N" sentinel; writing it before
-        // confirming the subprocess succeeded leaves an orphan
-        // marker that the daemon's discovery path treats as a
-        // legitimate (but credential-less) account.
+        // when the subprocess failed. The marker is the "this dir
+        // holds credentials for account N" sentinel; writing it
+        // before confirming the subprocess succeeded leaves an
+        // orphan marker that the daemon's discovery path treats
+        // as a legitimate (but credential-less) account.
         return Err(anyhow!("claude auth login exited with non-zero status"));
     }
 
@@ -594,7 +611,7 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
     // We read keychain first, fall back to file. Either source is
     // authoritative — they hold the same payload — and at least one
     // is guaranteed to exist after a successful auth.
-    let creds = keychain::read(&config_dir)
+    let creds = keychain::read(config_dir)
         .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok())
         .ok_or_else(|| {
             anyhow!("no credentials captured after login — keychain and file both empty")
@@ -610,9 +627,8 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
     // REV-R1-02 (M8): write the marker AFTER the credential save
     // succeeds, so a subprocess failure or post-subprocess credential
     // capture failure leaves no orphan marker on disk.
-    markers::write_csq_account(&config_dir, account)?;
-
-    finalize(base_dir, account)
+    markers::write_csq_account(config_dir, account)?;
+    Ok(())
 }
 
 /// Post-login finalization shared by both paths.
@@ -718,5 +734,54 @@ mod tests {
         // signature pins this; if the type drifts we want the
         // failure here, not in a downstream race test.
         let _r: oauth::PasteResolver = stdin_paste_resolver();
+    }
+
+    // ── REV-R1-02 / M8: marker-write ordering regression ───────────
+
+    #[test]
+    fn handle_direct_does_not_write_marker_on_subprocess_failure() {
+        // Simulates the failure path of `handle_direct` without
+        // spawning the real `claude` binary. If the subprocess fails,
+        // the .csq-account marker MUST NOT be written — otherwise the
+        // daemon's discovery sees an orphan account with no creds.
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(7u16).unwrap();
+        let config_dir = dir.path().join("config-7");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Pretend the subprocess returned non-zero.
+        let result = handle_direct_post_subprocess(dir.path(), account, &config_dir, false);
+        assert!(result.is_err(), "subprocess failure must propagate as Err");
+
+        // No marker written.
+        let marker = config_dir.join(".csq-account");
+        assert!(
+            !marker.exists(),
+            ".csq-account marker MUST NOT exist after subprocess failure: {:?}",
+            marker
+        );
+    }
+
+    #[test]
+    fn handle_direct_does_not_write_marker_when_credentials_missing() {
+        // Subprocess succeeded but no credentials were captured
+        // (keychain empty AND .credentials.json missing). Marker
+        // must NOT be written — same rationale as the failure path.
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(8u16).unwrap();
+        let config_dir = dir.path().join("config-8");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let result = handle_direct_post_subprocess(dir.path(), account, &config_dir, true);
+        assert!(result.is_err(), "missing credentials must propagate as Err");
+
+        let marker = config_dir.join(".csq-account");
+        assert!(
+            !marker.exists(),
+            ".csq-account marker MUST NOT exist when credential capture fails: {:?}",
+            marker
+        );
     }
 }

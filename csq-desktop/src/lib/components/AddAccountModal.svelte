@@ -4,6 +4,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import { homeDir, join } from '@tauri-apps/api/path';
+  import { tick } from 'svelte';
 
   // ── Props ─────────────────────────────────────────────────
   let {
@@ -199,6 +200,20 @@
     /// to success/exchange via the normal event sequence — this
     /// step is a transient explanation, not a terminal state.
     | { kind: 'info'; message: string }
+    /// UX-R2-03 / SEC-R2-01: dedicated recovery UI when the backend
+    /// reports another csq process (CLI or desktop) holds the
+    /// per-account login lock for the slot we tried to use. Distinct
+    /// from `error` so the action button is "Close and retry"
+    /// rather than the generic "Try again" — the user needs to
+    /// resolve the OTHER login (wait or kill) before retrying.
+    | {
+        kind: 'login-in-progress';
+        account: number;
+        /// The full backend message (includes PID hint when
+        /// available). Surfaced verbatim so the user has the
+        /// concrete next action.
+        message: string;
+      }
     | { kind: 'error'; message: string };
 
   let step = $state<Step>({ kind: 'picker' });
@@ -449,6 +464,10 @@
       clearTimeout(copyResetTimer);
       copyResetTimer = null;
     }
+    // SEC-R2-03: clear the race token whenever listeners are torn
+    // down so a stale token from a previous race can't accidentally
+    // be passed to a future cancel.
+    activeRaceToken = null;
   }
 
   /// Returns the account number of the in-flight race, or `null` if
@@ -468,6 +487,20 @@
       default:
         return null;
     }
+  }
+
+  /// SEC-R2-03: opaque per-race token returned by
+  /// `start_claude_login_race` and required by `cancel_race_login`.
+  /// Captured here so the cancel call site can thread it through.
+  /// Cleared on race completion / cancellation.
+  let activeRaceToken = $state<string | null>(null);
+
+  /// Backend response shape for `start_claude_login_race`.
+  /// SEC-R2-03: carries the per-race token the frontend MUST supply
+  /// to cancel.
+  interface StartRaceResponse {
+    account: number;
+    race_token: string;
   }
 
   async function startClaudeOAuth(account: number) {
@@ -653,13 +686,59 @@
 
     // Now invoke the orchestrator. Returns immediately; the rest of
     // the flow plays out via the events above.
+    //
+    // SEC-R2-03: capture the per-race token returned by the backend.
+    // The cancel call site MUST pass this token back; without it,
+    // `cancel_race_login` returns Unauthorized (the backend can't
+    // tell our cancel from a malicious in-process JS handler's).
     try {
       const baseDir = await getBaseDir();
-      await invoke('start_claude_login_race', { baseDir, account });
+      const response = await invoke<StartRaceResponse>('start_claude_login_race', {
+        baseDir,
+        account,
+      });
+      activeRaceToken = response.race_token;
     } catch (e) {
       await cleanupRaceListeners();
-      step = { kind: 'error', message: String(e) };
+      activeRaceToken = null;
+      // UX-R2-03 / SEC-R2-01: detect the structured
+      // "another login in progress" error from the backend so we
+      // can render a dedicated recovery UI instead of a bare error
+      // banner. The backend error message starts with
+      // "login already in progress for account N" — match on that
+      // prefix; including the account number ensures we don't
+      // misidentify a different "in progress" message.
+      const errStr = String(e);
+      if (errStr.toLowerCase().includes('login already in progress')) {
+        step = {
+          kind: 'login-in-progress',
+          account,
+          message: errStr,
+        };
+        return;
+      }
+      step = { kind: 'error', message: errStr };
     }
+  }
+
+  /// UX-R2-03: clicked from the login-in-progress recovery UI.
+  /// Invokes cancel on the race that's blocking us (we don't have
+  /// its race token, but if the holder is the desktop app's own
+  /// state, the user must manually cancel it from the OTHER modal
+  /// — this button cannot cancel another process's lock). Closes
+  /// the current modal so the user can retry.
+  ///
+  /// In practice the lock holder is almost always the CLI, in which
+  /// case the only recovery is for the user to wait or kill the CLI
+  /// process. The recovery button text reflects this: "Close and
+  /// retry" rather than "Cancel previous login".
+  async function dismissLoginInProgressAndRetry() {
+    if (step.kind !== 'login-in-progress') return;
+    const account = step.account;
+    step = { kind: 'picker' };
+    // Brief tick so Svelte renders the picker before we re-trigger.
+    await tick();
+    await startClaudeOAuth(account);
   }
 
   async function submitRacePasteCode() {
@@ -1126,11 +1205,13 @@
     // so the cancellation event itself doesn't bounce the modal
     // back into a stale state.
     //
-    // Snapshot the active race account BEFORE cleanupRaceListeners
-    // runs — the cleanup itself doesn't change `step`, but a late
-    // event arrival between the two awaits could in principle. Read
-    // once, cancel with that value.
+    // Snapshot the active race account AND token BEFORE
+    // cleanupRaceListeners runs — the cleanup itself clears the
+    // token (SEC-R2-03), and a late event arrival between the two
+    // awaits could in principle change `step`. Read once, cancel
+    // with those values.
     const cancelAccount = activeRaceAccount();
+    const cancelToken = activeRaceToken;
     await cleanupRaceListeners();
 
     // Tell the backend to abort the orchestrator task IF there was
@@ -1144,9 +1225,16 @@
     // Best-effort: a no-op cancel (orchestrator already finished)
     // is `Ok(())`, so the only failure mode here is a transport
     // error from a torn-down IPC channel during shutdown — log only.
-    if (cancelAccount !== null) {
+    //
+    // SEC-R2-03: pass the race token captured at race-start time.
+    // The backend rejects cancels without a matching token to
+    // prevent the cancel-account-iteration oracle.
+    if (cancelAccount !== null && cancelToken !== null) {
       try {
-        await invoke('cancel_race_login', { account: cancelAccount });
+        await invoke('cancel_race_login', {
+          account: cancelAccount,
+          raceToken: cancelToken,
+        });
       } catch (_) {
         /* best-effort — ignore */
       }
@@ -1760,6 +1848,32 @@
           -->
           <div class="info-banner" data-testid="race-info-banner">{step.message}</div>
           <p class="hint">Finishing up — this window will update automatically.</p>
+        {:else if step.kind === 'login-in-progress'}
+          <!--
+            UX-R2-03 / SEC-R2-01: dedicated recovery banner for
+            "another csq process holds the per-account login lock".
+            The action is "Close and retry" because the only resolution
+            is for the user to wait for the OTHER login to finish (or
+            kill it if they know the PID — the message includes the
+            PID hint when the backend could read it). After they
+            resolve the other login they re-enter via this modal.
+          -->
+          <div class="warning-banner" data-testid="login-in-progress-banner">
+            ⚠ {step.message}
+          </div>
+          <p class="hint">
+            Wait for the other sign-in to finish, then click <strong>Retry</strong>.
+            If you started the other sign-in from a terminal and it's
+            stuck, close that terminal first.
+          </p>
+          <div class="actions">
+            <button class="secondary" onclick={handleClose}>Close</button>
+            <button
+              class="primary"
+              data-testid="login-in-progress-retry"
+              onclick={dismissLoginInProgressAndRetry}
+            >Retry</button>
+          </div>
         {:else if step.kind === 'error'}
           <div class="error-banner">{step.message}</div>
           <div class="actions">

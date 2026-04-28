@@ -47,7 +47,7 @@ use crate::oauth::constants::PASTE_CODE_REDIRECT_URI;
 use crate::oauth::login::build_auth_url;
 use crate::oauth::loopback::{generate_path_secret, CallbackParams, LoopbackListener};
 use crate::oauth::pkce::{challenge_from_verifier, generate_verifier, CodeVerifier};
-use crate::oauth::state_store::OAuthStateStore;
+use crate::oauth::state_store::{constant_time_eq_state, OAuthStateStore};
 use crate::types::AccountNum;
 use std::future::Future;
 use std::pin::Pin;
@@ -280,7 +280,14 @@ pub async fn drive_race(
             // Loopback path — the browser hit our listener.
             res = &mut listener_fut => {
                 let CallbackParams { code, state: cb_state } = res?;
-                if cb_state != state {
+                // SEC-R2-06: constant-time comparison. State tokens are
+                // 43 base64url chars (32 bytes of CSPRNG output) — short
+                // and known-length, but a per-byte early-exit comparison
+                // gives a same-host attacker a timing oracle on every
+                // failed match. Routing through `subtle::ConstantTimeEq`
+                // collapses the timing surface to "checked" whether the
+                // strings match or not.
+                if !constant_time_eq_state(&cb_state, &state) {
                     // Validate against the original we minted.
                     // Anthropic must echo state verbatim; if it
                     // doesn't, treat as CSRF.
@@ -298,7 +305,8 @@ pub async fn drive_race(
             res = &mut paste_fut => {
                 let pasted = res?;
                 let (code, paste_state) = split_paste_value(&pasted)?;
-                if paste_state != state {
+                // SEC-R2-06: constant-time compare on the paste path too.
+                if !constant_time_eq_state(paste_state, &state) {
                     return Err(OAuthError::StateMismatch);
                 }
                 let _pending = state_store.consume(&state)?;

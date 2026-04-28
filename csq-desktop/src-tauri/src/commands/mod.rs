@@ -1040,6 +1040,13 @@ pub fn cancel_login(state: State<'_, AppState>, state_token: String) -> Result<(
         Err(csq_core::error::OAuthError::ExchangeTimeout { .. }) => {
             Err("cancel failed: exchange_timeout".into())
         }
+        // SEC-R2-01: this variant is set by the desktop race path,
+        // not by `consume`. Listed for exhaustiveness so a future
+        // widening of `consume`'s error surface to include it
+        // surfaces a typed error here.
+        Err(csq_core::error::OAuthError::LoginInProgressElsewhere { .. }) => {
+            Err("cancel failed: login_in_progress".into())
+        }
     }
 }
 

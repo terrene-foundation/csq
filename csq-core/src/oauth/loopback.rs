@@ -314,22 +314,52 @@ async fn handle_connection(
         return ConnectionOutcome::Continue;
     }
 
-    // Host header binding (SEC-R1-01). Reject anything that doesn't
-    // exactly match `127.0.0.1:<bound_port>`. Browsers always set
-    // Host to the literal authority from the URL; a browser fetch
-    // from a different origin will set a different Host. We check
-    // BEFORE the path so a probe never even gets to learn the
-    // expected path shape.
-    let host_ok = head_str
-        .lines()
-        .skip(1) // request line, not a header
-        .take_while(|l| !l.is_empty())
-        .any(|line| {
-            let mut it = line.splitn(2, ':');
-            let name = it.next().unwrap_or("").trim();
-            let value = it.next().unwrap_or("").trim();
-            name.eq_ignore_ascii_case("host") && value == expected_host
-        });
+    // Host header binding (SEC-R1-01 + SEC-R2-09).
+    //
+    // SEC-R2-09: strict parser. RFC 7230 §5.4 requires exactly ONE
+    // Host header per request; multiple Host headers are an HTTP
+    // smuggling vector ("Host header injection") that lets an
+    // attacker who controls one header line flip routing decisions
+    // downstream. We collect every Host header in the request and:
+    //   1. Reject if count != 1 (zero = missing, ≥2 = duplicate).
+    //   2. Compare the value EXACTLY against `127.0.0.1:<bound_port>`.
+    //      Header NAME comparison is case-insensitive (HTTP spec);
+    //      header VALUE comparison is case-sensitive (Host is a
+    //      hostname:port literal — `127.0.0.1:9999` and
+    //      `127.0.0.1:9999 ` are NOT equivalent for Host-binding
+    //      purposes; we strip only the trailing CRLF, never trim the
+    //      semantic value).
+    //
+    // Browsers always set Host to the literal authority from the URL;
+    // a browser fetch from a different origin will set a different
+    // Host. We check BEFORE the path so a probe never even gets to
+    // learn the expected path shape.
+    let host_count_and_match = {
+        let mut count: usize = 0;
+        let mut matched_exactly = false;
+        for line in head_str.lines().skip(1).take_while(|l| !l.is_empty()) {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            // Trailing CRLF is already stripped by `lines()`. We do
+            // NOT additionally `.trim()` the value — that would mask
+            // a `Host: 127.0.0.1:9999  ` (trailing spaces) sent by a
+            // smuggler, which is semantically NOT the same as the
+            // expected literal value. Leading optional whitespace
+            // after the colon is permitted by RFC 7230 §3.2.4 ("OWS"
+            // — optional whitespace), so we strip exactly one ASCII
+            // space if present, but no tabs / no multi-space runs.
+            let value_after_colon = value.strip_prefix(' ').unwrap_or(value);
+            if name.eq_ignore_ascii_case("host") {
+                count += 1;
+                if value_after_colon == expected_host {
+                    matched_exactly = true;
+                }
+            }
+        }
+        (count, matched_exactly)
+    };
+    let host_ok = host_count_and_match.0 == 1 && host_count_and_match.1;
     if !host_ok {
         let _ = write_response(&mut stream, 400, "Bad Request", "bad host").await;
         return ConnectionOutcome::Continue;
@@ -988,6 +1018,132 @@ mod tests {
         assert_eq!(result.code, "ok");
         slow_handle.abort();
         let _ = slow_handle.await;
+    }
+
+    // ── SEC-R2-09: strict Host header parsing ─────────────────────
+
+    #[tokio::test]
+    async fn host_header_duplicate_rejected() {
+        // RFC 7230 §5.4 — exactly one Host header. Two Host headers
+        // are a smuggling vector. The listener MUST reject with 400
+        // even when one of them is the correct value.
+        let listener = LoopbackListener::bind(TEST_PATH_SECRET.into())
+            .await
+            .unwrap();
+        let port = listener.port;
+        let server = tokio::spawn(listener.accept_one());
+
+        let req = format!(
+            "GET /callback/{TEST_PATH_SECRET}?code=A&state=B HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Host: evil.example\r\n\
+             \r\n",
+            host_header(port)
+        );
+        let resp = send_raw(port, req.as_bytes()).await;
+        assert_eq!(
+            status_code(&resp),
+            Some(400),
+            "duplicate Host header MUST be rejected with 400 (RFC 7230 §5.4)"
+        );
+
+        let still_running = tokio::time::timeout(Duration::from_millis(200), server).await;
+        assert!(
+            still_running.is_err(),
+            "duplicate-Host request must not resolve the listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_header_with_trailing_whitespace_rejected() {
+        // SEC-R2-09: do NOT trim the value. `127.0.0.1:9999 ` (with
+        // trailing space) is not the same as `127.0.0.1:9999` for
+        // Host-binding purposes — accepting it would let a same-host
+        // attacker bypass the strict comparison by appending
+        // whitespace to a forged Host.
+        let listener = LoopbackListener::bind(TEST_PATH_SECRET.into())
+            .await
+            .unwrap();
+        let port = listener.port;
+        let server = tokio::spawn(listener.accept_one());
+
+        let req = format!(
+            "GET /callback/{TEST_PATH_SECRET}?code=A&state=B HTTP/1.1\r\n\
+             Host: {}  \r\n\
+             \r\n",
+            host_header(port)
+        );
+        let resp = send_raw(port, req.as_bytes()).await;
+        assert_eq!(
+            status_code(&resp),
+            Some(400),
+            "Host with trailing whitespace MUST be rejected with 400 \
+             (value is parsed verbatim, not trimmed)"
+        );
+
+        let still_running = tokio::time::timeout(Duration::from_millis(200), server).await;
+        assert!(still_running.is_err());
+    }
+
+    #[tokio::test]
+    async fn host_header_case_insensitive_on_name() {
+        // Header NAME is case-insensitive per RFC 7230. `host`,
+        // `HOST`, `Host` are all the same header. The listener must
+        // accept any case for the name (but reject case variants in
+        // the value — see the next test).
+        let listener = LoopbackListener::bind(TEST_PATH_SECRET.into())
+            .await
+            .unwrap();
+        let port = listener.port;
+        let server = tokio::spawn(listener.accept_one());
+
+        let req = format!(
+            "GET /callback/{TEST_PATH_SECRET}?code=A&state=B HTTP/1.1\r\n\
+             host: {}\r\n\
+             \r\n",
+            host_header(port)
+        );
+        let _ = send_raw(port, req.as_bytes()).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server resolved")
+            .expect("join")
+            .expect("captured");
+        assert_eq!(result.code, "A");
+        assert_eq!(result.state, "B");
+    }
+
+    #[tokio::test]
+    async fn host_header_case_sensitive_on_value() {
+        // Header VALUE comparison is case-sensitive. `127.0.0.1` is
+        // a literal IPv4 — only `127.0.0.1` is correct. `LOCALHOST`
+        // or `127.0.0.1:9999/extra` are different values and MUST be
+        // rejected. We can't really test "case" on `127.0.0.1` (no
+        // letters) so we test the closely-related "extra suffix"
+        // case which the strict parser ALSO catches.
+        let listener = LoopbackListener::bind(TEST_PATH_SECRET.into())
+            .await
+            .unwrap();
+        let port = listener.port;
+        let server = tokio::spawn(listener.accept_one());
+
+        // Append a stray suffix — verbatim comparison must reject.
+        let req = format!(
+            "GET /callback/{TEST_PATH_SECRET}?code=A&state=B HTTP/1.1\r\n\
+             Host: {}.evil.example\r\n\
+             \r\n",
+            host_header(port)
+        );
+        let resp = send_raw(port, req.as_bytes()).await;
+        assert_eq!(
+            status_code(&resp),
+            Some(400),
+            "value with trailing suffix MUST be rejected"
+        );
+
+        let still_running = tokio::time::timeout(Duration::from_millis(200), server).await;
+        assert!(still_running.is_err());
     }
 
     #[tokio::test]

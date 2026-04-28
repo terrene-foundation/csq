@@ -584,6 +584,20 @@ pub enum OAuthError {
     /// possibly-misleading network error. UX-R1-M4.
     #[error("token exchange timed out after {timeout_secs}s")]
     ExchangeTimeout { timeout_secs: u64 },
+
+    /// Another csq process (CLI or desktop) holds the per-account
+    /// `AccountLoginLock` for this account. SEC-R2-01: the desktop
+    /// race path acquires the same lock as `csq login` to prevent
+    /// concurrent CLI + desktop logins from stomping
+    /// `credentials/N.json` (last-writer-wins).
+    ///
+    /// `pid` is the holder's PID when readable from the lock file;
+    /// `None` when the file is empty or unreadable. The frontend
+    /// renders a "cancel previous login (PID …) and retry" UX when
+    /// the PID is known, falling back to a generic "wait or use the
+    /// CLI" message when not.
+    #[error("login already in progress for account {account}")]
+    LoginInProgressElsewhere { account: u16, pid: Option<u32> },
 }
 
 #[derive(Error, Debug)]

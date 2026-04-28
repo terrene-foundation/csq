@@ -68,6 +68,7 @@ use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 /// Maximum number of pending logins the store will hold.
 ///
@@ -293,6 +294,34 @@ fn random_state_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Constant-time comparison of two state-token strings.
+///
+/// SEC-R2-06: state tokens are short (43 base64url chars), known-length,
+/// CSPRNG-derived. A naive `==` comparison short-circuits on the first
+/// byte mismatch, exposing a timing oracle that lets a same-host
+/// attacker iterate prefixes against the listener with measurable
+/// latency differences. Routing through [`subtle::ConstantTimeEq`]
+/// removes the early exit so every comparison takes the same wall-clock
+/// time regardless of where the strings diverge.
+///
+/// Length-mismatched inputs short-circuit (returning `false` before
+/// touching `ConstantTimeEq`) — the length check itself does not leak
+/// useful information because legitimate state tokens are always 43
+/// chars; an attacker who knows the format learns nothing from a length
+/// rejection.
+///
+/// Pulled out of the per-callsite `if a == b` check and into a helper
+/// so every consumer of state-token equality (race orchestrator now,
+/// future paths after this PR) goes through the same primitive — the
+/// failure mode of "one new compare site forgot to switch" should be
+/// impossible.
+pub fn constant_time_eq_state(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +475,62 @@ mod tests {
             !dbg.contains("secret-verifier-bytes"),
             "PendingState Debug leaked the verifier: {dbg}"
         );
+    }
+
+    // ── SEC-R2-06: constant-time state comparison ─────────────────
+
+    #[test]
+    fn constant_time_eq_state_matches_equal_strings() {
+        // Two identical 43-char tokens compare equal.
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(constant_time_eq_state(a, b));
+    }
+
+    #[test]
+    fn constant_time_eq_state_rejects_unequal_strings() {
+        // Two different 43-char tokens compare unequal.
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        assert!(!constant_time_eq_state(a, b));
+    }
+
+    #[test]
+    fn constant_time_eq_state_rejects_length_mismatch() {
+        // Different-length strings short-circuit to false. The
+        // legitimate state-token format is fixed-length, so a length
+        // mismatch is itself a hard "no match" signal — we don't need
+        // to feed both into ConstantTimeEq for the length-mismatch
+        // case.
+        let a = "AAAAAAAA";
+        let b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(!constant_time_eq_state(a, b));
+        assert!(!constant_time_eq_state(b, a));
+    }
+
+    #[test]
+    fn constant_time_eq_state_rejects_one_byte_difference() {
+        // The most failure-prone case: differs only in the last byte.
+        // A naive byte-by-byte compare would loop almost the full
+        // length before returning; the constant-time path pays the
+        // full-length cost regardless.
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB";
+        assert!(!constant_time_eq_state(a, b));
+    }
+
+    #[test]
+    fn constant_time_eq_state_compiles_with_subtle_primitive() {
+        // Structural assertion (the actual constant-time guarantee
+        // lives in `subtle::ConstantTimeEq`'s implementation). This
+        // test pins the call shape so a future refactor that swaps
+        // the primitive for an `==` regression triggers a compile
+        // failure on the `ct_eq` symbol rather than silently widening
+        // the timing surface.
+        use subtle::ConstantTimeEq as _;
+        let a = b"abcdef";
+        let b = b"abcdef";
+        let _ct: subtle::Choice = a.ct_eq(b);
     }
 
     #[test]

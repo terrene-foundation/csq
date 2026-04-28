@@ -90,6 +90,11 @@ function setupMocks(overrides: Record<string, unknown> = {}) {
     list_providers: [ANTHROPIC_PROVIDER, MINIMAX_PROVIDER, OLLAMA_PROVIDER],
     get_accounts: [],
     start_claude_login: 1,
+    // SEC-R2-03: start_claude_login_race now returns a
+    // StartRaceResponse with the per-race token. Tests that exercise
+    // the race flow need a default mock return shape; tests that
+    // care about the token value override.
+    start_claude_login_race: { account: 3, race_token: "test-race-token" },
     set_provider_key: "abc…xyz",
     bind_keyless_provider: null,
     list_ollama_models: ["gemma4", "qwen3:latest", "gpt-oss:20b"],
@@ -1071,7 +1076,14 @@ describe("AddAccountModal", () => {
     // F2: cancel call site MUST pass the active account so a stale
     // cancel from a closed modal cannot abort a sibling modal's
     // race for a different slot.
-    expect(call?.[1]).toEqual({ account: RACE_ACCOUNT });
+    //
+    // SEC-R2-03 (round-3): cancel call site ALSO passes the
+    // race_token captured from start_claude_login_race. Without it
+    // the backend's cancel_race_login returns Unauthorized.
+    expect(call?.[1]).toEqual({
+      account: RACE_ACCOUNT,
+      raceToken: "test-race-token",
+    });
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -1432,6 +1444,169 @@ describe("AddAccountModal", () => {
     const via = container.querySelector('[data-testid="race-via"]');
     expect(via).not.toBeNull();
     expect(via?.textContent).toContain("Browser sign-in completed");
+  });
+
+  // ── Round-3 fixes ─────────────────────────────────────────────
+  //
+  // R3-F1 (REV-R2-04): manual-url panel renders WITHOUT a hint
+  // element when the backend doesn't send one — the optional hint
+  // mustn't leak an empty span into the DOM.
+  //
+  // R3-F2 (SEC-R2-03): the modal must capture and thread the
+  // race_token returned from start_claude_login_race through to
+  // cancel_race_login. Without the token cancel returns Unauthorized.
+  //
+  // R3-F3 (UX-R2-03): the login-in-progress error from the backend
+  // (SEC-R2-01 — another csq holds the per-account flock) must
+  // render a dedicated recovery UI rather than a bare error banner.
+
+  it("R3-F1: manual_url without hint renders no hint element", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    // Backend omits the optional hint field.
+    await emit("claude-login-manual-url-ready", {
+      manual_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+
+    // Manual panel renders, but the hint element is absent.
+    const panel = container.querySelector('[data-testid="race-manual-panel"]');
+    expect(panel).not.toBeNull();
+    const hint = container.querySelector('[data-testid="race-manual-hint"]');
+    expect(
+      hint,
+      "manual-url panel MUST NOT render a hint element when the " +
+        "backend doesn't send one (REV-R2-04 — keeps empty spans " +
+        "out of the DOM rather than rendering null/undefined)",
+    ).toBeNull();
+  });
+
+  it("R3-F2: captures race_token from start_claude_login_race", async () => {
+    setupMocks({
+      list_providers: [ANTHROPIC_PROVIDER],
+      start_claude_login_race: {
+        account: 3,
+        race_token: "specific-token-for-this-test",
+      },
+    });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    // Cancel mid-race; the cancel invoke MUST carry the captured
+    // race_token verbatim.
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://x",
+    });
+    const closeBtn = container.querySelector(".close") as HTMLButtonElement;
+    await fireEvent.click(closeBtn);
+    await settle();
+
+    const cancelCall = mockInvoke.mock.calls.find(
+      (args) => args[0] === "cancel_race_login",
+    );
+    expect(cancelCall?.[1]).toEqual({
+      account: 3,
+      raceToken: "specific-token-for-this-test",
+    });
+  });
+
+  it("R3-F3: cross-account collision renders recovery UI not error banner", async () => {
+    // Backend rejects with "login already in progress for account N"
+    // (SEC-R2-01 path). Modal must render the dedicated
+    // login-in-progress step — not the generic error banner.
+    setupMocks({
+      list_providers: [ANTHROPIC_PROVIDER],
+    });
+    installRaceListenMock();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_claude_login_race") {
+        return Promise.reject(
+          new Error(
+            "login already in progress for account 3 (PID 12345). " +
+              "Cancel the other login or wait for it to finish.",
+          ),
+        );
+      }
+      if (cmd in mockResponses) return Promise.resolve(mockResponses[cmd]);
+      return Promise.resolve(undefined);
+    });
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+    // pickAnthropicRace's await chain may resolve before the
+    // start_claude_login_race rejection percolates through the
+    // catch + state assignment. Settle further so the
+    // login-in-progress step renders.
+    await settle();
+
+    // The dedicated login-in-progress banner renders.
+    const banner = container.querySelector(
+      '[data-testid="login-in-progress-banner"]',
+    );
+    expect(
+      banner,
+      `expected login-in-progress banner; container HTML: ${container.innerHTML.slice(0, 800)}`,
+    ).not.toBeNull();
+    expect(banner?.textContent).toContain("login already in progress");
+    expect(banner?.textContent).toContain("12345");
+
+    // The generic error banner is NOT used.
+    expect(container.querySelector(".error-banner")).toBeNull();
+
+    // The Retry button is present and labelled "Retry" (not
+    // "Try again").
+    const retryBtn = container.querySelector(
+      '[data-testid="login-in-progress-retry"]',
+    );
+    expect(retryBtn).not.toBeNull();
+    expect(retryBtn?.textContent).toContain("Retry");
+  });
+
+  it("R3-F3: clicking Retry on login-in-progress re-invokes start_claude_login_race", async () => {
+    // First start invocation rejects; second (after Retry) succeeds
+    // with a normal response. The Retry button must trigger the
+    // second invocation.
+    let startCount = 0;
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_claude_login_race") {
+        startCount += 1;
+        if (startCount === 1) {
+          return Promise.reject(
+            new Error("login already in progress for account 3"),
+          );
+        }
+        return Promise.resolve({ account: 3, race_token: "second-token" });
+      }
+      if (cmd in mockResponses) return Promise.resolve(mockResponses[cmd]);
+      return Promise.resolve(undefined);
+    });
+
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+    await settle();
+
+    const retryBtn = container.querySelector(
+      '[data-testid="login-in-progress-retry"]',
+    ) as HTMLButtonElement;
+    expect(
+      retryBtn,
+      `expected retry button; container HTML: ${container.innerHTML.slice(0, 500)}`,
+    ).not.toBeNull();
+    await fireEvent.click(retryBtn);
+    await settle(16);
+
+    expect(startCount).toBe(2);
   });
 
   it("F6: renders clipboard fallback hint when navigator.clipboard.writeText rejects", async () => {

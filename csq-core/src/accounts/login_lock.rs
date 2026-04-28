@@ -28,6 +28,7 @@
 //! cleared on release so a stale file never misattributes a fresh
 //! lock attempt.
 
+use crate::platform::fs::secure_file;
 use crate::types::AccountNum;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -41,7 +42,18 @@ pub enum AcquireOutcome {
     /// Another process holds the lock. The PID is the holder
     /// (read from the lock file) when available, `None` if the
     /// lock file is empty or unreadable.
-    Held { pid: Option<u32> },
+    ///
+    /// `pid_alive` is `Some(true)` when the holder PID is verifiably
+    /// running, `Some(false)` when the PID is dead (stale lock from a
+    /// prior crash), and `None` when no PID was readable or the
+    /// liveness probe is unsupported on this platform.
+    /// SEC-R2-08 / REV-R2-03 — distinguishes a real contention from a
+    /// stale crash artefact so the caller can render a "the lock has
+    /// been reclaimed" message instead of pointing at a dead PID.
+    Held {
+        pid: Option<u32>,
+        pid_alive: Option<bool>,
+    },
 }
 
 impl std::fmt::Debug for AcquireOutcome {
@@ -50,7 +62,11 @@ impl std::fmt::Debug for AcquireOutcome {
             AcquireOutcome::Acquired(g) => {
                 f.debug_struct("Acquired").field("path", &g.path).finish()
             }
-            AcquireOutcome::Held { pid } => f.debug_struct("Held").field("pid", pid).finish(),
+            AcquireOutcome::Held { pid, pid_alive } => f
+                .debug_struct("Held")
+                .field("pid", pid)
+                .field("pid_alive", pid_alive)
+                .finish(),
         }
     }
 }
@@ -105,6 +121,17 @@ impl AccountLoginLock {
             .truncate(false)
             .open(&path)?;
 
+        // SEC-R2-07 / UX-R2-04: secure the lock file so a same-host
+        // attacker cannot read the holder PID through a world-readable
+        // file. The PID itself is low-impact, but a per-account stream
+        // of "csq is logging in for slot N" timing data is exactly the
+        // information a side-channel attack would seek. `secure_file`
+        // is best-effort — on Windows it's a no-op (ACL defaults
+        // already protect owner-only) and on Unix it sets 0o600. A
+        // failure here is non-fatal: the lock still works correctly,
+        // the file is just at default umask.
+        let _ = secure_file(&path);
+
         match try_lock_exclusive(&file)? {
             LockResult::Acquired => {
                 // We own it. Write our PID so a concurrent waiter
@@ -124,7 +151,21 @@ impl AccountLoginLock {
                 let mut buf = String::new();
                 let _ = file.read_to_string(&mut buf);
                 let pid = buf.trim().parse::<u32>().ok();
-                Ok(AcquireOutcome::Held { pid })
+                // SEC-R2-08 / REV-R2-03: confirm the PID is alive. A
+                // crashed login holder leaves a `.login-N.lock` file
+                // on disk with its (now-dead) PID inside, but the OS
+                // released the flock when the process exited — so any
+                // FRESH attempt would actually succeed on `flock` and
+                // fall through this branch. Reaching `WouldBlock` with
+                // a dead PID written inside is the rarer race where
+                // ANOTHER concurrent acquire holds the live flock but
+                // hasn't yet rewritten the file with its own PID.
+                // Either way, the user sees a more accurate message:
+                // "stale lock file" when the file contents lie about
+                // the holder, "PID N — wait or kill" when the holder
+                // is verifiably alive.
+                let pid_alive = pid.map(pid_is_alive);
+                Ok(AcquireOutcome::Held { pid, pid_alive })
             }
         }
     }
@@ -151,6 +192,20 @@ impl Drop for AccountLoginLock {
         // file description are closed (the kernel does this on
         // File::drop). On Windows, LockFileEx is released by
         // CloseHandle, also driven by File::drop.
+        //
+        // REV-R2-02: actively delete the lock file after the kernel
+        // releases the flock. Without this, every `csq login N` ever
+        // run leaves a `.login-N.lock` artefact on disk that
+        // accumulates across the lifetime of the install. The race
+        // the original docstring warned about ("re-create vs remove")
+        // is bounded by the next acquirer's `OpenOptions::create(true)`
+        // which is atomic with respect to deletion: the worst case is
+        // the next acquirer creates a fresh file with default umask,
+        // and the SECURE_FILE call in `acquire` then sets it back to
+        // 0o600 before any meaningful content is written. Best-effort
+        // — a failure (filesystem unmounted, perms changed under us)
+        // leaves the artefact but does not affect correctness.
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -179,6 +234,73 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<LockResult> {
             Err(err)
         }
     }
+}
+
+/// Returns true when the given OS process ID corresponds to a process
+/// that is currently alive (or for which we cannot tell — fail-open on
+/// the "alive" side because reporting "stale lock — reclaimed" for a
+/// live holder would mislead the user into killing nothing).
+///
+/// SEC-R2-08 / REV-R2-03: the lock file content is plain text that
+/// outlives the holder process. A crash between flock acquire and
+/// flock release leaves the PID inside but the kernel has reclaimed
+/// the lock — so a fresh `acquire` would actually pass `flock`. Reaching
+/// the contention path means a SECOND concurrent acquirer holds the live
+/// flock; we use this probe to disambiguate "the file says PID 12345
+/// but that PID is dead" (stale artefact) from "PID 12345 is the active
+/// holder" (real contention).
+///
+/// Implementation notes:
+///
+/// - Unix: `kill(pid, 0)` returns 0 if the signal could be delivered
+///   (process exists), `ESRCH` if no such process. `EPERM` (no
+///   permission to signal — different UID) means the PID is alive but
+///   we cannot signal it; treat as alive. The pidfile-on-csq always
+///   contains same-UID PIDs, so EPERM is unlikely in practice.
+/// - Windows: not implemented yet; returns `true` so the message
+///   shape matches "PID is alive" — Windows live-PID detection requires
+///   `OpenProcess` + close, which is feasible but adds windows-sys
+///   surface that this PR keeps out of scope. Documented blocker for a
+///   follow-up; the message reads correctly either way ("PID 12345 —
+///   wait for it to finish, or run `taskkill /F /PID 12345`").
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // Safe-guard against truncation on platforms where pid_t is
+    // narrower than u32. macOS/Linux pid_t is i32; PIDs above i32::MAX
+    // are unreachable in practice but we still refuse to misinterpret
+    // them as a valid query.
+    let pid_signed = match i32::try_from(pid) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    // SAFETY: `kill` with signal 0 performs no side-effect; it only
+    // checks signal-delivery permission. The pid is a value the
+    // kernel will validate.
+    let rc = unsafe { libc::kill(pid_signed, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => false,
+        // EPERM = process exists but we lack permission to signal it.
+        // Treat as alive — the holder is real, we just can't probe it.
+        Some(libc::EPERM) => true,
+        _ => true,
+    }
+}
+
+#[cfg(windows)]
+fn pid_is_alive(_pid: u32) -> bool {
+    // Windows liveness probe is a follow-up. Defaulting to `true`
+    // keeps the contended-acquire message accurate for the common
+    // case (live holder); the rarer crash-stale case prints a
+    // slightly less precise message on Windows than on Unix until
+    // OpenProcess/GetExitCodeProcess wiring lands.
+    true
 }
 
 #[cfg(windows)]
@@ -265,13 +387,18 @@ mod tests {
         // spawning a child process.
         let second = AccountLoginLock::acquire(&dir_path, account(7)).unwrap();
         match second {
-            AcquireOutcome::Held { pid } => {
+            AcquireOutcome::Held { pid, pid_alive } => {
                 let pid = pid.expect("holder should have written a PID");
                 assert_eq!(
                     pid,
                     std::process::id(),
                     "lock file should contain the holder's PID"
                 );
+                // SEC-R2-08: the holder is THIS process, which is by
+                // definition alive at this assertion. Unix returns
+                // Some(true); Windows is a follow-up so it also
+                // returns Some(true) via the conservative default.
+                assert_eq!(pid_alive, Some(true), "live holder must be reported alive");
             }
             AcquireOutcome::Acquired(_) => {
                 panic!("second acquire must report Held while first guard is alive")
@@ -364,5 +491,162 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = AccountLoginLock::lock_path(dir.path(), account(42));
         assert_eq!(path, dir.path().join(".login-42.lock"));
+    }
+
+    // ── SEC-R2-07 / UX-R2-04: lock file is chmod 0600 on Unix ──────
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_is_chmod_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let _guard = match AccountLoginLock::acquire(dir.path(), account(11)).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            _ => panic!("first acquire must succeed"),
+        };
+
+        let path = dir.path().join(".login-11.lock");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "lock file must be chmod 0600 to prevent same-host PID disclosure: got 0o{:o}",
+            mode
+        );
+    }
+
+    // ── REV-R2-02: lock file removed after Drop ────────────────────
+
+    #[test]
+    fn lock_file_removed_after_drop() {
+        // The lock file is best-effort removed when the guard drops.
+        // After the next acquire, a fresh file is created — so we
+        // observe the artefact going away between the two windows.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".login-13.lock");
+
+        {
+            let _guard = match AccountLoginLock::acquire(dir.path(), account(13)).unwrap() {
+                AcquireOutcome::Acquired(g) => g,
+                _ => panic!("first acquire must succeed"),
+            };
+            assert!(path.exists(), "lock file must exist while guard is alive");
+        }
+        assert!(
+            !path.exists(),
+            "lock file MUST be removed after guard drops (REV-R2-02): {:?}",
+            path
+        );
+    }
+
+    // ── SEC-R2-08 / REV-R2-03: dead PID in lock file → stale ───────
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_pid_in_lock_file_produces_stale_lock_message() {
+        // Manually pre-populate a lock file with a known-dead PID,
+        // then force a contention by holding the lock from a thread.
+        // The Held-branch must report `pid_alive: Some(false)` for
+        // the stale PID written into the file, even though the
+        // ACTUAL holder is the live thread (the file content lies
+        // about who's holding because we wrote it manually before
+        // the thread acquired). The point: the caller's render path
+        // sees the file content as the source of truth for the PID,
+        // and SEC-R2-08 lets it disambiguate "stale" from "live".
+        //
+        // In production this case is reached when a prior crash left
+        // the file with a dead PID and a NEW concurrent acquirer
+        // holds the live flock but hasn't yet truncated the old PID
+        // out. We simulate that ordering by writing the dead PID,
+        // acquiring the live lock, then probing.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".login-29.lock");
+
+        // Pick a PID that is guaranteed dead. PID 1 is init, almost
+        // certainly alive, so we can't use it as a "dead PID". Use
+        // a value well above any PID a sandbox would hand out: u32
+        // wrap-around space is huge, and `kill(0xDEAD_BEEF, 0)`
+        // will return ESRCH on every supported OS.
+        let dead_pid: u32 = 0xDEAD_BEEF;
+        // Sanity-check: must actually be reported dead by our probe
+        // before we use it as the stale-PID fixture.
+        assert!(
+            !pid_is_alive(dead_pid),
+            "test fixture PID {dead_pid} must be reported dead"
+        );
+
+        // Write the stale PID into a fresh lock file. Don't acquire
+        // through the public API — just seed the bytes.
+        std::fs::write(&path, format!("{dead_pid}\n")).unwrap();
+
+        // Now hold the live lock from a thread so the next acquire
+        // hits the contention path. We use a barrier-via-channel so
+        // the thread has acquired BEFORE we attempt the second
+        // acquire.
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let dir_for_thread = dir.path().to_path_buf();
+        let handle = thread::spawn(move || {
+            let g = AccountLoginLock::acquire(&dir_for_thread, account(29)).unwrap();
+            // We immediately re-write the file with the dead PID so
+            // the contender reads "stale" content — production hits
+            // this when the live holder hasn't yet rewritten the file.
+            // The lock guard write happens after `flock` succeeds
+            // (see `acquire`), so we have to clobber it back to the
+            // dead PID for the contender to observe a stale read.
+            std::fs::write(
+                dir_for_thread.join(".login-29.lock"),
+                format!("{dead_pid}\n"),
+            )
+            .unwrap();
+            ready_tx.send(()).unwrap();
+            // Hold until the main thread says we can release.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(g);
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("holder thread should have signalled ready");
+
+        // Contend.
+        let outcome = AccountLoginLock::acquire(dir.path(), account(29)).unwrap();
+        match outcome {
+            AcquireOutcome::Held { pid, pid_alive } => {
+                assert_eq!(pid, Some(dead_pid), "should have read the stale PID");
+                assert_eq!(
+                    pid_alive,
+                    Some(false),
+                    "stale PID must be reported as dead so the caller can render \
+                     a 'stale lock file' message instead of pointing at a dead PID"
+                );
+            }
+            AcquireOutcome::Acquired(_) => panic!("expected contention, got acquired"),
+        }
+
+        // Release the holder so the test cleans up.
+        let _ = release_tx.send(());
+        let _ = handle.join();
+    }
+
+    // ── pid_is_alive sanity: this process is alive ────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_returns_true_for_self() {
+        assert!(
+            pid_is_alive(std::process::id()),
+            "pid_is_alive(self) MUST return true — defines the predicate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_returns_false_for_zero_pid() {
+        // PID 0 is the kernel scheduler placeholder; `kill(0, 0)`
+        // semantics are "send signal 0 to every process in this
+        // process group" which is meaningless as a liveness probe.
+        // Treat as dead.
+        assert!(!pid_is_alive(0));
     }
 }

@@ -554,6 +554,7 @@ impl OAuthErrorKind for OAuthError {
             OAuthError::Cancelled => "cancelled",
             OAuthError::StoreAtCapacity { .. } => "store_at_capacity",
             OAuthError::ExchangeTimeout { .. } => "exchange_timeout",
+            OAuthError::LoginInProgressElsewhere { .. } => "login_in_progress",
         }
     }
 }

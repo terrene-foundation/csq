@@ -69,9 +69,8 @@ pub const DEFAULT_OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// See `services/oauth/index.ts:138-153` in the CC source — the
 /// hosted code page joins the two values with `#` so the user
 /// pastes a single token.
-pub type PasteResolver = Box<
-    dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<String, OAuthError>> + Send>> + Send,
->;
+pub type PasteResolver =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<String, OAuthError>> + Send>> + Send>;
 
 /// Inputs to [`race_login`].
 pub struct RaceConfig {
@@ -95,15 +94,9 @@ pub struct RaceConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RaceWinner {
     /// The browser hit the loopback listener.
-    Loopback {
-        code: String,
-        redirect_uri: String,
-    },
+    Loopback { code: String, redirect_uri: String },
     /// The user pasted the code from Anthropic's hosted page.
-    Paste {
-        code: String,
-        redirect_uri: String,
-    },
+    Paste { code: String, redirect_uri: String },
 }
 
 impl RaceWinner {
@@ -346,7 +339,13 @@ fn split_paste_value(value: &str) -> Result<(&str, &str), OAuthError> {
 /// to assert on the bound port before entering the race.
 pub async fn race_login(cfg: RaceConfig) -> Result<RaceResult, OAuthError> {
     let prep = prepare_race(&cfg.state_store, cfg.account).await?;
-    drive_race(prep, &cfg.state_store, cfg.paste_resolver, cfg.overall_timeout).await
+    drive_race(
+        prep,
+        &cfg.state_store,
+        cfg.paste_resolver,
+        cfg.overall_timeout,
+    )
+    .await
 }
 
 // ─── helpers used by both production and tests ──────────────────
@@ -407,16 +406,14 @@ mod tests {
     /// Sends the loopback callback to the bound port. Spawned by
     /// the loopback-wins tests after the race has started.
     async fn fire_loopback_callback(port: u16, code: &str, state: &str) {
-        let request = format!(
-            "GET /callback?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
-        );
+        let request =
+            format!("GET /callback?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect to loopback");
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut buf = Vec::new();
-        let _ =
-            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf)).await;
     }
 
     #[tokio::test]
@@ -554,13 +551,7 @@ mod tests {
         let store = Arc::new(OAuthStateStore::new());
         let prep = prepare_race(&store, acct(6)).await.unwrap();
 
-        let result = drive_race(
-            prep,
-            &store,
-            never_resolves(),
-            Duration::from_millis(80),
-        )
-        .await;
+        let result = drive_race(prep, &store, never_resolves(), Duration::from_millis(80)).await;
 
         match result {
             Err(OAuthError::StateExpired { ttl_secs }) => {

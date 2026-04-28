@@ -1,58 +1,54 @@
 //! `csq login <N>` — OAuth login flow for a new account.
 //!
-//! # Path selection (revised in v2.0.0-alpha.5)
+//! # Path selection (revised for the parallel-race flow)
 //!
-//! Previous versions tried a daemon-delegated path first that
-//! assumed the daemon would catch a loopback OAuth redirect. That
-//! was true under the v1.x loopback design, but journal 0020
-//! retired loopback and nothing replaced the "daemon completes the
-//! exchange" step — the CLI would open the browser and then poll
-//! `credentials/{N}.json` for five minutes while nothing ever
-//! wrote it.
+//! Default is the in-process parallel-race flow that mirrors CC's
+//! `services/oauth/index.ts:58-86` pattern: csq binds an ephemeral
+//! loopback listener AND prompts for a paste code in parallel.
+//! Whichever resolves first wins; the loser is dropped cleanly.
+//! The user can authorise seamlessly OR copy the URL to a separate
+//! device and paste the resulting code back. Same login flow,
+//! both work — no daemon, no `claude` binary on PATH required.
 //!
-//! The current priority is:
+//! `--legacy-shell` preserves the original `claude auth login`
+//! shell-out path as an emergency rollback. The daemon-delegated
+//! paste-code path is still exposed as `handle_paste_code` for the
+//! desktop shim during the transition; it is no longer the CLI
+//! default.
 //!
-//! 1. **Delegate to `claude auth login`** (preferred) — if the
-//!    `claude` binary is on `PATH`, spawn it with an isolated
-//!    `CLAUDE_CONFIG_DIR=config-{N}/`. CC has its own
-//!    seamless flow (browser opens, hosted callback page bridges
-//!    the code back to a local listener CC owns). csq imports the
-//!    credentials from the isolated dir when CC exits. **This is
-//!    the same UX as running `claude auth login` yourself.**
-//!
-//! 2. **Paste-code via the daemon** (fallback) — if `claude` is
-//!    not on `PATH` or its process fails, and a healthy daemon is
-//!    available, ask the daemon to `GET /api/login/{N}` for an
-//!    authorize URL, open the browser, prompt on stdin for the
-//!    authorization code from Anthropic's hosted callback page,
-//!    and `POST /api/oauth/exchange` with the code. The daemon
-//!    writes `credentials/{N}.json` on successful exchange.
-//!
-//! Both paths finish by updating `profiles.json` (email label),
-//! writing the `.csq-account` marker, and clearing any
-//! `broker_failed` sentinel.
+//! All paths end by writing the `.csq-account` marker, updating
+//! `profiles.json` with the email label, and clearing any
+//! `broker_failed` sentinel via [`csq_core::accounts::login::finalize_login`].
 
 use anyhow::{anyhow, Context, Result};
 use csq_core::accounts::markers;
 use csq_core::credentials::{self, file, keychain};
+use csq_core::oauth::{self, RaceResult};
 use csq_core::types::AccountNum;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use csq_core::daemon::{self, DaemonClientError, DetectResult};
 
 /// Entry point invoked from `main.rs`. Dispatches on `provider`:
 ///
-/// * `"claude"` (default) — Anthropic OAuth flow. Prefers shell-out
-///   to `claude auth login` (same UX as running CC directly); falls
-///   back to the daemon paste-code path when `claude` is unavailable.
+/// * `"claude"` (default) — Anthropic OAuth via the in-process
+///   parallel-race flow. Pass `legacy_shell = true` to fall back
+///   to the legacy `claude auth login` shell-out (emergency
+///   rollback only).
 /// * `"codex"` — Codex device-auth flow per spec 07 §7.3.3 (PR-C3b).
-///   Shells out to `codex login --device-auth` under an isolated
-///   `CODEX_HOME`, probes the macOS keychain for residue, relocates
-///   the resulting auth.json to `credentials/codex-<N>.json`.
-pub fn handle(base_dir: &Path, account: AccountNum, provider: &str) -> Result<()> {
+///   `legacy_shell` is ignored for Codex.
+pub fn handle(
+    base_dir: &Path,
+    account: AccountNum,
+    provider: &str,
+    legacy_shell: bool,
+) -> Result<()> {
     match provider {
         "codex" => return handle_codex(base_dir, account),
         // FR-G-CLI-06: Gemini has no OAuth login flow — API keys
@@ -72,24 +68,147 @@ pub fn handle(base_dir: &Path, account: AccountNum, provider: &str) -> Result<()
         }
     }
 
-    if csq_core::accounts::login::find_claude_binary().is_some() {
+    if legacy_shell {
         return handle_direct(base_dir, account);
     }
 
-    #[cfg(unix)]
-    {
-        eprintln!(
-            "note: `claude` binary not found on PATH — falling back to daemon paste-code flow"
-        );
-        handle_paste_code(base_dir, account)
+    handle_race(base_dir, account)
+}
+
+/// Default Anthropic login: in-process parallel-race flow.
+///
+/// 1. Bind a loopback listener on `127.0.0.1:0`.
+/// 2. Build both URLs (auto = loopback redirect, manual =
+///    paste-code redirect) sharing one PKCE verifier + state.
+/// 3. Print the auto URL and try to open the browser; print the
+///    manual URL after a 3-second beat (or immediately if the
+///    browser open fails).
+/// 4. Race the loopback `accept_one` future against a stdin
+///    `read_line` paste resolver via `tokio::select!`.
+/// 5. On winner: exchange the captured code at the token endpoint,
+///    persist credentials atomically, finalize.
+fn handle_race(base_dir: &Path, account: AccountNum) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("csq-login-race")
+        .build()
+        .context("failed to build tokio runtime for login race")?;
+
+    let result: RaceResult = rt.block_on(async move { run_race_with_browser(account).await })?;
+
+    // PKCE binds the issued code to the original redirect_uri, so
+    // the exchange MUST use the same redirect_uri the authorize URL
+    // carried. The race winner exposes that for us.
+    let redirect_uri = result.winner.redirect_uri().to_string();
+    let code = result.winner.code().to_string();
+    let verifier = result.verifier;
+
+    let credential = oauth::exchange_code(
+        &code,
+        &verifier,
+        &redirect_uri,
+        csq_core::http::post_json_node,
+    )
+    .map_err(|e| anyhow!("token exchange failed: {e}"))?;
+
+    file::save_canonical(base_dir, account, &credential)
+        .with_context(|| format!("save credential for account {account}"))?;
+    println!("Login successful.");
+
+    // Best-effort marker write — finalize_login also handles the
+    // marker but it requires the config dir to exist already on
+    // some legacy paths. Mirror handle_direct's defensive write.
+    let config_dir = base_dir.join(format!("config-{}", account));
+    if config_dir.exists() {
+        let _ = markers::write_csq_account(&config_dir, account);
     }
 
-    #[cfg(not(unix))]
-    {
-        Err(anyhow!(
-            "`claude` binary not found on PATH — install Claude Code and re-run `csq login {account}`"
-        ))
+    finalize(base_dir, account)
+}
+
+/// Async core of the race flow. Separated so unit tests can drive
+/// it with a mock paste resolver.
+async fn run_race_with_browser(account: AccountNum) -> Result<RaceResult> {
+    let store = Arc::new(oauth::OAuthStateStore::new());
+    let prep = oauth::prepare_race(&store, account)
+        .await
+        .map_err(|e| anyhow!("OAuth race preparation failed: {e}"))?;
+
+    println!("Starting login for account {account}...");
+    println!("Opening browser...");
+
+    let browser_opened = open_in_browser(&prep.auto_url).is_ok();
+    if !browser_opened {
+        // Browser failed — show paste prompt immediately. The
+        // loopback listener still runs in case the user copies
+        // the URL into a working browser elsewhere.
+        eprintln!("warning: could not open browser automatically.");
+        eprintln!("Open this URL manually to continue:");
+        eprintln!("  {}", prep.auto_url);
+        eprintln!();
+        print_paste_prompt(&prep.manual_url);
+    } else {
+        // Browser opened — give it 3 seconds to render before
+        // surfacing the paste fallback. The race itself is
+        // already running underneath, so the loopback path can
+        // win during this delay.
+        let manual_url = prep.manual_url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            print_paste_prompt(&manual_url);
+        });
     }
+
+    let paste_resolver = stdin_paste_resolver();
+    let result = oauth::drive_race(prep, &store, paste_resolver, oauth::DEFAULT_OVERALL_TIMEOUT)
+        .await
+        .map_err(|e| anyhow!("OAuth race failed: {e}"))?;
+
+    Ok(result)
+}
+
+/// Prints the paste prompt to stdout. Called either after a 3s
+/// delay (browser opened) or immediately (browser open failed).
+fn print_paste_prompt(manual_url: &str) {
+    println!();
+    println!("Browser didn't open? Open this URL manually:");
+    println!("  {manual_url}");
+    println!("After authorizing, paste the code shown by Anthropic:");
+    let _ = std::io::stdout().flush();
+}
+
+/// Builds the production paste resolver: reads one line from
+/// stdin asynchronously so it can be raced against the loopback
+/// listener via `tokio::select!`.
+///
+/// `tokio::io::stdin` is line-buffered on TTYs; reading one line
+/// blocks until the user hits enter. If the loopback listener
+/// resolves first, the race orchestrator drops this future and
+/// the in-flight `read_line` is aborted. The next time stdin is
+/// read by the process (which won't happen in this command path)
+/// it would resume from the next character.
+fn stdin_paste_resolver() -> oauth::PasteResolver {
+    Box::new(|| {
+        Box::pin(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let stdin = tokio::io::stdin();
+            let mut reader = BufReader::new(stdin);
+            let mut line = String::new();
+            // Read one line, propagate read errors as Exchange
+            // errors with a sanitised message (no token material
+            // is in scope at this point).
+            match reader.read_line(&mut line).await {
+                Ok(0) => Err(csq_core::error::OAuthError::Exchange(
+                    "stdin closed before paste".to_string(),
+                )),
+                Ok(_) => Ok(line.trim().to_string()),
+                Err(e) => Err(csq_core::error::OAuthError::Exchange(format!(
+                    "stdin read failed: {e}"
+                ))),
+            }
+        }) as Pin<Box<dyn std::future::Future<Output = _> + Send>>
+    })
 }
 
 /// `--provider codex` dispatch. Thin wrapper around
@@ -113,9 +232,16 @@ fn handle_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
 // bundle) can find `claude` even when their `$PATH` is the minimal
 // Finder default.
 
-/// Paste-code login path via the csq daemon.
+/// Daemon-delegated paste-code login path (deprecated for CLI).
 ///
-/// Only used when `claude` is not on `PATH`. Steps:
+/// **Status**: kept for backward compatibility with the desktop
+/// shim during the parallel-race transition. The CLI default is
+/// now [`handle_race`] (in-process, no daemon dependency, no
+/// `claude` binary on PATH). Once the desktop migrates to the
+/// in-process orchestrator this function and its helpers are slated
+/// for removal.
+///
+/// Steps:
 ///
 /// 1. Detect the healthy daemon; require `DetectResult::Healthy`.
 /// 2. `GET /api/login/{N}` — daemon mints a PKCE state and returns
@@ -127,6 +253,7 @@ fn handle_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
 ///    runs the token exchange and writes `credentials/{N}.json`.
 /// 6. Finalize (profile update, marker, broker-failed clear).
 #[cfg(unix)]
+#[allow(dead_code)]
 fn handle_paste_code(base_dir: &Path, account: AccountNum) -> Result<()> {
     // Step 1: detect the daemon.
     let socket_path = match daemon::detect_daemon(base_dir) {
@@ -256,14 +383,20 @@ fn handle_paste_code(base_dir: &Path, account: AccountNum) -> Result<()> {
 ///
 /// Defined locally so the CLI is not coupled to the full struct's
 /// layout — `auth_url` + `state` are the load-bearing fields.
+///
+/// Used only by [`handle_paste_code`], which is kept around for
+/// the desktop shim transition. Marked `dead_code`-allowed
+/// because the CLI default no longer reaches this path.
 #[cfg(unix)]
 #[derive(Debug)]
+#[allow(dead_code)]
 struct DaemonLoginRequest {
     auth_url: String,
     state: String,
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn parse_login_response(body: &str) -> Result<DaemonLoginRequest> {
     let json: serde_json::Value = serde_json::from_str(body)
         .with_context(|| format!("response is not valid JSON: {body}"))?;
@@ -432,6 +565,8 @@ fn notify_daemon_cache_invalidation(_base_dir: &Path) {
 mod tests {
     use super::*;
 
+    // ── Daemon paste-code parser regression tests (deprecated path) ──
+
     #[test]
     fn parse_login_response_extracts_auth_url() {
         let body = r#"{
@@ -466,5 +601,25 @@ mod tests {
         let body = "not json";
         let err = parse_login_response(body).unwrap_err();
         assert!(err.to_string().contains("valid JSON"));
+    }
+
+    // ── Race-flow regression tests ─────────────────────────────────
+
+    #[test]
+    fn print_paste_prompt_includes_manual_url() {
+        // Smoke test: the function should not panic and should
+        // render the URL into stdout. We can't capture stdout in
+        // a unit test without ceremony, but the function has no
+        // branches — calling it once exercises the body.
+        print_paste_prompt("https://example.invalid/manual");
+    }
+
+    #[test]
+    fn stdin_paste_resolver_returns_a_paste_resolver() {
+        // Type-shape assertion: stdin_paste_resolver must produce
+        // an oauth::PasteResolver. The race orchestrator's
+        // signature pins this; if the type drifts we want the
+        // failure here, not in a downstream race test.
+        let _r: oauth::PasteResolver = stdin_paste_resolver();
     }
 }

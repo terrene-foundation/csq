@@ -76,6 +76,12 @@ enum Command {
         /// flow (spec 07 §7.3.3).
         #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
         provider: String,
+        /// Use the legacy `claude auth login` shell-out path. Default
+        /// is the in-process parallel-race flow (loopback callback
+        /// vs paste-code, whichever resolves first). Provided as an
+        /// emergency rollback while the race flow is alpha.
+        #[arg(long = "legacy-shell")]
+        legacy_shell: bool,
     },
 
     /// Remove an account: deletes credentials, config dir, and profile entry.
@@ -316,10 +322,14 @@ fn main() -> Result<()> {
         Command::Status => commands::status::handle(&base_dir, json),
         Command::Suggest => commands::suggest::handle(&base_dir),
         Command::Statusline => commands::statusline::handle(&base_dir),
-        Command::Login { account, provider } => {
+        Command::Login {
+            account,
+            provider,
+            legacy_shell,
+        } => {
             let account_num = AccountNum::try_from(account)
                 .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
-            commands::login::handle(&base_dir, account_num, &provider)
+            commands::login::handle(&base_dir, account_num, &provider, legacy_shell)
         }
         Command::Logout { account, yes } => {
             let account_num = AccountNum::try_from(account)
@@ -419,6 +429,56 @@ fn main() -> Result<()> {
         Command::Completions { shell } => {
             commands::completions::handle(shell);
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn login_default_does_not_set_legacy_shell() {
+        let cli = Cli::try_parse_from(["csq", "login", "3"]).expect("parse default login");
+        match cli.command {
+            Some(Command::Login {
+                account,
+                provider,
+                legacy_shell,
+            }) => {
+                assert_eq!(account, 3);
+                assert_eq!(provider, "claude");
+                assert!(!legacy_shell, "default must NOT enable legacy shell");
+            }
+            other => panic!("expected Login subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn login_legacy_shell_flag_parses() {
+        let cli = Cli::try_parse_from(["csq", "login", "5", "--legacy-shell"])
+            .expect("parse legacy-shell login");
+        match cli.command {
+            Some(Command::Login {
+                account,
+                legacy_shell,
+                ..
+            }) => {
+                assert_eq!(account, 5);
+                assert!(legacy_shell, "--legacy-shell must enable the flag");
+            }
+            other => panic!("expected Login subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn login_provider_codex_parses() {
+        let cli = Cli::try_parse_from(["csq", "login", "1", "--provider", "codex"])
+            .expect("parse codex login");
+        match cli.command {
+            Some(Command::Login { provider, .. }) => assert_eq!(provider, "codex"),
+            other => panic!("expected Login subcommand, got {other:?}"),
         }
     }
 }

@@ -128,9 +128,10 @@ impl LoopbackListener {
     pub async fn accept_one(self) -> Result<CallbackParams, OAuthError> {
         let LoopbackListener { listener, .. } = self;
         loop {
-            let (stream, _peer) = listener.accept().await.map_err(|e| {
-                OAuthError::Exchange(format!("loopback accept failed: {e}"))
-            })?;
+            let (stream, _peer) = listener
+                .accept()
+                .await
+                .map_err(|e| OAuthError::Exchange(format!("loopback accept failed: {e}")))?;
             match handle_connection(stream).await {
                 ConnectionOutcome::Captured(params) => return Ok(params),
                 ConnectionOutcome::Continue => continue,
@@ -564,10 +565,7 @@ mod tests {
         let _ = server.await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let second = TcpStream::connect(("127.0.0.1", port)).await;
-        assert!(
-            second.is_err(),
-            "port must be released after future drop"
-        );
+        assert!(second.is_err(), "port must be released after future drop");
     }
 
     #[test]

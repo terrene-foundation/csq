@@ -71,7 +71,7 @@ pub use login::{
 pub use loopback::{CallbackParams, LoopbackListener, SUCCESS_REDIRECT_URL};
 pub use pkce::{challenge_from_verifier, generate_verifier, CodeChallenge, CodeVerifier};
 pub use race::{
-    drive_race, prepare_race, race_login, PasteResolver, RaceConfig, RacePreparation,
-    RaceResult, RaceWinner, DEFAULT_OVERALL_TIMEOUT,
+    drive_race, prepare_race, race_login, PasteResolver, RaceConfig, RacePreparation, RaceResult,
+    RaceWinner, DEFAULT_OVERALL_TIMEOUT,
 };
 pub use state_store::{OAuthStateStore, PendingState, MAX_PENDING, STATE_TTL};

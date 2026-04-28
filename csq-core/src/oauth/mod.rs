@@ -55,6 +55,7 @@
 pub mod constants;
 pub mod exchange;
 pub mod login;
+pub mod loopback;
 pub mod pkce;
 pub mod state_store;
 
@@ -64,5 +65,6 @@ pub use constants::{
 };
 pub use exchange::exchange_code;
 pub use login::{start_login, start_login_default_port, LoginRequest};
+pub use loopback::{CallbackParams, LoopbackListener, SUCCESS_REDIRECT_URL};
 pub use pkce::{challenge_from_verifier, generate_verifier, CodeChallenge, CodeVerifier};
 pub use state_store::{OAuthStateStore, PendingState, MAX_PENDING, STATE_TTL};

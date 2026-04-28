@@ -257,12 +257,14 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<LockResult> {
 ///   permission to signal — different UID) means the PID is alive but
 ///   we cannot signal it; treat as alive. The pidfile-on-csq always
 ///   contains same-UID PIDs, so EPERM is unlikely in practice.
-/// - Windows: not implemented yet; returns `true` so the message
-///   shape matches "PID is alive" — Windows live-PID detection requires
-///   `OpenProcess` + close, which is feasible but adds windows-sys
-///   surface that this PR keeps out of scope. Documented blocker for a
-///   follow-up; the message reads correctly either way ("PID 12345 —
-///   wait for it to finish, or run `taskkill /F /PID 12345`").
+/// - Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+///   pid)` returns NULL when the PID does not correspond to any
+///   process; on success we call `GetExitCodeProcess` and treat
+///   `STILL_ACTIVE (259)` as alive. `ERROR_ACCESS_DENIED` (PID exists
+///   but is owned by a higher-privilege account) is treated as ALIVE
+///   so the message never tells the user the holder is stale when it
+///   may not be — fail-open on the "alive" side, matching the Unix
+///   `EPERM` branch above. R3-M1 / round-4 redteam.
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
@@ -294,13 +296,74 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn pid_is_alive(_pid: u32) -> bool {
-    // Windows liveness probe is a follow-up. Defaulting to `true`
-    // keeps the contended-acquire message accurate for the common
-    // case (live holder); the rarer crash-stale case prints a
-    // slightly less precise message on Windows than on Unix until
-    // OpenProcess/GetExitCodeProcess wiring lands.
-    true
+fn pid_is_alive(pid: u32) -> bool {
+    // R3-M1 / round-4 redteam: real Windows liveness probe via
+    // `OpenProcess` + `GetExitCodeProcess`. Previously stubbed to
+    // `true`, which made the stale-lock-detection UX message lie:
+    // a Windows user with a `.login-N.lock` from a crashed prior
+    // process saw "PID 12345 is in progress" even when the process
+    // was dead, leading them to `taskkill /F /PID 12345` only to
+    // get "process not found". The real probe disambiguates so the
+    // user sees the accurate "stale lock — reclaiming" message
+    // instead.
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        // PID 0 is the system idle process on Windows; never a
+        // user-mode login holder.
+        return false;
+    }
+
+    // SAFETY: `OpenProcess` is a documented Win32 API. A zero/NULL
+    // return indicates failure (no such PID, or access denied). We
+    // check the handle before any further use, and always
+    // `CloseHandle` on the success path.
+    //
+    // windows-sys 0.52 declares `HANDLE` as `isize` (not a raw
+    // pointer), so the NULL check is against the integer value 0
+    // — `is_null()` is unavailable on this newtype.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == 0 {
+        // Distinguish "no such process" from "no permission to
+        // query". Permission denials on a same-user lock file
+        // should be rare (csq writes 0o600 / ACL owner-only) but
+        // could happen if an admin process or service account
+        // holds the lock. Treat ERROR_ACCESS_DENIED as ALIVE so
+        // we never tell the user "stale — reclaiming" for a real
+        // holder we just couldn't query — matches the Unix EPERM
+        // branch.
+        let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+        return code == ERROR_ACCESS_DENIED;
+    }
+
+    // STILL_ACTIVE = 259 is the canonical "process has not yet
+    // exited" sentinel returned by GetExitCodeProcess. There is a
+    // 1-in-2^32 false-positive risk if a real process happens to
+    // exit with code 259, but every csq subprocess we care about
+    // (the prior login holder) exits with 0 on success or a small
+    // signal-derived code on crash — so 259 in practice means the
+    // process is still running.
+    const STILL_ACTIVE: u32 = 259;
+    let mut exit_code: u32 = 0;
+    // SAFETY: handle is non-null (checked above). exit_code is a
+    // valid out-pointer. GetExitCodeProcess does not retain the
+    // handle.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: handle is non-null and we own it. CloseHandle is
+    // idempotent w.r.t. our local pointer; we never use it again
+    // after this call.
+    unsafe { CloseHandle(handle) };
+
+    if ok == 0 {
+        // GetExitCodeProcess failed for a reason we couldn't
+        // anticipate. Fail-open as alive so the user-facing message
+        // never falsely claims the holder is dead.
+        return true;
+    }
+    exit_code == STILL_ACTIVE
 }
 
 #[cfg(windows)]
@@ -394,10 +457,11 @@ mod tests {
                     std::process::id(),
                     "lock file should contain the holder's PID"
                 );
-                // SEC-R2-08: the holder is THIS process, which is by
-                // definition alive at this assertion. Unix returns
-                // Some(true); Windows is a follow-up so it also
-                // returns Some(true) via the conservative default.
+                // SEC-R2-08 / R3-M1: the holder is THIS process, which
+                // is by definition alive at this assertion. Both Unix
+                // (`kill(pid, 0)`) and Windows (`OpenProcess` +
+                // `GetExitCodeProcess` per round-4 redteam) return
+                // Some(true) for a live holder.
                 assert_eq!(pid_alive, Some(true), "live holder must be reported alive");
             }
             AcquireOutcome::Acquired(_) => {
@@ -647,6 +711,54 @@ mod tests {
         // semantics are "send signal 0 to every process in this
         // process group" which is meaningless as a liveness probe.
         // Treat as dead.
+        assert!(!pid_is_alive(0));
+    }
+
+    // ── R3-M1 / round-4 redteam: Windows liveness probe ──────────
+
+    #[cfg(windows)]
+    #[test]
+    fn pid_is_alive_returns_true_for_self_windows() {
+        // The current process is by definition alive. The Windows
+        // `OpenProcess` + `GetExitCodeProcess` path must agree.
+        // Pre-R3-M1 this was a `true`-return stub; the assertion is
+        // unchanged from the Unix sibling because the contract is
+        // platform-uniform.
+        assert!(
+            pid_is_alive(std::process::id()),
+            "pid_is_alive(self) MUST return true on Windows (R3-M1)"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pid_is_alive_returns_false_for_non_existent_pid_windows() {
+        // Pick a PID that is overwhelmingly unlikely to be assigned:
+        // `OpenProcess` returns NULL with last-error
+        // `ERROR_INVALID_PARAMETER` for a non-existent PID. We must
+        // observe `false` (not the legacy `true` stub) so the
+        // stale-lock UX message correctly reports "reclaimable" when
+        // the prior holder crashed.
+        //
+        // Production-equivalent: a `.login-N.lock` left behind by a
+        // crashed prior holder. The kernel released the flock at
+        // process exit, but the file content still names the dead
+        // PID — without R3-M1 the user would see "PID 0xDEAD_BEEF
+        // is in progress" and run a futile `taskkill`.
+        let dead_pid: u32 = 0xDEAD_BEEF;
+        assert!(
+            !pid_is_alive(dead_pid),
+            "pid_is_alive must return false for a non-existent PID on Windows \
+             (R3-M1 — pre-fix this was a true-stub)"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pid_is_alive_returns_false_for_zero_pid_windows() {
+        // PID 0 is the system idle process on Windows; the function
+        // short-circuits to false so a malformed lock file containing
+        // "0\n" cannot be misread as a live holder.
         assert!(!pid_is_alive(0));
     }
 }

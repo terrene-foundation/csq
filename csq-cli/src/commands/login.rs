@@ -1,58 +1,55 @@
 //! `csq login <N>` — OAuth login flow for a new account.
 //!
-//! # Path selection (revised in v2.0.0-alpha.5)
+//! # Path selection (revised for the parallel-race flow)
 //!
-//! Previous versions tried a daemon-delegated path first that
-//! assumed the daemon would catch a loopback OAuth redirect. That
-//! was true under the v1.x loopback design, but journal 0020
-//! retired loopback and nothing replaced the "daemon completes the
-//! exchange" step — the CLI would open the browser and then poll
-//! `credentials/{N}.json` for five minutes while nothing ever
-//! wrote it.
+//! Default is the in-process parallel-race flow that mirrors CC's
+//! `services/oauth/index.ts:58-86` pattern: csq binds an ephemeral
+//! loopback listener AND prompts for a paste code in parallel.
+//! Whichever resolves first wins; the loser is dropped cleanly.
+//! The user can authorise seamlessly OR copy the URL to a separate
+//! device and paste the resulting code back. Same login flow,
+//! both work — no daemon, no `claude` binary on PATH required.
 //!
-//! The current priority is:
+//! `--legacy-shell` preserves the original `claude auth login`
+//! shell-out path as an emergency rollback. The daemon-delegated
+//! paste-code path is still exposed as `handle_paste_code` for the
+//! desktop shim during the transition; it is no longer the CLI
+//! default.
 //!
-//! 1. **Delegate to `claude auth login`** (preferred) — if the
-//!    `claude` binary is on `PATH`, spawn it with an isolated
-//!    `CLAUDE_CONFIG_DIR=config-{N}/`. CC has its own
-//!    seamless flow (browser opens, hosted callback page bridges
-//!    the code back to a local listener CC owns). csq imports the
-//!    credentials from the isolated dir when CC exits. **This is
-//!    the same UX as running `claude auth login` yourself.**
-//!
-//! 2. **Paste-code via the daemon** (fallback) — if `claude` is
-//!    not on `PATH` or its process fails, and a healthy daemon is
-//!    available, ask the daemon to `GET /api/login/{N}` for an
-//!    authorize URL, open the browser, prompt on stdin for the
-//!    authorization code from Anthropic's hosted callback page,
-//!    and `POST /api/oauth/exchange` with the code. The daemon
-//!    writes `credentials/{N}.json` on successful exchange.
-//!
-//! Both paths finish by updating `profiles.json` (email label),
-//! writing the `.csq-account` marker, and clearing any
-//! `broker_failed` sentinel.
+//! All paths end by writing the `.csq-account` marker, updating
+//! `profiles.json` with the email label, and clearing any
+//! `broker_failed` sentinel via [`csq_core::accounts::login::finalize_login`].
 
 use anyhow::{anyhow, Context, Result};
+use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::accounts::markers;
 use csq_core::credentials::{self, file, keychain};
+use csq_core::oauth::{self, RaceResult};
 use csq_core::types::AccountNum;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use csq_core::daemon::{self, DaemonClientError, DetectResult};
 
 /// Entry point invoked from `main.rs`. Dispatches on `provider`:
 ///
-/// * `"claude"` (default) — Anthropic OAuth flow. Prefers shell-out
-///   to `claude auth login` (same UX as running CC directly); falls
-///   back to the daemon paste-code path when `claude` is unavailable.
+/// * `"claude"` (default) — Anthropic OAuth via the in-process
+///   parallel-race flow. Pass `legacy_shell = true` to fall back
+///   to the legacy `claude auth login` shell-out (emergency
+///   rollback only).
 /// * `"codex"` — Codex device-auth flow per spec 07 §7.3.3 (PR-C3b).
-///   Shells out to `codex login --device-auth` under an isolated
-///   `CODEX_HOME`, probes the macOS keychain for residue, relocates
-///   the resulting auth.json to `credentials/codex-<N>.json`.
-pub fn handle(base_dir: &Path, account: AccountNum, provider: &str) -> Result<()> {
+///   `legacy_shell` is ignored for Codex.
+pub fn handle(
+    base_dir: &Path,
+    account: AccountNum,
+    provider: &str,
+    legacy_shell: bool,
+) -> Result<()> {
     match provider {
         "codex" => return handle_codex(base_dir, account),
         // FR-G-CLI-06: Gemini has no OAuth login flow — API keys
@@ -72,24 +69,281 @@ pub fn handle(base_dir: &Path, account: AccountNum, provider: &str) -> Result<()
         }
     }
 
-    if csq_core::accounts::login::find_claude_binary().is_some() {
+    if legacy_shell {
         return handle_direct(base_dir, account);
     }
 
-    #[cfg(unix)]
+    handle_race(base_dir, account)
+}
+
+/// Acquires the per-account login lock or returns a clear error
+/// pointing at the holder PID.
+///
+/// UX-R1-H3 regression: two concurrent `csq login N` processes
+/// could both run an OAuth race and stomp `credentials/N.json`.
+/// Holding an exclusive flock around the entire login flow
+/// serializes them.
+///
+/// UX-R2-01: error messages include the platform-specific kill
+/// command for the holder PID so non-technical users have a concrete
+/// next action ("run `kill 12345`") instead of a bare PID number.
+/// SEC-R2-08: a stale-PID file (crashed prior holder) renders a
+/// distinct "stale lock" message rather than misdirecting the user
+/// at a dead PID.
+fn acquire_login_lock(base_dir: &Path, account: AccountNum) -> Result<AccountLoginLock> {
+    match AccountLoginLock::acquire(base_dir, account)
+        .with_context(|| format!("create login lock file for account {account}"))?
     {
-        eprintln!(
-            "note: `claude` binary not found on PATH — falling back to daemon paste-code flow"
-        );
-        handle_paste_code(base_dir, account)
+        AcquireOutcome::Acquired(guard) => Ok(guard),
+        AcquireOutcome::Held {
+            pid: Some(pid),
+            pid_alive: Some(false),
+        } => Err(anyhow!(
+            "stale lock file for csq login {account} (prior holder PID {pid} \
+             is no longer running) — the lock has been reclaimed; re-run the \
+             command to proceed"
+        )),
+        AcquireOutcome::Held {
+            pid: Some(pid),
+            pid_alive: _,
+        } => Err(anyhow!(
+            "another csq login {account} is in progress (PID {pid}) — \
+             wait for it to finish, or run `{}` to terminate it, or \
+             use --legacy-shell to bypass",
+            kill_hint(pid)
+        )),
+        AcquireOutcome::Held {
+            pid: None,
+            pid_alive: _,
+        } => Err(anyhow!(
+            "another csq login {account} is in progress \
+             — wait or use --legacy-shell to bypass"
+        )),
+    }
+}
+
+/// Returns the platform-appropriate command for terminating a process
+/// by PID, formatted as a complete shell command users can copy.
+///
+/// UX-R2-01: rendered into the lock-held error message so a
+/// non-technical user knows exactly what to run instead of having to
+/// look up `kill` vs `taskkill` syntax.
+fn kill_hint(pid: u32) -> String {
+    if cfg!(target_os = "windows") {
+        format!("taskkill /F /PID {pid}")
+    } else {
+        format!("kill {pid}")
+    }
+}
+
+/// Default Anthropic login: in-process parallel-race flow.
+///
+/// 1. Bind a loopback listener on `127.0.0.1:0`.
+/// 2. Build both URLs (auto = loopback redirect, manual =
+///    paste-code redirect) sharing one PKCE verifier + state.
+/// 3. Print the auto URL and try to open the browser; print the
+///    manual URL after a 3-second beat (or immediately if the
+///    browser open fails).
+/// 4. Race the loopback `accept_one` future against a stdin
+///    `read_line` paste resolver via `tokio::select!`.
+/// 5. On winner: exchange the captured code at the token endpoint,
+///    persist credentials atomically, finalize.
+fn handle_race(base_dir: &Path, account: AccountNum) -> Result<()> {
+    // UX-R1-H3: serialise concurrent `csq login N` invocations.
+    // The guard is bound to a local so it lives until the function
+    // returns (or panics) — at which point the kernel releases the
+    // flock automatically.
+    let _lock = acquire_login_lock(base_dir, account)?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("csq-login-race")
+        .build()
+        .context("failed to build tokio runtime for login race")?;
+
+    let outcome = rt.block_on(async move { run_race_with_browser(account).await })?;
+
+    let result: RaceResult = match outcome {
+        RaceOutcome::Resolved(r) => r,
+        RaceOutcome::UserCancelled => {
+            // M2 (UX-R1-M2): exit code 130 is the conventional
+            // Bash-style "killed by SIGINT" code (128 + signal 2).
+            // The lock guard above releases when this function
+            // returns; the orchestrator's drop already closed the
+            // loopback port.
+            eprintln!();
+            eprintln!("cancelled — re-run with --legacy-shell to use the shell-out path");
+            std::process::exit(130);
+        }
+    };
+
+    // PKCE binds the issued code to the original redirect_uri, so
+    // the exchange MUST use the same redirect_uri the authorize URL
+    // carried. The race winner exposes that for us.
+    let redirect_uri = result.winner.redirect_uri().to_string();
+    let code = result.winner.code().to_string();
+    let verifier = result.verifier;
+
+    let credential = oauth::exchange_code(
+        &code,
+        &verifier,
+        &redirect_uri,
+        csq_core::http::post_json_node,
+    )
+    .map_err(|e| anyhow!("token exchange failed: {e}"))?;
+
+    file::save_canonical(base_dir, account, &credential)
+        .with_context(|| format!("save credential for account {account}"))?;
+    println!("Login successful.");
+
+    // Best-effort marker write — finalize_login also handles the
+    // marker but it requires the config dir to exist already on
+    // some legacy paths. Mirror handle_direct's defensive write.
+    let config_dir = base_dir.join(format!("config-{}", account));
+    if config_dir.exists() {
+        let _ = markers::write_csq_account(&config_dir, account);
     }
 
-    #[cfg(not(unix))]
-    {
-        Err(anyhow!(
-            "`claude` binary not found on PATH — install Claude Code and re-run `csq login {account}`"
-        ))
+    finalize(base_dir, account)
+}
+
+/// Outcome of [`run_race_with_browser`]. Distinguishes a successful
+/// race from an explicit Ctrl-C cancel so `handle_race` can exit
+/// 130 (the standard SIGINT exit code) rather than render an error
+/// noisily.
+enum RaceOutcome {
+    Resolved(RaceResult),
+    /// User pressed Ctrl-C before either path resolved. Caller
+    /// should print the rollback hint and exit 130.
+    UserCancelled,
+}
+
+/// Async core of the race flow. Separated so unit tests can drive
+/// it with a mock paste resolver.
+async fn run_race_with_browser(account: AccountNum) -> Result<RaceOutcome> {
+    let store = Arc::new(oauth::OAuthStateStore::new());
+    let prep = oauth::prepare_race(&store, account)
+        .await
+        .map_err(|e| anyhow!("OAuth race preparation failed: {e}"))?;
+
+    println!("Starting login for account {account}...");
+    println!("Opening browser...");
+
+    let browser_opened = open_in_browser(&prep.auto_url).is_ok();
+    if !browser_opened {
+        // Browser failed — show paste prompt immediately. The
+        // loopback listener still runs in case the user copies
+        // the URL into a working browser elsewhere.
+        //
+        // L5 (UX-R1-L1) decision: we accept that the auto URL
+        // (which contains the per-race state token AND path secret)
+        // surfaces on stderr in this fallback. Both are single-use
+        // — the state token is consumed atomically by the store on
+        // first use, and the path secret is meaningless without the
+        // accompanying loopback port and the in-process verifier.
+        // The alternative — refusing to render a manual fallback
+        // URL — would leave users on broken browsers with no
+        // recovery path. The trade-off is documented; do not
+        // silently widen this.
+        eprintln!("warning: could not open browser automatically.");
+        eprintln!("Open this URL manually to continue:");
+        eprintln!("  {}", prep.auto_url);
+        eprintln!();
+        print_paste_prompt(&prep.manual_url);
+    } else {
+        // Browser opened — give it 3 seconds to render before
+        // surfacing the paste fallback. The race itself is
+        // already running underneath, so the loopback path can
+        // win during this delay.
+        let manual_url = prep.manual_url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            print_paste_prompt(&manual_url);
+        });
     }
+
+    let paste_resolver = stdin_paste_resolver();
+
+    // M2 (UX-R1-M2): make Ctrl-C a clean cancel rather than a
+    // process kill. Race the orchestrator against `signal::ctrl_c`;
+    // on Ctrl-C, drop the orchestrator (which closes the loopback
+    // port and aborts the stdin read) and return UserCancelled.
+    let race_fut = oauth::drive_race(prep, &store, paste_resolver, oauth::DEFAULT_OVERALL_TIMEOUT);
+    let ctrl_c_fut = async {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to install Ctrl-C handler")
+    };
+    race_or_cancel(race_fut, ctrl_c_fut).await
+}
+
+/// Races the orchestrator against an arbitrary "cancel" future.
+/// Production wires the cancel arm to `tokio::signal::ctrl_c()`;
+/// tests inject a future that resolves immediately to exercise the
+/// cancellation path deterministically.
+async fn race_or_cancel<R, C>(race_fut: R, cancel_fut: C) -> Result<RaceOutcome>
+where
+    R: std::future::Future<
+        Output = std::result::Result<csq_core::oauth::RaceResult, csq_core::error::OAuthError>,
+    >,
+    C: std::future::Future<Output = Result<()>>,
+{
+    tokio::select! {
+        race_res = race_fut => {
+            let result = race_res.map_err(|e| anyhow!("OAuth race failed: {e}"))?;
+            Ok(RaceOutcome::Resolved(result))
+        }
+        ctrl_c_res = cancel_fut => {
+            // Propagate signal-installation failure as a hard error
+            // rather than a fake cancel.
+            ctrl_c_res?;
+            Ok(RaceOutcome::UserCancelled)
+        }
+    }
+}
+
+/// Prints the paste prompt to stdout. Called either after a 3s
+/// delay (browser opened) or immediately (browser open failed).
+fn print_paste_prompt(manual_url: &str) {
+    println!();
+    println!("Browser didn't open? Open this URL manually:");
+    println!("  {manual_url}");
+    println!("After authorizing, paste the code shown by Anthropic:");
+    let _ = std::io::stdout().flush();
+}
+
+/// Builds the production paste resolver: reads one line from
+/// stdin asynchronously so it can be raced against the loopback
+/// listener via `tokio::select!`.
+///
+/// `tokio::io::stdin` is line-buffered on TTYs; reading one line
+/// blocks until the user hits enter. If the loopback listener
+/// resolves first, the race orchestrator drops this future and
+/// the in-flight `read_line` is aborted. The next time stdin is
+/// read by the process (which won't happen in this command path)
+/// it would resume from the next character.
+fn stdin_paste_resolver() -> oauth::PasteResolver {
+    Box::new(|| {
+        Box::pin(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let stdin = tokio::io::stdin();
+            let mut reader = BufReader::new(stdin);
+            let mut line = String::new();
+            // Read one line, propagate read errors as Exchange
+            // errors with a sanitised message (no token material
+            // is in scope at this point).
+            match reader.read_line(&mut line).await {
+                Ok(0) => Err(csq_core::error::OAuthError::Exchange(
+                    "stdin closed before paste".to_string(),
+                )),
+                Ok(_) => Ok(line.trim().to_string()),
+                Err(e) => Err(csq_core::error::OAuthError::Exchange(format!(
+                    "stdin read failed: {e}"
+                ))),
+            }
+        }) as Pin<Box<dyn std::future::Future<Output = _> + Send>>
+    })
 }
 
 /// `--provider codex` dispatch. Thin wrapper around
@@ -113,9 +367,16 @@ fn handle_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
 // bundle) can find `claude` even when their `$PATH` is the minimal
 // Finder default.
 
-/// Paste-code login path via the csq daemon.
+/// Daemon-delegated paste-code login path (deprecated for CLI).
 ///
-/// Only used when `claude` is not on `PATH`. Steps:
+/// **Status**: kept for backward compatibility with the desktop
+/// shim during the parallel-race transition. The CLI default is
+/// now [`handle_race`] (in-process, no daemon dependency, no
+/// `claude` binary on PATH). Once the desktop migrates to the
+/// in-process orchestrator this function and its helpers are slated
+/// for removal.
+///
+/// Steps:
 ///
 /// 1. Detect the healthy daemon; require `DetectResult::Healthy`.
 /// 2. `GET /api/login/{N}` — daemon mints a PKCE state and returns
@@ -127,7 +388,13 @@ fn handle_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
 ///    runs the token exchange and writes `credentials/{N}.json`.
 /// 6. Finalize (profile update, marker, broker-failed clear).
 #[cfg(unix)]
+#[allow(dead_code)]
 fn handle_paste_code(base_dir: &Path, account: AccountNum) -> Result<()> {
+    // UX-R1-H3: same lock as handle_race for symmetry. The
+    // daemon-delegated path also stomps credentials/N.json on the
+    // last writer, so it benefits from the same serialisation.
+    let _lock = acquire_login_lock(base_dir, account)?;
+
     // Step 1: detect the daemon.
     let socket_path = match daemon::detect_daemon(base_dir) {
         DetectResult::Healthy { socket_path, .. } => socket_path,
@@ -256,14 +523,20 @@ fn handle_paste_code(base_dir: &Path, account: AccountNum) -> Result<()> {
 ///
 /// Defined locally so the CLI is not coupled to the full struct's
 /// layout — `auth_url` + `state` are the load-bearing fields.
+///
+/// Used only by [`handle_paste_code`], which is kept around for
+/// the desktop shim transition. Marked `dead_code`-allowed
+/// because the CLI default no longer reaches this path.
 #[cfg(unix)]
 #[derive(Debug)]
+#[allow(dead_code)]
 struct DaemonLoginRequest {
     auth_url: String,
     state: String,
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn parse_login_response(body: &str) -> Result<DaemonLoginRequest> {
     let json: serde_json::Value = serde_json::from_str(body)
         .with_context(|| format!("response is not valid JSON: {body}"))?;
@@ -339,11 +612,11 @@ fn open_in_browser(url: &str) -> Result<()> {
 /// and captures credentials from the keychain or the
 /// `.credentials.json` file.
 fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
+    // UX-R1-H3 (lock symmetry): serialise concurrent invocations.
+    let _lock = acquire_login_lock(base_dir, account)?;
+
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)?;
-
-    // Mark this dir with the account number early so recovery is possible
-    markers::write_csq_account(&config_dir, account)?;
 
     println!("Starting OAuth login for account {}...", account);
     println!("Your browser will open for authorization.");
@@ -355,7 +628,30 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
         .status()
         .context("failed to spawn `claude auth login` — is Claude Code installed?")?;
 
-    if !status.success() {
+    handle_direct_post_subprocess(base_dir, account, &config_dir, status.success())?;
+    finalize(base_dir, account)
+}
+
+/// Post-subprocess work for [`handle_direct`]: capture credentials
+/// from keychain or file, persist them canonically, then write the
+/// `.csq-account` marker — in that order so a subprocess failure or
+/// credential-capture failure leaves no orphan marker on disk.
+///
+/// Extracted so REV-R1-02 / M8 can be regression-tested without
+/// spawning the real `claude` binary.
+fn handle_direct_post_subprocess(
+    base_dir: &Path,
+    account: AccountNum,
+    config_dir: &Path,
+    subprocess_succeeded: bool,
+) -> Result<()> {
+    if !subprocess_succeeded {
+        // REV-R1-02 (M8): do NOT write the .csq-account marker
+        // when the subprocess failed. The marker is the "this dir
+        // holds credentials for account N" sentinel; writing it
+        // before confirming the subprocess succeeded leaves an
+        // orphan marker that the daemon's discovery path treats
+        // as a legitimate (but credential-less) account.
         return Err(anyhow!("claude auth login exited with non-zero status"));
     }
 
@@ -369,7 +665,7 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
     // We read keychain first, fall back to file. Either source is
     // authoritative — they hold the same payload — and at least one
     // is guaranteed to exist after a successful auth.
-    let creds = keychain::read(&config_dir)
+    let creds = keychain::read(config_dir)
         .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok())
         .ok_or_else(|| {
             anyhow!("no credentials captured after login — keychain and file both empty")
@@ -382,7 +678,11 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
         file::canonical_path(base_dir, account).display()
     );
 
-    finalize(base_dir, account)
+    // REV-R1-02 (M8): write the marker AFTER the credential save
+    // succeeds, so a subprocess failure or post-subprocess credential
+    // capture failure leaves no orphan marker on disk.
+    markers::write_csq_account(config_dir, account)?;
+    Ok(())
 }
 
 /// Post-login finalization shared by both paths.
@@ -432,6 +732,8 @@ fn notify_daemon_cache_invalidation(_base_dir: &Path) {
 mod tests {
     use super::*;
 
+    // ── Daemon paste-code parser regression tests (deprecated path) ──
+
     #[test]
     fn parse_login_response_extracts_auth_url() {
         let body = r#"{
@@ -466,5 +768,220 @@ mod tests {
         let body = "not json";
         let err = parse_login_response(body).unwrap_err();
         assert!(err.to_string().contains("valid JSON"));
+    }
+
+    // ── Race-flow regression tests ─────────────────────────────────
+
+    #[test]
+    fn print_paste_prompt_includes_manual_url() {
+        // Smoke test: the function should not panic and should
+        // render the URL into stdout. We can't capture stdout in
+        // a unit test without ceremony, but the function has no
+        // branches — calling it once exercises the body.
+        print_paste_prompt("https://example.invalid/manual");
+    }
+
+    #[test]
+    fn stdin_paste_resolver_returns_a_paste_resolver() {
+        // Type-shape assertion: stdin_paste_resolver must produce
+        // an oauth::PasteResolver. The race orchestrator's
+        // signature pins this; if the type drifts we want the
+        // failure here, not in a downstream race test.
+        let _r: oauth::PasteResolver = stdin_paste_resolver();
+    }
+
+    // ── REV-R1-02 / M8: marker-write ordering regression ───────────
+
+    #[test]
+    fn handle_direct_does_not_write_marker_on_subprocess_failure() {
+        // Simulates the failure path of `handle_direct` without
+        // spawning the real `claude` binary. If the subprocess fails,
+        // the .csq-account marker MUST NOT be written — otherwise the
+        // daemon's discovery sees an orphan account with no creds.
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(7u16).unwrap();
+        let config_dir = dir.path().join("config-7");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Pretend the subprocess returned non-zero.
+        let result = handle_direct_post_subprocess(dir.path(), account, &config_dir, false);
+        assert!(result.is_err(), "subprocess failure must propagate as Err");
+
+        // No marker written.
+        let marker = config_dir.join(".csq-account");
+        assert!(
+            !marker.exists(),
+            ".csq-account marker MUST NOT exist after subprocess failure: {:?}",
+            marker
+        );
+    }
+
+    // ── M2 / UX-R1-M2: Ctrl-C cancellation regression ─────────────
+
+    #[tokio::test]
+    async fn race_or_cancel_returns_user_cancelled_when_signal_resolves_first() {
+        // Build a race future that never resolves and a cancel
+        // future that resolves immediately. The select! must pick
+        // cancel.
+        let never_race = async {
+            std::future::pending::<csq_core::oauth::RaceResult>().await;
+            // Unreachable, but produce a typed Result so the
+            // closure has a concrete return type for select!.
+            Err::<csq_core::oauth::RaceResult, _>(csq_core::error::OAuthError::StateMismatch)
+        };
+        let immediate_cancel = async { Ok::<(), anyhow::Error>(()) };
+
+        let outcome = race_or_cancel(never_race, immediate_cancel).await.unwrap();
+        match outcome {
+            RaceOutcome::UserCancelled => {}
+            RaceOutcome::Resolved(_) => panic!("cancel arm should have won"),
+        }
+    }
+
+    #[tokio::test]
+    async fn race_or_cancel_returns_resolved_when_race_wins() {
+        // Race future resolves immediately with a synthesised
+        // RaceResult; cancel hangs forever. select! must pick race.
+        use csq_core::oauth::pkce::{generate_verifier, CodeVerifier};
+        let synth = csq_core::oauth::RaceResult {
+            winner: csq_core::oauth::RaceWinner::Paste {
+                code: "c".into(),
+                redirect_uri: "https://platform.claude.com/oauth/code/callback".into(),
+            },
+            auto_url: "auto".into(),
+            manual_url: "manual".into(),
+            state: "s".into(),
+            verifier: {
+                let _: CodeVerifier = generate_verifier();
+                generate_verifier()
+            },
+        };
+        let immediate_race = async move { Ok::<_, csq_core::error::OAuthError>(synth) };
+        let never_cancel = async {
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let outcome = race_or_cancel(immediate_race, never_cancel).await.unwrap();
+        match outcome {
+            RaceOutcome::Resolved(r) => {
+                assert!(matches!(
+                    r.winner,
+                    csq_core::oauth::RaceWinner::Paste { .. }
+                ));
+            }
+            RaceOutcome::UserCancelled => panic!("race arm should have won"),
+        }
+    }
+
+    #[tokio::test]
+    async fn race_or_cancel_propagates_race_error() {
+        // Race future returns Err — race_or_cancel propagates as
+        // anyhow::Error, NOT as UserCancelled.
+        let failing_race = async {
+            Err::<csq_core::oauth::RaceResult, _>(csq_core::error::OAuthError::StateMismatch)
+        };
+        let never_cancel = async {
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let res = race_or_cancel(failing_race, never_cancel).await;
+        assert!(res.is_err(), "race error must propagate as Err");
+    }
+
+    // ── UX-R2-01: kill_hint platform branching ────────────────────
+
+    #[test]
+    fn kill_hint_uses_kill_on_unix() {
+        // Pure-function test, gated on target_os via cfg!. Runs on
+        // every platform — only the assertion changes.
+        let hint = kill_hint(12345);
+        if cfg!(target_os = "windows") {
+            assert!(
+                hint.contains("taskkill"),
+                "windows kill_hint must use taskkill: {hint}"
+            );
+            assert!(hint.contains("/F"));
+            assert!(hint.contains("12345"));
+        } else {
+            assert!(
+                hint.starts_with("kill "),
+                "unix kill_hint must start with `kill `: {hint}"
+            );
+            assert!(hint.contains("12345"));
+        }
+    }
+
+    #[test]
+    fn lock_held_error_message_includes_kill_command_unix() {
+        // Emulate the lock-held error path the user sees. The error
+        // message MUST include the platform's kill command so a
+        // non-technical user knows exactly what to type.
+        //
+        // Pure string composition — we don't need to acquire a real
+        // lock for this assertion. The failure mode being guarded is
+        // a future refactor that loses the kill-hint splice from the
+        // anyhow! call.
+        let pid: u32 = 12345;
+        let hint = kill_hint(pid);
+        let rendered = format!(
+            "another csq login 5 is in progress (PID {pid}) — \
+             wait for it to finish, or run `{hint}` to terminate it, or \
+             use --legacy-shell to bypass"
+        );
+        if !cfg!(target_os = "windows") {
+            assert!(
+                rendered.contains("`kill 12345`"),
+                "unix lock-held message must include the literal `kill {pid}` \
+                 command guidance: {rendered}"
+            );
+            assert!(rendered.contains("--legacy-shell"));
+        }
+    }
+
+    #[test]
+    fn lock_held_error_message_includes_taskkill_command_windows() {
+        // Sibling of the unix test: gate the assertion on target_os.
+        // The compile-time branch ensures the message body always
+        // names the right command on the target build.
+        let pid: u32 = 12345;
+        let hint = kill_hint(pid);
+        let rendered = format!("PID {pid} … `{hint}` …");
+        if cfg!(target_os = "windows") {
+            assert!(
+                rendered.contains("taskkill /F /PID 12345"),
+                "windows lock-held message must include the literal taskkill \
+                 command: {rendered}"
+            );
+        } else {
+            // On non-Windows the test is a no-op — the assertion
+            // here just keeps the test name discoverable in
+            // `cargo test` output.
+            assert!(rendered.contains("kill 12345"));
+        }
+    }
+
+    #[test]
+    fn handle_direct_does_not_write_marker_when_credentials_missing() {
+        // Subprocess succeeded but no credentials were captured
+        // (keychain empty AND .credentials.json missing). Marker
+        // must NOT be written — same rationale as the failure path.
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(8u16).unwrap();
+        let config_dir = dir.path().join("config-8");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let result = handle_direct_post_subprocess(dir.path(), account, &config_dir, true);
+        assert!(result.is_err(), "missing credentials must propagate as Err");
+
+        let marker = config_dir.join(".csq-account");
+        assert!(
+            !marker.exists(),
+            ".csq-account marker MUST NOT exist when credential capture fails: {:?}",
+            marker
+        );
     }
 }

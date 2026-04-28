@@ -1,3 +1,6 @@
+pub mod race;
+pub use race::RaceLoginState;
+
 use crate::{AppState, CachedUpdateInfo};
 use csq_core::accounts::discovery;
 use csq_core::accounts::AccountSource;
@@ -804,6 +807,16 @@ pub fn begin_claude_login(
 ///
 /// On 3P import, the daemon's account-discovery cache is invalidated
 /// so the dashboard sees the new account on its next 5s poll.
+///
+/// # Legacy shell-out path
+///
+/// As of v2.4 the default Claude OAuth path is the in-process
+/// parallel-race flow (see [`race::start_claude_login_race`]). This
+/// shell-out command is preserved as an emergency-rollback knob,
+/// invocable via `force_legacy_shell: true` from a future Settings
+/// toggle if the in-process race regresses on a particular host /
+/// browser combination. The frontend does not reach this path
+/// during normal operation.
 #[tauri::command]
 pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
@@ -1014,6 +1027,25 @@ pub fn cancel_login(state: State<'_, AppState>, state_token: String) -> Result<(
         }
         Err(csq_core::error::OAuthError::Exchange(_)) => {
             Err("cancel failed: exchange_failed".into())
+        }
+        // The race-only error variants cannot be returned from
+        // `consume` (they're set by the orchestrator/exchange paths),
+        // but listing them keeps the match exhaustive so a future
+        // widening of `consume` surfaces a typed error here rather
+        // than at runtime.
+        Err(csq_core::error::OAuthError::Cancelled) => Err("cancel failed: cancelled".into()),
+        Err(csq_core::error::OAuthError::StoreAtCapacity { .. }) => {
+            Err("cancel failed: store_at_capacity".into())
+        }
+        Err(csq_core::error::OAuthError::ExchangeTimeout { .. }) => {
+            Err("cancel failed: exchange_timeout".into())
+        }
+        // SEC-R2-01: this variant is set by the desktop race path,
+        // not by `consume`. Listed for exhaustiveness so a future
+        // widening of `consume`'s error surface to include it
+        // surfaces a typed error here.
+        Err(csq_core::error::OAuthError::LoginInProgressElsewhere { .. }) => {
+            Err("cancel failed: login_in_progress".into())
         }
     }
 }

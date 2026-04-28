@@ -42,7 +42,7 @@ use crate::error::{CredentialError, CsqError};
 use crate::oauth::constants::{
     scopes_joined, OAUTH_AUTHORIZE_URL, OAUTH_CLIENT_ID, PASTE_CODE_REDIRECT_URI,
 };
-use crate::oauth::pkce::{challenge_from_verifier, generate_verifier};
+use crate::oauth::pkce::{challenge_from_verifier, generate_verifier, CodeChallenge};
 use crate::oauth::state_store::OAuthStateStore;
 use crate::types::AccountNum;
 use serde::Serialize;
@@ -103,47 +103,8 @@ pub fn start_login(store: &OAuthStateStore, account: AccountNum) -> Result<Login
 
     let verifier = generate_verifier();
     let challenge = challenge_from_verifier(&verifier);
-    let state = store.insert(verifier, account);
-
-    // urlencoding::encode performs application/x-www-form-urlencoded
-    // percent-encoding, which matches the query-string encoding
-    // Anthropic's authorize endpoint expects. The colons and slashes
-    // inside redirect_uri must be percent-encoded because they're
-    // query values, not path components.
-    //
-    // # INVARIANT: param keys MUST be static string literals.
-    //
-    // The format! below concatenates `k` verbatim without percent-
-    // encoding. That is safe **only** because every key in this
-    // array is a compile-time constant composed of lowercase
-    // letters and underscores. If you ever need to add a dynamic
-    // key, percent-encode both sides of the `=` sign. Grepping
-    // this file for `urlencoding::encode` should show both the
-    // key and value being encoded once that invariant weakens.
-    //
-    // Parameter order matches `claude auth login`'s live output as
-    // observed on 2026-04-11: `code=true` appears first, then the
-    // standard OAuth params. Anthropic's authorize endpoint is not
-    // documented to be order-sensitive, but matching the reference
-    // client keeps any server-side quirks from surprising us.
-    let params = [
-        ("code", "true".to_string()),
-        ("client_id", OAUTH_CLIENT_ID.to_string()),
-        ("response_type", "code".to_string()),
-        ("redirect_uri", PASTE_CODE_REDIRECT_URI.to_string()),
-        ("scope", scopes_joined()),
-        ("code_challenge", challenge.as_str().to_string()),
-        ("code_challenge_method", "S256".to_string()),
-        ("state", state.clone()),
-    ];
-
-    let query = params
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-        .collect::<Vec<_>>()
-        .join("&");
-
-    let auth_url = format!("{OAUTH_AUTHORIZE_URL}?{query}");
+    let state = store.insert(verifier, account).map_err(CsqError::OAuth)?;
+    let auth_url = build_auth_url(&state, &challenge, PASTE_CODE_REDIRECT_URI);
 
     Ok(LoginRequest {
         auth_url,
@@ -151,6 +112,60 @@ pub fn start_login(store: &OAuthStateStore, account: AccountNum) -> Result<Login
         account: account.get(),
         expires_in_secs: super::STATE_TTL.as_secs(),
     })
+}
+
+/// Builds an Anthropic authorize URL with a caller-chosen redirect
+/// URI and a pre-computed PKCE challenge + state token.
+///
+/// Mirrors the parameter layout `claude auth login` emits as of
+/// 2026-04-11: `code=true` first, then the standard OAuth params.
+/// Anthropic's authorize endpoint is not documented to be
+/// order-sensitive, but matching the reference client insulates us
+/// from any server-side quirks.
+///
+/// # INVARIANT: param keys MUST be static string literals.
+///
+/// The encoding loop concatenates `k` verbatim without percent-
+/// encoding. That is safe **only** because every key in the params
+/// array is a compile-time constant composed of lowercase letters
+/// and underscores. If a dynamic key is ever added, percent-encode
+/// both sides of the `=` sign.
+///
+/// # Why a free function
+///
+/// The race orchestrator needs to build TWO URLs that share a
+/// single PKCE verifier + state token (one for the loopback
+/// listener, one for the paste-code page). [`start_login`] keeps
+/// the original single-URL convenience for the daemon paste-code
+/// path; [`race_login`](crate::oauth::race::race_login) calls this
+/// helper directly.
+pub fn build_auth_url(state: &str, challenge: &CodeChallenge, redirect_uri: &str) -> String {
+    let params = [
+        ("code", "true".to_string()),
+        ("client_id", OAUTH_CLIENT_ID.to_string()),
+        ("response_type", "code".to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("scope", scopes_joined()),
+        ("code_challenge", challenge.as_str().to_string()),
+        ("code_challenge_method", "S256".to_string()),
+        ("state", state.to_string()),
+    ];
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{OAUTH_AUTHORIZE_URL}?{query}")
+}
+
+/// Builds the loopback variant of the authorize URL.
+///
+/// Convenience wrapper around [`build_auth_url`] that constructs
+/// the `http://127.0.0.1:<port>/callback` redirect URI used by
+/// [`crate::oauth::loopback::LoopbackListener`].
+pub fn build_loopback_url(state: &str, challenge: &CodeChallenge, port: u16) -> String {
+    let redirect = format!("http://127.0.0.1:{port}/callback");
+    build_auth_url(state, challenge, &redirect)
 }
 
 /// Convenience wrapper: builds a paste-code login request.
@@ -308,6 +323,47 @@ mod tests {
         assert_eq!(
             param(&params, "redirect_uri"),
             Some("https://platform.claude.com/oauth/code/callback")
+        );
+    }
+
+    #[test]
+    fn build_loopback_url_uses_ipv4_loopback_with_port() {
+        let verifier = generate_verifier();
+        let challenge = challenge_from_verifier(&verifier);
+        let url = build_loopback_url("state-tok", &challenge, 51234);
+        let params = parse_query(&url);
+        assert_eq!(
+            param(&params, "redirect_uri"),
+            Some("http://127.0.0.1:51234/callback")
+        );
+        assert_eq!(param(&params, "state"), Some("state-tok"));
+    }
+
+    #[test]
+    fn build_auth_url_and_build_loopback_url_share_state_and_challenge() {
+        // Race orchestrator invariant: both URLs MUST share the same
+        // state token and PKCE challenge so that whichever path wins
+        // can validate against the same OAuthStateStore entry.
+        let verifier = generate_verifier();
+        let challenge = challenge_from_verifier(&verifier);
+        let state = "shared-state-token";
+
+        let auto = build_loopback_url(state, &challenge, 41234);
+        let manual = build_auth_url(state, &challenge, PASTE_CODE_REDIRECT_URI);
+
+        let auto_params = parse_query(&auto);
+        let manual_params = parse_query(&manual);
+
+        assert_eq!(param(&auto_params, "state"), Some(state));
+        assert_eq!(param(&manual_params, "state"), Some(state));
+        assert_eq!(
+            param(&auto_params, "code_challenge"),
+            param(&manual_params, "code_challenge"),
+        );
+        assert_ne!(
+            param(&auto_params, "redirect_uri"),
+            param(&manual_params, "redirect_uri"),
+            "redirect_uri must differ between auto and manual"
         );
     }
 }

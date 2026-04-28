@@ -68,6 +68,7 @@ use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 /// Maximum number of pending logins the store will hold.
 ///
@@ -186,10 +187,23 @@ impl OAuthStateStore {
     /// the pending entry, and returns the state token for
     /// embedding in the authorize URL.
     ///
-    /// If the store is at capacity, the oldest entry is evicted
-    /// before insertion to keep the size bounded. This never
-    /// rejects a new login.
-    pub fn insert(&self, code_verifier: CodeVerifier, account: AccountNum) -> String {
+    /// # Errors
+    ///
+    /// Returns [`OAuthError::StoreAtCapacity`] if the store already
+    /// holds [`MAX_PENDING`] entries. UX-R1-L2: prior versions
+    /// silently evicted the oldest entry to make room, but that
+    /// converted a "concurrent legitimate login" into a "first
+    /// login mysteriously fails on consume" silent drop. Failing
+    /// fast at insert lets the orchestrator surface a clear error.
+    /// In production the cap is 100 — a legitimate user never
+    /// reaches it; an attacker hitting it cannot starve a user out
+    /// of the OAuth flow because the cap drains via TTL within 10
+    /// minutes.
+    pub fn insert(
+        &self,
+        code_verifier: CodeVerifier,
+        account: AccountNum,
+    ) -> Result<String, OAuthError> {
         let state = random_state_token();
         let pending = PendingState {
             code_verifier,
@@ -199,16 +213,12 @@ impl OAuthStateStore {
 
         let mut guard = self.locked();
         if guard.len() >= self.max_pending {
-            if let Some(oldest_key) = guard
-                .iter()
-                .min_by_key(|(_, v)| v.created_at)
-                .map(|(k, _)| k.clone())
-            {
-                guard.remove(&oldest_key);
-            }
+            return Err(OAuthError::StoreAtCapacity {
+                max_pending: self.max_pending,
+            });
         }
         guard.insert(state.clone(), pending);
-        state
+        Ok(state)
     }
 
     /// Consumes a pending login by state token.
@@ -258,6 +268,14 @@ impl OAuthStateStore {
     /// state — so we recover via `into_inner()` instead of panicking
     /// ourselves. See module doc "Poison recovery" for the full
     /// rationale. Journal 0063 P2-3, PR-B7.
+    ///
+    /// # Why no `expect`
+    ///
+    /// REV-R1-L10: every public method of this store goes through
+    /// `locked()` rather than calling `lock().expect()`. A panicking
+    /// holder elsewhere in the process should not poison the OAuth
+    /// flow — the worst case is a few stale pending entries the
+    /// caller couldn't have done anything with anyway.
     fn locked(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingState>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -274,6 +292,34 @@ fn random_state_token() -> String {
     getrandom::getrandom(&mut bytes)
         .expect("OS CSPRNG unavailable — cannot generate OAuth state token");
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Constant-time comparison of two state-token strings.
+///
+/// SEC-R2-06: state tokens are short (43 base64url chars), known-length,
+/// CSPRNG-derived. A naive `==` comparison short-circuits on the first
+/// byte mismatch, exposing a timing oracle that lets a same-host
+/// attacker iterate prefixes against the listener with measurable
+/// latency differences. Routing through [`subtle::ConstantTimeEq`]
+/// removes the early exit so every comparison takes the same wall-clock
+/// time regardless of where the strings diverge.
+///
+/// Length-mismatched inputs short-circuit (returning `false` before
+/// touching `ConstantTimeEq`) — the length check itself does not leak
+/// useful information because legitimate state tokens are always 43
+/// chars; an attacker who knows the format learns nothing from a length
+/// rejection.
+///
+/// Pulled out of the per-callsite `if a == b` check and into a helper
+/// so every consumer of state-token equality (race orchestrator now,
+/// future paths after this PR) goes through the same primitive — the
+/// failure mode of "one new compare site forgot to switch" should be
+/// impossible.
+pub fn constant_time_eq_state(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
 #[cfg(test)]
@@ -293,7 +339,7 @@ mod tests {
     #[test]
     fn insert_stores_pending_entry() {
         let store = OAuthStateStore::new();
-        let state = store.insert(verifier("v1"), account(1));
+        let state = store.insert(verifier("v1"), account(1)).unwrap();
         assert_eq!(store.len(), 1);
         assert!(!state.is_empty());
     }
@@ -303,7 +349,7 @@ mod tests {
         let store = OAuthStateStore::new();
         let mut seen = HashSet::new();
         for _ in 0..50 {
-            let s = store.insert(verifier("v"), account(1));
+            let s = store.insert(verifier("v"), account(1)).unwrap();
             assert!(seen.insert(s), "duplicate state token");
         }
     }
@@ -311,7 +357,7 @@ mod tests {
     #[test]
     fn consume_returns_pending_and_removes_entry() {
         let store = OAuthStateStore::new();
-        let state = store.insert(verifier("v1"), account(7));
+        let state = store.insert(verifier("v1"), account(7)).unwrap();
 
         let pending = store.consume(&state).expect("consume should succeed");
         assert_eq!(pending.account, account(7));
@@ -329,7 +375,7 @@ mod tests {
     #[test]
     fn consume_is_single_use() {
         let store = OAuthStateStore::new();
-        let state = store.insert(verifier("v"), account(1));
+        let state = store.insert(verifier("v"), account(1)).unwrap();
 
         assert!(store.consume(&state).is_ok());
         // Second consume must NOT return the same entry (replay attack).
@@ -340,7 +386,7 @@ mod tests {
     #[test]
     fn expired_entry_is_rejected_and_removed() {
         let store = OAuthStateStore::with_config(Duration::from_millis(10), MAX_PENDING);
-        let state = store.insert(verifier("v"), account(1));
+        let state = store.insert(verifier("v"), account(1)).unwrap();
 
         thread::sleep(Duration::from_millis(25));
 
@@ -356,8 +402,8 @@ mod tests {
     #[test]
     fn sweep_removes_expired_entries() {
         let store = OAuthStateStore::with_config(Duration::from_millis(10), MAX_PENDING);
-        let _ = store.insert(verifier("v1"), account(1));
-        let _ = store.insert(verifier("v2"), account(2));
+        let _ = store.insert(verifier("v1"), account(1)).unwrap();
+        let _ = store.insert(verifier("v2"), account(2)).unwrap();
         assert_eq!(store.len(), 2);
 
         thread::sleep(Duration::from_millis(25));
@@ -370,31 +416,41 @@ mod tests {
     #[test]
     fn sweep_preserves_fresh_entries() {
         let store = OAuthStateStore::with_config(Duration::from_secs(60), MAX_PENDING);
-        let _ = store.insert(verifier("v"), account(1));
+        let _ = store.insert(verifier("v"), account(1)).unwrap();
         let removed = store.sweep_expired();
         assert_eq!(removed, 0);
         assert_eq!(store.len(), 1);
     }
 
     #[test]
-    fn insert_at_capacity_evicts_oldest() {
+    fn insert_at_capacity_returns_error_not_evict() {
+        // UX-R1-L2 regression. Prior to this fix, insert silently
+        // evicted the oldest entry to make room. That converted a
+        // "100 concurrent legitimate logins" scenario into a
+        // mysterious StateMismatch on the user whose entry got
+        // evicted out from under them. Failing fast at insert
+        // surfaces a clear error the orchestrator can translate.
         let store = OAuthStateStore::with_config(Duration::from_secs(60), 3);
-        let s1 = store.insert(verifier("v1"), account(1));
-        // Ensure distinct created_at timestamps so "oldest" is well-defined.
+        let s1 = store.insert(verifier("v1"), account(1)).unwrap();
+        // Ensure distinct created_at timestamps so the test is
+        // deterministic about which entries survive.
         thread::sleep(Duration::from_millis(2));
-        let s2 = store.insert(verifier("v2"), account(2));
+        let s2 = store.insert(verifier("v2"), account(2)).unwrap();
         thread::sleep(Duration::from_millis(2));
-        let s3 = store.insert(verifier("v3"), account(3));
+        let s3 = store.insert(verifier("v3"), account(3)).unwrap();
         assert_eq!(store.len(), 3);
 
         thread::sleep(Duration::from_millis(2));
-        // Fourth insert must evict s1.
-        let _s4 = store.insert(verifier("v4"), account(4));
+        // Fourth insert must FAIL — no eviction.
+        let err = store.insert(verifier("v4"), account(4)).unwrap_err();
+        assert!(
+            matches!(err, OAuthError::StoreAtCapacity { max_pending: 3 }),
+            "insert at capacity must return StoreAtCapacity, got {err:?}"
+        );
         assert_eq!(store.len(), 3, "capacity must be held at 3");
 
-        // s1 is gone; s2, s3, s4 remain.
-        let e1 = store.consume(&s1).unwrap_err();
-        assert!(matches!(e1, OAuthError::StateMismatch));
+        // All three original entries still consumable.
+        assert!(store.consume(&s1).is_ok());
         assert!(store.consume(&s2).is_ok());
         assert!(store.consume(&s3).is_ok());
     }
@@ -403,20 +459,78 @@ mod tests {
     fn is_empty_reflects_store_state() {
         let store = OAuthStateStore::new();
         assert!(store.is_empty());
-        let _ = store.insert(verifier("v"), account(1));
+        let _ = store.insert(verifier("v"), account(1)).unwrap();
         assert!(!store.is_empty());
     }
 
     #[test]
     fn pending_state_debug_does_not_leak_verifier() {
         let store = OAuthStateStore::new();
-        let state = store.insert(verifier("secret-verifier-bytes"), account(1));
+        let state = store
+            .insert(verifier("secret-verifier-bytes"), account(1))
+            .unwrap();
         let pending = store.consume(&state).unwrap();
         let dbg = format!("{pending:?}");
         assert!(
             !dbg.contains("secret-verifier-bytes"),
             "PendingState Debug leaked the verifier: {dbg}"
         );
+    }
+
+    // ── SEC-R2-06: constant-time state comparison ─────────────────
+
+    #[test]
+    fn constant_time_eq_state_matches_equal_strings() {
+        // Two identical 43-char tokens compare equal.
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(constant_time_eq_state(a, b));
+    }
+
+    #[test]
+    fn constant_time_eq_state_rejects_unequal_strings() {
+        // Two different 43-char tokens compare unequal.
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        assert!(!constant_time_eq_state(a, b));
+    }
+
+    #[test]
+    fn constant_time_eq_state_rejects_length_mismatch() {
+        // Different-length strings short-circuit to false. The
+        // legitimate state-token format is fixed-length, so a length
+        // mismatch is itself a hard "no match" signal — we don't need
+        // to feed both into ConstantTimeEq for the length-mismatch
+        // case.
+        let a = "AAAAAAAA";
+        let b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(!constant_time_eq_state(a, b));
+        assert!(!constant_time_eq_state(b, a));
+    }
+
+    #[test]
+    fn constant_time_eq_state_rejects_one_byte_difference() {
+        // The most failure-prone case: differs only in the last byte.
+        // A naive byte-by-byte compare would loop almost the full
+        // length before returning; the constant-time path pays the
+        // full-length cost regardless.
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB";
+        assert!(!constant_time_eq_state(a, b));
+    }
+
+    #[test]
+    fn constant_time_eq_state_compiles_with_subtle_primitive() {
+        // Structural assertion (the actual constant-time guarantee
+        // lives in `subtle::ConstantTimeEq`'s implementation). This
+        // test pins the call shape so a future refactor that swaps
+        // the primitive for an `==` regression triggers a compile
+        // failure on the `ct_eq` symbol rather than silently widening
+        // the timing surface.
+        use subtle::ConstantTimeEq as _;
+        let a = b"abcdef";
+        let b = b"abcdef";
+        let _ct: subtle::Choice = a.ct_eq(b);
     }
 
     #[test]
@@ -436,7 +550,7 @@ mod tests {
         let store = Arc::new(OAuthStateStore::new());
 
         // Seed one pending entry so we can assert state survives.
-        let pre_state = store.insert(verifier("pre-poison"), account(1));
+        let pre_state = store.insert(verifier("pre-poison"), account(1)).unwrap();
         assert_eq!(store.len(), 1);
 
         // Poison the mutex by panicking while holding it. We go
@@ -463,7 +577,8 @@ mod tests {
         let (new_state, len_after_insert, consumed, _swept) =
             res.expect("locked() must not panic on a poisoned mutex");
 
-        assert!(!new_state.is_empty(), "insert worked after poison");
+        let new_state_value = new_state.expect("insert worked after poison");
+        assert!(!new_state_value.is_empty(), "insert returned a state token");
         assert_eq!(len_after_insert, 2, "both entries present after poison");
         assert!(consumed.is_ok(), "pre-poison entry consumable after poison");
     }

@@ -49,6 +49,14 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
+# `subtle` provides constant-time equality (`ConstantTimeEq`) for
+# comparing OAuth state tokens. Already a transitive dep of
+# `ed25519-dalek` / `aes-gcm`, so adding it as a direct workspace dep
+# does not pull anything new into the build graph — only gives us the
+# public API surface. Kept at workspace level so both `csq-core` (state
+# store + race) and `csq-desktop` (race state-token compare) share the
+# same version.
+subtle = { version = "2", default-features = false }
 # Gemini PR-G2a.2 — Linux Secret Service / kwallet via D-Bus. The crate's
 # `rt-tokio-crypto-rust` feature picks tokio for the async runtime and
 # RustCrypto for session-key crypto so we keep the no-OpenSSL-FFI posture.

@@ -908,6 +908,15 @@ pub fn run() {
             commands::submit_oauth_code,
             commands::cancel_login,
             commands::start_claude_login,
+            // Parallel-race OAuth (CC's reference UX): loopback callback
+            // and paste prompt converge on the same token exchange.
+            // Uses full paths because Tauri's `generate_handler!` macro
+            // looks up `__cmd__<name>` siblings of the function, and a
+            // `pub use` re-export in commands/mod.rs does not re-export
+            // those macro-generated siblings.
+            commands::race::start_claude_login_race,
+            commands::race::submit_paste_code,
+            commands::race::cancel_race_login,
             commands::set_provider_key,
             commands::bind_keyless_provider,
             commands::list_ollama_models,
@@ -1022,6 +1031,14 @@ pub fn run() {
                 ollama_pull_child: Arc::new(Mutex::new(None)),
                 codex_login_child: Arc::new(Mutex::new(None)),
             });
+
+            // Separate state object for the parallel-race OAuth flow.
+            // Kept out of `AppState` so the race lifecycle (one
+            // outstanding race at a time) is enforced by its own type
+            // rather than tucked into a generic options bag — and so
+            // the race subsystem can evolve without churning unrelated
+            // command handlers.
+            app.manage(commands::RaceLoginState::default());
 
             // ── Background update check ────────────────────────
             //

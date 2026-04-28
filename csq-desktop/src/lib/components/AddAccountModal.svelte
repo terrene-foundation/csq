@@ -4,6 +4,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import { homeDir, join } from '@tauri-apps/api/path';
+  import { tick } from 'svelte';
 
   // ── Props ─────────────────────────────────────────────────
   let {
@@ -56,17 +57,23 @@
 
   // ── Local state ───────────────────────────────────────────
   //
-  // Claude OAuth flow (preferred — shell out to `claude auth login`
-  // via absolute path, mirroring `csq login N`):
-  //   1. `picker`             — user picks a provider
-  //   2. `running-claude`     — `claude auth login` subprocess running
-  //   3. `success` / `error`
+  // Claude OAuth — parallel-race flow (default since v2.4):
+  //   1. `picker`              — user picks a provider
+  //   2. `claude-race-init`    — Tauri command starting; waiting for
+  //                              the first event from the backend
+  //   3. `claude-race-active`  — auto URL emitted; modal shows
+  //                              "Browser opening…" and after 3 s
+  //                              expands to show the manual URL
+  //                              + paste input
+  //   4. `claude-race-resolving` — one path captured a code; UI
+  //                              freezes inputs and shows "Authorizing…"
+  //   5. `claude-race-exchanging` — backend POSTing to the token
+  //                              endpoint
+  //   6. `success` / `error`
   //
-  // Claude OAuth paste-code fallback (used when `claude` binary
-  // cannot be located on disk — the start_claude_login command
-  // returns CLAUDE_NOT_FOUND and we drop into the in-process flow):
-  //   1. `paste-code`     — browser is open, user pastes the code
-  //   2. `exchanging`     — submitting code to Anthropic
+  // Legacy Claude OAuth (kept for backward-compat / emergency rollback):
+  //   - `running-claude` — `claude auth login` subprocess running
+  //   - `paste-code`     — pre-race in-process paste-code flow
   //
   // Bearer-key flow (MiniMax, Z.AI):
   //   1. `picker`        — user picks a provider
@@ -77,6 +84,47 @@
   //   2. `keyless-confirm` — info screen, Confirm binds slot
   type Step =
     | { kind: 'picker' }
+    // ── Claude race flow (current default) ─────────────────────
+    | { kind: 'claude-race-init'; account: number }
+    | {
+        kind: 'claude-race-active';
+        account: number;
+        /// URL the browser was asked to open. Held so the
+        /// "Browser didn't open?" link can fall back to it.
+        autoUrl: string;
+        /// URL displayed for manual copy after the 3 s delay.
+        /// `null` until the `claude-login-manual-url-ready` event
+        /// fires — keeps the manual panel hidden during the
+        /// initial "Browser opening…" window per CC's UX.
+        manualUrl: string | null;
+        /// Optional one-line guidance from the backend on how to
+        /// recover when the auto-open path likely failed (e.g.
+        /// "site cannot be reached" guidance). Rendered above the
+        /// manual URL when present, omitted otherwise.
+        manualUrlHint: string | null;
+        /// Paste buffer for the manual code path.
+        pasteCode: string;
+        /// Inline error from a failed paste submission. Cleared
+        /// when the user edits the input again.
+        error: string | null;
+        /// Inline informational hint shown when the clipboard API
+        /// rejects (UX-R1-L6 round-2 fix). Distinct from `error` so
+        /// the styling can be muted rather than alarming.
+        copyHint: string | null;
+        /// "" while idle; "Copied!" for ~2 s after the user clicks
+        /// the manual-URL copy button. Drives the inline confirmation.
+        copyState: '' | 'copied';
+      }
+    | {
+        kind: 'claude-race-resolving';
+        account: number;
+        /// Which path won — "loopback" (browser callback fired)
+        /// or "paste" (user submitted a code). Drives the
+        /// "Browser sign-in completed" overlay text.
+        via: 'loopback' | 'paste';
+      }
+    | { kind: 'claude-race-exchanging'; account: number }
+    // ── Legacy Claude flows (preserved for fallback/rollback) ──
     | { kind: 'running-claude'; account: number }
     | {
         kind: 'paste-code';
@@ -144,6 +192,28 @@
         error: string | null;
       }
     | { kind: 'success'; message: string }
+    /// Informational step rendered when the backend reports a paste
+    /// arrived after the loopback already won the race (round-2
+    /// finding via `kind: "paste_after_loopback_won"`). Visually
+    /// distinct from `error`: the user did nothing wrong, the
+    /// loopback path simply finished first. The flow then continues
+    /// to success/exchange via the normal event sequence — this
+    /// step is a transient explanation, not a terminal state.
+    | { kind: 'info'; message: string }
+    /// UX-R2-03 / SEC-R2-01: dedicated recovery UI when the backend
+    /// reports another csq process (CLI or desktop) holds the
+    /// per-account login lock for the slot we tried to use. Distinct
+    /// from `error` so the action button is "Close and retry"
+    /// rather than the generic "Try again" — the user needs to
+    /// resolve the OTHER login (wait or kill) before retrying.
+    | {
+        kind: 'login-in-progress';
+        account: number;
+        /// The full backend message (includes PID hint when
+        /// available). Surfaced verbatim so the user has the
+        /// concrete next action.
+        message: string;
+      }
     | { kind: 'error'; message: string };
 
   let step = $state<Step>({ kind: 'picker' });
@@ -296,43 +366,432 @@
     }
   }
 
-  // ── Claude OAuth (shell-out via absolute path, with fallback) ─
+  // ── Claude OAuth — parallel-race flow ─────────────────────
   //
-  // PRIMARY: invoke `start_claude_login` which finds `claude` via
-  // csq_core::accounts::login::find_claude_binary (walks $PATH plus
-  // a fixed list of well-known install dirs so the Finder-launched
-  // bundle can find it). Same flow as `csq login N`: spawn a real
-  // `claude auth login` subprocess, let CC own the browser dance,
-  // read the credentials file when it exits.
+  // Mirrors CC's reference UX (`ConsoleOAuthFlow.tsx`): one auth
+  // URL, two convergent paths. Loopback callback OR paste code,
+  // whichever resolves first.
   //
-  // FALLBACK: if start_claude_login returns CLAUDE_NOT_FOUND, the
-  // user has no `claude` install we can locate. Drop into the in-
-  // process paste-code flow (`begin_claude_login` +
-  // `submit_oauth_code`) which exchanges the code through the
-  // daemon and never touches a subprocess.
+  // Lifecycle:
+  //   1. Subscribe to `claude-login-*` events BEFORE invoking
+  //      `start_claude_login_race`. Otherwise a fast loopback fires
+  //      before `listen()` has registered the handler and the first
+  //      event is dropped.
+  //   2. Backend emits `claude-login-browser-opening` with the URL
+  //      to open. The frontend opens it via `tauri-plugin-opener`.
+  //   3. After 3 s the backend emits `claude-login-manual-url-ready`
+  //      with the same URL. The modal expands to show a copy button
+  //      and a paste input.
+  //   4. Either path resolves first — backend emits
+  //      `claude-login-resolved` with `via: "loopback" | "paste"`,
+  //      then `claude-login-exchanging`, then either
+  //      `claude-login-success` or `claude-login-error`.
+  //   5. Cancel: closing the modal calls `cancel_race_login` which
+  //      aborts the orchestrator task and emits
+  //      `claude-login-cancelled`.
+  //
+  // Account-scoping (UX-R1-H2 round-2 fix):
+  //   Every `claude-login-*` event payload carries an `account: u16`
+  //   field as of the round-2 backend contract update. The modal
+  //   guards every handler with an account-equality check so a stale
+  //   event from a previously-cancelled race for a different slot
+  //   cannot mutate the current modal's state. This is defence in
+  //   depth on top of the cleanup-on-close path — the bus is
+  //   process-wide, not modal-scoped.
+
+  // Per-event payload shapes — kept in lock-step with the backend
+  // `csq-desktop/src-tauri/src/commands/race.rs` payload structs.
+  // Every payload has an `account` field as of the round-2 contract;
+  // the frontend uses it to guard against wrong-window routing.
+  interface BrowserOpeningPayload {
+    account: number;
+    auto_url: string;
+  }
+  interface ManualUrlPayload {
+    account: number;
+    manual_url: string;
+    /// Optional one-line user-facing hint (e.g. "if your browser
+    /// shows a 'site cannot be reached' error, paste the code below
+    /// instead"). Rendered inline above the manual URL when present.
+    hint?: string;
+  }
+  interface ResolvedPayload {
+    account: number;
+    via: 'loopback' | 'paste';
+  }
+  interface ExchangingPayload {
+    account: number;
+  }
+  interface SuccessPayload {
+    account: number;
+    email: string;
+  }
+  interface ErrorPayload {
+    account: number;
+    message: string;
+    /// Fixed-vocabulary tag for UI branching. Round-2 additions:
+    /// `paste_after_loopback_won` is rendered as an info banner
+    /// rather than an error — the user's typed code wasn't needed
+    /// because the loopback path already won the race.
+    kind: string;
+  }
+  interface CancelledPayload {
+    account: number;
+  }
+
+  /// All in-flight Tauri event subscriptions for the race. Cleared
+  /// in `cleanupRaceListeners` on cancel / completion / unmount so
+  /// late events from an aborted login cannot touch a closed modal
+  /// (matches the journal-0021 pattern from the Codex flow).
+  let raceUnlistens = $state<UnlistenFn[]>([]);
+  /// Set BEFORE we invoke `start_claude_login_race` so `await listen`
+  /// callbacks (which can complete after the modal is closed) can
+  /// detect the closed state and unregister immediately.
+  let raceListenersClosed = $state(false);
+
+  /// Resets the inline copy-state flash after the timeout fires.
+  /// Stored on the closure so a second click before the previous
+  /// timeout fires resets the timer cleanly.
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function cleanupRaceListeners() {
+    raceListenersClosed = true;
+    for (const fn of raceUnlistens) {
+      try { fn(); } catch (_) { /* best effort */ }
+    }
+    raceUnlistens = [];
+    if (copyResetTimer !== null) {
+      clearTimeout(copyResetTimer);
+      copyResetTimer = null;
+    }
+    // SEC-R2-03: clear the race token whenever listeners are torn
+    // down so a stale token from a previous race can't accidentally
+    // be passed to a future cancel.
+    activeRaceToken = null;
+  }
+
+  /// Returns the account number of the in-flight race, or `null` if
+  /// no race is active. Drives the `cancel_race_login` call site
+  /// (UX-R1-H1 round-2): the backend cancel command now takes an
+  /// `account: u16` so a stale cancel from a closed modal cannot
+  /// abort a sibling modal's race targeting a different slot. Every
+  /// race step variant carries the account it was started with, so
+  /// reading it back is a straight switch.
+  function activeRaceAccount(): number | null {
+    switch (step.kind) {
+      case 'claude-race-init':
+      case 'claude-race-active':
+      case 'claude-race-resolving':
+      case 'claude-race-exchanging':
+        return step.account;
+      default:
+        return null;
+    }
+  }
+
+  /// SEC-R2-03: opaque per-race token returned by
+  /// `start_claude_login_race` and required by `cancel_race_login`.
+  /// Captured here so the cancel call site can thread it through.
+  /// Cleared on race completion / cancellation.
+  // R3-L2 / round-4 redteam: MUST untrack writes if this state is
+  // both READ and WRITTEN inside any future $effect — see
+  // svelte-patterns.md Rule 5. The current call sites only assign
+  // from event handlers (no surrounding $effect), so untrack is not
+  // needed today; this note exists so a future "react to race
+  // token" effect doesn't trip the alpha.21 ChangeModelModal hang
+  // pattern (journal 0061).
+  let activeRaceToken = $state<string | null>(null);
+
+  /// Backend response shape for `start_claude_login_race`.
+  /// SEC-R2-03: carries the per-race token the frontend MUST supply
+  /// to cancel.
+  interface StartRaceResponse {
+    account: number;
+    race_token: string;
+  }
+
   async function startClaudeOAuth(account: number) {
-    step = { kind: 'running-claude', account };
+    // Reset listener bookkeeping for a fresh race. Previous event
+    // handles (if any) were already cleaned in `handleClose` —
+    // this is defensive for the user clicking Try Again.
+    await cleanupRaceListeners();
+    raceListenersClosed = false;
+    step = { kind: 'claude-race-init', account };
+
+    // Subscribe to every `claude-login-*` event BEFORE invoking the
+    // command. Order matters: a fast loopback callback can fire
+    // before listen() resolves if we reverse it. Guard each handler
+    // against `raceListenersClosed` so a late event from an aborted
+    // race cannot touch a disposed modal.
+    //
+    // Account-scope guard (UX-R1-H2 round-2): every handler bails
+    // immediately if `e.payload.account !== account`. The Tauri event
+    // bus is process-wide, so a stale event from a previous race for
+    // a different slot can theoretically arrive at this listener
+    // before its unlisten fires; the equality check stops it from
+    // mutating the wrong modal's state. The check is per-listener
+    // (not pulled into a wrapper) because each handler has different
+    // payload typing.
+    try {
+      const browserOpening = await listen<BrowserOpeningPayload>(
+        'claude-login-browser-opening',
+        async (e) => {
+          if (e.payload.account !== account) return;
+          if (raceListenersClosed) return;
+          if (step.kind !== 'claude-race-init' && step.kind !== 'claude-race-active') return;
+          step = {
+            kind: 'claude-race-active',
+            account,
+            autoUrl: e.payload.auto_url,
+            manualUrl: null,
+            manualUrlHint: null,
+            pasteCode: '',
+            error: null,
+            copyHint: null,
+            copyState: '',
+          };
+          // Best-effort browser open. If the OS reports failure we
+          // surface the manual URL immediately rather than waiting
+          // the 3 s delay — the user already needs to act.
+          try {
+            await openUrl(e.payload.auto_url);
+          } catch (_) {
+            if (step.kind === 'claude-race-active') {
+              step = { ...step, manualUrl: e.payload.auto_url };
+            }
+          }
+        },
+      );
+      if (raceListenersClosed) { browserOpening(); return; }
+      raceUnlistens = [...raceUnlistens, browserOpening];
+
+      const manualUrlReady = await listen<ManualUrlPayload>(
+        'claude-login-manual-url-ready',
+        (e) => {
+          if (e.payload.account !== account) return;
+          if (raceListenersClosed) return;
+          if (step.kind === 'claude-race-active') {
+            // Hint is optional — only set it if the backend actually
+            // sent one. Nullifying when absent keeps the inline note
+            // out of the DOM rather than rendering an empty span.
+            step = {
+              ...step,
+              manualUrl: e.payload.manual_url,
+              manualUrlHint: e.payload.hint ?? null,
+            };
+          }
+        },
+      );
+      if (raceListenersClosed) { manualUrlReady(); return; }
+      raceUnlistens = [...raceUnlistens, manualUrlReady];
+
+      const resolved = await listen<ResolvedPayload>(
+        'claude-login-resolved',
+        (e) => {
+          if (e.payload.account !== account) return;
+          if (raceListenersClosed) return;
+          // F5: transitioning to `claude-race-resolving` immediately
+          // unmounts the paste input + Sign-in button — that's how
+          // a mid-typing user is prevented from submitting a code
+          // that's no longer needed. The resolving step's via-flag
+          // overlay ("Browser sign-in completed — finishing up.")
+          // tells them what happened. The `loopbackWon` flag on the
+          // active step is reserved for the rare case where the
+          // transition is briefly blocked (e.g. an in-flight Svelte
+          // micro-task batching) so the input goes inert in-place.
+          if (
+            step.kind === 'claude-race-active' ||
+            step.kind === 'claude-race-init'
+          ) {
+            step = {
+              kind: 'claude-race-resolving',
+              account,
+              via: e.payload.via,
+            };
+          }
+        },
+      );
+      if (raceListenersClosed) { resolved(); return; }
+      raceUnlistens = [...raceUnlistens, resolved];
+
+      const exchanging = await listen<ExchangingPayload>(
+        'claude-login-exchanging',
+        (e) => {
+          if (e.payload.account !== account) return;
+          if (raceListenersClosed) return;
+          if (
+            step.kind === 'claude-race-resolving' ||
+            step.kind === 'claude-race-active'
+          ) {
+            step = { kind: 'claude-race-exchanging', account };
+          }
+        },
+      );
+      if (raceListenersClosed) { exchanging(); return; }
+      raceUnlistens = [...raceUnlistens, exchanging];
+
+      const success = await listen<SuccessPayload>(
+        'claude-login-success',
+        async (e) => {
+          if (e.payload.account !== account) return;
+          if (raceListenersClosed) return;
+          await cleanupRaceListeners();
+          onAccountAdded();
+          step = {
+            kind: 'success',
+            message: `Account ${e.payload.account} added successfully (${e.payload.email}).`,
+          };
+        },
+      );
+      if (raceListenersClosed) { success(); return; }
+      raceUnlistens = [...raceUnlistens, success];
+
+      const errorEvt = await listen<ErrorPayload>(
+        'claude-login-error',
+        async (e) => {
+          if (e.payload.account !== account) return;
+          if (raceListenersClosed) return;
+          // F4: paste_after_loopback_won is a known race-loser
+          // condition where the user pasted a code AFTER the loopback
+          // path had already resolved. The backend already handed
+          // off to `exchanging` via the loopback's code, so this is
+          // informational, not an error — keep the listeners alive
+          // so the success/exchange events still land.
+          if (e.payload.kind === 'paste_after_loopback_won') {
+            step = {
+              kind: 'info',
+              message:
+                "You already signed in via your browser — your pasted code wasn't needed.",
+            };
+            return;
+          }
+          await cleanupRaceListeners();
+          step = { kind: 'error', message: e.payload.message };
+        },
+      );
+      if (raceListenersClosed) { errorEvt(); return; }
+      raceUnlistens = [...raceUnlistens, errorEvt];
+
+      const cancelled = await listen<CancelledPayload>(
+        'claude-login-cancelled',
+        async (e) => {
+          if (e.payload.account !== account) return;
+          if (raceListenersClosed) return;
+          await cleanupRaceListeners();
+          // Cancellation is a user-initiated outcome; drop straight
+          // back to the picker rather than showing an error.
+          step = { kind: 'picker' };
+        },
+      );
+      if (raceListenersClosed) { cancelled(); return; }
+      raceUnlistens = [...raceUnlistens, cancelled];
+    } catch (e) {
+      await cleanupRaceListeners();
+      step = { kind: 'error', message: `Could not subscribe to login events: ${e}` };
+      return;
+    }
+
+    // Now invoke the orchestrator. Returns immediately; the rest of
+    // the flow plays out via the events above.
+    //
+    // SEC-R2-03: capture the per-race token returned by the backend.
+    // The cancel call site MUST pass this token back; without it,
+    // `cancel_race_login` returns Unauthorized (the backend can't
+    // tell our cancel from a malicious in-process JS handler's).
     try {
       const baseDir = await getBaseDir();
-      const result = await invoke<number>('start_claude_login', { baseDir, account });
-      onAccountAdded();
-      step = {
-        kind: 'success',
-        message: `Account ${result} added successfully.`,
-      };
+      const response = await invoke<StartRaceResponse>('start_claude_login_race', {
+        baseDir,
+        account,
+      });
+      activeRaceToken = response.race_token;
     } catch (e) {
-      const raw = String(e);
-      if (raw.includes('CLAUDE_NOT_FOUND')) {
-        // Binary missing — fall back to paste-code automatically.
-        try {
-          const login = await invoke<ClaudeLoginView>('begin_claude_login', { account });
-          await openUrl(login.auth_url);
-          step = { kind: 'paste-code', login, code: '', error: null };
-        } catch (e2) {
-          step = { kind: 'error', message: String(e2) };
+      await cleanupRaceListeners();
+      activeRaceToken = null;
+      // UX-R2-03 / SEC-R2-01: detect the structured
+      // "another login in progress" error from the backend so we
+      // can render a dedicated recovery UI instead of a bare error
+      // banner. The backend error message starts with
+      // "login already in progress for account N" — match on that
+      // prefix; including the account number ensures we don't
+      // misidentify a different "in progress" message.
+      const errStr = String(e);
+      if (errStr.toLowerCase().includes('login already in progress')) {
+        step = {
+          kind: 'login-in-progress',
+          account,
+          message: errStr,
+        };
+        return;
+      }
+      step = { kind: 'error', message: errStr };
+    }
+  }
+
+  /// UX-R2-03: clicked from the login-in-progress recovery UI.
+  /// Invokes cancel on the race that's blocking us (we don't have
+  /// its race token, but if the holder is the desktop app's own
+  /// state, the user must manually cancel it from the OTHER modal
+  /// — this button cannot cancel another process's lock). Closes
+  /// the current modal so the user can retry.
+  ///
+  /// In practice the lock holder is almost always the CLI, in which
+  /// case the only recovery is for the user to wait or kill the CLI
+  /// process. The recovery button text reflects this: "Close and
+  /// retry" rather than "Cancel previous login".
+  async function dismissLoginInProgressAndRetry() {
+    if (step.kind !== 'login-in-progress') return;
+    const account = step.account;
+    step = { kind: 'picker' };
+    // Brief tick so Svelte renders the picker before we re-trigger.
+    await tick();
+    await startClaudeOAuth(account);
+  }
+
+  async function submitRacePasteCode() {
+    if (step.kind !== 'claude-race-active') return;
+    const current = step;
+    const code = current.pasteCode.trim();
+    if (!code) {
+      step = { ...current, error: 'Authorization code must not be empty' };
+      return;
+    }
+    try {
+      await invoke('submit_paste_code', { account: current.account, code });
+      // Don't transition state here — wait for the
+      // `claude-login-resolved` event so the via-flag is accurate.
+    } catch (e) {
+      step = { ...current, error: String(e) };
+    }
+  }
+
+  /// Best-effort copy-to-clipboard for the manual URL. Uses the
+  /// browser Clipboard API (available in Tauri's WebView). On
+  /// failure (clipboard API blocked, insecure context, no
+  /// permission), surfaces an inline hint pointing at the keyboard
+  /// shortcut — silently swallowing the error left users staring
+  /// at a Copy button that did nothing (UX-R1-L6 round-2).
+  async function copyManualUrl() {
+    if (step.kind !== 'claude-race-active' || !step.manualUrl) return;
+    try {
+      await navigator.clipboard.writeText(step.manualUrl);
+      step = { ...step, copyState: 'copied', copyHint: null };
+      if (copyResetTimer !== null) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => {
+        if (step.kind === 'claude-race-active') {
+          step = { ...step, copyState: '' };
         }
-      } else {
-        step = { kind: 'error', message: raw };
+        copyResetTimer = null;
+      }, 2000);
+    } catch (_) {
+      // The URL above is selectable, so the user CAN still copy it
+      // by hand. Tell them how — no error styling, just a
+      // muted-tone instruction next to the Copy button.
+      if (step.kind === 'claude-race-active') {
+        step = {
+          ...step,
+          copyHint: 'Copy failed — select the URL above and Cmd-C / Ctrl-C',
+        };
       }
     }
   }
@@ -748,6 +1207,46 @@
       codexDeviceCodeUnlisten = null;
     }
 
+    // Same hardening for the parallel-race Claude login: tear down
+    // the event subscriptions BEFORE invoking `cancel_race_login`
+    // so the cancellation event itself doesn't bounce the modal
+    // back into a stale state.
+    //
+    // Snapshot the active race account AND token BEFORE
+    // cleanupRaceListeners runs — the cleanup itself clears the
+    // token (SEC-R2-03), and a late event arrival between the two
+    // awaits could in principle change `step`. Read once, cancel
+    // with those values.
+    const cancelAccount = activeRaceAccount();
+    const cancelToken = activeRaceToken;
+    await cleanupRaceListeners();
+
+    // Tell the backend to abort the orchestrator task IF there was
+    // one in flight. Skipping the invoke when no race is active
+    // avoids two failure modes:
+    //   1. The backend's account-scoped cancel rejects unknown
+    //      accounts; sending a junk value would surface as a noisy
+    //      error in the log.
+    //   2. We avoid telling the backend to abort a sibling modal's
+    //      race that happens to share the slot picker default.
+    // Best-effort: a no-op cancel (orchestrator already finished)
+    // is `Ok(())`, so the only failure mode here is a transport
+    // error from a torn-down IPC channel during shutdown — log only.
+    //
+    // SEC-R2-03: pass the race token captured at race-start time.
+    // The backend rejects cancels without a matching token to
+    // prevent the cancel-account-iteration oracle.
+    if (cancelAccount !== null && cancelToken !== null) {
+      try {
+        await invoke('cancel_race_login', {
+          account: cancelAccount,
+          raceToken: cancelToken,
+        });
+      } catch (_) {
+        /* best-effort — ignore */
+      }
+    }
+
     // Journal 0021 finding 6: kill the running codex subprocess so
     // it does not orphan for the minutes-long device-auth window.
     // Best-effort — the backend treats a no-op (no child running)
@@ -852,6 +1351,126 @@
               </button>
             {/each}
           </div>
+        {:else if step.kind === 'claude-race-init'}
+          <p class="lede" data-testid="race-init-lede">
+            Starting sign-in for account #{step.account}…
+          </p>
+          <p class="hint">
+            Opening Anthropic's authorize page in your browser.
+          </p>
+        {:else if step.kind === 'claude-race-active'}
+          <p class="lede" data-testid="race-active-lede">
+            Signing in to account #{step.account}…
+          </p>
+          <p class="hint">
+            A browser window should be open to Anthropic. Approve the
+            sign-in there — csq will pick up the credentials
+            automatically.
+          </p>
+          {#if !step.manualUrl}
+            <p class="hint">
+              Browser didn't open?
+              <button
+                type="button"
+                class="link-btn"
+                data-testid="race-open-url"
+                onclick={() => openUrl(step.kind === 'claude-race-active' ? step.autoUrl : '')}
+              >Open the sign-in URL</button>
+            </p>
+          {/if}
+          {#if step.manualUrl}
+            <!--
+              Manual URL panel appears 3 s after the browser open per
+              CC's reference UX (`ConsoleOAuthFlow.tsx`). Most users on
+              well-configured boxes never see it; the delay keeps
+              clutter out of the common path.
+            -->
+            <div class="manual-url-panel" data-testid="race-manual-panel">
+              {#if step.manualUrlHint}
+                <!--
+                  F3: optional backend-provided hint (e.g. "if your
+                  browser shows a 'site cannot be reached' error,
+                  paste the code below instead"). Muted styling so
+                  the user understands it's guidance, not an error.
+                -->
+                <p class="manual-url-hint" data-testid="race-manual-hint">
+                  {step.manualUrlHint}
+                </p>
+              {/if}
+              <p class="hint">
+                Or, after authorizing in your browser, paste the code
+                Anthropic shows you here:
+              </p>
+              <div class="manual-url-row">
+                <a
+                  href={step.manualUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="manual-url-link"
+                  data-testid="race-manual-url"
+                >{step.manualUrl}</a>
+                <button
+                  type="button"
+                  class="copy-btn"
+                  data-testid="race-copy-url"
+                  onclick={copyManualUrl}
+                >{step.copyState === 'copied' ? 'Copied!' : 'Copy'}</button>
+              </div>
+              {#if step.copyHint}
+                <!--
+                  F6: clipboard write failed (API blocked, no perms,
+                  insecure context). The URL is still selectable by
+                  hand so we just point the user at the keyboard
+                  shortcut. Inline below the row so it's visually
+                  attached to the Copy button that just failed.
+                -->
+                <p class="manual-url-hint" data-testid="race-copy-hint">
+                  {step.copyHint}
+                </p>
+              {/if}
+              <label class="field">
+                <span>Authorization code</span>
+                <input
+                  type="password"
+                  bind:value={step.pasteCode}
+                  oninput={() => {
+                    if (step.kind === 'claude-race-active' && step.error) {
+                      step = { ...step, error: null };
+                    }
+                  }}
+                  placeholder="Paste the code from Anthropic's page"
+                  autocomplete="off"
+                  spellcheck="false"
+                  data-testid="race-paste-input"
+                />
+              </label>
+              {#if step.error}
+                <div class="error-banner" data-testid="race-error">{step.error}</div>
+              {/if}
+              <div class="actions">
+                <button
+                  class="primary"
+                  data-testid="race-submit-paste"
+                  onclick={submitRacePasteCode}
+                  disabled={!step.pasteCode.trim()}
+                >Sign in</button>
+              </div>
+            </div>
+          {/if}
+        {:else if step.kind === 'claude-race-resolving'}
+          <p class="lede" data-testid="race-resolving-lede">
+            Authorizing account #{step.account}…
+          </p>
+          <p class="hint" data-testid="race-via">
+            {step.via === 'loopback'
+              ? 'Browser sign-in completed — finishing up.'
+              : 'Code accepted — finishing up.'}
+          </p>
+        {:else if step.kind === 'claude-race-exchanging'}
+          <p class="lede" data-testid="race-exchanging-lede">
+            Exchanging credentials for account #{step.account}…
+          </p>
+          <p class="hint">Talking to Anthropic. This usually takes a second.</p>
         {:else if step.kind === 'running-claude'}
           <p class="lede">
             Launching Claude Code to sign in to account #{step.account}…
@@ -1225,6 +1844,43 @@
           <div class="actions">
             <button class="primary" onclick={handleClose}>Done</button>
           </div>
+        {:else if step.kind === 'info'}
+          <!--
+            F4 round-2: informational banner shown when the user
+            pasted a code that was redundant because the loopback
+            path already finished. The flow continues — the
+            success/error events are still wired — so we don't
+            offer a Done button here. The next event will move us
+            on to exchanging or success.
+          -->
+          <div class="info-banner" data-testid="race-info-banner">{step.message}</div>
+          <p class="hint">Finishing up — this window will update automatically.</p>
+        {:else if step.kind === 'login-in-progress'}
+          <!--
+            UX-R2-03 / SEC-R2-01: dedicated recovery banner for
+            "another csq process holds the per-account login lock".
+            The action is "Close and retry" because the only resolution
+            is for the user to wait for the OTHER login to finish (or
+            kill it if they know the PID — the message includes the
+            PID hint when the backend could read it). After they
+            resolve the other login they re-enter via this modal.
+          -->
+          <div class="warning-banner" data-testid="login-in-progress-banner">
+            ⚠ {step.message}
+          </div>
+          <p class="hint">
+            Wait for the other sign-in to finish, then click <strong>Retry</strong>.
+            If you started the other sign-in from a terminal and it's
+            stuck, close that terminal first.
+          </p>
+          <div class="actions">
+            <button class="secondary" onclick={handleClose}>Close</button>
+            <button
+              class="primary"
+              data-testid="login-in-progress-retry"
+              onclick={dismissLoginInProgressAndRetry}
+            >Retry</button>
+          </div>
         {:else if step.kind === 'error'}
           <div class="error-banner">{step.message}</div>
           <div class="actions">
@@ -1442,6 +2098,21 @@
     color: #4caf50;
     font-size: 0.9rem;
   }
+  /*
+   * Info banner — neither error nor success. Used for the
+   * paste-after-loopback-won case where the user did the right
+   * thing but their input wasn't needed. Subtle blue tone keeps
+   * the message informational, not alarming.
+   */
+  .info-banner {
+    background: rgba(80, 140, 220, 0.10);
+    border: 1px solid rgba(80, 140, 220, 0.55);
+    border-radius: 4px;
+    padding: 0.55rem 0.7rem;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+  }
   .device-code-panel {
     display: flex;
     flex-direction: column;
@@ -1465,6 +2136,69 @@
     color: var(--text-secondary);
     word-break: break-all;
     text-align: center;
+  }
+
+  /* Parallel-race Claude OAuth — manual URL panel */
+  .manual-url-panel {
+    margin-top: 0.85rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--border);
+  }
+  .manual-url-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin: 0.4rem 0;
+  }
+  /*
+   * Inline guidance line above/below the manual URL row. Used by
+   * the optional backend hint and by the clipboard-failure hint.
+   * Muted, no background, smaller-than-body — informational, not
+   * an error or status badge.
+   */
+  .manual-url-hint {
+    margin: 0.25rem 0;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    line-height: 1.35;
+  }
+  .manual-url-link {
+    flex: 1;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    padding: 0.3rem 0.5rem;
+    border-radius: 3px;
+    word-break: break-all;
+    min-height: 1.6rem;
+    text-decoration: none;
+  }
+  .manual-url-link:hover {
+    color: var(--accent);
+  }
+  .copy-btn {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.35rem 0.7rem;
+    color: inherit;
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .copy-btn:hover {
+    border-color: var(--accent);
+  }
+  .link-btn {
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    font-size: inherit;
+    padding: 0;
+    text-decoration: underline;
   }
 
   /* PR-G5 Gemini provision panel */

@@ -1004,6 +1004,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1021,12 +1022,15 @@ name = "csq-desktop"
 version = "2.3.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "csq-core",
  "dirs 5.0.1",
+ "getrandom 0.2.17",
  "log",
  "secrecy",
  "serde",
  "serde_json",
+ "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

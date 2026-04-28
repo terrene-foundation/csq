@@ -53,7 +53,7 @@ tags: [list of relevant tags]
 
 ### 4. Use Correct Entry Types
 
-Six entry types exist. Use the right one:
+Seven entry types exist. Use the right one:
 
 | Type           | Purpose                                                                   | When Created                                                                      |
 | -------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
@@ -63,6 +63,7 @@ Six entry types exist. Use the right one:
 | **RISK**       | Record an identified risk, vulnerability, or concern                      | When stress-testing, reviewing, or validating reveals potential problems          |
 | **CONNECTION** | Note a relationship between concepts, components, or findings             | When cross-referencing reveals links that matter                                  |
 | **GAP**        | Flag something missing that needs attention                               | When analysis reveals missing data, untested assumptions, or unresolved questions |
+| **CLOSEOUT**   | Mark a workspace cycle converged — name the ship version + final state    | When a workspace's planned scope ships and no in-flight work remains              |
 
 ### 5. For Discussion Section
 
@@ -88,6 +89,28 @@ DECISION entries SHOULD include alternatives considered and the rationale for th
 ### 2. Consequences and Follow-Up
 
 Entries SHOULD include consequences, follow-up actions, or next steps where applicable.
+
+### 3. Workspace Closeout via CLOSEOUT Entry
+
+When a workspace's planned scope has shipped AND its `todos/active/` directory is empty AND no further cycles are planned, the converging session SHOULD write a CLOSEOUT entry naming the ship version, the final PR or commit SHA, and any deferred items routed to other workspaces or filed as GH issues.
+
+```markdown
+# DO — terminal CLOSEOUT entry at workspace convergence
+
+## CLOSEOUT — workspace shipped in v2.4.0 (PR #213, commit a4993f4)
+
+Final state: parallel-race OAuth flow live; E2E harness in place (PR #214);
+no active todos; no deferred items.
+
+# DO NOT — abandon a workspace silently
+
+(no CLOSEOUT entry; later sessions cannot tell "shipped + closed" from "in
+progress + idle")
+```
+
+**Why:** A converged workspace without a CLOSEOUT looks identical to an idle one. `/sweep` and `/ws` cannot distinguish "this workspace finished and is parked" from "this workspace stalled mid-cycle and someone forgot." The CLOSEOUT entry is the explicit "we're done here" signal that prevents repeated re-audits across future sessions.
+
+Origin: csq SWEEP-2026-04-28 LOW-04 — three workspaces (cross-platform, gemini, codex) appeared closed but had no terminal marker, forcing the sweep to flag them as ambiguous.
 
 ## MUST NOT Rules
 

@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://terrene.foundation/csq/schemas/suite-v1.json",
+  "title": "csq coc-eval Suite Definition v1.0.0",
+  "description": "Schema for the SUITE dict each suite module exports. Validates against `lib/suite_validator.py`.",
+  "type": "object",
+  "required": [
+    "name",
+    "version",
+    "permission_profile",
+    "fixture_strategy",
+    "tests"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "enum": ["capability", "compliance", "safety", "implementation"]
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "permission_profile": {
+      "type": "string",
+      "enum": ["plan", "read-only", "write"]
+    },
+    "fixture_strategy": {
+      "type": "string",
+      "enum": ["per-cli-isolated", "shared", "coc-env"]
+    },
+    "tests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "fixture": { "type": "string" },
+          "fixturePerCli": { "type": "object" },
+          "cwdSubdir": { "type": "string" },
+          "prompt": { "type": "string" },
+          "permission_mode_override": {
+            "type": "string",
+            "enum": ["plan", "read-only", "write"]
+          },
+          "requires_write_justification": { "type": "string" },
+          "requires_writes": { "type": "boolean" },
+          "scoring_backend": {
+            "type": "string",
+            "enum": ["regex", "tiered_artifact"]
+          },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "quarantined": { "type": "boolean" },
+          "expect": { "type": "object" },
+          "post_assertions": { "type": "array" },
+          "evidence_required": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

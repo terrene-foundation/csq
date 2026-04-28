@@ -57,7 +57,17 @@ journal/*-data/
 # Session notes (ephemeral, per-machine)
 workspaces/**/.session-notes
 
-# COC eval environment (large, local-only)
-coc-eval/
+# COC eval environment — durable code (lib/, schemas/, tests/, fixtures/,
+# suites/, conftest.py, run.py) is tracked. Only ephemeral run state is
+# ignored. The legacy `coc-eval/coc-env/` workspace and per-run results
+# are local-only.
+coc-eval/__pycache__/
+coc-eval/.pytest_cache/
+coc-eval/.benchmarks/
+coc-eval/coc-env/
+coc-eval/results/
+coc-eval/scaffolds/output/
+coc-eval/run-environment-pin.json
+coc-eval/**/__pycache__/
 .playwright-mcp/
 .claude/worktrees/

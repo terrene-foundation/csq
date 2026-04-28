@@ -1,0 +1,7 @@
+{
+  "include": ["coc-eval/lib", "coc-eval/tests"],
+  "extraPaths": ["coc-eval"],
+  "pythonVersion": "3.12",
+  "reportMissingImports": "error",
+  "reportReturnType": "error"
+}

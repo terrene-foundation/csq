@@ -1,3 +1,8 @@
+pub mod race;
+pub use race::{
+    cancel_race_login, start_claude_login_race, submit_paste_code, RaceLoginState,
+};
+
 use crate::{AppState, CachedUpdateInfo};
 use csq_core::accounts::discovery;
 use csq_core::accounts::AccountSource;
@@ -804,6 +809,16 @@ pub fn begin_claude_login(
 ///
 /// On 3P import, the daemon's account-discovery cache is invalidated
 /// so the dashboard sees the new account on its next 5s poll.
+///
+/// # Legacy shell-out path
+///
+/// As of v2.4 the default Claude OAuth path is the in-process
+/// parallel-race flow (see [`race::start_claude_login_race`]). This
+/// shell-out command is preserved as an emergency-rollback knob,
+/// invocable via `force_legacy_shell: true` from a future Settings
+/// toggle if the in-process race regresses on a particular host /
+/// browser combination. The frontend does not reach this path
+/// during normal operation.
 #[tauri::command]
 pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;

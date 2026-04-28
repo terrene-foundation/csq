@@ -56,17 +56,23 @@
 
   // ── Local state ───────────────────────────────────────────
   //
-  // Claude OAuth flow (preferred — shell out to `claude auth login`
-  // via absolute path, mirroring `csq login N`):
-  //   1. `picker`             — user picks a provider
-  //   2. `running-claude`     — `claude auth login` subprocess running
-  //   3. `success` / `error`
+  // Claude OAuth — parallel-race flow (default since v2.4):
+  //   1. `picker`              — user picks a provider
+  //   2. `claude-race-init`    — Tauri command starting; waiting for
+  //                              the first event from the backend
+  //   3. `claude-race-active`  — auto URL emitted; modal shows
+  //                              "Browser opening…" and after 3 s
+  //                              expands to show the manual URL
+  //                              + paste input
+  //   4. `claude-race-resolving` — one path captured a code; UI
+  //                              freezes inputs and shows "Authorizing…"
+  //   5. `claude-race-exchanging` — backend POSTing to the token
+  //                              endpoint
+  //   6. `success` / `error`
   //
-  // Claude OAuth paste-code fallback (used when `claude` binary
-  // cannot be located on disk — the start_claude_login command
-  // returns CLAUDE_NOT_FOUND and we drop into the in-process flow):
-  //   1. `paste-code`     — browser is open, user pastes the code
-  //   2. `exchanging`     — submitting code to Anthropic
+  // Legacy Claude OAuth (kept for backward-compat / emergency rollback):
+  //   - `running-claude` — `claude auth login` subprocess running
+  //   - `paste-code`     — pre-race in-process paste-code flow
   //
   // Bearer-key flow (MiniMax, Z.AI):
   //   1. `picker`        — user picks a provider
@@ -77,6 +83,38 @@
   //   2. `keyless-confirm` — info screen, Confirm binds slot
   type Step =
     | { kind: 'picker' }
+    // ── Claude race flow (current default) ─────────────────────
+    | { kind: 'claude-race-init'; account: number }
+    | {
+        kind: 'claude-race-active';
+        account: number;
+        /// URL the browser was asked to open. Held so the
+        /// "Browser didn't open?" link can fall back to it.
+        autoUrl: string;
+        /// URL displayed for manual copy after the 3 s delay.
+        /// `null` until the `claude-login-manual-url-ready` event
+        /// fires — keeps the manual panel hidden during the
+        /// initial "Browser opening…" window per CC's UX.
+        manualUrl: string | null;
+        /// Paste buffer for the manual code path.
+        pasteCode: string;
+        /// Inline error from a failed paste submission. Cleared
+        /// when the user edits the input again.
+        error: string | null;
+        /// "" while idle; "Copied!" for ~2 s after the user clicks
+        /// the manual-URL copy button. Drives the inline confirmation.
+        copyState: '' | 'copied';
+      }
+    | {
+        kind: 'claude-race-resolving';
+        account: number;
+        /// Which path won — "loopback" (browser callback fired)
+        /// or "paste" (user submitted a code). Drives the
+        /// "Browser sign-in completed" overlay text.
+        via: 'loopback' | 'paste';
+      }
+    | { kind: 'claude-race-exchanging'; account: number }
+    // ── Legacy Claude flows (preserved for fallback/rollback) ──
     | { kind: 'running-claude'; account: number }
     | {
         kind: 'paste-code';
@@ -296,44 +334,236 @@
     }
   }
 
-  // ── Claude OAuth (shell-out via absolute path, with fallback) ─
+  // ── Claude OAuth — parallel-race flow ─────────────────────
   //
-  // PRIMARY: invoke `start_claude_login` which finds `claude` via
-  // csq_core::accounts::login::find_claude_binary (walks $PATH plus
-  // a fixed list of well-known install dirs so the Finder-launched
-  // bundle can find it). Same flow as `csq login N`: spawn a real
-  // `claude auth login` subprocess, let CC own the browser dance,
-  // read the credentials file when it exits.
+  // Mirrors CC's reference UX (`ConsoleOAuthFlow.tsx`): one auth
+  // URL, two convergent paths. Loopback callback OR paste code,
+  // whichever resolves first.
   //
-  // FALLBACK: if start_claude_login returns CLAUDE_NOT_FOUND, the
-  // user has no `claude` install we can locate. Drop into the in-
-  // process paste-code flow (`begin_claude_login` +
-  // `submit_oauth_code`) which exchanges the code through the
-  // daemon and never touches a subprocess.
+  // Lifecycle:
+  //   1. Subscribe to `claude-login-*` events BEFORE invoking
+  //      `start_claude_login_race`. Otherwise a fast loopback fires
+  //      before `listen()` has registered the handler and the first
+  //      event is dropped.
+  //   2. Backend emits `claude-login-browser-opening` with the URL
+  //      to open. The frontend opens it via `tauri-plugin-opener`.
+  //   3. After 3 s the backend emits `claude-login-manual-url-ready`
+  //      with the same URL. The modal expands to show a copy button
+  //      and a paste input.
+  //   4. Either path resolves first — backend emits
+  //      `claude-login-resolved` with `via: "loopback" | "paste"`,
+  //      then `claude-login-exchanging`, then either
+  //      `claude-login-success` or `claude-login-error`.
+  //   5. Cancel: closing the modal calls `cancel_race_login` which
+  //      aborts the orchestrator task and emits
+  //      `claude-login-cancelled`.
+
+  /// All in-flight Tauri event subscriptions for the race. Cleared
+  /// in `cleanupRaceListeners` on cancel / completion / unmount so
+  /// late events from an aborted login cannot touch a closed modal
+  /// (matches the journal-0021 pattern from the Codex flow).
+  let raceUnlistens = $state<UnlistenFn[]>([]);
+  /// Set BEFORE we invoke `start_claude_login_race` so `await listen`
+  /// callbacks (which can complete after the modal is closed) can
+  /// detect the closed state and unregister immediately.
+  let raceListenersClosed = $state(false);
+
+  /// Resets the inline copy-state flash after the timeout fires.
+  /// Stored on the closure so a second click before the previous
+  /// timeout fires resets the timer cleanly.
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function cleanupRaceListeners() {
+    raceListenersClosed = true;
+    for (const fn of raceUnlistens) {
+      try { fn(); } catch (_) { /* best effort */ }
+    }
+    raceUnlistens = [];
+    if (copyResetTimer !== null) {
+      clearTimeout(copyResetTimer);
+      copyResetTimer = null;
+    }
+  }
+
   async function startClaudeOAuth(account: number) {
-    step = { kind: 'running-claude', account };
+    // Reset listener bookkeeping for a fresh race. Previous event
+    // handles (if any) were already cleaned in `handleClose` —
+    // this is defensive for the user clicking Try Again.
+    await cleanupRaceListeners();
+    raceListenersClosed = false;
+    step = { kind: 'claude-race-init', account };
+
+    // Subscribe to every `claude-login-*` event BEFORE invoking the
+    // command. Order matters: a fast loopback callback can fire
+    // before listen() resolves if we reverse it. Guard each handler
+    // against `raceListenersClosed` so a late event from an aborted
+    // race cannot touch a disposed modal.
+    try {
+      const browserOpening = await listen<{ auto_url: string }>(
+        'claude-login-browser-opening',
+        async (e) => {
+          if (raceListenersClosed) return;
+          if (step.kind !== 'claude-race-init' && step.kind !== 'claude-race-active') return;
+          step = {
+            kind: 'claude-race-active',
+            account,
+            autoUrl: e.payload.auto_url,
+            manualUrl: null,
+            pasteCode: '',
+            error: null,
+            copyState: '',
+          };
+          // Best-effort browser open. If the OS reports failure we
+          // surface the manual URL immediately rather than waiting
+          // the 3 s delay — the user already needs to act.
+          try {
+            await openUrl(e.payload.auto_url);
+          } catch (_) {
+            if (step.kind === 'claude-race-active') {
+              step = { ...step, manualUrl: e.payload.auto_url };
+            }
+          }
+        },
+      );
+      if (raceListenersClosed) { browserOpening(); return; }
+      raceUnlistens = [...raceUnlistens, browserOpening];
+
+      const manualUrlReady = await listen<{ manual_url: string }>(
+        'claude-login-manual-url-ready',
+        (e) => {
+          if (raceListenersClosed) return;
+          if (step.kind === 'claude-race-active') {
+            step = { ...step, manualUrl: e.payload.manual_url };
+          }
+        },
+      );
+      if (raceListenersClosed) { manualUrlReady(); return; }
+      raceUnlistens = [...raceUnlistens, manualUrlReady];
+
+      const resolved = await listen<{ via: 'loopback' | 'paste' }>(
+        'claude-login-resolved',
+        (e) => {
+          if (raceListenersClosed) return;
+          if (
+            step.kind === 'claude-race-active' ||
+            step.kind === 'claude-race-init'
+          ) {
+            step = {
+              kind: 'claude-race-resolving',
+              account,
+              via: e.payload.via,
+            };
+          }
+        },
+      );
+      if (raceListenersClosed) { resolved(); return; }
+      raceUnlistens = [...raceUnlistens, resolved];
+
+      const exchanging = await listen<Record<string, never>>(
+        'claude-login-exchanging',
+        () => {
+          if (raceListenersClosed) return;
+          if (
+            step.kind === 'claude-race-resolving' ||
+            step.kind === 'claude-race-active'
+          ) {
+            step = { kind: 'claude-race-exchanging', account };
+          }
+        },
+      );
+      if (raceListenersClosed) { exchanging(); return; }
+      raceUnlistens = [...raceUnlistens, exchanging];
+
+      const success = await listen<{ email: string; account: number }>(
+        'claude-login-success',
+        async (e) => {
+          if (raceListenersClosed) return;
+          await cleanupRaceListeners();
+          onAccountAdded();
+          step = {
+            kind: 'success',
+            message: `Account ${e.payload.account} added successfully (${e.payload.email}).`,
+          };
+        },
+      );
+      if (raceListenersClosed) { success(); return; }
+      raceUnlistens = [...raceUnlistens, success];
+
+      const errorEvt = await listen<{ message: string; kind: string }>(
+        'claude-login-error',
+        async (e) => {
+          if (raceListenersClosed) return;
+          await cleanupRaceListeners();
+          step = { kind: 'error', message: e.payload.message };
+        },
+      );
+      if (raceListenersClosed) { errorEvt(); return; }
+      raceUnlistens = [...raceUnlistens, errorEvt];
+
+      const cancelled = await listen<Record<string, never>>(
+        'claude-login-cancelled',
+        async () => {
+          if (raceListenersClosed) return;
+          await cleanupRaceListeners();
+          // Cancellation is a user-initiated outcome; drop straight
+          // back to the picker rather than showing an error.
+          step = { kind: 'picker' };
+        },
+      );
+      if (raceListenersClosed) { cancelled(); return; }
+      raceUnlistens = [...raceUnlistens, cancelled];
+    } catch (e) {
+      await cleanupRaceListeners();
+      step = { kind: 'error', message: `Could not subscribe to login events: ${e}` };
+      return;
+    }
+
+    // Now invoke the orchestrator. Returns immediately; the rest of
+    // the flow plays out via the events above.
     try {
       const baseDir = await getBaseDir();
-      const result = await invoke<number>('start_claude_login', { baseDir, account });
-      onAccountAdded();
-      step = {
-        kind: 'success',
-        message: `Account ${result} added successfully.`,
-      };
+      await invoke('start_claude_login_race', { baseDir, account });
     } catch (e) {
-      const raw = String(e);
-      if (raw.includes('CLAUDE_NOT_FOUND')) {
-        // Binary missing — fall back to paste-code automatically.
-        try {
-          const login = await invoke<ClaudeLoginView>('begin_claude_login', { account });
-          await openUrl(login.auth_url);
-          step = { kind: 'paste-code', login, code: '', error: null };
-        } catch (e2) {
-          step = { kind: 'error', message: String(e2) };
+      await cleanupRaceListeners();
+      step = { kind: 'error', message: String(e) };
+    }
+  }
+
+  async function submitRacePasteCode() {
+    if (step.kind !== 'claude-race-active') return;
+    const current = step;
+    const code = current.pasteCode.trim();
+    if (!code) {
+      step = { ...current, error: 'Authorization code must not be empty' };
+      return;
+    }
+    try {
+      await invoke('submit_paste_code', { account: current.account, code });
+      // Don't transition state here — wait for the
+      // `claude-login-resolved` event so the via-flag is accurate.
+    } catch (e) {
+      step = { ...current, error: String(e) };
+    }
+  }
+
+  /// Best-effort copy-to-clipboard for the manual URL. Uses the
+  /// browser Clipboard API (available in Tauri's WebView). Falls
+  /// back silently — the URL is also clickable, so a copy failure
+  /// just means the user has to click rather than paste.
+  async function copyManualUrl() {
+    if (step.kind !== 'claude-race-active' || !step.manualUrl) return;
+    try {
+      await navigator.clipboard.writeText(step.manualUrl);
+      step = { ...step, copyState: 'copied' };
+      if (copyResetTimer !== null) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => {
+        if (step.kind === 'claude-race-active') {
+          step = { ...step, copyState: '' };
         }
-      } else {
-        step = { kind: 'error', message: raw };
-      }
+        copyResetTimer = null;
+      }, 2000);
+    } catch (_) {
+      /* clipboard API blocked — ignore, user can still click the link */
     }
   }
 
@@ -748,6 +978,22 @@
       codexDeviceCodeUnlisten = null;
     }
 
+    // Same hardening for the parallel-race Claude login: tear down
+    // the event subscriptions BEFORE invoking `cancel_race_login`
+    // so the cancellation event itself doesn't bounce the modal
+    // back into a stale state.
+    await cleanupRaceListeners();
+
+    // Tell the backend to abort the orchestrator task. Best-effort:
+    // a no-op cancel (no race in flight) is `Ok(())`, so the only
+    // failure mode here is a transport error from a torn-down IPC
+    // channel during shutdown — log only.
+    try {
+      await invoke('cancel_race_login');
+    } catch (_) {
+      /* best-effort — ignore */
+    }
+
     // Journal 0021 finding 6: kill the running codex subprocess so
     // it does not orphan for the minutes-long device-auth window.
     // Best-effort — the backend treats a no-op (no child running)
@@ -852,6 +1098,103 @@
               </button>
             {/each}
           </div>
+        {:else if step.kind === 'claude-race-init'}
+          <p class="lede" data-testid="race-init-lede">
+            Starting sign-in for account #{step.account}…
+          </p>
+          <p class="hint">
+            Opening Anthropic's authorize page in your browser.
+          </p>
+        {:else if step.kind === 'claude-race-active'}
+          <p class="lede" data-testid="race-active-lede">
+            Signing in to account #{step.account}…
+          </p>
+          <p class="hint">
+            A browser window should be open to Anthropic. Approve the
+            sign-in there — csq will pick up the credentials
+            automatically.
+          </p>
+          {#if !step.manualUrl}
+            <p class="hint">
+              Browser didn't open?
+              <button
+                type="button"
+                class="link-btn"
+                data-testid="race-open-url"
+                onclick={() => openUrl(step.kind === 'claude-race-active' ? step.autoUrl : '')}
+              >Open the sign-in URL</button>
+            </p>
+          {/if}
+          {#if step.manualUrl}
+            <!--
+              Manual URL panel appears 3 s after the browser open per
+              CC's reference UX (`ConsoleOAuthFlow.tsx`). Most users on
+              well-configured boxes never see it; the delay keeps
+              clutter out of the common path.
+            -->
+            <div class="manual-url-panel" data-testid="race-manual-panel">
+              <p class="hint">
+                Or, after authorizing in your browser, paste the code
+                Anthropic shows you here:
+              </p>
+              <div class="manual-url-row">
+                <a
+                  href={step.manualUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="manual-url-link"
+                  data-testid="race-manual-url"
+                >{step.manualUrl}</a>
+                <button
+                  type="button"
+                  class="copy-btn"
+                  data-testid="race-copy-url"
+                  onclick={copyManualUrl}
+                >{step.copyState === 'copied' ? 'Copied!' : 'Copy'}</button>
+              </div>
+              <label class="field">
+                <span>Authorization code</span>
+                <input
+                  type="password"
+                  bind:value={step.pasteCode}
+                  oninput={() => {
+                    if (step.kind === 'claude-race-active' && step.error) {
+                      step = { ...step, error: null };
+                    }
+                  }}
+                  placeholder="Paste the code from Anthropic's page"
+                  autocomplete="off"
+                  spellcheck="false"
+                  data-testid="race-paste-input"
+                />
+              </label>
+              {#if step.error}
+                <div class="error-banner" data-testid="race-error">{step.error}</div>
+              {/if}
+              <div class="actions">
+                <button
+                  class="primary"
+                  data-testid="race-submit-paste"
+                  onclick={submitRacePasteCode}
+                  disabled={!step.pasteCode.trim()}
+                >Sign in</button>
+              </div>
+            </div>
+          {/if}
+        {:else if step.kind === 'claude-race-resolving'}
+          <p class="lede" data-testid="race-resolving-lede">
+            Authorizing account #{step.account}…
+          </p>
+          <p class="hint" data-testid="race-via">
+            {step.via === 'loopback'
+              ? 'Browser sign-in completed — finishing up.'
+              : 'Code accepted — finishing up.'}
+          </p>
+        {:else if step.kind === 'claude-race-exchanging'}
+          <p class="lede" data-testid="race-exchanging-lede">
+            Exchanging credentials for account #{step.account}…
+          </p>
+          <p class="hint">Talking to Anthropic. This usually takes a second.</p>
         {:else if step.kind === 'running-claude'}
           <p class="lede">
             Launching Claude Code to sign in to account #{step.account}…
@@ -1465,6 +1808,57 @@
     color: var(--text-secondary);
     word-break: break-all;
     text-align: center;
+  }
+
+  /* Parallel-race Claude OAuth — manual URL panel */
+  .manual-url-panel {
+    margin-top: 0.85rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--border);
+  }
+  .manual-url-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin: 0.4rem 0;
+  }
+  .manual-url-link {
+    flex: 1;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    padding: 0.3rem 0.5rem;
+    border-radius: 3px;
+    word-break: break-all;
+    min-height: 1.6rem;
+    text-decoration: none;
+  }
+  .manual-url-link:hover {
+    color: var(--accent);
+  }
+  .copy-btn {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.35rem 0.7rem;
+    color: inherit;
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .copy-btn:hover {
+    border-color: var(--accent);
+  }
+  .link-btn {
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    font-size: inherit;
+    padding: 0;
+    text-decoration: underline;
   }
 
   /* PR-G5 Gemini provision panel */

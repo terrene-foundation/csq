@@ -7,6 +7,26 @@ Phase: 4
 
 ---
 
+**STATUS UPDATE 2026-04-28:** csq is shipped at v2.3.1 in production; this milestone audited against current code.
+
+- delivered (DONE):
+  - M11-05 .deb / .rpm / AppImage bundles — `tauri.conf.json::bundle.targets` lists `["app","dmg","deb","rpm","appimage","msi","nsis"]`; `release.yml` ships them.
+  - M11-06 curl-pipe installer — `install.sh` at repo root, downloads from GitHub Releases with SHA256 verification.
+  - M11-07 `csq doctor` — `csq-cli/src/commands/doctor.rs` exists.
+  - M11-08 shell completions — `csq-cli/src/commands/completions.rs` exists.
+  - M11-09 `--json` output — implemented across status / suggest / etc.
+  - M11-10 v1.x migration in `csq install` — `csq-cli/src/commands/install.rs`.
+- outstanding (NOT-DONE):
+  - M11-01 macOS Apple Developer ID + notarization — only Foundation Ed25519 `.sig` files ship; `.app`/`.dmg` Gatekeeper still warns on first launch (release.yml comment confirms).
+  - M11-02 Windows Authenticode — same: Ed25519 only; SmartScreen still warns.
+  - M11-03 Homebrew tap (`terrene-foundation/tap`) — does not exist; install path is curl-pipe.
+  - M11-04 Scoop manifest — does not exist.
+  - M11-11 cross-platform smoke test sign-off — manual gate, no committable artifact.
+
+These five outstanding items are the v2.0 packaging-polish backlog; users install via `install.sh` (CLI) or download desktop bundles directly from Releases. None block shipped functionality.
+
+---
+
 ## M11-01: Build macOS code signing
 
 Apple Developer ID. Notarization via `xcrun notarytool`. Gatekeeper-passing `.app` bundle. CI integration for automated signing.

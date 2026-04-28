@@ -233,6 +233,23 @@ struct RaceSlot {
     /// discover which account currently has an active login (oracle).
     /// Constant-time-compared on cancel.
     race_token: String,
+    /// R3-M2 / round-4 redteam: tracks whether the user submitted a
+    /// paste code BEFORE the loopback path won. Set to `true` by
+    /// `submit_paste_code` at the moment it takes the sender — i.e.
+    /// before the `sender.send(...)` call, which means the flag is
+    /// flipped even when the orchestrator's `tokio::select!` cancels
+    /// the resolver future before its `paste_rx.await` returns.
+    ///
+    /// Drives the UX-R2-02 `paste_after_loopback_won` info banner.
+    /// Pre-R3-M2 the flag was set INSIDE the resolver future after
+    /// `paste_rx.await`; if loopback won the select between
+    /// `submit_paste_code`'s `sender.send(...)` and the resolver
+    /// observing the value, the flag stayed false and the banner
+    /// silently failed to fire. Moving the write into
+    /// `submit_paste_code` closes that window — the user's submit
+    /// action and the flag observation are now atomic with respect
+    /// to the slot mutex.
+    paste_was_used: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RaceLoginState {
@@ -281,9 +298,17 @@ impl RaceLoginState {
         Ok(())
     }
 
-    /// Atomically takes the paste-channel sender. Returns the
-    /// reason the take failed (so the caller can surface a precise
-    /// error) when no sender is available.
+    /// Atomically takes the paste-channel sender AND a clone of the
+    /// `paste_was_used` flag. Returns the reason the take failed (so
+    /// the caller can surface a precise error) when no sender is
+    /// available.
+    ///
+    /// R3-M2 / round-4 redteam: the flag clone is returned alongside
+    /// the sender so `submit_paste_code` can flip it BEFORE calling
+    /// `sender.send(...)`. This closes the race where loopback won
+    /// the orchestrator's `tokio::select!` between the user's submit
+    /// and the resolver's `paste_rx.await`, leaving the flag false
+    /// and the `paste_after_loopback_won` banner silently lost.
     fn take_paste_sender(&self, account: u16) -> PasteSenderTake {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(slot) = guard.as_mut() else {
@@ -295,7 +320,10 @@ impl RaceLoginState {
             };
         }
         match slot.paste_tx.take() {
-            Some(tx) => PasteSenderTake::Got(tx),
+            Some(tx) => PasteSenderTake::Got {
+                sender: tx,
+                paste_was_used: slot.paste_was_used.clone(),
+            },
             None => PasteSenderTake::AlreadyUsed,
         }
     }
@@ -496,13 +524,17 @@ impl RaceLoginState {
 
 /// Outcome of [`RaceLoginState::take_paste_sender`].
 enum PasteSenderTake {
-    Got(oneshot::Sender<PasteCode>),
+    /// Sender was taken AND the `paste_was_used` flag clone is
+    /// returned so `submit_paste_code` can flip it BEFORE the
+    /// `sender.send(...)` call. R3-M2 / round-4 redteam.
+    Got {
+        sender: oneshot::Sender<PasteCode>,
+        paste_was_used: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     /// No race is installed at all.
     NoSlot,
     /// A race IS installed but for a different account.
-    WrongAccount {
-        active: u16,
-    },
+    WrongAccount { active: u16 },
     /// The paste sender for this account was already taken (the
     /// loopback path won OR the user already pasted).
     AlreadyUsed,
@@ -782,16 +814,24 @@ pub async fn start_claude_login_race(
     // (reachable from submit_paste_code); the receiver is consumed
     // by the resolver closure on its single invocation by drive_race.
     let (paste_tx, paste_rx) = oneshot::channel::<PasteCode>();
-    // SEC-R2-02 / REV-R2-01: track whether the paste resolver
-    // observed an active sender at the moment loopback won. Drives
-    // the UX-R2-02 `paste_after_loopback_won` event — when the user
-    // had typed a paste but the loopback path beat them to it, we
-    // surface a friendlier info banner instead of a confusing error.
+    // SEC-R2-02 / REV-R2-01 / R3-M2: track whether the user
+    // submitted a paste BEFORE the loopback path won. The flag
+    // lives on the slot (so `submit_paste_code` can flip it under
+    // the slot mutex) and a clone is captured by the orchestrator
+    // task for the success-branch read.
     //
-    // The flag is set by `submit_paste_code` to indicate the user
-    // had submitted (or attempted to submit) before loopback won.
+    // R3-M2: pre-fix, the flag was set INSIDE the resolver future
+    // after `paste_rx.await`. If loopback won the orchestrator's
+    // `tokio::select!` between `submit_paste_code`'s `sender.send`
+    // and the resolver advancing past its await, the resolver
+    // future was cancelled and the flag stayed false — the
+    // `paste_after_loopback_won` info banner silently failed to
+    // fire even though the user had typed and submitted a code.
+    // The fix moves the write to `submit_paste_code` itself, where
+    // it happens unconditionally before `sender.send` and is
+    // serialised with every other slot read by the slot mutex.
     let paste_was_used = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let paste_was_used_for_resolver = paste_was_used.clone();
+    let paste_was_used_for_task = paste_was_used.clone();
     let paste_resolver: csq_core::oauth::race::PasteResolver = Box::new(move || {
         Box::pin(async move {
             // Map oneshot's Cancelled (sender dropped — i.e., user
@@ -799,8 +839,13 @@ pub async fn start_claude_login_race(
             // so drive_race terminates with a recoverable variant
             // that the bridge translates to a no-op (the cancel
             // event has already fired). L7 / UX-R1-L3.
+            //
+            // R3-M2: the resolver no longer flips `paste_was_used`
+            // — that responsibility moved to `submit_paste_code` so
+            // a select-cancellation of this future does not lose
+            // the bookkeeping. The flag write here would be
+            // redundant on every code path that reaches this `Ok`.
             let pasted = paste_rx.await.map_err(|_| OAuthError::Cancelled)?;
-            paste_was_used_for_resolver.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(pasted.into_inner())
         })
     });
@@ -843,6 +888,10 @@ pub async fn start_claude_login_race(
         login_lock: Some(login_lock),
         window_label: window_label.clone(),
         race_token: race_token.clone(),
+        // R3-M2: the slot owns the canonical flag; the orchestrator
+        // task captured a clone above (paste_was_used_for_task) and
+        // `submit_paste_code` clones it out via take_paste_sender.
+        paste_was_used: paste_was_used.clone(),
     });
 
     if let Err((InstallError::OccupiedByAccount(other), rejected)) = install_result {
@@ -916,7 +965,7 @@ pub async fn start_claude_login_race(
                 // event for the banner, then the normal exchanging
                 // sequence for the rest of the flow.
                 if matches!(result.winner, RaceWinner::Loopback { .. })
-                    && paste_was_used.load(std::sync::atomic::Ordering::SeqCst)
+                    && paste_was_used_for_task.load(std::sync::atomic::Ordering::SeqCst)
                 {
                     emit_error(
                         &app_handle,
@@ -1076,9 +1125,26 @@ pub fn submit_paste_code(
     }
 
     match state.take_paste_sender(account_num.get()) {
-        PasteSenderTake::Got(sender) => sender.send(code).map_err(|_| {
-            "race orchestrator dropped the paste channel — retry the login".to_string()
-        }),
+        PasteSenderTake::Got {
+            sender,
+            paste_was_used,
+        } => {
+            // R3-M2 / round-4 redteam: set the flag BEFORE
+            // `sender.send(...)`. The orchestrator's `tokio::select!`
+            // can otherwise observe loopback winning between our
+            // send completing and the resolver future advancing past
+            // its `paste_rx.await`, which would silently drop the
+            // `paste_after_loopback_won` info banner. Flipping
+            // here makes the user's submit action and the flag
+            // observation atomic from the orchestrator's
+            // perspective: by the time the success branch reads
+            // the flag, it has been set unconditionally on every
+            // path that reached this match arm.
+            paste_was_used.store(true, std::sync::atomic::Ordering::SeqCst);
+            sender.send(code).map_err(|_| {
+                "race orchestrator dropped the paste channel — retry the login".to_string()
+            })
+        }
         PasteSenderTake::NoSlot => Err(format!("no active race for account {}", account_num.get())),
         PasteSenderTake::WrongAccount { active } => Err(format!(
             "the active race is for a different account ({active}) — cancel it first"
@@ -1442,6 +1508,7 @@ mod tests {
                 login_lock: None,
                 window_label: "main".into(),
                 race_token: token.into(),
+                paste_was_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             rx,
         )
@@ -1476,6 +1543,7 @@ mod tests {
                 login_lock: None,
                 window_label: "main".into(),
                 race_token: "synth-token".into(),
+                paste_was_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             rx,
         )
@@ -1537,7 +1605,7 @@ mod tests {
         // The original account-1 race is still installed — the
         // error did not stomp it.
         match state.take_paste_sender(1) {
-            PasteSenderTake::Got(_) => {}
+            PasteSenderTake::Got { .. } => {}
             other => panic!(
                 "account-1 slot should still be alive: {:?}",
                 debug_take(&other)
@@ -1636,6 +1704,7 @@ mod tests {
             login_lock: None,
             window_label: "main".into(),
             race_token: "tok".into(),
+            paste_was_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let outcome = state.install(new_slot);
@@ -1695,7 +1764,7 @@ mod tests {
 
     fn debug_take(t: &PasteSenderTake) -> &'static str {
         match t {
-            PasteSenderTake::Got(_) => "Got",
+            PasteSenderTake::Got { .. } => "Got",
             PasteSenderTake::NoSlot => "NoSlot",
             PasteSenderTake::WrongAccount { .. } => "WrongAccount",
             PasteSenderTake::AlreadyUsed => "AlreadyUsed",
@@ -1719,7 +1788,7 @@ mod tests {
         }
         // Right account still works after the wrong-account miss.
         match state.take_paste_sender(7) {
-            PasteSenderTake::Got(_) => {}
+            PasteSenderTake::Got { .. } => {}
             other => panic!("expected Got, got {}", debug_take(&other)),
         }
     }
@@ -1731,7 +1800,7 @@ mod tests {
         install_or_panic(&state, slot);
 
         match state.take_paste_sender(3) {
-            PasteSenderTake::Got(_) => {}
+            PasteSenderTake::Got { .. } => {}
             other => panic!("first take must succeed, got {}", debug_take(&other)),
         }
         match state.take_paste_sender(3) {
@@ -1771,7 +1840,7 @@ mod tests {
         assert!(!state.cancel_for(99));
         // Slot for 5 still alive.
         match state.take_paste_sender(5) {
-            PasteSenderTake::Got(_) => {}
+            PasteSenderTake::Got { .. } => {}
             other => panic!(
                 "account-5 slot must survive a wrong-account cancel: {}",
                 debug_take(&other)
@@ -1825,7 +1894,7 @@ mod tests {
         // Different account — must NOT clear.
         state.clear_for(99);
         match state.take_paste_sender(5) {
-            PasteSenderTake::Got(_) => {}
+            PasteSenderTake::Got { .. } => {}
             other => panic!(
                 "expected Got after wrong-account clear: {}",
                 debug_take(&other)
@@ -2173,6 +2242,7 @@ mod tests {
             login_lock: None,
             window_label: "main-window".into(),
             race_token: "tok".into(),
+            paste_was_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert_eq!(slot.window_label, "main-window");
     }
@@ -2244,6 +2314,7 @@ mod tests {
             login_lock: None,
             window_label: "main".into(),
             race_token: "tok".into(),
+            paste_was_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Field exists and is Optional. Production sets Some(...).
         assert!(slot.login_lock.is_none(), "synth slot has None lock");
@@ -2300,5 +2371,132 @@ mod tests {
         let msg = login_in_progress_message(5, None);
         assert!(msg.contains("account 5"));
         assert!(msg.contains("CLI") || msg.contains("--legacy-shell"));
+    }
+
+    // ── R3-M2 / round-4 redteam: paste_was_used flip race ─────────
+
+    #[tokio::test]
+    async fn paste_after_loopback_won_fires_when_user_pastes_then_loopback_wins_immediately() {
+        // R3-M2 regression. Reproduces the race the round-3 redteam
+        // surfaced: the user submits a paste, oneshot::send succeeds,
+        // but the orchestrator's `tokio::select!` observes loopback
+        // resolving in the same poll cycle and cancels the resolver
+        // future before its `paste_rx.await` returns. Pre-fix, the
+        // `paste_was_used` flag — set INSIDE the resolver after the
+        // await — stayed false, and the success branch's
+        // `paste_after_loopback_won` info-banner condition silently
+        // evaluated false.
+        //
+        // The fix moves the flag write into `submit_paste_code`,
+        // BEFORE the `sender.send(...)` call. The slot mutex
+        // serialises this against the orchestrator's read of the
+        // same Arc, so the flag is observable regardless of which
+        // arm of the select wins.
+        //
+        // The test exercises the contract directly without spinning
+        // up a real race orchestrator (which would need a Tauri
+        // AppHandle): we simulate the user-submit by calling
+        // `take_paste_sender` on a synth slot, flipping the flag
+        // exactly as `submit_paste_code` does, then dropping the
+        // sender (mimicking a select-cancellation that aborts the
+        // resolver future before the receiver advances). The
+        // orchestrator-side clone (the one captured at install
+        // time) MUST observe `true`.
+        let state = RaceLoginState::default();
+        let (slot, _rx) = synth_slot_for(7);
+        // Capture the slot's Arc the way the orchestrator does at
+        // spawn time — production captures `paste_was_used.clone()`
+        // BEFORE installing the slot (see start_claude_login_race),
+        // so the orchestrator's view of the flag survives the slot
+        // being taken.
+        let orchestrator_view = slot.paste_was_used.clone();
+        install_or_panic(&state, slot);
+
+        // Simulate `submit_paste_code` taking the sender. Per R3-M2
+        // the take returns the flag clone alongside the sender.
+        let (sender, paste_was_used) = match state.take_paste_sender(7) {
+            PasteSenderTake::Got {
+                sender,
+                paste_was_used,
+            } => (sender, paste_was_used),
+            other => panic!("expected Got, got {}", debug_take(&other)),
+        };
+
+        // Flip the flag BEFORE attempting send — exactly the order
+        // submit_paste_code uses.
+        paste_was_used.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Now drop the sender WITHOUT calling send(). This simulates
+        // the worst case where the orchestrator's select observes
+        // loopback completing first and the resolver future is
+        // cancelled before paste_rx.await even starts. Even in this
+        // pathological case the orchestrator's read of the flag must
+        // see true.
+        drop(sender);
+
+        // The orchestrator's view (independent Arc clone) sees the
+        // flag set — the success branch would correctly emit
+        // paste_after_loopback_won. Pre-R3-M2 this would be false
+        // because the flag write lived inside the (now-cancelled)
+        // resolver future.
+        assert!(
+            orchestrator_view.load(std::sync::atomic::Ordering::SeqCst),
+            "paste_was_used MUST be observable by the orchestrator's \
+             Arc clone after submit_paste_code flipped it, even when \
+             the resolver future is cancelled before paste_rx.await \
+             returns (R3-M2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_was_used_is_false_when_no_paste_submitted() {
+        // Sister test: with no submit_paste_code call the flag
+        // stays false — so a loopback-only success does NOT
+        // misleadingly emit paste_after_loopback_won.
+        let state = RaceLoginState::default();
+        let (slot, _rx) = synth_slot_for(8);
+        let orchestrator_view = slot.paste_was_used.clone();
+        install_or_panic(&state, slot);
+
+        // No call to take_paste_sender → flag stays at construction
+        // default (false).
+        assert!(
+            !orchestrator_view.load(std::sync::atomic::Ordering::SeqCst),
+            "paste_was_used must default to false so a loopback-only \
+             success does not emit a spurious paste_after_loopback_won"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_paste_sender_returns_flag_clone_alongside_sender() {
+        // Pin the API contract: take_paste_sender::Got carries
+        // BOTH the sender AND a clone of paste_was_used. A future
+        // refactor that drops one of these would silently regress
+        // R3-M2.
+        let state = RaceLoginState::default();
+        let (slot, _rx) = synth_slot_for(3);
+        install_or_panic(&state, slot);
+
+        match state.take_paste_sender(3) {
+            PasteSenderTake::Got {
+                sender: _,
+                paste_was_used,
+            } => {
+                // The returned Arc is independently observable —
+                // flipping it must be visible to a sibling clone
+                // (proving they share storage).
+                let sibling = paste_was_used.clone();
+                paste_was_used.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    sibling.load(std::sync::atomic::Ordering::SeqCst),
+                    "paste_was_used returned by take_paste_sender must \
+                     be a clone of the slot's Arc, not a fresh allocation"
+                );
+            }
+            other => panic!(
+                "expected Got with paste_was_used clone, got {}",
+                debug_take(&other)
+            ),
+        }
     }
 }

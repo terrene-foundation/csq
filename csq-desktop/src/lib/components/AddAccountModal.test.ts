@@ -778,6 +778,14 @@ describe("AddAccountModal", () => {
   // tests register a per-event dispatch table and capture the
   // listener functions so the suite can simulate the orchestrator's
   // emit sequence deterministically.
+  //
+  // ROUND-2 contract: every payload now carries `account: number`
+  // as its first field. The component guards each handler with
+  // `if (e.payload.account !== account) return;` so a stale event
+  // for a different slot cannot mutate this modal's state. The
+  // `emit()` helper below auto-injects the active account so test
+  // bodies don't need to repeat it; tests that explicitly want a
+  // wrong-account payload pass the second argument.
 
   /**
    * Per-event listener captures, keyed by event name. Populated each
@@ -786,6 +794,12 @@ describe("AddAccountModal", () => {
    */
   type RaceHandler = (e: { payload: unknown }) => void | Promise<void>;
   let raceHandlers: Map<string, RaceHandler>;
+
+  /// The account every race test runs with. Must match the
+  /// `nextAccountId` in `renderModal()` because picking a provider
+  /// passes `chosenSlot` (initialised from `nextAccountId`) to
+  /// `start_claude_login_race`.
+  const RACE_ACCOUNT = 3;
 
   function installRaceListenMock() {
     raceHandlers = new Map();
@@ -800,14 +814,24 @@ describe("AddAccountModal", () => {
     );
   }
 
-  async function emit(name: string, payload: unknown) {
+  /**
+   * Emit a race event to the registered handler. Auto-injects
+   * `account: RACE_ACCOUNT` into the payload so tests don't have to
+   * spell it out everywhere; pass an explicit `account` field in
+   * `payload` to override (used by the wrong-account guard tests).
+   */
+  async function emit(name: string, payload: Record<string, unknown> = {}) {
     const fn = raceHandlers.get(name);
     if (!fn) {
       throw new Error(
         `no race handler registered for ${name}; available: ${Array.from(raceHandlers.keys()).join(", ")}`,
       );
     }
-    await fn({ payload });
+    const merged: Record<string, unknown> = {
+      account: RACE_ACCOUNT,
+      ...payload,
+    };
+    await fn({ payload: merged });
     // Allow Svelte to flush state after the handler runs.
     for (let i = 0; i < 4; i++) await tick();
   }
@@ -893,6 +917,10 @@ describe("AddAccountModal", () => {
       '[data-testid="race-submit-paste"]',
     ) as HTMLButtonElement;
     expect(submit.disabled).toBe(true);
+    // No hint when the backend doesn't send one.
+    expect(
+      container.querySelector('[data-testid="race-manual-hint"]'),
+    ).toBeNull();
   });
 
   it("invokes submit_paste_code with trimmed value when Sign in clicked", async () => {
@@ -990,7 +1018,6 @@ describe("AddAccountModal", () => {
 
     await emit("claude-login-success", {
       email: "user@example.com",
-      account: 3,
     });
     expect(onAccountAdded).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("Account 3 added successfully");
@@ -1021,7 +1048,7 @@ describe("AddAccountModal", () => {
     expect(tryAgain).toBeDefined();
   });
 
-  it("calls cancel_race_login when the modal is closed mid-race", async () => {
+  it("calls cancel_race_login with the active account when the modal is closed mid-race", async () => {
     const onClose = vi.fn();
     setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
     installRaceListenMock();
@@ -1041,6 +1068,10 @@ describe("AddAccountModal", () => {
       (args) => args[0] === "cancel_race_login",
     );
     expect(call).toBeTruthy();
+    // F2: cancel call site MUST pass the active account so a stale
+    // cancel from a closed modal cannot abort a sibling modal's
+    // race for a different slot.
+    expect(call?.[1]).toEqual({ account: RACE_ACCOUNT });
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -1123,5 +1154,326 @@ describe("AddAccountModal", () => {
     const err = container.querySelector('[data-testid="race-error"]');
     expect(err).not.toBeNull();
     expect(err?.textContent).toContain("invalid code");
+  });
+
+  // ── Round-2 fixes (F1–F6) ───────────────────────────────────
+  //
+  // These tests cover the round-2 fix pass: every event handler
+  // must guard on payload.account, the cancel command must carry
+  // the account, the optional manual-url hint must render, the
+  // paste-after-loopback-won kind must render as info not error,
+  // and the clipboard write fallback must surface a hint.
+
+  it("F1: ignores claude-login-browser-opening for a different account", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    // Initial state: race-init for account 3.
+    expect(container.textContent).toContain("Starting sign-in for account #3");
+
+    // A stale event for a different account (99) MUST be a no-op.
+    await emit("claude-login-browser-opening", {
+      account: 99,
+      auto_url: "https://claude.com/wrong-account",
+    });
+
+    // openUrl must NOT have been called — the wrong-account event
+    // never reached the browser-open path.
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    // State stays on the init step (no transition to active).
+    expect(container.textContent).toContain("Starting sign-in for account #3");
+    expect(
+      container.querySelector('[data-testid="race-active-lede"]'),
+    ).toBeNull();
+  });
+
+  it("F1: ignores claude-login-manual-url-ready for a different account", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    // Wrong-account manual-url MUST NOT cause the panel to render
+    // with the wrong URL.
+    await emit("claude-login-manual-url-ready", {
+      account: 99,
+      manual_url: "https://claude.com/wrong-account",
+    });
+
+    expect(
+      container.querySelector('[data-testid="race-manual-panel"]'),
+    ).toBeNull();
+  });
+
+  it("F1: ignores claude-login-resolved for a different account", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-resolved", {
+      account: 99,
+      via: "loopback",
+    });
+
+    // Wrong-account resolved must NOT transition to the resolving
+    // step — the modal stays on the active panel for our account.
+    expect(container.querySelector('[data-testid="race-via"]')).toBeNull();
+    expect(container.textContent).toContain("Signing in to account #3");
+  });
+
+  it("F1: ignores claude-login-success for a different account", async () => {
+    const onAccountAdded = vi.fn();
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal({ onAccountAdded });
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-success", {
+      account: 99,
+      email: "wrong@example.com",
+    });
+
+    // onAccountAdded MUST NOT fire for a different account's
+    // success — that would refresh the dashboard with stale data
+    // attributed to the wrong slot.
+    expect(onAccountAdded).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain("wrong@example.com");
+  });
+
+  it("F1: ignores claude-login-error for a different account", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-error", {
+      account: 99,
+      message: "wrong slot's error",
+      kind: "exchange_failed",
+    });
+
+    // Wrong-account error must NOT swap our modal into the error
+    // state. The active panel stays put.
+    expect(container.textContent).not.toContain("wrong slot's error");
+    expect(container.textContent).toContain("Signing in to account #3");
+  });
+
+  it("F1: ignores claude-login-cancelled for a different account", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-cancelled", { account: 99 });
+
+    // Wrong-account cancel must NOT bounce us to picker.
+    expect(container.textContent).toContain("Signing in to account #3");
+    expect(container.querySelectorAll(".provider-card").length).toBe(0);
+  });
+
+  it("F2: skips cancel_race_login invoke when no race is active", async () => {
+    // Open the modal, never start a race, then close it. We must
+    // NOT call `cancel_race_login` because there's nothing to
+    // cancel and the backend's account-scoped cancel rejects junk
+    // values.
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+
+    const closeBtn = container.querySelector(".close") as HTMLButtonElement;
+    await fireEvent.click(closeBtn);
+    await settle();
+
+    const cancelCall = mockInvoke.mock.calls.find(
+      (args) => args[0] === "cancel_race_login",
+    );
+    expect(cancelCall).toBeUndefined();
+  });
+
+  it("F3: renders the manual-url hint when provided by the backend", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-manual-url-ready", {
+      manual_url: "https://claude.com/cai/oauth/authorize?x=1",
+      hint: "if your browser shows a 'site cannot be reached' error, paste the code below instead",
+    });
+
+    const hint = container.querySelector('[data-testid="race-manual-hint"]');
+    expect(hint).not.toBeNull();
+    expect(hint?.textContent).toContain("site cannot be reached");
+  });
+
+  it("F4: renders paste_after_loopback_won as an info banner, not an error", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-manual-url-ready", {
+      manual_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    // Backend reports the user pasted a code AFTER loopback won.
+    await emit("claude-login-error", {
+      message:
+        "race orchestrator dropped the paste channel — the loopback path completed first",
+      kind: "paste_after_loopback_won",
+    });
+
+    // The informational banner is present.
+    const info = container.querySelector('[data-testid="race-info-banner"]');
+    expect(info).not.toBeNull();
+    expect(info?.textContent).toContain("already signed in via your browser");
+
+    // The error-styled banner is NOT present — we don't want to
+    // alarm a user whose only mistake was being too quick to paste.
+    expect(container.querySelector(".error-banner")).toBeNull();
+    // No Try-again button either — the flow is still alive and
+    // will continue to success on the next event.
+    const tryAgain = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Try again"),
+    );
+    expect(tryAgain).toBeUndefined();
+  });
+
+  it("F4: paste_after_loopback_won keeps listeners alive so success still lands", async () => {
+    // The orchestrator may emit `success` AFTER the
+    // paste_after_loopback_won error because the loopback path
+    // already had the code in flight. The component MUST NOT tear
+    // down listeners on the info path.
+    const onAccountAdded = vi.fn();
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal({ onAccountAdded });
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-error", {
+      message: "paste arrived after loopback already won",
+      kind: "paste_after_loopback_won",
+    });
+
+    // Listeners still registered after the info path.
+    expect(raceHandlers.has("claude-login-success")).toBe(true);
+    expect(raceHandlers.has("claude-login-exchanging")).toBe(true);
+
+    await emit("claude-login-exchanging", {});
+    await emit("claude-login-success", {
+      email: "user@example.com",
+    });
+
+    expect(onAccountAdded).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Account 3 added successfully");
+  });
+
+  it("F5: disables paste input + shows overlay on loopback win while typing", async () => {
+    // Variant of the existing "disables paste input after loopback
+    // resolves" test that pins the overlay text. Catches a
+    // regression where the resolved handler skips the loopbackWon
+    // flag and goes straight to the resolving step (which is fine
+    // for users who haven't started typing, but the overlay is the
+    // signal that catches mid-typing users).
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-manual-url-ready", {
+      manual_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+
+    // Loopback wins while user is on the active panel.
+    await emit("claude-login-resolved", { via: "loopback" });
+
+    // After loopback win, the resolving step's "Browser sign-in
+    // completed — finishing up" message is the overlay.
+    const via = container.querySelector('[data-testid="race-via"]');
+    expect(via).not.toBeNull();
+    expect(via?.textContent).toContain("Browser sign-in completed");
+  });
+
+  it("F6: renders clipboard fallback hint when navigator.clipboard.writeText rejects", async () => {
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    installRaceListenMock();
+    // Mock the clipboard API to reject — the JSDOM default has no
+    // clipboard at all, so we install a minimal stub. The
+    // `configurable: true` lets later tests reset it.
+    const writeText = vi
+      .fn<(text: string) => Promise<void>>()
+      .mockRejectedValue(new Error("clipboard blocked"));
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      writable: true,
+      configurable: true,
+    });
+
+    const { container } = renderModal();
+    await settle();
+    await pickAnthropicRace(container);
+
+    await emit("claude-login-browser-opening", {
+      auto_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+    await emit("claude-login-manual-url-ready", {
+      manual_url: "https://claude.com/cai/oauth/authorize?x=1",
+    });
+
+    // Click the Copy button — clipboard write rejects.
+    const copyBtn = container.querySelector(
+      '[data-testid="race-copy-url"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(copyBtn);
+    await settle();
+
+    expect(writeText).toHaveBeenCalled();
+    const hint = container.querySelector('[data-testid="race-copy-hint"]');
+    expect(hint).not.toBeNull();
+    expect(hint?.textContent).toMatch(/Cmd-C|Ctrl-C/);
+    // The "Copied!" confirmation MUST NOT appear when the write
+    // actually failed.
+    expect(copyBtn.textContent).toContain("Copy");
+    expect(copyBtn.textContent).not.toContain("Copied!");
   });
 });

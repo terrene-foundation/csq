@@ -233,17 +233,34 @@ async fn run_race_with_browser(account: AccountNum) -> Result<RaceOutcome> {
     // on Ctrl-C, drop the orchestrator (which closes the loopback
     // port and aborts the stdin read) and return UserCancelled.
     let race_fut = oauth::drive_race(prep, &store, paste_resolver, oauth::DEFAULT_OVERALL_TIMEOUT);
+    let ctrl_c_fut = async {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to install Ctrl-C handler")
+    };
+    race_or_cancel(race_fut, ctrl_c_fut).await
+}
 
+/// Races the orchestrator against an arbitrary "cancel" future.
+/// Production wires the cancel arm to `tokio::signal::ctrl_c()`;
+/// tests inject a future that resolves immediately to exercise the
+/// cancellation path deterministically.
+async fn race_or_cancel<R, C>(race_fut: R, cancel_fut: C) -> Result<RaceOutcome>
+where
+    R: std::future::Future<
+        Output = std::result::Result<csq_core::oauth::RaceResult, csq_core::error::OAuthError>,
+    >,
+    C: std::future::Future<Output = Result<()>>,
+{
     tokio::select! {
         race_res = race_fut => {
             let result = race_res.map_err(|e| anyhow!("OAuth race failed: {e}"))?;
             Ok(RaceOutcome::Resolved(result))
         }
-        ctrl_c_res = tokio::signal::ctrl_c() => {
-            // ctrl_c() returns Err only on platforms where signal
-            // installation failed at startup. Treat that as a hard
-            // error rather than a fake cancel.
-            ctrl_c_res.context("failed to install Ctrl-C handler")?;
+        ctrl_c_res = cancel_fut => {
+            // Propagate signal-installation failure as a hard error
+            // rather than a fake cancel.
+            ctrl_c_res?;
             Ok(RaceOutcome::UserCancelled)
         }
     }
@@ -761,6 +778,80 @@ mod tests {
             ".csq-account marker MUST NOT exist after subprocess failure: {:?}",
             marker
         );
+    }
+
+    // ── M2 / UX-R1-M2: Ctrl-C cancellation regression ─────────────
+
+    #[tokio::test]
+    async fn race_or_cancel_returns_user_cancelled_when_signal_resolves_first() {
+        // Build a race future that never resolves and a cancel
+        // future that resolves immediately. The select! must pick
+        // cancel.
+        let never_race = async {
+            std::future::pending::<csq_core::oauth::RaceResult>().await;
+            // Unreachable, but produce a typed Result so the
+            // closure has a concrete return type for select!.
+            Err::<csq_core::oauth::RaceResult, _>(csq_core::error::OAuthError::StateMismatch)
+        };
+        let immediate_cancel = async { Ok::<(), anyhow::Error>(()) };
+
+        let outcome = race_or_cancel(never_race, immediate_cancel).await.unwrap();
+        match outcome {
+            RaceOutcome::UserCancelled => {}
+            RaceOutcome::Resolved(_) => panic!("cancel arm should have won"),
+        }
+    }
+
+    #[tokio::test]
+    async fn race_or_cancel_returns_resolved_when_race_wins() {
+        // Race future resolves immediately with a synthesised
+        // RaceResult; cancel hangs forever. select! must pick race.
+        use csq_core::oauth::pkce::{generate_verifier, CodeVerifier};
+        let synth = csq_core::oauth::RaceResult {
+            winner: csq_core::oauth::RaceWinner::Paste {
+                code: "c".into(),
+                redirect_uri: "https://platform.claude.com/oauth/code/callback".into(),
+            },
+            auto_url: "auto".into(),
+            manual_url: "manual".into(),
+            state: "s".into(),
+            verifier: {
+                let _: CodeVerifier = generate_verifier();
+                generate_verifier()
+            },
+        };
+        let immediate_race = async move { Ok::<_, csq_core::error::OAuthError>(synth) };
+        let never_cancel = async {
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let outcome = race_or_cancel(immediate_race, never_cancel).await.unwrap();
+        match outcome {
+            RaceOutcome::Resolved(r) => {
+                assert!(matches!(
+                    r.winner,
+                    csq_core::oauth::RaceWinner::Paste { .. }
+                ));
+            }
+            RaceOutcome::UserCancelled => panic!("race arm should have won"),
+        }
+    }
+
+    #[tokio::test]
+    async fn race_or_cancel_propagates_race_error() {
+        // Race future returns Err — race_or_cancel propagates as
+        // anyhow::Error, NOT as UserCancelled.
+        let failing_race = async {
+            Err::<csq_core::oauth::RaceResult, _>(csq_core::error::OAuthError::StateMismatch)
+        };
+        let never_cancel = async {
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let res = race_or_cancel(failing_race, never_cancel).await;
+        assert!(res.is_err(), "race error must propagate as Err");
     }
 
     #[test]

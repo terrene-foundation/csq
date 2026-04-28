@@ -1028,6 +1028,18 @@ pub fn cancel_login(state: State<'_, AppState>, state_token: String) -> Result<(
         Err(csq_core::error::OAuthError::Exchange(_)) => {
             Err("cancel failed: exchange_failed".into())
         }
+        // The race-only error variants cannot be returned from
+        // `consume` (they're set by the orchestrator/exchange paths),
+        // but listing them keeps the match exhaustive so a future
+        // widening of `consume` surfaces a typed error here rather
+        // than at runtime.
+        Err(csq_core::error::OAuthError::Cancelled) => Err("cancel failed: cancelled".into()),
+        Err(csq_core::error::OAuthError::StoreAtCapacity { .. }) => {
+            Err("cancel failed: store_at_capacity".into())
+        }
+        Err(csq_core::error::OAuthError::ExchangeTimeout { .. }) => {
+            Err("cancel failed: exchange_timeout".into())
+        }
     }
 }
 

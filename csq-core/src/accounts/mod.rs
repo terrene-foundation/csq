@@ -6,6 +6,7 @@
 pub mod discovery;
 pub mod identity;
 pub mod login;
+pub mod login_lock;
 pub mod logout;
 pub mod markers;
 pub mod profiles;

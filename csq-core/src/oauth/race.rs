@@ -44,8 +44,8 @@
 
 use crate::error::OAuthError;
 use crate::oauth::constants::PASTE_CODE_REDIRECT_URI;
-use crate::oauth::login::{build_auth_url, build_loopback_url};
-use crate::oauth::loopback::{CallbackParams, LoopbackListener};
+use crate::oauth::login::build_auth_url;
+use crate::oauth::loopback::{generate_path_secret, CallbackParams, LoopbackListener};
 use crate::oauth::pkce::{challenge_from_verifier, generate_verifier, CodeVerifier};
 use crate::oauth::state_store::OAuthStateStore;
 use crate::types::AccountNum;
@@ -174,6 +174,12 @@ pub struct RacePreparation {
     /// recompute SHA256.
     #[allow(dead_code)]
     pub(crate) challenge_str: String,
+    /// The full loopback redirect URI used in `auto_url`. Stored so
+    /// `drive_race` can pass it verbatim to `exchange_code` (PKCE
+    /// binds the issued code to the original redirect_uri, so the
+    /// exchange MUST match byte-for-byte). Includes the per-race
+    /// `/callback/<path_secret>` path.
+    pub(crate) loopback_redirect: String,
 }
 
 /// Two-phase split of [`race_login`] so the CLI can:
@@ -185,12 +191,26 @@ pub struct RacePreparation {
 /// Splitting the bind from the accept lets the CLI surface a
 /// useful error early ("port refused / sandbox forbids loopback")
 /// without entering the long-running race.
+///
+/// # Path-secret minting (SEC-R1-01)
+///
+/// A fresh 16-byte URL-safe base64 secret is minted per call and
+/// embedded in the loopback redirect URI as
+/// `http://127.0.0.1:<port>/callback/<path_secret>`. The listener
+/// only accepts requests on that exact path (combined with a
+/// matching `Host:` header). A same-host attacker who scrapes the
+/// auto URL (e.g., from a tauri event) gets the secret too — the
+/// secret alone is not the security boundary; combined with the
+/// Host check and the local single-use state token it raises the
+/// bar against cross-origin browser fetches.
 pub async fn prepare_race(
     state_store: &OAuthStateStore,
     account: AccountNum,
 ) -> Result<RacePreparation, OAuthError> {
-    let listener = LoopbackListener::bind().await?;
+    let path_secret = generate_path_secret();
+    let listener = LoopbackListener::bind(path_secret.clone()).await?;
     let port = listener.port;
+    let callback_path = listener.callback_path();
 
     let verifier = generate_verifier();
     let challenge = challenge_from_verifier(&verifier);
@@ -200,9 +220,13 @@ pub async fn prepare_race(
     // removes it on the winning path. Both copies wrap the same
     // SecretString contents but are zeroized independently on
     // drop.
-    let state = state_store.insert(verifier.clone(), account);
+    //
+    // If the store is at capacity, propagate the error directly
+    // (UX-R1-L2). The orchestrator never silently drops a request.
+    let state = state_store.insert(verifier.clone(), account)?;
 
-    let auto_url = build_loopback_url(&state, &challenge, port);
+    let loopback_redirect = format!("http://127.0.0.1:{port}{callback_path}");
+    let auto_url = build_auth_url(&state, &challenge, &loopback_redirect);
     let manual_url = build_auth_url(&state, &challenge, PASTE_CODE_REDIRECT_URI);
 
     Ok(RacePreparation {
@@ -212,6 +236,7 @@ pub async fn prepare_race(
         state,
         verifier,
         challenge_str: challenge.as_str().to_string(),
+        loopback_redirect,
     })
 }
 
@@ -240,9 +265,8 @@ pub async fn drive_race(
         state,
         verifier,
         challenge_str: _,
+        loopback_redirect: auto_redirect,
     } = prep;
-    let port = listener.port;
-    let auto_redirect = format!("http://127.0.0.1:{port}/callback");
 
     let race = async {
         let listener_fut = listener.accept_one();
@@ -381,18 +405,6 @@ mod tests {
         Box::new(move || Box::pin(async move { Ok(value) }))
     }
 
-    /// Mock paste resolver that resolves with the configured
-    /// pasted value AFTER a short delay. Lets the loopback test
-    /// reliably hit "loopback resolves first" on slow CI.
-    fn paste_returns_delayed(value: String, delay: Duration) -> PasteResolver {
-        Box::new(move || {
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                Ok(value)
-            })
-        })
-    }
-
     /// Drop sentinel — flips an `AtomicBool` true on drop. Used to
     /// prove the paste resolver future is cancelled when loopback
     /// wins.
@@ -404,10 +416,18 @@ mod tests {
     }
 
     /// Sends the loopback callback to the bound port. Spawned by
-    /// the loopback-wins tests after the race has started.
-    async fn fire_loopback_callback(port: u16, code: &str, state: &str) {
-        let request =
-            format!("GET /callback?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    /// the loopback-wins tests after the race has started. Caller
+    /// passes the callback path (including the per-race secret)
+    /// returned by `prep.listener.callback_path()`.
+    async fn fire_loopback_callback(
+        port: u16,
+        callback_path: &str,
+        code: &str,
+        state: &str,
+    ) {
+        let request = format!(
+            "GET {callback_path}?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        );
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect to loopback");
@@ -422,14 +442,17 @@ mod tests {
         let prep = prepare_race(&store, acct(1)).await.unwrap();
         let port = prep.listener.port;
         let state = prep.state.clone();
+        let callback_path = prep.listener.callback_path();
+        let expected_redirect = format!("http://127.0.0.1:{port}{callback_path}");
 
         // Fire the loopback callback after the race starts. The
         // paste resolver never resolves, so loopback must win.
         let cb_port = port;
         let cb_state = state.clone();
+        let cb_path = callback_path.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            fire_loopback_callback(cb_port, "loopback-code", &cb_state).await;
+            fire_loopback_callback(cb_port, &cb_path, "loopback-code", &cb_state).await;
         });
 
         let result = drive_race(prep, &store, never_resolves(), Duration::from_secs(5))
@@ -439,7 +462,7 @@ mod tests {
         match result.winner {
             RaceWinner::Loopback { code, redirect_uri } => {
                 assert_eq!(code, "loopback-code");
-                assert_eq!(redirect_uri, format!("http://127.0.0.1:{port}/callback"));
+                assert_eq!(redirect_uri, expected_redirect);
             }
             other => panic!("expected Loopback, got {other:?}"),
         }
@@ -583,8 +606,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            auto.contains(&format!("http%3A%2F%2F127.0.0.1%3A{port}%2Fcallback")),
-            "auto_url should contain the loopback redirect (encoded): {auto}"
+            auto.contains(&format!("http%3A%2F%2F127.0.0.1%3A{port}%2Fcallback%2F")),
+            "auto_url should contain the loopback redirect (encoded, with /callback/ prefix): {auto}"
         );
         assert!(
             manual.contains("platform.claude.com%2Foauth%2Fcode%2Fcallback"),
@@ -622,9 +645,10 @@ mod tests {
 
         let cb_port = port;
         let cb_state = state.clone();
+        let cb_path = prep.listener.callback_path();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            fire_loopback_callback(cb_port, "loopback-wins", &cb_state).await;
+            fire_loopback_callback(cb_port, &cb_path, "loopback-wins", &cb_state).await;
         });
 
         let result = drive_race(prep, &store, resolver, Duration::from_secs(5))
@@ -642,6 +666,10 @@ mod tests {
 
     #[tokio::test]
     async fn race_paste_winner_releases_loopback_port() {
+        // L9 (UX-R1-L5): use paste_returns(...) — immediate — rather
+        // than a wall-clock-coupled paste_returns_delayed. Race
+        // ordering does the work: the loopback listener never
+        // receives a connection, so paste wins by default.
         let store = Arc::new(OAuthStateStore::new());
         let prep = prepare_race(&store, acct(9)).await.unwrap();
         let port = prep.listener.port;
@@ -650,7 +678,7 @@ mod tests {
         let _ = drive_race(
             prep,
             &store,
-            paste_returns_delayed(format!("c#{state}"), Duration::from_millis(20)),
+            paste_returns(format!("c#{state}")),
             Duration::from_secs(5),
         )
         .await
@@ -719,5 +747,61 @@ mod tests {
             split_paste_value("code#"),
             Err(OAuthError::Exchange(_))
         ));
+    }
+
+    // ── HIGH 1 (SEC-R1-01) regression tests ─────────────────────
+
+    #[tokio::test]
+    async fn race_uses_random_path_secret_per_invocation() {
+        // Two consecutive races must mint distinct path secrets.
+        // Same-host attacker who scrapes one race's auto URL cannot
+        // pre-compute or reuse the secret for the next race.
+        let store_a = Arc::new(OAuthStateStore::new());
+        let store_b = Arc::new(OAuthStateStore::new());
+        let prep_a = prepare_race(&store_a, acct(1)).await.unwrap();
+        let prep_b = prepare_race(&store_b, acct(1)).await.unwrap();
+        assert_ne!(
+            prep_a.listener.callback_path(),
+            prep_b.listener.callback_path(),
+            "two races must mint distinct path secrets"
+        );
+    }
+
+    #[tokio::test]
+    async fn race_url_includes_path_secret_in_redirect_uri() {
+        // The auto URL must include the per-race path secret in the
+        // loopback redirect URI. Without it the listener has no way
+        // to distinguish a legitimate browser callback from a
+        // cooperating same-host attacker who guessed `/callback`.
+        let store = Arc::new(OAuthStateStore::new());
+        let prep = prepare_race(&store, acct(2)).await.unwrap();
+
+        let callback_path = prep.listener.callback_path();
+        // Sanity: the callback path is `/callback/<22-char-base64url>`
+        // — the leading prefix and a non-trivial suffix.
+        assert!(callback_path.starts_with("/callback/"));
+        assert!(
+            callback_path.len() > "/callback/".len(),
+            "callback_path must include the path secret: {callback_path}"
+        );
+
+        // The encoded callback path appears in the auto URL's
+        // redirect_uri query param. We percent-encode the literal `/`
+        // so the assertion matches the URL-encoded form.
+        let encoded_path = callback_path.replace('/', "%2F");
+        assert!(
+            prep.auto_url.contains(&encoded_path),
+            "auto_url must embed the per-race callback path: auto={}, expected fragment={}",
+            prep.auto_url,
+            encoded_path
+        );
+
+        // The manual URL uses Anthropic's paste-code redirect; it
+        // must NOT include the loopback callback path.
+        assert!(
+            !prep.manual_url.contains(&encoded_path),
+            "manual_url must not include the loopback path: {}",
+            prep.manual_url
+        );
     }
 }

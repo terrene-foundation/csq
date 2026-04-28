@@ -551,6 +551,9 @@ impl OAuthErrorKind for OAuthError {
             OAuthError::StateMismatch => "state_mismatch",
             OAuthError::PkceVerification => "pkce_verification",
             OAuthError::Exchange(_) => "exchange",
+            OAuthError::Cancelled => "cancelled",
+            OAuthError::StoreAtCapacity { .. } => "store_at_capacity",
+            OAuthError::ExchangeTimeout { .. } => "exchange_timeout",
         }
     }
 }
@@ -1621,7 +1624,7 @@ mod tests {
         // Seed one pending entry so we have a valid state token.
         let account = AccountNum::try_from(1u16).unwrap();
         let verifier = crate::oauth::CodeVerifier::new("test-verifier".into());
-        let state_token = store.insert(verifier, account);
+        let state_token = store.insert(verifier, account).unwrap();
         assert_eq!(store.len(), 1);
 
         // First call with a wrong state token — should 400 and

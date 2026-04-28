@@ -103,7 +103,9 @@ pub fn start_login(store: &OAuthStateStore, account: AccountNum) -> Result<Login
 
     let verifier = generate_verifier();
     let challenge = challenge_from_verifier(&verifier);
-    let state = store.insert(verifier, account);
+    let state = store
+        .insert(verifier, account)
+        .map_err(|e| CsqError::OAuth(e))?;
     let auth_url = build_auth_url(&state, &challenge, PASTE_CODE_REDIRECT_URI);
 
     Ok(LoginRequest {

@@ -176,7 +176,9 @@ impl LoopbackListener {
         })?;
         let port = listener
             .local_addr()
-            .map_err(|e| OAuthError::Exchange(redact_tokens(&format!("loopback addr failed: {e}"))))?
+            .map_err(|e| {
+                OAuthError::Exchange(redact_tokens(&format!("loopback addr failed: {e}")))
+            })?
             .port();
         Ok(Self {
             listener,
@@ -216,8 +218,7 @@ impl LoopbackListener {
         let expected_path = format!("/callback/{path_secret}");
         let expected_host = format!("127.0.0.1:{port}");
 
-        let (capture_tx, mut capture_rx) =
-            tokio::sync::mpsc::unbounded_channel::<CallbackParams>();
+        let (capture_tx, mut capture_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackParams>();
 
         loop {
             tokio::select! {
@@ -599,9 +600,7 @@ mod tests {
         let port = listener.port;
         let server = tokio::spawn(listener.accept_one());
 
-        let req = format!(
-            "GET /callback/{TEST_PATH_SECRET}?code=ABC&state=XYZ HTTP/1.1\r\n\r\n"
-        );
+        let req = format!("GET /callback/{TEST_PATH_SECRET}?code=ABC&state=XYZ HTTP/1.1\r\n\r\n");
         let resp = send_raw(port, req.as_bytes()).await;
         assert_eq!(status_code(&resp), Some(400));
 
@@ -842,7 +841,10 @@ mod tests {
         let listener = LoopbackListener::bind(TEST_PATH_SECRET.into())
             .await
             .unwrap();
-        assert_eq!(listener.callback_path(), format!("/callback/{TEST_PATH_SECRET}"));
+        assert_eq!(
+            listener.callback_path(),
+            format!("/callback/{TEST_PATH_SECRET}")
+        );
     }
 
     #[tokio::test]

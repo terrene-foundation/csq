@@ -419,12 +419,7 @@ mod tests {
     /// the loopback-wins tests after the race has started. Caller
     /// passes the callback path (including the per-race secret)
     /// returned by `prep.listener.callback_path()`.
-    async fn fire_loopback_callback(
-        port: u16,
-        callback_path: &str,
-        code: &str,
-        state: &str,
-    ) {
+    async fn fire_loopback_callback(port: u16, callback_path: &str, code: &str, state: &str) {
         let request = format!(
             "GET {callback_path}?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
         );

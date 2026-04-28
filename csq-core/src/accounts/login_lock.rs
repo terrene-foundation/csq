@@ -47,13 +47,10 @@ pub enum AcquireOutcome {
 impl std::fmt::Debug for AcquireOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcquireOutcome::Acquired(g) => f
-                .debug_struct("Acquired")
-                .field("path", &g.path)
-                .finish(),
-            AcquireOutcome::Held { pid } => {
-                f.debug_struct("Held").field("pid", pid).finish()
+            AcquireOutcome::Acquired(g) => {
+                f.debug_struct("Acquired").field("path", &g.path).finish()
             }
+            AcquireOutcome::Held { pid } => f.debug_struct("Held").field("pid", pid).finish(),
         }
     }
 }
@@ -175,8 +172,7 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<LockResult> {
         let err = std::io::Error::last_os_error();
         // EWOULDBLOCK / EAGAIN means another process holds the
         // lock. Anything else is a real error.
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK)
-            || err.raw_os_error() == Some(libc::EAGAIN)
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN)
         {
             Ok(LockResult::WouldBlock)
         } else {
@@ -188,7 +184,7 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<LockResult> {
 #[cfg(windows)]
 fn try_lock_exclusive(file: &File) -> std::io::Result<LockResult> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_IO_PENDING};
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{
         LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
     };

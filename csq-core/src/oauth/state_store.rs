@@ -437,7 +437,9 @@ mod tests {
     #[test]
     fn pending_state_debug_does_not_leak_verifier() {
         let store = OAuthStateStore::new();
-        let state = store.insert(verifier("secret-verifier-bytes"), account(1)).unwrap();
+        let state = store
+            .insert(verifier("secret-verifier-bytes"), account(1))
+            .unwrap();
         let pending = store.consume(&state).unwrap();
         let dbg = format!("{pending:?}");
         assert!(

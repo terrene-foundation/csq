@@ -232,12 +232,7 @@ async fn run_race_with_browser(account: AccountNum) -> Result<RaceOutcome> {
     // process kill. Race the orchestrator against `signal::ctrl_c`;
     // on Ctrl-C, drop the orchestrator (which closes the loopback
     // port and aborts the stdin read) and return UserCancelled.
-    let race_fut = oauth::drive_race(
-        prep,
-        &store,
-        paste_resolver,
-        oauth::DEFAULT_OVERALL_TIMEOUT,
-    );
+    let race_fut = oauth::drive_race(prep, &store, paste_resolver, oauth::DEFAULT_OVERALL_TIMEOUT);
 
     tokio::select! {
         race_res = race_fut => {

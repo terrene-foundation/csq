@@ -69,8 +69,7 @@ pub use login::{
     build_auth_url, build_loopback_url, start_login, start_login_default_port, LoginRequest,
 };
 pub use loopback::{
-    generate_path_secret, CallbackParams, LoopbackListener, PATH_SECRET_BYTES,
-    SUCCESS_REDIRECT_URL,
+    generate_path_secret, CallbackParams, LoopbackListener, PATH_SECRET_BYTES, SUCCESS_REDIRECT_URL,
 };
 pub use pkce::{challenge_from_verifier, generate_verifier, CodeChallenge, CodeVerifier};
 pub use race::{

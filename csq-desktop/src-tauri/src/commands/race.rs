@@ -47,8 +47,10 @@
 //!   Account modal — concurrent logins make no UX sense and would
 //!   compete for the loopback port.
 
+use crate::AppState;
 use csq_core::credentials;
-use csq_core::oauth::race::{race_login, RaceConfig, RaceWinner};
+use csq_core::error::OAuthError;
+use csq_core::oauth::race::{drive_race, prepare_race, RaceWinner, DEFAULT_OVERALL_TIMEOUT};
 use csq_core::types::AccountNum;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -184,15 +186,14 @@ struct ErrorPayload {
 /// Starts a parallel-race OAuth login for the given account slot.
 ///
 /// Spawns the orchestrator on a tokio task, registers it in
-/// `RaceLoginState`, and returns immediately. The orchestrator drives
-/// the browser-open + 3 s manual-URL delay + loopback-vs-paste race
-/// internally and emits Tauri events at each transition (see module
-/// docs for the event vocabulary).
+/// `RaceLoginState`, and returns immediately. The orchestrator
+/// emits Tauri events at each transition (see module docs for the
+/// event vocabulary).
 ///
 /// The frontend MUST subscribe to the `claude-login-*` events BEFORE
 /// invoking this command — otherwise a fast race (loopback fires
 /// before the listener registers) drops the first event. See the
-/// AddAccountModal `runRaceLogin` function for the correct ordering.
+/// AddAccountModal `startClaudeOAuth` function for the correct ordering.
 ///
 /// # Errors
 ///
@@ -205,55 +206,87 @@ struct ErrorPayload {
 #[tauri::command]
 pub async fn start_claude_login_race(
     app: AppHandle,
-    state: State<'_, RaceLoginState>,
+    race_state: State<'_, RaceLoginState>,
+    app_state: State<'_, AppState>,
     base_dir: String,
     account: u16,
 ) -> Result<(), String> {
-    let account_num =
-        AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
     let base = PathBuf::from(&base_dir);
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
 
-    // The race orchestrator owns:
-    //   - loopback listener bound at race construction time
-    //   - browser-open task (handled by Tauri opener plugin from the FE)
-    //   - 3-second manual-URL delay timer
-    //   - paste resolver (oneshot::Receiver passed in via RaceConfig)
+    // Two-phase race: prepare binds the loopback listener and mints
+    // the URLs SYNCHRONOUSLY (microseconds), then drive blocks on
+    // the actual user interaction. Splitting them lets us emit the
+    // URLs IMMEDIATELY so the frontend can open the browser and
+    // start its 3-second manual-URL display timer while the race is
+    // still waiting on the first callback.
     //
-    // We pre-build the paste channel here so the sender lives in
-    // RaceLoginState; the receiver moves into RaceConfig.
-    let (paste_tx, paste_rx) = oneshot::channel::<String>();
+    // The alternative (calling the convenience `race_login` wrapper)
+    // would force us to delay browser-opening until AFTER the race
+    // resolves — exactly the wrong UX, since the race resolves on
+    // the user's authorize click in the browser we haven't opened yet.
+    let prep = prepare_race(&app_state.oauth_store, account_num)
+        .await
+        .map_err(|e| format!("race init failed: {e}"))?;
+    let auto_url = prep.auto_url.clone();
+    let manual_url = prep.manual_url.clone();
 
-    let cfg = RaceConfig {
-        account: account_num,
-        paste_resolver: paste_rx,
-        manual_url_delay: MANUAL_URL_DELAY,
-    };
+    // Emit browser-opening synchronously from the command thread so
+    // the frontend has the URL by the time we return Ok(). The
+    // frontend opens the browser in its event handler — we MUST NOT
+    // open it from here (Tauri's openUrl plugin lives on the JS
+    // side; opening from Rust would route through `tauri::shell` /
+    // `opener` plugin which isn't initialised on the backend).
+    emit_browser_opening(&app, &auto_url);
+
+    // Set up the paste channel. The sender lives in RaceLoginState
+    // (reachable from submit_paste_code); the receiver is consumed
+    // by the resolver closure on its single invocation by drive_race.
+    let (paste_tx, paste_rx) = oneshot::channel::<String>();
+    let paste_resolver: csq_core::oauth::race::PasteResolver = Box::new(move || {
+        Box::pin(async move {
+            // Map oneshot's Cancelled (sender dropped — i.e., user
+            // closed the modal mid-race) to OAuthError::Exchange so
+            // drive_race terminates with a recoverable error rather
+            // than panicking.
+            paste_rx
+                .await
+                .map_err(|_| OAuthError::Exchange("paste channel closed".to_string()))
+        })
+    });
 
     let app_handle = app.clone();
     let base_clone = base.clone();
+    let store_clone = app_state.oauth_store.clone();
+    let manual_url_for_delay = manual_url.clone();
+
     // Use tokio::spawn (NOT tauri::async_runtime::spawn) so the
     // JoinHandle type matches the field on RaceSlot. Both runtimes
     // are tokio under the hood, but tauri's wrapper hides the abort
     // primitives our cancel path needs.
     let task = tokio::spawn(async move {
-        // Race init returns the immediate URLs (auto + manual) so the
-        // frontend can open the browser. The race body then waits for
-        // either path to converge.
-        match race_login(cfg).await {
+        // Spawn a parallel timer for the 3 s manual-URL emission.
+        // CC's `setShowPastePrompt(true)` fires 3 s after the auth
+        // URL surfaces; mirror that exactly so users on broken
+        // browsers see the paste prompt without the race needing to
+        // resolve first.
+        //
+        // The timer task is independent of the race body — if the
+        // race resolves before the 3 s elapses (loopback fast path),
+        // the manual-URL event still fires and the frontend's state
+        // machine ignores it because it's already past `claude-race-
+        // active`. The wasted emit costs nothing.
+        let manual_url_app = app_handle.clone();
+        let _delay_handle = tokio::spawn(async move {
+            tokio::time::sleep(MANUAL_URL_DELAY).await;
+            emit_manual_url_ready(&manual_url_app, &manual_url_for_delay);
+        });
+
+        match drive_race(prep, &store_clone, paste_resolver, DEFAULT_OVERALL_TIMEOUT).await {
             Ok(result) => {
-                // Emit the auto URL so the frontend can open it. The
-                // manual URL is sent via a delayed emit handled inside
-                // the orchestrator (see RaceConfig::manual_url_delay).
-                emit_browser_opening(&app_handle, &result.auto_url);
-
-                // Manual URL emission is the orchestrator's responsibility
-                // when the delay elapses; we hold a copy here for the
-                // resolved/success payload composition only.
-                emit_manual_url_ready(&app_handle, &result.manual_url);
-
                 let via = match &result.winner {
                     RaceWinner::Loopback { .. } => "loopback",
                     RaceWinner::Paste { .. } => "paste",
@@ -285,7 +318,7 @@ pub async fn start_claude_login_race(
         }
     });
 
-    state.install(RaceSlot {
+    race_state.install(RaceSlot {
         account: account_num.get(),
         task,
         paste_tx: Some(paste_tx),
@@ -319,8 +352,7 @@ pub fn submit_paste_code(
     account: u16,
     code: String,
 ) -> Result<(), String> {
-    let account_num =
-        AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
 
     // Same trim semantics as `submit_oauth_code`: strip whitespace
     // and Windows CR. Codes can contain `#` so we MUST NOT split at
@@ -350,10 +382,7 @@ pub fn submit_paste_code(
 /// Emits `claude-login-cancelled` so the modal can transition out
 /// of any in-progress state.
 #[tauri::command]
-pub fn cancel_race_login(
-    app: AppHandle,
-    state: State<'_, RaceLoginState>,
-) -> Result<(), String> {
+pub fn cancel_race_login(app: AppHandle, state: State<'_, RaceLoginState>) -> Result<(), String> {
     let cancelled = state.cancel();
     if cancelled {
         // Only emit the cancellation event if there actually was a
@@ -436,7 +465,7 @@ async fn finalize_login(
     // Read the email back from profiles.json (populated by
     // finalize_login above). Falling back to "unknown" if the file
     // isn't readable — the user can rename later from the dashboard.
-    let email = read_email_for(&base.to_path_buf(), account).unwrap_or_else(|| "unknown".into());
+    let email = read_email_for(base, account).unwrap_or_else(|| "unknown".into());
     Ok(email)
 }
 
@@ -560,7 +589,23 @@ mod tests {
         let (slot2, _rx2) = synth_slot(2);
         state.install(slot2);
 
-        // The first task must be aborted by install().
+        // `abort()` schedules cancellation but doesn't synchronously
+        // wait for the task to be reaped. Yield once to let the
+        // scheduler run the abort, then assert the task is finished.
+        // Without this, `is_finished()` races the abort and we get a
+        // false negative on a busy CI runner.
+        tokio::task::yield_now().await;
+        // Belt-and-braces: a single yield is enough on a single-thread
+        // runtime, but a multi-thread tokio runtime can require a
+        // brief sleep before the abort signal is observed by the
+        // pending future. 10 ms is well under any test-timeout floor
+        // and orders of magnitude longer than scheduler latency.
+        for _ in 0..50 {
+            if task1_handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         assert!(
             task1_handle.is_finished(),
             "prior race task must be aborted when a new race installs"
@@ -602,7 +647,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_returns_false_when_no_race() {
         let state = RaceLoginState::default();
-        assert!(!state.cancel(), "cancel with no active race must return false");
+        assert!(
+            !state.cancel(),
+            "cancel with no active race must return false"
+        );
     }
 
     #[tokio::test]

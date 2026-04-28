@@ -910,9 +910,13 @@ pub fn run() {
             commands::start_claude_login,
             // Parallel-race OAuth (CC's reference UX): loopback callback
             // and paste prompt converge on the same token exchange.
-            commands::start_claude_login_race,
-            commands::submit_paste_code,
-            commands::cancel_race_login,
+            // Uses full paths because Tauri's `generate_handler!` macro
+            // looks up `__cmd__<name>` siblings of the function, and a
+            // `pub use` re-export in commands/mod.rs does not re-export
+            // those macro-generated siblings.
+            commands::race::start_claude_login_race,
+            commands::race::submit_paste_code,
+            commands::race::cancel_race_login,
             commands::set_provider_key,
             commands::bind_keyless_provider,
             commands::list_ollama_models,

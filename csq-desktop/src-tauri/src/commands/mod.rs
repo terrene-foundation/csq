@@ -1,7 +1,5 @@
 pub mod race;
-pub use race::{
-    cancel_race_login, start_claude_login_race, submit_paste_code, RaceLoginState,
-};
+pub use race::RaceLoginState;
 
 use crate::{AppState, CachedUpdateInfo};
 use csq_core::accounts::discovery;

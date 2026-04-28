@@ -1,41 +1,50 @@
-# Session Notes — 2026-04-23 — PR-C8 shipped (v2.1 Codex chain desktop-complete)
+# Session Notes — 2026-04-28
 
-PR-C8 (desktop Codex UI) complete. With PR-C5/C6/C7 already merged earlier in the day, v2.1 Codex-surface is fully user-facing across CLI + desktop. Only PR-C9 redteam + release notes remain before v2.1.0 cut.
-
-Workspace tests 1123 → 1178 (+55). Vitest 94 → 100 (+6). Clippy + fmt clean. svelte-check 0 errors / 0 warnings.
+Wrap of the OAuth-race + E2E-harness + commands-sync + sweep cycle. Next session begins Phase 1 of csq evolution.
 
 ## Read These Files First (in order)
 
-1. `workspaces/codex/journal/0020-DECISION-pr-c8-desktop-codex-ui.md` — full decision record + alternatives + For Discussion items + residual-risk resolutions (R1-R4).
-2. `workspaces/codex/02-plans/01-implementation-plan.md` §PR-C9a/b/c — the remaining redteam rounds + release notes.
-3. `specs/07-provider-surface-dispatch.md` §7.3.3 (Codex login sequence), §7.5 invariants — PR-C8 implements the desktop half of §7.3.3.
-4. `csq-core/src/providers/codex/{tos,models,desktop_login}.rs` — the three new modules backing PR-C8.
-5. `csq-desktop/src-tauri/src/commands.rs` — five new Tauri commands (start_codex_login, complete_codex_login, list_codex_models, acknowledge_codex_tos, set_codex_slot_model).
-6. `csq-desktop/src/lib/components/{AddAccountModal,ChangeModelModal,AccountList}.svelte` — frontend additions (ToS disclosure, Codex picker, surface badge).
+1. `workspaces/csq-v2/journal/0074-DECISION-csq-as-cli-phase-1-and-2-architecture.md` — the Phase 1 + Phase 2a/2b roadmap with corrected framing (csq is NOT a distribution vehicle)
+2. `~/.claude/accounts/term-4164/projects/-Users-esperie-repos-terrene-contrib-csq/memory/project_csq_loom_relationship.md` — auto-memory companion to journal 0074
+3. `SWEEP-2026-04-28.md` — current repo state audit (post-cleanup: 0 orphans)
+4. `~/repos/loom/.claude/test-harness/` — Phase 1 source: 3 suites × 3 CLIs × 7 fixtures, 18 tests, JSONL output
+5. `~/repos/loom/workspaces/multi-cli-coc/04-validate/26-CONVERGED.md` — converged multi-CLI COC spec (6 redteam rounds)
+6. `coc-eval/runner.py` — csq's current Claude-only harness; Phase 1 extends this to 3 CLIs
 
 ## Accomplished
 
-- **PR-C8** (this PR) — desktop Codex UI. Three new csq-core modules (tos + models + desktop_login), five new Tauri commands, four new Svelte panels (codex-tos, codex-keychain-prompt, codex-running in AddAccountModal; codex-picker in ChangeModelModal), surface badge in AccountList. +55 Rust tests + 6 Vitest tests. All zero-tolerance residuals (R1-R4) resolved in-session.
-- Prior three PRs (PR-C5 #176, PR-C6 #177, PR-C7 #178) already merged earlier in the day.
+- **PR #213** — OAuth parallel-race login flow (CC-style seamless + paste-back). 4 redteam rounds to convergence. Loopback HTTP listener + race orchestrator + per-account flock + Tauri bridge.
+- **PR #214** — E2E test harness for the race (20 tests, 0.31s, mutation-verified). Replaces smoke-test gate.
+- **PR #215** — 5 commands ported from loom: `/sweep`, `/autonomize`, `/test`, `/validate`, `/release`. csq commands 14 → 19.
+- **csq-v2 milestone closeout** (commit `d21f960`) — 12/14 milestones moved to `completed/`. Only M11 (packaging) remains active with 5 external-blocker items.
+- **CLOSEOUT journal entry type added** (commit `7598613`) — 7th type for marking workspace convergence.
+- **Repo hygiene cleanup** — 1 orphan worktree force-removed, 2 orphan remote branches deleted, 3 stale tracking refs pruned. Only `origin/main` remains.
 
 ## Outstanding
 
-- [ ] **Admin-merge PR-C8** once CI confirms 6/6 green.
-- [ ] **PR-C9a/b/c** — redteam rounds + release notes (next session).
-- [ ] **INV-P05 spec amendment** — journal 0019 Q1 proposes "Same-surface ClaudeCode repoints; Codex always exec-replaces." Still needs user approval before editing `specs/07-provider-surface-dispatch.md`.
-- [ ] **Follow-up PR-C3c M1** — move `verify_codex_canonical_is_regular_file` from CLI into `create_handle_dir_codex` so desktop inherits it.
-- [ ] **Operational** — `rm -rf "/Applications/Code Session Quota.app.alpha.4.bak"` + `rm -rf ~/.codex.bak-1776836710/`.
+- [ ] **Phase 1 — multi-CLI test harness consolidation** (next major work). Spawn `workspaces/coc-harness-unification/` via `/analyze`. Port loom's `.claude/test-harness/lib/harness.mjs`, `suites/{capability,compliance,safety}.mjs`, `fixtures/{baseline-cc,baseline-codex,baseline-gemini,pathscoped,compliance,safety,subagent}/` into csq. Adapt csq's `coc-eval/runner.py:458-473` to dispatch via per-CLI launcher table. Use `kailash-coc-py` (CLI-agnostic) as fixture template, not `kailash-coc-claude-py`.
+- [ ] **Phase 2a + 2b — capability layer** (after Phase 1). Open `workspaces/coc-cli-phase2/`. See journal 0074 §"Open decisions" for unified-format and capability-layer-mechanism choices.
+- [ ] **Spec drafts**: `specs/08-coc-eval-harness.md` (Phase 1), `specs/09-unified-coc-artifact-standard.md` + `specs/10-coc-model-capability-layer.md` (Phase 2)
+- [ ] **csq-v2 M11 packaging** — 5 outstanding items in `workspaces/csq-v2/todos/active/M11-packaging.md` (Apple/Microsoft signing, Homebrew tap, Scoop manifest, manual smoke). All external-blocker, not code work.
+- [ ] **Loom-csq symbiotic boundary rule** — paired rule needed in BOTH repos defining who owns what. Draft as `csq/.claude/rules/csq-loom-boundary.md` + mirror in `loom/.claude/rules/loom-csq-boundary.md`.
 
-## Oversight — Verify Before Starting (Next Session)
+## Oversight — Verify Before Starting
 
-- [ ] `git log --oneline -4` — HEAD should be the PR-C8 merge.
-- [ ] `cargo test --workspace` — 1178 passing, 0 failing.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- [ ] `grep -rn 'pub fn start_codex_login' csq-desktop/` — command present.
-- [ ] `grep -n 'surface-badge' csq-desktop/src/lib/components/AccountList.svelte` — badge present.
+- [ ] `git -C ~/repos/terrene/contrib/csq status && git log -1 --oneline` — expect clean tree at `7598613` (or later if other sessions landed work)
+- [ ] `gh pr list --repo terrene-foundation/csq` — expect 0 open
+- [ ] `cargo test --workspace` and `cd csq-desktop && npx vitest run` — confirm green baseline before Phase 1 changes
+- [ ] If `cargo build` hits "could not acquire lock /Users/esperie/.pyenv/shims/.pyenv-shim": `rm -f ~/.pyenv/shims/.pyenv-shim` (recurring stale lock per session memory)
+- [ ] Read journal 0074 BEFORE proposing Phase 2 architecture — corrected framing matters (NOT distribution vehicle)
+
+## Oversight — Verify After Completing
+
+- [ ] `/validate` passes (cargo check + clippy + fmt + tests + svelte-check + vitest + stub scan)
+- [ ] Mutation testing on any new test code (proven approach from PR #214)
+- [ ] PR merged with `gh pr merge <N> --admin --merge --delete-branch` — the `--delete-branch` flag avoids the leftover-remote-branch pattern surfaced in this sweep
+- [ ] If Phase 1 work, run `/sweep` to verify no new orphans
 
 ## Blockers
 
-- **Apple Developer cert** (L1), **Windows EV cert** (L3) — unchanged, not PR-C8 blockers.
-- **Codex test account** — end-to-end device-code validation on real codex-cli will require a fresh `codex login` cycle (device-code flows are one-shot); deferred to PR-C9 redteam.
-- **Cross-surface swap on Windows** — platform follow-up (needs Win32 JobObjects); out of PR-C8 scope (tracked as known limitation in journal 0019).
+- **Phase 1**: none. Loom harness is the reference; tasks are mechanical port + adapt.
+- **Phase 2a**: capability-layer mechanism choice (recommendation in journal 0074 §3) — user decision needed before `/todos`.
+- **Phase 2b**: API key strategy for OpenAI/Google — user dependency.

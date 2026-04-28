@@ -493,6 +493,13 @@
   /// `start_claude_login_race` and required by `cancel_race_login`.
   /// Captured here so the cancel call site can thread it through.
   /// Cleared on race completion / cancellation.
+  // R3-L2 / round-4 redteam: MUST untrack writes if this state is
+  // both READ and WRITTEN inside any future $effect — see
+  // svelte-patterns.md Rule 5. The current call sites only assign
+  // from event handlers (no surrounding $effect), so untrack is not
+  // needed today; this note exists so a future "react to race
+  // token" effect doesn't trip the alpha.21 ChangeModelModal hang
+  // pattern (journal 0061).
   let activeRaceToken = $state<string | null>(null);
 
   /// Backend response shape for `start_claude_login_race`.

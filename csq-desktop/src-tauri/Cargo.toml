@@ -41,3 +41,10 @@ tauri-plugin-dialog = "2"
 [dev-dependencies]
 tempfile.workspace = true
 csq-core = { path = "../../csq-core", features = ["secret-in-memory"] }
+# R3-L3 / round-4 redteam: enables `tauri::test::mock_app` and the
+# `MockRuntime` so the bridge can exercise `emit_to(...)` against a
+# stale window label and assert the credential persistence path is
+# not coupled to event delivery. The `test` feature is a Tauri-level
+# opt-in and adds NO runtime surface to the production binary
+# because the dependency is dev-only.
+tauri = { version = "2.10.3", features = ["tray-icon", "image-png", "test"] }

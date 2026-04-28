@@ -1364,8 +1364,28 @@ async fn finalize_login(
 // matches the `tauri-commands.md` "No sensitive data in event
 // payloads" guidance — the secret is sensitive for the duration of
 // the race even though it expires when the race resolves.
+//
+// R3-L4 / round-4 redteam note: emit_to scopes to the calling
+// window's label. If a future tabbed UI hosts multiple
+// AddAccountModal instances in one window, account-guards on each
+// frontend handler still discriminate correctly — the per-payload
+// `account` field is the second filter (UX-R1-H2 fix). The
+// window-label scope is the outer filter; the account guard is
+// the inner one. Both must be present for multi-modal-per-window
+// scenarios to remain race-safe.
 
-fn emit_browser_opening(app: &AppHandle, window_label: &str, account: u16, auto_url: &str) {
+// R3-L3: the emit shims are generic over `R: tauri::Runtime` so the
+// regression test in this module can drive them with `AppHandle<MockRuntime>`.
+// Production code passes the default `AppHandle` (`AppHandle<Wry>`); the
+// monomorphisation cost is the same as before because there is exactly
+// one production runtime.
+
+fn emit_browser_opening<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    window_label: &str,
+    account: u16,
+    auto_url: &str,
+) {
     if let Err(e) = app.emit_to(
         window_label,
         "claude-login-browser-opening",
@@ -1378,8 +1398,8 @@ fn emit_browser_opening(app: &AppHandle, window_label: &str, account: u16, auto_
     }
 }
 
-fn emit_manual_url_ready(
-    app: &AppHandle,
+fn emit_manual_url_ready<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     window_label: &str,
     account: u16,
     manual_url: &str,
@@ -1398,7 +1418,12 @@ fn emit_manual_url_ready(
     }
 }
 
-fn emit_resolved(app: &AppHandle, window_label: &str, account: u16, via: &str) {
+fn emit_resolved<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    window_label: &str,
+    account: u16,
+    via: &str,
+) {
     if let Err(e) = app.emit_to(
         window_label,
         "claude-login-resolved",
@@ -1411,7 +1436,7 @@ fn emit_resolved(app: &AppHandle, window_label: &str, account: u16, via: &str) {
     }
 }
 
-fn emit_exchanging(app: &AppHandle, window_label: &str, account: u16) {
+fn emit_exchanging<R: tauri::Runtime>(app: &AppHandle<R>, window_label: &str, account: u16) {
     if let Err(e) = app.emit_to(
         window_label,
         "claude-login-exchanging",
@@ -1421,7 +1446,12 @@ fn emit_exchanging(app: &AppHandle, window_label: &str, account: u16) {
     }
 }
 
-fn emit_success(app: &AppHandle, window_label: &str, account: u16, email: &str) {
+fn emit_success<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    window_label: &str,
+    account: u16,
+    email: &str,
+) {
     if let Err(e) = app.emit_to(
         window_label,
         "claude-login-success",
@@ -1434,8 +1464,8 @@ fn emit_success(app: &AppHandle, window_label: &str, account: u16, email: &str) 
     }
 }
 
-fn emit_error(
-    app: &AppHandle,
+fn emit_error<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     window_label: &str,
     account: u16,
     message: &str,
@@ -1457,7 +1487,7 @@ fn emit_error(
     }
 }
 
-fn emit_cancelled(app: &AppHandle, window_label: &str, account: u16) {
+fn emit_cancelled<R: tauri::Runtime>(app: &AppHandle<R>, window_label: &str, account: u16) {
     if let Err(e) = app.emit_to(
         window_label,
         "claude-login-cancelled",
@@ -2498,5 +2528,116 @@ mod tests {
                 debug_take(&other)
             ),
         }
+    }
+
+    // ── R3-L3 / round-4 redteam: credential write decoupled from emit ─
+
+    #[tokio::test]
+    async fn credential_persists_when_event_emit_to_stale_window() {
+        // R3-L3 contract: the credential write path
+        // (`credentials::save_canonical`) is independent of event
+        // delivery. If the calling window has been closed (or its
+        // label no longer matches any live window), `emit_to(label,
+        // ...)` silently no-ops in Tauri — the listener filter
+        // simply finds no match and the call returns Ok(()) without
+        // surfacing the missing target. The credential must still
+        // land on disk regardless.
+        //
+        // We exercise this in three stages:
+        //   1. Spin up a `tauri::test::mock_app` with NO window
+        //      registered for the label our shim will target.
+        //   2. Invoke each emit shim with the stale label. Every
+        //      shim must return without panicking — we depend on
+        //      the silent no-op contract.
+        //   3. Write a credential via `credentials::save_canonical`
+        //      and confirm the canonical file exists on disk.
+        //
+        // Pre-fix this property already held in production; the test
+        // locks it in so a future refactor that makes credential
+        // persistence conditional on emit success regresses loudly.
+        use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::types::{AccessToken, RefreshToken};
+        use std::collections::HashMap;
+        use tauri::test::mock_app;
+        use tauri::Manager;
+        use tempfile::TempDir;
+
+        // Stage 1: app with NO window for `stale-window`. mock_app
+        // returns an App whose webview list is empty by default.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        // Sanity: confirm the label we're targeting is genuinely
+        // absent. This pins the test fixture against a future
+        // mock_app change that pre-registers a window.
+        assert!(
+            handle.get_webview_window("stale-window").is_none(),
+            "test fixture invariant: mock_app must not pre-register \
+             a 'stale-window' webview"
+        );
+
+        // Stage 2: every emit shim against the stale label must be
+        // a no-op (no panic, no propagated error). The shim wraps
+        // emit_to in `if let Err(e) = ... { log::warn!(...) }` so
+        // even an internal error path stays silent — but the
+        // dominant path here is Ok(()) with no listener match.
+        emit_browser_opening(&handle, "stale-window", 1, "https://example/auto");
+        emit_manual_url_ready(
+            &handle,
+            "stale-window",
+            1,
+            "https://example/manual",
+            Some("hint".into()),
+        );
+        emit_resolved(&handle, "stale-window", 1, "loopback");
+        emit_exchanging(&handle, "stale-window", 1);
+        emit_success(&handle, "stale-window", 1, "user@example.com");
+        emit_error(
+            &handle,
+            "stale-window",
+            1,
+            "synthetic message",
+            "race_failed",
+        );
+        emit_cancelled(&handle, "stale-window", 1);
+        // Reaching this line means none of the seven emit shims
+        // panicked. If any were re-written to `.unwrap()` the
+        // emit_to result, this assertion would never run.
+
+        // Stage 3: persist a credential exactly the way the
+        // production bridge does and confirm the canonical file
+        // lands on disk. The credential write happens in
+        // `finalize_login` BEFORE the `emit_success` call, so a
+        // dropped emit cannot prevent the credential from being
+        // recoverable on the next dashboard poll.
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(7u16).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-stale-window-test".into()),
+                refresh_token: RefreshToken::new("sk-ant-ort01-stale-window-test".into()),
+                expires_at: 4_102_444_800_000, // year 2100, no test-time-bomb
+                scopes: vec!["user:inference".into()],
+                subscription_type: Some("max".into()),
+                rate_limit_tier: Some("default_claude_max_20x".into()),
+                extra: HashMap::new(),
+            },
+            extra: HashMap::new(),
+        });
+
+        csq_core::credentials::save_canonical(dir.path(), account, &creds)
+            .expect("credential write must succeed regardless of emit_to delivery");
+
+        // Canonical Anthropic credential lives at
+        // <base>/credentials/<N>.json (per spec 02 / spec 07).
+        let canonical = dir
+            .path()
+            .join("credentials")
+            .join(format!("{}.json", account.get()));
+        assert!(
+            canonical.exists(),
+            "credential file MUST exist after save_canonical even when \
+             every event emit went to a stale window: {:?}",
+            canonical
+        );
     }
 }

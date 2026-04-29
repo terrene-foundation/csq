@@ -89,3 +89,59 @@
 ## Risk
 
 Forward-compat semantics mean the schema validator MUST be lenient on unknown fields (`additionalProperties: true` at the right scope) but strict on type/enum violations. Easy to flip the wrong way — test both cases.
+
+## Verification
+
+Closed 2026-04-29 — `/implement` cycle complete. See `journal/0012-DECISION-h4-jsonl-writer-shipped.md` + `journal/0013-RISK-h4-security-review-round1-converged.md`.
+
+**Plan reference:** `02-plans/01-implementation-plan.md` §H4 + `01-analysis/06-jsonl-schema-v1.md`. Every checklist item below maps to a plan paragraph or schema section.
+
+**Build — JSONL writer**
+
+- `coc-eval/lib/jsonl.py::JsonlWriter` — `open(run_id, suite, base_dir, skip_gitignore_check)` + `write_header(...)` + `record_result(record)` + `write_log(...)` + `close()`. MED-04 startup assertion lives in `_verify_results_path_gitignored` (PATH-resolved git via trusted-prefix allowlist after H4 review H2).
+- `read_record(line)` returns dict (forward-compat). `iter_records(path)` enforces 10MB per-file + 100KB per-line + bounded int parsing.
+
+**Build — run-id format**
+
+- `coc-eval/lib/run_id.py::generate_run_id` — `<iso8601-second>-<pid>-<counter>-<rand>` per spec. `validate_run_id` enforces `RUN_ID_RE.fullmatch` BEFORE any FS op (AC-21).
+
+**Build — JSON schema v1.0.0**
+
+- `coc-eval/schemas/v1.0.0.json` — header + test record definitions, regex + tiered_artifact backends, parallel arrays per AD-05, closed `state` enum per AC-7.
+
+**Build — companion .log writer**
+
+- `JsonlWriter.write_log` writes `<run_id>/logs/<cli>-<suite>-<test>.log` at mode 0o600 from creation (M2 fix using `os.open` + `O_EXCL`). Banner + headers + redacted bodies. Evidence-required tests get a sibling `.evidence.log`.
+
+**Build — aggregator hardening primitives**
+
+- `escape_md(s)` — `|`, `<`, `>`, backticks, newlines (AC-8a markdown injection).
+- `iter_records(path)` — per-file 10MB cap, per-line 100KB cap, bounded `parse_int` (AC-8b).
+
+**Test files**
+
+- `tests/lib/test_run_id.py` — 13 tests: regex match, components, sub-second distinct, 5-process collision via `mp.Pool(spawn)`, `validate_run_id` rejects malformed/non-string.
+- `tests/lib/test_jsonl.py` — 24 tests: round-trip header + record, redaction canary on stdout AND stderr, forward-compat (unknown field validates), schema strictness (state enum rejected), path-traversal blocked (run_id + suite), per-line cap, companion log mode 0o600 + redaction + evidence sibling, plus 5 security regressions: extra-kwarg redaction, auth_probe.reason redaction, log symlink refusal, file mode at creation.
+- `tests/lib/test_aggregator_hardening.py` — 12 tests: escape_md (pipe/HTML/anchor/backtick/newlines/non-string), per-line byte cap, bounded int, per-file size cap.
+- `tests/lib/test_suite_validator.py` — extracted schema-validator tests pinned to new public API + cyclic `$ref` guard test (M4).
+
+**Gate**
+
+- `pytest coc-eval/tests/lib/`: 234 passed (was 186 H3 baseline; +48).
+- `pytest coc-eval/tests/integration/`: 2 passed (AC-16 canary + capability smoke; H4 changes do not touch launcher).
+- `cargo check --workspace`: clean.
+- `cargo fmt --check`: clean.
+- Stub scan + `shell=True` + `os.system` greps: clean.
+
+**Acceptance criteria**
+
+- AC-6 schema validation — `validate_record` runs at every write.
+- AC-7 closed state taxonomy — `test_invented_state_rejected` GREEN.
+- AC-11a run-id collision — `test_five_parallel_generators` GREEN.
+- AC-20 redaction canary — `test_token_in_stderr_redacted_on_disk` + `test_token_in_stdout_redacted` + `TestExtraKwargRedacted` (2) GREEN.
+- AC-21 path-traversal blocked — `TestPathTraversalBlocked::*` GREEN.
+
+**Cross-cutting**
+
+- specs/08-coc-eval-harness.md unchanged — H4 matches the existing JSONL spec wording (parallel-arrays, closed state taxonomy, stdlib-only, per-line cap, redaction at persistence).
+- Journals 0012 (ship) + 0013 (security-review convergence) written. 6 above-LOW security findings (2 HIGH + 4 MEDIUM) all resolved in-session per zero-tolerance Rule 5.

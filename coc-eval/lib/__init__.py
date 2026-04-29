@@ -7,5 +7,8 @@ Modules:
 - auth: per-CLI authentication probe (cc in H3; codex/gemini in H10/H11)
 - fixtures: per-test fixture lifecycle (prepare/cleanup/verify)
 - states: closed State enum + precedence ladders
+- schema_validator: stdlib JSON Schema (subset) validator with $ref + recursion guard
 - suite_validator: validates SUITE dicts against schemas/suite-v1.json
+- run_id: generate/validate `<iso8601>-<pid>-<counter>-<rand>` run ids
+- jsonl: JSONL writer + reader + redaction integration + aggregator hardening primitives
 """

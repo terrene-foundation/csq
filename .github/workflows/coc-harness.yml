@@ -42,6 +42,14 @@ jobs:
       - name: Install bubblewrap (sandbox for implementation suite, future)
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
+      - name: Install pytest
+        # H5 added pytest invocations but not the install step — pre-existing
+        # bug fixed in H6. setup-python ships Python only; pytest is pinned
+        # to a known-good version. PYTEST_DISABLE_PLUGIN_AUTOLOAD is
+        # exported on the run step (H5-T-7); install must happen WITHOUT
+        # that env var so pytest's entrypoint registers normally.
+        run: pip install pytest==8.4.2
+
       - name: Run lib pytest
         # H5-T-7: PYTEST_DISABLE_PLUGIN_AUTOLOAD blocks malicious plugin
         # auto-loading via dep regression. Tests are designed to be

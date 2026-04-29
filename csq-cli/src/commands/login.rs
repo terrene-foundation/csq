@@ -568,7 +568,6 @@ fn parse_login_response(body: &str) -> Result<DaemonLoginRequest> {
 /// tokens. It never contains shell metacharacters that could escape
 /// an argv. Even so, we pass the URL as a single `arg()` entry, not
 /// via a shell string, so no shell parsing is involved.
-#[cfg(unix)]
 fn open_in_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {

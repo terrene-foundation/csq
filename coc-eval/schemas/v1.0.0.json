@@ -1,0 +1,253 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://terrene.foundation/csq/schemas/v1.0.0.json",
+  "title": "csq coc-eval JSONL Record v1.0.0",
+  "description": "Schema for individual JSONL records (header + per-test). Validated by `lib.jsonl.validate_record`. Forward-compat: unknown fields are accepted (additionalProperties defaults to true). See workspaces/coc-harness-unification/01-analysis/06-jsonl-schema-v1.md for the full prose contract.",
+  "definitions": {
+    "iso8601_ts": {
+      "type": "string",
+      "minLength": 20
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z-\\d+-\\d{4}-[A-Za-z0-9_-]{6,12}$"
+    },
+    "suite_name": {
+      "type": "string",
+      "enum": ["capability", "compliance", "safety", "implementation"]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "pass_after_retry",
+        "fail",
+        "error_fixture",
+        "error_invocation",
+        "error_json_parse",
+        "error_timeout",
+        "error_token_budget",
+        "skipped_sandbox",
+        "skipped_artifact_shape",
+        "skipped_cli_missing",
+        "skipped_cli_auth",
+        "skipped_quota",
+        "skipped_quarantined",
+        "skipped_user_request",
+        "skipped_budget"
+      ]
+    },
+    "criteria_kind": {
+      "type": "string",
+      "enum": ["contains", "absent", "fs_assert", "tier"]
+    },
+    "auth_probe": {
+      "type": "object",
+      "required": ["ok", "probed_at"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "probed_at": { "$ref": "#/definitions/iso8601_ts" },
+        "version": { "type": "string" }
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "required": ["label", "kind", "matched", "points", "max_points"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "kind": { "$ref": "#/definitions/criteria_kind" },
+        "matched": { "type": "boolean" },
+        "points": { "type": "number" },
+        "max_points": { "type": "number" },
+        "pattern": { "type": "string" },
+        "assertion": {
+          "type": "string",
+          "enum": ["FileAbsent", "FileUnchanged", "DirEmpty", "FilePresent"]
+        },
+        "path": { "type": "string" }
+      }
+    },
+    "tier": {
+      "type": "object",
+      "required": ["name", "points", "max_points"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "points": { "type": "number" },
+        "max_points": { "type": "number" },
+        "reason": { "type": "string" }
+      }
+    },
+    "score": {
+      "type": "object",
+      "required": ["pass", "total", "max_total"],
+      "properties": {
+        "pass": { "type": "boolean" },
+        "total": { "type": "number" },
+        "max_total": { "type": "number" },
+        "criteria": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/criterion" }
+        },
+        "tiers": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/tier" }
+        },
+        "rubric": { "type": "string" }
+      }
+    },
+    "header_record": {
+      "type": "object",
+      "required": [
+        "_header",
+        "schema_version",
+        "harness_version",
+        "run_id",
+        "suite",
+        "started_at",
+        "host",
+        "cli_versions",
+        "auth_probes"
+      ],
+      "properties": {
+        "_header": { "type": "boolean", "enum": [true] },
+        "schema_version": { "type": "string", "minLength": 1 },
+        "harness_version": { "type": "string", "minLength": 1 },
+        "run_id": { "$ref": "#/definitions/run_id" },
+        "suite": { "$ref": "#/definitions/suite_name" },
+        "started_at": { "$ref": "#/definitions/iso8601_ts" },
+        "host": {
+          "type": "object",
+          "required": ["platform", "arch", "python"],
+          "properties": {
+            "platform": { "type": "string" },
+            "arch": { "type": "string" },
+            "python": { "type": "string" }
+          }
+        },
+        "cli_versions": {
+          "type": "object"
+        },
+        "auth_probes": {
+          "type": "object"
+        },
+        "fixtures_commit": { "type": ["string", "null"] },
+        "selected_clis": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "selected_tests": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "selected_rubrics": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "permission_profile": {
+          "type": "string",
+          "enum": ["plan", "read-only", "write"]
+        },
+        "home_mode": {
+          "type": "string",
+          "enum": ["stub", "host"]
+        },
+        "harness_invocation": { "type": "string" },
+        "model_id": { "type": ["string", "null"] },
+        "token_budget": {
+          "type": "object",
+          "properties": {
+            "input": { "type": "number" },
+            "output": { "type": "number" }
+          }
+        }
+      }
+    },
+    "test_record": {
+      "type": "object",
+      "required": [
+        "_header",
+        "suite",
+        "test",
+        "cli",
+        "fixture",
+        "fixture_dir",
+        "permission_mode",
+        "started_at",
+        "ended_at",
+        "runtime_ms",
+        "exit_code",
+        "timed_out",
+        "attempts",
+        "state",
+        "scoring_backend",
+        "score"
+      ],
+      "properties": {
+        "_header": { "type": "boolean", "enum": [false] },
+        "suite": { "$ref": "#/definitions/suite_name" },
+        "test": { "type": "string", "minLength": 1 },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "cli": { "type": "string", "minLength": 1 },
+        "cli_version": { "type": "string" },
+        "rubric": { "type": "string" },
+        "fixture": { "type": "string", "minLength": 1 },
+        "fixture_dir": { "type": "string", "minLength": 1 },
+        "prompt_sha256": { "type": "string" },
+        "cmd_template_id": { "type": "string" },
+        "cwd": { "type": "string" },
+        "stub_home": { "type": ["string", "null"] },
+        "home_root": { "type": ["string", "null"] },
+        "permission_mode": {
+          "type": "string",
+          "enum": ["plan", "read-only", "write", "default"]
+        },
+        "sandbox_profile": {
+          "type": ["string", "null"],
+          "enum": ["none", "read-only", "write-confined", null]
+        },
+        "home_mode": {
+          "type": "string",
+          "enum": ["stub", "host"]
+        },
+        "effective_timeout_ms": { "type": ["number", "null"] },
+        "started_at": { "$ref": "#/definitions/iso8601_ts" },
+        "ended_at": { "$ref": "#/definitions/iso8601_ts" },
+        "runtime_ms": { "type": "number" },
+        "exit_code": { "type": ["integer", "null"] },
+        "signal": { "type": ["string", "null"] },
+        "timed_out": { "type": "boolean" },
+        "attempts": { "type": "integer" },
+        "attempt_states": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/state" }
+        },
+        "auth_state_changed": { "type": "boolean" },
+        "state": { "$ref": "#/definitions/state" },
+        "scoring_backend": {
+          "type": "string",
+          "enum": ["regex", "tiered_artifact"]
+        },
+        "score": { "$ref": "#/definitions/score" },
+        "stdout_truncated": { "type": "string" },
+        "stderr_truncated": { "type": "string" },
+        "log_path": { "type": ["string", "null"] },
+        "evidence_log_deleted_at": { "type": ["string", "null"] },
+        "tokens": {
+          "type": "object",
+          "properties": {
+            "input": { "type": "number" },
+            "output": { "type": "number" }
+          }
+        },
+        "num_turns": { "type": "integer" },
+        "artifacts": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

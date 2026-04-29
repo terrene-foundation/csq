@@ -1,12 +1,13 @@
-# H3 ship — test-results
+# H4 ship — test-results
 # 2026-04-29
-# branch: feat/coc-harness-h3-launcher-cc-canary
-# baseline (HEAD pre-H3 = cff5e15): 135 lib tests passed.
-# H3 (post round-1 security review convergence):
-#   pytest coc-eval/tests/lib/         186 passed (+51 vs baseline)
+# branch: feat/coc-harness-h4-jsonl-schema
+# baseline (HEAD pre-H4 = 30c1808 H3 merge): 186 lib tests passed.
+# H4 (post round-1 security review convergence):
+#   pytest coc-eval/tests/lib/         234 passed (+48 vs baseline)
 #   pytest coc-eval/tests/integration/   2 passed (AC-16 canary + capability smoke)
 #   cargo check --workspace            clean
 #   cargo fmt --all --check            clean
 #   stub scan / shell=True / os.system clean
 # regressions: 0
-# security review (HIGH=1, MEDIUM=3, LOW=2): all resolved in-session per zero-tolerance Rule 5
+# security review (HIGH=2, MEDIUM=4, LOW=3): 6 above-LOW resolved in-session per zero-tolerance Rule 5
+# (L1 + L2 are H9 aggregator concerns; L3 was a false alarm)

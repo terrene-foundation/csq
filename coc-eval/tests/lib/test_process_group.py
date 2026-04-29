@@ -181,7 +181,10 @@ class TestSpawnCliEndToEnd:
         )
         proc = spawn_cli(spec, inputs)
         try:
-            stdout, _ = proc.communicate(timeout=5.0)
+            # 15s ceiling for spawn+echo+exit. The binary itself completes
+            # in microseconds; the budget covers contention from the
+            # multiprocessing tests in test_run_id.py running concurrently.
+            stdout, _ = proc.communicate(timeout=15.0)
         finally:
             if proc.poll() is None:
                 kill_process_group(proc, grace_secs=1.0)

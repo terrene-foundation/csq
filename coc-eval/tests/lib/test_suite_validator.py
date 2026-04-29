@@ -152,28 +152,61 @@ class TestValidateSuite:
 
 
 class TestSchemaValidator:
-    """Sanity tests of the JSON Schema subset validator."""
+    """Sanity tests of the JSON Schema subset validator.
+
+    The validator was extracted to `lib.schema_validator` in H4; the
+    public entry is `validate_against_schema` raising `SchemaValidationError`.
+    These tests pin the post-extraction contract.
+    """
 
     def test_minimal_object_passes(self):
-        from lib.suite_validator import _validate_against_schema
+        from lib.schema_validator import validate_against_schema
 
         schema = {
             "type": "object",
             "required": ["x"],
             "properties": {"x": {"type": "string"}},
         }
-        _validate_against_schema({"x": "hello"}, schema)
+        validate_against_schema({"x": "hello"}, schema)
 
     def test_type_mismatch_fails(self):
-        from lib.suite_validator import _validate_against_schema
+        from lib.schema_validator import (
+            SchemaValidationError,
+            validate_against_schema,
+        )
 
         schema = {"type": "string"}
-        with pytest.raises(SuiteValidationError, match="expected string"):
-            _validate_against_schema(42, schema, "field")
+        with pytest.raises(SchemaValidationError, match="expected"):
+            validate_against_schema(42, schema, "field")
 
     def test_enum_violation_fails(self):
-        from lib.suite_validator import _validate_against_schema
+        from lib.schema_validator import (
+            SchemaValidationError,
+            validate_against_schema,
+        )
 
         schema = {"type": "string", "enum": ["a", "b", "c"]}
-        with pytest.raises(SuiteValidationError, match="not in enum"):
-            _validate_against_schema("d", schema, "field")
+        with pytest.raises(SchemaValidationError, match="not in enum"):
+            validate_against_schema("d", schema, "field")
+
+    def test_cyclic_ref_bounded(self):
+        """H4 review M4 — a cyclic $ref MUST NOT recurse unbounded.
+
+        The bundled v1.0.0 schema has no cycles; the validator is
+        nonetheless reused as a library, so a maliciously planted
+        schema must not exhaust Python's recursion limit.
+        """
+        from lib.schema_validator import (
+            SchemaValidationError,
+            validate_against_schema,
+        )
+
+        cyclic = {
+            "$ref": "#/definitions/A",
+            "definitions": {
+                "A": {"$ref": "#/definitions/B"},
+                "B": {"$ref": "#/definitions/A"},
+            },
+        }
+        with pytest.raises(SchemaValidationError, match="recursion depth"):
+            validate_against_schema({}, cyclic)

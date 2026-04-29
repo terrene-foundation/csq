@@ -9,9 +9,8 @@ suite module exports a top-level `SUITE` dict; this validator enforces:
 3. Test IDs match the per-suite manifest in `lib/validators.py`.
 4. INV-PAR-2 criteria-count parity across CLIs (with skipped_artifact_shape carve-out).
 
-Stdlib-only: re-implements the JSON Schema subset we use (type, required,
-properties, enum, items, additionalProperties, oneOf for parallel-array
-records). No `jsonschema` PyPI dep.
+Stdlib-only: shares the lightweight JSON Schema validator at
+`schema_validator.py`. No `jsonschema` PyPI dep.
 """
 
 from __future__ import annotations
@@ -20,87 +19,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .schema_validator import (
+    SchemaValidationError,
+    validate_against_schema,
+)
 from .validators import (
+    KNOWN_CLI_IDS,
     SUITE_MANIFEST,
     SUITE_TEST_MANIFESTS,
-    KNOWN_CLI_IDS,
     validate_name,
 )
 
 
 class SuiteValidationError(ValueError):
     """Raised when a SUITE dict fails validation."""
-
-
-# ---- Lightweight JSON Schema validator (subset) ----
-
-
-def _validate_against_schema(
-    value: Any, schema: dict[str, Any], path: str = ""
-) -> None:
-    """Recursive validator covering the JSON Schema subset suite-v1.json uses.
-
-    Subset: type, required, properties, enum, items, additionalProperties,
-    minLength, minItems. No $ref, no oneOf (handled inline below for criteria
-    polymorphism), no allOf.
-    """
-    schema_type = schema.get("type")
-    if schema_type == "object":
-        if not isinstance(value, dict):
-            raise SuiteValidationError(
-                f"{path or '<root>'}: expected object, got {type(value).__name__}"
-            )
-        required = schema.get("required", [])
-        for key in required:
-            if key not in value:
-                raise SuiteValidationError(
-                    f"{path or '<root>'}: missing required key {key!r}"
-                )
-        properties = schema.get("properties", {})
-        additional_allowed = schema.get("additionalProperties", True)
-        for key, subval in value.items():
-            sub_path = f"{path}.{key}" if path else key
-            if key in properties:
-                _validate_against_schema(subval, properties[key], sub_path)
-            elif not additional_allowed:
-                raise SuiteValidationError(f"{sub_path}: unexpected property")
-    elif schema_type == "array":
-        if not isinstance(value, list):
-            raise SuiteValidationError(
-                f"{path}: expected array, got {type(value).__name__}"
-            )
-        min_items = schema.get("minItems")
-        if min_items is not None and len(value) < min_items:
-            raise SuiteValidationError(
-                f"{path}: minItems {min_items}, got {len(value)}"
-            )
-        items_schema = schema.get("items")
-        if items_schema is not None:
-            for idx, item in enumerate(value):
-                _validate_against_schema(item, items_schema, f"{path}[{idx}]")
-    elif schema_type == "string":
-        if not isinstance(value, str):
-            raise SuiteValidationError(
-                f"{path}: expected string, got {type(value).__name__}"
-            )
-        min_length = schema.get("minLength")
-        if min_length is not None and len(value) < min_length:
-            raise SuiteValidationError(
-                f"{path}: minLength {min_length}, got {len(value)}"
-            )
-    elif schema_type == "integer":
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise SuiteValidationError(
-                f"{path}: expected integer, got {type(value).__name__}"
-            )
-    elif schema_type == "boolean":
-        if not isinstance(value, bool):
-            raise SuiteValidationError(
-                f"{path}: expected boolean, got {type(value).__name__}"
-            )
-    enum_values = schema.get("enum")
-    if enum_values is not None and value not in enum_values:
-        raise SuiteValidationError(f"{path}: value {value!r} not in enum {enum_values}")
 
 
 # ---- High-level suite validator ----
@@ -133,7 +65,11 @@ def validate_suite(suite: dict[str, Any]) -> None:
     - INV-PAR-2 criteria-count parity per test.
     """
     schema = _load_schema()
-    _validate_against_schema(suite, schema)
+    try:
+        validate_against_schema(suite, schema)
+    except SchemaValidationError as e:
+        # Surface the same exception type callers expected pre-extraction.
+        raise SuiteValidationError(str(e)) from e
 
     name = suite.get("name")
     if name not in SUITE_MANIFEST:
@@ -143,6 +79,8 @@ def validate_suite(suite: dict[str, Any]) -> None:
 
     tests = suite.get("tests", [])
     seen_ids: set[str] = set()
+    if not isinstance(name, str):
+        raise SuiteValidationError(f"suite `name` must be a string, got {name!r}")
     expected_ids = set(SUITE_TEST_MANIFESTS[name])
 
     for test in tests:

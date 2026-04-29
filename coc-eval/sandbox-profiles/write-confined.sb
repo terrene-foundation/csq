@@ -1,0 +1,19 @@
+;; coc-eval write-confined sandbox profile (macOS sandbox-exec)
+;;
+;; Used by the implementation suite (H7+) when spawning cc with
+;; `--dangerously-skip-permissions`. Denies read+write on credential-shaped
+;; paths in the user's HOME so a model that performs file-system tool calls
+;; cannot exfiltrate or overwrite them, even if --dangerously-skip-permissions
+;; would let the cc CLI itself do so.
+;;
+;; The capability/compliance/safety suites do NOT load this profile — they
+;; rely on the HOME override (CLAUDE_CONFIG_DIR + HOME=fixture/_stub_root) as
+;; the primary defense per spec 08 §"Stub-HOME with $HOME override".
+;;
+;; sandbox-exec is Apple-deprecated as of macOS 10.10 but functional through
+;; macOS 14. v1.1 follow-up: migrate to the `sandbox` framework via Rust shim.
+
+(version 1)
+(allow default)
+(deny file-read* (regex "^/Users/[^/]+/\\.(?:claude|ssh|codex|gemini|aws|gnupg)(/|$)"))
+(deny file-write* (regex "^/Users/[^/]+/\\.(?:claude|ssh|codex|gemini|aws|gnupg)(/|$)"))

@@ -241,11 +241,16 @@ class TestCliRegistry:
     """R1-UX-11: CLI registration mechanism — adding a 4th CLI is data, not code."""
 
     def setup_method(self):
-        # Clean registry for each test.
+        # Save + clear so each test sees a deterministic registry. cc is
+        # registered at module import (H3); restore it in teardown so other
+        # test modules that depend on the live registry (e.g. integration
+        # canary, smoke tests) see the production state.
+        self._saved_registry = dict(CLI_REGISTRY)
         CLI_REGISTRY.clear()
 
     def teardown_method(self):
         CLI_REGISTRY.clear()
+        CLI_REGISTRY.update(self._saved_registry)
 
     def test_register_and_lookup(self):
         def fake_launcher(
@@ -272,6 +277,18 @@ class TestCliRegistry:
         register_cli(entry)
         assert len(CLI_REGISTRY) == 1
 
-    def test_registry_starts_empty(self):
-        # H1: no CLIs registered yet (H3/H10/H11 add cc/codex/gemini).
-        assert CLI_REGISTRY == {}
+
+class TestCcRegisteredOnImport:
+    """H3: cc auto-registers when `lib.launcher` is imported."""
+
+    def test_cc_entry_present(self):
+        # Re-import to defeat the test class above's setup/teardown side-
+        # effects. The module-level registration line in launcher.py runs
+        # exactly once per process; after the TestCliRegistry teardown
+        # restores it, the entry is back.
+        assert "cc" in CLI_REGISTRY
+        entry = CLI_REGISTRY["cc"]
+        assert entry.cli_id == "cc"
+        assert entry.binary == "claude"
+        assert callable(entry.launcher)
+        assert callable(entry.auth_probe)

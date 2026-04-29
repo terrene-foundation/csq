@@ -97,3 +97,72 @@
 ## Risk
 
 Stub-HOME builder is the load-bearing isolation for capability/compliance/safety. Testing the AC-16 canary HERE (before H5/H6 build atop it) is critical — if H3 ships with a partial isolation, every subsequent PR's results are contaminated. Per `04-validate/02-redteam-round2-findings.md`, this canary placement is the round-2 fix for AD-01.
+
+## Verification
+
+Closed 2026-04-29 — `/implement` cycle complete. See `journal/0010-DECISION-h3-launcher-cc-canary-shipped.md`.
+
+**Plan reference:** `02-plans/01-implementation-plan.md` §H3 + `01-analysis/05-launcher-table-contract.md`. Every checklist item below maps to a plan paragraph or contract section.
+
+**Build — cc launcher**
+
+- `cc_launcher(LaunchInputs) -> LaunchSpec` — `coc-eval/lib/launcher.py`. Permission mapping: `--permission-mode plan` for capability/compliance/safety; `--print --output-format json --dangerously-skip-permissions` for implementation. INV-PERM-1 asserted at the top of `cc_launcher`.
+- Sandbox wrapper: `_resolve_sandbox_wrapper` returns `("sandbox-exec", "-f", profile_path)` on macOS and the documented bwrap argv on Linux; raises on other platforms.
+- cc registered in `CLI_REGISTRY` at module-import time via `CLI_REGISTRY["cc"] = CliEntry(...)`.
+
+**Build — auth probe (real, not mtime)**
+
+- `coc-eval/lib/auth.py` — `probe_auth("cc", suite, env=...)`. Runs `claude --print --permission-mode plan ping` 10s timeout. INV-AUTH-3 cache cleared via `mark_auth_changed("cc")` on `is_auth_error_line` matches.
+- `AuthProbeResult` dataclass already in `launcher.py` per H1 — re-exported from `auth.py` indirectly via the proxy `_probe_auth_cc_proxy()`.
+
+**Build — stub-HOME builder (with $HOME override)**
+
+- `build_stub_home(suite, fixture_dir) -> (stub_home, home_root)` — symlinks `<fixture_dir>/_stub_home/.credentials.json` to the user's real credential, writes `<fixture_dir>/_stub_home/.claude.json` with `{"hasCompletedOnboarding": true}`, creates empty `<fixture_dir>/_stub_root/{.ssh,.codex,.gemini,.aws,.gnupg}/`.
+- `_find_user_credentials()` checks `~/.claude/.credentials.json` first then falls back to most-recently-modified `~/.claude/accounts/config-N/.credentials.json` (csq layout).
+- `_build_cc_env` sets BOTH `CLAUDE_CONFIG_DIR=stub_home` AND `HOME=home_root`, plus inherits PATH/LANG/LC\_\*.
+
+**Build — settings-key positive allowlist**
+
+- `filter_settings_overlay(merged: dict) -> dict` — top-level allowlist `{env, model, permissions}`. `_filter_env_keys` allows `ANTHROPIC_*` + `CLAUDE_CONFIG_DIR`; rejects `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `PATH`. `_filter_permissions_keys` validates `{allow, deny, defaultMode}` with simple-string-only `allow`/`deny` (rejects `file:`-scheme + objects).
+
+**Build — pre-spawn revalidation + process-group kill**
+
+- `_assert_credentials_symlink_intact(stub_home)` — INV-ISO-6: `os.readlink` + double-stat for inode parity. Raises RuntimeError on any mismatch.
+- `spawn_cli(spec, inputs)` — `start_new_session=True`; INV-PERM-1 + INV-ISO-6 checks BEFORE Popen. Stdout/stderr captured; stdin DEVNULL.
+- `kill_process_group(proc, grace_secs=5.0)` — `os.killpg(SIGTERM)` → `wait(grace)` → `os.killpg(SIGKILL)` → `wait(2.0)`.
+- O_CLOEXEC: PEP 446 makes Python 3.4+ `os.open()` non-inheritable by default; documented in the spawn_cli docstring.
+
+**Build — AC-16 canary**
+
+- `coc-eval/tests/integration/test_stub_home_canary.py` — writes `~/.claude/rules/_test_canary.md`, runs cc with stub HOME, asserts `CANARY_USER_RULE_ZWP4` absent. Cleanup in `try/finally`. **GREEN against real cc.**
+
+**Test files**
+
+- `tests/lib/test_cc_launcher.py` — 27 tests: permission mode per suite, settings allowlist, build_stub_home layout (incl. stale-symlink replacement + missing-creds error), HOME-override env wiring, sandbox wrapper presence-by-suite.
+- `tests/lib/test_auth_probe.py` — 14 tests: missing-binary, real probe (skip-or-success), timeout path, non-zero exit, cache scoping, mid-run invalidation, `is_auth_error_line` patterns.
+- `tests/lib/test_process_group.py` — 6 tests: SIGTERM-ignoring child reaped within 5s, cooperative child sub-second, already-dead returns rc, spawn_cli aborts on INV-PERM-1 + INV-ISO-6 violations.
+
+**Smoke integration**
+
+- `tests/integration/test_capability_smoke.py` — C1-baseline-root marker `MARKER_CC_BASE=cc-base-loaded-CC9A1` surfaces in cc's response. **GREEN.**
+
+**Gate**
+
+- `pytest coc-eval/tests/lib/`: 182 passed (135 baseline + 47 new).
+- `pytest coc-eval/tests/integration/`: 2 passed.
+- `cargo check --workspace`: clean.
+- `cargo fmt --check`: clean.
+- Stub scan + `shell=True` + `os.system` greps: clean.
+
+**Acceptance criteria**
+
+- AC-9 — `TestProbeMissingBinary::test_returns_skip_when_claude_absent`.
+- AC-16 — `test_stub_home_isolation_canary_absent` GREEN.
+- AC-19a — `TestKillProcessGroupSigtermIgnoringChild` GREEN; elapsed <5s.
+- AC-22 — `TestSettingsAllowlist` (8 tests) GREEN.
+- AC-22a — `TestInvPerm1RuntimeCheck` (4 tests) + `test_inv_perm_1_blocks_wrong_mode_in_launcher` + `test_spawn_aborts_on_inv_perm_1_violation` GREEN.
+
+**Cross-cutting**
+
+- specs/08-coc-eval-harness.md unchanged — H3 matches existing spec wording for INV-PERM-1, INV-AUTH-3, INV-ISO-6, INV-RUN-3, settings allowlist, sandbox profile path.
+- Journal 0010 written with §For Discussion items on AC-16 positive control, probe overhead, and timeout ceiling.

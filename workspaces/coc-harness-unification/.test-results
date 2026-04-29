@@ -1,34 +1,12 @@
-H1 implementation cycle test results
-====================================
-
-Commit (pre-implementation): 2ca6d91e6e3b6e4fd8daff727e3fb8e2ca0cb980
-Date: 2026-04-28
-
-## Baseline (before H1)
-- pytest coc-eval: no tests existed for lib/ (zero baseline)
-- cargo test --workspace: 1614+ tests pass, 0 failures
-
-## H1 results
-- pytest coc-eval/tests/lib/: 116 passed, 0 failed (new tests)
-  - test_validators.py: 19 tests
-  - test_redact.py: 38 tests
-  - test_states.py: 21 tests
-  - test_launcher.py: 25 tests
-  - test_suite_validator.py: 13 tests
-- cargo test --workspace: unchanged (Python additions don't affect Rust)
-- Regression count: 0
-
-## CI grep guards (AC-13, AC-32-bis, R3-CRIT-04)
-- shell=True grep: zero matches in coc-eval/
-- os.system / os.popen grep: zero matches in coc-eval/
-- glob discovery on suites/tests: zero matches in coc-eval/lib/
-
-## Coverage of H1 acceptance criteria
-- AC-1: suite-v1.json schema + validator (R3-CRIT-01) - shipped
-- AC-12: stdlib-only check - validated
-- AC-13: no shell=True grep guard (R3-CRIT-04) - shipped
-- AC-20: redaction canary - 1 test, green
-- AC-20a: 25-fixture parity (subset; full ports continue in H4) - tests cover all pattern classes
-- AC-26: spec exists at specs/08-coc-eval-harness.md
-- AC-27: README exists at coc-eval/README.md
-- AC-32-bis: no-glob check - validated via grep
+# H3 ship — test-results
+# 2026-04-29
+# branch: feat/coc-harness-h3-launcher-cc-canary
+# baseline (HEAD pre-H3 = cff5e15): 135 lib tests passed.
+# H3 (post round-1 security review convergence):
+#   pytest coc-eval/tests/lib/         186 passed (+51 vs baseline)
+#   pytest coc-eval/tests/integration/   2 passed (AC-16 canary + capability smoke)
+#   cargo check --workspace            clean
+#   cargo fmt --all --check            clean
+#   stub scan / shell=True / os.system clean
+# regressions: 0
+# security review (HIGH=1, MEDIUM=3, LOW=2): all resolved in-session per zero-tolerance Rule 5

@@ -1,0 +1,126 @@
+name: COC Harness
+
+# H5 (R3-HIGH-01): PR-triggered fast-loop for the multi-CLI COC harness
+# under coc-eval/. Lib pytest + grep guards always run; the cc capability
+# suite needs auth and is gated to `coc_harness:run-cc` label PRs (auth
+# secrets are not exposed to public-fork PRs).
+
+on:
+  pull_request:
+    paths:
+      - "coc-eval/**"
+      - "coc-env/**"
+      - "csq-core/**"
+      - ".claude/rules/**"
+      - ".github/workflows/coc-harness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "coc-eval/**"
+      - "coc-env/**"
+      - "csq-core/**"
+      - ".claude/rules/**"
+      - ".github/workflows/coc-harness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # ── lib pytest + grep guards ──────────────────────────────────
+  harness-lib:
+    name: Harness lib (pytest + grep guards)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bubblewrap (sandbox for implementation suite, future)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Run lib pytest
+        # H5-T-7: PYTEST_DISABLE_PLUGIN_AUTOLOAD blocks malicious plugin
+        # auto-loading via dep regression. Tests are designed to be
+        # network-free; document the no-network expectation here.
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: python -m pytest coc-eval/tests/lib/ -q
+
+      - name: Run non-cc-spawning integration tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          python -m pytest coc-eval/tests/integration/test_zero_auth_first_run.py \
+                            coc-eval/tests/integration/test_resume_smoke.py \
+                            coc-eval/tests/integration/test_flake_discrimination.py \
+                            -v
+
+      # ── Grep guards — fail fast on regressed invariants ─────────────
+      - name: Guard — SUITE_MANIFEST authority
+        run: |
+          # `validators.SUITE_MANIFEST` is THE closed manifest. Any new
+          # `SUITE_MANIFEST = ...` literal outside lib/validators.py is
+          # forbidden (CRIT-03 fix).
+          if grep -RIn --include="*.py" \
+              -E "^SUITE_MANIFEST\s*[:=]" coc-eval \
+              | grep -v "coc-eval/lib/validators.py"; then
+            echo "ERROR: SUITE_MANIFEST defined outside lib/validators.py" >&2
+            exit 1
+          fi
+
+      - name: Guard — no glob discovery of suites
+        run: |
+          # Suite discovery is via the static SUITE_REGISTRY dict. A glob
+          # over coc-eval/suites/*.py is the CRIT-03 attack surface.
+          if grep -RIn --include="*.py" \
+              -E "(suites/\*\.py|glob.*suites)" \
+              coc-eval/lib coc-eval/run.py; then
+            echo "ERROR: glob-based suite discovery detected" >&2
+            exit 1
+          fi
+
+      - name: Guard — no shell=True (H5-T-4 includes tests/)
+        run: |
+          if grep -RIn --include="*.py" "shell=True" \
+              coc-eval/lib coc-eval/suites coc-eval/run.py coc-eval/tests; then
+            echo "ERROR: shell=True is forbidden — use argv lists" >&2
+            exit 1
+          fi
+
+      - name: Guard — fixture-substitution stub (H5-T-4 includes tests/)
+        run: |
+          # Every fixture name passed to prepare_fixture flows through
+          # `validate_name` (CRIT-02 mitigation). Once H6 lands fixture
+          # variants, this guard expands to detect string-format fixture
+          # names that bypass validate_name.
+          if grep -RIn --include="*.py" -E "prepare_fixture\([^)]*[fF]\"" \
+              coc-eval/lib coc-eval/suites coc-eval/run.py coc-eval/tests; then
+            echo "ERROR: f-string fixture name in prepare_fixture call" >&2
+            exit 1
+          fi
+
+      - name: Guard — scaffold-injection stub (H5-T-4 includes tests/)
+        run: |
+          if grep -RIn --include="*.py" -E "scaffolds/.*[fF]\"" \
+              coc-eval/lib coc-eval/suites coc-eval/run.py coc-eval/tests; then
+            echo "ERROR: f-string scaffold path detected" >&2
+            exit 1
+          fi
+
+      - name: Guard — pyright clean (lib + suites + run.py)
+        run: |
+          pip install pyright==1.1.371
+          pyright coc-eval/lib coc-eval/suites coc-eval/run.py
+
+      - name: Guard — no print() left in lib/runner.py
+        run: |
+          # Runner uses sys.stdout/stderr explicitly so test redirection
+          # captures output. A bare print() escapes redirection.
+          if grep -nE "^[[:space:]]*print\(" coc-eval/lib/runner.py; then
+            echo "ERROR: bare print() in runner.py — use sys.stdout/stderr" >&2
+            exit 1
+          fi

@@ -188,9 +188,15 @@ def _verify_results_path_gitignored(results_root: Path) -> None:
         "HOME": os.environ.get("HOME", ""),
         "LANG": os.environ.get("LANG", "C"),
     }
+    # `git check-ignore` against a directory path returns rc=1 even when
+    # the .gitignore pattern is `<dir>/` — git's pattern semantics only
+    # match the directory's CONTENTS, not the directory entry itself. A
+    # synthetic probe file inside the dir forces git to evaluate the
+    # pattern against a contained path and report rc=0 when ignored.
+    probe = results_root / ".gitignore-probe"
     try:
         result = subprocess.run(
-            [git_bin, "check-ignore", "-q", str(results_root)],
+            [git_bin, "check-ignore", "-q", str(probe)],
             capture_output=True,
             cwd=str(repo_root),
             env=safe_env,

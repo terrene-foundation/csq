@@ -111,6 +111,13 @@ jobs:
             exit 1
           fi
 
+      - name: Guard — fixture-substitution audit (R2-MED-03 / H6)
+        run: |
+          # Enforce `independence.md`: no commercial-product names in
+          # fixture content. Source of truth: substitution log in
+          # workspaces/coc-harness-unification/journal/0016-...md.
+          coc-eval/scripts/check-fixture-substitution.sh
+
       - name: Guard — pyright clean (lib + suites + run.py)
         run: |
           pip install pyright==1.1.371

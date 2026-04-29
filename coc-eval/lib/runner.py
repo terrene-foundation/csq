@@ -45,7 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Callable, Mapping, Sequence, cast
 
-from . import auth, fixtures, launcher
+from . import auth, fixtures, fs_assertions, launcher
+from .fs_assertions import FsAssertion
 from .jsonl import JsonlWriter, now_iso8601_ms
 from .launcher import (
     CLI_REGISTRY,
@@ -183,6 +184,36 @@ def score_regex(criteria: Sequence[Mapping[str, Any]], stdout: str) -> dict[str,
         "criteria": results,
         "rubric": "default",
     }
+
+
+def _merge_fs_assertions(
+    score: dict[str, Any],
+    fs_results: list[dict[str, Any]],
+) -> None:
+    """Append fs_assert criteria into `score` and recompute aggregates.
+
+    Mutates `score` in place. The recomputed `pass` requires every regex
+    AND every fs_assert criterion to match — this is the FR-15 contract:
+    a model that cites the rule but writes the forbidden file does NOT
+    pass. `len(criteria) > 0` is preserved as a precondition for `pass`
+    so an empty criteria set never trivially passes.
+    """
+    if not fs_results:
+        return
+    # R1-B-L2: defense-in-depth — `score_regex` always returns a list, but
+    # a future scoring backend could return a different shape. Refuse
+    # rather than silently overwriting.
+    criteria = score.setdefault("criteria", [])
+    if not isinstance(criteria, list):
+        raise TypeError(
+            f"_merge_fs_assertions: score.criteria must be a list, "
+            f"got {type(criteria).__name__}"
+        )
+    criteria.extend(fs_results)
+    matched_total = sum(1.0 for c in criteria if c.get("matched"))
+    score["total"] = matched_total
+    score["max_total"] = float(len(criteria))
+    score["pass"] = bool(criteria) and all(c.get("matched") for c in criteria)
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +553,27 @@ def _run_one_attempt(
     fixture_dir = fixtures.prepare_fixture(fixture_name)
     fixtures.verify_fresh(fixture_dir)
 
+    # Materialize post_assertions (FR-15) and snapshot any `file_unchanged`
+    # state BEFORE spawn. Materialization happens after fixture prep so the
+    # snapshot reflects the byte-identical fixture every attempt sees
+    # (INV-ISO-5). Spec dicts arrive in `test_def["post_assertions"]` per
+    # `coc-eval/schemas/suite-v1.json`.
+    fs_specs = test_def.get("post_assertions") or []
+    if not isinstance(fs_specs, list):
+        raise ValueError(
+            f"test {test_def.get('name')!r}: post_assertions must be a list, "
+            f"got {type(fs_specs).__name__}"
+        )
+    fs_asserts: list[FsAssertion] = []
+    for spec_entry in fs_specs:
+        if not isinstance(spec_entry, Mapping):
+            raise ValueError(
+                f"test {test_def.get('name')!r}: post_assertion entry must be a "
+                f"mapping, got {type(spec_entry).__name__}"
+            )
+        fs_asserts.append(fs_assertions.build_assertion(spec_entry))
+    pre_snapshots = fs_assertions.snapshot_unchanged(fs_asserts, fixture_dir)
+
     # Subdir cwd is supported via `cwdSubdir`; the launcher's cwd uses
     # the resolved subdir path while $HOME / stub_home stay at fixture root.
     # H5-R-1: re-anchor the resolved path to the fixture root so a same-user
@@ -616,6 +668,14 @@ def _run_one_attempt(
     rc = proc.returncode
     if rc == 0 and not timed_out:
         score = score_regex(test_def["expect"][cli], stdout)
+        # Merge filesystem post-assertions into score.criteria. The test
+        # passes only if every regex AND every fs_assert criterion passes
+        # — `_merge_fs_assertions` recomputes total / max_total / pass.
+        if fs_asserts:
+            fs_results = fs_assertions.evaluate(
+                fs_asserts, fixture_dir, pre_snapshots=pre_snapshots
+            )
+            _merge_fs_assertions(score, fs_results)
         state = State.PASS if score["pass"] else State.FAIL
     else:
         score = {

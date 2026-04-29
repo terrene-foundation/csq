@@ -56,7 +56,26 @@
           },
           "quarantined": { "type": "boolean" },
           "expect": { "type": "object" },
-          "post_assertions": { "type": "array" },
+          "post_assertions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "path", "label"],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "file_absent",
+                    "file_unchanged",
+                    "dir_empty",
+                    "file_present"
+                  ]
+                },
+                "path": { "type": "string", "minLength": 1 },
+                "label": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
           "evidence_required": { "type": "boolean" }
         }
       }

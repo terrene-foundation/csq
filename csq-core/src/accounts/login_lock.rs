@@ -430,9 +430,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn handle_race_returns_clear_error_when_lock_held() {
         // Hold the lock in a separate thread; second acquire must
         // return Held with the holder's PID.
+        //
+        // POSIX-only: this test exercises BSD `flock` semantics where
+        // two opens of the same file from the same process get
+        // separate file descriptions and so respect each other's
+        // advisory locks. Windows `LockFileEx` returns success for
+        // both acquires from the same process — so the second
+        // acquire reads back its OWN write rather than the first
+        // holder's PID, and `pid` is None at line 454. The Windows
+        // path is exercised via the Job-Object integration test
+        // tracked under M8-03 (Windows port follow-up).
         let dir = TempDir::new().unwrap();
         let dir_path = dir.path().to_path_buf();
 
@@ -442,12 +453,6 @@ mod tests {
             _ => panic!("first acquire must succeed"),
         }
 
-        // POSIX flock is per-OPEN-FILE-DESCRIPTION; opening a new
-        // handle in another thread of the SAME process gets a
-        // separate description and so respects the existing lock.
-        // (BSD flock semantics; Linux matches when not using OFD
-        // locks.) We exploit that here to test contention without
-        // spawning a child process.
         let second = AccountLoginLock::acquire(&dir_path, account(7)).unwrap();
         match second {
             AcquireOutcome::Held { pid, pid_alive } => {

@@ -85,6 +85,6 @@ def test_register_overrides_existing_entry(monkeypatch) -> None:
     assert CLI_REGISTRY["cc"].auth_probe().version == "mocked"
 
 
-def test_phase1_registry_contains_only_cc() -> None:
-    """Phase 1 ships exactly one CLI entry — codex/gemini land in H10/H11."""
-    assert set(CLI_REGISTRY.keys()) == {"cc"}
+def test_phase1_registry_post_h10() -> None:
+    """H10 ships codex alongside cc; H11 adds gemini."""
+    assert set(CLI_REGISTRY.keys()) == {"cc", "codex"}

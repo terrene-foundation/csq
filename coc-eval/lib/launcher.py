@@ -160,6 +160,9 @@ CLI_TIMEOUT_MS: dict[tuple[SuiteId, CliId], int | None] = {
     ("capability", "codex"): 60_000,
     ("capability", "gemini"): 180_000,
     ("compliance", "cc"): 60_000,
+    # H10: codex tier. Per the H10 plan the compliance/codex pair
+    # warrants the same 60s budget as cc; codex `exec` returns plain
+    # text so parse cost is comparable.
     ("compliance", "codex"): 60_000,
     ("compliance", "gemini"): 180_000,
     ("safety", "cc"): 60_000,
@@ -434,6 +437,30 @@ def build_stub_home(
     _canary.write_memory_canary_file(stub_home / "memory" / "_canary.md")
     _canary.write_memory_canary_file(home_root / ".claude" / "memory" / "_canary.md")
 
+    # H10: codex auth files. codex reads auth from `$CODEX_HOME/auth.json`
+    # + optional `config.toml`. We symlink (never copy) so token
+    # rotations survive. Codex setup is best-effort — if the user has
+    # not run `codex login` the files are absent and codex will probe-
+    # fail with `skipped_cli_auth`. Same containment check as cc creds.
+    user_codex_root = Path.home() / ".codex"
+    for codex_filename in ("auth.json", "config.toml"):
+        src_path = user_codex_root / codex_filename
+        if not src_path.is_file() and not src_path.is_symlink():
+            continue
+        if not _is_within(src_path, user_codex_root):
+            # Defensive: refuse to chain a credential symlink that
+            # points outside ~/.codex/.
+            continue
+        link = stub_home / codex_filename
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        # H10 R1-HIGH-1: symlink to the path itself (not its resolved
+        # target) so an atomic rotation at the source (codex daemon
+        # rewriting auth.json with a new inode) is visible through the
+        # stub_home link without re-running build_stub_home. Same shape
+        # as cc's `.credentials.json` symlink.
+        link.symlink_to(src_path)
+
     return stub_home, home_root
 
 
@@ -600,6 +627,63 @@ def _resolve_sandbox_wrapper(fixture_dir: Path) -> tuple[str, ...]:
         f"sandbox not supported on platform={sysname!r}; "
         "implementation suite is Phase-1-gated to macOS/Linux"
     )
+
+
+def _build_codex_args(suite: SuiteId, prompt: str) -> tuple[str, ...]:
+    """Compose `codex` CLI argv (without the binary itself).
+
+    H10 contract:
+    - capability/compliance/safety: `exec --sandbox read-only "<prompt>"`
+    - implementation: skipped at runner level per ADR-B; reaching here is
+      a programming error.
+
+    `--sandbox read-only` blocks file-write tool calls — the codex
+    sandbox is the analogue of cc's `--permission-mode plan` for our
+    Phase 1 suites. Implementation × codex would need
+    `--sandbox workspace-write` per the H10 plan but is gated out at
+    `runner.run_test_with_retry` (the runner stamps
+    `skipped_artifact_shape` for codex-implementation cells).
+    """
+    if suite == "implementation":
+        # Defense-in-depth: the runner already gates this. Reaching
+        # here means a SUITE entry slipped past validation; raise so
+        # the misconfiguration is loud.
+        raise RuntimeError(
+            "codex_launcher: implementation × codex is gated out in "
+            "Phase 1 (ADR-B). Should not have reached _build_codex_args."
+        )
+    # H10 R1-CRIT-1: insert `--` argv terminator before the prompt so a
+    # prompt starting with `--` (e.g. SF4-shaped indirect injection
+    # bait, or a future SUITE entry that templates user content) is
+    # parsed as the positional, never as a flag.
+    return ("exec", "--sandbox", "read-only", "--", prompt)
+
+
+def _build_codex_env(inputs: LaunchInputs) -> dict[str, str]:
+    """Compose env mapping for codex subprocess.
+
+    Sets `CODEX_HOME=<stub_home>` so codex reads its `auth.json` /
+    `config.toml` from the per-fixture stub rather than the user's
+    real `~/.codex/`. Sets `HOME=<home_root>` so any `~/...`
+    expansion lands in the placeholder $HOME root. Filtered env per
+    the H7 / H8 hardening (XDG_* stripped, PATH preserved).
+    """
+    env: dict[str, str] = {}
+    parent_path = os.environ.get("PATH", "")
+    if parent_path:
+        env["PATH"] = parent_path
+    for key in ("LANG", "LC_ALL", "LC_CTYPE"):
+        v = os.environ.get(key)
+        if v is not None:
+            env[key] = v
+
+    if inputs.stub_home is not None:
+        env["CODEX_HOME"] = str(inputs.stub_home)
+    if inputs.home_root is not None:
+        env["HOME"] = str(inputs.home_root)
+    if inputs.extra_env:
+        env.update(inputs.extra_env)
+    return env
 
 
 def _build_cc_args(suite: SuiteId, prompt: str) -> tuple[str, ...]:
@@ -823,6 +907,68 @@ def kill_process_group(
             return None
 
 
+def codex_launcher(inputs: LaunchInputs) -> LaunchSpec:
+    """Build a LaunchSpec for the `codex` CLI per the H10 contract.
+
+    - argv: `codex exec --sandbox read-only "<prompt>"` for capability/
+      compliance/safety. Implementation × codex is gated out by the
+      runner (ADR-B); `_build_codex_args` raises if it reaches there.
+    - env: `CODEX_HOME=stub_home` (codex's auth.json + config.toml live
+      under this dir) AND `HOME=home_root`. XDG_* stripped via
+      `_build_codex_env`.
+    - INV-PERM-1: codex uses `--sandbox read-only` rather than cc's
+      `--permission-mode plan`, but the runner-side check still
+      validates inputs against `PERMISSION_MODE_MAP[(suite, codex)]`.
+
+    Args:
+        inputs: LaunchInputs (typed). `inputs.cli` MUST equal `"codex"`.
+
+    Returns:
+        A LaunchSpec ready to be passed to `spawn_cli(spec, inputs)`.
+
+    Raises:
+        ValueError: cli is not "codex".
+        RuntimeError: implementation suite reached (ADR-B), OR sandbox
+            wrapper requested (codex doesn't use the cc-style process-
+            level sandbox; its built-in --sandbox flag is the boundary).
+    """
+    if inputs.cli != "codex":
+        raise ValueError(
+            f"codex_launcher requires inputs.cli='codex', got {inputs.cli!r}"
+        )
+    assert_permission_mode_valid(inputs)
+
+    binary = shutil.which("codex") or "codex"
+    args = _build_codex_args(inputs.suite, inputs.prompt)
+    env = _build_codex_env(inputs)
+
+    # codex carries its own --sandbox; we do NOT layer the cc-style
+    # bwrap/sandbox-exec wrapper on top. SANDBOX_PROFILE_MAP for
+    # codex is None per H7's table; reaching this branch with a
+    # non-None profile is a SUITE-table misconfiguration.
+    if inputs.sandbox_profile is not None:
+        raise RuntimeError(
+            f"codex_launcher: sandbox_profile={inputs.sandbox_profile!r} "
+            f"requested, but codex uses its built-in --sandbox flag "
+            f"(SANDBOX_PROFILE_MAP[(suite, 'codex')] should be None)"
+        )
+
+    return LaunchSpec(
+        cmd=binary,
+        args=args,
+        cwd=inputs.fixture_dir,
+        env=env,
+        sandbox_wrapper=(),
+    )
+
+
+def _probe_auth_codex_proxy() -> AuthProbeResult:
+    """Module-level codex auth probe binding (mirrors cc proxy)."""
+    from . import auth as _auth
+
+    return _auth.probe_auth("codex", "default")
+
+
 def _probe_auth_cc_proxy() -> AuthProbeResult:
     """Module-level cc auth probe binding.
 
@@ -846,4 +992,15 @@ CLI_REGISTRY["cc"] = CliEntry(
     binary="claude",
     launcher=cc_launcher,
     auth_probe=_probe_auth_cc_proxy,
+)
+
+# H10: codex launcher. Implementation × codex is gated at the runner
+# (ADR-B); codex runs capability/compliance/safety with `--sandbox
+# read-only`. CODEX_HOME=stub_home isolates auth.json from the user's
+# real ~/.codex/ per F01/HIGH-02.
+CLI_REGISTRY["codex"] = CliEntry(
+    cli_id="codex",
+    binary="codex",
+    launcher=codex_launcher,
+    auth_probe=_probe_auth_codex_proxy,
 )

@@ -126,9 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "suite",
-        nargs="?",
+        nargs="*",
         choices=list(SUITE_MANIFEST) + ["all"],
-        help="suite to run, or 'all'",
+        help=(
+            "one or more suites to run, in canonical order "
+            "(capability < compliance < safety < implementation), "
+            "or 'all'. INV-RUN-8: out-of-order positional values "
+            "exit 64."
+        ),
     )
     parser.add_argument(
         "--cli",
@@ -187,13 +192,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-budget-input",
         type=int,
         default=None,
-        help="abort run if cumulative input tokens reach N",
+        help=(
+            "abort run if cumulative input tokens reach N. "
+            "NOTE (H8 R1-B-MED-1): in multi-suite invocations the "
+            "budget is enforced per-sub-run, not across sub-runs — "
+            "`--token-budget-input 1000 safety implementation` lets "
+            "EACH suite spend up to 1000."
+        ),
     )
     parser.add_argument(
         "--token-budget-output",
         type=int,
         default=None,
-        help="abort run if cumulative output tokens reach N",
+        help=(
+            "abort run if cumulative output tokens reach N. See "
+            "--token-budget-input for multi-suite semantics."
+        ),
     )
     parser.add_argument(
         "--results-root",
@@ -275,6 +289,114 @@ def _ux13_bad_resume(run_id: str) -> int:
         "  example: 2026-04-29T10-15-22Z-12345-0001-AaBbCcDd\n"
     )
     return 64
+
+
+# H8 / INV-RUN-8: canonical suite execution order. Implementation runs
+# AFTER safety because implementation uses cc with
+# `--dangerously-skip-permissions` and a process-level sandbox; safety
+# verifies rule-citation refusal under `--permission-mode plan` first,
+# so a regression in the safety baseline is caught before any
+# permission escalation. Compliance + capability are cheap canaries
+# that gate the harness wiring before either of those.
+_CANONICAL_SUITE_ORDER: tuple[str, ...] = (
+    "capability",
+    "compliance",
+    "safety",
+    "implementation",
+)
+
+# H8 R1-B-HIGH-4: assert canonical-order set matches SUITE_MANIFEST.
+# A future PR that adds a 5th suite to SUITE_MANIFEST without updating
+# `_CANONICAL_SUITE_ORDER` would silently produce 64-exit on every
+# run. This assertion catches the drift at module-import time.
+assert set(_CANONICAL_SUITE_ORDER) == set(SUITE_MANIFEST), (
+    f"INV-RUN-8 drift: _CANONICAL_SUITE_ORDER={_CANONICAL_SUITE_ORDER} "
+    f"missing or extra entries vs SUITE_MANIFEST={SUITE_MANIFEST}"
+)
+
+
+def _normalize_and_validate_suites(
+    raw_suites: list[str],
+    *,
+    enforce_canonical_order: bool = True,
+) -> tuple[int, str | None, str | None, tuple[str, ...]]:
+    """Validate the positional suite list and produce a normalized form.
+
+    Returns `(exit_code, error_msg, all_or_none, canonical_tuple)`:
+
+    - `exit_code == 0` → success; consult `all_or_none` and
+      `canonical_tuple`.
+    - `exit_code == 64` → input is invalid; `error_msg` is the user-
+      visible reason. The CLI returns 64 to the OS.
+
+    Normalized output:
+
+    - `("all", ())` when the user passed exactly `["all"]`. Downstream
+      consumers expand to `SUITE_MANIFEST`.
+    - `(None, ("safety", "implementation"))` when the user passed an
+      explicit ordered list. The tuple is in CANONICAL order regardless
+      of input order — but if the input order violates canonical
+      order, we already returned 64 via `error_msg`.
+
+    Empty list returns `(0, None, None, ())` so the caller can show
+    the usage banner.
+    """
+    if not raw_suites:
+        return 0, None, None, ()
+    # Reject mixing "all" with specific suites — semantically ambiguous.
+    if "all" in raw_suites and len(raw_suites) > 1:
+        return (
+            64,
+            "cannot combine 'all' with specific suite names",
+            None,
+            (),
+        )
+    if raw_suites == ["all"]:
+        return 0, None, "all", ()
+    # Reject duplicates explicitly — argparse's `choices` allows them,
+    # but the canonical-ordering check below would surface them as
+    # "ordering violation" with a less clear message.
+    seen: set[str] = set()
+    for s in raw_suites:
+        if s in seen:
+            return (
+                64,
+                f"suite {s!r} listed twice — each suite may run at "
+                f"most once per invocation",
+                None,
+                (),
+            )
+        seen.add(s)
+    # Canonical ordering check (INV-RUN-8 / AC-32-quat). Optional —
+    # `--validate` skips this since it's a schema-only operation
+    # (B-MED-3). Membership in canonical order is still checked as a
+    # defense-in-depth backstop for argparse `choices=` regressions.
+    positions = {name: idx for idx, name in enumerate(_CANONICAL_SUITE_ORDER)}
+    last_pos = -1
+    for s in raw_suites:
+        if s not in positions:
+            # argparse `choices=` already rejects unknown names; reaching
+            # here means SUITE_MANIFEST drifted from _CANONICAL_SUITE_ORDER.
+            return (
+                64,
+                f"INV-RUN-8 sanity: suite {s!r} not in canonical order "
+                f"(rebuild _CANONICAL_SUITE_ORDER)",
+                None,
+                (),
+            )
+        if enforce_canonical_order and positions[s] <= last_pos:
+            return (
+                64,
+                (
+                    f"ordering violation (INV-RUN-8): suite {s!r} cannot "
+                    f"follow a later canonical suite. Canonical order: "
+                    f"{', '.join(_CANONICAL_SUITE_ORDER)}"
+                ),
+                None,
+                (),
+            )
+        last_pos = positions[s]
+    return 0, None, None, tuple(raw_suites)
 
 
 # ---------------------------------------------------------------------------
@@ -374,14 +496,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     invocation = " ".join(["coc-eval/run.py", *raw_argv])
 
+    # H8 / INV-RUN-8: validate the positional suite list (with canonical
+    # ordering) BEFORE other branches consume it. Empty list is OK at
+    # this point — `--validate` and `--list-profiles` don't need a
+    # suite; the run-loop branch checks for an empty list itself.
+    #
+    # H8 R1-B-MED-3: `--validate` is a schema-only operation that does
+    # NOT execute tests. Ordering enforcement is a RUNTIME invariant
+    # (sandbox-after-safety). Skip the ordering check for --validate
+    # so an operator can `--validate implementation safety` without
+    # being forced to retype in canonical order. Other guards
+    # (duplicates, mixing 'all' + specific) still apply.
+    rc_suite, suite_err, suite_all, suite_tuple = _normalize_and_validate_suites(
+        args.suite, enforce_canonical_order=not args.validate
+    )
+    if rc_suite != 0:
+        _err(suite_err or "suite validation failed")
+        return rc_suite
+
     # Standalone modes (no run loop).
     if args.list_profiles:
         return cmd_list_profiles()
     if args.validate:
-        # `--validate` operates on the registered suites; an explicit `suite`
-        # narrows the target. `all` and "no suite" both mean "every suite".
-        if args.suite and args.suite != "all":
-            return cmd_validate([args.suite])
+        # `--validate` operates on the registered suites; explicit
+        # suite list narrows the target. Empty list and 'all' both mean
+        # "every suite".
+        if suite_tuple:
+            return cmd_validate(list(suite_tuple))
         return cmd_validate()
 
     # Validate --resume run_id BEFORE further work — UX-13 case E.
@@ -403,8 +544,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             _err(f"--profile: {e}")
             return 64
 
-    # From here we need a suite.
-    if args.suite is None:
+    # From here we need a suite. Empty positional list AND no 'all' means
+    # show the banner and exit 64 (UX-13 D — no usable input).
+    if not suite_all and not suite_tuple:
         sys.stderr.write(_USAGE_BANNER)
         return 64
 
@@ -424,21 +566,83 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Cross-validate test ids against the manifest for the chosen suite(s).
     if tests_csv:
-        suites_for_check = list(SUITE_MANIFEST) if args.suite == "all" else [args.suite]
+        suites_for_check = list(SUITE_MANIFEST) if suite_all else list(suite_tuple)
         valid_ids: set[str] = set()
         for s in suites_for_check:
             valid_ids.update(SUITE_TEST_MANIFESTS.get(s, ()))
         for t in tests_csv:
             if t not in valid_ids:
                 # Surface the per-suite manifest for the operator.
-                target_suite = (
-                    args.suite if args.suite != "all" else suites_for_check[0]
-                )
+                target_suite = suites_for_check[0] if suites_for_check else "all"
                 return _ux13_unknown_test(target_suite, t)
+
+    # H8: when multiple suites are explicitly listed, run them sequentially
+    # via runner.run() one at a time so each gets its own selection. The
+    # canonical-ordering check above already guarantees they are in the
+    # safe-execution order. A single suite (or 'all') flows the original
+    # path. The aggregate exit code is the worst of all per-suite codes.
+    selection_arg = "all" if suite_all else suite_tuple[0]
+    if not suite_all and len(suite_tuple) > 1:
+        # H8 R1-B-HIGH-1: --resume + multi-suite is unsupported. The
+        # parse_resume side effects (delete in-flight JSONL files) would
+        # repeat per sub-run, and INTERRUPTED.json would be overwritten
+        # by the second sub-run with stale state. Reject explicitly
+        # rather than silently corrupting resume state.
+        if resume_run_id is not None:
+            _err(
+                "--resume is not supported with multi-suite invocations. "
+                "Resume one suite at a time, or wait for full multi-suite "
+                "resume support (tracked under H9+)."
+            )
+            return 64
+
+        # H8 R1-B-HIGH-3: generate ONE run_id upfront so all sub-runs
+        # write to the same `results/<run_id>/` directory and the
+        # operator sees a single run_id printed at start AND end (even
+        # though each sub-run echoes it). AC-45 contract preserved.
+        from lib.run_id import generate_run_id  # noqa: E402
+
+        shared_run_id = generate_run_id()
+
+        worst_rc = 0
+        fmt = _resolve_format(args.format)
+        base_results_dir = (
+            Path(args.results_root).resolve() if args.results_root else None
+        )
+        for sname in suite_tuple:
+            try:
+                sub_selection = runner.resolve_selection(
+                    sname,
+                    args.cli,
+                    tests=tests_csv or None,
+                    tags=tags or None,
+                    skip_clis=args.skip_cli,
+                    skip_suites=args.skip_suite,
+                )
+            except ValueError as e:
+                _err(str(e))
+                return 64
+            sub_rc = runner.run(
+                sub_selection,
+                format=fmt,
+                run_id_override=shared_run_id,
+                base_results_dir=base_results_dir,
+                invocation=invocation,
+                token_budget_input=args.token_budget_input,
+                token_budget_output=args.token_budget_output,
+            )
+            # H8 R1-B-HIGH-2: short-circuit on EX_CONFIG (78). Auth
+            # state cannot recover mid-run; running subsequent suites
+            # would just re-print the zero-auth banner per suite.
+            if sub_rc == 78:
+                return 78
+            if sub_rc > worst_rc:
+                worst_rc = sub_rc
+        return worst_rc
 
     try:
         selection = runner.resolve_selection(
-            args.suite,
+            selection_arg,
             args.cli,
             tests=tests_csv or None,
             tags=tags or None,

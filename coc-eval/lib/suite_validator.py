@@ -98,6 +98,35 @@ def validate_suite(suite: dict[str, Any]) -> None:
         # scoring_backend enum is enforced by the schema layer (suite-v1.json);
         # no redundant check here.
 
+        # H8 R1-C-HIGH-2: validate setup_fn / scaffold mutual exclusion + shape.
+        # `setup_fn` MUST be callable; `scaffold` MUST be a string. Both
+        # set together is rejected. The runner's _resolve_test_setup_fn
+        # also enforces this at runtime, but catching at SUITE-load time
+        # gives operators a clearer error before any spawn cost.
+        scaffold_v = test.get("scaffold")
+        setup_fn_v = test.get("setup_fn")
+        if scaffold_v is not None and setup_fn_v is not None:
+            raise SuiteValidationError(
+                f"test {tid!r}: cannot set both `scaffold` and "
+                f"`setup_fn` — pick one"
+            )
+        if scaffold_v is not None and not isinstance(scaffold_v, str):
+            raise SuiteValidationError(
+                f"test {tid!r}: `scaffold` must be a string, got "
+                f"{type(scaffold_v).__name__}"
+            )
+        if setup_fn_v is not None:
+            if isinstance(setup_fn_v, type):
+                raise SuiteValidationError(
+                    f"test {tid!r}: `setup_fn` must not be a class — "
+                    f"pass a function or callable instance instead"
+                )
+            if not callable(setup_fn_v):
+                raise SuiteValidationError(
+                    f"test {tid!r}: `setup_fn` must be callable, got "
+                    f"{type(setup_fn_v).__name__}"
+                )
+
         # R1-A-MED-2: refuse SUITE entries that mix backend signals.
         # tiered_artifact MUST have non-empty `scoring.tiers` and
         # MUST NOT carry per-CLI `expect[cli]` lists. regex MUST have

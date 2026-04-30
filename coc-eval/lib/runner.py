@@ -189,6 +189,55 @@ def score_regex(criteria: Sequence[Mapping[str, Any]], stdout: str) -> dict[str,
 _SCAFFOLDS_DIR: Path = Path(__file__).resolve().parent.parent / "scaffolds"
 
 
+def _resolve_test_setup_fn(
+    test_def: Mapping[str, Any],
+) -> Callable[[Path], None] | None:
+    """Resolve the setup_fn for a SUITE test entry.
+
+    Two sources are supported:
+
+    - `scaffold` field (H7, implementation suite): names a directory
+      under `coc-eval/scaffolds/` whose contents are layered into the
+      fixture before git-init. Validation + symlink defense in
+      `_build_scaffold_setup_fn`.
+    - `setup_fn` field (H8, safety suite SF4): a Python callable
+      `(fixture_dir: Path) -> None` invoked with the prepared fixture
+      root before git-init. Used by safety SF4 to write `notes.md`
+      with embedded injection bait.
+
+    Both fields together are rejected — a SUITE entry must pick one.
+    Returns None when neither field is present.
+    """
+    scaffold = test_def.get("scaffold")
+    setup_callable = test_def.get("setup_fn")
+    if scaffold is not None and setup_callable is not None:
+        raise ValueError(
+            f"test {test_def.get('name')!r}: cannot use both `scaffold` "
+            f"and `setup_fn` — pick one"
+        )
+    if scaffold is not None:
+        return _build_scaffold_setup_fn(test_def)
+    if setup_callable is not None:
+        # H8 R1-A-MED-3: narrow `callable()` to function-shaped objects.
+        # Bare classes (whose __call__ is __init__) are rejected so a
+        # SUITE author can't accidentally trigger class instantiation
+        # with side effects during fixture prep. `functools.partial`,
+        # bound methods, and lambdas remain accepted via the duck-type
+        # `callable(...)` check.
+        if isinstance(setup_callable, type):
+            raise ValueError(
+                f"test {test_def.get('name')!r}: `setup_fn` must not be "
+                f"a class — pass a function or callable instance instead"
+            )
+        if not callable(setup_callable):
+            raise ValueError(
+                f"test {test_def.get('name')!r}: `setup_fn` must be "
+                f"callable, got {type(setup_callable).__name__}"
+            )
+        return setup_callable
+    return None
+
+
 def _build_scaffold_setup_fn(
     test_def: Mapping[str, Any],
 ) -> Callable[[Path], None] | None:
@@ -646,7 +695,7 @@ def _run_one_attempt(
     permission_mode = PERMISSION_MODE_MAP[(suite_typed, cli)]
     sandbox = SANDBOX_PROFILE_MAP.get((suite_typed, cli))
 
-    setup_fn = _build_scaffold_setup_fn(test_def)
+    setup_fn = _resolve_test_setup_fn(test_def)
     fixture_dir = fixtures.prepare_fixture(fixture_name, setup_fn=setup_fn)
     fixtures.verify_fresh(fixture_dir)
 
@@ -1016,10 +1065,13 @@ def run_test_with_retry(
             record["attempts"] = attempt
             record["attempt_states"] = [s.value for s in attempt_states]
             return record
-        except RuntimeError as e:
-            # INV-PERM-1 violation, INV-ISO-6 violation, sandbox failure, etc.
-            # Surface as error_invocation without retry — these are
-            # programming errors, not flake.
+        except (RuntimeError, ValueError) as e:
+            # INV-PERM-1 violation, INV-ISO-6 violation, sandbox failure,
+            # malformed SUITE entry (`scoring`/`scaffold`/`setup_fn`
+            # validation), or unknown scoring_backend. Surface as
+            # error_invocation without retry — these are programming
+            # errors, not flake. H8 R1-A-HIGH-1: ValueError is now caught
+            # too (was previously uncaught and crashed the whole run).
             attempt_states.append(State.ERROR_INVOCATION)
             record = _stamp_error_invocation_record(suite, test_def, cli, ctx, str(e))
             record["attempts"] = attempt
@@ -1592,6 +1644,7 @@ def run(
     *,
     format: str = "pretty",
     resume_run_id: str | None = None,
+    run_id_override: str | None = None,
     base_results_dir: Path | None = None,
     invocation: str | None = None,
     token_budget_input: int | None = None,
@@ -1607,6 +1660,12 @@ def run(
     1 → one or more tests failed.
     78 (EX_CONFIG) → zero-auth state, no work attempted.
     130 → SIGINT.
+
+    `run_id_override` (H8 R1-B-HIGH-3): when set (and `resume_run_id`
+    is None), use this string as the run_id directly without invoking
+    `parse_resume`. The multi-suite execution loop in `run.py` uses
+    this so every sub-run shares ONE run_id without re-running resume
+    side effects (which delete in-flight JSONL files).
     """
     out_stream = out if out is not None else sys.stdout
     err_stream = err if err is not None else sys.stderr
@@ -1619,10 +1678,28 @@ def run(
     else:
         registry = suite_registry
 
-    # Resume: derive the run_id from --resume; otherwise generate.
+    # H8 R1-B-HIGH-3: if both resume and override are passed, prefer
+    # the explicit resume (it carries the parse_resume side effects).
+    # Multi-suite invocations supply one or the other, never both.
+    if resume_run_id is not None and run_id_override is not None:
+        raise ValueError(
+            "runner.run: pass at most one of resume_run_id, run_id_override"
+        )
+
+    # Resume: derive the run_id from --resume; otherwise use override
+    # or generate.
     if resume_run_id is not None:
         run_id = resume_run_id
         completed, run_dir = parse_resume(run_id, base_results_dir)
+    elif run_id_override is not None:
+        run_id = run_id_override
+        completed = set()
+        base = (
+            base_results_dir
+            if base_results_dir is not None
+            else (Path(__file__).resolve().parent.parent / "results")
+        )
+        run_dir = base / run_id
     else:
         run_id = generate_run_id()
         completed = set()

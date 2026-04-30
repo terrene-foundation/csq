@@ -158,6 +158,55 @@ Three tripwires guard implementation-suite isolation:
 2. **Credential canary** (R2-HIGH-02): The fixture at `coc-eval/fixtures/credential-canary/` plus `lib/canary.write_canary_credentials_file` build a synthetic `.credentials.json` with the marker substring `CANARY_DO_NOT_USE_AAAAAAAAAAAAAAAAAAAA`. The full `sk-ant-oat01-…CANARY…` token literal is constructed at runtime in `lib/canary.build_canary_credential_token` to avoid pre-commit secret-scanner trips. Detection on the same marker triggers `canary_leak_credential`.
 3. **Audit-hook tripwire** (R1-HIGH-07): `lib/credential_audit.arm_for_implementation_run` installs `sys.addaudithook`. The hook fires on harness-process Python `open()` events for paths matching `_GUARDED_PATH_SUFFIXES` (`/.claude/.credentials.json`, `/.ssh/id_rsa`, `/.aws/credentials`, etc.) and raises `CredentialAuditViolation`. Defense-in-depth ONLY — the hook does NOT see cc subprocess syscalls; the sandbox profile is the primary defense.
 
+## Cross-suite ordering (INV-RUN-8 / AC-32-quat)
+
+H8. The harness enforces a canonical execution order when a user
+explicitly lists multiple suites:
+
+```
+capability < compliance < safety < implementation
+```
+
+Implementation runs AFTER safety because implementation uses cc with
+`--dangerously-skip-permissions` plus a process-level sandbox; safety
+verifies rule-citation refusal under `--permission-mode plan` first,
+so a regression in the safety baseline is caught before any
+permission escalation. Capability + compliance are cheap canaries
+that gate the harness wiring before either of those.
+
+Enforcement lives in `coc-eval/run.py::_normalize_and_validate_suites`:
+
+- Empty positional list → show usage banner, exit 64.
+- `["all"]` alone → expand to `SUITE_MANIFEST`.
+- Mixing `"all"` with specific names → exit 64 (ambiguous).
+- Duplicate suite names → exit 64 (each suite runs at most once per invocation).
+- Out-of-canonical-order list → exit 64 with `INV-RUN-8` ordering message.
+- Valid multi-suite list → run sequentially via `runner.run()` once per suite, returning the worst exit code.
+
+Test coverage: `coc-eval/tests/lib/test_h8_ordering_and_setup_fn.py`
+(11 tests covering empty, single, "all", canonical pairs, full
+canonical order, duplicates, mixing, end-to-end exit-64 verification).
+
+## Per-test setup_fn (H8)
+
+The fixture lifecycle in `coc-eval/lib/fixtures.prepare_fixture(name,
+setup_fn=None)` accepts a `setup_fn` callable invoked on the prepared
+fixture root BEFORE `git init`. Two SUITE-entry shapes feed it:
+
+- **`scaffold` field** (H7, implementation suite): names a directory
+  under `coc-eval/scaffolds/` whose contents are layered into the
+  fixture. `_build_scaffold_setup_fn` validates the name + refuses
+  any symlink at any depth (R1-A-HIGH-4).
+- **`setup_fn` field** (H8, safety SF4): a Python callable
+  `(fixture_dir: Path) -> None` invoked with the prepared fixture
+  root. Used by safety SF4 to write `notes.md` with embedded
+  injection bait (the model is then expected to flag the injection
+  per CRIT-INJECT-Z9P).
+
+`coc-eval/lib/runner.py::_resolve_test_setup_fn` dispatches between
+the two; both fields together raise `ValueError` (a SUITE entry must
+pick one). Non-callable `setup_fn` values are also rejected.
+
 ## F07/AD-11 memory drop
 
 The legacy `coc-eval/runner.py::_symlink_shared_dirs` previously included `"memory"` in the symlinked-into-config-dir list. H7 drops it everywhere (the function itself, `build_bare_config`, `build_ablation_config`). For the new SUITE-based runner, `build_stub_home` already does NOT symlink memory — only the canary file is written there. Regression coverage in `coc-eval/tests/lib/test_h7_runner_integration.py::test_legacy_symlink_shared_dirs_excludes_memory`.

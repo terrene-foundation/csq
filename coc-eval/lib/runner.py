@@ -55,7 +55,6 @@ from .launcher import (
     PERMISSION_MODE_MAP,
     SANDBOX_PROFILE_MAP,
     SuiteId,
-    cc_launcher,
 )
 from .run_id import generate_run_id, validate_run_id
 from .states import State
@@ -751,17 +750,16 @@ def _run_one_attempt(
     else:
         target_cwd = fixture_dir
 
-    if cli != "cc":
-        # Defense-in-depth: run_suite already gates on CLI_REGISTRY +
-        # `shutil.which(binary)` and stamps `skipped_cli_missing`. Reaching
-        # here means a launcher was registered for a CLI other than cc but
-        # the runner has no per-CLI dispatch path yet (codex/gemini land in
-        # H10/H11). Surface as a structured RuntimeError so the caller's
-        # `except RuntimeError` path stamps `error_invocation` without
-        # retry, and the run continues to the next test.
+    # H10: per-CLI launcher dispatch via CLI_REGISTRY. The H7-era
+    # `cli != "cc"` guard is replaced by a registry lookup; codex
+    # ships in H10, gemini in H11. Unknown CLIs raise RuntimeError so
+    # the caller's `except (RuntimeError, ValueError)` path stamps
+    # error_invocation without retry.
+    cli_entry = CLI_REGISTRY.get(cli)
+    if cli_entry is None:
         raise RuntimeError(
-            f"runner phase-1 dispatch: cli={cli!r} has no per-CLI runner "
-            "(only 'cc' registered). Skip via --cli or wait for H10/H11."
+            f"runner: cli={cli!r} not in CLI_REGISTRY "
+            f"(known: {sorted(CLI_REGISTRY.keys())})"
         )
 
     stub_home, home_root = launcher.build_stub_home(suite_typed, fixture_dir)
@@ -775,7 +773,7 @@ def _run_one_attempt(
         home_root=home_root,
         sandbox_profile=sandbox,
     )
-    spec = cc_launcher(inputs)
+    spec = cli_entry.launcher(inputs)
     # cwd override for cwdSubdir tests.
     if target_cwd != fixture_dir:
         spec = launcher.LaunchSpec(

@@ -121,6 +121,12 @@ def _hook(event: str, args: tuple[Any, ...]) -> None:
         return
     if not args:
         return
+    # H10 round-1 followup: respect the install-once flag so
+    # `disarm_for_tests()` actually disarms within a single Python
+    # process. `sys.addaudithook` cannot be removed, but checking
+    # `_installed` here lets cross-test-file isolation work.
+    if not _installed:
+        return
     raw_path = args[0]
     if isinstance(raw_path, bytes):
         # `errors='replace'` cannot raise — guaranteed to return a str. Pyright

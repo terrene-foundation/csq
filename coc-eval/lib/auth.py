@@ -35,9 +35,29 @@ _AUTH_CACHE: dict[tuple[str, str], AuthProbeResult] = {}
 _PROBE_TIMEOUT_SEC: float = 10.0
 _VERSION_TIMEOUT_SEC: float = 5.0
 
+# H10 R1-MED-1: codex `exec ping` round-trips through ChatGPT API.
+# Cold-start + model-load on a slow link can exceed 10s, especially
+# on first use of the day. Raised to 20s for codex specifically; cc
+# stays at 10s (well-tuned local-network OAuth refresh path).
+_CODEX_PROBE_TIMEOUT_SEC: float = 20.0
+
 # Mid-run stderr lines containing any of these substrings invalidate the
 # auth cache (caller scans stderr line-by-line via `is_auth_error_line`).
-_AUTH_ERROR_PATTERNS: tuple[str, ...] = ("401", "invalid_grant", "expired_token")
+# H10 R1-HIGH-2: codex patterns tightened. Bare `"unauthorized"` would
+# false-positive on legitimate model output discussing auth (e.g. a
+# model explanation containing the word). Anchor each codex pattern
+# to an HTTP-style or error-shape context so prose mentions don't
+# trigger a cache flush + re-probe.
+_AUTH_ERROR_PATTERNS: tuple[str, ...] = (
+    "401",
+    "invalid_grant",
+    "expired_token",
+    "401 Unauthorized",
+    "Error: Token expired",
+    "error: Token expired",
+    "Please sign in to ChatGPT",
+    "codex login required",
+)
 
 
 def probe_auth(
@@ -66,10 +86,12 @@ def probe_auth(
 
     if cli == "cc":
         result = _probe_cc(env)
+    elif cli == "codex":
+        result = _probe_codex(env)
     else:
         result = AuthProbeResult(
             ok=False,
-            reason=f"no probe registered for cli={cli!r} (H10/H11 add codex/gemini)",
+            reason=f"no probe registered for cli={cli!r} (H11 adds gemini)",
             version="",
             probed_at=time.monotonic(),
         )
@@ -180,6 +202,89 @@ def _probe_cc(env: Mapping[str, str] | None) -> AuthProbeResult:
     # echoing refresh-token prefixes inside `invalid_grant` responses
     # (journals 0007 + 0010) — the probe MUST NOT carry an unredacted token
     # in `AuthProbeResult.reason` even briefly.
+    stderr_text = (result.stderr or "").strip()
+    raw = stderr_text[:500] if stderr_text else f"exit code {result.returncode}"
+    reason = redact_tokens(raw)
+    return AuthProbeResult(
+        ok=False,
+        reason=reason,
+        version=version,
+        probed_at=time.monotonic(),
+    )
+
+
+def _probe_codex(env: Mapping[str, str] | None) -> AuthProbeResult:
+    """Real codex probe: `codex --version` for version capture, then
+    `codex exec --sandbox read-only "ping"` for auth validation.
+
+    Mirrors `_probe_cc`. codex's auth lives at `$CODEX_HOME/auth.json`
+    (or `~/.codex/auth.json` if CODEX_HOME unset); the probe will
+    surface auth failures via non-zero exit code + stderr containing
+    the patterns in `_AUTH_ERROR_PATTERNS`.
+    """
+    binary = shutil.which("codex")
+    if binary is None:
+        return AuthProbeResult(
+            ok=False,
+            reason="codex binary not found on PATH",
+            version="",
+            probed_at=time.monotonic(),
+        )
+
+    probe_env: dict[str, str] | None
+    if env is None:
+        probe_env = None
+    else:
+        probe_env = dict(env)
+        probe_env.setdefault("PATH", os.environ.get("PATH", ""))
+
+    version = ""
+    try:
+        v = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_VERSION_TIMEOUT_SEC,
+            env=probe_env,
+            check=False,
+        )
+        if v.returncode == 0:
+            version = v.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    try:
+        result = subprocess.run(
+            [binary, "exec", "--sandbox", "read-only", "ping"],
+            capture_output=True,
+            text=True,
+            timeout=_CODEX_PROBE_TIMEOUT_SEC,
+            env=probe_env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return AuthProbeResult(
+            ok=False,
+            reason=f"probe timed out after {_CODEX_PROBE_TIMEOUT_SEC:.0f}s",
+            version=version,
+            probed_at=time.monotonic(),
+        )
+    except OSError as e:
+        return AuthProbeResult(
+            ok=False,
+            reason=f"probe spawn failed: {e}",
+            version=version,
+            probed_at=time.monotonic(),
+        )
+
+    if result.returncode == 0:
+        return AuthProbeResult(
+            ok=True,
+            reason=None,
+            version=version,
+            probed_at=time.monotonic(),
+        )
+
     stderr_text = (result.stderr or "").strip()
     raw = stderr_text[:500] if stderr_text else f"exit code {result.returncode}"
     reason = redact_tokens(raw)

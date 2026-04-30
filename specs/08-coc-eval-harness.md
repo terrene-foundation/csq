@@ -124,6 +124,40 @@ Merged settings post-overlay MUST contain only keys in `{"env", "model", "permis
 
 `cleanup_eval_tempdirs()` finalizer at run start AND end removes every `/tmp/csq-eval-*` older than the current run. Mkdtemp directories with credential symlinks MUST NOT survive process exit (HIGH-03 #3).
 
+## Codex activation (H10)
+
+`coc-eval/lib/launcher.codex_launcher` ships in H10. Contract:
+
+- **argv**: `codex exec --sandbox read-only "<prompt>"` for capability/
+  compliance/safety. Implementation × codex is gated out at the runner
+  (ADR-B); `_build_codex_args("implementation", …)` raises.
+- **env**: `CODEX_HOME=<stub_home>` (codex reads `auth.json` /
+  `config.toml` from this dir), `HOME=<home_root>`, `PATH` preserved,
+  XDG\_\* stripped via `_filter_env_keys`. Per F01/HIGH-02 mitigation —
+  codex MUST NOT read the user's real `~/.codex/`.
+- **sandbox**: codex carries its own `--sandbox read-only` flag; we
+  do NOT layer the cc-style bwrap/sandbox-exec wrapper on top.
+  `SANDBOX_PROFILE_MAP[(suite, "codex")]` is `None` for every suite;
+  `codex_launcher` raises if a non-None profile is requested.
+- **permission_mode**: `PERMISSION_MODE_MAP[(suite, "codex")] =
+"read-only"` for capability/compliance/safety;
+  `PERMISSION_MODE_MAP[("implementation", "codex")] = None` (skipped).
+- **timeout**: `CLI_TIMEOUT_MS[(suite, "codex")] = 60_000` for
+  capability/compliance/safety.
+- **auth probe**: `lib.auth.probe_auth("codex", suite)` runs
+  `codex exec --sandbox read-only "ping"` with a 10s timeout. Mid-run
+  stderr containing `unauthorized`, `Token expired`, or `Sign in to
+ChatGPT` triggers `mark_auth_changed("codex")`.
+- **stub_home extension**: `build_stub_home` symlinks
+  `~/.codex/auth.json` and `~/.codex/config.toml` into `<stub_home>/`
+  alongside cc's `.credentials.json` when present (best-effort —
+  absent → codex probe lands `skipped_cli_auth`).
+
+Per-CLI dispatch in `runner._run_one_attempt` consults
+`CLI_REGISTRY.get(cli)` rather than the H7-era `cli != "cc"` guard.
+Unknown CLIs raise `RuntimeError`; the existing exception handler in
+`run_test_with_retry` stamps `error_invocation`.
+
 ## Aggregator + baselines (H9)
 
 `coc-eval/aggregate.py` consumes JSONL records and renders a matrix

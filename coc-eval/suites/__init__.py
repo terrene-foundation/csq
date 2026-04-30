@@ -11,10 +11,12 @@ from typing import Any
 
 from .capability import SUITE as CAPABILITY_SUITE
 from .compliance import SUITE as COMPLIANCE_SUITE
+from .implementation import SUITE as IMPLEMENTATION_SUITE
 
 SUITE_REGISTRY: dict[str, dict[str, Any]] = {
     "capability": CAPABILITY_SUITE,
     "compliance": COMPLIANCE_SUITE,
+    "implementation": IMPLEMENTATION_SUITE,
 }
 
 __all__ = ["SUITE_REGISTRY"]

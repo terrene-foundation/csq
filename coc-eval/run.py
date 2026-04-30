@@ -92,6 +92,13 @@ EXAMPLES
   coc-eval/run.py --list-profiles
   coc-eval/run.py --resume 2026-04-29T10-15-22Z-12345-0001-AaBbCcDd
 
+LEGACY COMPAT (H7 — informational only; legacy runner.py shim)
+  --mode {full,coc-only,bare}            ablation mode for the legacy single-CLI runner
+  --ablation-group {no-rules,no-agents,no-skills,rules-only}
+                                          which COC layer to strip (legacy ablation)
+  --profile NAME                          settings profile name (e.g. opus, sonnet);
+                                          validated via validate_name (CRIT-02)
+
 EXIT CODES
   0    success
   1    tests failed
@@ -195,6 +202,38 @@ def build_parser() -> argparse.ArgumentParser:
             "directory to write JSONL + logs under (default: "
             "coc-eval/results/). Tests pass a tmp_path to avoid "
             "polluting the developer tree."
+        ),
+    )
+    # Implementation-suite ablation flags (FR-10). Accepted by run.py for
+    # forward compat with the legacy runner.py shim — the new SUITE-based
+    # path uses fixtures, not modes. The flags are validated at parse
+    # time; a future PR can wire them to per-test fixture selection.
+    parser.add_argument(
+        "--mode",
+        choices=("full", "coc-only", "bare"),
+        default=None,
+        help=(
+            "implementation-suite ablation mode (legacy compat). "
+            "full=COC + memory; coc-only=COC, no memory; bare=no COC. "
+            "Currently informational; set on the run record only."
+        ),
+    )
+    parser.add_argument(
+        "--ablation-group",
+        choices=("no-rules", "no-agents", "no-skills", "rules-only"),
+        default=None,
+        help=(
+            "implementation-suite ablation layer (legacy compat). "
+            "Validated; informational only in Phase 1."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help=(
+            "settings profile name (e.g. 'opus', 'sonnet'). Validated "
+            "via validate_name (CRIT-02). Use --list-profiles to see "
+            "available."
         ),
     )
     parser.add_argument("-h", "--help", action="store_true")
@@ -352,6 +391,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if not RUN_ID_RE.fullmatch(resume_run_id):
             return _ux13_bad_resume(resume_run_id)
+
+    # Validate --profile (CRIT-02 — path traversal in profile filenames).
+    # `validate_name` rejects `..`, leading dots, slashes, control chars,
+    # and over-length names. AC-38 surface: bad profile name exits 64
+    # with the validator's error message.
+    if args.profile is not None:
+        try:
+            validate_name(args.profile)
+        except ValueError as e:
+            _err(f"--profile: {e}")
+            return 64
 
     # From here we need a suite.
     if args.suite is None:

@@ -6,6 +6,16 @@
 ;; cannot exfiltrate or overwrite them, even if --dangerously-skip-permissions
 ;; would let the cc CLI itself do so.
 ;;
+;; H7 round-1 review (B-CRIT-1 / B-CRIT-2):
+;; - Profile remains `(allow default)` + selective `deny` because cc must
+;;   reach Anthropic's API over HTTPS, read its node binary, and write
+;;   inside the bound fixture root. A `(deny default)` + allowlist is the
+;;   correct long-term shape but requires enumerating every macOS bundle
+;;   path cc transitively reads — out of scope for H7 (tracked for v1.1
+;;   sandbox-framework Rust shim migration). The deny rules below were
+;;   widened to cover the XDG-relocation paths cc may use on macOS plus
+;;   the Library credential locations Apple-side keychain caches use.
+;;
 ;; The capability/compliance/safety suites do NOT load this profile — they
 ;; rely on the HOME override (CLAUDE_CONFIG_DIR + HOME=fixture/_stub_root) as
 ;; the primary defense per spec 08 §"Stub-HOME with $HOME override".
@@ -15,5 +25,29 @@
 
 (version 1)
 (allow default)
-(deny file-read* (regex "^/Users/[^/]+/\\.(?:claude|ssh|codex|gemini|aws|gnupg)(/|$)"))
-(deny file-write* (regex "^/Users/[^/]+/\\.(?:claude|ssh|codex|gemini|aws|gnupg)(/|$)"))
+
+;; Classic dotfile credential locations.
+(deny file-read* (regex "^/Users/[^/]+/\\.(?:claude|ssh|codex|gemini|aws|gnupg|netrc|pgpass|docker|kube|npmrc|pypirc)(/|$)"))
+(deny file-write* (regex "^/Users/[^/]+/\\.(?:claude|ssh|codex|gemini|aws|gnupg|netrc|pgpass|docker|kube|npmrc|pypirc)(/|$)"))
+
+;; XDG-relocated credential paths (B-CRIT-2). cc on macOS may relocate to
+;; ~/.config/claude/.credentials.json or ~/.local/share/claude/. Apple-side
+;; bundle caches live under ~/Library/Application Support/Claude and
+;; ~/Library/Caches/com.anthropic.* — none of those should be readable by
+;; the model.
+(deny file-read* (regex "^/Users/[^/]+/\\.config/claude(/|$)"))
+(deny file-write* (regex "^/Users/[^/]+/\\.config/claude(/|$)"))
+(deny file-read* (regex "^/Users/[^/]+/\\.local/share/claude(/|$)"))
+(deny file-write* (regex "^/Users/[^/]+/\\.local/share/claude(/|$)"))
+(deny file-read* (regex "^/Users/[^/]+/\\.cache/claude(/|$)"))
+(deny file-write* (regex "^/Users/[^/]+/\\.cache/claude(/|$)"))
+(deny file-read* (regex "^/Users/[^/]+/Library/Application Support/Claude(/|$)"))
+(deny file-write* (regex "^/Users/[^/]+/Library/Application Support/Claude(/|$)"))
+(deny file-read* (regex "^/Users/[^/]+/Library/Caches/com\\.anthropic\\."))
+(deny file-write* (regex "^/Users/[^/]+/Library/Caches/com\\.anthropic\\."))
+(deny file-read* (regex "^/Users/[^/]+/Library/Preferences/com\\.anthropic\\."))
+(deny file-write* (regex "^/Users/[^/]+/Library/Preferences/com\\.anthropic\\."))
+
+;; root-account install path (defensive — same-user threat model usually
+;; rules this out, but coverage is cheap).
+(deny file-read* (regex "^/var/root/\\."))

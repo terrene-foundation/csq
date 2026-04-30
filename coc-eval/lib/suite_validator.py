@@ -98,6 +98,48 @@ def validate_suite(suite: dict[str, Any]) -> None:
         # scoring_backend enum is enforced by the schema layer (suite-v1.json);
         # no redundant check here.
 
+        # R1-A-MED-2: refuse SUITE entries that mix backend signals.
+        # tiered_artifact MUST have non-empty `scoring.tiers` and
+        # MUST NOT carry per-CLI `expect[cli]` lists. regex MUST have
+        # non-empty `expect` and MUST NOT carry `scoring`. Mixing
+        # signals is a configuration smell — without this check, a
+        # future maintainer who adds `expect` to a tiered_artifact
+        # entry sees no error but the data is silently ignored.
+        backend = test.get("scoring_backend", "regex")
+        if backend == "tiered_artifact":
+            scoring_block = test.get("scoring")
+            if (
+                not isinstance(scoring_block, dict)
+                or not isinstance(scoring_block.get("tiers"), list)
+                or not scoring_block["tiers"]
+            ):
+                raise SuiteValidationError(
+                    f"test {tid!r}: scoring_backend='tiered_artifact' "
+                    f"requires non-empty `scoring.tiers` list"
+                )
+            expect_block = test.get("expect", {})
+            if isinstance(expect_block, dict):
+                clis_with_criteria = [
+                    cli
+                    for cli in KNOWN_CLI_IDS
+                    if cli in expect_block
+                    and isinstance(expect_block.get(cli), list)
+                    and expect_block.get(cli)
+                ]
+                if clis_with_criteria:
+                    raise SuiteValidationError(
+                        f"test {tid!r}: scoring_backend='tiered_artifact' "
+                        f"must not carry expect[cli] criteria; found: "
+                        f"{clis_with_criteria}"
+                    )
+        elif backend == "regex":
+            if "scoring" in test:
+                raise SuiteValidationError(
+                    f"test {tid!r}: scoring_backend='regex' must not "
+                    f"carry a `scoring` block; that field belongs to "
+                    f"tiered_artifact"
+                )
+
         # INV-PAR-2 criteria-count parity (with skipped_artifact_shape carve-out).
         # Carve-out: if expect[cli] is missing entirely, the cell is implicitly
         # skipped_artifact_shape — exempt from parity (R2-MED-02).

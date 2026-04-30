@@ -124,6 +124,91 @@ Merged settings post-overlay MUST contain only keys in `{"env", "model", "permis
 
 `cleanup_eval_tempdirs()` finalizer at run start AND end removes every `/tmp/csq-eval-*` older than the current run. Mkdtemp directories with credential symlinks MUST NOT survive process exit (HIGH-03 #3).
 
+## Aggregator + baselines (H9)
+
+`coc-eval/aggregate.py` consumes JSONL records and renders a matrix
+of `(suite, test, cli) -> {state, score, runtime}` cells in
+pretty/json/csv/md formats.
+
+**Discovery + run resolution.** Default to the lex-latest run dir
+under `coc-eval/results/`. Explicit `--run-id` is regex-matched and
+must `is_relative_to(results_root.resolve())`; symlinked run dirs and
+symlinked entries during discovery are refused (R1-A-HIGH-2).
+
+**Caps (R1-HIGH-05 / AC-8b).** Per-file 10 MiB; per-record 100 KiB;
+integers must lie in `[-(2**53-1), 2**53-1]`. Reader uses 64 KiB
+chunked reads so a single oversized line cannot blow memory before
+the size check fires. Records exceeding any cap or carrying out-of-
+range ints are dropped to `invalid_records`.
+
+**Schema.** Header records carry `schema_version`. Aggregator default
+rejects mismatch with `--allow-stale` for forensic mode. Subsequent
+headers in the same run dir MUST match the first header's `run_id`
+(R1-A-HIGH-3 — co-mingled runs are forensically unsafe).
+
+**State validation.** State strings are enum-validated against the
+v1.0.0 closed set at load time (R1-B-MED-3). Test records carrying
+`run_id` or `schema_version` top-level keys are refused
+(R1-A-HIGH-4 — header impersonation defense).
+
+**Score validation.** A record with `total < 0`, `max_total < 0`, or
+`total > max_total` (when `max_total > 0`) is refused as malformed
+(R1-B-HIGH-3).
+
+**Gates.**
+
+- `--gate baseline` — fails (rc 1) on any cell below `baselines.json`
+  floor. Both `min_total` and `min_pct` are independently enforced
+  (dual-floor: BOTH must hold). `max_total <= 0` with a `min_pct`
+  floor fails the gate (cannot evaluate ratio).
+- `--full` — fails (rc 2) if any (suite, test, cli) cell from the
+  intersection of `SUITE_TEST_MANIFESTS[suite]` and `run.clis_seen`
+  is missing. `--allow-partial` waives.
+- `--include-quarantined` opts a quarantined cell into the matrix;
+  default skips.
+
+**Quarantine + isolation breach.** Quarantined cells with
+`score.isolation_breach: True` are tracked separately in
+`run.quarantined_breaches` and surfaced as a stderr WARNING banner
+on every aggregator invocation (R1-B-HIGH-5 — quarantine MUST NOT
+silence canary leaks).
+
+**Markdown-injection escape (AC-8a).** `_md_escape` strips control
+characters (`\\x00`–`\\x1f` minus space), escapes `\\|`/`\\\\`/`\\``/
+`[`/`]`, and entity-encodes `<`/`>`. Newlines + carriage returns are
+replaced with a single space (R1-B-HIGH-1 — table cells cannot carry
+row breaks).
+
+**Baselines schema validation.** `_load_baselines` rejects unknown
+leaf keys (typo `min_totl` would otherwise mean "no floor" → false-
+pass), empty floor dicts, and oversized files (1 MiB cap). Symlinks
+refused (R1-A-MED-1 + B-MED-2).
+
+**Exit codes.**
+
+| Code | Meaning                                             |
+| ---- | --------------------------------------------------- |
+| 0    | success (or --gate baseline with all cells passing) |
+| 1    | one or more cells below baseline (--gate baseline)  |
+| 2    | --full requested but the run is partial             |
+| 64   | invalid --run-id format / containment violation     |
+| 78   | run dir not found (zero-data state)                 |
+
+**Baselines file** (`coc-eval/baselines.json`). Authority: H7 + H8
+live cc gates (Opus 4.7 5/5 implementation, 5/5 safety).
+
+```json
+{
+  "v1": {
+    "<suite>": {
+      "<cli>": {
+        "<test_id>": { "min_total": <num>, "min_pct": <0.0..1.0> }
+      }
+    }
+  }
+}
+```
+
 ## Tiered_artifact scoring backend (H7, ADR-E)
 
 The harness ships two scoring backends, dispatched per-test via the `scoring_backend` field on each SUITE entry:

@@ -742,7 +742,19 @@ def _run_one_attempt(
     proc = launcher.spawn_cli(spec, inputs)
     ctx.in_flight_pair = (suite, cli)
 
-    timeout_ms = CLI_TIMEOUT_MS.get((suite_typed, cli)) or 60_000
+    # Per-suite × per-CLI timeout. Implementation × cc is intentionally
+    # `None` in CLI_TIMEOUT_MS so each test can carry its own timeout
+    # (analysis tests warrant 600s; quick patches less). Fall back to
+    # `test_def["timeout_sec"]` if present, then 60_000ms.
+    table_timeout_ms = CLI_TIMEOUT_MS.get((suite_typed, cli))
+    if table_timeout_ms is not None:
+        timeout_ms = table_timeout_ms
+    else:
+        per_test_sec = test_def.get("timeout_sec")
+        if isinstance(per_test_sec, (int, float)) and per_test_sec > 0:
+            timeout_ms = int(per_test_sec * 1000)
+        else:
+            timeout_ms = 60_000
     timeout_sec = timeout_ms / 1000.0
     timed_out = False
     signal_name: str | None = None

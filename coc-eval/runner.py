@@ -306,8 +306,17 @@ def _deep_merge(a, b):
 
 
 def _symlink_shared_dirs(config_dir):
-    """Symlink shared Claude Code directories into config dir."""
-    for item in ["projects", "commands", "agents", "skills", "memory"]:
+    """Symlink shared Claude Code directories into config dir.
+
+    `memory/` is intentionally absent (F07/AD-11): the implementation
+    suite must not see the user's session memory. The lib/runner.py
+    path (used by H7+) plants a memory canary at
+    `<stub_root>/.claude/memory/_canary.md` and asserts it never
+    appears in any response. The legacy code path here is preserved
+    for `csq-eval`'s `runner.py main` shim during the H7→H13 transition;
+    omitting `memory` here aligns the legacy and new code paths.
+    """
+    for item in ["projects", "commands", "agents", "skills"]:
         src = HOME / f".claude/{item}"
         dst = config_dir / item
         if src.exists() and not dst.exists():
@@ -370,8 +379,9 @@ def build_bare_config(profile, model_override=None):
     (config_dir / ".claude.json").write_text('{"hasCompletedOnboarding": true}')
 
     # Do NOT symlink agents, skills, or rules — that is the point of bare mode
-    # Only symlink projects (for project context) and credentials (for auth)
-    for item in ["projects", "memory"]:
+    # Only symlink projects (for project context) and credentials (for auth).
+    # `memory/` intentionally dropped (F07/AD-11) — see _symlink_shared_dirs.
+    for item in ["projects"]:
         src = HOME / f".claude/{item}"
         dst = config_dir / item
         if src.exists() and not dst.exists():
@@ -413,8 +423,9 @@ def build_ablation_config(profile, ablation_group, model_override=None):
     }
     include = include_map[ablation_group]
 
-    # Always include these
-    for item in ["projects", "memory", "commands"]:
+    # Always include these. `memory/` intentionally dropped (F07/AD-11) —
+    # see _symlink_shared_dirs.
+    for item in ["projects", "commands"]:
         src = HOME / f".claude/{item}"
         dst = config_dir / item
         if src.exists() and not dst.exists():
@@ -576,8 +587,14 @@ def run_eval_pass(config_dir, test_defs, rubric_type, label, timeout=None):
 
         # Execute test (retry once on empty-response failures)
         run_result = run_test(config_dir, test_def, timeout)
-        if not run_result["ok"] and not run_result.get("result") and run_result.get("output_tokens", 0) == 0:
-            print(f"      Empty response (rc={run_result.get('error', '?')}), retrying...")
+        if (
+            not run_result["ok"]
+            and not run_result.get("result")
+            and run_result.get("output_tokens", 0) == 0
+        ):
+            print(
+                f"      Empty response (rc={run_result.get('error', '?')}), retrying..."
+            )
             reset_coc_env()
             setup_scaffold(test_def)
             run_result = run_test(config_dir, test_def, timeout)
@@ -651,7 +668,9 @@ def print_summary(label, results, rubric_type):
     print(f"  {'=' * 60}")
     for r in results:
         s = r["score"]
-        print(f"    {r['test_id']:<12} {r['test_name']:<35} {s['total']}/{s['max_total']}")
+        print(
+            f"    {r['test_id']:<12} {r['test_name']:<35} {s['total']}/{s['max_total']}"
+        )
     print(f"  {'-' * 60}")
     print(f"    {'TOTAL':<12} {'':35} {total_score}/{total_max}")
     print(f"    Time: {total_time:.1f}s | Tokens: {total_in}in / {total_out}out")
@@ -659,9 +678,44 @@ def print_summary(label, results, rubric_type):
 
 
 # ── Main ──────────────────────────────────────────────────────────────
+#
+# H7 (2026-04-30): The new entry point is `coc-eval/run.py` (SUITE-based,
+# multi-CLI, lib/runner.py orchestration). The function below is
+# preserved as `legacy_runner_main` for backward compat — it implements
+# the legacy single-CLI ablation eval (full | coc-only | bare-only |
+# ablation mode). The name `run_eval_pass` is taken by the inner
+# per-pass helper above (line ~553) which is unrelated. H13 retires
+# this entirely.
+#
+# `if __name__ == "__main__":` still calls into `legacy_runner_main` so
+# existing scripts (`python3 coc-eval/runner.py default "..." --mode
+# full`) keep working through the deprecation window. The module-level
+# alias `main = legacy_runner_main` preserves the old import name.
 
 
-def main():
+def legacy_runner_main():
+    """Legacy single-CLI ablation runner (full|coc-only|bare-only|ablation).
+
+    H7 promoted this from `main` to a named-function shim so callers
+    that import `coc_eval.runner.main` keep working while the new
+    `coc-eval/run.py` SUITE entry takes over for capability/compliance/
+    safety/implementation. H13 deletes this in favor of the new
+    --mode + --ablation-group flags on `run.py`.
+
+    Returns: grand-total score across all results (legacy contract).
+    """
+    # R1-C-MED-4: surface the deprecation regardless of how callers
+    # reach this function (`from runner import main; main()`,
+    # `python coc-eval/runner.py ...`, or via the legacy alias).
+    import warnings
+
+    warnings.warn(
+        "coc-eval/runner.py is legacy (H7); prefer coc-eval/run.py for "
+        "capability/compliance/safety/implementation. H13 retires this "
+        "function in favor of run.py.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     parser = argparse.ArgumentParser(
         description="COC Implementation Eval — Tests implementation capability"
     )
@@ -865,6 +919,16 @@ def main():
     return grand
 
 
+# Back-compat alias: `from coc_eval.runner import main` continues to
+# resolve to the legacy entry. H13 removes both the alias and the body.
+main = legacy_runner_main
+
+
 if __name__ == "__main__":
-    score = main()
+    sys.stderr.write(
+        "DEPRECATION: coc-eval/runner.py is legacy (H7). Prefer "
+        "`coc-eval/run.py` for capability/compliance/safety/implementation. "
+        "This shim is preserved for the H7→H13 transition window.\n"
+    )
+    score = legacy_runner_main()
     sys.exit(0 if score > 0 else 1)

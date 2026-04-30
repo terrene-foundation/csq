@@ -17,10 +17,20 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURES_DIR="${ROOT_DIR}/fixtures"
+SCAFFOLDS_DIR="${ROOT_DIR}/scaffolds"
 
 if [ ! -d "${FIXTURES_DIR}" ]; then
     echo "error: fixtures dir not found: ${FIXTURES_DIR}" >&2
     exit 2
+fi
+
+# H7 R1-C-MED-1: extend audit to scan scaffolds/ as well — the H7
+# implementation suite layers per-test scaffold trees on top of the
+# coc-env base fixture, so commercial-name regressions could land
+# in a scaffold and bypass a fixtures-only scan.
+SEARCH_DIRS=("${FIXTURES_DIR}")
+if [ -d "${SCAFFOLDS_DIR}" ]; then
+    SEARCH_DIRS+=("${SCAFFOLDS_DIR}")
 fi
 
 # `-l` lists matching files; `-q` would suppress them. We want filenames
@@ -54,8 +64,10 @@ matches=$(grep -rIli \
     --include="*.json" \
     --include="*.toml" \
     --include="*.py" \
+    --include="*.js" \
+    --include="*.ts" \
     -E "kailash|dataflow" \
-    -- "${FIXTURES_DIR}" || true)
+    -- "${SEARCH_DIRS[@]}" || true)
 
 if [ -n "${matches}" ]; then
     echo "ERROR: fixture content references commercial product names:" >&2

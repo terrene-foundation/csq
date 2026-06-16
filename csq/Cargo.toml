@@ -1,0 +1,113 @@
+[package]
+name = "csq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "csq — unified CLI + desktop for Claude Code multi-account management"
+
+[[bin]]
+name = "csq"
+path = "src/main.rs"
+
+[build-dependencies]
+# tauri-build must be unconditional (Cargo does not support optional build-deps).
+# build.rs checks CARGO_FEATURE_DESKTOP at build time before calling tauri_build::build().
+tauri-build = { version = "2.5.6", features = [] }
+
+[features]
+# Development default: both modes compiled for easy local testing.
+# Release builds: cargo build -p csq --features cli --no-default-features
+#                 cargo build -p csq --features desktop --no-default-features
+default = ["cli", "desktop"]
+cli = [
+  "dep:clap",
+  "dep:clap_complete",
+  "dep:url",
+]
+# test-utils: enables env-var test bypass gates compiled OUT of production.
+# NOT enabled by default. Enabled for integration tests via the csq test
+# binary when running `cargo test --features test-utils`.
+# Per rules/security.md MUST Rule 1: production binaries MUST NOT respond to
+# CSQ_TEST_BYPASS_TTY; this feature gate enforces that at compile time.
+# Also forwards to csq-core/test-utils so doctor tests can use identity
+# fixtures (M1-8, issue #292 A++ Phase 1).
+test-utils = ["csq-core/test-utils"]
+# ── M14 sink forwarding (workspace-owner decision §5: opt-in, never default) ──
+# Operators rebuild with --features csq/rekor-sink or csq/csq-ledger-sink to
+# activate external anchoring. These MUST NOT appear in the `default`, `cli`,
+# or `desktop` feature sets.
+rekor-sink = ["csq-core/rekor-sink"]
+csq-ledger-sink = ["csq-core/csq-ledger-sink"]
+# enterprise: activates Phase-2b direct-API provider client infrastructure.
+# Forwards csq-core/enterprise + the enterprise seam crate/kailash-trust.
+# MUST NOT appear in default, cli, or desktop feature sets (community gate).
+desktop = [
+  "dep:tauri",
+  "dep:tauri-plugin-log",
+  "dep:tauri-plugin-opener",
+  "dep:tauri-plugin-autostart",
+  "dep:tauri-plugin-single-instance",
+  "dep:tauri-plugin-updater",
+  "dep:tauri-plugin-process",
+  "dep:tauri-plugin-dialog",
+  "dep:log",
+]
+
+[dependencies]
+# ── always compiled ──────────────────────────────────────────────────────
+csq-core = { path = "../csq-core" }
+# ── enterprise-only (optional, activated by the enterprise feature) ──────
+# the enterprise seam crate is gated behind kailash-trust; optional = true ensures
+# it compiles into neither the community binary nor unfeaturised CI builds.
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+serde.workspace = true
+serde_json.workspace = true
+secrecy.workspace = true
+dirs.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+# tracing-log default feature already disabled at the workspace level (see
+# Cargo.toml comment) so the desktop tauri-plugin-log façade owns the log
+# crate. The cli surface re-uses the same workspace pin.
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+subtle.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+libc.workspace = true
+
+# ── cli-only (optional) ──────────────────────────────────────────────────
+clap = { workspace = true, optional = true }
+clap_complete = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+
+# ── desktop-only (optional) ──────────────────────────────────────────────
+tauri = { version = "2.10.3", features = ["tray-icon", "image-png"], optional = true }
+tauri-plugin-log = { version = "2", optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
+tauri-plugin-autostart = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+tauri-plugin-updater = { version = "2", optional = true }
+tauri-plugin-process = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+log = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+csq-core = { path = "../csq-core", features = ["secret-in-memory", "test-utils"] }
+ed25519-dalek.workspace = true
+hex.workspace = true
+
+# Mirror csq-desktop's Unix-gated tauri test feature so the bridge can
+# exercise `tauri::test::mock_app` against MockRuntime. Windows is excluded
+# because Tauri 2.10's MockRuntime imports WebView2Loader entry points that
+# are absent at unit-test load time. See csq-desktop/src-tauri/Cargo.toml
+# for the original rationale.
+[target.'cfg(unix)'.dev-dependencies]
+tauri = { version = "2.10.3", features = ["tray-icon", "image-png", "test"] }
+
+[lints.rust]
+unexpected_cfgs = "allow"

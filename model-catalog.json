@@ -1,0 +1,17 @@
+{
+  "zai": {
+    "models": ["glm-4.5-air", "glm-4.7", "glm-5.1"],
+    "latest": "glm-5.1",
+    "default": "glm-5.1"
+  },
+  "mm": {
+    "models": ["MiniMax-M2.7-highspeed"],
+    "latest": "MiniMax-M2.7-highspeed",
+    "default": "MiniMax-M2.7-highspeed"
+  },
+  "ollama": {
+    "models": [],
+    "latest": null,
+    "default": "qwen3:latest"
+  }
+}

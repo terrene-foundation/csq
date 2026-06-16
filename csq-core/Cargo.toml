@@ -1,0 +1,210 @@
+[package]
+name = "csq-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+hex.workspace = true
+sha2.workspace = true
+unicode-normalization.workspace = true
+secrecy.workspace = true
+urlencoding.workspace = true
+# `url` is pulled in by `reqwest` already; declaring it directly lets the
+# Codex desktop-login extractor (`providers::codex::desktop_login::
+# extract_device_auth_url`) parse codex-cli's verification URL with the
+# same structural defenses csq-cli uses (userinfo rejection, host
+# allowlist, HTTPS-only). Same major as csq-cli's pin so the workspace
+# resolves to one version.
+url = "2"
+base64.workspace = true
+getrandom.workspace = true
+reqwest.workspace = true
+ed25519-dalek.workspace = true
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+# Gemini PR-G2a.2 (Vault file fallback path). aes-gcm + argon2 are the
+# RustCrypto AEAD + KDF. zeroize wipes secret buffers before drop. None of
+# these add C FFI; all pure Rust audited by the RustCrypto collective. The
+# code path is platform-independent so the crypto crates live at the top
+# level — only the dispatch layer (open_default_vault on Linux) wires them
+# in. macOS + Windows builds compile the file backend module so unit tests
+# of the crypto stay portable, but `open_default_vault` refuses to route
+# there from non-Linux even when the env override is set.
+aes-gcm.workspace = true
+argon2.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+# PR-CA8 commit 2: codex per-spawn handle-dir config.toml merge via
+# toml::Value round-trip. Exact-version-pinned at workspace root per
+# round-2 R2-H1 stability concern.
+toml.workspace = true
+# `regex` is used by `audit::persist` to validate RULE_ID strings
+# against `^[A-Z][A-Z0-9-]{1,32}$` (B6 mitigation, spec 12 §12.5).
+regex.workspace = true
+# UUID v4 for identity-keyed account storage (issue #292 / A++ Phase 1).
+# Consumed only by `accounts::identity_store` in Phase 1; production
+# readers continue using slot-keyed paths until Phase 2. See workspace
+# todo `M1-phase1-identity-coexistence.md` for the migration trajectory.
+uuid.workspace = true
+# tempfile: used ONLY by `testing::identity_fixtures` (M1-7, test-utils feature).
+# Promoted from dev-dependency so external test consumers that enable
+# `csq-core/test-utils` can access the fixture surface. Optional — compiled
+# only when `test-utils` feature is active. Never compiled into production binaries.
+tempfile = { workspace = true, optional = true }
+# `async-trait` is a hard requirement for the `audit::LedgerSink` trait
+# introduced in M01 (workspace `csq-pact-eatp-adoption`). The daemon
+# drives sinks through `dyn LedgerSink`, which requires object-safe
+# async vtables. The macro is a build-time-only expansion; it adds no
+# runtime cost beyond the `Pin<Box<dyn Future>>` shape it generates.
+async-trait.workspace = true
+# `keyring` v3 — single cross-platform OS keychain API.  Used by
+# `audit::key_custody` (M04) for Ed25519 signing-key storage under
+# service name `csq-audit-signing`.  Per PRIMARY METHODOLOGICAL DIRECTIVE
+# M04: native per-platform crates (`security-framework`, `secret-service`,
+# `windows-rs`) are BLOCKED for signing-key custody.
+keyring.workspace = true
+# `jsonschema` validates JSON values against a JSON Schema document.
+# Optional — compiled only when the `enterprise` feature is active.
+# The governance enforcement loop (phase2b::governance_loop) uses it to
+# validate provider responses against the response_format JSON Schema.
+jsonschema = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+
+# Gemini PR-G2a.2 (Linux Secret Service backend). D-Bus client; the
+# `rt-tokio-crypto-rust` feature picks tokio + RustCrypto for the session
+# transport key exchange, matching the rest of csq-core. Linux-only — the
+# crate is unbuildable on macOS / Windows.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service.workspace = true
+
+# Windows-only: low-level syscalls for session discovery (PEB
+# walking via NtQueryInformationProcess + ReadProcessMemory). The
+# `windows-sys` crate is a thin set of FFI bindings and is the same
+# dependency `tauri` and `tokio` already pull in on Windows, so no
+# new transitive graph.
+#
+# Gemini PR-G2a.3 adds two more feature groups so the secret module
+# can call Credential Manager (CredWriteW/CredReadW/CredDeleteW/
+# CredEnumerateW/CredFree) and refuse to start as `LocalSystem`
+# (TokenUser query + IsWellKnownSid). DPAPI binds to the user profile;
+# a daemon launched as SYSTEM would have a different DPAPI scope from
+# a user-launched CLI, breaking the multi-process credential view.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Storage_FileSystem",
+] }
+
+[features]
+default = []
+# Enables `platform::secret::in_memory::InMemoryVault` to be selected
+# at runtime via `CSQ_SECRET_BACKEND=in-memory`. Compiled into integration
+# test harnesses; NEVER enable in production binaries.
+secret-in-memory = []
+# enterprise: activates Phase-2b direct-API provider client infrastructure
+# (ProviderClient trait, AnthropicCompatibleClient, 3P clients).
+# Enterprise-only; MUST NOT appear in community builds.
+# Community gate: cargo build -p csq-core (no features) MUST succeed.
+# Enterprise gate: cargo test -p csq-core --features enterprise.
+# Enables test-only adjustments to cli_deps::probe (e.g. extended 30s probe
+# timeout for integration tests where shell-script stub spawn under heavy
+# parallel test load can exceed the 2s production deadline). Production
+# builds get the spec/13 §8 2s default; integration tests opt in via
+# `--features csq-core/test-utils`. Companion to csq's `test-utils` feature.
+#
+# Also enables `csq-core::testing::identity_fixtures` (M1-7) which requires
+# `tempfile`. External consumers (integration tests, coc-eval) enable this
+# feature so the fixture surface is available outside `cfg(test)`. Production
+# binaries MUST NOT enable this feature.
+test-utils = ["dep:tempfile"]
+
+# ── M07 LedgerSink reference-impl feature flags ─────────────────────────────
+#
+# Every external-sink dep MUST be optional = true and gated behind one of
+# these features. The default build compiles NO external-sink code.
+# Per workspace-owner decision §5 (00-index.md): csq ships local-only by
+# default; operators opt in by rebuilding with the desired flag.
+#
+# PRIMARY METHODOLOGICAL DIRECTIVE (M07): external sinks are NEVER on
+# the default code path. Audit primitive:
+#   grep -E '^(sigstore|sigstore-rekor|aws-sdk-s3|azure-storage|google-cloud-storage)' \
+#     csq-core/Cargo.toml | grep -v 'optional = true'
+#   # Expected: 0 matches
+#
+# rekor-sink: Sigstore Rekor (public instance or operator self-hosted).
+# Requires sigstore + sigstore-rekor opt-in deps (see [dependencies] below).
+rekor-sink = []
+# s3-sink: AWS S3 Object Lock compliance-mode bucket.
+# Requires aws-sdk-s3 opt-in dep.
+s3-sink = []
+# azure-sink: Azure Immutable Blob Storage.
+# Requires azure-storage-blobs opt-in dep.
+azure-sink = []
+# gcp-sink: GCP Cloud Storage Bucket Lock + retention.
+# Requires google-cloud-storage opt-in dep.
+gcp-sink = []
+# azure-sql-sink: Azure SQL Database ledger tables (cryptographically-verifiable
+# append-only tables). Requires the tiberius (SQL Server) opt-in dep when an
+# operator hardens the mock substrate for production.
+azure-sql-sink = []
+# csq-ledger-sink: Foundation-owned csq-ledger transparency log (M10, shipped).
+# Enabling this feature compiles `audit::impls::csq_ledger_sink::CsqLedgerSink`
+# (a `reqwest`-backed `LedgerSink` impl that POSTs records to a csq-ledger
+# server) and makes `validate_sink_compiled_in("csq-ledger")` return Ok.
+# `reqwest` is already a non-optional csq-core dep, so the feature adds no new
+# crate to the graph; the default build simply never compiles the sink body.
+# See spec 17 (csq-ledger protocol) and the `csq-ledger/` workspace crate.
+csq-ledger-sink = []
+
+[[bin]]
+name = "stub-cli"
+path = "tests/bin/stub_cli.rs"
+test = false
+doctest = false
+
+# ── M07 optional external-sink dependencies ─────────────────────────────────
+#
+# ALL external-sink deps MUST be `optional = true`.  The features above
+# gate their compilation; none appear in the default build.
+#
+# When a reference impl is wired (M07 ships mock/in-memory stubs for each),
+# the concrete SDK dep will be listed here.  For the initial M07 ship the
+# impls use in-memory fakes so the actual SDK crates are not yet required.
+# This section is a documented extension point; add SDK deps here when the
+# operator-hardening guides in docs/audit-sinks/ are paired with real network
+# code.  Example (NOT active — shown for future reference):
+#
+#   sigstore = { version = "0.10", optional = true }         # rekor-sink
+#   sigstore-rekor = { version = "0.3", optional = true }    # rekor-sink
+#   aws-sdk-s3 = { version = "1", optional = true }          # s3-sink
+#   azure-storage-blobs = { version = "0.20", optional = true } # azure-sink
+#   google-cloud-storage = { version = "0.20", optional = true } # gcp-sink
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+unexpected_cfgs = "allow"

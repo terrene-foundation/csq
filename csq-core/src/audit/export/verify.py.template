@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+# csq audit bundle verifier — self-contained, zero-install.
+#
+# Runs on a vanilla operator/auditor machine with NO csq install and NO PyPI
+# packages. Ed25519 signature verification is a pure-Python-stdlib RFC 8032
+# implementation (no `cryptography` package, no `openssl` CLI dependency) so the
+# script works identically on Linux (OpenSSL), macOS (ships LibreSSL, which does
+# NOT support Ed25519 in its `openssl` CLI), and Windows. Everything else is
+# Python 3 standard library (`hashlib`, `json`, `base64`, `tarfile`, `urllib`).
+#
+# Usage (run from the extracted bundle directory):
+#     ./verify                 # local verification (chain + signatures + lock + sig)
+#     ./verify --rekor <url>   # additionally run a best-effort Rekor entry-
+#                              # EXISTENCE check (NOT a cryptographic inclusion
+#                              # proof; see spec 16 §16.7 — real inclusion-proof
+#                              # verification is Phase B)
+#
+# Exit codes:
+#     0  PASS — chain verified end-to-end
+#     1  FAIL — a specific integrity check failed (see the FAIL: line)
+#     2  ENVIRONMENT — a prerequisite is missing
+#
+# The verifier reproduces csq's canonical form BYTE-FOR-BYTE. csq computes
+# canonical_hash as:
+#     canonical_hash = sha256( canonical_bytes )
+# where canonical_bytes is the compact JSON serialization (no spaces) of the
+# record's fields in a FIXED declaration order with `canonical_hash` set to the
+# 64-zero genesis sentinel and the `signature` field omitted. Top-level and
+# typed-payload fields keep declaration order; nested free-form JSON objects
+# (EATP attestation blobs) are emitted with SORTED keys, matching csq's
+# serde_json BTreeMap object serialization. canonical_form_vectors/ embeds
+# golden (record -> canonical_hash) vectors so this reproduction is self-checked
+# before any chain record is verified.
+
+import base64
+import hashlib
+import json
+import os
+import sys
+
+GENESIS = "0" * 64
+
+# Canonical-form field order — mirrors csq-core/src/audit/persist.rs::CanonicalView.
+# Fixed top-level order; canonical_hash is forced to the genesis sentinel; the
+# `signature` field is excluded from the pre-image entirely.
+_TOP_ORDER = [
+    "schema_version",
+    "record_id",
+    "chain_id",
+    "seq",
+    "prev_hash",
+    "kind",
+    "payload",
+    "ts",
+    "key_id",
+    "canonical_hash",
+]
+# Optional EATP fields appended in declaration order, only when present.
+_OPT_ORDER = ["actor", "authority", "trust", "eatp_start_ts", "eatp_end_ts"]
+
+
+def fail(msg):
+    print("FAIL: " + msg)
+    sys.exit(1)
+
+
+def env_error(msg):
+    print("FAIL: " + msg)
+    sys.exit(2)
+
+
+def warn(msg):
+    print("WARN: " + msg)
+
+
+def _sorted_value(v):
+    """Reproduce serde_json's Value serialization order.
+
+    serde_json (without the `preserve_order` feature, which csq does not enable)
+    backs Value::Object with a BTreeMap, so object keys serialize SORTED. Arrays
+    and scalars keep their order/value. csq's typed structs are NOT Values and
+    keep declaration order — those are handled by the fixed orders above; this
+    helper only normalizes free-form JSON (EATP blobs).
+    """
+    if isinstance(v, dict):
+        return {k: _sorted_value(v[k]) for k in sorted(v.keys())}
+    if isinstance(v, list):
+        return [_sorted_value(x) for x in v]
+    return v
+
+
+def canonical_bytes(rec):
+    """Compute the canonical pre-image bytes for a record dict.
+
+    Builds an ordered dict matching csq's CanonicalView, sets canonical_hash to
+    the genesis sentinel, omits `signature`, and serializes compactly. Free-form
+    EATP objects are key-sorted to match serde_json's BTreeMap output.
+    """
+    view = {}
+    for f in _TOP_ORDER:
+        if f == "canonical_hash":
+            view[f] = GENESIS
+        elif f == "payload":
+            # payload is a typed enum (tag="kind", content="data") — its OUTER
+            # keys ("kind","data") are struct-shaped (declaration order: kind
+            # then data), and the inner "data" is a typed payload struct whose
+            # field order is fixed by csq. The values reaching us are already in
+            # that order from the on-disk JSONL (csq wrote them); we must NOT
+            # sort them. Re-emit as-is.
+            view[f] = rec[f]
+        else:
+            view[f] = rec[f]
+    for f in _OPT_ORDER:
+        if rec.get(f) is not None:
+            # EATP blobs are free-form serde_json Values -> sorted keys.
+            view[f] = _sorted_value(rec[f])
+    return json.dumps(view, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def cutoff_canonical_bytes(m):
+    """Reproduce the M16 CUTOFF.json canonical pre-image (spec 16 §16.14).
+
+    Mirrors csq-core/src/audit/cutoff.rs::CanonicalCutoffView: fixed field
+    order, `cutoff_hash` forced to the genesis sentinel, `signature` excluded,
+    `latest_anchor_ref` either null or an ordered {sink, sink_id, ack_seq}
+    object (a typed struct — declaration order, NOT key-sorted), compact JSON.
+    """
+    ar = m.get("latest_anchor_ref")
+    if ar is not None:
+        ar = {"sink": ar["sink"], "sink_id": ar["sink_id"], "ack_seq": ar["ack_seq"]}
+    view = {
+        "cutoff_version": m["cutoff_version"],
+        "chain_id": m["chain_id"],
+        "latest_hash": m["latest_hash"],
+        "latest_seq": m["latest_seq"],
+        "latest_anchor_ref": ar,
+        "export_ts": m["export_ts"],
+        "cutoff_hash": GENESIS,
+        "key_id": m["key_id"],
+    }
+    return json.dumps(view, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def sha256_hex(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+# ── Pure-Python Ed25519 verification (RFC 8032) ──────────────────────────────
+# Self-contained so the verifier needs no openssl/cryptography. This is the
+# reference field arithmetic over the edwards25519 curve. SHA-512 comes from the
+# stdlib `hashlib`.
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = (-121665 * pow(121666, _P - 2, _P)) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _x_recover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = (4 * pow(5, _P - 2, _P)) % _P
+_BX = _x_recover(_BY)
+_B = (_BX % _P, _BY % _P, 1, (_BX * _BY) % _P)  # extended coords (X,Y,Z,T)
+
+
+def _edwards_add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = ((y1 - x1) * (y2 - x2)) % _P
+    b = ((y1 + x1) * (y2 + x2)) % _P
+    c = (t1 * 2 * _D * t2) % _P
+    dd = (z1 * 2 * z2) % _P
+    e = b - a
+    f = dd - c
+    g = dd + c
+    h = b + a
+    return ((e * f) % _P, (g * h) % _P, (f * g) % _P, (e * h) % _P)
+
+
+def _scalarmult(p, e):
+    q = (0, 1, 1, 0)  # neutral element
+    while e > 0:
+        if e & 1:
+            q = _edwards_add(q, p)
+        p = _edwards_add(p, p)
+        e >>= 1
+    return q
+
+
+def _to_affine(p):
+    x, y, z, _t = p
+    zi = pow(z, _P - 2, _P)
+    return ((x * zi) % _P, (y * zi) % _P)
+
+
+def _decompress(b32):
+    y = int.from_bytes(b32, "little") & ((1 << 255) - 1)
+    sign = (b32[31] >> 7) & 1
+    x = _x_recover(y)
+    if x & 1 != sign:
+        x = _P - x
+    return (x % _P, y % _P, 1, (x * y) % _P)
+
+
+def ed25519_verify(raw_pubkey_hex, message_bytes, signature_bytes, _workdir=None):
+    """Verify an Ed25519 signature in pure Python. Returns True/False.
+
+    raw_pubkey_hex:  64-char hex of the raw 32-byte public key.
+    message_bytes:   the exact bytes that were signed (the 32 raw hash bytes).
+    signature_bytes: the 64-byte signature (R || S).
+
+    Signature-equation note (intentional asymmetry with the Rust side): this
+    implements the PERMISSIVE RFC 8032 §5.1.7 verification equation
+    ([S]B == R + [h]A, with S range-checked against the group order L), the
+    "cofactorless" form. csq's Rust producer signs and locally verifies with
+    `ed25519-dalek::verify_strict`, which additionally rejects small-order /
+    non-canonical R points. The asymmetry is intentional and safe: every
+    signature in a csq-generated bundle is produced by ed25519-dalek and is
+    therefore canonical, so it satisfies BOTH equations. The permissive form is
+    chosen here because it is the minimal correct RFC 8032 check expressible in
+    pure stdlib Python without re-deriving dalek's canonicality predicates; it
+    never ACCEPTS a signature that verify_strict would, for canonical inputs.
+    """
+    try:
+        raw = bytes.fromhex(raw_pubkey_hex)
+        if len(raw) != 32 or len(signature_bytes) != 64:
+            return False
+        r_bytes = signature_bytes[:32]
+        s = int.from_bytes(signature_bytes[32:], "little")
+        if s >= _L:
+            return False
+        a = _decompress(raw)
+        h = int.from_bytes(
+            hashlib.sha512(r_bytes + raw + message_bytes).digest(), "little"
+        ) % _L
+        # Check [s]B == R + [h]A
+        sb = _scalarmult(_B, s)
+        ha = _scalarmult(a, h)
+        r_point = _decompress(r_bytes)
+        rhs = _edwards_add(r_point, ha)
+        return _to_affine(sb) == _to_affine(rhs)
+    except Exception:
+        return False
+
+
+def key_id_for_pubkey(raw_pubkey_hex):
+    """csq derives key_id = 'ed25519:' + sha256(raw_32_byte_pubkey)."""
+    raw = bytes.fromhex(raw_pubkey_hex)
+    return "ed25519:" + hashlib.sha256(raw).hexdigest()
+
+
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def main():
+    rekor_url = None
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--rekor":
+            if i + 1 >= len(args):
+                env_error("--rekor requires a URL argument")
+            rekor_url = args[i + 1]
+            i += 2
+        else:
+            env_error("unknown argument: " + args[i])
+
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    # --- Step 0: required files present -------------------------------------
+    required = [
+        "chain.jsonl",
+        "public_keys.json",
+        "rotation_chain.json",
+        "CUTOFF.json",
+        "PROVENANCE.json",
+        "BUNDLE.lock",
+        "BUNDLE.sig",
+        "verify",
+    ]
+    for name in required:
+        if not os.path.isfile(os.path.join(here, name)):
+            fail("bundle is missing required file: " + name)
+    if not os.path.isdir(os.path.join(here, "canonical_form_vectors")):
+        fail("bundle is missing required directory: canonical_form_vectors")
+
+    public_keys = read_json(os.path.join(here, "public_keys.json"))
+    if "genesis" not in public_keys or "keys" not in public_keys:
+        fail("public_keys.json missing 'genesis' or 'keys' field")
+    genesis_key_id = public_keys["genesis"]
+    # keys: { key_id -> raw_pubkey_hex }
+    keys = public_keys["keys"]
+    if genesis_key_id not in keys:
+        fail("public_keys.json genesis key " + genesis_key_id + " absent from keys map")
+
+    # Per-key derivation check (spec 16 §16.4): EVERY key in public_keys.json
+    # must have key_id == "ed25519:" + sha256(raw_pubkey). A mismatch on ANY
+    # key (not just genesis) means public_keys.json was tampered — reject.
+    for kid, pubhex in keys.items():
+        if key_id_for_pubkey(pubhex) != kid:
+            fail(
+                "public_keys.json key_id "
+                + kid
+                + " does not match sha256 of its pubkey "
+                "(bundle public_keys.json tampered)"
+            )
+
+    # --- Step 1: BUNDLE.sig verifies BUNDLE.lock via genesis key ------------
+    # This is checked BEFORE any chain-level check so a tampered BUNDLE.lock
+    # surfaces as a signature failure first (the export-time anchor guarantee).
+    with open(os.path.join(here, "BUNDLE.lock"), "rb") as f:
+        lock_bytes = f.read()
+    with open(os.path.join(here, "BUNDLE.sig"), "rb") as f:
+        sig_bytes = f.read()
+    if len(sig_bytes) != 64:
+        fail(
+            "BUNDLE.sig verification failed: signature is not 64 bytes "
+            "(bundle tamper detected at export-time anchor key)"
+        )
+    genesis_pub_hex = keys[genesis_key_id]
+    # Sanity: the genesis key_id must actually derive from its pubkey.
+    if key_id_for_pubkey(genesis_pub_hex) != genesis_key_id:
+        fail(
+            "public_keys.json genesis key_id does not match sha256 of its pubkey "
+            "(bundle public_keys.json tampered)"
+        )
+    if not ed25519_verify(genesis_pub_hex, lock_bytes, sig_bytes, here):
+        fail(
+            "BUNDLE.sig verification failed: bundle tamper detected at "
+            "export-time anchor key (signature over BUNDLE.lock did not verify)"
+        )
+
+    # --- Step 2: every file's SHA-256 matches BUNDLE.lock -------------------
+    # BUNDLE.lock format: one "<sha256>  <relpath>" line per file, sorted by path.
+    lock_lines = lock_bytes.decode("utf-8").splitlines()
+    recorded = {}
+    for ln in lock_lines:
+        if not ln.strip():
+            continue
+        parts = ln.split("  ", 1)
+        if len(parts) != 2:
+            fail("BUNDLE.lock has a malformed line: " + ln)
+        recorded[parts[1]] = parts[0]
+    for relpath, want in recorded.items():
+        fpath = os.path.join(here, relpath)
+        if not os.path.isfile(fpath):
+            fail("BUNDLE.lock references missing file: " + relpath)
+        with open(fpath, "rb") as f:
+            got = sha256_hex(f.read())
+        if got != want:
+            fail(
+                "file "
+                + relpath
+                + " SHA-256 mismatch: bundle file "
+                + relpath
+                + " tampered after BUNDLE.sig was created"
+            )
+
+    # --- Step 2.5: CUTOFF.json signed-cutoff self-check (M16, spec 16 §16.14) ─
+    # The cutoff is signed by the genesis-anchored export key over the 32 raw
+    # bytes of its canonical hash — the SAME signing contract as chain records.
+    # Self-consistency (hash + signature) is checked here; the cross-check
+    # against the actual chain HEAD runs after the chain walk (Step 5.5), once
+    # the head seq/canonical_hash are known.
+    cutoff = read_json(os.path.join(here, "CUTOFF.json"))
+    if not isinstance(cutoff, dict):
+        fail("CUTOFF.json is not a JSON object (cutoff tamper detected)")
+    # Fail CLOSED on a deleted/malformed field: a tampered CUTOFF.json missing a
+    # canonical field must produce a clean FAIL, never an unhandled traceback.
+    for field in (
+        "cutoff_version",
+        "chain_id",
+        "latest_hash",
+        "latest_seq",
+        "export_ts",
+        "cutoff_hash",
+        "key_id",
+        "signature",
+    ):
+        if field not in cutoff:
+            fail("CUTOFF.json is missing required field '" + field + "' (cutoff tamper detected)")
+    ar_field = cutoff.get("latest_anchor_ref")
+    if ar_field is not None and (
+        not isinstance(ar_field, dict)
+        or any(k not in ar_field for k in ("sink", "sink_id", "ack_seq"))
+    ):
+        fail("CUTOFF.json latest_anchor_ref is malformed (cutoff tamper detected)")
+    if cutoff.get("cutoff_version") != "1":
+        fail(
+            "CUTOFF.json cutoff_version is "
+            + str(cutoff.get("cutoff_version"))
+            + " — this verifier only understands version 1"
+        )
+    # The cutoff MUST be signed by the genesis-anchored export key (the same key
+    # that signs BUNDLE.sig); any other key id is a tamper signal.
+    if cutoff.get("key_id") != genesis_key_id:
+        fail(
+            "CUTOFF.json key_id "
+            + str(cutoff.get("key_id"))
+            + " is not the genesis-anchored export key "
+            + genesis_key_id
+            + " (cutoff signed by an unexpected key)"
+        )
+    recomputed_cutoff = sha256_hex(cutoff_canonical_bytes(cutoff))
+    if cutoff.get("cutoff_hash") != recomputed_cutoff:
+        fail(
+            "CUTOFF.json cutoff_hash does not match its recomputed canonical "
+            "hash — the signed cutoff was tampered"
+        )
+    try:
+        cutoff_digest = bytes.fromhex(recomputed_cutoff)
+        cutoff_sig = bytes.fromhex(cutoff.get("signature", ""))
+    except Exception:
+        fail("CUTOFF.json signature or cutoff_hash is not valid hex")
+    if len(cutoff_sig) != 64:
+        fail("CUTOFF.json signature is not 64 bytes (cutoff tamper detected)")
+    if not ed25519_verify(genesis_pub_hex, cutoff_digest, cutoff_sig, here):
+        fail(
+            "CUTOFF.json signature did not verify against the genesis-anchored "
+            "export key — the signed cutoff was tampered"
+        )
+
+    # --- Step 3: canonical_form_vectors self-check --------------------------
+    # Reproduce csq's canonical form against embedded golden vectors BEFORE
+    # trusting our reproduction on real chain records.
+    vec_dir = os.path.join(here, "canonical_form_vectors")
+    vectors_path = os.path.join(vec_dir, "vectors.json")
+    version_path = os.path.join(vec_dir, "VERSION")
+    if not os.path.isfile(vectors_path) or not os.path.isfile(version_path):
+        fail("canonical_form_vectors/ missing vectors.json or VERSION")
+    golden = read_json(vectors_path)
+    for vec in golden.get("vectors", []):
+        # record_json is the verbatim on-disk line; json.loads preserves the
+        # field order so canonical_bytes reproduces the exact pre-image.
+        rec = json.loads(vec["record_json"])
+        want = vec["canonical_hash"]
+        got = sha256_hex(canonical_bytes(rec))
+        if got != want:
+            fail(
+                "canonical_form self-check failed for vector '"
+                + vec.get("name", "?")
+                + "': this verifier cannot reproduce csq's canonical form "
+                "byte-for-byte (expected "
+                + want
+                + ", got "
+                + got
+                + ")"
+            )
+
+    # --- Step 4: rotation_chain anchors every signing key to genesis --------
+    rotation_chain = read_json(os.path.join(here, "rotation_chain.json"))
+    # rotation_chain: { anchor_key_id, entries: [ {previous_key_id, new_key_id} ] }
+    # anchor_key_id is the chain's current genesis-ANCHORED head key (the
+    # BUNDLE.sig signer); the entries carry the rotation history back to genesis.
+    anchored_keys = set()
+    anchored_keys.add(rotation_chain.get("anchor_key_id", genesis_key_id))
+    for entry in rotation_chain.get("entries", []):
+        anchored_keys.add(entry["new_key_id"])
+        anchored_keys.add(entry["previous_key_id"])
+
+    # --- Step 5: chain.jsonl integrity --------------------------------------
+    with open(os.path.join(here, "chain.jsonl"), "r", encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+
+    prev_canonical = None
+    prev_seq = None
+    rotations = len(rotation_chain.get("entries", []))
+    anchor_records = 0
+    verified = 0
+    last_rec = None
+    by_seq = {}
+
+    for raw in lines:
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            fail("chain.jsonl contains a line that is not valid JSON")
+
+        rid = rec.get("record_id", "<unknown>")
+        seq = rec.get("seq")
+
+        # seq monotonicity
+        if prev_seq is None:
+            if seq != 0:
+                fail("record " + str(rid) + ": first record seq must be 0, got " + str(seq))
+        else:
+            if seq != prev_seq + 1:
+                fail(
+                    "record "
+                    + str(rid)
+                    + ": seq is not strictly monotonic (expected "
+                    + str(prev_seq + 1)
+                    + ", got "
+                    + str(seq)
+                    + ")"
+                )
+
+        # prev_hash chain link
+        expected_prev = GENESIS if prev_canonical is None else sha256_hex(prev_canonical)
+        if rec.get("prev_hash") != expected_prev:
+            fail(
+                "record "
+                + str(rid)
+                + ": prev_hash chain link broken (expected "
+                + expected_prev
+                + ", got "
+                + str(rec.get("prev_hash"))
+                + ")"
+            )
+
+        # canonical_hash recompute
+        recomputed = sha256_hex(canonical_bytes(rec))
+        if rec.get("canonical_hash") != recomputed:
+            fail(
+                "record "
+                + str(rid)
+                + ": canonical_hash does not match recomputed value — "
+                "record content tampered"
+            )
+
+        # signature verification (skip placeholder/all-zero key)
+        key_id = rec.get("key_id", "")
+        if key_id != "ed25519:" + GENESIS:
+            if key_id not in keys:
+                fail(
+                    "record "
+                    + str(rid)
+                    + ": signing key "
+                    + key_id
+                    + " not found in public_keys.json"
+                )
+            if key_id not in anchored_keys:
+                fail(
+                    "record "
+                    + str(rid)
+                    + ": signing key "
+                    + key_id
+                    + " is not anchored in rotation_chain.json back to genesis"
+                )
+            # signed pre-image = the 32 raw bytes of canonical_hash
+            digest = bytes.fromhex(recomputed)
+            sig = bytes.fromhex(rec["signature"])
+            if not ed25519_verify(keys[key_id], digest, sig, here):
+                fail(
+                    "record "
+                    + str(rid)
+                    + ": invalid Ed25519 signature for key "
+                    + key_id
+                )
+            anchor_records += 1
+
+        prev_canonical = canonical_bytes_with_real_hash(rec)
+        prev_seq = seq
+        last_rec = rec
+        by_seq[seq] = rec
+        verified += 1
+
+    # --- Step 5.5: CUTOFF.json cross-check against the chain HEAD (M16) ------
+    # The signed cutoff pins the chain HEAD (latest_hash, latest_seq) at export
+    # time. A post-export tail truncation leaves a chain whose head no longer
+    # matches the cutoff — detected HERE, explicitly (vs M09's implicit
+    # detection via BUNDLE.lock's SHA-256 over the whole chain.jsonl).
+    if last_rec is None:
+        fail("CUTOFF.json present but chain.jsonl has no records to anchor it to")
+    if cutoff["latest_seq"] != last_rec.get("seq"):
+        fail(
+            "CUTOFF.json latest_seq "
+            + str(cutoff["latest_seq"])
+            + " does not match the chain head seq "
+            + str(last_rec.get("seq"))
+            + " — tail truncation or head tamper after export"
+        )
+    if cutoff["latest_hash"] != last_rec.get("canonical_hash"):
+        fail(
+            "CUTOFF.json latest_hash does not match the chain head canonical_hash "
+            "— the chain head was tampered after export"
+        )
+    # latest_anchor_ref (M14 link): when present, the named seq MUST be a
+    # replication_ack carrying the same sink + sink_id.
+    ar = cutoff.get("latest_anchor_ref")
+    if ar is not None:
+        ack = by_seq.get(ar.get("ack_seq"))
+        if ack is None:
+            fail(
+                "CUTOFF.json latest_anchor_ref.ack_seq "
+                + str(ar.get("ack_seq"))
+                + " is not present in chain.jsonl"
+            )
+        ack_data = ack.get("payload", {}).get("data", {})
+        if (
+            ack.get("kind") != "replication_ack"
+            or ack_data.get("sink") != ar.get("sink")
+            or ack_data.get("sink_id") != ar.get("sink_id")
+        ):
+            fail(
+                "CUTOFF.json latest_anchor_ref does not match the chain "
+                "replication_ack record at seq " + str(ar.get("ack_seq"))
+            )
+
+    # --- Step 5.7: PROVENANCE.json governance lane (M21, spec 16 §16.15) ----
+    # The provenance lane is an auditor-consumable, seq-ordered projection of
+    # every `provenance_anchored` chain record. It is COVERED by BUNDLE.lock
+    # (Step 2 already confirmed its SHA-256), so a post-export edit is caught
+    # there. THIS step is the orthogonal guarantee: the lane is a FAITHFUL +
+    # COMPLETE projection of the SIGNED chain — every chain provenance record
+    # appears in the lane and vice-versa, and every projected field matches the
+    # chain record. That turns PROVENANCE.json from an unverified convenience
+    # file into a trustworthy derived view an auditor can act on (AC4), and
+    # surfaces the UNBACKED count (AC5). HIGH-1: the lane MUST NOT carry verbatim
+    # human words — only `words_hash` — so a tampered lane that injected a
+    # `human_words`/`words` key FAILs here.
+    prov = read_json(os.path.join(here, "PROVENANCE.json"))
+    if not isinstance(prov, dict):
+        fail("PROVENANCE.json is not a JSON object (provenance-lane tamper detected)")
+    for field in ("provenance_version", "chain_id", "record_count", "unbacked_count", "records"):
+        if field not in prov:
+            fail(
+                "PROVENANCE.json is missing required field '"
+                + field
+                + "' (provenance-lane tamper detected)"
+            )
+    if prov.get("provenance_version") != "1":
+        fail(
+            "PROVENANCE.json provenance_version is "
+            + str(prov.get("provenance_version"))
+            + " — this verifier only understands version 1"
+        )
+    lane_records = prov.get("records")
+    if not isinstance(lane_records, list):
+        fail("PROVENANCE.json 'records' is not a list (provenance-lane tamper detected)")
+
+    # Collect the chain's provenance_anchored records by seq (authoritative set).
+    # A record is "provenance" iff BOTH its top-level `kind` AND its tagged
+    # payload discriminant are "provenance_anchored" — this mirrors the
+    # producer's dual filter (`build_provenance_lane`: kind == ProvenanceAnchored
+    # AND payload is the ProvenanceAnchored variant). Matching on `kind` alone
+    # would let the verifier's set diverge from the producer's if a record's
+    # top-level `kind` and payload kind ever disagreed (a malformed/tampered
+    # record), producing a spurious seq-set mismatch; requiring both keeps the
+    # two filters provably identical. csq's record deserializer rejects
+    # kind/payload mismatches at write + export pre-flight, so for an honest
+    # bundle the two predicates coincide; the dual check makes that explicit
+    # rather than relying on the pre-flight to mask the asymmetry.
+    chain_prov = {
+        seq: r
+        for seq, r in by_seq.items()
+        if r.get("kind") == "provenance_anchored"
+        and r.get("payload", {}).get("kind") == "provenance_anchored"
+    }
+    # Completeness: the lane's seq-set MUST exactly equal the chain's
+    # provenance seq-set — no dropped record (hidden decision) and no injected
+    # record (lane entry with no signed chain backing).
+    lane_seqs = []
+    for entry in lane_records:
+        if not isinstance(entry, dict) or "seq" not in entry:
+            fail("PROVENANCE.json has a record with no 'seq' (provenance-lane tamper detected)")
+        # HIGH-1 structural guard: verbatim human words MUST NEVER appear.
+        for forbidden in ("human_words", "words"):
+            if forbidden in entry:
+                fail(
+                    "PROVENANCE.json record at seq "
+                    + str(entry.get("seq"))
+                    + " carries a verbatim '"
+                    + forbidden
+                    + "' field — HIGH-1 redact-then-hash violated (only words_hash is permitted)"
+                )
+        lane_seqs.append(entry["seq"])
+    if sorted(lane_seqs) != sorted(chain_prov.keys()):
+        fail(
+            "PROVENANCE.json lane is not a faithful projection of the chain: "
+            "lane seqs "
+            + str(sorted(lane_seqs))
+            + " != chain provenance_anchored seqs "
+            + str(sorted(chain_prov.keys()))
+            + " (a provenance record was dropped from or injected into the lane)"
+        )
+
+    # Per-record field cross-check against the signed chain record.
+    lane_unbacked = 0
+    for entry in lane_records:
+        seq = entry["seq"]
+        rec = chain_prov[seq]
+        data = rec.get("payload", {}).get("data", {})
+        actor = rec.get("actor") or {}
+        trust = rec.get("trust") or {}
+        chain_backing = actor.get("backing", "unbacked")
+        chain_principal = actor.get("principal")
+        chain_trust_level = trust.get("level")
+        # Build operator_ref from the chain record for cross-check.
+        # The lane emits a nested object; the chain stores it in data["operator_ref"].
+        chain_operator_ref = data.get("operator_ref")
+        lane_operator_ref = entry.get("operator_ref")
+        checks = [
+            ("record_id", entry.get("record_id"), rec.get("record_id")),
+            ("decision_id", entry.get("decision_id"), data.get("decision_id")),
+            ("surface", entry.get("surface"), data.get("surface")),
+            (
+                "claimed_decision_ts",
+                entry.get("claimed_decision_ts"),
+                data.get("claimed_decision_ts"),
+            ),
+            (
+                "received_bytes_hash",
+                entry.get("received_bytes_hash"),
+                data.get("received_bytes_hash"),
+            ),
+            (
+                "f101_schema_version",
+                entry.get("f101_schema_version"),
+                data.get("f101_schema_version"),
+            ),
+            ("words_hash", entry.get("words_hash"), data.get("words_hash")),
+            ("backing", entry.get("backing"), chain_backing),
+            ("principal", entry.get("principal"), chain_principal),
+            ("trust_level", entry.get("trust_level"), chain_trust_level),
+            ("authority", entry.get("authority"), rec.get("authority")),
+            # M18-bind: prev_link, kind, session, operator_ref cross-check so
+            # a tampered lane cannot swap chains, erase authorship, or relabel
+            # sessions. operator_ref is a nested object; compare it whole.
+            ("prev_link", entry.get("prev_link"), data.get("prev_link")),
+            ("kind", entry.get("kind"), data.get("kind")),
+            ("session", entry.get("session"), data.get("session")),
+            ("operator_ref", lane_operator_ref, chain_operator_ref),
+            # M20 epistemic-honesty annotations — cross-checked so a tampered
+            # lane cannot relabel a wall-clock-ordered span as causally-ordered
+            # or hide a timeout-forced predecessor link.
+            ("ordering_basis", entry.get("ordering_basis"), data.get("ordering_basis")),
+            (
+                "predecessor_missing",
+                entry.get("predecessor_missing"),
+                data.get("predecessor_missing"),
+            ),
+        ]
+        for fname, lane_val, chain_val in checks:
+            if lane_val != chain_val:
+                fail(
+                    "PROVENANCE.json record at seq "
+                    + str(seq)
+                    + " field '"
+                    + fname
+                    + "' ("
+                    + json.dumps(lane_val)
+                    + ") does not match the signed chain record ("
+                    + json.dumps(chain_val)
+                    + ") — provenance-lane tamper detected"
+                )
+        if entry.get("backing") != "verified":
+            lane_unbacked += 1
+
+    # record_count / unbacked_count headers MUST match the actual lane content.
+    if prov.get("record_count") != len(lane_records):
+        fail(
+            "PROVENANCE.json record_count "
+            + str(prov.get("record_count"))
+            + " does not match the "
+            + str(len(lane_records))
+            + " records present (provenance-lane tamper detected)"
+        )
+    if prov.get("unbacked_count") != lane_unbacked:
+        fail(
+            "PROVENANCE.json unbacked_count "
+            + str(prov.get("unbacked_count"))
+            + " does not match the "
+            + str(lane_unbacked)
+            + " unbacked records present (provenance-lane tamper detected)"
+        )
+    prov_total = len(lane_records)
+
+    # --- Step 6: optional Rekor entry-EXISTENCE check (best-effort) ---------
+    # NOT a cryptographic inclusion proof. See verify_rekor() docstring and
+    # spec 16 §16.7: real Merkle inclusion-proof verification against a signed
+    # tree head is Phase B, gated on csq's Rekor sink emitting rekor_log_index.
+    if rekor_url:
+        rekor_result = verify_rekor(rekor_url, lines, here)
+        if rekor_result is False:
+            fail("Rekor entry-existence check failed against " + rekor_url)
+        elif rekor_result is None:
+            warn(
+                "--rekor passed but no record carries a rekor_log_index; "
+                "Rekor entry-existence check skipped for this chain"
+            )
+    else:
+        warn("--rekor not passed; Rekor entry-existence check skipped")
+
+    print(
+        "PASS: chain verified end-to-end ("
+        + str(verified)
+        + " records, "
+        + str(rotations)
+        + " key rotations, "
+        + str(anchor_records)
+        + " signed records; signed cutoff confirms head seq "
+        + str(cutoff["latest_seq"])
+        + "; provenance lane: "
+        + str(prov_total)
+        + " decision(s), "
+        + str(lane_unbacked)
+        + " unbacked)"
+    )
+    print(
+        "NOTE: trust requires the genesis public key ("
+        + genesis_key_id
+        + ") was confirmed out-of-band. The bundle is self-attesting: an "
+        "attacker who re-signs a tampered bundle with their own key AND swaps "
+        "public_keys.json[genesis] produces an identical PASS. Confirm the "
+        "genesis key via an independent channel before trusting this verdict."
+    )
+    sys.exit(0)
+
+
+def canonical_bytes_with_real_hash(rec):
+    """The prev_hash of record N+1 is sha256 of the canonical bytes of record N.
+
+    csq computes the NEXT record's prev_hash from canonical_bytes_for(prev),
+    which serializes the prev record with its REAL (stored) canonical_hash — not
+    the genesis sentinel. So for the chain-link computation we re-serialize the
+    record with its actual canonical_hash in place.
+    """
+    view = {}
+    for f in _TOP_ORDER:
+        view[f] = rec[f]  # re-emit field as-is; includes the real canonical_hash
+    for f in _OPT_ORDER:
+        if rec.get(f) is not None:
+            view[f] = _sorted_value(rec[f])
+    return json.dumps(view, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _rekor_body_references_hash(body, canonical_hash):
+    """Structured check: does a Rekor response body reference canonical_hash?
+
+    This is a STRUCTURED EXISTENCE check, NOT a Merkle inclusion proof. We parse
+    the Rekor response (a map keyed by entry UUID) and look for canonical_hash
+    in the entry's `hashedrekord` content hash field specifically — not a raw
+    `hash in blob` substring over the whole response. A Rekor `hashedrekord`
+    entry's decoded body has shape:
+
+        { "apiVersion": ..., "kind": "hashedrekord",
+          "spec": { "data": { "hash": { "algorithm": "sha256",
+                                        "value": "<hex>" } } } }
+
+    We compare canonical_hash against `spec.data.hash.value` (the only field a
+    well-formed entry uses for the artifact digest). Falling back to a raw
+    substring search would let arbitrary blob content satisfy the check, so the
+    structured field read is the minimum honest existence assertion.
+    """
+    if not isinstance(body, dict):
+        return False
+    for _uuid, entry in body.items():
+        if not isinstance(entry, dict):
+            continue
+        raw_b64 = entry.get("body", "")
+        if not raw_b64:
+            continue
+        try:
+            decoded = base64.b64decode(raw_b64).decode("utf-8", "ignore")
+            parsed = json.loads(decoded)
+        except Exception:
+            continue
+        # Navigate the specific hashedrekord digest field; no whole-blob scan.
+        value = (
+            parsed.get("spec", {})
+            .get("data", {})
+            .get("hash", {})
+            .get("value", "")
+            if isinstance(parsed, dict)
+            else ""
+        )
+        if isinstance(value, str) and value.lower() == canonical_hash.lower():
+            return True
+    return False
+
+
+def verify_rekor(rekor_url, lines, workdir):
+    """Best-effort Rekor entry-EXISTENCE check — NOT a cryptographic proof.
+
+    IMPORTANT: This does NOT perform Sigstore Rekor Merkle-inclusion-proof
+    verification. It fetches the named log entry and structurally confirms the
+    entry references the record's canonical_hash. It does NOT verify an
+    inclusion proof against a signed tree head, does NOT validate a checkpoint,
+    and does NOT establish that the entry is actually committed to the log's
+    Merkle tree. A real inclusion-proof verifier is Phase B (spec 16 §16.7),
+    gated on csq's Rekor sink emitting rekor_log_index in the first place.
+
+    Returns True if at least one record's Rekor entry was fetched and references
+    its canonical_hash, None if no record carries a rekor_log_index (graceful
+    skip), False on a fetch failure or a structured-reference mismatch. Uses
+    only stdlib urllib — no sigstore SDK.
+
+    A record opts in by carrying a `rekor_log_index` field (set by csq's Rekor
+    sink). When present, the verifier fetches the log entry and runs the
+    structured existence check (`_rekor_body_references_hash`).
+    """
+    import urllib.request
+
+    checked = 0
+    for raw in lines:
+        rec = json.loads(raw)
+        log_index = rec.get("rekor_log_index")
+        if log_index is None:
+            continue
+        url = rekor_url.rstrip("/") + "/api/v1/log/entries?logIndex=" + str(log_index)
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # network/parse failure is a check failure
+            print(
+                "WARN: Rekor fetch failed for logIndex "
+                + str(log_index)
+                + ": "
+                + str(e)
+            )
+            return False
+        if not _rekor_body_references_hash(body, rec.get("canonical_hash", "")):
+            return False
+        checked += 1
+    if checked == 0:
+        return None
+    return True
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,556 @@
+//! Integration tests for credential management.
+//!
+//! Tests keychain service-name parity (locking in CC's hash format
+//! so csq stays compatible with CC's keychain writes), round-trip
+//! file operations, refresh token merge, concurrent access, and
+//! canonical save mirroring.
+
+use csq_core::credentials::file::{canonical_path, live_path, load, save, save_canonical_for};
+use csq_core::credentials::keychain::service_name;
+use csq_core::credentials::refresh::{
+    merge_refresh, refresh_token, RefreshResponse, TOKEN_ENDPOINT,
+};
+use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
+use csq_core::types::{AccessToken, AccountNum, RefreshToken};
+use std::collections::HashMap;
+use tempfile::TempDir;
+
+fn sample_creds() -> CredentialFile {
+    CredentialFile::Anthropic(AnthropicCredentialFile {
+        claude_ai_oauth: OAuthPayload {
+            access_token: AccessToken::new("sk-ant-oat01-integration-test".into()),
+            refresh_token: RefreshToken::new("sk-ant-ort01-integration-test".into()),
+            expires_at: 1775726524877,
+            scopes: vec![
+                "user:file_upload".into(),
+                "user:inference".into(),
+                "user:mcp_servers".into(),
+                "user:profile".into(),
+                "user:sessions:claude_code".into(),
+            ],
+            subscription_type: Some("max".into()),
+            rate_limit_tier: Some("default_claude_max_20x".into()),
+            extra: HashMap::new(),
+        },
+        extra: HashMap::new(),
+    })
+}
+
+// ── Keychain service name parity ──────────────────────────────────────
+
+#[test]
+fn keychain_service_name_known_paths() {
+    // Golden values computed from v1.x Python:
+    //   hashlib.sha256(unicodedata.normalize('NFC', path).encode()).hexdigest()[:8]
+    // CC's `claude auth login` writes the credential blob under the
+    // same hashed service name when launched with a non-default
+    // CLAUDE_CONFIG_DIR — locking these values keeps csq's read
+    // path compatible with CC's writes across both implementations.
+    let expected = [
+        (
+            "/Users/test/.claude/accounts/config-1",
+            "Claude Code-credentials-cfdcc24b",
+        ),
+        (
+            "/Users/test/.claude/accounts/config-2",
+            "Claude Code-credentials-550a6ea2",
+        ),
+        (
+            "/Users/test/.claude/accounts/config-3",
+            "Claude Code-credentials-d705092c",
+        ),
+        (
+            "/home/user/.claude/accounts/config-1",
+            "Claude Code-credentials-abf1dc4a",
+        ),
+        (
+            "/tmp/.claude/accounts/config-1",
+            "Claude Code-credentials-dbea6435",
+        ),
+    ];
+
+    for (path, expected_name) in &expected {
+        let actual = service_name(std::path::Path::new(path));
+        assert_eq!(
+            &actual, expected_name,
+            "v1.x parity failure for path {path}: got {actual}, expected {expected_name}"
+        );
+    }
+}
+
+// ── Round-trip file operations ────────────────────────────────────────
+
+#[test]
+fn full_credential_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("creds.json");
+
+    let original = sample_creds();
+    save(&path, &original).unwrap();
+
+    // Read back the raw JSON to verify structure
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    // Verify CC-compatible key names (camelCase)
+    assert!(parsed["claudeAiOauth"].is_object());
+    assert!(parsed["claudeAiOauth"]["accessToken"].is_string());
+    assert!(parsed["claudeAiOauth"]["refreshToken"].is_string());
+    assert!(parsed["claudeAiOauth"]["expiresAt"].is_number());
+    assert!(parsed["claudeAiOauth"]["subscriptionType"].is_string());
+    assert!(parsed["claudeAiOauth"]["rateLimitTier"].is_string());
+
+    // Load and verify values
+    let loaded = load(&path).unwrap();
+    assert_eq!(
+        loaded
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret(),
+        "sk-ant-oat01-integration-test"
+    );
+    assert_eq!(loaded.expect_anthropic().claude_ai_oauth.scopes.len(), 5);
+    assert_eq!(
+        loaded
+            .expect_anthropic()
+            .claude_ai_oauth
+            .subscription_type
+            .as_deref(),
+        Some("max")
+    );
+}
+
+#[test]
+fn unknown_fields_survive_round_trip() {
+    let json = r#"{
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-test",
+            "refreshToken": "sk-ant-ort01-test",
+            "expiresAt": 1000,
+            "scopes": [],
+            "subscriptionType": "max",
+            "rateLimitTier": "tier",
+            "futureOAuthField": {"nested": true},
+            "anotherFuture": [1, 2, 3]
+        },
+        "futureTopLevel": "preserved",
+        "futureNested": {"a": 1}
+    }"#;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("future.json");
+
+    let creds: CredentialFile = serde_json::from_str(json).unwrap();
+    save(&path, &creds).unwrap();
+    let loaded = load(&path).unwrap();
+    let reserialized = serde_json::to_value(&loaded).unwrap();
+
+    assert_eq!(reserialized["futureTopLevel"], "preserved");
+    assert_eq!(reserialized["futureNested"]["a"], 1);
+    assert_eq!(
+        reserialized["claudeAiOauth"]["futureOAuthField"]["nested"],
+        true
+    );
+    assert_eq!(reserialized["claudeAiOauth"]["anotherFuture"][1], 2);
+}
+
+// ── Refresh merge verification ────────────────────────────────────────
+
+#[test]
+fn refresh_merge_preserves_all_metadata() {
+    let original = sample_creds();
+
+    let response = RefreshResponse {
+        access_token: "sk-ant-oat01-refreshed-new".into(),
+        refresh_token: "sk-ant-ort01-refreshed-new".into(),
+        expires_in: 18000,
+        scope: None,
+    };
+
+    let merged = merge_refresh(&original, &response);
+
+    // Tokens updated
+    assert_eq!(
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret(),
+        "sk-ant-oat01-refreshed-new"
+    );
+    assert_eq!(
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .refresh_token
+            .expose_secret(),
+        "sk-ant-ort01-refreshed-new"
+    );
+
+    // Expiry updated (should be ~18000s from now)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(merged.expect_anthropic().claude_ai_oauth.expires_at > now_ms);
+    assert!(merged.expect_anthropic().claude_ai_oauth.expires_at < now_ms + 20_000_000);
+
+    // Metadata preserved
+    assert_eq!(
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .subscription_type
+            .as_deref(),
+        Some("max")
+    );
+    assert_eq!(
+        merged
+            .expect_anthropic()
+            .claude_ai_oauth
+            .rate_limit_tier
+            .as_deref(),
+        Some("default_claude_max_20x")
+    );
+    assert_eq!(merged.expect_anthropic().claude_ai_oauth.scopes.len(), 5);
+}
+
+#[test]
+fn refresh_merge_with_extra_fields_preserved() {
+    let json = r#"{
+        "claudeAiOauth": {
+            "accessToken": "old",
+            "refreshToken": "old",
+            "expiresAt": 1000,
+            "scopes": ["a"],
+            "customField": "must survive refresh"
+        }
+    }"#;
+
+    let original: CredentialFile = serde_json::from_str(json).unwrap();
+
+    let response = RefreshResponse {
+        access_token: "new".into(),
+        refresh_token: "new".into(),
+        expires_in: 18000,
+        scope: None,
+    };
+
+    let merged = merge_refresh(&original, &response);
+    let value = serde_json::to_value(&merged).unwrap();
+
+    assert_eq!(
+        value["claudeAiOauth"]["customField"],
+        "must survive refresh"
+    );
+}
+
+// ── Canonical save — M4-12 fail-closed ───────────────────────────────
+
+#[test]
+fn save_canonical_for_fails_closed_without_uuid_post_m4_12() {
+    // M4-12 retired the numeric `credentials/<N>.json` write path.
+    // `save_canonical_for` now requires a UUID-provisioned identity
+    // record (written by daemon Pass 0 identity mint, M1-4). Without
+    // a UUID, it returns `CredentialError::NoCredentials` — fail-closed
+    // instead of silently writing nothing (the old fail-open trap,
+    // Finding 1.1).
+    let dir = TempDir::new().unwrap();
+    let account = AccountNum::try_from(5u16).unwrap();
+
+    // No UUID provisioned — save_canonical_for MUST fail.
+    let result = save_canonical_for(dir.path(), account, &sample_creds());
+    assert!(
+        result.is_err(),
+        "save_canonical_for MUST fail-closed when no UUID is provisioned (M4-12)"
+    );
+
+    // Neither the numeric canonical nor the live mirror must be written.
+    let canonical = canonical_path(dir.path(), account);
+    let live = live_path(dir.path(), account);
+    assert!(
+        !canonical.exists(),
+        "numeric canonical must NOT be written post-M4-12; got {:?}",
+        canonical
+    );
+    assert!(
+        !live.exists(),
+        "live mirror must NOT exist post-M3-7; got {:?}",
+        live
+    );
+}
+
+// ── Concurrent access ─────────────────────────────────────────────────
+
+#[test]
+fn concurrent_credential_saves() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    let path = Arc::new(dir.path().join("concurrent.json"));
+
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let path = Arc::clone(&path);
+            thread::spawn(move || {
+                for j in 0..50 {
+                    let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                        claude_ai_oauth: OAuthPayload {
+                            access_token: AccessToken::new(format!("t{i}_{j}")),
+                            refresh_token: RefreshToken::new(format!("r{i}_{j}")),
+                            expires_at: 1000 + i * 100 + j,
+                            scopes: vec![],
+                            subscription_type: None,
+                            rate_limit_tier: None,
+                            extra: HashMap::new(),
+                        },
+                        extra: HashMap::new(),
+                    });
+                    let _ = save(&path, &creds);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Final file must be valid JSON
+    let loaded = load(&path).unwrap();
+    assert!(
+        loaded
+            .expect_anthropic()
+            .claude_ai_oauth
+            .access_token
+            .expose_secret()
+            .starts_with('t'),
+        "final access token should be from one of the writers"
+    );
+}
+
+// ── File permission verification ──────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn direct_save_files_have_600_permissions() {
+    // M4-12: `save_canonical_for` requires UUID provisioning and writes
+    // to UUID-keyed identity paths. This test verifies the base `save`
+    // helper (used by E2E harnesses and direct-path writes) applies 0o600.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test-creds.json");
+
+    save(&path, &sample_creds()).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "credential file {:?} written by `save` should be 0o600",
+        path
+    );
+}
+
+// ── save_canonical is independent of legacy live-dir state ────────────
+
+#[cfg(unix)]
+#[test]
+fn save_canonical_for_fails_closed_regardless_of_legacy_live_dir_post_m4_12() {
+    // M4-12: `save_canonical_for` requires a UUID-provisioned identity.
+    // Without UUID, it fails-closed (returns NoCredentials). A stale
+    // unwritable `config-N/` dir from a pre-M3-7 layout has no effect
+    // on this outcome — neither path is attempted.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let account = AccountNum::try_from(2u16).unwrap();
+
+    // Pre-seed an unwritable legacy live config dir — emulates stale layout.
+    let legacy_live_dir = dir.path().join("config-2");
+    std::fs::create_dir_all(&legacy_live_dir).unwrap();
+    std::fs::set_permissions(&legacy_live_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Without UUID: must fail-closed, not fail-open.
+    let result = save_canonical_for(dir.path(), account, &sample_creds());
+    assert!(
+        result.is_err(),
+        "save_canonical_for MUST fail-closed when no UUID is provisioned (M4-12 Finding 1.1)"
+    );
+
+    // Numeric canonical and live mirror must NOT be written.
+    let canonical = canonical_path(dir.path(), account);
+    assert!(
+        !canonical.exists(),
+        "numeric canonical must NOT be written post-M4-12; got {:?}",
+        canonical
+    );
+    assert!(
+        !live_path(dir.path(), account).exists(),
+        "live mirror must NOT be written post-M3-7"
+    );
+
+    // Restore permissions for tempdir cleanup.
+    std::fs::set_permissions(&legacy_live_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ── refresh_token URL and body verification ───────────────────────────
+
+#[test]
+fn refresh_token_passes_correct_url_and_body() {
+    // Anthropic's token endpoint now rejects form-encoded bodies and
+    // requires JSON with client_id (see journal 0034 and commit
+    // 8a9fdc9). It ALSO rejects `scope` in the refresh body with
+    // `400 invalid_scope` (journal 0052 / 2026-04-14) — per RFC 6749
+    // §6, scope is OPTIONAL on refresh and the new token retains the
+    // original grant scopes when omitted. This test locks in the
+    // exact JSON shape: a regression back to form-encoded fails fast
+    // at from_str, a regression that drifts client_id away from the
+    // authoritative constant fails at assert_eq, and a regression
+    // that re-adds the `scope` field fails at the obj.len() check.
+    use csq_core::oauth::constants::OAUTH_CLIENT_ID;
+
+    let existing = sample_creds();
+
+    let captured_url = std::cell::RefCell::new(String::new());
+    let captured_body = std::cell::RefCell::new(String::new());
+
+    let result = refresh_token(&existing, |url, body| {
+        *captured_url.borrow_mut() = url.to_string();
+        *captured_body.borrow_mut() = body.to_string();
+        Ok(br#"{"access_token":"new","refresh_token":"new","expires_in":18000}"#.to_vec())
+    });
+
+    assert!(result.is_ok());
+    assert_eq!(*captured_url.borrow(), TOKEN_ENDPOINT);
+
+    let body = captured_body.borrow();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("refresh body must be valid JSON");
+
+    assert_eq!(parsed["grant_type"], "refresh_token");
+    assert_eq!(parsed["refresh_token"], "sk-ant-ort01-integration-test");
+    assert_eq!(parsed["client_id"], OAUTH_CLIENT_ID);
+    assert!(
+        parsed.get("scope").is_none(),
+        "refresh body must NOT contain `scope` — Anthropic returns invalid_scope (journal 0052)"
+    );
+
+    // No extra fields — a future regression that adds e.g. client_secret
+    // or re-adds scope should fail this check rather than silently
+    // change the payload.
+    let obj = parsed
+        .as_object()
+        .expect("refresh body must be a JSON object");
+    let expected_keys = ["grant_type", "refresh_token", "client_id"];
+    assert_eq!(
+        obj.len(),
+        expected_keys.len(),
+        "refresh body contains unexpected fields: {obj:?}"
+    );
+    for key in expected_keys {
+        assert!(obj.contains_key(key), "missing field: {key}");
+    }
+}
+
+// ── OAuth error-type allowlist diagnostic plumbing ───────────────────
+
+/// Integration test: a 400 with `{"error":"invalid_scope"}` must produce
+/// an error message containing the literal string `invalid_scope`.
+///
+/// This test exercises the full diagnostic pipeline:
+///   `refresh_token` → `extract_oauth_error` → `extract_oauth_error_type`
+///   → `OAuthError::Exchange(msg)` containing "invalid_scope".
+///
+/// Before journal 0052, this string was stripped from logs by `redact_tokens`
+/// (the refresh body contained `scope` which triggered Anthropic's rejection,
+/// and the error word itself was never surfaced at the log level). This test
+/// locks in the requirement that the RFC 6749 error category survives the
+/// full error-formatting path and reaches the caller.
+#[test]
+fn oauth_invalid_scope_error_is_diagnostic_in_error_message() {
+    use csq_core::error::OAuthError;
+
+    let existing = sample_creds();
+
+    // Simulate Anthropic returning 400 invalid_scope (journal 0052)
+    let result = refresh_token(&existing, |_url, _body| {
+        Ok(br#"{"error":"invalid_scope","error_description":"The requested scope is invalid, unknown, or malformed."}"#.to_vec())
+    });
+
+    match result {
+        Err(OAuthError::Exchange(msg)) => {
+            assert!(
+                msg.contains("invalid_scope"),
+                "error message must contain 'invalid_scope' for operator diagnosis: {msg}"
+            );
+            // The description text must also survive (it has no token patterns to redact)
+            assert!(
+                msg.contains("invalid") || msg.contains("scope"),
+                "error message should be descriptive: {msg}"
+            );
+            // Must NOT contain token patterns from the request body
+            assert!(
+                !msg.contains("sk-ant-"),
+                "error message must not contain token prefixes: {msg}"
+            );
+        }
+        other => panic!("expected OAuthError::Exchange, got {other:?}"),
+    }
+}
+
+// ── IPC error string mapping ──────────────────────────────────────────
+
+#[test]
+fn csq_error_ipc_mapping_coverage() {
+    use csq_core::error::*;
+
+    // NotFound -> NOT_FOUND
+    let err = CsqError::Credential(CredentialError::NotFound {
+        path: std::path::PathBuf::from("/tmp/test"),
+    });
+    let s: String = err.into();
+    assert!(s.starts_with("NOT_FOUND:"), "got: {s}");
+
+    // RefreshTokenInvalid -> LOGIN_REQUIRED
+    let err = CsqError::Broker(BrokerError::RefreshTokenInvalid { account: 1 });
+    let s: String = err.into();
+    assert!(s.starts_with("LOGIN_REQUIRED:"), "got: {s}");
+
+    // StateMismatch -> CSRF_ERROR
+    let err = CsqError::OAuth(OAuthError::StateMismatch);
+    let s: String = err.into();
+    assert!(s.starts_with("CSRF_ERROR:"), "got: {s}");
+
+    // Other -> INTERNAL_ERROR
+    let err = CsqError::Platform(PlatformError::Io(std::io::Error::other("test")));
+    let s: String = err.into();
+    assert!(s.starts_with("INTERNAL_ERROR:"), "got: {s}");
+}
+
+// ── OAuthError body sanitization ──────────────────────────────────────
+
+#[test]
+fn oauth_error_http_redacts_tokens_in_body() {
+    use csq_core::error::OAuthError;
+
+    let err = OAuthError::Http {
+        status: 401,
+        body: "invalid token: sk-ant-oat01-leaked-value and sk-ant-ort01-leaked-refresh".into(),
+    };
+    let display = format!("{err}");
+    assert!(
+        !display.contains("leaked-value"),
+        "access token should be redacted: {display}"
+    );
+    assert!(
+        !display.contains("leaked-refresh"),
+        "refresh token should be redacted: {display}"
+    );
+    assert!(
+        display.contains("[REDACTED]"),
+        "should contain redaction marker: {display}"
+    );
+}

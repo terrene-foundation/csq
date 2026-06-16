@@ -1,0 +1,85 @@
+[package]
+name = "csq-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Foundation-owned, self-hostable transparency-log server for csq audit anchoring (M10)."
+
+# M10 — csq-ledger. A standalone HTTP/JSON transparency-log server built on
+# the RFC 6962 Merkle tree, native to csq's existing crypto (ed25519-dalek +
+# sha2). It consumes csq-core's M07 `LedgerSink` trait for the `--anchor-to-sink`
+# strengthening; it does NOT define a new sink abstraction (PRIMARY DIRECTIVE 3).
+#
+# Storage is hand-rolled append-only segment files (PRIMARY DIRECTIVE 1: local
+# file, not a database). `sled` was the milestone-blessed default; it is NOT used
+# because it would add ~15 transitive crates (a B-tree engine, crossbeam, fxhash,
+# parking_lot, zstd) to the workspace dep graph for a write-once append-only
+# workload that segment files handle natively. The milestone explicitly permits
+# the hand-rolled fallback "if `sled` adds undesirable dep mass." See spec 17 §17.4.
+
+[[bin]]
+name = "csq-ledger"
+path = "src/main.rs"
+
+[dependencies]
+# csq-core: the SignedRecord schema + M07 LedgerSink trait + reference-impl
+# catalog. Anchoring re-uses these; no new sink trait is defined here.
+csq-core = { path = "../csq-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+# axum 0.8: HTTP/JSON server (PRIMARY DIRECTIVE 5 — axum, not tonic).
+# default-features off + only the features the four routes need.
+axum = { workspace = true, features = ["tokio", "http1", "json"] }
+# RFC 6962 Merkle hashing (sha2) + checkpoint signing (ed25519-dalek). Same
+# primitives csq-core's verify.rs uses; no kailash/eatp dependency (correction 2).
+# The signing-key file uses a self-contained PEM-style envelope wrapping the
+# hex-encoded 32-byte seed (see signing.rs); the ed25519-dalek `pem`/`pkcs8`
+# feature is deliberately NOT enabled to avoid pulling the pkcs8/der dep chain
+# into the workspace graph.
+sha2.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+# getrandom: first-boot signing-key seed generation.
+getrandom.workspace = true
+# zeroize: wipe the signing-key seed bytes from memory after use (same posture
+# as csq-core's key_custody). Pure Rust, no FFI.
+zeroize.workspace = true
+# thiserror: typed error enums at the storage / server boundary.
+thiserror.workspace = true
+# chrono: RFC 3339 timestamps for anchor receipts. The workspace pin disables
+# default features (no `clock`), so enable `clock` here for `Utc::now()`.
+chrono = { workspace = true, features = ["clock"] }
+# clap 4: server CLI (--data-dir, --port, --anchor-to-sink, --anchor-cadence).
+# `env` enables the per-flag environment-variable fallback used for container
+# deployment (CSQ_LEDGER_DATA_DIR, CSQ_LEDGER_PORT, CSQ_LEDGER_BIND).
+clap = { workspace = true, features = ["env"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# async-trait: csq-core's LedgerSink is an async_trait; the anchor task drives it.
+async-trait.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+# tower `util` feature: ServiceExt::oneshot for in-process handler tests.
+# Dev-only — does NOT add tower to the runtime dep graph (independence.md Rule 3).
+tower = { workspace = true, features = ["util"] }
+
+[features]
+default = []
+# Per-sink anchor features. Each enables the matching csq-core M07 reference
+# impl AND gates the `resolve_sink` arm via the crate's own cfg name (Cargo
+# dependency-features are NOT directly cfg-visible; the crate must own a feature
+# name to cfg on). Operators rebuild with the sink they anchor to:
+#   cargo build -p csq-ledger --features anchor-rekor
+anchor-rekor = ["csq-core/rekor-sink"]
+anchor-s3 = ["csq-core/s3-sink"]
+anchor-azure = ["csq-core/azure-sink"]
+anchor-gcp = ["csq-core/gcp-sink"]
+# Convenience bundle (all anchor sinks). Used by the integration-test suite.
+anchor-sinks = ["anchor-rekor", "anchor-s3", "anchor-azure", "anchor-gcp"]

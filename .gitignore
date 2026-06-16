@@ -1,0 +1,135 @@
+.env
+__pycache__/
+*.pyc
+/credentials/
+.account.*
+.DS_Store
+**/.DS_Store
+
+# Credential and session state files (security: never commit)
+config-*/
+.credentials.json
+.csq-account
+.current-account
+.live-pid
+.quota-cursor
+# Daemon runtime state — sockets and PIDs leaked into the repo would
+# either be dead pointers (sock) or pid-collision fodder (pid).
+*.sock
+*.pid
+# OAuth login locks — held only while a login flow is in flight; if
+# they ever land in the working tree it's because a test fixture wrote
+# into the wrong cwd.
+.login-*.lock
+# Belt-and-braces: any per-account directory tree that drifted into the
+# working tree (e.g. via test fixtures pointing at `./accounts/`). Anchored
+# to repo root so it does NOT catch source code paths like
+# `csq-core/src/accounts/`.
+/accounts/
+
+# Gemini CLI-durable event log (spec 05 §5.8.1, security: never commit)
+gemini-events-*.ndjson
+gemini-events-*.corrupt.*
+
+# Codex wham/usage raw + drift captures (PII-redacted on write but the
+# diffs would still surface user_id / account_id / email shape drift
+# across sessions; captures live only on the operator's machine).
+/accounts/codex-wham-raw.json
+/accounts/codex-wham-drift.json
+
+# Maintainer-local release artifacts. Produced by
+# `docs/release-signing.md` §3-§7c on the maintainer host (sign +
+# notarize + staple + minisign) and uploaded to the GitHub release
+# pre-tag-push via §8. The local copies persist in the working tree
+# afterward and never need to be committed — they regenerate every
+# release cut. Anchored to repo root so a directory of a similar name
+# anywhere else in the tree is not affected.
+#
+# Extending this block: add an anchored pattern here when
+# `docs/release-signing.md` introduces a new artifact shape (e.g. a
+# new hash algorithm like `.sha512` or a new bundle format).
+/csq-desktop-*.dmg
+/csq-desktop-*.dmg.sha256
+/csq-desktop-*.app.tar.gz
+/csq-desktop-*.app.tar.gz.sha256
+/csq-desktop-*.app.tar.gz.sig
+# §3-§7c also emit these alongside the bundle artifacts. Same
+# disposition: regenerated every release cut, uploaded to the GH
+# release pre-tag-push, never need to be committed.
+/latest.json
+/SHA256SUMS
+/SHA256SUMS.sig
+# Signing keys. Today the Tauri updater key lives outside the repo at
+# `~/.tauri/csq-updater.key` (per `discovery_tauri_signing_key_local_path`
+# user memory). The narrow anchored pattern below is defense-in-depth
+# against accidental relocation during key rotation. Not broad enough
+# to catch unrelated `*.key` files elsewhere in the tree.
+/csq-updater.key
+
+# Developer-local Cargo config overrides (machine-specific [patch] blocks).
+# The canonical example lives at .cargo/config.toml.example.
+.cargo/config.toml
+
+# Rust build artifacts
+target/
+
+# Frontend + Tauri CLI host build artifacts (csq crate)
+csq/node_modules/
+csq/ui/node_modules/
+csq/ui/dist/
+
+# Local-only research and notes folders
+notes/
+research/
+internal/
+upstream-internals/
+*.research.md
+
+# Phase test outputs and other ephemeral analysis data
+journal/*-data/
+
+# Runtime learning state — auto-appended on every session start.
+# Tracking it produces churn on every commit and never carries useful diffs.
+# Matches at any depth (csq-desktop/.claude/learning/ too) via the **/ prefix.
+**/.claude/learning/
+
+# Scheduled-task lock file — runtime state for the harness cron
+# scheduler. Recreated on every session; has no diff value.
+**/.claude/scheduled_tasks.lock
+
+# IDE settings
+.vscode/
+**/.vscode/
+
+# Session notes (ephemeral, per-machine)
+workspaces/**/.session-notes
+
+# COC eval environment — durable code (lib/, schemas/, tests/, fixtures/,
+# suites/, conftest.py, run.py) is tracked. Only ephemeral run state is
+# ignored. The legacy `coc-eval/coc-env/` workspace and per-run results
+# are local-only.
+coc-eval/__pycache__/
+coc-eval/.pytest_cache/
+coc-eval/.benchmarks/
+coc-eval/coc-env/
+coc-eval/results/
+coc-eval/bench/results/
+coc-eval/scaffolds/output/
+coc-eval/run-environment-pin.json
+coc-eval/**/__pycache__/
+# Vector 3 — append-only longitudinal events file. Regenerable from
+# `coc-eval/results/_history/<YYYY-MM>/*.jsonl.gz` archives. Gitignored
+# by default; operators may opt-in to commit the file when reproducible
+# cross-version dashboards matter for the repo.
+coc-eval/baselines-longitudinal.json
+.playwright-mcp/
+.claude/worktrees/
+
+# PR-CA9b — stub binaries (built per CI run, never committed)
+coc-eval/bench/stubs/stub-claude
+coc-eval/bench/stubs/stub-codex
+coc-eval/bench/stubs/stub-gemini
+# Issue #272 — unprefixed symlinks emitted by build-stubs.sh
+coc-eval/bench/stubs/claude
+coc-eval/bench/stubs/codex
+coc-eval/bench/stubs/gemini

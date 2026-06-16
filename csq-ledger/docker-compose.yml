@@ -1,0 +1,47 @@
+# csq-ledger — minimal single-instance deployment example (M10).
+#
+# A single transparency-log server with a volume-mounted data directory. This
+# is the simplest deployment; for tamper-resistance against the operator,
+# mount the volume on write-once media (S3 Object Lock via a CSI driver, Azure
+# Immutable Blob, GCP Bucket Lock, or on-prem `chattr +a`) AND configure
+# --anchor-to-sink. See docs/audit-sinks/csq-ledger.md § "Threat model".
+#
+# Usage:
+#   docker compose -f csq-ledger/docker-compose.yml up -d
+#   curl http://localhost:8080/v1/health
+#
+# IMPORTANT — first boot auto-generates a signing key at /data/signing-key.pem.
+# BACK IT UP. Losing it makes existing checkpoints unverifiable. Once you have
+# reviewed + backed up the key, set CSQ_LEDGER_SIGNING_KEY_PATH (below) to
+# acknowledge it and clear the persistent warning.
+
+services:
+  csq-ledger:
+    image: ghcr.io/terrene-foundation/csq-ledger:latest
+    # To build locally instead of pulling, comment out `image:` and use:
+    # build:
+    #   context: ..
+    #   dockerfile: csq-ledger/Dockerfile
+    container_name: csq-ledger
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # The append-only log + signing key live here. For WORM enforcement,
+      # back this with immutable storage (see the ops doc threat model).
+      - csq-ledger-data:/data
+    environment:
+      CSQ_LEDGER_DATA_DIR: /data
+      CSQ_LEDGER_PORT: "8080"
+      CSQ_LEDGER_BIND: "0.0.0.0"
+      # Uncomment AFTER you have backed up /data/signing-key.pem to acknowledge
+      # the key and clear the first-boot warning:
+      # CSQ_LEDGER_SIGNING_KEY_PATH: /data/signing-key.pem
+    healthcheck:
+      # distroless has no shell/curl; rely on the container exit + an external
+      # probe, or add a sidecar. The server exposes GET /v1/health for an
+      # external monitor / reverse-proxy health check.
+      disable: true
+
+volumes:
+  csq-ledger-data:

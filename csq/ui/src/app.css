@@ -1,0 +1,61 @@
+/* Terrene Foundation Design System — Desktop App
+   Derived from terrene-theme.css (website) */
+
+:root {
+  /* Dark mode (default for desktop app) */
+  --bg-primary: #1A1918;
+  --bg-secondary: #242320;
+  --bg-tertiary: #3A3835;
+  --text-primary: #E0DDD8;
+  --text-secondary: #9A958F;
+  --text-tertiary: #6B6358;
+  --border: #3A3835;
+  --accent: #D9A55C;
+  --accent-hover: #E8C48A;
+  --accent-low: #1F1A10;
+  --green: #4CC49A;
+  --yellow: #E08050;
+  --red: #E8675C;
+  --info: #6BAED6;
+  --surface: #242320;
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg-primary: #FFFFFF;
+    --bg-secondary: #EFECE7;
+    --bg-tertiary: #D5D0C8;
+    --text-primary: #2E2E2C;
+    --text-secondary: #6B6358;
+    --text-tertiary: #9E968E;
+    --border: #D5D0C8;
+    --accent: #805A10;
+    --accent-hover: #6B4C0D;
+    --accent-low: #FDF8EF;
+    --green: #186E52;
+    --yellow: #A0421E;
+    --red: #B5443A;
+    --info: #3A6B8A;
+    --surface: #EFECE7;
+  }
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(217, 165, 92, 0.25);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

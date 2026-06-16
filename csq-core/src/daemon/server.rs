@@ -1,0 +1,2487 @@
+//! Unix socket IPC server for the daemon.
+//!
+//! Serves a minimal axum HTTP/1.1 router over a Unix domain socket.
+//! M8.3 only wires the `GET /api/health` route — additional routes
+//! (accounts, usage, refresh, OAuth callback) land in M8.4+.
+//!
+//! # Platform scope
+//!
+//! This module is Unix-only (`cfg(unix)`). Windows named-pipe
+//! support is deferred to M8.6 — see
+//! `workspaces/csq-v2/todos/completed/M8-daemon-core.md` task M8-03.
+//!
+//! # Security model
+//!
+//! Three defensive layers protect the IPC surface. Any single layer
+//! breaking should not expose the daemon; together they match the
+//! hardening baseline sshd and systemd use for local sockets.
+//!
+//! ## Layer 1 — socket file permissions (0o600)
+//!
+//! The socket file is created with `0o600` permissions. To close the
+//! microsecond window between `bind(2)` and `chmod(2)` during which
+//! the socket would otherwise inherit the process umask (typically
+//! 0o644 or 0o755), [`serve`] temporarily sets the thread's umask to
+//! `0o077` immediately before bind and restores it immediately after.
+//! The explicit `set_permissions(0o600)` call remains as
+//! defense-in-depth.
+//!
+//! ## Layer 2 — `SO_PEERCRED` / `LOCAL_PEERCRED` peer UID check
+//!
+//! Every accepted connection is checked against `geteuid()` before
+//! the HTTP router sees the request. Linux uses `SO_PEERCRED` to
+//! read `struct ucred.uid`; macOS uses `LOCAL_PEERCRED` to read
+//! `struct xucred.cr_uid`. Connections from other UIDs are closed
+//! immediately with no HTTP response. This catches the case where
+//! a file-permission bug (incorrect chmod, symlink swap, race) lets
+//! a different-UID process connect.
+//!
+//! ## Layer 3 — per-user socket directory
+//!
+//! The socket path itself lives under a per-user directory:
+//! `$XDG_RUNTIME_DIR` on Linux (tmpfs, 0o700), `~/.claude/accounts`
+//! on macOS (0o755 but inside the user's HOME), or
+//! `/tmp/csq-{uid}.sock` as the Linux fallback (uid in the name so
+//! different-UID collisions are harmless).
+//!
+//! ## HTTP request authentication
+//!
+//! There is no application-layer authentication on the HTTP
+//! requests because the three layers above establish that any
+//! caller is the owning user. Anyone who can open the socket is
+//! already the same UID, which is exactly the threat model for a
+//! per-user daemon.
+
+// This module is shared by both the Unix-socket listener (cfg(unix))
+// and the Windows named-pipe listener (cfg(windows) — see
+// `server_windows.rs`). The router definition, RouterState, request
+// handlers, and request/response types are cross-platform. Only the
+// Unix-specific bind/accept loop and SO_PEERCRED helpers are gated
+// behind `#[cfg(unix)]` further down.
+
+use super::cache::TtlCache;
+use super::refresher::RefreshStatus;
+use super::usage_poller::gemini::GeminiConsumerState;
+use crate::accounts::{discovery, AccountInfo};
+use crate::credentials;
+use crate::error::{DaemonError, OAuthError};
+use crate::oauth::{
+    exchange_code, start_login, LoginRequest, OAuthStateStore, PASTE_CODE_REDIRECT_URI,
+};
+use crate::types::AccountNum;
+use axum::{
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tokio_util::sync::CancellationToken;
+
+/// Shared router state — cache + base_dir paths + OAuth state
+/// store. Cloned cheaply (every field is an `Arc` / `PathBuf`
+/// inside) for each request via axum's `State` extractor.
+#[derive(Clone)]
+pub struct RouterState {
+    /// Refresh-status cache owned by the daemon lifecycle. The
+    /// refresher writes; HTTP routes only read.
+    pub cache: Arc<TtlCache<u16, RefreshStatus>>,
+    /// Short-TTL cache of the full discovered account list. Used
+    /// by `/api/accounts` and `/api/refresh-status` to avoid a
+    /// full filesystem scan on every request. Bounded to
+    /// [`DISCOVERY_CACHE_MAX_AGE`]. Single-entry — the key is
+    /// `()` because discovery is per-base-dir and the base dir
+    /// is constant for the life of the daemon.
+    ///
+    /// Addresses M8.5 security review MED #1 (full fs scan per
+    /// request is a DoS vector once the statusline starts
+    /// polling on a tight interval).
+    pub discovery_cache: Arc<TtlCache<(), Vec<AccountInfo>>>,
+    /// csq base directory, passed through for account discovery.
+    pub base_dir: Arc<PathBuf>,
+    /// OAuth state store for pending paste-code logins. The daemon
+    /// keeps this in memory — `start_login` inserts an entry keyed
+    /// by a random state token, and the subsequent
+    /// `/api/oauth/exchange` call consumes it when the user submits
+    /// their copied authorization code.
+    ///
+    /// `None` when the daemon was started without OAuth support
+    /// (tests, custom builds). In that case both `/api/login/{N}`
+    /// and `/api/oauth/exchange` return 503.
+    pub oauth_store: Option<Arc<OAuthStateStore>>,
+    /// Gemini event-consumer state — shared with the NDJSON drain
+    /// task so the live IPC route AND the drainer dedup against
+    /// the same applied-set and serialise quota writes through the
+    /// same per-process mutex (spec 05 §5.8.1 single-writer
+    /// invariant). Cloned cheaply (every field is an `Arc`).
+    pub gemini_consumer: GeminiConsumerState,
+    /// Audit-chain health as determined at daemon startup by
+    /// `verify_chain`. Gates the audit subsystem:
+    /// - Anchor task skips anchoring when `!is_operational()`.
+    /// - `POST /api/audit/record` rejects emits when `!is_operational()`.
+    ///
+    /// Other subsystems (token-refresh, usage-poller, IPC server itself)
+    /// are NEVER gated on this — see spec 12 §12.13.5.
+    pub audit_health: crate::audit::AuditHealth,
+}
+
+/// Maximum staleness for the discovery cache: 5 seconds.
+///
+/// Chosen so that:
+///
+/// 1. A statusline polling every 1–2 seconds pays the fs-scan
+///    cost at most once per 5s window, not on every render.
+/// 2. A new account added via OAuth callback becomes visible to
+///    the rest of the API within 5s without any explicit
+///    invalidation wiring.
+/// 3. Stale reads are bounded — no user-visible "ghost account"
+///    lingers beyond the TTL even if the underlying credentials
+///    file is deleted out of band.
+///
+/// Dogpile race: two concurrent handlers may both miss the cache
+/// and both run discovery. This is acceptable at 5s TTL because
+/// the cost is exactly one extra fs scan per race, and the
+/// filesystem scan at realistic account counts (<= 100) is a
+/// few milliseconds. Adding single-flight coordination would
+/// require holding an async lock across spawn_blocking, which
+/// is strictly worse than the bounded dogpile.
+pub const DISCOVERY_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum request body size accepted by the daemon HTTP router.
+/// M8.3 has no body-accepting routes, but the limit is set now so
+/// every future route (M8.5 `/api/login`, `/api/refresh-token/:id`,
+/// etc.) inherits it automatically. 1 MiB is generous for JSON
+/// command payloads while still bounding worst-case allocation.
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// Health endpoint response body. Deliberately minimal — the client
+/// only cares that the endpoint responds with 200 and valid JSON.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub pid: u32,
+}
+
+/// Builds the axum router for the daemon HTTP API.
+///
+/// Routes mounted:
+/// - `GET /api/health` — liveness probe (M8.3)
+/// - `GET /api/accounts` — discovered accounts (M8.5)
+/// - `GET /api/refresh-status` — all refresh statuses from the cache (M8.5)
+/// - `GET /api/refresh-status/:id` — one account's refresh status (M8.5)
+/// - `GET /api/login/:id` — initiate a paste-code OAuth flow
+/// - `POST /api/oauth/exchange` — submit the paste-code and exchange it
+/// - `POST /api/invalidate-cache` — clear all caches (M8-10c)
+///
+/// The [`DefaultBodyLimit`] layer is installed here so every future
+/// route inherits the 1 MiB cap without having to remember. State
+/// is shared via `with_state` so each handler gets a cheap clone
+/// of the [`RouterState`].
+pub fn router(state: RouterState) -> Router {
+    Router::new()
+        .route("/api/health", get(health_handler))
+        .route("/api/accounts", get(accounts_handler))
+        .route("/api/refresh-status", get(refresh_status_all_handler))
+        .route("/api/refresh-status/{id}", get(refresh_status_one_handler))
+        .route("/api/login/{id}", get(login_handler))
+        .route("/api/oauth/exchange", post(oauth_exchange_handler))
+        .route("/api/invalidate-cache", post(invalidate_cache_handler))
+        .route("/api/slot-swap", post(slot_swap_handler))
+        .route("/api/gemini/event", post(gemini_event_handler))
+        .route("/api/audit/record", post(audit_record_handler))
+        .route("/api/provenance/anchor", post(provenance_anchor_handler))
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+}
+
+async fn health_handler() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        pid: std::process::id(),
+    })
+}
+
+/// Runs account discovery, hitting [`RouterState::discovery_cache`]
+/// first and only falling through to a real filesystem scan on
+/// cache miss or expiry.
+///
+/// Returns an empty `Vec` if the underlying spawn_blocking task
+/// panics — the error is logged with a fixed tag (no `%e` per
+/// RISK-0007) and the handler continues to serve an empty list
+/// rather than surfacing a 500. This matches the behavior of
+/// `refresh_status_all_handler` before the cache was added.
+async fn cached_discovery(
+    base_dir: Arc<PathBuf>,
+    cache: Arc<TtlCache<(), Vec<AccountInfo>>>,
+) -> Vec<AccountInfo> {
+    // Fast path: the cached entry is live.
+    if let Some(cached) = cache.get(&()) {
+        return cached;
+    }
+
+    // Cold path: run discovery on a blocking worker. Concurrent
+    // callers may both land here (bounded dogpile); see
+    // DISCOVERY_CACHE_MAX_AGE docstring.
+    //
+    // Uses `discover_all` so Codex + third-party (MiniMax/Z.AI/
+    // Ollama) + manual slots are visible to /api/accounts
+    // consumers (statusline, `csq status`, Tauri dashboard). Prior
+    // to this change the route returned Anthropic-only and the
+    // CLI rendered an incomplete view for mixed setups.
+    let base_for_task = Arc::clone(&base_dir);
+    let accounts =
+        match tokio::task::spawn_blocking(move || discovery::discover_all(&base_for_task)).await {
+            Ok(a) => a,
+            Err(_join_err) => {
+                // JoinError may include a panic payload — do NOT
+                // format it with `%` per RISK-0007. Log only the
+                // fixed tag.
+                tracing::warn!(
+                    error_kind = "discovery_task_panic",
+                    "accounts discovery task panicked"
+                );
+                Vec::new()
+            }
+        };
+
+    cache.set((), accounts.clone());
+    accounts
+}
+
+/// GET /api/accounts — returns the full discovered account list.
+///
+/// Reads from [`RouterState::discovery_cache`] when warm; runs
+/// `discovery::discover_anthropic` inside `spawn_blocking` on
+/// cache miss. For realistic account counts (<= 100) the response
+/// size is well under the 1 MiB body cap.
+async fn accounts_handler(State(state): State<RouterState>) -> Json<AccountsResponse> {
+    let accounts = cached_discovery(
+        Arc::clone(&state.base_dir),
+        Arc::clone(&state.discovery_cache),
+    )
+    .await;
+    Json(AccountsResponse { accounts })
+}
+
+/// GET /api/refresh-status — returns every currently-cached
+/// `RefreshStatus` entry as a map keyed by account ID.
+async fn refresh_status_all_handler(
+    State(state): State<RouterState>,
+) -> Json<RefreshStatusListResponse> {
+    // Walk known account IDs via the short-TTL discovery cache
+    // and look up each in the refresh-status cache. We do NOT
+    // expose the refresh-status cache's internal HashMap directly
+    // because that couples the IPC schema to the cache's internal
+    // layout. A linear lookup over discovered accounts is fine
+    // for the realistic account count.
+    let accounts = cached_discovery(
+        Arc::clone(&state.base_dir),
+        Arc::clone(&state.discovery_cache),
+    )
+    .await;
+
+    let mut entries = Vec::new();
+    for info in accounts {
+        if let Some(status) = state.cache.get(&info.id) {
+            entries.push(status);
+        }
+    }
+
+    Json(RefreshStatusListResponse { statuses: entries })
+}
+
+/// GET /api/refresh-status/:id — returns one account's cached
+/// refresh status, or 404 if no cached entry exists.
+///
+/// The path parameter `{id}` is validated via
+/// `AccountNum::try_from` — values outside 1..=999 are rejected
+/// with 400 so path-injection attempts like `/api/refresh-status/
+/// ../../etc` fail at deserialization (u16 parse) or the range
+/// guard before touching the cache.
+async fn refresh_status_one_handler(
+    State(state): State<RouterState>,
+    AxumPath(id): AxumPath<u16>,
+) -> Result<Json<RefreshStatus>, (StatusCode, String)> {
+    // Validate account number. This also defends against negative
+    // or out-of-range values that slipped past the u16 decode.
+    let account = AccountNum::try_from(id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+
+    match state.cache.get(&account.get()) {
+        Some(status) => Ok(Json(status)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("no cached refresh status for account {id}"),
+        )),
+    }
+}
+
+/// GET /api/login/:id — initiates a paste-code OAuth login for
+/// the given account slot.
+///
+/// Generates a fresh PKCE verifier + state token, records them in
+/// the shared [`OAuthStateStore`], and returns a [`LoginRequest`]
+/// containing the authorize URL the caller should open in a
+/// browser. After the user authorizes, Anthropic displays an
+/// authorization code on its callback page; the caller then POSTs
+/// that code to `/api/oauth/exchange` to complete the login.
+///
+/// # Errors
+///
+/// - **400 Bad Request** — account id is outside 1..=999.
+/// - **503 Service Unavailable** — the daemon was started without
+///   an OAuth state store (`oauth_store: None`). Tests and custom
+///   builds can disable OAuth; real daemons always enable it.
+/// - **500 Internal Server Error** — unexpected failure in
+///   `start_login` (impossible on supported platforms — it only
+///   fails if the OS CSPRNG is unavailable).
+async fn login_handler(
+    State(state): State<RouterState>,
+    AxumPath(id): AxumPath<u16>,
+) -> Result<Json<LoginRequest>, (StatusCode, String)> {
+    let account = AccountNum::try_from(id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+
+    let Some(store) = state.oauth_store.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth support is not available on this daemon".to_string(),
+        ));
+    };
+
+    start_login(store, account).map(Json).map_err(|e| {
+        // start_login is effectively infallible for valid
+        // AccountNum on supported platforms; if it ever errors we
+        // map to 500 without echoing internal details.
+        tracing::warn!(error = %e, "start_login failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "oauth login initiation failed".to_string(),
+        )
+    })
+}
+
+/// Request body for `POST /api/oauth/exchange`.
+#[derive(Debug, Deserialize)]
+pub struct OAuthExchangeRequest {
+    /// State token returned by the preceding `GET /api/login/{N}`.
+    pub state: String,
+    /// Authorization code displayed by Anthropic on its callback
+    /// page after the user authorizes.
+    pub code: String,
+}
+
+/// Response body for `POST /api/oauth/exchange`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OAuthExchangeResponse {
+    /// The account slot that was authenticated — echoes
+    /// [`crate::oauth::PendingState::account`] so callers can
+    /// confirm without re-parsing the state token.
+    pub account: u16,
+}
+
+/// POST /api/oauth/exchange — submits the paste-code from the
+/// browser and exchanges it for a credential file.
+///
+/// Flow:
+///
+/// 1. Looks up the pending PKCE state keyed by `state` in the
+///    [`OAuthStateStore`] — this is the authentication boundary.
+///    Missing, expired, or already-consumed tokens map to 400.
+/// 2. Calls [`exchange_code`] against the Anthropic token endpoint
+///    with the recovered verifier and the paste-code redirect URI
+///    (must be byte-identical to what the authorize URL advertised).
+/// 3. Writes the resulting credential file to `credentials/N.json`
+///    with `0o600` via [`credentials::save_canonical`].
+/// 4. Returns the validated account number.
+///
+/// # Errors
+///
+/// - **400 Bad Request** — empty code, or state token not found /
+///   expired / already consumed.
+/// - **502 Bad Gateway** — Anthropic rejected the code or returned
+///   a malformed token response.
+/// - **500 Internal Server Error** — disk write failed.
+/// - **503 Service Unavailable** — daemon started without OAuth
+///   support.
+///
+/// All error messages are redacted by `OAuthError` / `CsqError`
+/// before surfacing — the upstream response body (which may echo
+/// the submitted code) is never included.
+async fn oauth_exchange_handler(
+    State(state): State<RouterState>,
+    Json(body): Json<OAuthExchangeRequest>,
+) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
+    let Some(store) = state.oauth_store.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth support is not available on this daemon".to_string(),
+        ));
+    };
+
+    // Clean the code: strip surrounding whitespace / CRs a shell
+    // caller may have included.
+    let code = body.code.trim().trim_end_matches('\r').to_string();
+    if code.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "code must not be empty".to_string(),
+        ));
+    }
+
+    // Consume the pending entry — single-use.
+    let pending = store.consume(&body.state).map_err(|e| match e {
+        OAuthError::StateMismatch => (
+            StatusCode::BAD_REQUEST,
+            "state token not recognized".to_string(),
+        ),
+        OAuthError::StateExpired { .. } => {
+            (StatusCode::BAD_REQUEST, "state token expired".to_string())
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state lookup failed".to_string(),
+        ),
+    })?;
+
+    // The exchange is a synchronous HTTP round-trip via blocking
+    // reqwest. Run it on a spawn_blocking worker so we don't stall
+    // the tokio runtime.
+    let verifier = pending.code_verifier.clone();
+    let account = pending.account;
+    let exchange_result = tokio::task::spawn_blocking(move || {
+        exchange_code(
+            &code,
+            &verifier,
+            PASTE_CODE_REDIRECT_URI,
+            crate::http::post_json_node,
+        )
+    })
+    .await;
+
+    let credential = match exchange_result {
+        Ok(Ok(c)) => c,
+        Ok(Err(OAuthError::Exchange(_))) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "exchange",
+                "oauth exchange failed"
+            );
+            return Err((StatusCode::BAD_GATEWAY, "code exchange failed".to_string()));
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = e.kind(),
+                "oauth exchange unexpected error"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal oauth error".to_string(),
+            ));
+        }
+        Err(_join_err) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "join_err",
+                "oauth exchange task panicked"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal oauth error".to_string(),
+            ));
+        }
+    };
+
+    // Persist credentials via UUID-keyed path (M4-12: numeric
+    // credentials/<N>.json retired; fail-closed if UUID absent).
+    //
+    // issue #633 (legacy/daemon-exchange sibling): this exchange-based path
+    // has NO `config-N/.claude.json` (it never spawns `claude auth login`), so
+    // `accounts::login::ensure_login_identity_minted` — which sources the email
+    // from that file — is structurally inapplicable here. This handler relies on
+    // daemon Pass-0 having already minted `by_slot[N]`. If this route is ever
+    // made the live first-login path for fresh installs, mint the UUID from the
+    // exchanged `credential`'s `oauthAccount.emailAddress` BEFORE this save, or
+    // it reintroduces the #633 "no credentials configured" fail-closed.
+    let base_dir = Arc::clone(&state.base_dir);
+    let save_result = tokio::task::spawn_blocking(move || {
+        credentials::save_canonical_for(&base_dir, account, &credential)
+    })
+    .await;
+
+    match save_result {
+        Ok(Ok(())) => {
+            // Invalidate caches so the next /api/accounts call
+            // shows the new row without waiting for the TTL.
+            state.discovery_cache.clear();
+            state.cache.clear();
+            tracing::info!(account = account.get(), "oauth login complete");
+            Ok(Json(OAuthExchangeResponse {
+                account: account.get(),
+            }))
+        }
+        Ok(Err(_)) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "credential_save",
+                "credential write failed after oauth exchange"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential write failed".to_string(),
+            ))
+        }
+        Err(_join_err) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "join_err",
+                "credential save task panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal save error".to_string(),
+            ))
+        }
+    }
+}
+
+/// Helper trait — keeps `error_kind = ...` tags small so the
+/// exchange handler can classify errors for structured logging
+/// without leaking details into the tag string.
+trait OAuthErrorKind {
+    fn kind(&self) -> &'static str;
+}
+
+impl OAuthErrorKind for OAuthError {
+    fn kind(&self) -> &'static str {
+        match self {
+            OAuthError::Http { .. } => "http",
+            OAuthError::StateExpired { .. } => "state_expired",
+            OAuthError::StateMismatch => "state_mismatch",
+            OAuthError::PkceVerification => "pkce_verification",
+            OAuthError::Exchange(_) => "exchange",
+            OAuthError::Cancelled => "cancelled",
+            OAuthError::StoreAtCapacity { .. } => "store_at_capacity",
+            OAuthError::ExchangeTimeout { .. } => "exchange_timeout",
+            OAuthError::LoginInProgressElsewhere { .. } => "login_in_progress",
+        }
+    }
+}
+
+/// POST /api/invalidate-cache — clears all daemon caches.
+///
+/// Called by `csq swap` after a successful account switch so that
+/// subsequent `/api/accounts` and `/api/refresh-status` calls
+/// reflect the new active account immediately instead of waiting
+/// for the 5-second TTL to expire.
+///
+/// Returns `200 {"cleared": true}` unconditionally.
+async fn invalidate_cache_handler(
+    State(state): State<RouterState>,
+) -> Json<InvalidateCacheResponse> {
+    state.discovery_cache.clear();
+    state.cache.clear();
+    tracing::debug!("cache invalidated by client request");
+    Json(InvalidateCacheResponse { cleared: true })
+}
+
+/// Response body for `POST /api/invalidate-cache`.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvalidateCacheResponse {
+    pub cleared: bool,
+}
+
+/// Request body for `POST /api/slot-swap`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlotSwapRequest {
+    pub from: u16,
+    pub to: u16,
+}
+
+/// Response body for `POST /api/slot-swap`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotSwapResponse {
+    pub invalidated: bool,
+}
+
+/// POST /api/slot-swap — targeted per-slot cache invalidation after `csq move`.
+///
+/// Called by `csq move FROM TO` after the on-disk rename completes. The daemon
+/// must drop any cached refresh-status entries keyed by the FROM and TO slot
+/// numbers so that subsequent `/api/refresh-status` calls reflect the new slot
+/// assignment (SEC-2.11).
+///
+/// The discovery cache is also cleared because account discovery reads
+/// `config-N/` directory names, which have changed after a rename.
+///
+/// Returns `200 {"invalidated": false}` when `from == to` (no-op swap —
+/// request anomaly; silently discarded per fire-and-forget semantics).
+/// Returns `200 {"invalidated": true}` on a valid swap. Validation failures
+/// (out-of-range slot) are logged and the in-range slot is still invalidated.
+async fn slot_swap_handler(
+    State(state): State<RouterState>,
+    Json(req): Json<SlotSwapRequest>,
+) -> Json<SlotSwapResponse> {
+    use crate::types::AccountNum;
+    // MED-3 guard: from == to is a no-op request anomaly (nothing was renamed).
+    if req.from == req.to {
+        tracing::warn!(
+            error_kind = "slot_swap_noop",
+            from = req.from,
+            "slot_swap: from == to — no-op; returning invalidated=false"
+        );
+        return Json(SlotSwapResponse { invalidated: false });
+    }
+    if let Ok(from_num) = AccountNum::try_from(req.from) {
+        state.cache.delete(&from_num.get());
+    } else {
+        tracing::warn!(
+            error_kind = "slot_swap_invalid_from",
+            from = req.from,
+            "slot_swap: from slot out of range — cache entry not deleted"
+        );
+    }
+    if let Ok(to_num) = AccountNum::try_from(req.to) {
+        state.cache.delete(&to_num.get());
+    } else {
+        tracing::warn!(
+            error_kind = "slot_swap_invalid_to",
+            to = req.to,
+            "slot_swap: to slot out of range — cache entry not deleted"
+        );
+    }
+    // Clear discovery cache — config-N/ dirs have been renamed.
+    state.discovery_cache.clear();
+    tracing::debug!(
+        from = req.from,
+        to = req.to,
+        "slot-swap cache invalidation applied"
+    );
+    Json(SlotSwapResponse { invalidated: true })
+}
+
+/// POST /api/gemini/event — accepts a single [`EventEnvelope`] from
+/// csq-cli and applies it to `quota.json`.
+///
+/// This is the **live IPC path** for Gemini events. The csq-cli
+/// emitter writes the event to its NDJSON log first (durability
+/// floor) then attempts this POST with a 50ms connect ceiling. The
+/// daemon dedups via `id`: if the same envelope arrives twice
+/// (live IPC + later NDJSON drain), only the first apply mutates
+/// `quota.json`. Per spec 05 §5.8.1.
+///
+/// Always returns 204 (no body) on accept-or-dedup; structured-log
+/// records the outcome via `error_kind` tags. On serialisation
+/// failure or invalid slot, returns 400 with a fixed-vocabulary
+/// error tag (no upstream body echoes — see security.md §2).
+async fn gemini_event_handler(
+    State(state): State<RouterState>,
+    Json(envelope): Json<crate::providers::gemini::capture::EventEnvelope>,
+) -> Result<StatusCode, (StatusCode, Json<GeminiEventError>)> {
+    use crate::providers::gemini::capture::{EVENT_SCHEMA_VERSION, EVENT_SURFACE_GEMINI};
+
+    if envelope.v != EVENT_SCHEMA_VERSION {
+        tracing::debug!(
+            error_kind = "gemini_event_unsupported_version",
+            v = envelope.v,
+            slot = envelope.slot,
+            "gemini IPC event with unsupported schema version"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(GeminiEventError {
+                error: "unsupported_version",
+            }),
+        ));
+    }
+
+    // PR-G3 redteam H1: reject envelopes claiming a non-Gemini
+    // surface. Without this gate, a same-UID caller could POST
+    // `surface: "anthropic"` and `apply_event` would clobber the
+    // Anthropic slot's row (forcing surface back to "gemini" and
+    // mutating counter/rate_limit fields the Anthropic UI doesn't
+    // expect). Same-UID threat-model bound is real but per
+    // zero-tolerance Rule 5 the cheap surface check closes it
+    // structurally.
+    if envelope.surface != EVENT_SURFACE_GEMINI {
+        tracing::warn!(
+            error_kind = "gemini_event_invalid_surface",
+            slot = envelope.slot,
+            received_surface = %envelope.surface,
+            "gemini IPC event with non-gemini surface tag refused"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(GeminiEventError {
+                error: "invalid_surface",
+            }),
+        ));
+    }
+
+    let slot = match crate::types::AccountNum::try_from(envelope.slot) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GeminiEventError {
+                    error: "invalid_slot",
+                }),
+            ));
+        }
+    };
+
+    // PR-G4a — H2 resolution. PR-G3 deferred this gate because no
+    // binding marker existed yet; PR-G4a writes
+    // `credentials/gemini-<N>.json` from `csq setkey gemini`, so
+    // the daemon can now authoritatively reject IPC traffic for an
+    // unprovisioned slot. Single `symlink_metadata` syscall per
+    // event — no JSON parse, no vault touch — keeps the live IPC
+    // hot path under its 50 ms budget per spec 07 §7.2.3.1.
+    if !crate::providers::gemini::provisioning::is_gemini_bound_slot(&state.base_dir, slot) {
+        tracing::warn!(
+            error_kind = "gemini_event_unbound_slot",
+            slot = slot.get(),
+            "gemini IPC event for slot with no binding marker — refusing 404"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(GeminiEventError {
+                error: "slot_not_provisioned",
+            }),
+        ));
+    }
+
+    let consumer = state.gemini_consumer.clone();
+    let base_dir = Arc::clone(&state.base_dir);
+    let result = tokio::task::spawn_blocking(move || {
+        let _q_guard = consumer
+            .quota_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut applied = consumer.applied.lock().unwrap_or_else(|p| p.into_inner());
+        if !applied.insert(envelope.id.clone()) {
+            return Ok::<bool, String>(false);
+        }
+        drop(applied);
+        let mut quota =
+            crate::quota::state::load_state(&base_dir).map_err(|e| format!("quota load: {e}"))?;
+        // PR-G3 redteam H2: structured-log when IPC creates a quota
+        // row for a previously-unseen slot. Same-UID caller can still
+        // do this (and we accept it — the live IPC path needs to work
+        // for newly-provisioned accounts before the discovery cache
+        // refreshes), but operators see the anomaly via log query.
+        let new_slot = !quota.accounts.contains_key(&slot.get().to_string());
+        if new_slot {
+            tracing::warn!(
+                error_kind = "gemini_event_first_time_slot",
+                slot = slot.get(),
+                "live IPC event for previously-unseen slot — verify provisioning"
+            );
+        }
+        let mut breakers = consumer.breakers.lock().unwrap_or_else(|p| p.into_inner());
+        let breaker = breakers.entry(slot.get()).or_default();
+        // PR-G3 redteam M3: IPC-source events do NOT count toward
+        // the schema-drift breaker — only csq-cli's NDJSON drain
+        // (which observed a real malformed response) trips it.
+        // Stops a same-UID caller from forcing kind=unknown via
+        // drift POSTs.
+        crate::daemon::usage_poller::gemini::apply_event_with_source(
+            &mut quota,
+            &envelope,
+            breaker,
+            crate::daemon::usage_poller::gemini::EventSource::Ipc,
+        );
+        crate::quota::state::save_state(&base_dir, &quota)
+            .map_err(|e| format!("quota save: {e}"))?;
+        Ok::<bool, String>(true)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_applied)) => Ok(StatusCode::NO_CONTENT),
+        Ok(Err(reason)) => {
+            tracing::warn!(
+                error_kind = "gemini_event_apply_failed",
+                slot = slot.get(),
+                reason = %reason,
+                "gemini IPC event apply failed"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(GeminiEventError {
+                    error: "apply_failed",
+                }),
+            ))
+        }
+        Err(_join) => {
+            tracing::warn!(
+                error_kind = "gemini_event_apply_panicked",
+                slot = slot.get(),
+                "gemini IPC event apply panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(GeminiEventError {
+                    error: "apply_panicked",
+                }),
+            ))
+        }
+    }
+}
+
+/// Error body for `POST /api/gemini/event`. Fixed-vocabulary tag —
+/// caller cannot trigger arbitrary strings here per security.md §2.
+#[derive(Debug, Clone, Serialize)]
+pub struct GeminiEventError {
+    pub error: &'static str,
+}
+
+/// Error body for `POST /api/audit/record`. Fixed-vocabulary tag —
+/// caller cannot trigger arbitrary strings here per security.md §2.
+/// The `error` field maps to one of: `invalid_rule_id`,
+/// `audit_deserialize_error`, `audit_io_error`, `audit_serialize_error`,
+/// `audit_chain_broken`.
+/// Note: `record_too_large` is now emitted as a router-level 413 (via
+/// `DefaultBodyLimit`) before this handler runs, not from the handler itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditRecordError {
+    pub error: &'static str,
+}
+
+/// Handler for `POST /api/audit/record`.
+///
+/// Accepts a JSON body matching `csq-runs-schema-v1.json`, validates
+/// RULE_ID strings, serializes, and persists to
+/// `~/.claude/accounts/csq-runs/<run_id>.jsonl` via the single write site
+/// `audit::persist::write_record`.
+///
+/// **Audit-subsystem fail-closed gate:** when `RouterState::audit_health` is
+/// `Broken` or `Unknown`, this handler rejects all emit requests with
+/// `503 Service Unavailable` and the fixed-vocabulary tag `audit_chain_broken`.
+/// No new records are appended to a chain that failed verification.
+/// (`Verified` and `Degraded` both pass through normally.)
+///
+/// Inherits the three-layer Unix socket security per `rules/security.md`
+/// §7 — no per-route auth needed.
+///
+/// Returns 204 on success; 400 with a fixed-vocabulary error tag on any
+/// write failure; 503 with `audit_chain_broken` when the audit chain is broken.
+/// No upstream body is echoed per `rules/security.md` §2.
+async fn audit_record_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<AuditRecordError>)> {
+    // Audit-subsystem fail-closed: reject new appends when the chain is broken.
+    // Health check MUST run before body deserialization so Broken/Unknown health
+    // returns 503 even when the request body would be malformed (422).
+    if !state.audit_health.is_operational() {
+        tracing::warn!(
+            error_kind = "audit_chain_broken",
+            "audit emit rejected — chain is not operational (audit_health={:?})",
+            state.audit_health
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuditRecordError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    // Deserialize after health gate passes.
+    let record: crate::audit::AuditRecord = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(
+            error_kind = "audit_deserialize_error",
+            "audit record deserialize failed: {e}"
+        );
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(AuditRecordError {
+                error: "audit_deserialize_error",
+            }),
+        )
+    })?;
+
+    // M19b: capture the run_id BEFORE the record is moved into the writer so we
+    // can emit the chain-level session-floor record after the v1 write succeeds.
+    let run_id = record.run_id.clone();
+
+    // Write via the single audited write site, anchored to the daemon's
+    // base_dir so integration tests with a TempDir base see the file
+    // under their temp path rather than $HOME/.claude/accounts.
+    match crate::audit::persist::write_record_to(record, Some(&state.base_dir)) {
+        Ok(_) => {
+            // M19b: emit the signed chain-level session-floor record. This is
+            // DEFENSE-IN-DEPTH on top of the (already-durable) v1 record, so it
+            // runs OFF the response path via `spawn_blocking` — the floor emit
+            // acquires the `.chain-lock` (up to 5s under contention) and may load
+            // the signing key, neither of which should delay the 204 that
+            // unblocks the user's `csq run`. The emit is idempotent
+            // (`run:<run_id>` dedup), so the rare overlap with the `.pending`
+            // reconciler drain appends exactly one floor record. Failures are
+            // logged, never surfaced — the v1 record is already persisted.
+            let base = state.base_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::audit::run_floor::emit_csq_run_record(&base, &run_id) {
+                    // Fixed-vocabulary tag only — no `{e}` interpolation per
+                    // security.md §2 (AuditV2Error Display carries no secrets, but
+                    // OAuth-adjacent modules keep the fixed-tag discipline). The
+                    // typed error is intentionally dropped; the tag is the signal.
+                    let _ = e;
+                    tracing::warn!(
+                        error_kind = "csq_run_floor_emit_failed",
+                        "M19b: csq-run session-floor record emit failed (non-fatal)"
+                    );
+                }
+            });
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => {
+            let tag = e.fixed_tag();
+            tracing::warn!(error_kind = tag, "audit record write failed");
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(AuditRecordError { error: tag }),
+            ))
+        }
+    }
+}
+
+/// Error body for `POST /api/provenance/anchor`.
+///
+/// Fixed-vocabulary tags — the handler never echoes upstream request content
+/// per `rules/security.md` §2 and `rules/tauri-commands.md` MUST-6.
+///
+/// Tags:
+/// - `"audit_chain_broken"` — chain broken sentinel present; write refused (503).
+/// - `"seam_io_error"`      — quarantine or pending-dir I/O failed (503).
+/// - `"seam_chain_write_error"` — chain write failed post-cutoff (503).
+/// - `"seam_registry_load_failed"` — operator surface-registry.json is corrupt;
+///   non-retryable (500). Operator: fix or delete the file.
+/// - `"seam_internal_error"` — internal error (500).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvenanceAnchorError {
+    pub error: &'static str,
+}
+
+/// Handler for `POST /api/provenance/anchor`.
+///
+/// Accepts a raw loom F101-1 provenance event body and routes it through the
+/// M18 seam ingest pipeline:
+///
+/// - **204 No Content**: event anchored into the audit chain (KnownVersion path).
+/// - **202 Accepted**: event quarantined (frontier rejection) or parked
+///   (unknown schema version). Daemon accepted custody — caller does not retry.
+/// - **503 Service Unavailable**: chain broken, signing failure post-cutoff, or
+///   I/O failure writing to custody dirs. Caller MAY retry after operator repair.
+///
+/// **Audit-subsystem fail-closed gate**: when `audit_health` is `Broken` or
+/// `Unknown`, the handler returns `503` before reading the body. This mirrors
+/// `audit_record_handler` — a broken chain blocks all audit appends.
+///
+/// **IPC security**: this route inherits the three-layer Unix socket security
+/// (SO_PEERCRED same-UID, 0o600 socket, per-user dir). No per-route auth
+/// is needed per `rules/security.md` §7. The inbound body is treated as
+/// UNTRUSTED (self-declared actor is UNTRUSTED metadata; validation at the
+/// frontier does not trust loom's claimed fields beyond what csq can verify).
+///
+/// **MAX_BODY_BYTES**: the router-level `DefaultBodyLimit` layer (1 MiB) caps
+/// the raw body before this handler runs. The seam frontier also enforces its
+/// own 256 KiB cap as defense-in-depth.
+///
+/// No upstream request body is echoed in any response or log.
+async fn provenance_anchor_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<ProvenanceAnchorError>)> {
+    use crate::audit::seam::{ingest_provenance_event, IngestOutcome, SeamError};
+
+    // Audit-subsystem fail-closed: reject appends when chain is broken.
+    // Health gate MUST run before body processing.
+    if !state.audit_health.is_operational() {
+        tracing::warn!(
+            error_kind = "seam_chain_broken",
+            "provenance/anchor rejected — audit chain not operational"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProvenanceAnchorError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    // Wall-clock for skew validation. Computed here (trusted daemon clock)
+    // rather than trusting any timestamp in the request body.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let base_dir = Arc::clone(&state.base_dir);
+    let raw = body.to_vec();
+
+    // Offload blocking I/O (chain lock, quarantine write, optional signing) to
+    // the blocking thread pool — must not block the axum runtime.
+    let result =
+        tokio::task::spawn_blocking(move || ingest_provenance_event(&base_dir, &raw, now_unix))
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    error_kind = "seam_internal_error",
+                    "provenance/anchor spawn_blocking panicked"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ProvenanceAnchorError {
+                        error: "seam_internal_error",
+                    }),
+                )
+            })?;
+
+    match result {
+        Ok(IngestOutcome::Anchored { .. }) => {
+            tracing::debug!(error_kind = "seam_anchored", "provenance event anchored");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(IngestOutcome::Rejected { reason }) => {
+            // Frontier rejection or quarantine. Daemon accepted custody (202).
+            // Fixed-vocab reason tag — no upstream content echoed.
+            tracing::info!(
+                error_kind = "seam_rejected",
+                reason = reason,
+                "provenance event quarantined"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(IngestOutcome::ParkedUnknownVersion { .. }) => {
+            // Unknown schema version — parked in .pending/provenance/. 202.
+            tracing::info!(
+                error_kind = "seam_parked",
+                "provenance event parked (unknown schema version)"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(IngestOutcome::DuplicateSuppressed { .. }) => {
+            // Duplicate decision_id — first record is authoritative. 202.
+            // The caller need not retry; the first anchor is the canonical one.
+            tracing::debug!(
+                error_kind = "seam_duplicate_suppressed",
+                "provenance event duplicate suppressed (decision_id already in chain)"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(IngestOutcome::HeldPendingPredecessor { .. }) => {
+            // Intra-source counter gap — held in .pending/provenance-ordered/
+            // until the predecessor drains or a bounded timeout fires (M20,
+            // F-SEAM-09). Custody accepted; the caller need not retry. 202.
+            tracing::info!(
+                error_kind = "seam_held_predecessor_gap",
+                "provenance event held pending intra-source predecessor"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Err(SeamError::Io(_)) => {
+            tracing::warn!(
+                error_kind = "seam_io_error",
+                "provenance/anchor custody write failed"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_io_error",
+                }),
+            ))
+        }
+        Err(SeamError::ChainWrite(_)) => {
+            tracing::warn!(
+                error_kind = "seam_chain_write_error",
+                "provenance/anchor chain write failed (cutoff active or chain broken)"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_chain_write_error",
+                }),
+            ))
+        }
+        Err(SeamError::AnchorRequiresInit) => {
+            // Pre-`audit init`: the anchored path fails closed (no unsigned
+            // provenance), but with an actionable tag so the operator knows to
+            // run `csq audit init` (R2 LOW-3).
+            tracing::warn!(
+                error_kind = "seam_anchor_requires_init",
+                "provenance/anchor refused: no signing key — run `csq audit init`"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_anchor_requires_init",
+                }),
+            ))
+        }
+        Err(SeamError::RegistryLoad) => {
+            tracing::warn!(
+                error_kind = "seam_registry_load_failed",
+                "provenance/anchor surface registry load failed"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProvenanceAnchorError {
+                    error: "seam_registry_load_failed",
+                }),
+            ))
+        }
+        Err(SeamError::CustodyFull) => {
+            tracing::warn!(
+                error_kind = "seam_custody_full",
+                "provenance/anchor refused: custody directory at hard cap"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_custody_full",
+                }),
+            ))
+        }
+        Err(SeamError::Internal) => {
+            tracing::warn!(
+                error_kind = "seam_internal_error",
+                "provenance/anchor internal error"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProvenanceAnchorError {
+                    error: "seam_internal_error",
+                }),
+            ))
+        }
+    }
+}
+
+/// Response body for `GET /api/accounts`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountsResponse {
+    pub accounts: Vec<AccountInfo>,
+}
+
+/// Response body for `GET /api/refresh-status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshStatusListResponse {
+    pub statuses: Vec<RefreshStatus>,
+}
+
+/// Handle to a running daemon HTTP server. Dropping this handle
+/// does NOT stop the server — use [`ServerHandle::shutdown`] to
+/// initiate graceful shutdown and await the join handle.
+pub struct ServerHandle {
+    /// Path to the socket file. Removed on shutdown.
+    socket_path: PathBuf,
+    /// Triggered to start graceful shutdown.
+    shutdown: CancellationToken,
+}
+
+impl ServerHandle {
+    /// Signals the server to shut down. The accept loop exits on the
+    /// next poll, and in-flight connections are allowed to complete.
+    /// Removes the socket file.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
+        // Best-effort socket file cleanup. If the server loop is
+        // already removing it, the error is ignored.
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+
+    /// Returns a clone of the shutdown token so sibling subsystems
+    /// (refresher, poller, future HTTP handlers) can cancel on the
+    /// same signal. Cloning a `CancellationToken` is cheap — it's
+    /// just an Arc bump.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// Returns the socket path the server is bound to.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+/// Binds a Unix domain socket at `socket_path` and serves the daemon
+/// HTTP router on it until `shutdown` fires.
+///
+/// `state` is the shared router state: cache + base_dir. The accept
+/// loop clones `state` per-connection so handlers get independent
+/// axum `State` extractor instances.
+///
+/// # Behavior
+///
+/// 1. Removes any existing file at `socket_path` (cleanup of stale
+///    sockets from previous crashed daemons). If a live daemon is
+///    bound there, the `try_lock`/PID file guard in
+///    [`super::pid::PidFile::acquire`] should have failed already —
+///    we trust that guard and overwrite.
+/// 2. Binds a `tokio::net::UnixListener`.
+/// 3. `chmod` the socket file to `0o600` so only the owning UID can
+///    connect. Done via `std::fs::set_permissions` on the path — the
+///    kernel honors this on macOS and modern Linux.
+/// 4. Spawns the accept loop, which waits for connections and
+///    dispatches each to a tokio task running the axum service.
+/// 5. On `shutdown.cancelled()`, the accept loop exits. In-flight
+///    connections are allowed to complete on their own tasks.
+/// 6. Removes the socket file on exit (best-effort).
+///
+/// Returns a [`ServerHandle`] the caller can use to trigger
+/// shutdown, and an awaitable future that resolves when the accept
+/// loop has exited.
+#[cfg(unix)]
+pub async fn serve(
+    socket_path: &Path,
+    state: RouterState,
+) -> Result<(ServerHandle, tokio::task::JoinHandle<()>), DaemonError> {
+    // Cleanup stale socket file (previous crash).
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path).map_err(|_| DaemonError::SocketConnect {
+            path: socket_path.to_path_buf(),
+        })?;
+    }
+
+    // Ensure parent directory exists.
+    if let Some(parent) = socket_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|_| DaemonError::SocketConnect {
+                path: parent.to_path_buf(),
+            })?;
+        }
+    }
+
+    // Tighten umask to 0o077 so the socket file bind(2) creates has
+    // 0o600 mode from the very first syscall — closing the
+    // bind→chmod race window where an unprivileged local process
+    // could otherwise racy-connect(2) to a world-readable socket.
+    // umask(2) is process-global on Unix; we restore the previous
+    // value immediately after bind. The window is bounded to a
+    // single syscall and no other daemon work races it because
+    // `serve()` is called from the single-threaded startup path
+    // before any background tokio tasks are spawned.
+    //
+    // SAFETY: libc::umask is always safe to call; we restore the
+    // previous mask on all paths via the explicit guard below.
+    let old_umask = unsafe { libc::umask(0o077) };
+
+    let bind_result = UnixListener::bind(socket_path);
+
+    // Restore the original umask before handling errors so a bind
+    // failure does not leave the process with a tightened mask.
+    unsafe {
+        libc::umask(old_umask);
+    }
+
+    let listener = bind_result.map_err(|e| {
+        tracing::debug!(error = %e, path = ?socket_path, "UnixListener::bind failed");
+        DaemonError::SocketConnect {
+            path: socket_path.to_path_buf(),
+        }
+    })?;
+
+    // Defense-in-depth: explicit set_permissions even after the
+    // umask-controlled bind. If the filesystem or kernel behaved
+    // unexpectedly (NFS, container layer), this catches it.
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        tracing::debug!(error = %e, "chmod socket 0o600 failed");
+        DaemonError::SocketConnect {
+            path: socket_path.to_path_buf(),
+        }
+    })?;
+
+    let shutdown = CancellationToken::new();
+    let handle = ServerHandle {
+        socket_path: socket_path.to_path_buf(),
+        shutdown: shutdown.clone(),
+    };
+
+    let app = Arc::new(router(state));
+    let sock_for_cleanup = socket_path.to_path_buf();
+    let join = tokio::spawn(async move {
+        accept_loop(listener, app, shutdown, sock_for_cleanup).await;
+    });
+
+    Ok((handle, join))
+}
+
+/// The accept loop. Exits when the shutdown token is cancelled.
+///
+/// Each accepted connection is handed to a fresh tokio task running
+/// the hyper connection service. In-flight tasks are NOT awaited on
+/// shutdown — the daemon's main loop (in lifecycle.rs) is
+/// responsible for the wider graceful-shutdown deadline via
+/// `JoinHandle::abort` or a tokio `timeout`.
+#[cfg(unix)]
+async fn accept_loop(
+    listener: UnixListener,
+    app: Arc<Router>,
+    shutdown: CancellationToken,
+    socket_path: PathBuf,
+) {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use tower::ServiceExt;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("daemon server: shutdown signaled, exiting accept loop");
+                break;
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _addr)) => {
+                        // Verify the connecting peer runs as our own
+                        // UID. Any mismatch is closed immediately —
+                        // the HTTP router is never invoked. This is
+                        // the second defensive layer after socket
+                        // file permissions.
+                        if let Err(e) = verify_peer_uid(&stream) {
+                            tracing::warn!(error = %e, "rejecting cross-UID connection");
+                            drop(stream);
+                            continue;
+                        }
+
+                        let app = Arc::clone(&app);
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+                            let service = service_fn(move |req| {
+                                let app = Arc::clone(&app);
+                                async move {
+                                    let router = (*app).clone();
+                                    router.oneshot(req).await
+                                }
+                            });
+                            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                tracing::debug!(error = %e, "connection service error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed, continuing");
+                        // A short pause avoids hot-spinning on
+                        // persistent accept errors (e.g., EMFILE).
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Best-effort socket cleanup on exit.
+    let _ = std::fs::remove_file(&socket_path);
+    tracing::info!(path = ?socket_path, "daemon server: accept loop exited");
+}
+
+/// Verifies the peer at the other end of a Unix domain socket is
+/// running under the same effective UID as this daemon.
+///
+/// On Linux this uses `getsockopt(SO_PEERCRED)` which returns a
+/// `struct ucred` with the peer's PID, UID, and GID. On macOS this
+/// uses `getsockopt(LOCAL_PEERCRED)` which returns a `struct xucred`
+/// with `cr_uid` (among other fields).
+///
+/// Any getsockopt failure or UID mismatch returns `Err` — the
+/// caller drops the stream without invoking the HTTP router.
+#[cfg(all(unix, target_os = "linux"))]
+fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
+    // `libc::ucred` layout: { pid: pid_t, uid: uid_t, gid: gid_t }
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    // SAFETY: fd is a valid Unix-domain socket fd; cred is a valid
+    // stack allocation of the right type; len matches its size.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let our_uid = unsafe { libc::geteuid() };
+    if cred.uid != our_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("peer UID {} != daemon UID {}", cred.uid, our_uid),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
+    // macOS `struct xucred` from <sys/ucred.h>:
+    //   cr_version: u32
+    //   cr_uid:     uid_t
+    //   cr_ngroups: i16
+    //   cr_groups:  [gid_t; NGROUPS]  (NGROUPS = 16)
+    #[repr(C)]
+    struct XUcred {
+        cr_version: u32,
+        cr_uid: libc::uid_t,
+        cr_ngroups: libc::c_short,
+        cr_groups: [libc::gid_t; 16],
+    }
+
+    // From <sys/un.h>: SOL_LOCAL = 0, LOCAL_PEERCRED = 1.
+    const SOL_LOCAL: libc::c_int = 0;
+    const LOCAL_PEERCRED: libc::c_int = 1;
+
+    let fd = stream.as_raw_fd();
+    let mut cred: XUcred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<XUcred>() as libc::socklen_t;
+
+    // SAFETY: fd is a valid Unix-domain socket fd; cred is a valid
+    // stack allocation matching struct xucred; len reflects size.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERCRED,
+            &mut cred as *mut XUcred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let our_uid = unsafe { libc::geteuid() };
+    if cred.cr_uid != our_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("peer UID {} != daemon UID {}", cred.cr_uid, our_uid),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn verify_peer_uid(_stream: &tokio::net::UnixStream) -> std::io::Result<()> {
+    // Other Unixes: no portable peer-credential API. The 0o600
+    // socket permission is the sole boundary; log a warning so
+    // operators on BSD/Illumos/etc. are aware.
+    tracing::warn!(
+        "peer UID verification not implemented on this platform — \
+         relying solely on socket file permissions"
+    );
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Builds a minimal RouterState for tests. Both caches start
+    /// empty; base_dir points at the provided temp directory. The
+    /// OAuth store is present so the `/api/login/{id}` tests
+    /// exercise the success path; individual tests that want to
+    /// exercise the 503 path pass `oauth_store: None` via
+    /// `test_state_no_oauth`. The discovery cache uses the
+    /// production 5-second TTL — tests that need a shorter TTL
+    /// use `test_state_with_discovery_ttl`.
+    ///
+    /// `audit_health` defaults to `AuditHealth::Verified` so tests
+    /// that don't care about audit gating get the clean path.
+    fn test_state(base: &Path) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
+            base_dir: Arc::new(base.to_path_buf()),
+            oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            gemini_consumer: GeminiConsumerState::default(),
+            audit_health: crate::audit::AuditHealth::Verified,
+        }
+    }
+
+    /// Builds a RouterState with `oauth_store: None` so the
+    /// `/api/login/{id}` handler returns 503.
+    fn test_state_no_oauth(base: &Path) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
+            base_dir: Arc::new(base.to_path_buf()),
+            oauth_store: None,
+            gemini_consumer: GeminiConsumerState::default(),
+            audit_health: crate::audit::AuditHealth::Verified,
+        }
+    }
+
+    /// Builds a RouterState with an explicit discovery-cache TTL.
+    /// Used by tests that verify expiry behavior without waiting
+    /// the full 5 seconds.
+    fn test_state_with_discovery_ttl(
+        base: &Path,
+        discovery_ttl: std::time::Duration,
+    ) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(discovery_ttl)),
+            base_dir: Arc::new(base.to_path_buf()),
+            oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            gemini_consumer: GeminiConsumerState::default(),
+            audit_health: crate::audit::AuditHealth::Verified,
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_binds_and_sets_permissions() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        assert!(sock.exists(), "socket file should be created");
+
+        // Verify 0o600 permissions.
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must be 0o600 (owner-only)");
+
+        handle.shutdown();
+        // Give the accept loop a moment to exit.
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Socket file should be cleaned up.
+        assert!(!sock.exists(), "socket file should be removed on shutdown");
+    }
+
+    #[tokio::test]
+    async fn serve_cleans_stale_socket_file() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+
+        // Pretend a stale socket file exists (regular file, not a real socket).
+        std::fs::write(&sock, "stale").unwrap();
+        assert!(sock.exists());
+
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        assert!(sock.exists());
+
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_over_real_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        // Connect and send a minimal HTTP/1.1 GET.
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the full response.
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("health response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("200 OK"),
+            "expected 200 OK in response, got: {text}"
+        );
+        assert!(
+            text.contains(r#""status":"ok""#),
+            "expected JSON body, got: {text}"
+        );
+        assert!(
+            text.contains(r#""version":""#),
+            "expected version field, got: {text}"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_404() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(b"GET /api/nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("404"),
+            "expected 404 for unknown route, got: {text}"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn health_response_serializes() {
+        let r = HealthResponse {
+            status: "ok",
+            version: "2.0.0-alpha.1",
+            pid: 42,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"pid\":42"));
+    }
+
+    /// Sends a minimal HTTP/1.1 GET over a Unix socket and reads
+    /// the full response. Returns (status_line, body) where body
+    /// is everything after the blank CRLF-CRLF.
+    async fn http_get(sock: &std::path::Path, path: &str) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
+        // Find the blank line separating headers from body.
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    /// Issues a raw HTTP POST with a JSON body against the daemon's
+    /// Unix socket and returns (status_line, body).
+    async fn http_post_json(sock: &std::path::Path, path: &str, body: &str) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\r\n{body}",
+            len = body.len(),
+            body = body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    #[tokio::test]
+    async fn accounts_route_returns_empty_list_on_empty_base() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/accounts").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(
+            body.contains(r#""accounts":[]"#),
+            "body should have empty accounts array: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_route_lists_discovered_accounts() {
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+
+        // Install a valid credentials/1.json so discover_anthropic picks it up.
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let num = AccountNum::try_from(1u16).unwrap();
+        credentials::save(
+            &crate::credentials::file::canonical_path(dir.path(), num),
+            &creds,
+        )
+        .unwrap();
+
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/accounts").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""id":1"#), "body: {body}");
+        assert!(body.contains(r#""source":"Anthropic""#), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_returns_404_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
+        assert!(status.contains("404"), "status: {status}");
+        assert!(body.contains("no cached refresh status"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_rejects_out_of_range_id() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        // 0 is out of the 1..=999 range so AccountNum::try_from rejects it.
+        let (status, body) = http_get(&sock, "/api/refresh-status/0").await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("invalid account id"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_returns_cached_entry() {
+        use crate::daemon::refresher::RefreshStatus;
+
+        let dir = TempDir::new().unwrap();
+        let state = test_state(dir.path());
+
+        // Pre-populate the cache with a known status.
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "refreshed".to_string(),
+                expires_at_ms: 1_234_567_890,
+                checked_at_secs: 42,
+            },
+        );
+
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""account":1"#), "body: {body}");
+        assert!(
+            body.contains(r#""last_result":"refreshed""#),
+            "body: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_all_returns_only_accounts_in_cache() {
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::daemon::refresher::RefreshStatus;
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+
+        // Install account 1 and account 2, but only populate the
+        // cache for account 1.
+        for id in [1u16, 2] {
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new("at".into()),
+                    refresh_token: RefreshToken::new("rt".into()),
+                    expires_at: 9_999_999_999_999,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            });
+            let num = AccountNum::try_from(id).unwrap();
+            credentials::save(
+                &crate::credentials::file::canonical_path(dir.path(), num),
+                &creds,
+            )
+            .unwrap();
+        }
+
+        let state = test_state(dir.path());
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "valid".to_string(),
+                expires_at_ms: 9_999_999_999_999,
+                checked_at_secs: 99,
+            },
+        );
+
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""account":1"#), "body: {body}");
+        // Account 2 is not in the cache, so it must not appear.
+        assert!(!body.contains(r#""account":2"#), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn login_route_returns_authorize_url() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        // Remember the store so we can verify the pending entry.
+        let store = Arc::clone(state.oauth_store.as_ref().unwrap());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/login/3").await;
+        assert!(status.contains("200"), "status: {status}");
+        // Paste-code flow: authorize URL is the current Anthropic
+        // endpoint and the redirect_uri embedded in it is the
+        // paste-code callback page, not a loopback URL.
+        assert!(
+            body.contains(r#""auth_url":"https://claude.com/cai/oauth/authorize"#),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("platform.claude.com%2Foauth%2Fcode%2Fcallback"),
+            "redirect_uri must be the paste-code callback, body: {body}"
+        );
+        assert!(body.contains(r#""account":3"#), "body: {body}");
+        assert!(body.contains(r#""state":""#));
+        assert_eq!(store.len(), 1, "state store should have one pending entry");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn login_route_returns_503_when_oauth_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state_no_oauth(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/login/1").await;
+        assert!(status.contains("503"), "status: {status}");
+        assert!(body.contains("oauth support is not available"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_empty_code() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let req_body = r#"{"state":"anything","code":"   "}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("code must not be empty"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_unknown_state() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        // Send a state token that was never issued — the consume
+        // step must reject it as state_mismatch and return 400.
+        let req_body = r#"{"state":"never-issued-this-token","code":"some-code"}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("state token"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_returns_503_when_oauth_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state_no_oauth(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let req_body = r#"{"state":"any","code":"any"}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("503"), "status: {status}");
+        assert!(body.contains("oauth support is not available"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_route_consumes_state_on_success_path_shape() {
+        // The exchange handler pulls the pending state from the
+        // store *before* making the HTTP round-trip. This test
+        // verifies that the state_mismatch branch drops the entry
+        // so a subsequent retry with the same token fails the
+        // same way — i.e. state is single-use even on failure.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        let store = Arc::clone(state.oauth_store.as_ref().unwrap());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Seed one pending entry so we have a valid state token.
+        let account = AccountNum::try_from(1u16).unwrap();
+        let verifier = crate::oauth::CodeVerifier::new("test-verifier".into());
+        let state_token = store.insert(verifier, account).unwrap();
+        assert_eq!(store.len(), 1);
+
+        // First call with a wrong state token — should 400 and
+        // leave the pending entry alone.
+        let req_body = r#"{"state":"not-the-real-one","code":"dummy"}"#;
+        let (status, _body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"));
+        assert_eq!(
+            store.len(),
+            1,
+            "wrong state token must not consume the legitimate entry"
+        );
+
+        // Second call with the real state token and a dummy code:
+        // the state gets consumed even though the HTTP exchange
+        // will fail (no real token endpoint reachable). We only
+        // verify the store length here — the actual exchange
+        // failure mode is covered by the csq_core::oauth::exchange
+        // unit tests.
+        //
+        // IMPORTANT: We send the request but do NOT wait for the
+        // full HTTP response. The exchange handler calls Anthropic's
+        // real token endpoint (no mock injected), which either
+        // times out or returns an error. Waiting for that response
+        // causes the test to time out at the 2s deadline in
+        // http_post_json. Instead, we send the request over the
+        // Unix socket and give the handler enough time to consume
+        // the state entry (which happens BEFORE the HTTP call).
+        {
+            use tokio::io::AsyncWriteExt;
+            use tokio::net::UnixStream;
+
+            let real_body = format!(r#"{{"state":"{state_token}","code":"some-code"}}"#);
+            let req = format!(
+                "POST /api/oauth/exchange HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {len}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                len = real_body.len(),
+                body = real_body,
+            );
+            let mut stream = UnixStream::connect(&sock).await.unwrap();
+            stream.write_all(req.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            // Give the handler time to parse the request and consume
+            // the state entry. The consume call is synchronous and
+            // happens before spawn_blocking, so 200ms is generous.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Drop the stream — we don't need the response.
+        }
+
+        assert_eq!(
+            store.len(),
+            0,
+            "successful state lookup must consume the entry"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_handler_uses_discovery_cache() {
+        // Verify the second GET /api/accounts hits the cache
+        // rather than doing a fresh filesystem scan. We do this
+        // by deleting the credentials file between calls — if
+        // discovery were re-running, the second call would see
+        // an empty list, but the cache should still return the
+        // pre-deletion state until the TTL elapses.
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // First call: runs discovery, finds account 1, caches.
+        let (status1, body1) = http_get(&sock, "/api/accounts").await;
+        assert!(status1.contains("200"), "status1: {status1}");
+        assert!(body1.contains(r#""id":1"#), "body1: {body1}");
+
+        // Delete the credentials file. Discovery would now return
+        // an empty list — but the cache should still serve the
+        // pre-deletion entry.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        // Second call: must hit the cache.
+        let (status2, body2) = http_get(&sock, "/api/accounts").await;
+        assert!(status2.contains("200"), "status2: {status2}");
+        assert!(
+            body2.contains(r#""id":1"#),
+            "second call must serve cached list, got: {body2}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_handler_cache_expires_after_ttl() {
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        // Very short TTL so the test doesn't wait 5 seconds.
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state_with_discovery_ttl(dir.path(), std::time::Duration::from_millis(50));
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Populate the cache.
+        let (status1, _) = http_get(&sock, "/api/accounts").await;
+        assert!(status1.contains("200"));
+
+        // Delete the file so a fresh discovery would return empty.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        // Wait past the TTL.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Third call: cache expired → fresh discovery → empty list.
+        let (status3, body3) = http_get(&sock, "/api/accounts").await;
+        assert!(status3.contains("200"), "status3: {status3}");
+        assert!(
+            body3.contains(r#""accounts":[]"#),
+            "expired cache should fall through to fresh discovery, got: {body3}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_all_uses_cached_discovery() {
+        // Verify refresh_status_all_handler also uses the discovery
+        // cache — not just accounts_handler. Two calls in a row
+        // must hit the cache on the second even if the underlying
+        // filesystem changed.
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::daemon::refresher::RefreshStatus;
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        // Pre-populate the refresh-status cache so the aggregated
+        // response has something to return.
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "valid".to_string(),
+                expires_at_ms: 9_999_999_999_999,
+                checked_at_secs: 0,
+            },
+        );
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status1, body1) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status1.contains("200"), "status1: {status1}");
+        assert!(body1.contains(r#""account":1"#), "body1: {body1}");
+
+        // Delete the credential file — discovery on a miss would
+        // return empty, which would produce an empty statuses
+        // list. The cache must prevent that.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        let (status2, body2) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status2.contains("200"), "status2: {status2}");
+        assert!(
+            body2.contains(r#""account":1"#),
+            "refresh-status must serve cached discovery, got: {body2}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn login_route_rejects_out_of_range_id() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // 0 is out of range (AccountNum requires >=1)
+        let (status, body) = http_get(&sock, "/api/login/0").await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("invalid account id"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// MED-3 regression: `POST /api/slot-swap` with `from == to` is a no-op
+    /// request anomaly. The handler MUST return `{"invalidated": false}` and
+    /// MUST NOT clear the discovery cache (no-op means no rename happened).
+    #[tokio::test]
+    async fn slot_swap_handler_rejects_from_equals_to() {
+        // Arrange: start a live server.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-test.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Act: POST /api/slot-swap with from == to (request anomaly).
+        let (status, body) = http_post_json(&sock, "/api/slot-swap", r#"{"from":3,"to":3}"#).await;
+
+        // Assert: HTTP 200, invalidated = false.
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            body.contains("\"invalidated\":false"),
+            "expected invalidated=false for from==to noop, got: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── Audit-health gate tests ──────────────────────────────────────────────
+
+    /// `POST /api/audit/record` is accepted when `audit_health` is Verified.
+    #[tokio::test]
+    async fn audit_record_accepted_when_health_verified() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-audit-ok.sock");
+        let state = test_state(dir.path()); // Verified by default
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Minimal valid v1 audit record body.
+        let body = r#"{"run_id":"r1","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/record", body).await;
+        // 204 = accepted; 400 = write error (no chain yet in tempdir is fine —
+        // we only care the gate did NOT return 503.
+        assert!(
+            !status.contains("503"),
+            "verified health must not return 503, got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// `POST /api/audit/record` is rejected (503) when `audit_health` is Broken.
+    #[tokio::test]
+    async fn audit_record_rejected_when_health_broken() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-audit-broken.sock");
+        let mut state = test_state(dir.path());
+        state.audit_health = crate::audit::AuditHealth::Broken {
+            error_kind: "audit_chain_broken_at_seq_0".to_string(),
+            reason: "test broken chain".to_string(),
+        };
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"r2","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/record", body).await;
+        assert!(
+            status.contains("503"),
+            "broken health must return 503, got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "response body must contain audit_chain_broken tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// `POST /api/audit/record` is rejected (503) when `audit_health` is Unknown.
+    #[tokio::test]
+    async fn audit_record_rejected_when_health_unknown() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-audit-unknown.sock");
+        let mut state = test_state(dir.path());
+        state.audit_health = crate::audit::AuditHealth::Unknown {
+            reason: "audit_verify_timeout".to_string(),
+        };
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"r3","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/record", body).await;
+        assert!(
+            status.contains("503"),
+            "unknown health must return 503, got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "response body must contain audit_chain_broken tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// `POST /api/audit/record` is accepted when `audit_health` is Degraded.
+    #[tokio::test]
+    async fn audit_record_accepted_when_health_degraded() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-audit-degraded.sock");
+        let mut state = test_state(dir.path());
+        state.audit_health = crate::audit::AuditHealth::Degraded {
+            gaps: vec![crate::audit::KeyGap {
+                key_id: format!("ed25519:{}", "a".repeat(64)),
+                first_seq: 0,
+                last_seq: 5,
+                count: 6,
+            }],
+        };
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"r4","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/record", body).await;
+        assert!(
+            !status.contains("503"),
+            "degraded health must not return 503, got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // M5 — provenance anchor handler tests.
+
+    /// M5(a): POST /api/provenance/anchor with a well-formed body whose
+    /// schema version is not in the production registry returns 202 (event
+    /// parked in `.pending/provenance/`).
+    ///
+    /// The production version dispatcher has ZERO registered arms (ADR-B2).
+    /// Every well-formed inbound event hits `ParkedUnknownVersion` → 202
+    /// until M18-bind registers the first decoder arm. This test verifies
+    /// the handler maps `ParkedUnknownVersion` correctly to 202 and does
+    /// NOT return 503 or 500.
+    #[tokio::test]
+    async fn provenance_anchor_wellformed_unknown_version_parked_202() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-prov-anchor-parked.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // A body that passes frontier validation (well-formed UUID, ts within skew,
+        // registered surface "cc") but has an unknown schema version.
+        // Production dispatcher → ParkedUnknownVersion → 202.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ts = crate::audit::seam::frontier::canonical_ts_for_test(now_unix);
+        let decision_id = "12345678-1234-1234-1234-123456789012";
+        let body = format!(
+            r#"{{"f101_schema_version":"unknown-v99","decision_id":"{decision_id}","claimed_decision_ts":"{ts}","surface":"cc","source_counter":1,"payload":"{{}}"}}"#,
+        );
+        let (status, resp) = http_post_json(&sock, "/api/provenance/anchor", &body).await;
+        assert!(
+            status.contains("202"),
+            "provenance/anchor with unknown-version body must return 202 (parked); got: {status}, body: {resp}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// M5(b): POST /api/provenance/anchor with a completely malformed body
+    /// returns 202 (event quarantined, not a hard error to the caller).
+    ///
+    /// Malformed bodies hit the frontier-rejection path → quarantine →
+    /// `seam_event_rejected` chain record attempt (which may produce 503 if
+    /// no signing key is present for the rejection record). The seam IPC
+    /// contract returns 202 for `Rejected` outcomes so loom doesn't retry.
+    ///
+    /// Note: the rejection path writes an unsigned record pre-`audit init`,
+    /// so it succeeds without a signing key.
+    #[tokio::test]
+    async fn provenance_anchor_accepts_malformed_with_202() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-prov-anchor-malformed.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Completely malformed body — not valid JSON.
+        let (status, _resp) = http_post_json(&sock, "/api/provenance/anchor", "not-json").await;
+        assert!(
+            status.contains("202"),
+            "provenance/anchor with malformed body must return 202 (quarantined); got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+}

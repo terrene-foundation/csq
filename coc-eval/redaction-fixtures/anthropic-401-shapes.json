@@ -1,0 +1,10 @@
+{
+  "schema_version": "1",
+  "provider": "anthropic",
+  "captured_at": null,
+  "captured_against_csq_sha": null,
+  "status_code": null,
+  "redacted_body": null,
+  "extraction_patterns": [],
+  "_placeholder_note": "Operator-run capture pending. Run coc-eval/scripts/characterize-error-bodies.sh --provider anthropic with a deliberately-malformed bad key. See plan workspaces/csq-as-cli/02-plans/05-pr-ca11-implementation-plan.md §0.3."
+}

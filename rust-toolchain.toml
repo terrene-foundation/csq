@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so CI doesn't break when a new stable lands with new lints.
+# Bump deliberately in its own PR and re-run `cargo clippy -D warnings`.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

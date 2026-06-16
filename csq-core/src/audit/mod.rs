@@ -127,14 +127,6 @@ pub mod run_floor;
 pub mod sink_config;
 pub mod sweep;
 pub mod traits;
-/// M2 T2.5 — trust-plane conformance grading (enterprise edition only).
-///
-/// Classifies a verified audit chain against the the enterprise edition trust-plane
-/// gradient (`Compatible`/`Conformant`/`Complete`). Surfaced in
-/// `csq audit verify` and the `csq doctor` schema. The community edition has no
-/// trust plane, so this module is `#[cfg(feature = "enterprise")]`.
-#[cfg(feature = "enterprise")]
-pub mod trust_grade;
 pub mod types;
 /// M05 — chain-integrity verifier (spec 12 §12.13).
 ///
@@ -223,11 +215,6 @@ pub use key_custody::{
 };
 
 // M2 T2.5 — trust-plane conformance grade (enterprise edition only).
-#[cfg(feature = "enterprise")]
-pub use trust_grade::{
-    grade_for_audit_health, grade_for_verify_result, grade_from_signals, TrustPlaneGrade,
-    TrustPlaneSignals,
-};
 
 // M08 — test-utils re-exports for the cross-impl canonical-form CI gate.
 // `canonical_bytes_for` and `AUDIT_SCHEMA_VERSION` are pub(crate) in persist.rs

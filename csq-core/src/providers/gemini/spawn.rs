@@ -735,10 +735,7 @@ mod tests {
         let env = prepare_env(
             &parent,
             handle,
-            Some((
-                "GEMINI_API_KEY",
-                "AIzaFAKETESTKEYDONOTUSE0000000000000000",
-            )),
+            Some(("GEMINI_API_KEY", "AIzaFAKETESTKEYDONOTUSE0000000000000000")),
         );
 
         let map: HashMap<_, _> = env.iter().cloned().collect();

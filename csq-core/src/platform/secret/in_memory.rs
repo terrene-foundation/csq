@@ -133,7 +133,10 @@ mod tests {
         let s = SecretString::new("AIzaFAKETESTKEYDONOTUSE0000000000000000".into());
         v.set(slot(1), &s).unwrap();
         let got = v.get(slot(1)).unwrap();
-        assert_eq!(got.expose_secret(), "AIzaFAKETESTKEYDONOTUSE0000000000000000");
+        assert_eq!(
+            got.expose_secret(),
+            "AIzaFAKETESTKEYDONOTUSE0000000000000000"
+        );
     }
 
     #[test]

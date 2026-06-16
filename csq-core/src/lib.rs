@@ -14,8 +14,6 @@ pub mod oauth;
 // (`cargo build -p csq-core`) MUST NOT depend on this module or any type it
 // exports.  Gate verification: `cargo build -p csq-core` (no --features) must
 // succeed with this declaration present.
-#[cfg(feature = "enterprise")]
-pub mod phase2b;
 pub mod platform;
 pub mod probe;
 pub mod providers;

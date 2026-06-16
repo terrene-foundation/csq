@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "csq"
-version = "2.16.1"
+version = "2.16.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "csq-core"
-version = "2.16.1"
+version = "2.16.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "csq-ledger"
-version = "2.16.1"
+version = "2.16.2"
 dependencies = [
  "async-trait",
  "axum",

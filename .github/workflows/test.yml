@@ -18,6 +18,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUST_VERSION: "1.94.1"
+  # Vault-dependent integration tests (cu2_gemini_one_shot, etc.) need a
+  # secret backend. github-hosted Linux/Windows have no Secret Service
+  # (dbus/gnome-keyring), so use the encrypted file fallback to keep the
+  # suite hermetic (matches the workflow header contract).
+  CSQ_SECRET_BACKEND: file
+  CSQ_SECRET_PASSPHRASE: ci-hermetic-test-passphrase
 
 jobs:
   test:

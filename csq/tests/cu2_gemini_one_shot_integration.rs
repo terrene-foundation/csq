@@ -74,6 +74,18 @@ fn clean_cmd(path_override: &str) -> Command {
     // Hermetic: the spawned `csq` binary must NOT shell `security` against the
     // operator's real login keychain (rules/test-hermeticity.md).
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
+    // Hermetic secret vault on Linux: use the encrypted file backend so the
+    // test does not depend on a running Secret Service (dbus/gnome-keyring),
+    // which github-hosted Linux CI does not provide — the env-cleared csq
+    // would otherwise fail with "secret backend unavailable". The file backend
+    // is self-contained under the sandbox HOME set below. macOS/Windows reject
+    // `CSQ_SECRET_BACKEND=file` (it is Linux-only) and use their native OS
+    // credential store, which is available on those CI runners.
+    #[cfg(target_os = "linux")]
+    {
+        cmd.env("CSQ_SECRET_BACKEND", "file");
+        cmd.env("CSQ_SECRET_PASSPHRASE", "hermetic-test-vault");
+    }
     cmd.env("HOME", sandbox_home());
     cmd.env("CLAUDE_HOME", sandbox_home());
     cmd.env("PATH", path_override);

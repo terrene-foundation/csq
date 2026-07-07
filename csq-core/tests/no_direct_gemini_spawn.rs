@@ -17,7 +17,7 @@
 //! defences. This test is the structural enforcement. (Earlier
 //! revisions framed the settings drift step as the "EP1 drift
 //! detector" of a 7-layer ToS guard — that framing was retracted
-//! in journal 0048.)
+//! in an internal journal entry)
 //!
 //! # Why not a clippy lint
 //!
@@ -34,7 +34,7 @@ use std::path::Path;
 /// - `spawn.rs` — CC-session spawn pipeline (env_clear + allowlist +
 ///   .env scan + settings drift reassertion + RLIMIT_CORE pre-exec).
 /// - `oauth_login.rs` — Code Assist OAuth login shell-out (Stage 2 of
-///   journal 0048). Different security posture from a CC-session
+///   an internal journal entry). Different security posture from a CC-session
 ///   spawn: inherits the user's env so their default browser opens,
 ///   no .env scan (not a CC session), no settings drift (no handle
 ///   dir). Defense is "delegate to reference client" — gemini-cli

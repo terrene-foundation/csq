@@ -198,7 +198,7 @@ fn read_tty(pid: u32) -> Option<String> {
 /// fast enough for a UX where the user changes tabs and glances
 /// at the dashboard.
 ///
-/// Design question 2 from journal 0026: decided to cache instead
+/// Design question 2 from an internal journal entry: decided to cache instead
 /// of calling per-poll because `osascript` is ~120ms and doing it
 /// at every list tick burns CPU for stale data.
 const ITERM_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn parse_ps_line_claude_session() {
-        let line = "37459 claude --resume csq PATH=/bin USER=esperie CLAUDE_CONFIG_DIR=/Users/esperie/.claude/accounts/config-8 HOME=/Users/esperie";
+        let line = "37459 claude --resume csq PATH=/bin USER=example CLAUDE_CONFIG_DIR=/Users/example/.claude/accounts/config-8 HOME=/Users/example";
         // Note: this test only exercises the parse path. read_cwd_via_lsof
         // and read_start_time will fail for this fake PID, leaving cwd
         // empty and started_at=None, which is the expected graceful
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(info.pid, 37459);
         assert_eq!(
             info.config_dir,
-            PathBuf::from("/Users/esperie/.claude/accounts/config-8")
+            PathBuf::from("/Users/example/.claude/accounts/config-8")
         );
         assert_eq!(info.account_id, Some(8));
     }
@@ -564,8 +564,8 @@ mod tests {
             PATH=/bin \
             TERM_SESSION_ID=w3t2p0:3B8385EC-9D2C-4E26-A416-2E04BCA60DA3 \
             ITERM_PROFILE=Default \
-            CLAUDE_CONFIG_DIR=/Users/esperie/.claude/accounts/config-8 \
-            HOME=/Users/esperie";
+            CLAUDE_CONFIG_DIR=/Users/example/.claude/accounts/config-8 \
+            HOME=/Users/example";
         let info = parse_ps_line(line).unwrap();
         assert_eq!(info.term_window, Some(3));
         assert_eq!(info.term_tab, Some(2));

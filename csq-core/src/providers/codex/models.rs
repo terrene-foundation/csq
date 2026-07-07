@@ -2,7 +2,7 @@
 //!
 //! The desktop `ChangeModelModal` for a Codex-surface slot needs a
 //! list of valid model ids the user can pick without typing. Four
-//! layered sources, consulted in this order by [`list_models`]:
+//! layered sources, consulted in this order by `list_models`:
 //!
 //! 1. **On-disk cache** (`accounts/codex-models-cache.json`). If present
 //!    and not older than [`CACHE_TTL_SECS`], returned immediately. The
@@ -117,7 +117,7 @@ pub enum ModelSource {
     Bundled,
 }
 
-/// Result of [`list_models`]. IPC-safe — no tokens, no user PII.
+/// Result of `list_models`. IPC-safe — no tokens, no user PII.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexModelList {
     pub models: Vec<CodexModel>,
@@ -190,7 +190,7 @@ pub fn bundled() -> CodexModelList {
 
 /// Parses the `backend-api/codex/models` response body into a
 /// `CodexModelList`. The response shape is documented-by-observation
-/// (see journal 0010 for `wham/usage`; `codex/models` parallel shape):
+/// (see an internal journal entry for `wham/usage`; `codex/models` parallel shape):
 /// `{"models": [{"id": "...", "display_name": "..."}, ...]}`. Unknown
 /// fields are ignored via `#[serde(default)]`. Rejection on empty
 /// models array is deliberate — an empty list from the upstream is
@@ -288,7 +288,7 @@ pub fn parse_codex_cli_models(stdout: &[u8], now: u64) -> Result<CodexModelList,
     })
 }
 
-/// Orchestrator for [`list_models`] consumed by the Tauri command.
+/// Orchestrator for `list_models` consumed by the Tauri command.
 /// DI-injected so tests can feed pre-canned bytes without spawning
 /// Node OR codex-cli.
 ///

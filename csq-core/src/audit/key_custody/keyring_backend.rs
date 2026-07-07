@@ -1086,7 +1086,7 @@ mod tests {
     ///   satisfying the T2.4 security contract.
     /// - The seed is ALSO anchored in the keychain (dual-store) — but the
     ///   keychain is the ANCHOR, not the primary store. Keychain-primary bricks
-    ///   the non-interactive daemon (journals 0033/0034); see journal 0009 for
+    ///   the non-interactive daemon (journals 0033/0034); see an internal journal entry for
     ///   why T2.4 was re-scoped to verify+document rather than make the keychain
     ///   authoritative.
     #[cfg(unix)]
@@ -1392,7 +1392,7 @@ mod tests {
         // Arrange — a REAL seed entry, exactly as `audit_init`/`csq login`
         // writes it (fixtures MUST mirror the real mint path; the original
         // fixture used a synthetic non-seed JSON and masked the
-        // deny_unknown_fields brick — PR #702 review C1/H1).
+        // deny_unknown_fields brick — an internal ticket review C1/H1).
         super::super::test_helpers::init_mock_keyring();
         let service = "csq-test-roster-floor-svc";
         let chain_id = "test-chain-floor-roundtrip";
@@ -1428,7 +1428,7 @@ mod tests {
 
     /// The floor writer refuses to patch an entry that is not a JSON seed
     /// payload (foreign JSON / legacy bare-hex) — it must not corrupt unknown
-    /// entries (PR #702 review M1).
+    /// entries (an internal ticket review M1).
     #[test]
     fn write_roster_floor_skips_non_seed_entry() {
         super::super::test_helpers::init_mock_keyring();

@@ -71,7 +71,7 @@ fn scan_file(path: &Path, offenders: &mut Vec<String>) {
 /// comment-parsing — if no such dependency is declared, `use kailash::` /
 /// `eatp::` cannot compile regardless of what the source scan sees. We assert it
 /// explicitly so the test OWNS the invariant rather than merely echoing it
-/// (security-reviewer LOW-1, journal 0014).
+/// (security-reviewer LOW-1, an internal journal entry).
 #[test]
 fn csq_ledger_cargo_toml_declares_no_kailash_or_eatp_dependency() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");

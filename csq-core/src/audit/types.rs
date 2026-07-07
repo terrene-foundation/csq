@@ -21,7 +21,6 @@ use std::fmt;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::redact_tokens;
 use crate::types::AccountNum;
 
 // ---------------------------------------------------------------------------
@@ -530,61 +529,12 @@ impl<'de> Deserialize<'de> for SinkId {
     }
 }
 
-/// Operator-facing error message that is structurally guaranteed to
-/// have been routed through [`redact_tokens`] before construction.
-///
-/// Per `rules/security.md` §2: relying on "callers must redact"
-/// docstring discipline is exactly the failure pattern token leaks
-/// reproduce. This newtype's only constructor — [`Self::from_untrusted`]
-/// — runs redaction on every input, so error variants that carry an
-/// operator-facing message cannot be constructed with raw token-bearing
-/// bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RedactedString(String);
-
-impl RedactedString {
-    /// Wraps `s` after running [`redact_tokens`] on it. Use this for
-    /// any string crossing from an external source (HTTP body, sink
-    /// response, OS error) into an operator-facing error variant.
-    pub fn from_untrusted(s: impl AsRef<str>) -> Self {
-        Self(redact_tokens(s.as_ref()))
-    }
-
-    /// Wraps `s` WITHOUT redaction. Use ONLY for strings whose
-    /// provenance is fully under csq control and contains no
-    /// secret-derivable content (e.g. const error labels).
-    pub fn from_trusted(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
-
-    /// Returns the redacted string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for RedactedString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for RedactedString {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for RedactedString {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Deserialization re-redacts so round-tripping a tampered file
-        // is also safe — the on-disk shape is post-redaction, but a
-        // forged file with raw tokens still passes through redact.
-        let s = String::deserialize(d)?;
-        Ok(Self::from_untrusted(&s))
-    }
-}
+/// Operator-facing error message guaranteed to have passed through
+/// [`redact_tokens`](csq_redact::redact_tokens) — relocated to the `csq-redact`
+/// leaf crate (W1) and re-exported here at its historical path
+/// (`crate::audit::types::RedactedString`; also re-exported from `crate::audit`)
+/// so every callsite compiles unchanged. See sdk-surface/an internal journal entry
+pub use csq_redact::RedactedString;
 
 // ---------------------------------------------------------------------------
 // Cryptographic primitives
@@ -762,7 +712,7 @@ pub enum LedgerError {
     /// non-interactive process such as the daemon cannot answer →
     /// `errSecInteractionNotAllowed` / `keyring::Error::PlatformFailure`).
     ///
-    /// This is structurally distinct from [`KeyNotFound`] (the key is
+    /// This is structurally distinct from `KeyNotFound` (the key is
     /// genuinely absent): a present-but-blocked key is a TRANSIENT condition
     /// that must NOT durably fail the chain. The verifier maps this to
     /// [`crate::audit::AuditHealth::Unknown`] (no `.chain-broken` sentinel) so
@@ -773,7 +723,7 @@ pub enum LedgerError {
     /// The access-vs-absence distinction is the load-bearing invariant: only
     /// `keyring::Error::{NoStorageAccess, PlatformFailure}` (allowlisted by
     /// `key_custody::is_keychain_access_error`) routes here; genuine `NoEntry`
-    /// stays [`KeyNotFound`], and a present-but-corrupt/planted entry stays
+    /// stays `KeyNotFound`, and a present-but-corrupt/planted entry stays
     /// fail-closed. See `specs/12-audit-trail.md` §12.13.2.
     #[error("signing key {key_id} is present but temporarily inaccessible (credential store locked / access-denied) — chain verification deferred, not failed")]
     KeychainUnavailable {
@@ -956,8 +906,8 @@ pub enum LedgerError {
 // Event taxonomy
 // ---------------------------------------------------------------------------
 
-/// Discriminant for the 18 audit-event kinds defined in the
-/// architecture recommendation §D1.
+/// Discriminant for the audit-event kinds (see [`EventKind::ALL`] for the
+/// canonical list; the count is asserted at compile time).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -1039,13 +989,70 @@ pub enum EventKind {
     /// a flood of one id → 1 anchor + 1 suppression record + silent no-ops).
     /// Metadata-only (HIGH-1: no raw body).
     SeamDuplicateSuppressed,
+    /// A per-turn governance decision from the live Phase-2b interactive
+    /// enforcement session (#784, M3 per-decision EATP attestation).
+    ///
+    /// One record per `GovernanceEvent` emitted by `InteractiveSession`
+    /// (turn-started / turn-completed / governance-failure / failover /
+    /// operator-override), distinguished by the fixed-vocabulary
+    /// [`GovernanceTurnPayload::event_class`] tag. The decision VERDICT rides on
+    /// [`SignedRecord::verification_level`] (a separate axis); an operator
+    /// override is the reserved `SignedAttestation` level (enterprise 6-level
+    /// gradient). The producer (the Phase-2b interactive substrate) is
+    /// enterprise-only and moat-stripped from the community edition; the kind
+    /// lives in the shared taxonomy so both editions compile it (community never
+    /// constructs one). HIGH-1: no raw untrusted free-text — the operator
+    /// override justification is stored redacted + as a content hash, and the
+    /// failover transport detail is dropped (only the discriminant is kept).
+    GovernanceTurn,
+    /// M3 §10.5 W2b/W3 — born-canonical EATP genesis record (seq == 0, signed)
+    /// and per-session-close EATP attestations. Record #0 is a
+    /// `SIGNED_ATTESTATION` genesis in the enterprise edition canonical form (W2b, emitted
+    /// at `csq audit init`); subsequent records are session-close attestations
+    /// from W3. The enterprise producer uses `attest_born_canonical_genesis` +
+    /// `write_record_v2_signed_in`; the community edition never constructs one;
+    /// the kind lives in the shared taxonomy so both editions compile it.
+    EatpAttestation,
+    /// An MCP tool-call gate decision from the spawn-boundary `csq mcp-proxy`
+    /// (#M6 T6.2 Shard 4). One record per gated `tools/call` a coding CLI
+    /// (codex/gemini) routes through the proxy: the tool id, the verdict
+    /// (`pass` / `block` / `escalate`), the spawned CLI, and the honest
+    /// `enforcement_fidelity = "spawn_boundary_only"` label.
+    ///
+    /// The proxy is a spawn-boundary interposer, NOT an in-loop enforcer, so
+    /// the verdict is on the tool-call REQUEST (not the model's decision to make
+    /// it) — hence the honest fidelity label distinguishing it from the cc/3P
+    /// in-loop `GovernanceTurn` stream. The producer (the proxy → the daemon
+    /// `POST /api/audit/mcp-gate` route, which builds + signs + appends this
+    /// record server-side) is enterprise-only and moat-stripped from the
+    /// community edition; the kind lives in the shared taxonomy so both editions
+    /// compile it (community never constructs one). HIGH-1: the `tool` is a
+    /// bounded MCP-declared identifier, never free-text prose; every other field
+    /// is a fixed-vocabulary tag.
+    McpGateDecision,
+    /// #787 b2b — a signed policy bundle was installed via `csq audit
+    /// bundle-install`. One record per successful install: the installed
+    /// `bundle_version` (== the new rollback floor), the out-of-band Ed25519
+    /// verifying key the detached signature was checked against, and the
+    /// installer's timestamp.
+    ///
+    /// A passive OWN-OP OBSERVATION, not a multi-sig-guarded decision: the
+    /// bundle's own detached signature (verified against the operator's
+    /// out-of-band `--pubkey`) IS its authority, so this record is single-sig
+    /// chain-signed and unguarded for op-class purposes (same rationale as
+    /// [`EventKind::GovernanceTurn`]). The producer (the `bundle-install`
+    /// handler) is enterprise-only and moat-stripped from the community edition;
+    /// the kind lives in the shared taxonomy so both editions compile it
+    /// (community never constructs one). HIGH-1: every field is a `u64`, a hex
+    /// key, or a structured timestamp — never free-text prose.
+    PolicyBundleInstall,
 }
 
 impl EventKind {
-    /// All 20 variants in declaration order. The wildcard-free match
+    /// All 24 variants in declaration order. The wildcard-free match
     /// in `event_payload_kind_matches_variant` is the compile-time
     /// drift catch; this array is for runtime iteration.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 24] = [
         Self::CsqRun,
         Self::OAuthRefresh,
         Self::ArtifactLoad,
@@ -1066,6 +1073,10 @@ impl EventKind {
         Self::ProvenanceAnchored,
         Self::ProvenanceCaptureMatrix,
         Self::SeamDuplicateSuppressed,
+        Self::GovernanceTurn,
+        Self::EatpAttestation,
+        Self::McpGateDecision,
+        Self::PolicyBundleInstall,
     ];
 }
 
@@ -1117,6 +1128,14 @@ pub enum EventPayload {
     ProvenanceCaptureMatrix(ProvenanceCaptureMatrixPayload),
     /// See [`EventKind::SeamDuplicateSuppressed`].
     SeamDuplicateSuppressed(SeamDuplicateSuppressedPayload),
+    /// See [`EventKind::GovernanceTurn`].
+    GovernanceTurn(GovernanceTurnPayload),
+    /// See [`EventKind::EatpAttestation`].
+    EatpAttestation(EatpAttestationPayload),
+    /// See [`EventKind::McpGateDecision`].
+    McpGateDecision(McpGateDecisionPayload),
+    /// See [`EventKind::PolicyBundleInstall`].
+    PolicyBundleInstall(PolicyBundleInstallPayload),
 }
 
 impl EventPayload {
@@ -1146,6 +1165,10 @@ impl EventPayload {
             Self::ProvenanceAnchored(_) => EventKind::ProvenanceAnchored,
             Self::ProvenanceCaptureMatrix(_) => EventKind::ProvenanceCaptureMatrix,
             Self::SeamDuplicateSuppressed(_) => EventKind::SeamDuplicateSuppressed,
+            Self::GovernanceTurn(_) => EventKind::GovernanceTurn,
+            Self::EatpAttestation(_) => EventKind::EatpAttestation,
+            Self::McpGateDecision(_) => EventKind::McpGateDecision,
+            Self::PolicyBundleInstall(_) => EventKind::PolicyBundleInstall,
         }
     }
 }
@@ -1577,6 +1600,285 @@ pub struct ProvenanceCaptureMatrixPayload {
 }
 
 // ---------------------------------------------------------------------------
+// #784 — per-decision EATP attestation (M3): per-turn governance record
+// ---------------------------------------------------------------------------
+
+/// Token usage projection for a completed governed turn.
+///
+/// A shared (community-compiled) numeric projection of the Phase-2b
+/// `TokenUsage` (which lives in the enterprise-only `phase2b` tree and cannot
+/// be referenced from this shared module). All fields are optional because
+/// some Anthropic-compatible 3P endpoints omit sub-counts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GovernanceTokenUsage {
+    /// Prompt/input tokens reported by the provider.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub input_tokens: Option<u32>,
+    /// Completion/output tokens reported by the provider.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output_tokens: Option<u32>,
+    /// Cache-creation input tokens (Anthropic prompt caching), when reported.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Cache-read input tokens (Anthropic prompt caching), when reported.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_read_input_tokens: Option<u32>,
+}
+
+/// Payload for [`EventKind::GovernanceTurn`] (#784, M3 per-decision EATP
+/// attestation).
+///
+/// One record per per-turn governance event emitted by the live Phase-2b
+/// interactive enforcement session. The six `GovernanceEvent` variants
+/// (`csq-core/src/phase2b/provider_client.rs`) project onto this single payload,
+/// distinguished by the fixed-vocabulary [`Self::event_class`] tag. The decision
+/// VERDICT is carried on [`SignedRecord::verification_level`] (a separate axis),
+/// NOT in this payload.
+///
+/// HIGH-1 invariant: no raw untrusted free-text. The operator override
+/// justification is stored redacted ([`RedactedString`]) AND as
+/// `justification_hash = sha256(redacted)` (the tamper-evidence binding,
+/// mirroring [`ProvenanceAnchoredPayload::words_hash`]); the failover
+/// `Transport { detail }` free-text is dropped entirely (only the discriminant
+/// is kept).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GovernanceTurnPayload {
+    /// The live session id (`interactive-live-<pid>-<nonce>`) — the dedup-key
+    /// namespace component AND the session this governance event belongs to.
+    /// Persisted in the payload (not only the `authority` blob) so the M20 dedup
+    /// index rebuild can re-derive the `gov:<session_id>:<record_seq>` key from
+    /// the on-chain record alone (mirrors `CsqRunPayload::run_id`).
+    pub session_id: String,
+    /// Session-monotonic record ordinal (the second dedup-key component). Counts
+    /// flushed governance records within the session; with `session_id` it forms
+    /// the globally-unique `gov:<session_id>:<record_seq>` idempotency key.
+    pub record_seq: u64,
+    /// Fixed-vocabulary event class: `turn_started`, `turn_completed`,
+    /// `governance_failure`, `failover`, `governance_override`,
+    /// `residency_enforcement` (M5). NEVER free-text.
+    pub event_class: String,
+    /// Session-level turn number the event pertains to (`0` for `failover`,
+    /// which carries no turn index).
+    pub turn: u32,
+    /// Provider catalog id involved (`event.provider_id` / `Failover.to`) —
+    /// catalog id only, never a secret. `None` where the event carries none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_id: Option<String>,
+    /// `Failover.from` provider catalog id (failover records only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub failover_from: Option<String>,
+    /// Fixed-vocabulary failover reason discriminant (`rate_limited`,
+    /// `service_unavailable`, `transport`). The `Transport { detail }` free-text
+    /// is DROPPED (HIGH-1) — only the discriminant is recorded.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub failover_reason: Option<String>,
+    /// Token usage reported for a completed turn (numeric counts only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub usage: Option<GovernanceTokenUsage>,
+    /// `sha256(redacted-justification)` for an operator override — the
+    /// tamper-evidence binding (the verbatim words are never stored raw).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub justification_hash: Option<Sha256Hex>,
+    /// The operator override justification, redacted ([`RedactedString`]) — the
+    /// human-readable reason-of-record an auditor reads. Present on
+    /// `governance_override` records.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub justification_redacted: Option<RedactedString>,
+    /// Governance failure reason (already redacted at source), re-wrapped for
+    /// structural type-safety. Present on `governance_failure` records.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub governance_reason: Option<RedactedString>,
+    /// #784 follow-up: the ISO-8601 UTC time the turn was GOVERNED (captured at
+    /// projection-build time). Distinct from `SignedRecord.ts` (the chain-WRITE
+    /// time, reassigned by the writer). This is the `timestamp` input to the
+    /// frozen cross-SDK kailash projection, so a witness recomputes against the
+    /// SAME value the producer used. `None` when no kailash projector is wired
+    /// (community / test paths). See an internal journal entry
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub governed_at: Option<String>,
+    /// #784 follow-up: the cross-SDK kailash-canonical projection hash for this
+    /// governance decision (`compute_hash_kailash_rs` over the frozen
+    /// GovernanceTurn → EATP anchor mapping, produced BY the `the enterprise seam crate`
+    /// seam via an injected projector — spec 18 §18.1). Stored INSIDE the signed
+    /// `CanonicalView`, so the existing Ed25519 signature makes it tamper-evident.
+    /// `None` when no projector is wired (community / pre-witness / test paths).
+    /// Honest-host grade: an external witness recomputes + corroborates this once
+    /// one exists; until then it is a same-key self-consistency checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kailash_canonical_hash: Option<String>,
+    /// #793: the session-constant auth mode that produced this governed turn —
+    /// `"subscription"` (reference-CLI capture, degraded tier) or `"direct-api"`
+    /// (paid-key native client, the moat). The maintainer's "segregate + tag"
+    /// requirement: every governed turn records which auth path drove it. Stored
+    /// inside the signed `CanonicalView` (the Ed25519 signature covers it).
+    /// `skip_serializing_if`/`default` keep records written before this field
+    /// (and untagged mock/test sessions) byte-identical + chain-verifiable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub auth_mode: Option<String>,
+    /// M5: the residency verdict for a `residency_enforcement` record —
+    /// fixed-vocabulary `"pass"` / `"block"` (the `EnvelopeVerdict` projected to a
+    /// binary admit/deny). Records BOTH allowed (`pass`) and denied (`block`)
+    /// provider requests so an auditor can verify every provider request was
+    /// checked. `None` on all non-residency event classes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub residency_verdict: Option<String>,
+    /// M5: the operator-authored `policy_name` of the residency policy that
+    /// produced the verdict (`residency_enforcement` records only). Not a secret.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub residency_policy_name: Option<String>,
+    /// M5: `sha256` of the canonical serialization of the residency policy that
+    /// applied — binds the attestation to the EXACT policy in force, so an auditor
+    /// can prove which policy a verdict was decided under. `residency_enforcement`
+    /// records only. `skip_serializing_if`/`default` (like every field above) keep
+    /// pre-M5 records byte-identical + chain-verifiable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub residency_policy_hash: Option<String>,
+}
+
+/// Payload for [`EventKind::McpGateDecision`] (M6 T6.2 Shard 4 — the
+/// spawn-boundary MCP-proxy gate decision attestation).
+///
+/// One record per gated `tools/call` the `csq mcp-proxy` interposes on. The
+/// verdict is on the tool-call REQUEST at the spawn boundary — NOT the model's
+/// in-loop decision to make the call — so [`Self::enforcement_fidelity`] is the
+/// honest constant `"spawn_boundary_only"`, distinguishing it from the cc/3P
+/// in-loop [`GovernanceTurnPayload`] stream (spec 25 §25.12).
+///
+/// HIGH-1 invariant: no raw untrusted free-text. [`Self::tool`] is a bounded
+/// MCP-declared tool identifier (the same value the proxy echoes in its denial
+/// message — `serde` escapes any metacharacter, and the daemon route caps its
+/// length); [`Self::verdict`], [`Self::cli`], and [`Self::enforcement_fidelity`]
+/// are fixed-vocabulary tags.
+///
+/// Idempotency: `session_nonce` + `record_seq` form the globally-unique
+/// `mcp:<session_nonce>:<record_seq>` dedup key (mirrors
+/// [`GovernanceTurnPayload`]'s `session_id`/`record_seq`), re-derivable from the
+/// on-chain record alone so the M20 in-lock dedup-index rebuild survives a
+/// sidecar drop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpGateDecisionPayload {
+    /// Per-proxy-process nonce (`mcp-proxy-<pid>-<nonce>`) — the dedup-key
+    /// namespace component AND the proxy session this decision belongs to.
+    pub session_nonce: String,
+    /// Proxy-session-monotonic decision ordinal (the second dedup-key
+    /// component); with `session_nonce` it forms the globally-unique
+    /// `mcp:<session_nonce>:<record_seq>` idempotency key.
+    pub record_seq: u64,
+    /// The spawned CLI whose MCP traffic was gated: `"codex"` | `"gemini"`.
+    pub cli: String,
+    /// The MCP-declared tool identifier that was gated (bounded; not a secret;
+    /// not free-text prose). E.g. `"mcp__fs__read"`.
+    pub tool: String,
+    /// Fixed-vocabulary gate verdict: `"pass"` (forwarded) | `"block"`
+    /// (allow-list miss, denied) | `"escalate"` (never-delegated, denied).
+    pub verdict: String,
+    /// Honest enforcement-fidelity label — always `"spawn_boundary_only"` for
+    /// this record kind (the proxy gates the tool-call request at the spawn
+    /// boundary, not the model's in-loop decision). Reserved as a field (rather
+    /// than implied by the kind) so the T6.5 fidelity matrix + the compliance
+    /// report can read it uniformly across event kinds.
+    pub enforcement_fidelity: String,
+}
+
+/// Payload for [`EventKind::PolicyBundleInstall`] (#787 b2b — the audited
+/// own-op record appended when `csq audit bundle-install` succeeds).
+///
+/// HIGH-1 invariant: no raw untrusted free-text. Every field is a `u64`, a hex
+/// public key, or a structured ISO-8601 timestamp — an auditor can tie the
+/// install to the exact bundle version and verifying key without any operator
+/// prose entering the signed chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyBundleInstallPayload {
+    /// The installed bundle's monotonic version. Equals the new rollback floor
+    /// after this install completes (see `phase2b::bundle_floor::write_bundle_floor`
+    /// — a plain code span, not an intra-doc link: this SHARED payload documents
+    /// under the community feature set where the enterprise-only `phase2b` module
+    /// is absent, so a `[...]` link would fail the broken-link doc gate).
+    pub bundle_version: u64,
+    /// The out-of-band Ed25519 verifying key the bundle's detached signature was
+    /// checked against (the operator's `--pubkey`). This is PUBLIC key material —
+    /// never a secret — stored verbatim so a governance auditor can tie the
+    /// install to the exact org-admin key with no indirection.
+    ///
+    /// A validated [`Ed25519PublicKey`] (NOT a raw `String`): it serializes as a
+    /// 64-char lowercase hex string but deserialize-VALIDATES to exactly 32 bytes
+    /// of hex (via `hex_array_32`), so the HIGH-1 "no free-text" invariant is
+    /// structurally enforced at the chain boundary — a tampered record with a
+    /// malformed key is rejected at parse time, never reaching a consumer.
+    pub bundle_pubkey: Ed25519PublicKey,
+    /// ISO-8601 UTC timestamp the installer captured at record-append time
+    /// (after the bundle + floor were persisted, before the chain append).
+    /// DISTINCT from [`SignedRecord::ts`] (the chain-write time the writer stamps
+    /// inside the lock, a slightly later instant) — this is the producer's own
+    /// clock, the [`GovernanceTurnPayload::governed_at`] analogue for bundle
+    /// installs.
+    pub installed_at: String,
+}
+
+/// Payload for [`EventKind::EatpAttestation`] (M3 §10.5 W2b/W3 — born-canonical
+/// EATP genesis record and per-session-close attestations).
+///
+/// Carries all `csq_trust_contract::CanonicalAnchorInput` fields verbatim plus
+/// the the enterprise edition canonical hash, so a daemon-side guard can re-derive and
+/// verify the genesis via the injected `EatpGenesisGuard` without re-encoding.
+///
+/// HIGH-1 invariant: no raw untrusted free-text. Every field is either a
+/// fixed-vocabulary tag, a hash, a structured timestamp, or operator-controlled
+/// metadata whose non-emptiness is validated by `attest_born_canonical_genesis`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EatpAttestationPayload {
+    /// kailash `anchor_id` — stable within a chain genesis:
+    /// `"eatp-genesis:<eatp_chain_id>"`.
+    pub anchor_id: String,
+    /// Monotonic EATP sequence within the kailash attestation anchor; always 0
+    /// for genesis records.
+    pub sequence: u64,
+    /// Previous anchor hash; `None` for genesis records (the kailash canonical
+    /// encoder uses the zero-hex sentinel; we do NOT store it here).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub previous_hash: Option<String>,
+    /// Agent or principal producing this attestation; `"csq-ee"` for W2b genesis.
+    pub agent_id: String,
+    /// Fixed-vocabulary action tag: `"eatp_genesis"` for W2b genesis;
+    /// `"session_close_attestation"` for W3 session-close records.
+    pub action: String,
+    /// kailash verification-level string. `"SIGNED_ATTESTATION"` for enterprise
+    /// EATP genesis and session-close attestations (the enterprise 6-level grade).
+    pub verification_level: String,
+    /// Optional kailash envelope id. `None` for genesis records.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub envelope_id: Option<String>,
+    /// Outcome tag: `"success"` for genesis records; fixed-vocabulary for W3.
+    pub result: String,
+    /// ISO-8601 UTC timestamp passed to `attest_born_canonical_genesis` (W2b) or
+    /// the W3 attestation function. DISTINCT from [`SignedRecord::ts`] (the
+    /// chain-write time, set by the writer). Stored here so the daemon guard
+    /// re-uses the EXACT same value the producer used — the
+    /// [`GovernanceTurnPayload::governed_at`] analogue for EATP attestations.
+    pub attestation_ts: String,
+    /// The the enterprise edition canonical projection hash produced by
+    /// `attest_born_canonical_genesis` (W2b) or the W3 equivalent. Stored INSIDE
+    /// the signed `CanonicalView`, so the Ed25519 signature makes it
+    /// tamper-evident. `None` is structurally BLOCKED for production genesis
+    /// records but kept `Option` for forward compatibility with record shapes not
+    /// yet assigned a canonical hash.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kailash_canonical_hash: Option<String>,
+    /// Non-empty JSON object metadata distinguishing this genesis as born-canonical
+    /// (`GenesisCanonicalStatus::BornCanonical`) from the legacy kailash-py
+    /// empty-metadata shape (`AmbiguousLegacyTwin`). REQUIRED non-empty for W2b
+    /// genesis records; validated by `attest_born_canonical_genesis` before
+    /// emission.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub metadata_json: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // EATP attestation typed placeholder wrappers (M02, Amendment 3)
 // ---------------------------------------------------------------------------
 
@@ -1604,6 +1906,41 @@ pub struct EatpActor(pub serde_json::Value);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EatpAuthority(pub serde_json::Value);
+
+impl EatpAuthority {
+    /// M3 §10.5 W3 (H3) — build a session-close authority blob from ONLY the
+    /// three opaque, install/session-scoped identifiers. The tuple constructor
+    /// (`EatpAuthority(serde_json::Value)`) is an untyped redaction-bypass channel:
+    /// any caller can stuff a host fingerprint, a username, or any PII into the
+    /// blob and it serializes verbatim. This constructor is the typed gate — it
+    /// accepts EXACTLY `instance_id` (random, install-scoped), `session_id` (the
+    /// daemon-minted session id), and `signing_key_id` (the PUBLIC key fingerprint,
+    /// never the private seed). No field can carry host fingerprint / PII by
+    /// construction, so a record built through it is H3-safe.
+    ///
+    /// The keys are emitted in a fixed alphabetical order so the resulting JSON is
+    /// deterministic regardless of the serde map backend.
+    #[must_use]
+    pub fn new_typed(instance_id: &str, session_id: &str, signing_key_id: &str) -> Self {
+        // `Map` preserves insertion order under `serde_json`'s default
+        // (`preserve_order` off → `BTreeMap`, alphabetical); inserting in
+        // alphabetical order keeps the wire form stable under either backend.
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "instance_id".to_string(),
+            serde_json::Value::String(instance_id.to_string()),
+        );
+        map.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+        map.insert(
+            "signing_key_id".to_string(),
+            serde_json::Value::String(signing_key_id.to_string()),
+        );
+        EatpAuthority(serde_json::Value::Object(map))
+    }
+}
 
 /// Opaque wrapper for an EATP Trust attestation blob.
 ///
@@ -1781,6 +2118,18 @@ pub struct SignedRecord {
     /// `None` so pre-M13 records remain byte-identical in canonical form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_phase: Option<OpPhase>,
+
+    /// M3a — explicit PACT verification level for this record. `None` for
+    /// every record written before M3a (legacy); skipped on serialize when
+    /// `None` so pre-M3a records remain byte-identical in canonical form.
+    /// When `Some`, the value is signed as part of the canonical hash.
+    ///
+    /// The ONLY level stamped by the op-emit path is `AutoApproved` —
+    /// see `PRIMARY METHODOLOGICAL DIRECTIVE 3` in the M3a contract.
+    /// `SIGNED_ATTESTATION` / `PEER_REVIEWED` are reserved for Phase-2b
+    /// turn-events (M3 T3.2) and MUST NOT be emitted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_level: Option<crate::audit::eatp_canonical::VerificationLevel>,
 }
 
 impl SignedRecord {
@@ -1827,6 +2176,8 @@ impl<'de> Deserialize<'de> for SignedRecord {
             eatp_end_ts: Option<String>,
             #[serde(default)]
             op_phase: Option<OpPhase>,
+            #[serde(default)]
+            verification_level: Option<crate::audit::eatp_canonical::VerificationLevel>,
         }
         let raw = Raw::deserialize(d)?;
         if raw.kind != raw.payload.kind() {
@@ -1854,6 +2205,7 @@ impl<'de> Deserialize<'de> for SignedRecord {
             eatp_start_ts: raw.eatp_start_ts,
             eatp_end_ts: raw.eatp_end_ts,
             op_phase: raw.op_phase,
+            verification_level: raw.verification_level,
         })
     }
 }
@@ -1924,6 +2276,41 @@ mod hex_array_64 {
 mod tests {
     use super::*;
 
+    /// M3 §10.5 W3 (H3): `EatpAuthority::new_typed` admits ONLY the three opaque
+    /// identifiers and emits them as a 3-key string object — no field can carry a
+    /// host fingerprint / PII through the typed gate, and the key set is exact.
+    #[test]
+    fn eatp_authority_new_typed_carries_only_opaque_ids() {
+        let authority = EatpAuthority::new_typed("instance-xyz", "session-abc", "ed25519:deadbeef");
+        let obj = authority
+            .0
+            .as_object()
+            .expect("authority must serialize as a JSON object");
+        // Exactly the three opaque fields — no extra channel.
+        let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["instance_id", "session_id", "signing_key_id"]);
+        // Every value is a string (no nested object / number that could smuggle data).
+        assert!(
+            obj.values().all(|v| v.is_string()),
+            "all values are strings"
+        );
+        assert_eq!(obj["instance_id"], serde_json::json!("instance-xyz"));
+        assert_eq!(obj["session_id"], serde_json::json!("session-abc"));
+        assert_eq!(obj["signing_key_id"], serde_json::json!("ed25519:deadbeef"));
+    }
+
+    /// The wire form is key-stable (deterministic) regardless of construction.
+    #[test]
+    fn eatp_authority_new_typed_wire_form_is_deterministic() {
+        let a = EatpAuthority::new_typed("i", "s", "k");
+        let b = EatpAuthority::new_typed("i", "s", "k");
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
+    }
+
     fn sample_record() -> SignedRecord {
         SignedRecord {
             schema_version: "2".to_string(),
@@ -1946,6 +2333,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
     }
 
@@ -2099,20 +2487,6 @@ mod tests {
         assert!(SinkId::try_new("etag.abc-123_x").is_ok());
     }
 
-    // -- RedactedString ------------------------------------------------------
-
-    #[test]
-    fn redacted_string_redacts_tokens() {
-        let r = RedactedString::from_untrusted("error containing sk-ant-oat01-leakedtoken-abcdef");
-        assert!(!r.as_str().contains("leakedtoken-abcdef"));
-    }
-
-    #[test]
-    fn redacted_string_passes_clean_through() {
-        let r = RedactedString::from_untrusted("ordinary message");
-        assert_eq!(r.as_str(), "ordinary message");
-    }
-
     // -- Hex shim length + case enforcement ----------------------------------
 
     #[test]
@@ -2128,6 +2502,16 @@ mod tests {
         let json = serde_json::Value::String("A".repeat(64));
         let result: Result<Ed25519PublicKey, _> = serde_json::from_value(json);
         assert!(result.is_err(), "uppercase pubkey hex must be rejected");
+    }
+
+    #[test]
+    fn ed25519_public_key_rejects_non_hex_charset() {
+        // 64 lowercase chars but 'g' is outside [0-9a-f] — must fail `hex::decode`.
+        // Guards the #787 b2b `bundle_pubkey` chain-parse boundary: a tampered
+        // record with a non-hex key is rejected before reaching any consumer.
+        let json = serde_json::Value::String("g".repeat(64));
+        let result: Result<Ed25519PublicKey, _> = serde_json::from_value(json);
+        assert!(result.is_err(), "non-hex pubkey charset must be rejected");
     }
 
     #[test]
@@ -2214,13 +2598,17 @@ mod tests {
                 EventKind::ProvenanceAnchored => "provenance_anchored",
                 EventKind::ProvenanceCaptureMatrix => "provenance_capture_matrix",
                 EventKind::SeamDuplicateSuppressed => "seam_duplicate_suppressed",
+                EventKind::GovernanceTurn => "governance_turn",
+                EventKind::EatpAttestation => "eatp_attestation",
+                EventKind::McpGateDecision => "mcp_gate_decision",
+                EventKind::PolicyBundleInstall => "policy_bundle_install",
             };
         }
     }
 
-    // Compile-time variant-count check; if a 21st variant lands, this
+    // Compile-time variant-count check; if a 25th variant lands, this
     // const-assert fails to compile.
-    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 20);
+    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 24);
 
     #[test]
     fn event_payload_kind_matches_variant() {
@@ -2329,6 +2717,60 @@ mod tests {
                             "3ae2926203bff32a2349e7584fd4df0c5bd01c4745bab723d666d8a7167cc00a"
                                 .to_string(),
                         surface: "journal/test.md".to_string(),
+                    })
+                }
+                EventKind::GovernanceTurn => EventPayload::GovernanceTurn(GovernanceTurnPayload {
+                    session_id: "sess-test".to_string(),
+                    record_seq: 0,
+                    event_class: "turn_completed".to_string(),
+                    turn: 1,
+                    provider_id: Some("claude".to_string()),
+                    failover_from: None,
+                    failover_reason: None,
+                    usage: None,
+                    justification_hash: None,
+                    justification_redacted: None,
+                    governance_reason: None,
+                    governed_at: None,
+                    kailash_canonical_hash: None,
+                    auth_mode: None,
+                    residency_verdict: None,
+                    residency_policy_name: None,
+                    residency_policy_hash: None,
+                }),
+                EventKind::EatpAttestation => {
+                    EventPayload::EatpAttestation(EatpAttestationPayload {
+                        anchor_id: "eatp-genesis:01JZ00000000000000000000XY".to_string(),
+                        sequence: 0,
+                        previous_hash: None,
+                        agent_id: "csq-ee".to_string(),
+                        action: "eatp_genesis".to_string(),
+                        verification_level: "SIGNED_ATTESTATION".to_string(),
+                        envelope_id: None,
+                        result: "success".to_string(),
+                        attestation_ts: "2026-01-01T00:00:00+00:00".to_string(),
+                        kailash_canonical_hash: None,
+                        metadata_json: Some(
+                            "{\"csq_edition\":\"enterprise\",\"genesis_kind\":\"eatp_chain_init\"}"
+                                .to_string(),
+                        ),
+                    })
+                }
+                EventKind::McpGateDecision => {
+                    EventPayload::McpGateDecision(McpGateDecisionPayload {
+                        session_nonce: "mcp-proxy-1234-abcd".to_string(),
+                        record_seq: 0,
+                        cli: "codex".to_string(),
+                        tool: "mcp__fs__read".to_string(),
+                        verdict: "block".to_string(),
+                        enforcement_fidelity: "spawn_boundary_only".to_string(),
+                    })
+                }
+                EventKind::PolicyBundleInstall => {
+                    EventPayload::PolicyBundleInstall(PolicyBundleInstallPayload {
+                        bundle_version: 7,
+                        bundle_pubkey: Ed25519PublicKey::new([0xaa; 32]),
+                        installed_at: "2026-07-04T00:00:00+00:00".to_string(),
                     })
                 }
             };

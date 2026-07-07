@@ -2,7 +2,7 @@
 //!
 //! # fsync before 200 (PRIMARY DIRECTIVE 6)
 //!
-//! The submit handler returns HTTP 200 ONLY after [`LedgerStore::append`] has
+//! The submit handler returns HTTP 200 ONLY after `LedgerStore::append` has
 //! fsync'd the record bytes (and the size marker) to disk. `append` performs:
 //! segment write → `sync_all` (fsync) → directory fsync → marker fsync, and
 //! only then returns. This handler awaits `append` BEFORE building the 200
@@ -203,6 +203,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
     }
 

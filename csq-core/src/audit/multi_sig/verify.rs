@@ -48,7 +48,7 @@ use crate::audit::authority::registry::AuthorityRegistry;
 use crate::audit::types::{Ed25519PublicKey, SignedRecord};
 
 use super::error::MultiSigError;
-use super::intent::intent_hash;
+use super::intent::{intent_hash, intent_hash_raw};
 
 /// Verify the multi-sig authorization on a `SignedRecord`.
 ///
@@ -116,6 +116,68 @@ pub fn verify_record_multi_sig(
         }
     };
 
+    // Re-derive the intent hash from this record's (chain_id, kind, payload).
+    // SEC-3: chain_id binds the intent to this chain, closing cross-chain replay.
+    let hash = intent_hash(record.chain_id.as_str(), &record.kind, &record.payload);
+
+    // M12: roster membership enforcement is active under the same condition as
+    // `enforced_op_class`. When active, only enrolled pubkeys count toward the
+    // threshold (the `record.seq` validity window); otherwise pure M11 behavior.
+    let membership: Option<(OpClass, &dyn AuthorityRegistry, u64)> =
+        match (enforced_op_class, registry) {
+            (Some(op_class), Some(reg)) => Some((op_class, reg, record.seq)),
+            _ => None,
+        };
+
+    verify_multi_sig_authorizations(ms_blob, &hash, membership)
+}
+
+/// Forward-compat (GH #910): verify the multi-sig authorization on a record
+/// whose `EventKind` is UNKNOWN to this binary.
+///
+/// An unknown kind cannot be mapped to an [`OpClass`], so M12 roster-membership
+/// enforcement cannot run — the reader does not know whether this future
+/// op-class is guarded. The check degrades to pure-M11 inner-threshold
+/// verification (every valid inner signature over the [`intent_hash_raw`]
+/// pre-image counts; no membership filter). The one INHERENT forward-compat
+/// limitation: a FUTURE guarded op-class shipped with NO `multi_sig` blob cannot
+/// be rejected as `MissingAuthorizationForGuardedOp` here — a kind-aware (newer)
+/// reader enforces that on its own verify. The outer Ed25519 signature (verified
+/// separately by the caller) already commits to the entire authority blob, so a
+/// present blob is tamper-evident regardless. See spec 25 §25.12.2.
+///
+/// `authority` is the record's authority slot parsed as a [`serde_json::Value`]
+/// (`None` when the record carries no authority — the fast path returns `Ok`).
+pub(crate) fn verify_opaque_multi_sig(
+    chain_id: &str,
+    kind: &str,
+    payload: &serde_json::value::RawValue,
+    authority: Option<&serde_json::Value>,
+) -> Result<(), MultiSigError> {
+    let ms_blob = match authority.and_then(|a| a.get("multi_sig")) {
+        Some(v) => v,
+        // No multi_sig blob: fast path. Unlike the typed path there is no
+        // `MissingAuthorizationForGuardedOp` branch — op-class is unknowable.
+        None => return Ok(()),
+    };
+    let hash = intent_hash_raw(chain_id, kind, payload);
+    verify_multi_sig_authorizations(ms_blob, &hash, None)
+}
+
+/// Verify the inner authorizations of a `multi_sig` blob against a precomputed
+/// `intent_hash`. Shared by [`verify_record_multi_sig`] (typed records) and
+/// [`verify_opaque_multi_sig`] (unknown-kind forward-compat records, GH #910).
+///
+/// `membership` is `Some((op_class, registry, record_seq))` when M12 roster
+/// enforcement applies — then only pubkeys enrolled for `op_class` at
+/// `record_seq` count toward the threshold. `None` is pure-M11 (inner-sig
+/// validity only), the mode used for opaque records whose op-class cannot be
+/// determined.
+fn verify_multi_sig_authorizations(
+    ms_blob: &serde_json::Value,
+    intent_hash: &[u8; 32],
+    membership: Option<(OpClass, &dyn AuthorityRegistry, u64)>,
+) -> Result<(), MultiSigError> {
     let ms = ms_blob
         .as_object()
         .ok_or(MultiSigError::MalformedAuthorityBlob(
@@ -149,19 +211,6 @@ pub fn verify_record_multi_sig(
             ));
         }
     }
-
-    // Re-derive the intent hash from this record's (chain_id, kind, payload).
-    // SEC-3: chain_id binds the intent to this chain, closing cross-chain replay.
-    let hash = intent_hash(record.chain_id.as_str(), &record.kind, &record.payload);
-
-    // M12: roster membership check is active under the same condition computed
-    // above (`enforced_op_class`). When active, only enrolled pubkeys count
-    // toward the threshold; otherwise pure M11 behavior (no membership filter).
-    let membership_check: Option<(OpClass, &dyn AuthorityRegistry)> =
-        match (enforced_op_class, registry) {
-            (Some(op_class), Some(reg)) => Some((op_class, reg)),
-            _ => None,
-        };
 
     // SEC-1: track seen pubkeys to detect duplicates. A duplicate pubkey in
     // a claimed-multi-sig blob is rejected as malformed (fail-closed). Ed25519
@@ -229,7 +278,7 @@ pub fn verify_record_multi_sig(
                 tracing::warn!(
                     error_kind = "multi_sig_verify_invalid_pubkey",
                     auth_index = idx,
-                    "verify_record_multi_sig: authorization pubkey is not a valid Ed25519 point"
+                    "verify_multi_sig_authorizations: authorization pubkey is not a valid Ed25519 point"
                 );
                 return Err(MultiSigError::MalformedAuthorityBlob(
                     "authorization.signer_pubkey is not a valid Ed25519 point",
@@ -238,29 +287,29 @@ pub fn verify_record_multi_sig(
         };
 
         let dalek_sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-        let sig_valid = verifying.verify_strict(&hash, &dalek_sig).is_ok();
+        let sig_valid = verifying.verify_strict(intent_hash, &dalek_sig).is_ok();
 
         if sig_valid {
             // M12: if membership check is active, verify enrollment.
-            match &membership_check {
+            match &membership {
                 None => {
                     // Pure M11 behavior: sig valid → count it.
                     valid_count += 1;
                 }
-                Some((op_class, reg)) => {
+                Some((op_class, reg, seq)) => {
                     // Membership enforced: pubkey must be enrolled for this
                     // op-class at this seq (validity window check).
                     let pk = Ed25519PublicKey(pk_arr);
-                    if reg.is_enrolled(&pk, *op_class, record.seq) {
+                    if reg.is_enrolled(&pk, *op_class, *seq) {
                         valid_count += 1;
                     } else {
                         // Sig-valid but unenrolled: contributes 0.
                         tracing::warn!(
                             error_kind = "multi_sig_non_member_signer",
                             auth_index = idx,
-                            seq = record.seq,
+                            seq = *seq,
                             op_class = ?op_class,
-                            "verify_record_multi_sig: sig-valid pubkey is not enrolled \
+                            "verify_multi_sig_authorizations: sig-valid pubkey is not enrolled \
                              in roster for this op-class — not counted toward threshold"
                         );
                     }
@@ -351,6 +400,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
     }
 

@@ -58,7 +58,7 @@ pub fn tos_marker_path(base_dir: &Path) -> PathBuf {
 /// ToS version. Absence, wrong version, or a malformed marker all
 /// return `false` — the UI re-prompts in every case.
 ///
-/// Journal 0021 finding M9: distinguishes `NotFound` (expected on
+/// an internal journal entry finding M9: distinguishes `NotFound` (expected on
 /// first run — silent) from other I/O errors (permissions, disk
 /// full, corrupt fs) which are logged at WARN so an operator can
 /// see why every ToS prompt loops. Behavior is unchanged — still

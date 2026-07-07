@@ -21,7 +21,7 @@
 
 use anyhow::Result;
 use csq_core::accounts::snapshot;
-use csq_core::quota::status::{show_status, AccountStatus};
+use csq_core::quota::status::{render_status_table, show_status, AccountStatus};
 use csq_core::types::AccountNum;
 use std::path::Path;
 
@@ -34,7 +34,7 @@ use csq_core::quota::status::compose_status;
 
 pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     // Resolve active account authority-first (workspace
-    // slot-attribution-consistency): snapshot_account reads `.csq-account`
+    // an internal workspace): snapshot_account reads `.csq-account`
     // (numeric direct / UUID via by_slot) and self-heals the cache, so the
     // "active" highlight cannot be pinned to a stale `.current-account`.
     let active = super::current_config_dir()
@@ -55,10 +55,8 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!();
-    for account in &accounts {
-        println!("{}", account.format_line());
-    }
+    let clock = chrono::Local::now().format("%a %H:%M").to_string();
+    print!("{}", render_status_table(&accounts, active, &clock));
     println!();
 
     Ok(())

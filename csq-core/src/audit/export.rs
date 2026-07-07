@@ -38,7 +38,7 @@
 //! # Dependency footprint (independence.md)
 //!
 //! This module adds ZERO new Rust crates. The archive is a plain (uncompressed)
-//! USTAR `.tar` produced by a hand-rolled writer ([`tar`]) using only `std`.
+//! USTAR `.tar` produced by a hand-rolled writer (`tar`) using only `std`.
 //! `zstd`/`tar`/`flate2` are NOT in the dependency tree and were NOT added;
 //! a `.tar` is universally extractable (`tar xf`, Python `tarfile`) without any
 //! third-party tooling. See spec 16 §16.8.
@@ -208,6 +208,20 @@ NOT yet applied — exporting the WHOLE chain (partial-range export is Phase B)"
         .filter_map(|l| serde_json::from_str::<SignedRecord>(l).ok())
         .collect();
 
+    // GH #910: a forward-compat record whose EventKind this build does not know
+    // does NOT parse as `SignedRecord`, but its Ed25519 signature is still real
+    // and verifiable. Its signing key MUST be bundled too, or the exported
+    // bundle cannot self-verify that record on a newer reader. Collect the
+    // key_ids of any such opaque records so the key-resolution loop below picks
+    // them up alongside the typed records' keys.
+    let opaque_key_ids: Vec<String> = String::from_utf8_lossy(&chain_jsonl)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| serde_json::from_str::<SignedRecord>(l).is_err())
+        .filter_map(|l| serde_json::from_str::<crate::audit::opaque::OpaqueRecord>(l).ok())
+        .map(|o| o.key_id.as_str().to_string())
+        .collect();
+
     // ── Resolve the genesis-anchored signing key (signs BUNDLE.lock) ────────
     // The genesis-anchored key is the chain's CURRENT active signing key in the
     // head slot (account = chain_id). It is the key whose public half is the
@@ -249,8 +263,13 @@ NOT yet applied — exporting the WHOLE chain (partial-range export is Phase B)"
     // pubkey: try the head slot + historical slots. A key we cannot resolve is
     // a hard error — the bundle must be self-contained.
     let placeholder = format!("ed25519:{}", "0".repeat(64));
-    for rec in &records {
-        let kid = rec.key_id.as_str();
+    // Typed records' keys + GH #910 opaque (unknown-kind) records' keys — both
+    // must be self-contained in the bundle for offline verification.
+    let referenced_key_ids = records
+        .iter()
+        .map(|rec| rec.key_id.as_str())
+        .chain(opaque_key_ids.iter().map(String::as_str));
+    for kid in referenced_key_ids {
         if kid == placeholder || keys.contains_key(kid) {
             continue;
         }
@@ -919,6 +938,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         let canonical = canonical_bytes_for(&record);
         record.canonical_hash = Sha256Hex::try_new(sha256_hex(&canonical)).unwrap();
@@ -968,6 +988,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         record.canonical_hash = Sha256Hex::genesis();
         let rust_canonical = canonical_bytes_for(&record);
@@ -1037,6 +1058,7 @@ print(hashlib.sha256(b).hexdigest())
             eatp_start_ts: with_eatp.then(|| "2100-01-01T00:00:00+00:00".to_string()),
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         serde_json::to_string(&rec).unwrap()
     }
@@ -1116,6 +1138,8 @@ print(hashlib.sha256(b).hexdigest())
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("shape");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1152,6 +1176,8 @@ print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("lock");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1179,6 +1205,8 @@ print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("sig");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1216,6 +1244,8 @@ print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, chain_id, svc) = make_signed_chain("preflight");
         let base = tmp.path();
         // Tamper the on-disk record's signature.
@@ -1243,6 +1273,8 @@ print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         crate::audit::key_custody::test_helpers::init_mock_keyring();
         let tmp = TempDir::new().unwrap();
         let result = export_bundle(tmp.path(), "csq-audit-export-empty", None, None, None);
@@ -1262,6 +1294,8 @@ print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("vectors");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1355,6 +1389,8 @@ print("OK")
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("verify_clean");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1395,6 +1431,8 @@ print("OK")
     #[cfg(unix)]
     fn verify_script_validates_provenance_lane() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![
             provenance_fixture("dec-backed", "codex", 1, "alice@example.test", true, None),
             provenance_fixture("dec-unbacked", "cc", 2, "bob@example.test", false, None),
@@ -1430,6 +1468,8 @@ print("OK")
     #[cfg(unix)]
     fn verify_script_fails_on_dropped_provenance_lane_record() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![
             provenance_fixture("dec-1", "codex", 1, "alice@example.test", true, None),
             provenance_fixture("dec-2", "cc", 2, "bob@example.test", false, None),
@@ -1477,6 +1517,8 @@ print("OK")
     #[cfg(unix)]
     fn verify_script_fails_on_tampered_ordering_basis() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![provenance_fixture_ordered(
             "dec-ordered",
             1,
@@ -1521,6 +1563,8 @@ print("OK")
     #[cfg(unix)]
     fn verify_script_fails_on_verbatim_words_in_lane() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![provenance_fixture(
             "dec-1",
             "codex",
@@ -1569,6 +1613,8 @@ print("OK")
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("verify_tamper_rec");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1638,6 +1684,8 @@ print("OK")
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("verify_tamper_lock");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1678,6 +1726,8 @@ before chain checks, got: {stdout}"
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("verify_rekor_absent");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1708,6 +1758,8 @@ before chain checks, got: {stdout}"
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("nongenesis_derive");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1841,6 +1893,8 @@ srv.serve_forever()
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("rekor_match");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -1894,6 +1948,8 @@ canonical_hash; stdout: {stdout}"
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("rekor_mismatch");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2026,6 +2082,7 @@ the canonical_hash; stdout: {stdout}"
                 eatp_start_ts: None,
                 eatp_end_ts: None,
                 op_phase: None,
+                verification_level: None,
             };
 
             // Compute canonical_hash: sha256(canonical_bytes_for(record with genesis sentinel)).
@@ -2075,6 +2132,8 @@ the canonical_hash; stdout: {stdout}"
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(7, "multi_clean");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2114,6 +2173,8 @@ the canonical_hash; stdout: {stdout}"
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(7, "multi_tamper_payload");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2189,6 +2250,8 @@ the canonical_hash; stdout: {stdout}"
         // M12: transitively reads CSQ_AUDIT_EDITION (via verify_chain/export_bundle/resolve_*);
         // hold the shared env lock so it doesn't race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(7, "multi_tamper_sig5");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2331,6 +2394,7 @@ the canonical_hash; stdout: {stdout}"
                 eatp_start_ts: None,
                 eatp_end_ts: None,
                 op_phase: None,
+                verification_level: None,
             };
             let canonical = canonical_bytes_for(&record);
             record.canonical_hash = Sha256Hex::try_new(sha256_hex(&canonical)).unwrap();
@@ -2411,6 +2475,7 @@ the canonical_hash; stdout: {stdout}"
                 eatp_start_ts: None,
                 eatp_end_ts: None,
                 op_phase: None,
+                verification_level: None,
             };
             let canonical = canonical_bytes_for(&record);
             record.canonical_hash = Sha256Hex::try_new(sha256_hex(&canonical)).unwrap();
@@ -2533,6 +2598,8 @@ the canonical_hash; stdout: {stdout}"
     #[test]
     fn provenance_lane_projects_ordering_annotations() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![provenance_fixture_ordered(
             "dec-ordered",
             1,
@@ -2561,6 +2628,8 @@ the canonical_hash; stdout: {stdout}"
     #[test]
     fn provenance_lane_present_with_backing_per_record() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![
             (
                 EventPayload::CsqRun(CsqRunPayload {
@@ -2621,6 +2690,8 @@ the canonical_hash; stdout: {stdout}"
     #[test]
     fn provenance_lane_omits_verbatim_human_words() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         // The pre-image of the words_hash — the phrase that MUST NOT leak.
         const VERBATIM: &str = "the confidential Q3 layoff decision rationale";
         let words_hash = sha256_hex(VERBATIM.as_bytes());
@@ -2674,6 +2745,8 @@ the canonical_hash; stdout: {stdout}"
     #[test]
     fn provenance_lane_covered_by_bundle_lock() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![provenance_fixture(
             "dec-1",
             "codex",
@@ -2711,6 +2784,8 @@ the canonical_hash; stdout: {stdout}"
     #[test]
     fn provenance_lane_empty_when_no_provenance_records() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("prov_empty");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2734,6 +2809,8 @@ the canonical_hash; stdout: {stdout}"
     #[test]
     fn cutoff_json_snapshots_chain_head() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, chain_id, svc) = make_signed_chain("cutoff_head");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2774,6 +2851,8 @@ the canonical_hash; stdout: {stdout}"
     #[test]
     fn cutoff_signature_verifies_via_genesis_key() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_signed_chain("cutoff_sig");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2819,6 +2898,8 @@ the canonical_hash; stdout: {stdout}"
     fn cutoff_latest_anchor_ref_from_replication_ack() {
         use crate::audit::types::{ReplicationAckPayload, SinkId, SinkName};
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let payloads = vec![
             EventPayload::CsqRun(CsqRunPayload {
                 run_id: "r0".to_string(),
@@ -2862,6 +2943,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_tampered_cutoff() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(3, "cutoff_tamper");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -2904,6 +2987,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_tail_truncation_via_cutoff() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(3, "cutoff_trunc");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3004,6 +3089,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_passes_clean_anchored_bundle() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_chain_with_payloads("anchored_pass", ack_payloads());
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3031,6 +3118,8 @@ the canonical_hash; stdout: {stdout}"
     fn verify_script_passes_clean_bundle_with_ack_head() {
         use crate::audit::types::{ReplicationAckPayload, SinkId, SinkName};
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let payloads = vec![
             EventPayload::CsqRun(CsqRunPayload {
                 run_id: "r0".to_string(),
@@ -3068,6 +3157,8 @@ the canonical_hash; stdout: {stdout}"
     fn verify_script_fails_on_nongenesis_cutoff_key_id() {
         use crate::audit::traits::SigningKey as _;
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(2, "nongenesis_key");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3115,6 +3206,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_anchor_ref_sink_mismatch() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) =
             make_chain_with_payloads("anchor_sink_mismatch", ack_payloads());
         let base = tmp.path();
@@ -3155,6 +3248,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_anchor_ref_pointing_at_nonack_record() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_chain_with_payloads("anchor_nonack", ack_payloads());
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3197,6 +3292,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_anchor_ref_ack_seq_absent() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_chain_with_payloads("anchor_absent", ack_payloads());
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3236,6 +3333,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_cutoff_missing_field() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(2, "cutoff_missing_field");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3274,6 +3373,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_cutoff_head_hash_mismatch_same_seq() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(3, "cutoff_hash_mismatch");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3311,6 +3412,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_cutoff_signature_corruption() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(2, "cutoff_sig_corrupt");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3355,6 +3458,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_fails_on_cutoff_version_mismatch() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let (tmp, _chain_id, svc) = make_multi_record_chain(2, "cutoff_version");
         let base = tmp.path();
         let out = base.join("bundle.tar");
@@ -3443,6 +3548,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_passes_with_operator_ref_no_display_id() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![provenance_fixture_with_operator_ref(
             "dec-no-display-id",
             false,
@@ -3487,6 +3594,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn verify_script_passes_with_operator_ref_with_display_id() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![provenance_fixture_with_operator_ref(
             "dec-with-display-id",
             true,
@@ -3525,6 +3634,8 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn provenance_lane_projects_session_field() {
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let records = vec![provenance_fixture_with_operator_ref("dec-session", false)];
         let (tmp, _chain_id, svc) = make_chain_with_attested_records("prov_session", records);
         let base = tmp.path();

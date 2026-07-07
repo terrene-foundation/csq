@@ -1,6 +1,6 @@
 //! Capability-layer logging redaction extensions.
 //!
-//! Spec: workspaces/csq-as-cli/02-plans/05-pr-ca11-implementation-plan.md § Group 1
+//! Spec: internal-design-docs § Group 1
 //! NFR: NFR-OBS-02 (zero raw tokens in logs)
 //! Mitigations: T2 (MCP payload exposure), B8 (Vertex SA structural fields)
 //!

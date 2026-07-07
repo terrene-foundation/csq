@@ -229,12 +229,16 @@ impl AuditHealth {
 // Sentinel helpers — `.chain-broken`
 // ---------------------------------------------------------------------------
 
-/// Returns the path of the `.chain-broken` sentinel file.
+/// Returns the path of the `.chain-broken` sentinel file for `runs_subdir`.
 ///
-/// The sentinel lives alongside the `.chain-lock` advisory lock, inside
-/// `csq-runs/`, so it is co-located with the chain it guards.
-fn sentinel_path(base_dir: &Path) -> std::path::PathBuf {
-    base_dir.join("csq-runs").join(".chain-broken")
+/// The sentinel lives alongside the `.chain-lock` advisory lock, inside the
+/// chain's runs-directory (`csq-runs/` for the op-chain, `eatp-runs/` for the
+/// born-canonical EATP attestation chain), so it is co-located with — and
+/// scoped to — the chain it guards. The two chains have independent sentinels:
+/// a broken op-chain does NOT block EATP attestation writes, and vice versa
+/// (separate fault domains, W1 chain-id parameterization).
+fn sentinel_path(base_dir: &Path, runs_subdir: &str) -> std::path::PathBuf {
+    base_dir.join(runs_subdir).join(".chain-broken")
 }
 
 /// Sets the `.chain-broken` sentinel to `error_kind`.
@@ -253,11 +257,21 @@ fn sentinel_path(base_dir: &Path) -> std::path::PathBuf {
 /// - `csq/src/cli/commands/audit.rs` — `handle_verify`
 /// - `csq/src/cli/commands/doctor.rs` — `check_audit_chain`
 /// - `csq/src/desktop/daemon_supervisor.rs` — desktop `run_daemon` verify block
+///
+/// Targets the op-chain (`csq-runs/`). For the EATP attestation chain use
+/// [`set_chain_broken_in`] with the chain's runs-subdir.
 pub fn set_chain_broken(base_dir: &Path, error_kind: &str) {
-    // Ensure csq-runs/ exists (best-effort; if the dir can't be created, the
+    set_chain_broken_in(base_dir, "csq-runs", error_kind);
+}
+
+/// Sets the `.chain-broken` sentinel for the chain whose records live under
+/// `<base_dir>/<runs_subdir>/`. See [`set_chain_broken`] for the op-chain
+/// (`runs_subdir == "csq-runs"`) convenience wrapper and the §5a write contract.
+pub fn set_chain_broken_in(base_dir: &Path, runs_subdir: &str, error_kind: &str) {
+    // Ensure the runs-dir exists (best-effort; if the dir can't be created, the
     // sentinel write will also fail and we fall through silently — the caller
     // has already logged the error).
-    let csq_runs = base_dir.join("csq-runs");
+    let csq_runs = base_dir.join(runs_subdir);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -271,7 +285,7 @@ pub fn set_chain_broken(base_dir: &Path, error_kind: &str) {
         let _ = std::fs::create_dir_all(&csq_runs);
     }
 
-    let path = sentinel_path(base_dir);
+    let path = sentinel_path(base_dir, runs_subdir);
     let tmp = unique_tmp_path(&path);
     // §5a: write → secure → replace, clean up tmp on every failure branch.
     if let Err(e) = std::fs::write(&tmp, error_kind.as_bytes()) {
@@ -310,8 +324,17 @@ pub fn set_chain_broken(base_dir: &Path, error_kind: &str) {
 ///
 /// Also called by the desktop daemon path immediately after any repair that
 /// brings the chain to a known-good state.
+///
+/// Targets the op-chain (`csq-runs/`). For the EATP attestation chain use
+/// [`clear_chain_broken_in`].
 pub fn clear_chain_broken(base_dir: &Path) {
-    let path = sentinel_path(base_dir);
+    clear_chain_broken_in(base_dir, "csq-runs");
+}
+
+/// Clears the `.chain-broken` sentinel for the chain under
+/// `<base_dir>/<runs_subdir>/` (best-effort; ignore ENOENT).
+pub fn clear_chain_broken_in(base_dir: &Path, runs_subdir: &str) {
+    let path = sentinel_path(base_dir, runs_subdir);
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -329,8 +352,18 @@ pub fn clear_chain_broken(base_dir: &Path) {
 ///
 /// Used inside `write_record_v2_impl` to fail-close ALL chain writers when
 /// the sentinel is present.
+///
+/// Targets the op-chain (`csq-runs/`). For the EATP attestation chain use
+/// [`is_chain_broken_in`].
 pub fn is_chain_broken(base_dir: &Path) -> Option<String> {
-    let path = sentinel_path(base_dir);
+    is_chain_broken_in(base_dir, "csq-runs")
+}
+
+/// Returns `Some(error_kind)` if the `.chain-broken` sentinel for the chain
+/// under `<base_dir>/<runs_subdir>/` is present, `None` if absent. Unreadable
+/// → fail-closed `Some("audit_sentinel_unreadable")`.
+pub fn is_chain_broken_in(base_dir: &Path, runs_subdir: &str) -> Option<String> {
+    let path = sentinel_path(base_dir, runs_subdir);
     match std::fs::read_to_string(&path) {
         Ok(s) => Some(s.trim().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -339,6 +372,37 @@ pub fn is_chain_broken(base_dir: &Path) -> Option<String> {
             // (fail-closed: if we cannot confirm the chain is sound, refuse to
             // extend it).
             Some("audit_sentinel_unreadable".to_string())
+        }
+    }
+}
+
+/// Classify a `verify_chain` result and reconcile the `.chain-broken` sentinel
+/// for the chain under `<base_dir>/<runs_subdir>/`.
+///
+/// The reconciliation policy matches every existing verify→sentinel callsite:
+/// - `Verified` / `Degraded` (chain-linking intact) → CLEAR the sentinel.
+/// - `Broken` (fatal `LedgerError`) → SET the sentinel to the fixed-vocab tag.
+/// - `Unknown` (transient `KeychainUnavailable`) → leave the sentinel UNCHANGED
+///   (a transient verify failure must not produce a durable write-lockout).
+///
+/// This is the EATP-attestation-chain analogue of the inline op-chain match in
+/// `daemon.rs` / `audit.rs` / `doctor.rs` / `daemon_supervisor.rs`. Callers pass
+/// the per-chain runs-subdir (`ChainKind::Eatp.runs_subdir()`); the EATP chain's
+/// sentinel is an independent fault domain from the op-chain's (W1).
+pub fn reconcile_chain_sentinel(
+    base_dir: &Path,
+    runs_subdir: &str,
+    result: &Result<crate::audit::VerifySummary, crate::audit::LedgerError>,
+) {
+    match AuditHealth::from_verify_result(result) {
+        AuditHealth::Verified | AuditHealth::Degraded { .. } => {
+            clear_chain_broken_in(base_dir, runs_subdir);
+        }
+        AuditHealth::Broken { error_kind, .. } => {
+            set_chain_broken_in(base_dir, runs_subdir, &error_kind);
+        }
+        AuditHealth::Unknown { .. } => {
+            // Transient (KeychainUnavailable): leave the sentinel unchanged.
         }
     }
 }
@@ -394,6 +458,59 @@ mod tests {
             reason: "audit_verify_timeout".to_string(),
         };
         assert!(!h.is_operational());
+    }
+
+    /// M3 §10.5 (W2a): `reconcile_chain_sentinel` sets the per-chain
+    /// `.chain-broken` sentinel on `Broken`, clears it on `Verified`, and leaves
+    /// it unchanged on `Unknown` (transient) — and the op-chain and EATP-chain
+    /// sentinels are INDEPENDENT fault domains (reconciling one never touches the
+    /// other).
+    #[test]
+    fn reconcile_chain_sentinel_sets_clears_unknown_per_subdir_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let verified: Result<crate::audit::VerifySummary, LedgerError> =
+            Ok(crate::audit::VerifySummary::default());
+        let broken: Result<crate::audit::VerifySummary, LedgerError> =
+            Err(LedgerError::KeyNotFound {
+                key_id: key_id(&"a".repeat(64)),
+            });
+        let unknown: Result<crate::audit::VerifySummary, LedgerError> =
+            Err(LedgerError::KeychainUnavailable {
+                key_id: key_id(&"b".repeat(64)),
+            });
+
+        // Broken on eatp-runs → sentinel set there ONLY (op-chain untouched).
+        reconcile_chain_sentinel(base, "eatp-runs", &broken);
+        assert_eq!(
+            is_chain_broken_in(base, "eatp-runs").as_deref(),
+            Some("audit_current_key_not_found")
+        );
+        assert!(
+            is_chain_broken_in(base, "csq-runs").is_none(),
+            "op-chain sentinel untouched by EATP reconcile"
+        );
+
+        // Unknown (transient) leaves the eatp sentinel UNCHANGED (still set).
+        reconcile_chain_sentinel(base, "eatp-runs", &unknown);
+        assert_eq!(
+            is_chain_broken_in(base, "eatp-runs").as_deref(),
+            Some("audit_current_key_not_found"),
+            "Unknown must not clear a previously-set sentinel"
+        );
+
+        // Verified clears the eatp sentinel.
+        reconcile_chain_sentinel(base, "eatp-runs", &verified);
+        assert!(is_chain_broken_in(base, "eatp-runs").is_none());
+
+        // Symmetric: Broken on the op-chain sets ONLY the op-chain sentinel.
+        reconcile_chain_sentinel(base, "csq-runs", &broken);
+        assert!(is_chain_broken_in(base, "csq-runs").is_some());
+        assert!(
+            is_chain_broken_in(base, "eatp-runs").is_none(),
+            "EATP sentinel untouched by op-chain reconcile"
+        );
     }
 
     /// `should_anchor` (anchor-skip predicate): Broken → false.

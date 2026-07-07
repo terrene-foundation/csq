@@ -1,0 +1,68 @@
+# cargo-about configuration for csq — third-party license ATTRIBUTION.
+#
+# Run:  scripts/generate-third-party-licenses.sh
+# Install: cargo install cargo-about --version "=0.7.1" --locked
+#
+# Produces THIRD-PARTY-LICENSES.md: the full license TEXT of every third-party
+# dependency bundled in the default (cli + desktop) csq build, satisfying the
+# attribution obligation of the permissive licenses (MIT / BSD / ISC / Apache-2.0
+# and others) under which those dependencies ship.
+#
+# This is distinct from the two other license surfaces:
+#   - cargo deny check  → license POLICY      (blocks copyleft at the dep tree)
+#   - generate-sbom.sh  → license ENUMERATION  (CycloneDX SBOM; ids/expressions)
+#   - this file          → license ATTRIBUTION (full text bundle; the gap above)
+
+# Generate for every platform csq ships on, so attribution is complete
+# regardless of the consumer's build target (over-inclusive is safe).
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+
+# Dev-dependencies never ship in the released binary; build-dependencies'
+# source does not ship either. Exclude both from the SHIPPED-binary attribution
+# surface (matches what a consumer actually redistributes).
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Resolve license text from LOCAL crate sources + the built-in SPDX corpus only;
+# never query clearlydefined.io. This makes generation DETERMINISTIC (the network
+# enrichment is the sole source of run-to-run drift) without forcing full offline
+# mode — so the freshness gate (scripts/check-third-party-licenses-fresh.sh) is
+# reproducible on CI with normal registry access (the generator runs `--locked`,
+# not offline; determinism comes from disabling this network enrichment, NOT from
+# offline mode). The dep graph + license CONTENT are host-independent (pinned
+# `targets` fix the crate set regardless of build platform); cargo-about's
+# license-TEXT whitespace rendering, however, has benign per-platform variance
+# (e.g. a trailing blank line), so the freshness gate compares whitespace-
+# normalized rather than byte-exact (see scripts/check-third-party-licenses-fresh.sh).
+no-clearly-defined = true
+
+# Accepted licenses — the OSS permissive set. Any license NOT listed here fails
+# the run (cargo-about `--fail`), which is the structural copyleft guard:
+# GPL / AGPL / LGPL / EUPL / SSPL are all absent → denied by default.
+accepted = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "OpenSSL",
+  "MPL-2.0",
+  "Zlib",
+  "CDLA-Permissive-2.0",
+]
+
+# First-party workspace crates (publish = false) are not third parties — skip
+# them. Any non-published crate is excluded from the attribution surface by
+# this guard. MUST be the LAST table in this file: TOML tables absorb every
+# following key until the next header, so top-level keys precede this section.
+[private]
+ignore = true

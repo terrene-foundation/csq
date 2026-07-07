@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 /// RAII guard around a PID file owned by the current process.
 ///
-/// Created via [`acquire`]. On drop, removes the PID file — but only
+/// Created via `acquire`. On drop, removes the PID file — but only
 /// if the file on disk still contains *our* PID (prevents removing a
 /// successor daemon's PID file if we're killed after a race).
 #[derive(Debug)]

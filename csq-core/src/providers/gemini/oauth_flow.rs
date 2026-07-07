@@ -641,7 +641,7 @@ fn exchange_code(
     // could surface a refresh-token fragment via the error chain.
     // `redact_tokens` covers the `1//` prefix as defense-in-depth, but
     // structural defense lives here: drop the serde error message entirely.
-    // Origin: redteam round 1 H1 (journal 0058).
+    // Origin: redteam round 1 H1 (an internal journal entry).
     let parsed: TokenResponse = serde_json::from_slice(&bytes).map_err(|_| {
         anyhow::anyhow!(
             "token endpoint returned malformed JSON (len={})",

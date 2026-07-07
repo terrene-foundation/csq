@@ -1,0 +1,27 @@
+[package]
+name = "csq-sdk"
+version.workspace = true
+edition.workspace = true
+# csq-sdk is the PUBLIC (Apache-2.0) edition-uniform wire contract: the SDK
+# envelope, error, completion, adapters, schema constants + payload DTOs that a
+# consumer parses. Zero dep on csq-core/daemon/credentials/moat — depends only on
+# csq-redact (the redaction leaf) + serde. It is the future crates.io crate that
+# external integrators declare. See internal-design-docs (W2).
+license.workspace = true
+description = "csq SDK wire contract — the csq.exec/verify/capabilities.v1 envelope, error, completion, and payload DTOs. Edition-uniform; zero csq-core deps."
+repository.workspace = true
+# Publishable (W3): csq-sdk is the crates.io public wire contract, consumed as a
+# normal crates.io dependency by external integrators. The workspace root
+# `[patch.crates-io]` redirects it to the local path for dev. As a genuine
+# published Apache-2.0 crate it now appears in THIRD-PARTY-LICENSES.md:
+# cargo-about's first-party exclusion (`[private] ignore`) keys on
+# `publish = false`, so a publishable crate is attributed — the correct
+# redistribution attribution for a standalone crates.io crate (over-inclusive
+# attribution is safe — see about.toml). Its dep on csq-redact carries a version
+# (workspace.dependencies) so `cargo publish` resolves it.
+
+[dependencies]
+# csq-redact — the redaction leaf (W1). SdkError's message is a RedactedString.
+csq-redact.workspace = true
+serde.workspace = true
+serde_json.workspace = true

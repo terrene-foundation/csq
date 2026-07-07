@@ -5,8 +5,8 @@
 //! - Slot-suppression: surface row appears only when authenticated slots exist.
 //! - Stale-slot variant: `Missing | WrongBinary` with slots configured.
 //! - Empty-state row: no slots on any surface.
-//! - `schema_version: 8` in JSON output (bumped 7 → 8 when the
-//!   `identity_store.consistency` field became a list of issues).
+//! - `schema_version` in JSON output — edition-specific (community 19 /
+//!   enterprise 22); asserted against the build-active value, not a literal.
 //! - Absent-key test: `codex_cli` omitted when no codex slots (R1-L2).
 //! - Probe-disabled disclosure via env var.
 //! - Half-migrated handle dir does not trigger surface row.
@@ -71,6 +71,9 @@ fn sandbox_home() -> std::path::PathBuf {
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
+    // Hermetic: the spawned `csq` binary must NOT shell `security` against the
+    // operator's real login keychain (rules/test-hermeticity.md).
+    cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     // Sandbox HOME and CLAUDE_HOME — never re-inject the parent's live values.
     cmd.env("HOME", sandbox_home());
     cmd.env("CLAUDE_HOME", sandbox_home());
@@ -222,12 +225,20 @@ fn test_1_all_surfaces_with_stubs_render_three_rows() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version is edition-specific (M2 T2.5): community 16, enterprise 17
-    // (enterprise adds the optional `audit_trust_plane_grade` field).
-    let expected_schema = if cfg!(feature = "enterprise") { 17 } else { 16 };
+    // schema_version: edition-specific — community 19, enterprise 22. The shared
+    // monotonic counter is the highest field-version an edition emits; v19's
+    // `mcp_partial_coverage` ships cross-edition (community rose 16→19), but the
+    // enterprise-only `mcp_gate_outbox_backlog` (v20 #914 + v21 M6 #909 shard-D
+    // daemon-aware `state`) and `audit_bundle_floor_anchor` (v22 #787 b2b) raise
+    // only the enterprise ceiling 19→22. The spawned binary carries this crate's
+    // feature set. Keep in lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
+    #[cfg(feature = "enterprise")]
+    let expected_schema = 22;
+    #[cfg(not(feature = "enterprise"))]
+    let expected_schema = 19;
     assert_eq!(
         json["schema_version"], expected_schema,
-        "schema_version must equal the edition-active value (community 16 / enterprise 17)"
+        "schema_version must equal the edition-active value (community 19 / enterprise 22)"
     );
     assert_eq!(json["claude_code"]["status"], "ok");
     assert_eq!(json["codex_cli"]["status"], "ok");
@@ -498,7 +509,7 @@ fn test_9_probe_disabled_row() {
 }
 
 /// (10) JSON output: top-level has the current `"schema_version"`.
-/// Journal 0042 bumped 4 → 5 when the `phase4_incomplete` top-level
+/// an internal journal entry bumped 4 → 5 when the `phase4_incomplete` top-level
 /// field landed.
 #[test]
 #[cfg(unix)]
@@ -515,12 +526,20 @@ fn test_10_json_schema_version_2() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version is edition-specific (M2 T2.5): community 16, enterprise 17.
-    let expected_schema: u64 = if cfg!(feature = "enterprise") { 17 } else { 16 };
+    // schema_version: edition-specific — community 19, enterprise 22. The
+    // enterprise-only `mcp_gate_outbox_backlog` (v20 #914 + v21 M6 #909 shard-D
+    // daemon-aware `state`) and `audit_bundle_floor_anchor` (v22 #787 b2b) raise
+    // only the enterprise ceiling 19→22; v19 (`mcp_partial_coverage`) was the last
+    // cross-edition bump. The spawned binary carries this crate's feature set. Keep
+    // in lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
+    #[cfg(feature = "enterprise")]
+    let expected_schema: u64 = 22;
+    #[cfg(not(feature = "enterprise"))]
+    let expected_schema: u64 = 19;
     assert_eq!(
         json["schema_version"],
         Value::Number(serde_json::Number::from(expected_schema)),
-        "schema_version must equal the edition-active value (community 16 / enterprise 17)"
+        "schema_version must equal the edition-active value (community 19 / enterprise 22)"
     );
 }
 

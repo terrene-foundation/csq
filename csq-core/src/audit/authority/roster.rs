@@ -520,7 +520,7 @@ pub fn save_detached_roster(
         }
     }
 
-    // --- Write sidecar FIRST, roster file SECOND (PR #703 review LOW-1) ---
+    // --- Write sidecar FIRST, roster file SECOND (an internal ticket review LOW-1) ---
     // A crash between the two renames must fail closed AND, where possible,
     // preserve availability. Sidecar-first means the crash window leaves the
     // OLD roster + NEW sidecar: if the old roster is embedded-form the sidecar
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Detached-signature tests (§12.16.6 — Issue #694 item 3)
+    // Detached-signature tests (§12.16.6 — an internal ticket item 3)
     // -----------------------------------------------------------------------
 
     /// Helper: sign `raw_bytes` with `sk`, return lowercase hex of the sig.

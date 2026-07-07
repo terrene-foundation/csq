@@ -30,7 +30,7 @@ use super::resolution::{resolve_developer, DevResolution};
 ///
 /// `actor` populates [`crate::audit::types::SignedRecord::actor`]; `trust`
 /// populates [`crate::audit::types::SignedRecord::trust`]. The corrected
-/// Phase-B contract (workspace journal 0022) assigns BOTH slots to M17 — the
+/// Phase-B contract (workspace an internal journal entry) assigns BOTH slots to M17 — the
 /// `actor` blob carries the per-dev identity + backing, and the `trust` blob
 /// carries the PACT-T verification level so an auditor reads the gradient tier
 /// directly off the `trust` slot without parsing the actor blob.
@@ -168,7 +168,7 @@ mod tests {
             "verified actor must contain nonce"
         );
 
-        // trust slot carries the PACT-T level (journal 0022 corrected contract).
+        // trust slot carries the PACT-T level (an internal journal entry corrected contract).
         let trust = att.trust.0.as_object().expect("trust must be JSON object");
         assert_eq!(
             trust.get("level").and_then(|v| v.as_str()),
@@ -333,6 +333,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
 
         // The slots carry the attestation backing/level.

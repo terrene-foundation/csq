@@ -1,6 +1,6 @@
 //! One-shot migration: strip the legacy `apiKeyHelper` field from
 //! 3P settings files written before the alpha.7 → alpha.8 fix
-//! (issue #184).
+//! (an internal ticket).
 //!
 //! # The bug being repaired
 //!
@@ -252,7 +252,7 @@ mod tests {
         }"#
     }
 
-    // ── Acceptance criteria from issue #184 ───────────────────────
+    // ── Acceptance criteria from an internal ticket ───────────────────────
 
     /// Acceptance #1: settings file with legacy apiKeyHelper +
     /// env.ANTHROPIC_AUTH_TOKEN → migrator strips helper, preserves

@@ -24,6 +24,23 @@ fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Builds a blocking HTTP client with idle connection pooling DISABLED.
+///
+/// `reqwest::blocking::Client::new()` keeps a keep-alive connection pool. When a
+/// request makes the server close the connection — e.g. the oversized POST that
+/// the 64 KiB `DefaultBodyLimit` rejects with 413 — the now-dead socket stays in
+/// the pool, and the NEXT request on the same client reuses it, surfacing a
+/// `hyper::Error(BodyWrite, BrokenPipe)` on the write instead of a clean response
+/// (flaky: ubuntu CI, `csq_ledger_oversized_body_is_rejected`'s follow-up GET to
+/// `/v1/checkpoint`). Forcing a fresh connection per request removes the
+/// reuse-after-close race; connection-pool perf is irrelevant in these tests.
+fn test_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("build test client")
+}
+
 /// A spawned ledger server child + its base URL.
 struct LedgerServer {
     child: Child,
@@ -61,7 +78,7 @@ impl LedgerServer {
 
     /// Polls `/v1/health` until it answers 200 (or times out).
     fn wait_for_health(&self) {
-        let client = reqwest::blocking::Client::new();
+        let client = test_client();
         for _ in 0..100 {
             if let Ok(resp) = client.get(format!("{}/v1/health", self.base_url)).send() {
                 if resp.status().is_success() {
@@ -182,7 +199,7 @@ fn ulid_for(i: usize) -> String {
 #[test]
 fn csq_ledger_server_submit_100_records_and_verify_proofs() {
     let server = LedgerServer::spawn(&[]);
-    let client = reqwest::blocking::Client::new();
+    let client = test_client();
 
     let mut last_checkpoint_size = 0u64;
     for i in 0..100usize {
@@ -222,7 +239,7 @@ fn csq_ledger_server_submit_100_records_and_verify_proofs() {
 #[test]
 fn csq_ledger_record_durable_before_200() {
     let data_dir = TempDir::new().unwrap();
-    let client = reqwest::blocking::Client::new();
+    let client = test_client();
 
     // Phase 1: spawn, submit 25 records (each 200'd ⇒ fsync'd), then SIGKILL.
     // We spawn directly (not via the LedgerServer helper) so the data dir is
@@ -322,7 +339,7 @@ fn csq_ledger_record_durable_before_200() {
 #[test]
 fn csq_ledger_anchor_to_sink_populates_checkpoint_anchored_to_field() {
     let server = LedgerServer::spawn(&["--anchor-to-sink", "rekor", "--anchor-cadence", "1"]);
-    let client = reqwest::blocking::Client::new();
+    let client = test_client();
 
     // Submit one record so the tree is non-empty.
     post_json(
@@ -375,7 +392,7 @@ fn csq_ledger_first_boot_auto_generates_key_and_warns() {
         .spawn()
         .expect("spawn");
     let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::blocking::Client::new();
+    let client = test_client();
     for _ in 0..100 {
         if client
             .get(format!("{base}/v1/health"))
@@ -460,7 +477,7 @@ fn csq_ledger_first_boot_auto_generates_key_and_warns() {
 #[test]
 fn csq_ledger_oversized_body_is_rejected() {
     let server = LedgerServer::spawn(&[]);
-    let client = reqwest::blocking::Client::new();
+    let client = test_client();
 
     // A 256 KiB body — 4x the 64 KiB cap.
     let oversized = vec![b'x'; 256 * 1024];
@@ -506,7 +523,7 @@ fn csq_ledger_oversized_body_is_rejected() {
 #[test]
 fn csq_ledger_unknown_record_returns_404() {
     let server = LedgerServer::spawn(&[]);
-    let client = reqwest::blocking::Client::new();
+    let client = test_client();
     let (status, _) = get_json(
         &client,
         &server.url("/v1/log/entries/01JZ00000000000000000000ZZ"),

@@ -4,7 +4,7 @@
 //! `.current-account` — fast-path cache, written by snapshot_account().
 //! `.live-pid` — PID of the CC process, used for snapshot caching.
 //!
-//! # Schema-compat reader (M1-5, issue #292 Phase 1)
+//! # Schema-compat reader (M1-5, an internal ticket Phase 1)
 //!
 //! [`read_identity_marker`] is the forward-compatible read path that accepts
 //! BOTH the current numeric format (`"3"`) AND the future UUID format
@@ -149,7 +149,7 @@ pub fn read_csq_account_uuid(config_dir: &Path) -> Option<IdentityId> {
 /// Writes the `.csq-account` marker as the canonical UUID string of
 /// the given [`IdentityId`].
 ///
-/// **M4-7 content-semantic flip (issue #292 Phase 4, spec 02 §INV-03 +
+/// **M4-7 content-semantic flip (an internal ticket Phase 4, spec 02 §INV-03 +
 /// §2.3.1):** the marker file content is the slot's identity UUID, not
 /// the decimal slot id. The filename `.csq-account` is retained
 /// (user-decided OQ #3 — flip content only, never rename the marker

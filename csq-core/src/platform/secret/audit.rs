@@ -1,4 +1,4 @@
-//! Append-only audit log for [`Vault`] access.
+//! Append-only audit log for `Vault` access.
 //!
 //! Per security review §6 — secret READ access is auditable. If a
 //! user later notices an unexpected Gemini bill, the audit log tells
@@ -14,10 +14,10 @@
 //! - `ts`: ISO-8601 UTC timestamp
 //! - `op`: `"set"` | `"get"` | `"delete"`
 //! - `slot`: account number (u16)
-//! - `surface`: the [`Surface::as_str()`] tag of the surface owning
+//! - `surface`: the `Surface::as_str()` tag of the surface owning
 //!   the slot — currently `"gemini"` (the only surface using the
 //!   vault). Future surfaces with vault-backed secrets serialize
-//!   their own [`Surface::as_str()`] value here.
+//!   their own `Surface::as_str()` value here.
 //! - `caller`: short symbolic tag (e.g. `"daemon::usage_poller"`)
 //! - `ok`: bool — whether the operation succeeded
 //! - `error_kind`: present only when `ok = false`; the
@@ -49,7 +49,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Audit entry written for every [`Vault`] operation. Fields chosen
+/// Audit entry written for every `Vault` operation. Fields chosen
 /// per security review §6; see module docstring for the MUST NOT
 /// list of fields explicitly excluded.
 #[derive(Debug, Clone, serde::Serialize)]

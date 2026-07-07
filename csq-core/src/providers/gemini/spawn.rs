@@ -12,7 +12,7 @@
 //!    refuse to spawn if the spawn CWD or any ancestor up to `$HOME`
 //!    contains a `.env` file declaring `GOOGLE_API_KEY` /
 //!    `GEMINI_API_KEY` / `GOOGLE_APPLICATION_CREDENTIALS`. Per
-//!    OPEN-G02 finding (journal 0004 RESOLVED), gemini-cli walks CWD
+//!    OPEN-G02 finding (an internal journal entry RESOLVED), gemini-cli walks CWD
 //!    ancestors for `.env` and prefers them over `Command::env()`.
 //!    csq's injected key for slot N would be OVERRIDDEN by an
 //!    ancestor `.env` declaring different credentials — meaning the
@@ -21,7 +21,7 @@
 //!    prevents this cross-account silent-shadow.
 //!
 //!    Earlier revisions framed this as "EP2/EP3/EP6" of a ToS-driven
-//!    defense stack — that framing was wrong (journal 0048). The
+//!    defense stack — that framing was wrong (an internal journal entry). The
 //!    scan stays because cross-account credential leak is a real
 //!    safety concern even without ToS implications.
 //! 2. **Settings drift reassertion** — call
@@ -90,7 +90,7 @@ const SHADOW_AUTH_VARS: &[&str] = &[
 /// Per security review §5 "argv / env / log" row — this is the
 /// cross-account credential-leak guard (formerly framed as
 /// "EP2/EP3/EP6" of the now-retracted ToS-defense stack — see
-/// journal 0048).
+/// an internal journal entry).
 pub fn pre_spawn_dotenv_scan(cwd: &Path, home: Option<&Path>) -> DotenvScanResult {
     let mut current: Option<&Path> = Some(cwd);
     let stop_at = home.map(|h| h.to_path_buf());
@@ -231,10 +231,10 @@ pub struct SpawnPlan {
 pub enum SpawnError {
     /// Pre-spawn `.env` scan flagged shadow auth — refuse the spawn
     /// rather than let an ancestor `.env` override the csq-injected
-    /// `GEMINI_API_KEY`. Per OPEN-G02 (journal 0004 RESOLVED) this
+    /// `GEMINI_API_KEY`. Per OPEN-G02 (an internal journal entry RESOLVED) this
     /// is the silent-shadow cross-account credential-leak vector
     /// the dotenv scan defends against (formerly described as
-    /// EP2/EP3/EP6; see journal 0048 for the framing correction).
+    /// EP2/EP3/EP6; see an internal journal entry for the framing correction).
     ///
     /// The Display string surfaces only the variable name (not the
     /// full `env_file` path) so a future telemetry / crash-reporter /
@@ -521,6 +521,9 @@ pub fn execute_plan(plan: SpawnPlan) -> std::io::Result<std::convert::Infallible
 /// each entry in `plan.envs`. Working directory set to
 /// `plan.handle_dir`. Argv forwarded verbatim from `plan.args`.
 ///
+/// Stdio: **inherited** (default). For the OneShot capture path
+/// (Gemini `--prompt` mode) use [`execute_plan_as_child_piped`].
+///
 /// [`pre_exec`]: std::os::unix::process::CommandExt::pre_exec
 pub fn execute_plan_as_child(plan: SpawnPlan) -> std::io::Result<std::process::Child> {
     use std::process::Command;
@@ -532,6 +535,61 @@ pub fn execute_plan_as_child(plan: SpawnPlan) -> std::io::Result<std::process::C
     }
     cmd.args(&plan.args);
     cmd.current_dir(&plan.handle_dir);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                let lim = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn()
+}
+
+/// Spawns a [`SpawnPlan`] as a child process with **piped** stdio for
+/// the one-shot capture path (CU2, spec 10 §10.4.2). The parent
+/// collects the child's full output via `wait_with_output` and runs
+/// `run_post_spawn_toggled` before echoing to the user.
+///
+/// Stdio shape:
+/// - **stdin:** `Stdio::null()` — `--prompt` mode reads no interactive
+///   input.
+/// - **stdout / stderr:** `Stdio::piped()` — captured by the parent for
+///   post-validation, then echoed verbatim on pass or suppressed on
+///   reject.
+///
+/// Preserves the SAME security posture as [`execute_plan_as_child`]:
+///
+/// - **Unix:** `pre_exec` sets `RLIMIT_CORE=0`.
+/// - **Windows:** no core-dump equivalent; same posture.
+/// - Allowlisted env via `Command::env_clear()`.
+///
+/// [`pre_exec`]: std::os::unix::process::CommandExt::pre_exec
+pub fn execute_plan_as_child_piped(plan: SpawnPlan) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(plan.binary);
+    cmd.env_clear();
+    for (k, v) in &plan.envs {
+        cmd.env(k, v);
+    }
+    cmd.args(&plan.args);
+    cmd.current_dir(&plan.handle_dir);
+
+    // OneShot stdio shape: null stdin, piped stdout+stderr.
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     #[cfg(unix)]
     {
@@ -770,7 +828,7 @@ mod tests {
         assert!(map.contains_key("GEMINI_API_KEY"));
     }
 
-    /// Stage 2 of journal 0048: OAuth-mode slots inject NO auth env
+    /// Stage 2 of an internal journal entry: OAuth-mode slots inject NO auth env
     /// var. gemini-cli auto-discovers `~/.gemini/oauth_creds.json` —
     /// csq stays hands-off.
     #[test]
@@ -922,7 +980,7 @@ mod tests {
         assert!(written.contains("\"name\": \"gemini-2.5-flash\""));
     }
 
-    /// Stage 2 of journal 0048: Code Assist OAuth slots inject
+    /// Stage 2 of an internal journal entry: Code Assist OAuth slots inject
     /// neither GEMINI_API_KEY nor GOOGLE_APPLICATION_CREDENTIALS.
     /// gemini-cli auto-discovers `~/.gemini/oauth_creds.json`.
     #[test]

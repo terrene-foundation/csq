@@ -31,7 +31,7 @@
 //! The additional feature flags required by this module
 //! (`Win32_Storage_FileSystem` and `Win32_System_IO`) are already declared.
 //!
-//! Origin: issue #292 Phase 1 M1-3.
+//! Origin: an internal ticket Phase 1 M1-3.
 
 use crate::error::PlatformError;
 use std::path::Path;
@@ -168,7 +168,7 @@ pub fn symlink_exclusive(target: &Path, link: &Path) -> Result<(), PlatformError
     // which is malformed (double prefix); the kernel resolves it to
     // garbage and Win32 callers traversing the junction get
     // `ERROR_INVALID_NAME` (code 123). Strip the `\\?\` verbatim prefix
-    // before prepending `\??\`. Origin: issue #437.
+    // before prepending `\??\`. Origin: an internal ticket.
     let target_abs = target.canonicalize().map_err(PlatformError::Io)?;
     let target_full = target_abs.to_string_lossy();
     let target_str = target_full.strip_prefix(r"\\?\").unwrap_or(&target_full);
@@ -291,7 +291,7 @@ mod tests {
         // Win32 `GetFinalPathNameByHandle` does not normalise that prefix.
         //
         // The functional check (canary read) is the actual user-facing
-        // behaviour we care about. Issue #437.
+        // behaviour we care about. an internal ticket.
         let link_meta = fs::symlink_metadata(&link).unwrap();
         assert!(
             link_meta.file_type().is_symlink(),

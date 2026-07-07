@@ -1,6 +1,6 @@
 //! Audit trail module — per-`csq run` JSONL record persistence and
 //! sweep (spec 12 v1), plus the M01 trait abstraction layer for the
-//! Phase-A `csq-pact-eatp-adoption` workspace (spec 12 §12.9).
+//! Phase-A `an internal workspace` workspace (spec 12 §12.9).
 //!
 //! # v1 surface (spec 12 §12.3)
 //!
@@ -16,7 +16,7 @@
 //! - [`CanonicalForm`] — deterministic canonical serialization + SHA-256 hash
 //! - [`SigningKey`] — key identity, sign (fallible), pubkey accessors
 //! - [`LedgerEngine`] — local hash-chained append-only log (`&self`)
-//! - [`LedgerSink`] — external anchor surface (async, exactly 3 methods)
+//! - `LedgerSink` — external anchor surface (async, exactly 3 methods)
 //!
 //! Per the M01 structural invariant, no vendor module paths appear
 //! in [`traits`] or [`types`]; the the enterprise edition impls live in a sibling
@@ -28,14 +28,15 @@
 //! [`RecordId`], [`KeyId`], [`Sha256Hex`], [`SinkName`], [`SinkId`],
 //! [`RedactedString`], [`Ed25519Signature`], [`Ed25519PublicKey`],
 //! [`SinkReceipt`], [`SinkError`] / [`LedgerError`] / [`SigningError`]
-//! / [`IdError`] (all `#[non_exhaustive]`), [`EventKind`] (16 variants),
-//! [`EventPayload`] (14 typed variants, includes `chain_id` for
+//! / [`IdError`] (all `#[non_exhaustive]`), [`EventKind`] (24 variants —
+//! the count is enforced by the `_EVENT_KIND_VARIANT_COUNT_CHECK` const-assert
+//! in `types.rs`), [`EventPayload`] (24 typed variants, includes `chain_id` for
 //! cross-record consistency per M05).
 //!
 //! [`CanonicalForm`]: traits::CanonicalForm
 //! [`SigningKey`]: traits::SigningKey
 //! [`LedgerEngine`]: traits::LedgerEngine
-//! [`LedgerSink`]: traits::LedgerSink
+//! `LedgerSink`: traits::LedgerSink
 //! [`SignedRecord`]: types::SignedRecord
 //! [`RecordId`]: types::RecordId
 //! [`KeyId`]: types::KeyId
@@ -68,16 +69,20 @@ pub mod impls;
 pub use impls::noop;
 
 /// M13b — Signed-when-possible emit helpers for lifecycle ops (account-swap,
-/// logout, move-slot). Encodes the OD-2 signing posture from journal 0031.
+/// logout, move-slot). Encodes the OD-2 signing posture from an internal journal entry
 pub mod op_emit;
 
 /// M14 — External anchoring driver (spec 12 §12.18, spec 15 §15.12).
 ///
-/// [`anchor::anchor_head`] commits the chain HEAD to an active [`LedgerSink`]
+/// [`anchor::anchor_head`] commits the chain HEAD to an active `LedgerSink`
 /// and records the outcome via `ReplicationAck` / `ReplicationFailed` events.
 /// The daemon tokio loop lives in [`crate::daemon::anchor_task`]; this module
 /// contains the pure, dependency-injected logic testable without a live daemon.
 pub mod anchor;
+/// FR-GOV #788 — plain-language compliance-report generator. Renders the signed
+/// EATP chain into an auditor-readable Markdown/HTML document (governed
+/// decisions vs lifecycle ops), grounded in the verified canonical records.
+pub mod compliance_report;
 /// M16 — signed export cutoff manifest (`CUTOFF.json`, spec 16 §16.14).
 ///
 /// [`cutoff::build_cutoff_json`] builds and signs the chain-HEAD snapshot
@@ -116,6 +121,15 @@ pub mod export;
 /// committed chain for INTENT records with no matching OUTCOME.
 pub mod intent_scan;
 pub mod key_custody;
+/// Shared, edition-neutral on-disk subdir NAMES for the durable outboxes —
+/// read by the community `doctor`, written by the (gated) producers. Non-gated
+/// so the community build can reference the directory names it must scan.
+pub mod outbox_paths;
+
+/// GH #910 — forward-compat opaque record: an older reader treats a record whose
+/// `EventKind` a newer writer added as opaque-but-intact (signature + hash-chain
+/// still verified) rather than `IntegrityBroken`. See the module doc.
+pub(crate) mod opaque;
 pub mod persist;
 /// M19b — chain-level session floor: a signed `CsqRun` record per `csq run`,
 /// emitted daemon-side when a v1 run record is ingested. Idempotent via the M20
@@ -185,12 +199,17 @@ pub mod health;
 
 // v1 re-exports — preserved for the spec 12 §12.3 write path.
 pub use persist::{
-    gen_run_id, write_record, AuditError, AuditRecord, Decision, ResultState, Surface,
+    gen_run_id, write_record, AuditError, AuditRecord, Decision, ResultState, SpawnGateRecord,
+    Surface,
 };
 // v2 re-exports — parallel write path (M02, spec 12 §12.2).
 pub use anchor::scan_chain_for_anchor_outcome;
 pub use intent_scan::{scan_orphan_intents, OrphanIntent, OrphanScanError};
-pub use persist::{write_record_v2, write_record_v2_signed, AuditV2Error, ChainGenesis};
+pub use persist::{
+    current_iso8601_utc_persist, gen_chain_id, write_genesis_v2_signed_in, write_record_v2,
+    write_record_v2_in, write_record_v2_signed, write_record_v2_signed_in, AuditV2Error,
+    ChainGenesis, ChainKind,
+};
 pub use sweep::{AuditSweepSnapshot, AuditSweeperHandle};
 
 // M01 trait surface + supporting types. `NoopSink` is intentionally
@@ -199,22 +218,21 @@ pub use sweep::{AuditSweepSnapshot, AuditSweeperHandle};
 pub use traits::{CanonicalForm, LedgerEngine, LedgerSink, SigningKey};
 pub use types::{
     AccountLogoutPayload, AccountMovePayload, AccountSwapPayload, ArtifactLoadPayload,
-    ChainContinuationPayload, ChainReGenesisPayload, CsqRunPayload, EatpActor, EatpAuthority,
-    EatpTrust, Ed25519PublicKey, Ed25519Signature, EventKind, EventPayload, IdError,
-    IdentityMintPayload, KeyId, KeyRotatePayload, LedgerError, ModelInvokePayload,
-    OAuthRefreshPayload, OpOutcome, OpPhase, OutputCapturePayload, RecordId, RedactedString,
-    ReleaseAuthPayload, ReplicationAckPayload, ReplicationFailedPayload, RotationReason, Sha256Hex,
-    SignedRecord, SigningError, SinkDriftDetectedPayload, SinkError, SinkId, SinkName, SinkReceipt,
+    ChainContinuationPayload, ChainReGenesisPayload, CsqRunPayload, EatpActor,
+    EatpAttestationPayload, EatpAuthority, EatpTrust, Ed25519PublicKey, Ed25519Signature,
+    EventKind, EventPayload, IdError, IdentityMintPayload, KeyId, KeyRotatePayload, LedgerError,
+    ModelInvokePayload, OAuthRefreshPayload, OpOutcome, OpPhase, OutputCapturePayload, RecordId,
+    RedactedString, ReleaseAuthPayload, ReplicationAckPayload, ReplicationFailedPayload,
+    RotationReason, Sha256Hex, SignedRecord, SigningError, SinkDriftDetectedPayload, SinkError,
+    SinkId, SinkName, SinkReceipt,
 };
 // M04 public surface — key custody operations.
 pub use key_custody::{
-    audit_init, check_signing_key, migrate_keys_to_file_store, repair_audit_chain, rotate_key,
-    try_load_signing_key, write_roster_floor_to_keychain, ChainState, KeyCustodyError,
-    KeyLoadOutcome, KeySlot, LocalSigningKey, MigrateOutcome, RepairOutcome, SigningKeyStatus,
-    SERVICE_NAME as AUDIT_SIGNING_SERVICE_NAME,
+    audit_init, check_signing_key, eatp_audit_init, migrate_keys_to_file_store, repair_audit_chain,
+    repair_audit_chain_in, rotate_key, try_load_signing_key, write_roster_floor_to_keychain,
+    ChainState, KeyCustodyError, KeyLoadOutcome, KeySlot, LocalSigningKey, MigrateOutcome,
+    RepairOutcome, SigningKeyStatus, SERVICE_NAME as AUDIT_SIGNING_SERVICE_NAME,
 };
-
-// M2 T2.5 — trust-plane conformance grade (enterprise edition only).
 
 // M08 — test-utils re-exports for the cross-impl canonical-form CI gate.
 // `canonical_bytes_for` and `AUDIT_SCHEMA_VERSION` are pub(crate) in persist.rs
@@ -232,14 +250,22 @@ pub use sink_config::{
 
 // M05 public surface — chain-integrity verifier.
 pub use verify::{
-    exit_code_for_error, to_json_output, verify_chain, KeyGap, KeychainAnchorStatus,
-    RosterFloorAnchorStatus, VerifyConfig, VerifyFailureDetail, VerifyJsonOutput, VerifySummary,
+    exit_code_for_error, to_json_output, verify_chain, verify_chain_in, KeyGap,
+    KeychainAnchorStatus, RosterFloorAnchorStatus, VerifyConfig, VerifyFailureDetail,
+    VerifyJsonOutput, VerifySummary,
 };
 
 // AuditHealth — daemon-startup verify outcome.
-pub use health::{clear_chain_broken, is_chain_broken, set_chain_broken, AuditHealth};
+pub use health::{
+    clear_chain_broken, clear_chain_broken_in, is_chain_broken, is_chain_broken_in,
+    reconcile_chain_sentinel, set_chain_broken, set_chain_broken_in, AuditHealth,
+};
 
 // M09 public surface — verifiable audit-bundle export.
+pub use compliance_report::{
+    build_compliance_report, classify_records, ComplianceReport, GovernedRow, LifecycleRow,
+    VerificationStatus,
+};
 pub use export::{export_bundle, ExportError, ExportSummary};
 
 // M11 public surface — multi-sig own-ops gate.

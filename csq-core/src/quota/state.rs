@@ -103,7 +103,7 @@ pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
 /// `surface` + `kind` fields on every record. PR-B8 (v2.0.1) read path
 /// tolerates both v1 and v2, so a v2 file written here remains readable
 /// if the user rolls back to v2.0.1. See spec 07 §7.4 + §7.6.2 and
-/// journal 0018.
+/// an internal journal entry
 pub fn save_state(base_dir: &Path, quota_file: &QuotaFile) -> Result<(), ConfigError> {
     let path = quota_path(base_dir);
     // Write schema_version=2 on disk (PR-C6 write-path flip).

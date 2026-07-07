@@ -13,11 +13,11 @@
 //!
 //! | Struct                    | Feature flag       | Target                            |
 //! |---------------------------|--------------------|-----------------------------------|
-//! | [`RekorSink`]             | `rekor-sink`       | Sigstore Rekor (public/self-host) |
-//! | [`S3ObjectLockSink`]      | `s3-sink`          | AWS S3 Object Lock                |
-//! | [`AzureImmutableBlobSink`]| `azure-sink`       | Azure Immutable Blob Storage      |
-//! | [`GcpBucketLockSink`]     | `gcp-sink`         | GCP Cloud Storage Bucket Lock     |
-//! | [`AzureSqlLedgerSink`]    | `azure-sql-sink`   | Azure SQL Database ledger tables  |
+//! | `RekorSink`             | `rekor-sink`       | Sigstore Rekor (public/self-host) |
+//! | `S3ObjectLockSink`      | `s3-sink`          | AWS S3 Object Lock                |
+//! | `AzureImmutableBlobSink`| `azure-sink`       | Azure Immutable Blob Storage      |
+//! | `GcpBucketLockSink`     | `gcp-sink`         | GCP Cloud Storage Bucket Lock     |
+//! | `AzureSqlLedgerSink`    | `azure-sql-sink`   | Azure SQL Database ledger tables  |
 //!
 //! `CsqLedgerSink` is reserved for M10 (feature flag `csq-ledger-sink`).
 //! The feature flag is defined in Cargo.toml so the Cargo feature graph is
@@ -32,7 +32,7 @@
 //! client; the trait surface is unchanged. See `docs/audit-sinks/` for the
 //! per-sink operator guide.
 //!
-//! The pattern is the same as [`crate::audit::impls::noop::NoopSink`]
+//! The pattern is the same as `crate::audit::impls::noop::NoopSink`
 //! (which ships in test builds only).  Reference-impl sinks are gated on
 //! feature flags rather than `#[cfg(test)]`; they may ship in release
 //! binaries when the operator explicitly opts in.
@@ -41,6 +41,8 @@
 pub mod azure;
 #[cfg(feature = "azure-sql-sink")]
 pub mod azure_sql;
+#[cfg(feature = "customer-body-store-sink")]
+pub mod customer_body_store;
 #[cfg(feature = "gcp-sink")]
 pub mod gcp;
 #[cfg(feature = "rekor-sink")]
@@ -52,6 +54,8 @@ pub mod s3;
 pub use azure::AzureImmutableBlobSink;
 #[cfg(feature = "azure-sql-sink")]
 pub use azure_sql::AzureSqlLedgerSink;
+#[cfg(feature = "customer-body-store-sink")]
+pub use customer_body_store::CustomerBodyStoreSink;
 #[cfg(feature = "gcp-sink")]
 pub use gcp::GcpBucketLockSink;
 #[cfg(feature = "rekor-sink")]

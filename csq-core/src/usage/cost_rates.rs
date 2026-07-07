@@ -1,4 +1,4 @@
-//! Static per-model cost rate table per journal 0050 D3.
+//! Static per-model cost rate table per an internal journal entry D3.
 //!
 //! Rates from public pricing pages as of 2026-05-06. Updated when providers
 //! announce changes — this is the SOLE source of truth for cost estimation in

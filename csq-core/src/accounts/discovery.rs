@@ -131,7 +131,7 @@ pub fn discover_all(base_dir: &Path) -> Vec<AccountInfo> {
 /// still classify correctly.
 /// Maps a 3P provider's display name to its [`BillingMode`].
 ///
-/// **Provisional Phase A dispatch — see journal 0047 for the design
+/// **Provisional Phase A dispatch — see an internal journal entry for the design
 /// rework planned for Phase B'.** This dispatch is structurally
 /// flawed: billing mode is a property of the user's PLAN with a
 /// provider, not the provider itself. MiniMax, Z.AI, and DeepSeek all
@@ -262,9 +262,15 @@ pub fn discover_per_slot_third_party(base_dir: &Path) -> Vec<AccountInfo> {
             .map(|s| !s.is_empty())
             .unwrap_or(false);
 
+        // A user rename (`by_slot_label`) wins over the provider-name default,
+        // matching the Anthropic `get_email` step-1 precedence. Only the
+        // display `label` is affected — the canonical `provider` id below is
+        // untouched (downstream dispatch keys on it).
+        let label =
+            profiles::slot_rename_label(base_dir, id).unwrap_or_else(|| provider_name.to_string());
         accounts.push(AccountInfo {
             id,
-            label: provider_name.to_string(),
+            label,
             oauth_email: None,
             source: AccountSource::ThirdParty {
                 provider: provider_name.to_string(),
@@ -337,7 +343,7 @@ pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
             // Skip slots owned by a Gemini binding. Without this, the
             // Anthropic refresher would try to refresh a Gemini-owned
             // identity that has no Anthropic OAuth tokens. Origin:
-            // redteam round 1 M3 (journal 0058) — pre-M4-4 the equivalent
+            // redteam round 1 M3 (an internal journal entry) — pre-M4-4 the equivalent
             // skip lived in Pass 2; the structural concern is identical.
             let gemini_marker = base_dir
                 .join("credentials")
@@ -368,18 +374,52 @@ pub fn discover_anthropic(base_dir: &Path) -> Vec<AccountInfo> {
             let has_credentials = match credentials::load(&uuid_cred_path) {
                 Ok(_) => true,
                 Err(e) => {
+                    // Distinguish a genuine phase4-gate miss from a slot whose
+                    // Anthropic credentials were INTENTIONALLY cleared (e.g.
+                    // `csq repair --heal-contaminated`, which deletes the store
+                    // AND the legacy `credentials/N.json`, leaving the slot
+                    // cleanly awaiting re-login). phase4_gate Check 3 refuses
+                    // start ONLY when the legacy ClaudeCode canonical is present;
+                    // its ABSENCE means the gate CORRECTLY let the slot through,
+                    // so the "gate should have caught this" WARN would
+                    // misattribute a designed post-heal state to a gate bug.
+                    let legacy_present = crate::types::AccountNum::try_from(id)
+                        .map(|acct| {
+                            crate::credentials::file::canonical_path_for(
+                                base_dir,
+                                acct,
+                                Surface::ClaudeCode,
+                            )
+                            .exists()
+                        })
+                        .unwrap_or(false);
                     // Path-free fixed-vocabulary tag; never `error = %e`
                     // (CredentialError::Display echoes the absolute path
                     // and serde_json error fragments). security.md §2;
                     // mirror of the discover_codex fix at line 534.
-                    warn!(
-                        slot = id,
-                        uuid_short = %uuid.to_canonical_string().chars().take(8).collect::<String>(),
-                        path = %uuid_cred_path.display(),
-                        error_kind = e.error_kind_tag(),
-                        "by_slot identity credentials unreadable; phase4_gate should have caught \
-                         this — daemon running in degraded mode for this slot"
-                    );
+                    if legacy_present {
+                        warn!(
+                            slot = id,
+                            uuid_short = %uuid.to_canonical_string().chars().take(8).collect::<String>(),
+                            path = %uuid_cred_path.display(),
+                            error_kind = e.error_kind_tag(),
+                            "by_slot identity credentials unreadable but legacy canonical \
+                             present; phase4_gate should have caught this — daemon running \
+                             in degraded mode for this slot"
+                        );
+                    } else {
+                        // No legacy source → gate correctly passed; benign
+                        // awaiting-login state (credentials cleared, e.g. by
+                        // `csq repair --heal-contaminated`, or a fresh-mint race).
+                        // The slot stays credential-less until `csq login`.
+                        tracing::debug!(
+                            slot = id,
+                            uuid_short = %uuid.to_canonical_string().chars().take(8).collect::<String>(),
+                            error_kind = e.error_kind_tag(),
+                            "by_slot Anthropic credentials unreadable (no legacy canonical) — \
+                             slot awaiting `csq login`"
+                        );
+                    }
                     false
                 }
             };
@@ -606,9 +646,15 @@ pub fn discover_codex(base_dir: &Path) -> Vec<AccountInfo> {
             };
 
             seen_slots.insert(id);
+            // A user rename (`by_slot_label`) wins over the `codex-N` default,
+            // matching the Pass-2 precedence below and the Anthropic `get_email`
+            // step-1 precedence. `pf` is not yet loaded in Pass 1, so use the
+            // base_dir accessor.
+            let label =
+                profiles::slot_rename_label(base_dir, id).unwrap_or_else(|| format!("codex-{id}"));
             accounts.push(AccountInfo {
                 id,
-                label: format!("codex-{id}"),
+                label,
                 oauth_email: None,
                 source: AccountSource::Codex,
                 surface: Surface::Codex,
@@ -616,7 +662,7 @@ pub fn discover_codex(base_dir: &Path) -> Vec<AccountInfo> {
                 has_credentials,
                 // Codex via OAuth is a ChatGPT subscription per
                 // CodexAuth::Chatgpt / ChatgptAuthTokens / AgentIdentity
-                // (journal 0046 §"Codex"). The API-key (`OPENAI_API_KEY`)
+                // (an internal journal entry §"Codex"). The API-key (`OPENAI_API_KEY`)
                 // path lands under a different AccountSource — Phase A
                 // does not unify those yet.
                 billing_mode: BillingMode::Subscription,
@@ -678,16 +724,24 @@ pub fn discover_codex(base_dir: &Path) -> Vec<AccountInfo> {
             }
         };
 
-        // Resolve label from profiles.json::by_slot_identity when available,
-        // filtering to only entries that start with "codex-" so a stale
-        // Anthropic-surface label (e.g. "anthropic-12/email") written by an
-        // earlier login on the same slot does not bleed into Codex discovery
-        // (DA-M2: stale by_slot_identity label from prior Anthropic login).
+        // Precedence (mirrors `get_email` step 1): a user rename in
+        // `by_slot_label` wins over the identity-derived default. Without this,
+        // renaming a Codex slot writes `by_slot_label[N]` but discovery keeps
+        // showing the `by_slot_identity` label (the "rename doesn't save" bug).
+        // Fallback: `by_slot_identity` filtered to "codex-" so a stale
+        // Anthropic-surface label (e.g. "anthropic-12/email") from an earlier
+        // login on the same slot does not bleed into Codex discovery (DA-M2),
+        // then the `codex-N` default.
         let label = pf
-            .by_slot_identity
+            .by_slot_label
             .get(slot_str)
-            .filter(|s| s.starts_with("codex-"))
             .cloned()
+            .or_else(|| {
+                pf.by_slot_identity
+                    .get(slot_str)
+                    .filter(|s| s.starts_with("codex-"))
+                    .cloned()
+            })
             .unwrap_or_else(|| format!("codex-{id}"));
 
         accounts.push(AccountInfo {
@@ -708,7 +762,7 @@ pub fn discover_codex(base_dir: &Path) -> Vec<AccountInfo> {
 
 /// Discovers Google Gemini bindings from `credentials/gemini-<N>.json`.
 /// Round-7 (this session) — Gemini provisioning has been writing these
-/// bindings since journal 0048 (Stage 2), but the discovery layer
+/// bindings since an internal journal entry (Stage 2), but the discovery layer
 /// didn't know about them, so Gemini-bound slots were invisible in the
 /// unified slot list (`csq` listing, desktop dashboard).
 ///
@@ -792,9 +846,13 @@ pub fn discover_gemini(base_dir: &Path) -> Vec<AccountInfo> {
             AuthMode::VertexSa { .. } => "vertex_sa",
             AuthMode::CodeAssistOAuth => "code_assist_oauth",
         };
+        // A user rename (`by_slot_label`) wins over the `gemini-N` default,
+        // matching the Anthropic `get_email` step-1 precedence.
+        let label =
+            profiles::slot_rename_label(base_dir, id).unwrap_or_else(|| format!("gemini-{id}"));
         accounts.push(AccountInfo {
             id,
-            label: format!("gemini-{id}"),
+            label,
             oauth_email: None,
             source: AccountSource::Gemini,
             surface: Surface::Gemini,
@@ -804,7 +862,7 @@ pub fn discover_gemini(base_dir: &Path) -> Vec<AccountInfo> {
             // Assist OAuth is subscription-bounded; API key + Vertex
             // SA are pay-per-token. Default to Subscription for the
             // OAuth path, PayPerToken for the others. This matches
-            // journal 0050's per-plan design.
+            // an internal journal entry's per-plan design.
             billing_mode: match &binding.auth {
                 AuthMode::CodeAssistOAuth => BillingMode::Subscription,
                 AuthMode::ApiKey | AuthMode::VertexSa { .. } => BillingMode::ApiKey,
@@ -1097,7 +1155,7 @@ mod tests {
     }
 
     /// **2026-05-22 codex-only regression** — slot 12 in the user-reported
-    /// session had a UUID minted by PR #530's codex-only mint path with
+    /// session had a UUID minted by an internal ticket's codex-only mint path with
     /// legacy `credentials/codex-12.json` (codex binding signal) but NO
     /// legacy `credentials/12.json` (no Anthropic OAuth ever ran). The
     /// pre-fix `discover_anthropic` enumerated slot 12 via `by_slot`,
@@ -1307,6 +1365,139 @@ mod tests {
         assert!(accounts.is_empty());
     }
 
+    // ── rename precedence: by_slot_label wins across ALL providers ─────
+    // Regression for the "rename doesn't save" bug: `rename_account` writes
+    // `by_slot_label[N]`, which Anthropic honors via `get_email` step 1 but
+    // Codex / Gemini / 3P discovery ignored (they read by_slot_identity /
+    // hardcoded `gemini-N` / provider name). Empirically: a codex slot with
+    // by_slot_label set kept showing its by_slot_identity label.
+
+    #[test]
+    fn discover_codex_legacy_rename_wins() {
+        // Pass 1 (legacy credentials/codex-N.json): by_slot_label wins over
+        // the `codex-N` default.
+        let dir = TempDir::new().unwrap();
+        write_codex_cred(dir.path(), 9);
+
+        let mut profiles = profiles::ProfilesFile::empty();
+        profiles
+            .by_slot_label
+            .insert("9".into(), "my-codex-rename".into());
+        profiles::save(&profiles::profiles_path(dir.path()), &profiles).unwrap();
+
+        let accounts = discover_codex(dir.path());
+        let slot9 = accounts.iter().find(|a| a.id == 9).expect("slot 9 present");
+        assert_eq!(slot9.label, "my-codex-rename");
+    }
+
+    #[test]
+    fn discover_codex_uuid_keyed_rename_wins() {
+        // Pass 2 (identities/<UUID>/credentials-codex.json — the production
+        // path for post-A++ codex slots, e.g. the user's slot 9): a user
+        // rename wins over both by_slot_identity and the `codex-N` default.
+        use crate::accounts::identity_store::IdentityId;
+        use std::str::FromStr;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = IdentityId::from_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let slot: u16 = 9;
+
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), uuid);
+        pf.by_slot_identity
+            .insert(slot.to_string(), "codex-8/3bf322e8".into());
+        pf.by_slot_label
+            .insert(slot.to_string(), "my-codex-rename".into());
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+        write_codex_cred_uuid(base, uuid); // no legacy codex-9.json → Pass 2
+
+        let accounts = discover_codex(base);
+        let slot9 = accounts.iter().find(|a| a.id == 9).expect("slot 9 present");
+        assert_eq!(
+            slot9.label, "my-codex-rename",
+            "user rename (by_slot_label) must win over by_slot_identity in Pass 2"
+        );
+    }
+
+    #[test]
+    fn discover_codex_uuid_keyed_falls_back_to_by_slot_identity() {
+        // Pass 2 without a rename → the existing by_slot_identity label wins
+        // (regression guard: the fix must not break the fallback).
+        use crate::accounts::identity_store::IdentityId;
+        use std::str::FromStr;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = IdentityId::from_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let slot: u16 = 9;
+
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), uuid);
+        pf.by_slot_identity
+            .insert(slot.to_string(), "codex-8/3bf322e8".into());
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+        write_codex_cred_uuid(base, uuid);
+
+        let accounts = discover_codex(base);
+        let slot9 = accounts.iter().find(|a| a.id == 9).expect("slot 9 present");
+        assert_eq!(slot9.label, "codex-8/3bf322e8");
+    }
+
+    #[test]
+    fn discover_per_slot_third_party_rename_wins() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings(dir.path(), 11, "https://api.deepseek.com/anthropic", "tok");
+
+        let mut profiles = profiles::ProfilesFile::empty();
+        profiles
+            .by_slot_label
+            .insert("11".into(), "my-deepseek".into());
+        profiles::save(&profiles::profiles_path(dir.path()), &profiles).unwrap();
+
+        let accounts = discover_per_slot_third_party(dir.path());
+        let slot11 = accounts
+            .iter()
+            .find(|a| a.id == 11)
+            .expect("slot 11 present");
+        assert_eq!(
+            slot11.label, "my-deepseek",
+            "user rename must win over the 3P provider-name default"
+        );
+        // The canonical provider id is untouched — only the display label moved.
+        assert!(matches!(
+            &slot11.source,
+            AccountSource::ThirdParty { provider } if provider == "DeepSeek"
+        ));
+    }
+
+    #[test]
+    fn discover_gemini_rename_wins() {
+        use crate::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
+        let dir = TempDir::new().unwrap();
+        // discover_gemini enumerates credentials/gemini-N.json stems, then
+        // reads the binding — set up both.
+        std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
+        std::fs::write(dir.path().join("credentials/gemini-6.json"), "{}").unwrap();
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(6u16).unwrap(),
+            &GeminiBinding::new(AuthMode::ApiKey, "gemini-2.5-flash"),
+        )
+        .unwrap();
+
+        let mut profiles = profiles::ProfilesFile::empty();
+        profiles
+            .by_slot_label
+            .insert("6".into(), "my-gemini".into());
+        profiles::save(&profiles::profiles_path(dir.path()), &profiles).unwrap();
+
+        let accounts = discover_gemini(dir.path());
+        let slot6 = accounts.iter().find(|a| a.id == 6).expect("slot 6 present");
+        assert_eq!(
+            slot6.label, "my-gemini",
+            "user rename must win over the gemini-N default"
+        );
+    }
+
     #[test]
     fn discover_manual_round_trip() {
         let dir = TempDir::new().unwrap();
@@ -1393,7 +1584,7 @@ mod tests {
         );
     }
 
-    /// Provisional Phase A dispatch — see journal 0047. Static
+    /// Provisional Phase A dispatch — see an internal journal entry Static
     /// dispatch can't distinguish per-plan modes; everything except
     /// genuinely-billing-less Ollama defaults to Subscription so
     /// existing 5h/7d bar rendering doesn't regress for users on
@@ -1895,7 +2086,7 @@ mod tests {
         );
     }
 
-    /// §5a regression (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `save_manual_account` fails
     /// after the tmp file would have been created (parent dir read-only
     /// → write fails), no `.tmp.` file must remain on disk.

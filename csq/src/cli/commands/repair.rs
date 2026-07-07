@@ -5,7 +5,7 @@
 //!
 //! 1. **Credential contamination** — cross-slot refresh-token sharing
 //!    (documented below).
-//! 2. **Slot attribution** (workspace slot-attribution-consistency) — stale
+//! 2. **Slot attribution** (workspace an internal workspace) — stale
 //!    `config-N/.current-account` caches, which make `csq swap N` show the
 //!    wrong slot. `--apply` rewrites each drifted cache to its canonical slot.
 //!    (A `by_slot` orphan-prune was prototyped here and REMOVED — see the
@@ -139,31 +139,63 @@ enum FindingKind {
     LiveSharedWith { other_slot: u16 },
     /// UUID-canonical (`identities/<UUID>/credentials.json`) token
     /// disagrees with the legacy canonical (`credentials/N.json`).
-    /// Phase 2 (M2-7) extension — see workspaces/account-slot-decoupling/
+    /// Phase 2 (M2-7) extension — see internal-design-docs
     /// 02-plans/03-phase2-readiness.md § M2-7.
     UuidLegacyDrift { uuid_prefix: String },
 }
 
-/// Public entry point. `apply = false` is a dry run.
-pub fn handle(base_dir: &Path, apply: bool) -> Result<()> {
-    // ── Pass 1: cross-slot credential contamination ──
+/// Public entry point. `apply = false` is a dry run. `heal_contaminated` opts
+/// into the network store-token ownership pass (an internal ticket / #61).
+pub fn handle(base_dir: &Path, apply: bool, heal_contaminated: bool) -> Result<()> {
+    // ── Pass 1: cross-slot credential contamination (offline, prefix compare) ──
     let findings = scan(base_dir).context("scan failed")?;
-    // ── Pass 2: slot-attribution drift + orphaned mappings ──
+    // ── Pass 2: slot-attribution drift + orphaned mappings (offline) ──
     let attribution = scan_attribution(base_dir);
 
-    if findings.is_empty() && attribution.is_empty() {
+    let offline_clean = findings.is_empty() && attribution.is_empty();
+    if offline_clean {
         println!("✓ No credential or slot-attribution issues detected.");
-        return Ok(());
+    } else {
+        print_contamination(&findings);
+        print_attribution(&attribution);
     }
 
-    print_contamination(&findings);
-    print_attribution(&attribution);
+    // ── Pass 3 (opt-in, NETWORK): store-token cross-account contamination ──
+    // Reuses the daemon's Cloudflare-safe Node transport + the custodian's
+    // `/api/oauth/profile` ownership detector (an internal ticket follow-up). Off by
+    // default so the offline passes stay fast and rate-limit-free. The same
+    // `http_get` is reused at apply time to re-verify each slot immediately
+    // before the irreversible delete (check-then-act — closes the scan→delete
+    // TOCTOU window).
+    let http_get: Option<csq_core::daemon::usage_poller::HttpGetFn> = if heal_contaminated {
+        Some(std::sync::Arc::new(
+            |url: &str, token: &str, headers: &[(&str, &str)]| {
+                csq_core::http::get_bearer_node(url, token, headers)
+            },
+        ))
+    } else {
+        None
+    };
+    let contaminated = if let Some(http_get) = &http_get {
+        let c = scan_contaminated(base_dir, http_get);
+        print_contaminated(&c);
+        c
+    } else {
+        Vec::new()
+    };
+
+    if offline_clean && contaminated.is_empty() {
+        return Ok(());
+    }
 
     if !apply {
         println!();
         println!("Dry run — no files modified. Re-run with `--apply` to repair");
-        println!("(delete contaminated canonical credentials, rewrite stale");
-        println!(".current-account caches).");
+        print!("(delete contaminated canonical credentials, rewrite stale .current-account caches");
+        if heal_contaminated {
+            print!(", clear foreign store tokens");
+        }
+        println!(").");
         return Ok(());
     }
 
@@ -171,13 +203,252 @@ pub fn handle(base_dir: &Path, apply: bool) -> Result<()> {
     let mut total = 0usize;
     total += apply_contamination(base_dir, &findings);
     total += apply_attribution(base_dir, &attribution);
+    if let Some(http_get) = &http_get {
+        total += apply_contaminated_heal(base_dir, &contaminated, http_get);
+    }
     println!();
     println!("Applied {total} repair(s).");
-    if !findings.is_empty() {
+    if !findings.is_empty() || !contaminated.is_empty() {
         println!("Run the Add Account flow (or `csq login N`) to re-authenticate");
         println!("any slot whose contaminated credentials were removed.");
     }
     Ok(())
+}
+
+/// A slot whose Anthropic **store** token was server-confirmed to belong to a
+/// DIFFERENT account than its `identity.json` anchor (an internal ticket cross-slot
+/// scramble class). Heal = clear the store credential, then `csq login <slot>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContaminatedSlot {
+    slot: u16,
+    /// The slot's display label (email) — never a filesystem path.
+    label: String,
+}
+
+/// Network scan (pass 3): per Anthropic slot, run the custodian's
+/// `/api/oauth/profile` ownership check and keep only the slots whose store
+/// token is server-CONFIRMED foreign. `Owned` and `Unknown` (revoked / no
+/// runtime / transport / rate-limited) are NEVER healed — fail-closed on doubt.
+/// `http_get` is injected so the scan is unit-testable without the network.
+fn scan_contaminated(
+    base_dir: &Path,
+    http_get: &csq_core::daemon::usage_poller::HttpGetFn,
+) -> Vec<ContaminatedSlot> {
+    use csq_core::daemon::custodian::{check_slot_store_token_ownership, SlotOwnership};
+    let mut out = Vec::new();
+    for a in csq_core::accounts::discovery::discover_anthropic(base_dir) {
+        let slot = match AccountNum::try_from(a.id) {
+            Ok(s) => s,
+            Err(e) => {
+                // Symmetric with apply_contaminated_heal's skip logging; unreachable
+                // in practice (discover_anthropic constrains ids to 1..=999).
+                eprintln!("  skipped slot {} — invalid slot: {e}", a.id);
+                continue;
+            }
+        };
+        if check_slot_store_token_ownership(base_dir, slot, http_get) == SlotOwnership::Contaminated
+        {
+            out.push(ContaminatedSlot {
+                slot: a.id,
+                label: a.label.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Prints the pass-3 store-token contamination findings.
+fn print_contaminated(slots: &[ContaminatedSlot]) {
+    if slots.is_empty() {
+        println!("✓ No contaminated store tokens detected.");
+        return;
+    }
+    println!("Detected {} contaminated store token(s):", slots.len());
+    for c in slots {
+        println!(
+            "  slot {:>3}  ({}) store token belongs to a DIFFERENT account \
+             — heal clears it, then `csq login {}`",
+            c.slot, c.label, c.slot
+        );
+    }
+}
+
+/// Applies pass-3 heal: for each contaminated slot, RE-VERIFIES ownership against
+/// `/api/oauth/profile` immediately before deleting (check-then-act, closing the
+/// scan→delete TOCTOU window — a token the daemon adopted after the scan is
+/// re-checked, and only a still-`Contaminated` verdict proceeds; `Owned`/`Unknown`
+/// skip, fail-closed on doubt). On confirm, clears the slot so the next
+/// `csq login N` re-authenticates a clean token.
+///
+/// Deletes TWO files for the slot, both resolved for THIS slot only:
+///  1. the store the daemon polls — [`slot_store_credential_path`] (UUID-keyed
+///     `identities/<UUID>/credentials.json`, or legacy `credentials/N.json`), the
+///     exact path the detector read; and
+///  2. the legacy `credentials/N.json` ClaudeCode canonical — the source
+///     [`phase4_gate_self_heal`] copies back into the identity store on the next
+///     daemon start. Leaving it would RESURRECT the (possibly still-contaminated)
+///     token and re-trip the gate; deleting it also makes phase4 Check 3 skip the
+///     slot (no legacy anthropic canonical → not ClaudeCode-bound-on-disk → no
+///     daemon-start refusal). When (1) already IS the legacy path (no UUID), the
+///     second remove is a benign idempotent no-op.
+///
+/// Never touches another slot's identity dir, never the slot's `identity.json` or
+/// `settings.json` (anchor/label/settings survive so re-login re-mints against the
+/// correct account and phase4 Check 4 stays satisfied), and never the keychain
+/// (that is login's job — it re-syncs on the next `csq login`). Also clears the
+/// slot's `broker_failed` sentinel (`sentinel-clearing-parity.md` Rule 1 names
+/// `csq repair --apply` as a resolution boundary) so a stale flag from the
+/// contaminated token does not outlive the heal in `csq doctor`.
+///
+/// **Why the third store-ingest path — `refresh::sync::backsync` — cannot
+/// resurrect the token.** `backsync` is live on every `csq statusline` render and
+/// promotes a live `.credentials.json` into the store when it is fresher, so with
+/// the store now empty a future-dated live file WOULD be promoted. But the live
+/// file `statusline` hands `backsync` is the TERMINAL's handle-dir
+/// `.credentials.json` (`current_config_dir()`), which in the M3-7 handle-dir
+/// model is a SYMLINK into the store we just deleted — so `credentials::load`
+/// fails and `backsync` returns `Ok(false)`, promoting nothing. The store stays
+/// empty until `csq login` (no auto-self-heal; the honest "needs login" state). A
+/// foreign token cannot reach the store through this path either: CC is
+/// keychain-first, so an in-session `/login` to another account writes the foreign
+/// token to the per-config-dir KEYCHAIN (the vector the custodian's ingest gate
+/// guards — `csq-core/src/daemon/custodian.rs` §"the wrong-account guard"), NOT to
+/// the handle-dir file, which stays a symlink. `config-N/.credentials.json` is left
+/// in place (as pass-1 does — CC may hold it, and it is not the handle-dir symlink
+/// target that `backsync` reads); it cannot re-seed a foreign token because the
+/// `config-N` file is same-account-path-keyed per that same threat model.
+///
+/// **Scope note (deliberate):** the heal is CLI-operator-initiated only. The
+/// daemon/desktop do NOT auto-heal — auto-deleting credentials on a background
+/// tick is a higher-blast-radius action that MUST require explicit operator
+/// intent. The desktop still SURFACES contamination read-only via the same
+/// detector (`csq doctor --check-token-owners`).
+///
+/// [`phase4_gate_self_heal`]: csq_core::daemon::startup_reconciler
+/// [`slot_store_credential_path`]: csq_core::daemon::custodian::slot_store_credential_path
+///
+/// Returns the count of slots whose store was actually cleared.
+fn apply_contaminated_heal(
+    base_dir: &Path,
+    slots: &[ContaminatedSlot],
+    http_get: &csq_core::daemon::usage_poller::HttpGetFn,
+) -> usize {
+    use csq_core::daemon::custodian::{
+        check_slot_store_token_ownership, slot_store_credential_path, SlotOwnership,
+    };
+    let mut cleared = 0usize;
+    for c in slots {
+        let acct = match AccountNum::try_from(c.slot) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("  skipped slot {} — invalid slot: {e}", c.slot);
+                continue;
+            }
+        };
+        // Re-verify under a fresh read right before the irreversible delete.
+        if check_slot_store_token_ownership(base_dir, acct, http_get) != SlotOwnership::Contaminated
+        {
+            println!(
+                "  slot {} no longer confirmed contaminated — skipped (self-healed or \
+                 unverifiable)",
+                c.slot
+            );
+            continue;
+        }
+        // (1) the store the daemon polls; (2) the legacy self-heal source.
+        // In practice a Contaminated slot is ALWAYS UUID-mapped —
+        // `check_slot_store_token_ownership` fail-closes to `Unknown` (never
+        // `Contaminated`) without an `identity.json` anchor, which only a
+        // UUID-mapped slot has — so `store_path` is the UUID-keyed file and
+        // `legacy_path` is the distinct `credentials/N.json`. The dedup guard
+        // below is defensive for the no-UUID case that the re-check above cannot
+        // actually reach.
+        let store_path = slot_store_credential_path(base_dir, acct);
+        let legacy_path = csq_core::credentials::file::canonical_path(base_dir, acct);
+        let mut removed_any = false;
+        let mut had_io_error = false;
+        for path in [&store_path, &legacy_path] {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed_any = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    had_io_error = true;
+                    eprintln!("  failed to clear a store file for slot {}: {e}", c.slot);
+                }
+            }
+            if store_path == legacy_path {
+                break; // no-UUID slot: the two paths are identical, remove once.
+            }
+        }
+        let outcome = heal_outcome(removed_any, had_io_error);
+        // Both `Cleared` and `AlreadyAbsent` confirm the contaminated token is gone
+        // (removed now, or already absent) → retire any stale broker_failed flag
+        // (`sentinel-clearing-parity.md` Rule 1 resolution boundary). `NotHealed`
+        // (a file survived an IO error) is NOT a resolution — leave the flag.
+        // Single callsite keeps the Rule-1 audit's one-caller/one-callsite invariant.
+        if outcome != HealOutcome::NotHealed {
+            csq_core::refresh::sentinel::clear_broker_failed(base_dir, acct);
+        }
+        match outcome {
+            HealOutcome::NotHealed => {
+                // At least one target could not be removed (permission/IO error,
+                // already logged above). BLOCKING even when the UUID store WAS
+                // removed: a surviving legacy `credentials/N.json` is exactly the
+                // phase4_gate_self_heal source that resurrects the contaminated
+                // token on the next daemon start. Do NOT report "cleared" or count.
+                eprintln!(
+                    "  slot {} NOT healed — a store file could not be removed (see \
+                     errors above); a surviving credentials/{}.json would resurrect \
+                     the token",
+                    c.slot, c.slot
+                );
+            }
+            HealOutcome::Cleared => {
+                println!(
+                    "  cleared contaminated store token for slot {} ({})",
+                    c.slot, c.label
+                );
+                cleared += 1;
+            }
+            HealOutcome::AlreadyAbsent => {
+                println!(
+                    "  slot {} store token already absent — nothing to clear",
+                    c.slot
+                );
+            }
+        }
+    }
+    cleared
+}
+
+/// The three terminal outcomes of a per-slot heal delete, decided from whether any
+/// file was actually removed and whether any non-`NotFound` I/O error occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealOutcome {
+    /// Every target removed cleanly (or was already gone AND at least one delete
+    /// succeeded) — the slot is healed; clear the sentinel and count it.
+    Cleared,
+    /// A file could not be removed (permission/IO error). BLOCKING regardless of a
+    /// partial success: a surviving `credentials/N.json` resurrects the token via
+    /// phase4_gate_self_heal, so the slot is NOT healed — no count, no sentinel clear.
+    NotHealed,
+    /// Nothing was removed and no error occurred — every target was already absent.
+    AlreadyAbsent,
+}
+
+/// Pure decision for [`apply_contaminated_heal`]'s per-slot outcome. `had_io_error`
+/// takes precedence over `removed_any` so a partial delete (store gone, legacy
+/// self-heal source un-removable) is reported as NOT healed rather than a false
+/// success — the exact resurrection window a naive `if removed_any` first-check
+/// would mask (redteam R4).
+fn heal_outcome(removed_any: bool, had_io_error: bool) -> HealOutcome {
+    if had_io_error {
+        HealOutcome::NotHealed
+    } else if removed_any {
+        HealOutcome::Cleared
+    } else {
+        HealOutcome::AlreadyAbsent
+    }
 }
 
 /// Prints the credential-contamination findings (pass 1).
@@ -272,7 +543,7 @@ fn scan(base_dir: &Path) -> Result<Vec<Finding>> {
         // The config-N/ path here is a PATH-BUILDER pointing at the live file;
         // we intentionally compare the live mirror, not the UUID-canonical, so
         // this site stays unchanged through Phase 2.
-        // See workspaces/account-slot-decoupling/02-plans/03-phase2-readiness.md § M2-7.
+        // See internal-design-docs § M2-7.
         let live = base_dir
             .join(format!("config-{slot}"))
             .join(".credentials.json");
@@ -317,7 +588,7 @@ fn scan(base_dir: &Path) -> Result<Vec<Finding>> {
         }
     }
 
-    // Pass 0b RETIRED (slot-attribution-consistency, 2026-06-01): the
+    // Pass 0b RETIRED (an internal workspace, 2026-06-01): the
     // `uuid_canonical ≠ live_legacy` check flagged every healthy post-M3-7
     // Anthropic OAuth slot as "A++ drift". `config-N/.credentials.json`
     // (`live_legacy`) is a TRANSIENT login landing-spot, not a maintained
@@ -423,7 +694,7 @@ mod tests {
     use super::*;
     use csq_core::accounts::identity_store::credentials_path_for;
     #[cfg(any(test, feature = "test-utils"))]
-    use csq_core::testing::identity_fixtures::fixture_uuid_for_slot;
+    use csq_core::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
     use tempfile::TempDir;
 
     /// Writes a legacy credential file (canonical or live) with the given refresh token.
@@ -566,7 +837,7 @@ mod tests {
     /// Verifies that the Phase 2 comparison surface "UUID + legacy canon +
     /// live" catches mismatches in any pair.
     ///
-    /// See workspaces/account-slot-decoupling/02-plans/03-phase2-readiness.md § M2-7.
+    /// See internal-design-docs § M2-7.
     #[cfg(any(test, feature = "test-utils"))]
     #[test]
     fn repair_credentials_detects_drift_across_uuid_and_legacy() {
@@ -622,7 +893,7 @@ mod tests {
         );
     }
 
-    /// Regression (slot-attribution-consistency, 2026-06-01): a HEALTHY
+    /// Regression (an internal workspace, 2026-06-01): a HEALTHY
     /// post-M4-12 Anthropic OAuth slot must produce NO finding. Shape:
     /// `credentials/N.json` pruned (canonical_legacy = None), a STALE
     /// `config-N/.credentials.json` left from before the first daemon refresh
@@ -655,7 +926,7 @@ mod tests {
         );
     }
 
-    // ── slot-attribution-consistency M5b: pass-2 (attribution) tests ──
+    // ── an internal workspace M5b: pass-2 (attribution) tests ──
 
     #[test]
     fn scan_attribution_detects_current_account_drift() {
@@ -682,6 +953,166 @@ mod tests {
                 .any(|i| matches!(i, AttributionIssue::CurrentAccountDrift { slot: 3, .. })),
             "consistent config-3 must NOT be flagged"
         );
+    }
+
+    // ── Pass 3: store-token contamination heal (#955 / #61) ──
+
+    #[test]
+    fn heal_outcome_io_error_blocks_success_even_on_partial_removal() {
+        // redteam R4: the resurrection-window regression. A partial delete (store
+        // removed, legacy self-heal source un-removable) MUST report NotHealed,
+        // NOT a false "Cleared" — else the surviving credentials/N.json resurrects
+        // the token on the next daemon start.
+        assert_eq!(
+            heal_outcome(true, true),
+            HealOutcome::NotHealed,
+            "removed store but hit an IO error on the other file → NOT healed"
+        );
+        assert_eq!(
+            heal_outcome(false, true),
+            HealOutcome::NotHealed,
+            "nothing removed + IO error → NOT healed"
+        );
+        assert_eq!(
+            heal_outcome(true, false),
+            HealOutcome::Cleared,
+            "clean removal → Cleared"
+        );
+        assert_eq!(
+            heal_outcome(false, false),
+            HealOutcome::AlreadyAbsent,
+            "all targets already absent, no error → AlreadyAbsent"
+        );
+    }
+
+    /// `/api/oauth/profile` stub returning a fixed account email for every token.
+    #[cfg(any(test, feature = "test-utils"))]
+    fn profile_http_get(email: &'static str) -> csq_core::daemon::usage_poller::HttpGetFn {
+        std::sync::Arc::new(move |_u: &str, _t: &str, _h: &[(&str, &str)]| {
+            Ok((
+                200u16,
+                format!(r#"{{"account":{{"uuid":"u","email":"{email}"}}}}"#).into_bytes(),
+            ))
+        })
+    }
+
+    /// Seed slot `slot` (already in `coexisting_fixture`'s `by_slot`) with a full
+    /// Anthropic identity: overwrite `identity.json` anchor to `anchor`, write the
+    /// UUID-keyed store credentials, the legacy `credentials/N.json` self-heal
+    /// source, and `settings.json` (so phase4 Check 4 is satisfied).
+    #[cfg(any(test, feature = "test-utils"))]
+    fn seed_full_anthropic_slot(base: &Path, slot: u16, anchor: &str) {
+        use csq_core::accounts::identity_store::{identity_json_path_for, settings_path_for};
+        let uuid = fixture_uuid_for_slot(slot);
+        std::fs::write(
+            identity_json_path_for(base, uuid),
+            format!(
+                r#"{{"email":"{anchor}","provider":"anthropic","created_at":"t","key_id":null}}"#
+            ),
+        )
+        .unwrap();
+        write_uuid_creds(base, slot, "sk-ant-ort01-store-token"); // identities/<UUID>/credentials.json
+        write_creds(base, slot, "sk-ant-ort01-legacy-token", false); // credentials/N.json (self-heal src)
+        std::fs::write(settings_path_for(base, uuid), "{}").unwrap();
+        // Bump the store-version sentinel to the current schema so phase4
+        // Check 1/2 pass (coexisting_fixture writes an older schema).
+        std::fs::write(
+            csq_core::accounts::identity_store::store_version_path(base),
+            format!(
+                r#"{{"schema":{},"minted_at":"t","source":"test"}}"#,
+                csq_core::daemon::identity_mint::STORE_VERSION_SCHEMA_CURRENT
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn apply_contaminated_heal_clears_store_and_legacy_source_and_keeps_gate_open() {
+        // Single-slot coexisting fixture (by_slot[1] + store-version). Seed slot 1
+        // fully, then heal it under a stub reporting a FOREIGN account email.
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        seed_full_anthropic_slot(base, 1, "owner@anchor.test");
+        let uuid = fixture_uuid_for_slot(1);
+        let store = credentials_path_for(base, uuid);
+        let legacy = base.join("credentials").join("1.json");
+        assert!(
+            store.exists() && legacy.exists(),
+            "fixture seeded both files"
+        );
+
+        // Foreign email (≠ anchor) → detector + re-check both return Contaminated.
+        let g = profile_http_get("stranger@foreign.test");
+        let cleared = apply_contaminated_heal(
+            base,
+            &[ContaminatedSlot {
+                slot: 1,
+                label: "owner@anchor.test".into(),
+            }],
+            &g,
+        );
+
+        assert_eq!(cleared, 1, "the confirmed-contaminated slot is cleared");
+        assert!(!store.exists(), "UUID-keyed store MUST be removed");
+        assert!(
+            !legacy.exists(),
+            "legacy credentials/1.json (phase4 self-heal source) MUST be removed \
+             so the next daemon start cannot resurrect the contaminated token"
+        );
+        // F2 proof: the post-heal on-disk shape must NOT block daemon start.
+        let gate = csq_core::daemon::startup_reconciler::phase4_gate_check(base);
+        assert!(
+            gate.is_ok(),
+            "healed slot (no legacy anthropic canonical, settings present) must pass \
+             the phase4 gate — daemon starts, slot cleanly awaits `csq login`; got: {gate:?}"
+        );
+    }
+
+    #[test]
+    fn apply_contaminated_heal_skips_slot_that_reverifies_not_contaminated() {
+        // Re-check gate (TOCTOU close): a slot whose store the daemon healed between
+        // scan and apply now re-verifies Owned → the heal MUST NOT delete it.
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        seed_full_anthropic_slot(base, 1, "owner@anchor.test");
+        let uuid = fixture_uuid_for_slot(1);
+        let store = credentials_path_for(base, uuid);
+
+        // Stub now reports the token as OWNED by the anchor (re-check → Owned).
+        let g = profile_http_get("owner@anchor.test");
+        let cleared = apply_contaminated_heal(
+            base,
+            &[ContaminatedSlot {
+                slot: 1,
+                label: "owner@anchor.test".into(),
+            }],
+            &g,
+        );
+        assert_eq!(cleared, 0, "a re-verified-Owned slot is not healed");
+        assert!(
+            store.exists(),
+            "store MUST survive when re-check is not Contaminated"
+        );
+    }
+
+    #[test]
+    fn apply_contaminated_heal_skips_absent_store_via_recheck() {
+        // No store credentials for the slot → detector fail-closes to Unknown →
+        // re-check skips (never a false delete), never panics.
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        // (no seed — identity.json exists from the fixture, but no store creds)
+        let g = profile_http_get("stranger@foreign.test");
+        let cleared = apply_contaminated_heal(
+            dir.path(),
+            &[ContaminatedSlot {
+                slot: 1,
+                label: "z@x.com".into(),
+            }],
+            &g,
+        );
+        assert_eq!(cleared, 0, "no store → Unknown → skipped, nothing removed");
+        let _ = base;
     }
 
     #[test]

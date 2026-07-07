@@ -1,4 +1,5 @@
 pub mod claude_login_subprocess;
+pub mod interactive;
 pub mod race;
 pub use race::RaceLoginState;
 
@@ -75,7 +76,7 @@ pub struct AccountView {
     /// label (which is localizable and could drift).
     pub provider_id: Option<String>,
 
-    /// Billing-mode classification (Phase B of journal 0046). Drives
+    /// Billing-mode classification (Phase B of an internal journal entry). Drives
     /// the AccountList render: `subscription` shows 5h/7d quota bars,
     /// `api-key` shows "API-key billing — pay per token" with no
     /// bars, `local` shows "Local provider — no billing".
@@ -87,9 +88,19 @@ pub struct AccountView {
     /// is the user-visible-quota-shape field.
     pub billing_mode: String,
     /// Catalog-level quota signal shape: "utilization" | "counter" | "unknown".
-    /// Phase B' (journal 0050 D5): "unknown" slots render the
+    /// Phase B' (an internal journal entry D5): "unknown" slots render the
     /// tokens-and-cost-over-time ledger view; others keep the 5h/7d bars.
     pub quota_kind: String,
+
+    /// Formatted balance string for pay-per-token providers (e.g. DeepSeek).
+    ///
+    /// Populated from `quota.json::balance` when the slot's catalog
+    /// `quota_kind` is `"balance"`. Rendered in the usage area instead of
+    /// 5h/7d bars (which are `None` for balance-based providers).
+    /// Format: `"$196.42"` for USD, `"196.42 CNY"` for other currencies.
+    /// `None` for every non-balance slot (subscription, counter, unknown, gemini).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_display: Option<String>,
 
     // ── PR-G5 — Gemini-specific quota fields ───────────────────
     //
@@ -127,6 +138,17 @@ pub struct AccountView {
 pub struct DaemonStatusView {
     pub running: bool,
     pub pid: Option<u32>,
+}
+
+/// Returns the build edition this binary was compiled as: `"community"` or
+/// `"enterprise"` (the compile-time `crate::BUILD_EDITION` const driven by the
+/// `enterprise` Cargo feature). The header renders an edition badge from it.
+/// Unspoofable (compiled in), and distinct from the runtime audit dialect.
+/// Infallible by construction; returns `Result` only to satisfy the uniform
+/// Tauri-command contract (`rules/tauri-commands.md` MUST Rule 1).
+#[tauri::command]
+pub fn get_build_edition() -> Result<&'static str, String> {
+    Ok(crate::BUILD_EDITION)
 }
 
 /// Returns all configured accounts with current quota data.
@@ -203,7 +225,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 // branch: `healthy` when credentials are present, `missing`
                 // otherwise, no countdown. Sibling of the Codex branch closing
                 // the same `account-terminal-separation.md` MUST Rule 4 bug
-                // class one surface over (journal 0029 follow-up).
+                // class one surface over (an internal journal entry follow-up).
                 let status = if a.has_credentials {
                     "healthy"
                 } else {
@@ -331,7 +353,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 None
             };
 
-            // Phase B' (journal 0050 D5): expose the catalog's quota_kind
+            // Phase B' (an internal journal entry D5): expose the catalog's quota_kind
             // so the frontend can branch — `Unknown` slots get the new
             // tokens-and-cost-over-time ledger view instead of stuck-at-
             // zero 5h/7d bars. Subscription slots (Utilization / Counter)
@@ -344,6 +366,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                         providers::catalog::QuotaKind::Utilization => "utilization",
                         providers::catalog::QuotaKind::Counter => "counter",
                         providers::catalog::QuotaKind::Unknown => "unknown",
+                        providers::catalog::QuotaKind::Balance => "balance",
                     })
                     .unwrap_or("utilization")
                     .to_string(),
@@ -397,9 +420,20 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 None
             };
 
+            // Balance display — populated for pay-per-token (DeepSeek) slots whose
+            // catalog quota_kind is Balance. The formatted string is rendered in the
+            // usage area instead of the 5h/7d bars (which are None for those slots).
+            // None on every other slot type: subscription, counter, unknown, Gemini.
+            // Uses the shared `fmt_balance` (csq-core) so currency formatting +
+            // control-char sanitization have a single source of truth with the
+            // statusline (#984 redteam L1/M1).
+            let balance_display = q
+                .and_then(|q| q.balance.as_ref())
+                .map(csq_core::quota::format::fmt_balance);
+
             // Utilization-quota fields (5h / 7d) are gated on
             // surface-match: the quota record's `surface` field MUST
-            // equal the account's surface. This is the journal 0058 H2
+            // equal the account's surface. This is the an internal journal entry H2
             // defense, restated structurally: slot ID namespace is shared
             // across surfaces, so a Codex binding at slot 13 collides with
             // a leftover `quota.json[13]` from a prior Anthropic occupant.
@@ -415,7 +449,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
             // because the AccountList surface check renders gemini's
             // dedicated block before reaching the usage-bars.
             //
-            // Origin: redteam round 1 H2 (journal 0058) and issue #367
+            // Origin: redteam round 1 H2 (an internal journal entry) and an internal ticket
             // (codex 5h/7d desktop UI gap).
             let utilization_quota = q.filter(|q| q.surface.as_str() == a.surface.as_str());
             AccountView {
@@ -451,6 +485,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 provider_id,
                 billing_mode: a.billing_mode.to_string(),
                 quota_kind,
+                balance_display,
                 gemini_counter_today,
                 gemini_rate_limit_reset_at,
                 gemini_selected_model,
@@ -492,6 +527,22 @@ pub fn rename_account(base_dir: String, account: u16, name: String) -> Result<()
         .map_err(|e| format!("rename failed: {e}"))
 }
 
+/// Whether a provider CLI binary is installed (resolvable on `PATH` or a
+/// standard install location).
+///
+/// The desktop add-account flow calls this BEFORE launching a codex/gemini
+/// login so a missing CLI surfaces a friendly "install codex-cli" prompt
+/// instead of a raw error mid-device-auth. `binary` MUST be one of the known
+/// surface binaries; any other value returns `false` without probing (a caller
+/// cannot use this to test for arbitrary binaries).
+#[tauri::command]
+pub fn provider_cli_installed(binary: String) -> bool {
+    if !matches!(binary.as_str(), "codex" | "gemini" | "claude") {
+        return false;
+    }
+    csq_core::accounts::login::find_cli_binary(&binary).is_some()
+}
+
 /// Removes an account: deletes credentials, config dir, profile entry,
 /// and — for Gemini ApiKey slots — the platform-native vault entry.
 ///
@@ -512,7 +563,7 @@ pub fn rename_account(base_dir: String, account: u16, name: String) -> Result<()
 /// For Gemini-only slots (no `credentials/N.json`, no `config-N/`),
 /// `logout_account` returns `NotConfigured` which is treated as success
 /// — the Gemini-specific state was already cleaned by the vault delete
-/// and `unbind` call above. See journal 0011 §FD #1 and journal 0013 D7.
+/// and `unbind` call above. See an internal journal entry §FD #1 and an internal journal entry D7.
 ///
 /// ## M13b FIX-6 — Gemini-specific audit ordering
 ///
@@ -884,7 +935,7 @@ pub struct MoveAccountSummary {
     pub live_pids_bound: Vec<u32>,
 }
 
-/// Phase B' (journal 0050) — returns the per-account usage summary for the
+/// Phase B' (an internal journal entry) — returns the per-account usage summary for the
 /// pay-per-token ledger view. Runs the aggregator inline (scans CC's
 /// session-meta + reads csq's launch log + attributes via post-hoc time
 /// correlation) and computes rolling time windows.
@@ -1304,7 +1355,7 @@ impl From<LoginRequest> for ClaudeLoginView {
 ///
 /// This is step 1 of the paste-code OAuth flow:
 /// 1. Generates a fresh PKCE verifier + challenge
-/// 2. Records them in the shared [`OAuthStateStore`] keyed by a
+/// 2. Records them in the shared `OAuthStateStore` keyed by a
 ///    random state token (CSRF protection + single-use)
 /// 3. Builds the Anthropic authorize URL and returns it to the
 ///    frontend as a [`ClaudeLoginView`]
@@ -1382,18 +1433,13 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
         std::fs::create_dir_all(&config_dir)
             .map_err(|e| format!("failed to create config dir: {e}"))?;
 
-        // Mark this dir with the account number.
-        //
-        // M4-7: identity UUID if `by_slot` maps; otherwise legacy decimal.
-        match csq_core::accounts::profiles::resolve_slot_to_uuid(&base, account_num.get()) {
-            Some(uuid) => csq_core::accounts::markers::write_csq_account(&config_dir, uuid)
-                .map_err(|e| format!("failed to write marker: {e}"))?,
-            None => csq_core::accounts::markers::write_csq_account_legacy(
-                &config_dir,
-                account_num,
-            )
-            .map_err(|e| format!("failed to write marker: {e}"))?,
-        }
+        // NOTE: the `.csq-account` marker is written LATER — only after the
+        // credential read + save succeed (see below). Writing it here, before
+        // the subprocess and `read_fresh_after_login` (which can now return
+        // Err(OnlyStale/NoCredentials)), would leave an orphan marker the
+        // daemon's discovery treats as a credential-less account — the M8 /
+        // REV-R1-02 bug the live CLI path (handle_direct_post_subprocess) fixed
+        // by ordering marker-after-save.
 
         // Run claude auth login with isolated config dir, calling
         // by absolute path so the Finder-default $PATH gap can't
@@ -1408,24 +1454,45 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
             return Err("claude auth login failed or was cancelled".to_string());
         }
 
-        // CC's modern `claude auth login` writes credentials to the
-        // macOS keychain at the hashed service name (sometimes also
-        // mirrored to `.credentials.json`, sometimes not). Read
-        // keychain first, fall back to file — at least one source
-        // is populated after a successful auth.
-        let creds = csq_core::credentials::keychain::read(&config_dir)
-            .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok())
-            .ok_or_else(|| {
-                "no credentials captured after login — keychain and file both empty".to_string()
-            })?;
+        // CC's modern `claude auth login` commits the freshly minted token to
+        // the macOS Keychain, and that write can land a beat AFTER the
+        // subprocess exits. `read_fresh_after_login` reads both keychain and
+        // file, keeps whichever has the later `expiresAt`, retries to let CC
+        // commit, and errors rather than persisting a stale token — the same
+        // hardening as the live CLI + desktop-twin login paths
+        // (`csq_core::credentials::post_login`). This `start_claude_login`
+        // entry point is a dormant `#[allow(dead_code)]` rollback knob, but it
+        // is hardened identically so re-enabling it can never re-introduce the
+        // keychain-commit-race bug. Already inside `spawn_blocking`, so the
+        // synchronous retry helper is fine here.
+        let creds = csq_core::credentials::read_fresh_after_login(&config_dir)
+            .map_err(|e| e.to_string())?;
+
+        // an internal ticket: mint the slot's identity UUID BEFORE save_canonical_for
+        // (which is fail-closed on an absent UUID, M4-12). Mirrors the two live
+        // login twins (CLI handle_direct_post_subprocess + desktop
+        // start_claude_login_subprocess) so re-enabling this rollback knob can't
+        // hit the fresh-install / keychain-only "no credentials configured"
+        // failure. Idempotent + no-op when already minted or no email source.
+        csq_core::accounts::login::ensure_login_identity_minted(&base, account_num)
+            .map_err(|e| format!("mint identity: {e}"))?;
 
         // Save canonical (UUID-keyed path; M4-12: fail-closed if UUID absent)
         credentials::save_canonical_for(&base, account_num, &creds)
             .map_err(|e| format!("credential write failed: {e}"))?;
 
-        // Marker, profiles.json email update, broker-failed clear —
-        // shared with `csq login` so the dashboard sees the real
-        // email instead of "unknown".
+        // Mark this dir with the account number — AFTER the credential read +
+        // save succeed (M8 / REV-R1-02 ordering, mirroring the live CLI path).
+        // M4-7: identity UUID if `by_slot` maps; otherwise legacy decimal.
+        match csq_core::accounts::profiles::resolve_slot_to_uuid(&base, account_num.get()) {
+            Some(uuid) => csq_core::accounts::markers::write_csq_account(&config_dir, uuid)
+                .map_err(|e| format!("failed to write marker: {e}"))?,
+            None => csq_core::accounts::markers::write_csq_account_legacy(&config_dir, account_num)
+                .map_err(|e| format!("failed to write marker: {e}"))?,
+        }
+
+        // profiles.json email update + broker-failed clear — shared with
+        // `csq login` so the dashboard sees the real email instead of "unknown".
         csq_core::accounts::login::finalize_login(&base, account_num)
             .map_err(|e| format!("post-login bookkeeping failed: {e}"))?;
 
@@ -1472,7 +1539,7 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
 /// - `"credential write failed: ..."` — disk error during save
 ///
 /// All error messages are pre-redacted — the underlying
-/// [`OAuthError`] types already run response bodies through
+/// `OAuthError` types already run response bodies through
 /// `redact_tokens`, so it is safe to surface the message to the
 /// frontend and the log.
 #[tauri::command]
@@ -1582,7 +1649,7 @@ pub fn cancel_login(state: State<'_, AppState>, state_token: String) -> Result<(
         // Fixed-vocabulary fallback to avoid leaking `OAuthError::Http { body }`
         // or `OAuthError::Exchange(String)` content through the IPC
         // response if a future refactor widens `consume`'s error
-        // surface. Journal 0063 M1.
+        // surface. an internal journal entry M1.
         Err(csq_core::error::OAuthError::Http { .. }) => Err("cancel failed: http_error".into()),
         Err(csq_core::error::OAuthError::PkceVerification) => {
             Err("cancel failed: pkce_verification".into())
@@ -1636,7 +1703,7 @@ pub fn set_provider_key(
 ) -> Result<String, String> {
     // 4096 matches MAX_KEY_LEN in csq-cli setkey.
     const MAX_KEY_LEN: usize = 4096;
-    // Mirrors csq_core::accounts::third_party::MIN_KEY_LEN (journal 0058).
+    // Mirrors csq_core::accounts::third_party::MIN_KEY_LEN (an internal journal entry).
     // Defense in depth against ESC / garbage tokens slipping through the
     // Bearer form's input box.
     const MIN_KEY_LEN: usize = 8;
@@ -1870,7 +1937,7 @@ pub fn list_ollama_models() -> Result<Vec<String>, String> {
 /// desktop use exactly the same Phase 2 logic.
 ///
 /// See `csq-core/src/session/settings.rs` for implementation and
-/// `workspaces/account-slot-decoupling/02-plans/03-phase2-readiness.md § M2-7`
+/// `internal-design-docs § M2-7`
 /// for the M2-7 READER routing contract.
 pub fn set_slot_model_write(base_dir: String, slot: u16, model: String) -> Result<(), String> {
     let slot_num =
@@ -2173,7 +2240,7 @@ pub fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String
 // for shape-consistency across platforms (a future user switching
 // hosts should not lose their preference).
 //
-// See `workspaces/desktop-dock-hide/journal/0001-DECISION-...` for
+// See `internal-design-docs` for
 // the API-choice rationale (Accessory vs `set_dock_visibility(false)`).
 
 /// Returns whether the running platform supports the dock-hide
@@ -2696,7 +2763,7 @@ pub async fn start_codex_login(
 /// with 0o400 and fires an `invalidate-cache` to the daemon so the
 /// dashboard sees the new slot on its next poll tick.
 ///
-/// # Idempotency + concurrency (journal 0021 finding 8)
+/// # Idempotency + concurrency (an internal journal entry finding 8)
 ///
 /// This command is NOT idempotent mid-flight: a second concurrent call
 /// for the same `account` returns `Err("codex login already in progress
@@ -2705,7 +2772,7 @@ pub async fn start_codex_login(
 /// populated we refuse. Once the first call completes (success or
 /// failure), the slot is cleared and a retry is allowed.
 ///
-/// # Cancellation (journal 0021 finding 6)
+/// # Cancellation (an internal journal entry finding 6)
 ///
 /// The running child process is registered in
 /// `AppState.codex_login_child` so a later [`cancel_codex_login`] can
@@ -2724,7 +2791,7 @@ pub async fn complete_codex_login(
     let base = PathBuf::from(&base_dir);
     let app_for_task = app.clone();
 
-    // Journal 0021 finding 8: refuse concurrent invocations for any
+    // an internal journal entry finding 8: refuse concurrent invocations for any
     // account. codex-cli writes to a single `CODEX_HOME/auth.json`
     // and multiple spawns would race both the subprocess itself and
     // the post-login `save_canonical_for` + `remove_file` sequence.
@@ -2754,13 +2821,13 @@ pub async fn complete_codex_login(
                 spawn_codex_device_auth_piped(config_dir, on_code, &app_for_task, &child_slot)
             },
             |info| {
-                // Journal 0021 finding 4: emit_to("main") so a
+                // an internal journal entry finding 4: emit_to("main") so a
                 // secondary window (tray/settings) cannot subscribe
                 // to the one-time user_code.
                 let _ = app_for_task.emit_to("main", "codex-device-code", &info);
             },
         )
-        // Journal 0021 finding M3: pass the full anyhow chain
+        // an internal journal entry finding M3: pass the full anyhow chain
         // through `redact_tokens` before it reaches the renderer.
         // Defense-in-depth — inner call sites already redact, but
         // a future `.context(...)` that omits redaction would leak
@@ -2782,7 +2849,7 @@ pub async fn complete_codex_login(
 
         // Best-effort: kick daemon cache invalidation so the dashboard
         // sees the new slot immediately rather than waiting for the
-        // 5s discovery tick. Journal 0021 finding M6: the HTTP POST
+        // 5s discovery tick. an internal journal entry finding M6: the HTTP POST
         // over the Unix socket has NO client-side timeout — a hung
         // daemon would block the spawn_blocking thread. We wrap in
         // a coarse 500ms deadline enforced by a worker thread. If
@@ -2872,7 +2939,7 @@ fn should_emit_url_without_code_diagnostic(
 /// same ergonomic pattern as `ollama-pull-progress` in
 /// [`pull_ollama_model`].
 ///
-/// # PR-C9a hardening (journal 0021)
+/// # PR-C9a hardening (an internal journal entry)
 ///
 /// - Device-code parse runs on the **scrubbed** line (finding 2) so a
 ///   malicious codex-cli that prints a synthetic code alongside a
@@ -2965,6 +3032,16 @@ fn spawn_codex_device_auth_piped(
         csq_core::providers::codex::desktop_login::DeviceCodeAccumulator::new(),
     ));
 
+    // #2a (browser auto-open): open the verification URL the instant codex-cli
+    // prints it, rather than waiting for the accumulator to pair URL+code.
+    // codex-cli 0.128.0+ prints the URL on an EARLIER line than the code, so the
+    // paired `codex-device-code` event (and the modal's openUrl) fire only after
+    // the later code line — leaving the browser closed in between (user had to
+    // open it manually). The URL is already allowlist/HTTPS/userinfo-validated by
+    // `extract_device_auth_url`. Guarded so it fires at most once; best-effort
+    // (an opener failure never blocks login — the modal still renders the link).
+    let url_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Reader factory. Only the stdout reader feeds the parser; stderr
     // emits progress only. This narrows the parse trust boundary:
     // stderr lines are never interpreted as device codes.
@@ -2977,7 +3054,8 @@ fn spawn_codex_device_auth_piped(
     >,
                   accumulator: Arc<
         std::sync::Mutex<csq_core::providers::codex::desktop_login::DeviceCodeAccumulator>,
-    >| {
+    >,
+                  url_opened: Arc<std::sync::atomic::AtomicBool>| {
         let stream = match stream {
             Some(s) => s,
             None => return None,
@@ -3036,6 +3114,29 @@ fn spawn_codex_device_auth_piped(
                 // accumulator so codex-cli 0.128.0's split-line shape
                 // is handled.
                 if parse && !truncated {
+                    // #2a: open the verification URL as soon as it appears,
+                    // before the code line arrives. Once-guarded, best-effort —
+                    // mirrors the CLI's URL-alone auto-launch.
+                    if !url_opened.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(url) =
+                            csq_core::providers::codex::desktop_login::extract_device_auth_url(
+                                &scrubbed,
+                            )
+                        {
+                            if url_opened
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                )
+                                .is_ok()
+                            {
+                                use tauri_plugin_opener::OpenerExt;
+                                let _ = app.opener().open_url(&url, None::<&str>);
+                            }
+                        }
+                    }
                     let maybe_info = accumulator
                         .lock()
                         .ok()
@@ -3057,6 +3158,7 @@ fn spawn_codex_device_auth_piped(
         app.clone(),
         tx.clone(),
         Arc::clone(&accumulator),
+        Arc::clone(&url_opened),
     );
     let stderr_t = reader(
         stderr.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
@@ -3065,6 +3167,7 @@ fn spawn_codex_device_auth_piped(
         app.clone(),
         tx.clone(),
         Arc::clone(&accumulator),
+        Arc::clone(&url_opened),
     );
 
     // Drop the forwarder's tx clone so rx.recv() returns Err once
@@ -3082,7 +3185,7 @@ fn spawn_codex_device_auth_piped(
         }
     }
 
-    // Journal 0021 finding 7: wait on the child BEFORE joining
+    // an internal journal entry finding 7: wait on the child BEFORE joining
     // reader threads. A stuck reader thread would deadlock .join()
     // forever otherwise. After child exit, the OS closes pipes and
     // the reader threads see EOF.
@@ -3325,7 +3428,7 @@ fn probe_codex_cli_models() -> Result<Vec<u8>, String> {
 /// desktop picker only surfaces ids from `list_codex_models`, and
 /// custom ids are an explicit override.
 ///
-/// # Surface verification (journal 0021 finding 9)
+/// # Surface verification (an internal journal entry finding 9)
 ///
 /// Refuses when the target slot is not a Codex slot. Without this
 /// check, a renderer passing a ClaudeCode slot number would cause
@@ -3351,7 +3454,7 @@ pub fn set_codex_slot_model(
         return Err(format!("base directory does not exist: {base_dir}"));
     }
 
-    // Journal 0021 finding 9: verify surface before writing.
+    // an internal journal entry finding 9: verify surface before writing.
     // `write_config_toml` does not verify the destination slot's
     // surface; it would silently poison an Anthropic slot with
     // Codex config.toml if called on the wrong slot.
@@ -3449,7 +3552,7 @@ pub fn acknowledge_gemini_tos(base_dir: String) -> Result<(), String> {
 /// credentials remain on disk untouched and would still be picked
 /// up by a separate Code Assist OAuth slot if one is bound. Earlier
 /// revisions framed this probe as ToS-driven enforcement
-/// (ADR-G01/G12) — that framing was retracted in journal 0048.
+/// (ADR-G01/G12) — that framing was retracted in an internal journal entry
 /// Returns the absolute path so the note can name the file
 /// concretely.
 #[tauri::command]
@@ -3649,7 +3752,7 @@ pub async fn gemini_provision_oauth(base_dir: String, slot: u16) -> Result<(), S
     // `~/.gemini/oauth_creds.json`, JSON parse, atomic binding-marker
     // write); keeping that off the Tauri runtime worker preserves
     // event-loop responsiveness even though the operation is fast
-    // (milliseconds, no subprocess, no browser wait — journal 0054).
+    // (milliseconds, no subprocess, no browser wait — an internal journal entry).
     //
     // Redact at the IPC boundary: `BindingWriteFailed` wraps
     // `ProvisionError` whose Display chain may include path / reason
@@ -3832,7 +3935,7 @@ mod tests {
     #[test]
     fn set_provider_key_rejects_key_with_control_char() {
         // ESC (0x1b) slipping through the Bearer form's password
-        // input is the desktop twin of the CLI bug in journal 0058.
+        // input is the desktop twin of the CLI bug in an internal journal entry
         let key = "valid-prefix\x1b-rest".to_string();
         let err = set_provider_key("/fake".into(), "mm".into(), key).unwrap_err();
         assert!(err.contains("control characters"), "got: {err}");
@@ -4015,6 +4118,18 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ── provider_cli_installed gating ──────────────────────────
+
+    #[test]
+    fn provider_cli_installed_rejects_unknown_binary() {
+        // Security gate: only the known surface binaries are probed. An
+        // arbitrary caller-supplied string returns false without touching PATH.
+        assert!(!provider_cli_installed("evil-binary".into()));
+        assert!(!provider_cli_installed("rm".into()));
+        assert!(!provider_cli_installed("".into()));
+        assert!(!provider_cli_installed("codex; rm -rf /".into()));
+    }
+
     // ── rename_account validation ──────────────────────────────
 
     #[test]
@@ -4075,7 +4190,7 @@ mod tests {
         assert_eq!(view.expires_in_secs, 600);
     }
 
-    // ── PR-C9a (journal 0021 finding 5) — IPC audit: whitelist, not blacklist ─
+    // ── PR-C9a (an internal journal entry finding 5) — IPC audit: whitelist, not blacklist ─
 
     /// Recursively collect every object key under `v`. The JSON is an
     /// arbitrary `serde_json::Value`; this walks nested objects +
@@ -4118,7 +4233,7 @@ mod tests {
             "IPC payload contains non-whitelisted keys {:?}. \
              Audit the type — if the new field is safe, add it to the \
              whitelist explicitly. Whitelist (not blacklist) is mandatory \
-             per journal 0021 finding 5.",
+             per an internal journal entry finding 5.",
             extra
         );
     }
@@ -4145,6 +4260,7 @@ mod tests {
             provider_id: None,
             billing_mode: "subscription".to_string(),
             quota_kind: "utilization".to_string(),
+            balance_display: None,
             gemini_counter_today: None,
             gemini_rate_limit_reset_at: None,
             gemini_selected_model: None,
@@ -4180,20 +4296,30 @@ mod tests {
                 "expires_in_secs",
                 "last_refresh_error",
                 "provider_id",
-                // Phase B (journal 0046): billing_mode is sent on
+                // Phase B (an internal journal entry): billing_mode is sent on
                 // every account so the renderer can branch on
                 // pay-per-token vs subscription vs local. Audited
                 // safe — the field is a fixed-vocabulary tag
                 // (`subscription` | `api-key` | `local`) with no
                 // credential material.
                 "billing_mode",
-                // Phase B' (journal 0050 D5): catalog quota_kind is
+                // Phase B' (an internal journal entry D5): catalog quota_kind is
                 // surfaced so the renderer can branch on Unknown slots
                 // (pay-per-token) and render the new BillingLedger
                 // view instead of stuck-at-zero 5h/7d bars. Audited
                 // safe — fixed-vocabulary tag from the catalog
                 // (`utilization` | `counter` | `unknown`).
                 "quota_kind",
+                // `balance_display` is skip_serializing_if=Option::is_none,
+                // so it doesn't appear in the serialized payload for
+                // subscription/utilization accounts (None here). Audited safe —
+                // it is a formatted monetary amount string ("$196.42"), not a
+                // credential, key, or path. It IS whitelisted here (a superset
+                // is fine) AND exercised with a populated `Some` value by
+                // `account_view_balance_variant_serializes_whitelisted` below,
+                // so the MUST-3 audit actually gates the field on the wire.
+                "balance_display",
+                //
                 // PR-G5 Gemini fields are skip_serializing_if=Option::is_none,
                 // so they don't appear in the serialized whitelist for
                 // non-Gemini accounts. They're added to the whitelist
@@ -4202,10 +4328,71 @@ mod tests {
         );
     }
 
+    /// #984 redteam (security M2): exercise the MUST-3 whitelist audit with
+    /// `balance_display` POPULATED (`Some`). The None-case test above cannot
+    /// gate the field because `skip_serializing_if=Option::is_none` drops it
+    /// from the wire; this test proves the populated field is a single scalar
+    /// key (no flattened sub-key leak) and is whitelisted.
+    #[test]
+    fn account_view_balance_variant_serializes_whitelisted() {
+        let v = AccountView {
+            id: 11,
+            label: "DeepSeek".into(),
+            source: "third_party".into(),
+            surface: "claude-code".into(),
+            has_credentials: true,
+            five_hour_pct: 0.0,
+            five_hour_resets_in: None,
+            seven_day_pct: 0.0,
+            seven_day_resets_in: None,
+            updated_at: 0.0,
+            token_status: "healthy".into(),
+            expires_in_secs: None,
+            last_refresh_error: None,
+            provider_id: Some("deepseek".into()),
+            billing_mode: "api-key".to_string(),
+            quota_kind: "balance".to_string(),
+            balance_display: Some("$196.42".into()),
+            gemini_counter_today: None,
+            gemini_rate_limit_reset_at: None,
+            gemini_selected_model: None,
+            gemini_effective_model: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(
+            json.contains(r#""balance_display":"$196.42""#),
+            "populated balance_display must serialize: {json}"
+        );
+        // The populated field must be gated by the whitelist audit — a
+        // formatted monetary string, no credential/key/path.
+        assert_ipc_keys_whitelisted(
+            &v,
+            &[
+                "id",
+                "label",
+                "source",
+                "surface",
+                "has_credentials",
+                "five_hour_pct",
+                "five_hour_resets_in",
+                "seven_day_pct",
+                "seven_day_resets_in",
+                "updated_at",
+                "token_status",
+                "expires_in_secs",
+                "last_refresh_error",
+                "provider_id",
+                "billing_mode",
+                "quota_kind",
+                "balance_display",
+            ],
+        );
+    }
+
     // ── PR-C8 Codex command IPC contract ───────────────────────
     //
     // Structural audit on every new Serialize type per
-    // `tauri-commands.md` MUST Rule 3. Journal 0021 finding 5 flips
+    // `tauri-commands.md` MUST Rule 3. an internal journal entry finding 5 flips
     // the blacklist harness to a per-struct whitelist so a future
     // `#[serde(flatten)] extra: CodexCredentials` slip is caught.
 
@@ -4216,7 +4403,7 @@ mod tests {
             tos_required: true,
             keychain: "absent".into(),
             awaiting_keychain_decision: false,
-            // Round-2 redteam MEDIUM-5 (journal 0054) — surface the
+            // Round-2 redteam MEDIUM-5 (an internal journal entry) — surface the
             // ChatGPT Security Settings prerequisite to the desktop UI
             // BEFORE the device-auth subprocess starts.
             device_auth_prereq_message:
@@ -4399,6 +4586,7 @@ mod tests {
             provider_id: None,
             billing_mode: "subscription".to_string(),
             quota_kind: "utilization".to_string(),
+            balance_display: None,
             gemini_counter_today: None,
             gemini_rate_limit_reset_at: None,
             gemini_selected_model: None,
@@ -4432,6 +4620,7 @@ mod tests {
             provider_id: None,
             billing_mode: "subscription".to_string(),
             quota_kind: "utilization".to_string(),
+            balance_display: None,
             gemini_counter_today: Some(42),
             gemini_rate_limit_reset_at: Some("2026-04-26T13:00:00Z".into()),
             gemini_selected_model: Some("gemini-3-pro-preview".into()),
@@ -4450,12 +4639,12 @@ mod tests {
 
     // ── #367 — utilization quota surface-match gate ─────────────────
     //
-    // Origin: issue #367 + journal 0058 H2. Codex slots (and any future
+    // Origin: an internal ticket + an internal journal entry H2. Codex slots (and any future
     // utilization-shape surface) MUST surface their own 5h/7d numbers
     // through the IPC payload; the gate is `quota.surface ==
     // account.surface`, NOT `account.source == Anthropic`. The
     // surface-match gate is also the structural defense against the
-    // journal 0058 H2 leakage path: a slot ID rebound from one surface
+    // an internal journal entry H2 leakage path: a slot ID rebound from one surface
     // to another with a stale quota.json[N] from the prior occupant must
     // NOT ship the prior surface's numbers.
 
@@ -4568,7 +4757,7 @@ mod tests {
         );
     }
 
-    /// **2026-05-26 Gemini token-badge follow-up to journal 0029.** The Codex
+    /// **2026-05-26 Gemini token-badge follow-up to an internal journal entry** The Codex
     /// fix introduced a Codex-specific token-status branch, but Gemini slots
     /// remained routed through the Anthropic else branch — which loads the
     /// Anthropic `credentials.json` at the slot's UUID path and reports
@@ -4748,7 +4937,7 @@ mod tests {
         assert_eq!(status(3), "healthy", "5h left — healthy control");
     }
 
-    /// Journal 0058 H2 regression: a slot ID rebound across surfaces
+    /// an internal journal entry H2 regression: a slot ID rebound across surfaces
     /// must NOT leak the prior occupant's quota. Seed a Codex slot at
     /// id 13 but write a stale claude-code-surfaced quota.json[13]
     /// (simulating an Anthropic slot that previously held id 13). The
@@ -4781,9 +4970,9 @@ mod tests {
         assert!(v.seven_day_resets_in.is_none());
     }
 
-    // ── PR-C9a journal 0021 — set_codex_slot_model surface verification ─
+    // ── PR-C9a an internal journal entry — set_codex_slot_model surface verification ─
 
-    /// Journal 0021 finding 9: `set_codex_slot_model` must refuse when
+    /// an internal journal entry finding 9: `set_codex_slot_model` must refuse when
     /// the target slot is not a Codex slot. Without this the command
     /// would write a `config.toml` into a ClaudeCode slot's directory,
     /// poisoning surface classification (config.toml is a Codex-unique
@@ -4857,7 +5046,7 @@ mod tests {
         );
     }
 
-    // ── PR-C9a journal 0021 finding 2 — device-code parse is on scrubbed line ─
+    // ── PR-C9a an internal journal entry finding 2 — device-code parse is on scrubbed line ─
 
     /// Pins the trust-boundary narrowing: if a codex-cli process
     /// substitution prints `"Go to https://legit enter FOOB-AR23 sk-ant-oat01-bad"`
@@ -4871,7 +5060,7 @@ mod tests {
         use csq_core::error::redact_tokens;
         // rt_* requires ≥20 body chars per TOKEN_PREFIXES_WITH_BODY in
         // csq-core error.rs — this reflects real Codex refresh tokens
-        // which are 87-char base64url bodies (journal 0010).
+        // which are 87-char base64url bodies (an internal journal entry).
         let raw =
             "Visit https://chatgpt.com/auth/device code FOOB-AR23 token=sk-ant-oat01-abcdef1234 \
                    eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3OCJ9.sigPaddingLongEnough \
@@ -4977,7 +5166,7 @@ mod tests {
     #[test]
     fn gemini_provision_api_key_rejects_control_characters() {
         // ESC byte mid-paste — same shape the Bearer form was bitten
-        // by in journal 0058. Refuse at the boundary.
+        // by in an internal journal entry Refuse at the boundary.
         let key = "AIzaSy\x1bXX_xxxxxxxxxxxxxxxxxxxxxxxxxx".to_string();
         let err = gemini_provision_api_key("/tmp".into(), 1, key).unwrap_err();
         assert!(err.contains("control characters"), "got: {err}");
@@ -5615,6 +5804,16 @@ mod tests {
         use csq_core::providers::gemini::SURFACE_GEMINI;
         use secrecy::SecretString;
 
+        // Hermeticity: open_default_vault (below) reads the process-global
+        // CSQ_SECRET_BACKEND (platform/secret/mod.rs). This test is #[ignore]d (runs
+        // only under --ignored, in isolation) so it cannot race in normal CI, but if
+        // it is ever un-ignored it MUST serialize against the sibling vault tests that
+        // mutate CSQ_SECRET_BACKEND. Hold the shared env lock + pin the default
+        // backend (unset → real keychain, which this smoke test intends)
+        // (testing.md Rule 6 / test-hermeticity.md MUST 1b — reader side).
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_SECRET_BACKEND");
+
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
         let slot_num = AccountNum::try_from(99u16).unwrap();
@@ -5681,7 +5880,7 @@ mod tests {
     // ── §5a regression helper (inline; csq-desktop cannot reach pub(crate)) ──
     //
     // Mirrors `csq_core::platform::fs::assert_no_tmp_leak_on_readonly_parent`.
-    // Origin: security.md §5a, journal 0065 B2, /redteam round 3 (2026-05-09).
+    // Origin: security.md §5a, an internal journal entry B2, /redteam round 3 (2026-05-09).
     #[cfg(unix)]
     fn assert_no_tmp_leak_on_readonly_parent_inline<F, E>(dir: &std::path::Path, op: F)
     where
@@ -5709,7 +5908,7 @@ mod tests {
         assert!(leaked.is_empty(), "§5a leaked tmp files: {leaked:?}");
     }
 
-    /// §5a regression — site 10 (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression — site 10 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `set_slot_model_write` fails
     /// after the tmp file would have been created (settings dir read-only →
     /// write fails), no `.tmp.` file must remain.
@@ -5803,6 +6002,113 @@ mod tests {
         assert!(
             e.contains("base directory does not exist"),
             "validation error must name the field, got: {e}"
+        );
+    }
+
+    // ── balance_display — DeepSeek balance field ─────────────────────
+    //
+    // Pins the IPC pipeline that propagates `AccountQuota::balance` →
+    // `AccountView::balance_display`. For DeepSeek slots the quota record
+    // has `balance: Some(BalanceInfo { currency: "USD", remaining: 196.42 })`
+    // and `five_hour` / `seven_day` are None. The formatted string MUST
+    // appear as `balance_display` on the IPC view; non-balance slots
+    // MUST have `balance_display = None`.
+
+    /// Helper: write a `config-<slot>/settings.json` pointing at DeepSeek.
+    fn write_deepseek_slot_settings(base: &std::path::Path, slot: u16, token: &str) {
+        let dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","ANTHROPIC_AUTH_TOKEN":"{token}"}}}}"#
+        );
+        std::fs::write(dir.join("settings.json"), json).unwrap();
+    }
+
+    /// Helper: write a quota.json with a balance-only record for `slot`.
+    fn write_balance_quota_file(base: &std::path::Path, slot: u16, currency: &str, remaining: f64) {
+        use csq_core::quota::{AccountQuota, BalanceInfo, QuotaFile};
+        let mut f = QuotaFile::empty();
+        f.schema_version = 2;
+        let q = AccountQuota {
+            surface: "claude-code".to_string(),
+            balance: Some(BalanceInfo {
+                currency: currency.to_string(),
+                remaining,
+            }),
+            updated_at: 1_775_722_800.0,
+            ..AccountQuota::default()
+        };
+        f.set(slot, q);
+        csq_core::quota::state::save_state(base, &f).unwrap();
+    }
+
+    #[test]
+    fn get_accounts_deepseek_slot_balance_display_usd() {
+        // Arrange: DeepSeek slot 5 with $196.42 USD balance.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_deepseek_slot_settings(dir.path(), 5, "sk-deepseek");
+        write_balance_quota_file(dir.path(), 5, "USD", 196.42);
+
+        // Act
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 5)
+            .expect("DeepSeek slot 5 must appear in the view");
+
+        // Assert
+        assert_eq!(v.source, "third_party");
+        assert_eq!(v.quota_kind, "balance");
+        assert_eq!(
+            v.balance_display.as_deref(),
+            Some("$196.42"),
+            "USD balance must be formatted as '$196.42'"
+        );
+    }
+
+    #[test]
+    fn get_accounts_deepseek_slot_balance_display_non_usd() {
+        // Arrange: DeepSeek slot 6 with a non-USD currency.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_deepseek_slot_settings(dir.path(), 6, "sk-deepseek");
+        write_balance_quota_file(dir.path(), 6, "CNY", 1400.50);
+
+        // Act
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 6)
+            .expect("DeepSeek slot 6 must appear in the view");
+
+        // Assert
+        assert_eq!(
+            v.balance_display.as_deref(),
+            Some("1400.50 CNY"),
+            "Non-USD balance must be formatted as '<amount> <currency>'"
+        );
+    }
+
+    #[test]
+    fn get_accounts_non_balance_slot_has_no_balance_display() {
+        // Arrange: Codex slot (subscription model) — no balance field.
+        let dir = tempfile::TempDir::new().unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        seed_codex_slot(&creds_dir, 7);
+        write_quota_file(dir.path(), &[(7, "codex", 25.0, 50.0)]);
+
+        // Act
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 7)
+            .expect("Codex slot 7 must appear in the view");
+
+        // Assert: subscription slots MUST NOT carry a balance_display.
+        assert!(
+            v.balance_display.is_none(),
+            "Non-balance (Codex subscription) slot must have balance_display = None; got {:?}",
+            v.balance_display
         );
     }
 }

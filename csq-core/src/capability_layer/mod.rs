@@ -32,7 +32,7 @@
 //! compile time, that no stage holds `&mut PreSpawnState` and
 //! `&PostSpawnState` simultaneously. Spec 10 §10.3.3 is the single
 //! load-bearing invariant; it is enforced by the type system, not by
-//! a runtime "scrambled order" test (per journal 0008).
+//! a runtime "scrambled order" test (per an internal journal entry).
 //!
 //! # Determinism (spec 10 §10.3.5)
 //!
@@ -51,6 +51,7 @@ pub mod errors;
 pub mod instrumentation;
 pub mod log_volume;
 pub mod logging;
+pub mod mcp_coverage;
 pub mod mcp_gate;
 pub mod pipeline;
 pub mod post_validate;

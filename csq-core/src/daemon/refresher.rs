@@ -110,7 +110,7 @@ pub const STARTUP_DELAY: Duration = Duration::from_secs(3);
 /// it is the channel that catches host sleep/wake). After the host wakes, the
 /// wall clock has jumped past the deadline, so the next tick fires within one
 /// probe granularity (≤30s) instead of ≤5 minutes. Smaller = faster post-wake
-/// catch-up but more idle wakeups; 30s balances both. Origin: journal 0062 Q2.
+/// catch-up but more idle wakeups; 30s balances both. Origin: an internal journal entry Q2.
 pub const WAKE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Compute the next sub-sleep chunk while waiting for the refresh `deadline`,
@@ -121,7 +121,7 @@ pub const WAKE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// host woke from sleep and the wall clock advanced), this returns `None`
 /// and the caller ticks immediately rather than waiting out a full monotonic
 /// interval. Otherwise it returns the shorter of `probe` and the remaining
-/// time, so the wait never overshoots the deadline. Origin: journal 0062 Q2.
+/// time, so the wait never overshoots the deadline. Origin: an internal journal entry Q2.
 fn next_wait_chunk(
     now: std::time::SystemTime,
     deadline: std::time::SystemTime,
@@ -154,7 +154,7 @@ fn next_wait_chunk(
 ///   while the host sleeps, so this channel catches sleep/wake — after wake the
 ///   wall clock has jumped past `deadline` and this returns `None`.
 ///
-/// Origin: journal 0062 Q2.
+/// Origin: an internal journal entry Q2.
 fn wait_chunk_or_done(
     elapsed: Duration,
     interval: Duration,
@@ -369,6 +369,22 @@ async fn run_loop(
             );
         }
 
+        // M6 #909 shard B: periodic backstop drain of both durable audit outboxes
+        // onto the signed chain. Rides the same 5-min refresher cadence as the
+        // held-sweep above; synchronous chain I/O → spawn_blocking so it never
+        // stalls the runtime. A panic surfaces as a JoinError and is logged
+        // without killing the loop (same posture as the held-sweep).
+        let drain_base = base_dir.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || run_outbox_drain_tick(&drain_base)).await
+        {
+            tracing::warn!(
+                error_kind = "outbox_periodic_drain_task_panicked",
+                error = %e,
+                "periodic outbox drain task panicked"
+            );
+        }
+
         // Wait for the next interval or cancellation. Two break channels so a
         // host sleep/wake doesn't strand aged tokens for a full interval while
         // a wall-clock step never delays a tick past the monotonic interval:
@@ -378,7 +394,7 @@ async fn run_loop(
         //   - wall-clock deadline: `next_wait_chunk` — catches host sleep/wake
         //     (wall clock jumps past the deadline while the monotonic clock was
         //     paused), so the loop ticks within one probe granularity of wake.
-        // Origin: journal 0062 Q2.
+        // Origin: an internal journal entry Q2.
         let started = Instant::now();
         let deadline = std::time::SystemTime::now() + interval;
         let probe = WAKE_PROBE_INTERVAL.min(interval);
@@ -397,6 +413,78 @@ async fn run_loop(
                 _ = tokio::time::sleep(chunk) => {}
             }
         }
+    }
+}
+
+/// M6 #909 shard B: periodic backstop drain of BOTH durable audit outboxes.
+///
+/// Runs on every refresher tick (the daemon's existing periodic cadence). Drains
+/// the `csq run` audit floor (`csq-runs/.pending/`, community) and — enterprise
+/// only — the MCP-gate outbox (`csq-runs/.pending-mcp-gate/`) onto the signed
+/// chain, then stamps the drain-cycle time. This backstop bounds the worst-case
+/// "queued compliance record not yet on chain" latency to ONE refresher interval
+/// instead of "until the next daemon restart" (days, for a long-lived daemon) — it
+/// covers every recovery scenario, including the daemon-stays-up signing-cutoff
+/// recovery that the startup drain never re-fires for. Startup drain + the
+/// event-driven live-path-recovery drain are the other two stamp sites.
+///
+/// Concurrency: unlike the startup reconciler (which runs before socket bind), this
+/// runs while live `POST /api/audit/*` handlers may emit. That is safe — every
+/// chain append (drain-side and live-side) is serialized by the `.chain-lock`, the
+/// drains leave any lock-contended record queued for an idempotent retry next tick,
+/// and each drain snapshots its outbox dir before processing so a concurrently
+/// written file is simply picked up next tick. Synchronous chain I/O → invoked via
+/// `spawn_blocking` from the async loop so it never stalls the runtime. Best-effort:
+/// nothing here ever propagates or panics into the refresher loop.
+pub(crate) fn run_outbox_drain_tick(base_dir: &std::path::Path) {
+    // Nothing can be queued without the chain dir; skip cleanly (this also avoids
+    // a spurious stamp-write warn on a base that has no audit subsystem at all).
+    if !base_dir.join("csq-runs").exists() {
+        return;
+    }
+
+    let run_floor = crate::daemon::startup_reconciler::drain_run_floor(base_dir);
+    if run_floor.drained > 0 || run_floor.invalid > 0 || run_floor.unknown_version > 0 {
+        info!(
+            error_kind = "outbox_periodic_drain_run_floor",
+            drained = run_floor.drained,
+            invalid = run_floor.invalid,
+            unknown_version = run_floor.unknown_version,
+            "periodic backstop drained csq-run audit floor"
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    {
+        let mcp = crate::audit::mcp_gate_outbox::drain_pending(base_dir);
+        // Surface the actionable subset in the tick summary too: `write_failed_terminal`
+        // is the operator-actionable non-self-healing backlog, and a deferred drain
+        // (broken/uninit chain) leaves EVERY queued record unprocessed — the exact
+        // scenario that most warrants a per-tick count. (`drain_pending` also emits its
+        // own deferred signal; this adds the structured count the operator triages on.)
+        if mcp.drained > 0
+            || mcp.invalid > 0
+            || mcp.write_failed > 0
+            || mcp.deferred_chain_unavailable
+        {
+            info!(
+                error_kind = "outbox_periodic_drain_mcp_gate",
+                drained = mcp.drained,
+                invalid = mcp.invalid,
+                write_failed = mcp.write_failed,
+                write_failed_terminal = mcp.write_failed_terminal,
+                deferred_chain_unavailable = mcp.deferred_chain_unavailable,
+                deferred_pending_count = mcp.deferred_pending_count,
+                "periodic backstop drained mcp-gate outbox"
+            );
+        }
+    }
+
+    if let Err(e) = crate::audit::outbox_paths::stamp_outbox_drain(base_dir) {
+        tracing::warn!(
+            error_kind = "outbox_drain_stamp_failed",
+            "periodic outbox drain-stamp write failed: {e}"
+        );
     }
 }
 
@@ -425,6 +513,39 @@ pub(crate) fn run_held_sweep_tick(base_dir: &std::path::Path) {
     }
 }
 
+/// After a tick refreshed at least one Anthropic credential, mirror the fresh
+/// tokens into the macOS keychain items Claude Code reads.
+///
+/// Current CC reads OAuth credentials keychain-first, not from the
+/// `.credentials.json` file the daemon refreshes — so without this a live handle
+/// dir keeps the pre-rotation token and 401s. `csq run`/`csq swap` sync at
+/// launch; this closes the mid-session gap (a long-running session whose token
+/// rotates under it).
+///
+/// Sweeps EVERY live handle dir via `keychain::sync_all_handle_dirs` rather than
+/// attributing dirs to the refreshed account: each dir is synced from its OWN
+/// credential symlink, and the newer-than-keychain guard makes unchanged dirs a
+/// no-op — so only the dirs whose token actually rotated this tick write. This
+/// deliberately avoids per-account handle-dir attribution, whose marker reader is
+/// numeric-only and blind to the UUID `.csq-account` markers modern `csq run`
+/// writes (which would make the fan-out silently do nothing). Called only when a
+/// refresh occurred this tick, so idle ticks pay nothing.
+///
+/// Best-effort + test-safe: a base dir with no `term-<pid>/` dirs (every
+/// refresher unit test) sweeps nothing, so no keychain syscall fires under
+/// `cargo test`; on non-macOS the write is a no-op stub. An aggregate failure is
+/// logged with a fixed tag; it never affects the refresh outcome.
+fn sync_refreshed_keychains(base_dir: &std::path::Path) {
+    let (_synced, _skipped, failed) = crate::credentials::keychain::sync_all_handle_dirs(base_dir);
+    if failed > 0 {
+        tracing::warn!(
+            error_kind = "cc_keychain_sync_failed",
+            failed,
+            "post-refresh CC keychain mirror failed for one or more handle dirs (non-fatal)"
+        );
+    }
+}
+
 /// Runs a single refresher tick — discover accounts, check each
 /// one, update cache, manage cooldowns.
 ///
@@ -446,7 +567,7 @@ pub(crate) async fn tick(
     // - `discover_anthropic`: Claude OAuth slots (refreshed via
     //   `broker_check`).
     // - `discover_codex`: Codex OAuth slots (PR-C3a primitive). Per
-    //   journal 0013 + spec 07 §7.5 INV-P01, the daemon must OWN
+    //   an internal journal entry + spec 07 §7.5 INV-P01, the daemon must OWN
     //   refresh cadence for Codex (2h pre-expiry); PR-C4 wires
     //   `broker_codex_check`. Until then, Codex slots are iterated
     //   but skipped inside the loop so telemetry sees them and
@@ -479,6 +600,21 @@ pub(crate) async fn tick(
     let mut rate_limited_this_tick = false;
 
     let mut codex_processed = 0usize;
+    // Set when any Anthropic account's store token changed this tick — by a real
+    // refresh (broker_check `Refreshed`) OR by the custodian adopting a harvested
+    // live token (Option A). Drives the post-loop CC keychain sweep
+    // (`sync_refreshed_keychains`), which redistributes the new token to every live
+    // handle dir's keychain.
+    let mut any_anthropic_refreshed = false;
+
+    // Custodian (Option A) validation transport: the SAME Node `/api/oauth/usage`
+    // GET the usage poller uses (Cloudflare-safe — `discovery_cloudflare_tls_fingerprint`).
+    // Built once per tick; cheap Arc clone per account.
+    let http_get: crate::daemon::usage_poller::HttpGetFn =
+        Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+            crate::http::get_bearer_node(url, token, headers)
+        });
+
     for info in accounts {
         // Surface dispatch (PR-C4): Codex slots route to
         // `broker_codex_check` instead of `broker_check`. Both share
@@ -532,7 +668,7 @@ pub(crate) async fn tick(
                     // serde_json's error Display, which can echo input
                     // bytes — and the input here IS credential JSON.
                     // Redact before formatting per security.md MUST Rule 8
-                    // / journal 0010.
+                    // / an internal journal entry
                     let redacted = crate::error::redact_tokens(&e.to_string());
                     warn!(
                         account = info.id,
@@ -731,7 +867,7 @@ pub(crate) async fn tick(
                 }
                 None => cred_file::canonical_path(&canonical_base, account),
             };
-        let expires_at_ms = match credentials::load(&canonical) {
+        let mut expires_at_ms = match credentials::load(&canonical) {
             Ok(c) => c.expect_anthropic().claude_ai_oauth.expires_at,
             Err(canonical_err) => {
                 // M3-7 / SEC-3-H4: the live-mirror resurrection block
@@ -750,7 +886,7 @@ pub(crate) async fn tick(
                 // serde_json's error Display which can echo input bytes
                 // (and the input IS credential JSON). Mirror the Codex
                 // sibling at :378 above and redact before formatting per
-                // security.md MUST Rule 8 / journal 0010.
+                // security.md MUST Rule 8 / an internal journal entry
                 let redacted = crate::error::redact_tokens(&canonical_err.to_string());
                 warn!(
                     account = info.id,
@@ -762,6 +898,81 @@ pub(crate) async fn tick(
                 continue;
             }
         };
+
+        // ── Keychain custodian (Option A): harvest → validate → adopt ─────────
+        // Before the refresh decision, adopt the freshest LIVE token across this
+        // account's live handle-dir keychains into the canonical store. This
+        // dissolves the multi-session refresh war: when a sibling CC session
+        // self-refreshes (rotating the account's refresh-token and stranding csq's
+        // store + other sessions on a now-dead token), the daemon harvests that
+        // fresh token and levels the account to it — instead of fighting CC's
+        // per-session refresh. Only a server-confirmed-live token (200 on
+        // /api/oauth/usage) is adopted (an internal journal entry); a rotated-dead candidate
+        // (401, future expiresAt) is discarded. Runs in `spawn_blocking`: harvest
+        // does `security` subprocess reads and validate does a node-subprocess
+        // HTTPS call, both blocking. broker_check below re-reads the (possibly
+        // adopted) canonical INSIDE its lock — it no-ops on a now-fresh token, or
+        // refreshes a near-expiry adopted one (strictly better than skipping it).
+        //
+        // Gated on `!rate_limited_this_tick`: validate issues a live GET to
+        // /api/oauth/usage, which shares Anthropic's per-IP Cloudflare limit with the
+        // refresh endpoint. Once any account this tick has been throttled, the
+        // custodian MUST also stand down — it is a best-effort optimization, and the
+        // next un-throttled tick re-levels. A custodian-observed 429 itself sets the
+        // flag so subsequent accounts short-circuit too.
+        if !rate_limited_this_tick {
+            if let Some(uuid) =
+                crate::accounts::profiles::resolve_slot_to_uuid(&canonical_base, account.get())
+            {
+                let base_for_custodian = canonical_base.clone();
+                let uuid_s = uuid.to_string();
+                let http_get_c = Arc::clone(&http_get);
+                let outcome = tokio::task::spawn_blocking(move || {
+                    crate::daemon::custodian::reconcile_account(
+                        &base_for_custodian,
+                        account,
+                        &uuid_s,
+                        &http_get_c,
+                    )
+                })
+                .await;
+                use crate::daemon::custodian::ReconcileOutcome;
+                match outcome {
+                    Ok(ReconcileOutcome::Adopted) => {
+                        // Store token changed via adopt → live handle dirs need the new
+                        // token redistributed by the post-loop sweep.
+                        any_anthropic_refreshed = true;
+                        // Re-read the post-adopt expiry so `needs_refresh`, the
+                        // rate-limited-skip status, and the cache record below reflect
+                        // the freshly adopted token rather than the pre-adopt (often
+                        // near-expiry) value the custodian just healed.
+                        if let Ok(c) = credentials::load(&canonical) {
+                            if let Some(a) = c.anthropic() {
+                                expires_at_ms = a.claude_ai_oauth.expires_at;
+                            }
+                        }
+                    }
+                    Ok(ReconcileOutcome::RateLimited) => {
+                        // The custodian's own validate was throttled — propagate to the
+                        // tick's cross-account backoff so the remaining accounts (and
+                        // this account's broker_check) stand down.
+                        rate_limited_this_tick = true;
+                    }
+                    Ok(_) => {}
+                    Err(join_err) => {
+                        // A panic inside reconcile_account (e.g. a poisoned per-account
+                        // write mutex) surfaces here as a JoinError. Log it with a fixed
+                        // tag — never silently swallow a daemon-task panic.
+                        warn!(
+                            account = info.id,
+                            error_kind = "custodian_task_panicked",
+                            panicked = join_err.is_panic(),
+                            "custodian reconcile task failed (non-fatal)"
+                        );
+                    }
+                }
+            }
+        }
 
         // Check if this account needs a refresh (within the 2-hour
         // window). If so and we already hit a rate limit this tick,
@@ -842,6 +1053,18 @@ pub(crate) async fn tick(
                     BrokerResult::Valid | BrokerResult::Refreshed => {
                         clear_cooldown(cooldowns, info.id);
                         clear_backoff(backoffs, info.id);
+                        // CC reads each session's OAuth credential from the macOS
+                        // keychain, NOT the `.credentials.json` file we just
+                        // refreshed. On a real refresh (token changed) flag the
+                        // tick to sweep all live handle dirs' keychains afterward,
+                        // or CC keeps the pre-rotation token and 401s. Flag on
+                        // `Refreshed` ONLY: `Valid` means unchanged (no rotation),
+                        // so it needs no sweep (the newer-than-keychain guard would
+                        // skip it anyway). The post-loop sweep is account-agnostic
+                        // (see `sync_refreshed_keychains`).
+                        if matches!(broker_result, BrokerResult::Refreshed) {
+                            any_anthropic_refreshed = true;
+                        }
                     }
                 }
                 cache.set(info.id, status);
@@ -891,6 +1114,30 @@ pub(crate) async fn tick(
                 cache.set(info.id, status);
                 processed += 1;
             }
+        }
+    }
+
+    // If any Anthropic token rotated this tick, mirror the fresh tokens into the
+    // keychain items CC reads (CC is keychain-first). Account-agnostic sweep; the
+    // newer-than-keychain guard no-ops unchanged dirs. Only runs on a real
+    // refresh, so idle ticks pay nothing.
+    //
+    // Runs in `spawn_blocking`: the sweep shells one or more `security`
+    // subprocesses per live handle dir (synchronous, no timeout), and the daemon
+    // runtime has only 2 worker threads — a direct call would tie up half the
+    // runtime and delay socket IPC (mirrors `run_held_sweep_tick`'s wrapper).
+    if any_anthropic_refreshed {
+        let sweep_base = base_dir.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            sync_refreshed_keychains(&sweep_base);
+        })
+        .await
+        {
+            tracing::warn!(
+                error_kind = "cc_keychain_sync_task_panicked",
+                error = %e,
+                "post-refresh CC keychain sweep task panicked (non-fatal)"
+            );
         }
     }
 
@@ -962,8 +1209,18 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::TempDir;
 
+    #[test]
+    fn sync_refreshed_keychains_is_noop_without_handle_dirs() {
+        // Test-safety invariant: with no `term-<pid>/` handle dirs the sweep
+        // enumerates nothing and fires no keychain syscall — which is why every
+        // other refresher test (tempdir base, no handle dirs) never touches the
+        // real keychain. A panic-free return on an empty base proves it.
+        let dir = TempDir::new().unwrap();
+        sync_refreshed_keychains(dir.path()); // must not panic / touch keychain
+    }
+
     /// `next_wait_chunk` caps the sub-sleep at `probe`, returns the short tail
-    /// near the deadline, and — the load-bearing case for journal 0062 Q2 —
+    /// near the deadline, and — the load-bearing case for an internal journal entry Q2 —
     /// returns `None` (tick now) when the wall clock has jumped past the
     /// deadline, as it does after the host wakes from sleep. A fixed UNIX-epoch
     /// base keeps the test deterministic (no `SystemTime::now`).
@@ -997,7 +1254,7 @@ mod tests {
     /// (it reads real clocks): the monotonic floor is checked first, so a fully
     /// elapsed interval ticks now even when the wall clock says "keep waiting"
     /// (the backward-clock-step case), and a not-yet-elapsed interval defers to
-    /// the wall-clock channel (catching host wake). Origin: journal 0062 Q2.
+    /// the wall-clock channel (catching host wake). Origin: an internal journal entry Q2.
     #[test]
     fn wait_chunk_or_done_floor_precedes_wall_clock() {
         let interval = Duration::from_secs(300);
@@ -1342,7 +1599,7 @@ mod tests {
     /// Codex slot was successfully refreshed in the first tick must
     /// NOT fire the Codex transport in the second — the new JWT exp
     /// is far in the future, so broker_codex_check returns Valid.
-    /// This is the in-process analogue of journal 0015's "two-codex-
+    /// This is the in-process analogue of an internal journal entry's "two-codex-
     /// process never both refresh" guarantee — once one tick lands a
     /// fresh JWT, subsequent ticks within the 2h window are no-ops.
     #[tokio::test]
@@ -2106,6 +2363,110 @@ mod tests {
             http_counter.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "daemon must NOT call the Anthropic HTTP transport for a Codex-only slot"
+        );
+    }
+
+    // ── M6 #909 shard B: periodic outbox-drain backstop tick ──────────────────
+
+    /// The tick stamps the drain cycle when `csq-runs/` exists (drain-liveness
+    /// signal for shard D), even when there is nothing to drain.
+    #[test]
+    fn run_outbox_drain_tick_stamps_when_csq_runs_exists() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("csq-runs")).unwrap();
+        assert!(
+            crate::audit::outbox_paths::read_outbox_drain_stamp(dir.path()).is_none(),
+            "no stamp before the tick"
+        );
+        run_outbox_drain_tick(dir.path());
+        assert!(
+            crate::audit::outbox_paths::read_outbox_drain_stamp(dir.path()).is_some(),
+            "periodic tick must stamp the drain cycle"
+        );
+    }
+
+    /// The tick is a clean no-op (no stamp, no dir created, no panic) on a base
+    /// with no `csq-runs/` — nothing can be queued without the chain dir.
+    #[test]
+    fn run_outbox_drain_tick_noop_without_csq_runs() {
+        let dir = TempDir::new().unwrap();
+        run_outbox_drain_tick(dir.path());
+        assert!(
+            !dir.path().join("csq-runs").exists(),
+            "tick must not create csq-runs/"
+        );
+        assert!(
+            crate::audit::outbox_paths::read_outbox_drain_stamp(dir.path()).is_none(),
+            "no csq-runs → no stamp"
+        );
+    }
+
+    /// Enterprise wiring: the periodic tick actually DRAINS the mcp-gate outbox
+    /// (not just stamps) — stages one queued decision against a bootstrapped chain
+    /// and asserts the tick drains it. Proves `run_outbox_drain_tick` calls
+    /// `mcp_gate_outbox::drain_pending`, not only that the stamp fires.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn run_outbox_drain_tick_drains_mcp_gate_outbox() {
+        use crate::audit::mcp_gate_outbox::{drain_pending, write_pending, McpGatePendingRecord};
+        use crate::audit::persist::write_record_v2;
+        use crate::audit::types::{
+            Ed25519Signature, EventKind, EventPayload, KeyId, McpGateDecisionPayload, RecordId,
+            Sha256Hex, SignedRecord,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Bootstrap a chain genesis (an McpGateDecision seed — stands in for init).
+        let boot = SignedRecord {
+            schema_version: crate::audit::persist::AUDIT_SCHEMA_VERSION_TEST.to_string(),
+            record_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            chain_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            seq: 0,
+            prev_hash: Sha256Hex::genesis(),
+            kind: EventKind::McpGateDecision,
+            payload: EventPayload::McpGateDecision(McpGateDecisionPayload {
+                session_nonce: "bootstrap".to_string(),
+                record_seq: 0,
+                cli: "codex".to_string(),
+                tool: "bootstrap_tool".to_string(),
+                verdict: "pass".to_string(),
+                enforcement_fidelity: crate::audit::mcp_gate_floor::MCP_ENFORCEMENT_FIDELITY
+                    .to_string(),
+            }),
+            ts: crate::audit::persist::current_iso8601_utc_persist(),
+            key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
+            canonical_hash: Sha256Hex::genesis(),
+            signature: Ed25519Signature::new([0u8; 64]),
+            actor: None,
+            authority: None,
+            trust: None,
+            eatp_start_ts: None,
+            eatp_end_ts: None,
+            op_phase: None,
+            verification_level: None,
+        };
+        write_record_v2(boot, Some(base)).unwrap();
+
+        write_pending(
+            base,
+            &McpGatePendingRecord::new("sess-tick", 0, "codex", "mcp__shell__exec", "block"),
+        )
+        .unwrap();
+
+        run_outbox_drain_tick(base);
+
+        // The queued decision must be gone (drained onto the chain), and the cycle
+        // stamped. A residual drain confirms nothing is left to drain.
+        let residual = drain_pending(base);
+        assert_eq!(
+            residual.seen, 0,
+            "the periodic tick must have drained the queued mcp-gate decision"
+        );
+        assert!(
+            crate::audit::outbox_paths::read_outbox_drain_stamp(base).is_some(),
+            "tick stamps the drain cycle"
         );
     }
 }

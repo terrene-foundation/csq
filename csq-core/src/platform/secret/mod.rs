@@ -20,7 +20,7 @@
 //!
 //! # Design source
 //!
-//! - `workspaces/gemini/02-plans/01-implementation-plan.md` PR-G2a
+//! - `internal-design-docs` PR-G2a
 //! - rust-desktop-specialist + security-reviewer joint design (this
 //!   session) reconciled where they conflicted in favor of the
 //!   security-reviewer's tighter posture on auto-fallback
@@ -56,8 +56,8 @@ pub mod windows;
 /// called from the daemon hot path (usage poller, spawn pre-flight)
 /// and a hung D-Bus / locked-keychain prompt MUST NOT pin those
 /// callers. Hard timeout at the trait boundary; backends honour it
-/// via either their own async runtime ([`linux::SecretServiceVault`])
-/// or the shared [`run_with_timeout`] helper ([`macos`] / [`windows`]).
+/// via either their own async runtime (`linux::SecretServiceVault`)
+/// or the shared `run_with_timeout` helper (`macos` / `windows`).
 pub const VAULT_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs a synchronous backend operation on a dedicated worker thread

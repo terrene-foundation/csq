@@ -518,7 +518,7 @@ fn probe_blocklisted_path_pure() {
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "windows-zombie-reap-needs-windows-crate; see workspaces/multi-cli-deps/journal/0005-RISK-windows-zombie-reap-coverage.md"
+    ignore = "windows-zombie-reap-needs-windows-crate; see internal-design-docs"
 )]
 #[cfg(unix)]
 fn probe_timeout_child_reaped_promptly() {

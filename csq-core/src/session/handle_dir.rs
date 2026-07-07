@@ -47,7 +47,7 @@ const ACCOUNT_BOUND_ITEMS: &[&str] = &[
 /// Creates an ephemeral handle directory `term-<pid>` under `base_dir`.
 ///
 /// Populates it with:
-/// - Symlinks to per-account items (heterogeneous target set per journal 0016 OQ #2):
+/// - Symlinks to per-account items (heterogeneous target set per an internal journal entry OQ #2):
 ///   - `.credentials.json` → `identities/<UUID>/credentials.json` when UUID is
 ///     present in `profiles.json::by_slot`; falls back to `config-<N>/.credentials.json`
 ///     for legacy-only layouts (Phase 3 retarget, M3-3).
@@ -94,6 +94,28 @@ pub fn create_handle_dir(
     account: AccountNum,
     pid: u32,
 ) -> Result<PathBuf, CredentialError> {
+    create_handle_dir_named(base_dir, claude_home, account, pid, &format!("term-{pid}"))
+}
+
+/// `create_handle_dir` generalized to an explicit `dir_name`.
+///
+/// `create_handle_dir` is the thin wrapper that passes `term-<pid>`. The
+/// daemon's Phase-2b interactive subscription-capture path (`phase2b::
+/// subscription_client`) passes a unique `interactive-capture-<…>` name so a
+/// single daemon process (one PID) can run multiple concurrent governed-turn
+/// captures without colliding on a single `term-<pid>` dir. `pid` is still
+/// recorded in `.live-pid` (the daemon PID, for liveness-based crash cleanup)
+/// and used in orphan-detection log lines. The caller that supplies a
+/// non-`term-<pid>` name owns that dir's lifecycle (the `term-*` sweeper only
+/// reaps `term-*` names — see `phase2b::subscription_client` for its
+/// self-managed cleanup of the `interactive-capture-*` namespace).
+pub fn create_handle_dir_named(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    pid: u32,
+    dir_name: &str,
+) -> Result<PathBuf, CredentialError> {
     let config_dir = base_dir.join(format!("config-{}", account));
     if !config_dir.is_dir() {
         return Err(CredentialError::Corrupt {
@@ -102,7 +124,7 @@ pub fn create_handle_dir(
         });
     }
 
-    let handle_dir = base_dir.join(format!("term-{}", pid));
+    let handle_dir = base_dir.join(dir_name);
 
     // Detect orphan from prior crash with same PID.
     //
@@ -122,7 +144,7 @@ pub fn create_handle_dir(
                 return Err(CredentialError::Corrupt {
                     path: handle_dir.clone(),
                     reason: format!(
-                        "handle dir term-{pid} is in use by live PID {recorded}. \
+                        "handle dir {dir_name} is in use by live PID {recorded}. \
                          Refusing to remove. If you believe this is stale, stop \
                          the process and rerun."
                     ),
@@ -132,6 +154,7 @@ pub fn create_handle_dir(
 
         warn!(
             pid,
+            dir_name,
             recorded = ?recorded_pid,
             "handle dir already exists with dead or missing PID — removing orphan"
         );
@@ -147,7 +170,7 @@ pub fn create_handle_dir(
         source: e,
     })?;
 
-    // Symlink account-bound items — heterogeneous target set per journal 0016 OQ #2.
+    // Symlink account-bound items — heterogeneous target set per an internal journal entry OQ #2.
     //
     // M3-3 retarget: `.credentials.json` uses the identity-keyed path when a UUID
     // is present in `profiles.json::by_slot` for this account.  All other items
@@ -260,11 +283,11 @@ pub fn create_handle_dir(
 /// `base_dir` for `Surface::Codex`.
 ///
 /// Per spec 07 §7.2.2 the Codex handle dir carries a distinct symlink
-/// set from Anthropic (heterogeneous target set per journal 0016 OQ #2 + OQ #3):
+/// set from Anthropic (heterogeneous target set per an internal journal entry OQ #2 + OQ #3):
 ///
 /// - `.csq-account` → `config-<N>/.csq-account` (always; marker stays at slot path)
 /// - `auth.json` → `identities/<UUID>/credentials-codex.json` when UUID present
-///   (M3-3 retarget, journal 0016 OQ #3); falls back to `credentials/codex-<N>.json`
+///   (M3-3 retarget, an internal journal entry OQ #3); falls back to `credentials/codex-<N>.json`
 ///   for legacy-only layouts. The legacy canonical is retained through Phase 4.
 /// - `config.toml` → `config-<N>/config.toml` (daemon-writable; model
 ///   + `cli_auth_credentials_store` mode)
@@ -301,6 +324,18 @@ pub fn create_handle_dir_codex(
     base_dir: &Path,
     account: AccountNum,
     pid: u32,
+) -> Result<PathBuf, CredentialError> {
+    create_handle_dir_codex_named(base_dir, account, pid, &format!("term-{pid}"))
+}
+
+/// `create_handle_dir_codex` generalized to an explicit `dir_name`. See
+/// [`create_handle_dir_named`] for the rationale (concurrent daemon-side
+/// subscription captures need unique dir names outside the `term-<pid>` space).
+pub fn create_handle_dir_codex_named(
+    base_dir: &Path,
+    account: AccountNum,
+    pid: u32,
+    dir_name: &str,
 ) -> Result<PathBuf, CredentialError> {
     let config_dir = base_dir.join(format!("config-{}", account));
     if !config_dir.is_dir() {
@@ -340,7 +375,7 @@ pub fn create_handle_dir_codex(
         });
     }
 
-    let handle_dir = base_dir.join(format!("term-{}", pid));
+    let handle_dir = base_dir.join(dir_name);
 
     // Same orphan-detection semantics as create_handle_dir — only
     // remove a stale handle dir whose recorded PID is dead or absent.
@@ -355,7 +390,7 @@ pub fn create_handle_dir_codex(
                 return Err(CredentialError::Corrupt {
                     path: handle_dir.clone(),
                     reason: format!(
-                        "handle dir term-{pid} is in use by live PID {recorded}. \
+                        "handle dir {dir_name} is in use by live PID {recorded}. \
                          Refusing to remove. If you believe this is stale, stop \
                          the process and rerun."
                     ),
@@ -365,6 +400,7 @@ pub fn create_handle_dir_codex(
 
         warn!(
             pid,
+            dir_name,
             recorded = ?recorded_pid,
             "codex handle dir already exists with dead or missing PID — removing orphan"
         );
@@ -380,7 +416,7 @@ pub fn create_handle_dir_codex(
     })?;
 
     // Codex symlink set per spec 07 §7.2.2 — heterogeneous target set per
-    // journal 0016 OQ #2 + OQ #3.
+    // an internal journal entry OQ #2 + OQ #3.
     //
     // M3-3 retarget: `auth.json` uses the identity-keyed path
     // (`identities/<UUID>/credentials-codex.json`) when a UUID is present in
@@ -519,7 +555,7 @@ pub fn create_handle_dir_codex(
 ///
 /// Also exposed publicly so `csq run` can defensively re-materialize as a
 /// belt-and-suspenders after `create_handle_dir`, in case future refactors
-/// factor the step out of `create_handle_dir`. See journal 0059 — stale
+/// factor the step out of `create_handle_dir`. See an internal journal entry — stale
 /// per-slot settings drifted silently through a csq install upgrade;
 /// making the invariant explicit at the call site guards against the same
 /// class of regression.
@@ -617,6 +653,29 @@ fn read_json_object_or_empty(path: &Path) -> Value {
     }
 }
 
+/// Resolve the per-handle-dir rename-serialization lock path (`.swap.lock`,
+/// dot) used by [`repoint_handle_dir`] and [`repoint_handle_dir_codex`].
+///
+/// Canonicalizes `handle_dir` first so a caller that passes a raw path
+/// (`csq swap` forwards `source.path()` verbatim) and a caller that passes a
+/// pre-canonicalized path (`auto_rotate` canonicalizes at the top of its loop)
+/// resolve to the SAME inode. Without this, a symlink component anywhere in the
+/// accounts base splits the two into different lock files that never contend, so
+/// the rename lock silently fails to serialize concurrent repoints (#928).
+/// Falls back to the raw path when canonicalize fails (dangling dir) — the same
+/// posture both callers use for their own canonicalization.
+///
+/// DISTINCT from [`crate::credentials::keychain::swap_lock_path`] (`.swap-lock`,
+/// hyphen — the A4a keychain-desync guard). The A4a guard is held ACROSS the
+/// repoint call by `csq swap` / `auto_rotate`; `lock_file` opens a fresh fd and
+/// `flock`s it, and on Unix/macOS `flock` is per-open-file-description, so
+/// re-`flock`-ing the SAME file from a second fd in one process blocks forever.
+/// The two lock files therefore MUST stay distinct (`.swap.lock` vs `.swap-lock`).
+fn repoint_lock_path(handle_dir: &Path) -> PathBuf {
+    let lock_dir = std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
+    lock_dir.join(".swap.lock")
+}
+
 /// Atomically repoints the account-bound symlinks in a handle dir
 /// to point at a new `config-<target>` directory.
 ///
@@ -648,7 +707,7 @@ pub fn repoint_handle_dir(
         });
     }
 
-    // PR-C9a CRITICAL belt-and-suspenders (journal 0021 finding 1): refuse
+    // PR-C9a CRITICAL belt-and-suspenders (an internal journal entry finding 1): refuse
     // to rewrite ACCOUNT_BOUND_ITEMS on a handle dir whose symlink set is
     // Codex-shaped. `repoint_handle_dir` only touches the Anthropic
     // `ACCOUNT_BOUND_ITEMS` (`.credentials.json`, `.csq-account`,
@@ -728,10 +787,28 @@ pub fn repoint_handle_dir(
     // daemon's auto-rotate tick — can interleave rename operations and leave the
     // handle dir pointing at two different config-N dirs simultaneously.
     //
+    // This is a DIFFERENT lock from the A4a keychain-desync guard
+    // (`keychain::swap_lock_path` → `.swap-lock`, hyphen). The names are
+    // deliberately distinct: `csq swap` (`SameSurfaceClaudeCode`) and
+    // `auto_rotate` ALREADY hold the `.swap-lock` (hyphen) A4a guard across this
+    // entire call. `lock_file` opens a fresh fd and `flock`s it; on Unix/macOS
+    // flock is per-open-file-description, so re-`flock`-ing the SAME file from a
+    // second fd in the same process blocks forever. Merging this inner rename
+    // lock onto `.swap-lock` would therefore self-deadlock every swap and every
+    // rotation — hence `.swap.lock` (dot) stays a separate file (#928).
+    //
+    // `repoint_lock_path` canonicalizes the dir BEFORE computing the lock path so
+    // this rename lock resolves to the SAME inode whether the caller passed a raw
+    // path (`csq swap` — swap.rs passes `source.path()` verbatim) or a
+    // pre-canonicalized one (`auto_rotate` canonicalizes at the top of its loop).
+    // Without this, a symlink component in the accounts base makes the two lock
+    // different inodes and the inner lock silently fails to serialize them (#928
+    // latent gap).
+    //
     // `.swap.lock` lives inside the handle dir so it is automatically cleaned up
     // when the handle dir is swept. `lock_file` blocks until the lock is available
     // (blocking, not try_lock) so the slower caller is serialized, not dropped.
-    let lock_path = handle_dir.join(".swap.lock");
+    let lock_path = repoint_lock_path(handle_dir);
     let _swap_guard =
         crate::platform::lock::lock_file(&lock_path).map_err(|e| CredentialError::Corrupt {
             path: lock_path.clone(),
@@ -741,7 +818,7 @@ pub fn repoint_handle_dir(
     // M3-4: Resolve the identity-keyed paths for the swap target BEFORE the
     // mtime bump and symlink rebuild.  The bump target MUST match the
     // post-rename symlink target (PRIMARY METHODOLOGICAL DIRECTIVE 1,
-    // journal 0016 WBS line 124 + 04-phase3-readiness.md §M3-4).  Splitting
+    // an internal journal entry WBS line 124 + 04-phase3-readiness.md §M3-4).  Splitting
     // the two into separate commits would open a window where the bump targets
     // `config-N/.credentials.json` but the symlink resolves to
     // `identities/<UUID>/credentials.json` — a silent #270-class regression.
@@ -771,7 +848,7 @@ pub fn repoint_handle_dir(
         new_config.join(".credentials.json")
     };
 
-    // Issue #270 observability: capture the credentials target's pre-swap
+    // an internal ticket observability: capture the credentials target's pre-swap
     // mtime + inode. CC's `invalidateOAuthCacheIfDiskChanged` (spec 01 §1.4)
     // fires only when `mtimeMs !== lastCredentialsMtimeMs`. If the post-swap
     // target happens to share the same mtime as the pre-swap target (e.g.
@@ -782,7 +859,7 @@ pub fn repoint_handle_dir(
     // future repro of #270 produces actionable evidence.
     let pre_swap_creds_target = stat_creds_target(handle_dir);
 
-    // Issue #270 fix: bump the new target's mtime strictly above the
+    // an internal ticket fix: bump the new target's mtime strictly above the
     // pre-swap target's mtime BEFORE the atomic rename. This eliminates
     // the mtime-collision race window entirely — between the rename and a
     // post-rename bump, CC could stat the new target with the colliding
@@ -795,7 +872,7 @@ pub fn repoint_handle_dir(
     // M3-4: bump targets `new_creds_symlink_target` (identity-keyed when
     // UUID is present), NOT `config-N/.credentials.json`.  The bump target
     // MUST match the post-rename symlink target per PRIMARY METHODOLOGICAL
-    // DIRECTIVE 1 (WBS line 124, journal 0013 D3).  Using `new_creds_symlink_target`
+    // DIRECTIVE 1 (WBS line 124, an internal journal entry D3).  Using `new_creds_symlink_target`
     // here and in the symlink rebuild loop guarantees they are always in sync
     // in this commit; the SAME-COMMIT REQUIREMENT in the WBS makes splitting
     // the two a blocked operation.
@@ -809,7 +886,7 @@ pub fn repoint_handle_dir(
     // collision case; the daemon's natural rename is a parallel path
     // that also advances mtime. Either path satisfies CC's invalidation.
     //
-    // Spec amendment (journal 0013 D2, extended by M3-4): Phase 3 retargets
+    // Spec amendment (an internal journal entry D2, extended by M3-4): Phase 3 retargets
     // the bump to `identities/<UUID>/credentials.json`, observed by EVERY
     // handle dir whose symlink resolves to that identity UUID — which may
     // span multiple slots after `csq move` (identity-scoped vs prior
@@ -836,13 +913,13 @@ pub fn repoint_handle_dir(
             warn!(
                 error = ?e,
                 path = %new_creds_symlink_target.display(),
-                "pre-swap mtime bump failed; CC may skip credential reload (issue #270)"
+                "pre-swap mtime bump failed; CC may skip credential reload (an internal ticket)"
             );
         }
     }
 
     // Atomic repoint: create temp symlink then rename over existing.
-    // M3-4 heterogeneous symlink set (journal 0016 OQ #2 Option A):
+    // M3-4 heterogeneous symlink set (an internal journal entry OQ #2 Option A):
     //   `.credentials.json` → identity-keyed when UUID present (via
     //   `new_creds_symlink_target` resolved above).
     //   All other items stay at `config-N/<item>` through Phase 4.
@@ -916,9 +993,32 @@ pub fn repoint_handle_dir(
     // them during the session) are preserved so `--resume` and per-CWD
     // state survive the swap. See `rebuild_claude_json_for_swap` for
     // the atomic write + projects merge.
+    // #832: capture the pre-rebuild `.claude.json` oauthAccount email (the stale/old
+    // value, before the rebuild overwrites it) so the reconcile can distinguish a
+    // stale copy it MAY overwrite from a foreign-account signal (a concurrent CC
+    // in-session `/login`) it MUST NOT overwrite. Read BEFORE the rebuild.
+    let pre_swap_oauth_email = crate::credentials::claude_json::read_oauth_email(handle_dir);
+
     rebuild_claude_json_for_swap(&new_config, handle_dir);
 
-    // Issue #270 observability: capture post-swap target stat and emit at
+    // #832: the rebuild sources `oauthAccount` from `config-<target>/.claude.json`,
+    // which can be absent (rebuild bails → stale copy retained) or carry no email.
+    // Reconcile `oauthAccount.emailAddress` to the authoritative identity anchor so
+    // the custodian wrong-account gate matches on the next tick instead of
+    // false-refusing the freshly-mirrored token — but ONLY when it is safe to
+    // overwrite (absent or the pre-swap value), never a foreign `/login` signal.
+    if let Some(identity_email) =
+        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get())
+            .and_then(|uuid| crate::accounts::identity_store::read_identity_email(base_dir, uuid))
+    {
+        reconcile_handle_dir_oauth_email(
+            handle_dir,
+            &identity_email,
+            pre_swap_oauth_email.as_deref(),
+        );
+    }
+
+    // an internal ticket observability: capture post-swap target stat and emit at
     // INFO so `CSQ_LOG=info csq swap N` exposes the mtime/inode that CC's
     // next stat will resolve. See pre_swap_creds_target capture above.
     let post_swap_creds_target = stat_creds_target(handle_dir);
@@ -944,7 +1044,7 @@ pub fn repoint_handle_dir(
             handle = %handle_dir.display(),
             post_mtime_ns = post_swap_creds_target.as_ref().map(|s| s.mtime_ns),
             post_ino = post_swap_creds_target.as_ref().map(|s| s.ino),
-            "swap repointed but credential mtime unchanged — CC may skip reload (issue #270)"
+            "swap repointed but credential mtime unchanged — CC may skip reload (an internal ticket)"
         );
     }
     Ok(())
@@ -1026,7 +1126,7 @@ fn mtime_collision(pre: &Option<CredsTargetStat>, post: &Option<CredsTargetStat>
 /// the old fd, while any new open (`codex resume`, a new session) hits
 /// the new slot. This matches the ClaudeCode model and replaces the
 /// prior `exec`-replace path that silently dropped the user's
-/// conversation (M10, journal 0023).
+/// conversation (M10, an internal journal entry).
 ///
 /// # Errors
 ///
@@ -1128,7 +1228,15 @@ pub fn repoint_handle_dir_codex(
     // Per-handle flock (mirrors ClaudeCode VP-final F4) so concurrent
     // swaps cannot interleave renames into a split state. The lock
     // file lives inside the handle dir so it is reaped with the dir.
-    let lock_path = handle_dir.join(".swap.lock");
+    //
+    // Distinct from the A4a `.swap-lock` (hyphen) keychain guard and
+    // canonicalized via `repoint_lock_path` for the same reasons as
+    // `repoint_handle_dir` (#928): codex swaps take no outer A4a guard
+    // (fresh-dir / keychain-absent), so this `.swap.lock` (dot) IS the sole
+    // rename serializer for concurrent codex repoints — canonicalizing the dir
+    // keeps that serialization sound even when the caller passes a raw,
+    // symlink-containing path.
+    let lock_path = repoint_lock_path(handle_dir);
     let _swap_guard =
         crate::platform::lock::lock_file(&lock_path).map_err(|e| CredentialError::Corrupt {
             path: lock_path.clone(),
@@ -1145,7 +1253,7 @@ pub fn repoint_handle_dir_codex(
     // The identity path is tested via fixture injection (SEC-3-H3 test) to prove
     // the primitive works once the file does exist.
     //
-    // PRIMARY METHODOLOGICAL DIRECTIVE 1 applies here too (journal 0016 WBS line 124):
+    // PRIMARY METHODOLOGICAL DIRECTIVE 1 applies here too (an internal journal entry WBS line 124):
     // the bump target MUST match `auth_symlink_target` — both are computed from the
     // same `identity_codex_path` variable in this commit, never split.
     let identity_codex_path =
@@ -1197,7 +1305,7 @@ pub fn repoint_handle_dir_codex(
         ("history.jsonl", new_config.join("codex-history.jsonl")),
     ];
 
-    // Issue #270 fix (Codex parallel, M3-4 retarget): bump the new auth.json
+    // an internal ticket fix (Codex parallel, M3-4 retarget): bump the new auth.json
     // target's mtime strictly above the pre-swap target's mtime BEFORE the
     // atomic rename.  codex-cli re-reads auth.json before each API call (spec
     // 07 §7.5); an mtime collision would cause the same silent-skip bug as #270.
@@ -1218,7 +1326,7 @@ pub fn repoint_handle_dir_codex(
         warn!(
             error = ?e,
             path = %auth_symlink_target.display(),
-            "pre-swap codex auth.json mtime bump failed; codex-cli may skip credential reload (issue #270)"
+            "pre-swap codex auth.json mtime bump failed; codex-cli may skip credential reload (an internal ticket)"
         );
     }
 
@@ -1256,7 +1364,7 @@ pub fn repoint_handle_dir_codex(
         debug!(item = name, account = %target, "repointed codex symlink");
     }
 
-    // Issue #270 observability (Codex parallel): post-swap mtime check mirrors
+    // an internal ticket observability (Codex parallel): post-swap mtime check mirrors
     // the ClaudeCode regression detector in `repoint_handle_dir`. If the
     // pre-bump failed (e.g. 0o400 permission with O_WRONLY — fixed by using
     // O_RDONLY in `bump_mtime_above`) and both the pre- and post-swap auth.json
@@ -1276,7 +1384,7 @@ pub fn repoint_handle_dir_codex(
                 handle = %handle_dir.display(),
                 post_mtime_ns = post_ns,
                 "codex swap repointed but auth.json mtime unchanged — \
-                 codex-cli may skip credential reload (issue #270)"
+                 codex-cli may skip credential reload (an internal ticket)"
             );
         }
     }
@@ -1387,6 +1495,153 @@ fn materialize_handle_claude_json(config_dir: &Path, handle_dir: &Path) {
 /// (`config_dir/.claude.json`) we leave the handle dir's file alone.
 /// Wiping it would strand CC with zero state, which is strictly worse
 /// than keeping the stale copy.
+/// #832: reconcile the handle dir's `.claude.json` `oauthAccount.emailAddress` to the
+/// authoritative identity anchor after a swap — WITHOUT clobbering a foreign-account
+/// signal.
+///
+/// `rebuild_claude_json_for_swap` sources `oauthAccount` from
+/// `config-<target>/.claude.json`, but that source can be ABSENT (the rebuild bails
+/// and leaves the OLD account's stale copy) or carry no `oauthAccount`. The daemon
+/// then mirrors the NEW account's token into this dir's keychain, so the custodian's
+/// wrong-account gate (`daemon::custodian::candidate_account_matches`) sees the NEW
+/// token paired with an OLD/absent email → false-refuses the adoption until CC
+/// eventually rewrites `.claude.json` (an internal journal entry FD1 / cc-keychain an internal journal entry H2).
+///
+/// `identity_email` is the SAME `identities/<UUID>/identity.json` value the gate uses
+/// as its anchor, so writing it here makes the local signal consistent with the
+/// binding on the very next tick — no wait, no false-refuse.
+///
+/// ## The foreign-signal safety gate (redteam R1 deep-analyst M-2)
+///
+/// The gate's whole invariant is `.claude.json` email == the keychain token's owner
+/// (CC writes both together on `/login`). Blindly forcing the anchor would DECOUPLE
+/// them: in the microsecond window between the rebuild's write and this read, a
+/// concurrent CC in-session `/login <other>` writes keychain=OTHER + `.claude.json`
+/// =OTHER. Overwriting that `.claude.json` back to the swap target would make the gate
+/// match (target==target) while the keychain holds OTHER's LIVE token → the custodian
+/// adopts a FOREIGN token into the target's account-global store (the exact
+/// catastrophe the gate exists to prevent).
+///
+/// So this only writes when the current email is SAFE to overwrite:
+/// - ABSENT / empty — no signal to lose (a concurrent CC `/login` would have written
+///   a PRESENT email, so absent ⇒ no race), OR
+/// - equal to `pre_swap_email` — the stale copy of the account we swapped AWAY from,
+///   whose keychain token the swap already CLEARED (so it cannot be adopted).
+///
+/// A present email that is NEITHER the anchor NOR `pre_swap_email` was written by
+/// something else (a concurrent foreign `/login`) → SKIP, leaving the gate fail-closed.
+/// `pre_swap_email` is captured from the handle dir BEFORE the rebuild.
+///
+/// Residual (bounded by an unfixable blocker): if a concurrent `/login` targets the
+/// SAME account the dir was on pre-swap (so `current == pre_swap_email`), the gate
+/// cannot distinguish the fresh concurrent write from the stale copy and this may
+/// overwrite it. Reaching it needs a triple-coincidence — the dir was on X pre-swap,
+/// is swapped away from X, AND is concurrently re-logged into X inside the
+/// rebuild→reconcile window — and it self-heals on CC's next `.claude.json` write.
+/// Fully closing it would require a keychain-token OWNER signal, which does not exist
+/// (the `sk-ant-oat01-` token is account-anonymous — the same fundamental limit the
+/// wrong-account gate itself has, an internal journal entry). Not closable in-session.
+///
+/// - Surgical: overrides ONLY `oauthAccount.emailAddress`, preserving every other
+///   field (esp. the CWD-scoped `projects` map the rebuild just merged).
+/// - Idempotent: no write when the field already matches (ASCII-case-insensitive,
+///   trimmed) — the common case where the rebuild sourced the right email.
+/// - Best-effort + non-fatal: any read/parse/write failure leaves the pre-existing
+///   fail-closed + self-heal path intact, so a reconcile failure never aborts the swap.
+/// - Atomic (CC may be running) via the full `security.md` §5a pipeline —
+///   `write` → `secure_file` (0600) → `atomic_replace`, tmp removed on every failure
+///   branch — because `.claude.json` carries the account email = PII. `rebuild_
+///   claude_json_for_swap` uses the identical pipeline. Serializes COMPACT
+///   (`to_string`, not `to_string_pretty`) so reconciling a near-`MAX_CLAUDE_JSON_BYTES`
+///   file can never inflate it past the gate's own read ceiling and re-break the gate
+///   it fixes (redteam R1 deep-analyst L-2).
+/// - Absent / oversized / unparseable / non-object `.claude.json`, or an empty
+///   `identity_email` → skip (never clobber a file we cannot safely round-trip). A
+///   still-un-round-trippable handle file after the rebuild (config-target absent AND
+///   the retained copy itself corrupt) therefore keeps the pre-existing tick-based
+///   self-heal — the AC's "no wait" guarantee is best-effort for that narrow sub-case.
+fn reconcile_handle_dir_oauth_email(
+    handle_dir: &Path,
+    identity_email: &str,
+    pre_swap_email: Option<&str>,
+) {
+    let email = identity_email.trim();
+    if email.is_empty() {
+        return;
+    }
+    let Some(content) = crate::credentials::claude_json::read_raw(handle_dir) else {
+        return;
+    };
+    let Ok(mut json) = serde_json::from_str::<Value>(&content) else {
+        return;
+    };
+    let Some(obj) = json.as_object_mut() else {
+        return;
+    };
+    let current = obj
+        .get("oauthAccount")
+        .and_then(|a| a.get("emailAddress"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    // Idempotent fast-path: already the anchor → no write.
+    if current.is_some_and(|cur| cur.eq_ignore_ascii_case(email)) {
+        return;
+    }
+    // Foreign-signal safety gate (M-2): overwrite ONLY an absent/empty email or the
+    // stale pre-swap value. A present email that is neither is a foreign `/login`
+    // signal the gate MUST keep seeing → skip.
+    let safe_to_write = match current {
+        None => true,
+        Some(cur) => pre_swap_email
+            .map(str::trim)
+            .is_some_and(|old| !old.is_empty() && cur.eq_ignore_ascii_case(old)),
+    };
+    if !safe_to_write {
+        debug!("swap: #832 reconcile skipped — .claude.json names a non-pre-swap account");
+        return;
+    }
+    // Force oauthAccount.emailAddress, creating (or replacing a non-object)
+    // oauthAccount while preserving sibling fields.
+    match obj.get_mut("oauthAccount").and_then(Value::as_object_mut) {
+        Some(oa) => {
+            oa.insert("emailAddress".to_string(), Value::String(email.to_string()));
+        }
+        None => {
+            let mut m = serde_json::Map::new();
+            m.insert("emailAddress".to_string(), Value::String(email.to_string()));
+            obj.insert("oauthAccount".to_string(), Value::Object(m));
+        }
+    }
+    let out = match serde_json::to_string(&json) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "swap: failed to serialize .claude.json for #832 reconcile");
+            return;
+        }
+    };
+    let path = handle_dir.join(".claude.json");
+    let tmp = crate::platform::fs::unique_tmp_path(&path);
+    if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(path = %tmp.display(), error = %e, "swap: #832 reconcile temp write failed");
+        return;
+    }
+    // 0600 the tmp before the rename (security.md §5a canonical pipeline): the file
+    // carries the account email = PII. secure_file is a no-op on Windows.
+    if let Err(e) = crate::platform::fs::secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(path = %tmp.display(), error = %e, "swap: #832 reconcile secure_file failed");
+        return;
+    }
+    if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(path = %path.display(), error = %e, "swap: #832 reconcile atomic replace failed");
+        return;
+    }
+    debug!("swap: reconciled .claude.json oauthAccount.emailAddress to identity anchor (#832)");
+}
+
 fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
     let handle_claude_json = handle_dir.join(".claude.json");
     let Some(json) =
@@ -1410,12 +1665,18 @@ fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
     // Atomic write: temp + rename. CC may be reading .claude.json
     // concurrently with this swap; a partial write would corrupt its
     // parse and potentially wipe session state.
-    // §5a cleanup: .claude.json carries CC session metadata — partial
-    // failure must remove the tmp so it doesn't linger at umask 0o644.
+    // §5a cleanup: .claude.json carries CC session metadata + the account email
+    // (PII) — partial failure must remove the tmp so it doesn't linger at umask
+    // 0o644, and the tmp is 0600'd before the rename (redteam R2 rust-specialist).
     let tmp = crate::platform::fs::unique_tmp_path(&handle_claude_json);
     if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         warn!(path = %tmp.display(), error = %e, "swap: temp .claude.json write failed");
+        return;
+    }
+    if let Err(e) = crate::platform::fs::secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(path = %tmp.display(), error = %e, "swap: secure_file of .claude.json failed");
         return;
     }
     if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &handle_claude_json) {
@@ -1438,7 +1699,7 @@ fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
 ///
 /// Before removing a dead handle dir, any `image-cache/<session-id>/`
 /// sub-directories are moved to `claude_home/image-cache/<session-id>/`
-/// so pasted images survive the sweep. See journal 0035 for the design.
+/// so pasted images survive the sweep. See an internal journal entry for the design.
 ///
 /// # PID recycling safety
 ///
@@ -1549,7 +1810,7 @@ pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize 
         // We cannot share `image-cache/` via SHARED_ITEMS because CC's
         // internal cleanup (`Dv7()`) deletes every entry that doesn't match
         // the live session ID, causing concurrent terminals to race on a
-        // shared directory — see journal 0035.
+        // shared directory — see an internal journal entry
         if let Some(home) = claude_home {
             preserve_image_cache(&path, home);
         }
@@ -1630,10 +1891,73 @@ pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize 
         }
     }
 
+    removed += sweep_stale_capture_dirs(base_dir);
+
     if removed > 0 {
         info!(removed, "handle dir sweep complete");
     }
     removed
+}
+
+/// Filename prefix of the daemon's Phase-2b interactive subscription-capture
+/// handle dirs (created via [`create_handle_dir_named`] /
+/// [`create_handle_dir_codex_named`] with this prefix by
+/// `phase2b::subscription_client`). Shared so the per-capture reaper and this
+/// periodic watcher agree on the namespace.
+pub(crate) const CAPTURE_DIR_PREFIX: &str = "interactive-capture-";
+
+/// Grace before a capture dir that lacks a `.live-pid` is treated as a crash
+/// leak rather than a concurrent sibling still being set up (the sibling writes
+/// `.live-pid` as its final step, so a fresh pid-less dir is in-flight).
+const CAPTURE_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Reap `interactive-capture-*` dirs left by a crashed daemon. A dir is removed
+/// when its `.live-pid` records a DEAD pid; a MISSING `.live-pid` is reapable
+/// only when the dir is older than [`CAPTURE_REAP_GRACE`] (else it is a sibling
+/// mid-setup — reaping it would delete a live capture's dir). Returns the count
+/// removed.
+///
+/// Called both per-capture (by `phase2b::subscription_client`, before creating a
+/// new capture dir) AND from [`sweep_dead_handles`] (the 60s watcher) so a leak
+/// is reaped even if no further subscription capture ever runs. The
+/// `interactive-capture-*` namespace holds only credential SYMLINKS (never
+/// copies), so `remove_dir_all` deletes links, not the real credentials.
+pub(crate) fn sweep_stale_capture_dirs(base_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(CAPTURE_DIR_PREFIX) {
+            continue;
+        }
+        let dir = entry.path();
+        let recorded: Option<u32> = std::fs::read_to_string(dir.join(".live-pid"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        let reapable = match recorded {
+            Some(pid) => !is_pid_alive(pid),
+            None => dir_age_exceeds(&dir, CAPTURE_REAP_GRACE),
+        };
+        if reapable && std::fs::remove_dir_all(&dir).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// `true` when `dir`'s mtime is older than `grace`. On any stat / clock error
+/// (incl. a future-dated mtime from clock skew) returns `false` (KEEP — fail
+/// safe; never reap on doubt).
+pub(crate) fn dir_age_exceeds(dir: &Path, grace: std::time::Duration) -> bool {
+    std::fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| mtime.elapsed().ok())
+        .map(|age| age > grace)
+        .unwrap_or(false)
 }
 
 /// Generates a unique tombstone suffix so concurrent sweeps do not
@@ -1724,7 +2048,7 @@ fn is_valid_session_name(name: &std::ffi::OsStr) -> bool {
 /// impossible in practice. The narrow exception is `--resume` of the
 /// same session from two handle dirs; the first-to-sweep wins and
 /// the second-to-sweep's newer images are lost. This is documented
-/// in journal 0036 as a known limitation — a merge-on-collision fix
+/// in an internal journal entry as a known limitation — a merge-on-collision fix
 /// is a follow-up.
 ///
 /// # Cross-filesystem rename (`EXDEV`)
@@ -2272,6 +2596,84 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // ── interactive-capture-* sweep (redteam R2 Q4) ──────────────────────────
+
+    fn make_capture_dir(base: &Path, suffix: &str, live_pid: Option<u32>) -> PathBuf {
+        let dir = base.join(format!("{CAPTURE_DIR_PREFIX}{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(pid) = live_pid {
+            std::fs::write(dir.join(".live-pid"), pid.to_string()).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn sweep_capture_reaps_dead_pid_dir() {
+        let base = TempDir::new().unwrap();
+        // 999_999_999 is not a live pid on any sane system.
+        let dir = make_capture_dir(base.path(), "999999999-0", Some(999_999_999));
+        assert_eq!(sweep_stale_capture_dirs(base.path()), 1);
+        assert!(!dir.exists(), "dead-pid capture dir must be reaped");
+    }
+
+    #[test]
+    fn sweep_capture_keeps_live_pid_dir() {
+        let base = TempDir::new().unwrap();
+        let dir = make_capture_dir(base.path(), "self-0", Some(std::process::id()));
+        assert_eq!(sweep_stale_capture_dirs(base.path()), 0);
+        assert!(dir.exists(), "live-pid capture dir must be kept");
+    }
+
+    #[test]
+    fn sweep_capture_keeps_fresh_pidless_sibling() {
+        // A dir with no `.live-pid` yet is a concurrent sibling mid-setup: KEEP
+        // (it is younger than CAPTURE_REAP_GRACE).
+        let base = TempDir::new().unwrap();
+        let dir = make_capture_dir(base.path(), "sibling-0", None);
+        assert_eq!(sweep_stale_capture_dirs(base.path()), 0);
+        assert!(dir.exists(), "fresh pid-less sibling must not be reaped");
+    }
+
+    #[test]
+    fn sweep_capture_ignores_non_capture_dirs() {
+        let base = TempDir::new().unwrap();
+        std::fs::create_dir_all(base.path().join("term-12345")).unwrap();
+        std::fs::create_dir_all(base.path().join("config-1")).unwrap();
+        assert_eq!(sweep_stale_capture_dirs(base.path()), 0);
+        assert!(base.path().join("term-12345").exists());
+        assert!(base.path().join("config-1").exists());
+    }
+
+    #[test]
+    fn dir_age_exceeds_keeps_fresh_dir() {
+        // A freshly created dir is NOT older than an hour → KEEP (false). This is
+        // the safety-critical direction (never reap a fresh sibling).
+        let base = TempDir::new().unwrap();
+        let dir = base.path().join("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!dir_age_exceeds(&dir, std::time::Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn dir_age_exceeds_reaps_when_older_than_grace() {
+        // The reap direction: any real dir's age exceeds a ZERO grace, so a
+        // pidless crash-leak older than CAPTURE_REAP_GRACE is reapable.
+        let base = TempDir::new().unwrap();
+        let dir = base.path().join("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir_age_exceeds(&dir, std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn dir_age_exceeds_missing_dir_is_false() {
+        // Stat error → KEEP (fail safe).
+        let base = TempDir::new().unwrap();
+        assert!(!dir_age_exceeds(
+            &base.path().join("nope"),
+            std::time::Duration::ZERO
+        ));
+    }
+
     fn setup_config_dir(base: &Path, account: u16) -> PathBuf {
         let config = base.join(format!("config-{account}"));
         std::fs::create_dir_all(&config).unwrap();
@@ -2339,7 +2741,7 @@ mod tests {
         }
     }
 
-    /// Issue #270 invariant pin: post-swap `.credentials.json` follows-symlink
+    /// an internal ticket invariant pin: post-swap `.credentials.json` follows-symlink
     /// stat MUST resolve to a different inode than pre-swap. CC's
     /// `invalidateOAuthCacheIfDiskChanged` (spec 01 §1.4) keys cache reload
     /// off `mtimeMs !== lastCredentialsMtimeMs`; the swap contract relies on
@@ -2380,7 +2782,7 @@ mod tests {
         );
     }
 
-    /// Issue #270 fix regression test: when the two config dirs have
+    /// an internal ticket fix regression test: when the two config dirs have
     /// `.credentials.json` files with IDENTICAL mtimes (the exact bug
     /// condition — daemon refresh in same nanosecond, FS precision clamp,
     /// etc.), the pre-swap mtime bump in `repoint_handle_dir` MUST advance
@@ -2390,7 +2792,7 @@ mod tests {
     /// Without the fix, the new symlink resolves to a target with the same
     /// mtime as the prior target, CC silently skips reload, and the swap
     /// "appears not to take effect" until something else perturbs the
-    /// file (issue #270 user repro).
+    /// file (an internal ticket user repro).
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_advances_mtime_when_targets_collide() {
@@ -2443,14 +2845,14 @@ mod tests {
             .unwrap();
         assert!(
             post_mtime > pre_mtime,
-            "issue #270 regression: post-swap mtime ({post_mtime:?}) must be \
+            "an internal ticket regression: post-swap mtime ({post_mtime:?}) must be \
              strictly greater than pre-swap mtime ({pre_mtime:?}). Same mtime \
              means CC silently skips credential reload. The pre-rename mtime \
              bump in repoint_handle_dir failed to advance the target."
         );
     }
 
-    /// Issue #270 fix regression test (Codex parallel): same invariant as
+    /// an internal ticket fix regression test (Codex parallel): same invariant as
     /// the Anthropic test above but for `repoint_handle_dir_codex`. Pins
     /// the defensive bump on `credentials/codex-<N>.json` against the same
     /// mtime-collision class.
@@ -2470,7 +2872,7 @@ mod tests {
             let cfg = base.join(format!("config-{slot}"));
             std::fs::create_dir_all(&cfg).unwrap();
             std::fs::write(cfg.join(".csq-account"), slot.to_string()).unwrap();
-            std::fs::write(cfg.join("config.toml"), "").unwrap();
+            std::fs::write(cfg.join("config.toml"), "").unwrap(); // CI-ALLOW-fs-write-config-toml
             std::fs::write(cfg.join(".credentials.json"), "{}").unwrap();
             std::fs::write(cfg.join("settings.json"), "{}").unwrap();
             std::fs::write(cfg.join(".claude.json"), "{}").unwrap();
@@ -2521,7 +2923,7 @@ mod tests {
             .unwrap();
         assert!(
             post_mtime > pre_mtime,
-            "issue #270 regression (codex): post-swap auth.json mtime ({post_mtime:?}) \
+            "an internal ticket regression (codex): post-swap auth.json mtime ({post_mtime:?}) \
              must be strictly greater than pre-swap ({pre_mtime:?})"
         );
     }
@@ -2529,7 +2931,7 @@ mod tests {
     /// Companion to inode-differ test: when the two config dirs have
     /// distinct credential files (the normal case), `mtime_changed` MUST
     /// report true so the post-swap INFO trace tells the truth. A regression
-    /// here would mean issue #270's observability is silently lying.
+    /// here would mean an internal ticket's observability is silently lying.
     #[test]
     fn mtime_changed_returns_true_for_distinct_stats() {
         let pre = Some(super::CredsTargetStat {
@@ -2546,7 +2948,7 @@ mod tests {
     /// Mtime-collision case: two config dirs whose credentials happen to
     /// share an mtime (rare but possible — same-instant daemon refresh,
     /// filesystem precision clamp). `mtime_changed` MUST report false so
-    /// the trace surfaces the failure mode that issue #270 hypothesizes.
+    /// the trace surfaces the failure mode that an internal ticket hypothesizes.
     #[test]
     fn mtime_changed_returns_false_for_colliding_mtimes() {
         let same_mtime = 1_500_000_000_i128;
@@ -4067,6 +4469,78 @@ mod tests {
         );
     }
 
+    // ── #928: repoint rename-lock path canonicalization ───────────────────
+
+    /// Regression guard: #928.
+    ///
+    /// The inner rename lock (`repoint_lock_path`) MUST resolve to the SAME
+    /// file whether the caller passes a raw, symlink-containing path (`csq swap`
+    /// forwards `source.path()` verbatim) or a pre-canonicalized one
+    /// (`auto_rotate`). Before the fix, `csq swap` locked `raw/.swap.lock` while
+    /// `auto_rotate` locked `canonical/.swap.lock` — different inodes on any host
+    /// whose accounts base has a symlink component, so the lock silently failed
+    /// to serialize concurrent repoints.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_lock_path_is_canonical_and_symlink_invariant() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        // Real handle dir at <root>/real/term-1.
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        let real_handle = real_parent.join("term-1");
+        std::fs::create_dir_all(&real_handle).unwrap();
+
+        // A symlinked view of the SAME handle dir: <root>/link -> <root>/real.
+        let link_parent = dir.path().join("link");
+        symlink(&real_parent, &link_parent).unwrap();
+        let via_symlink = link_parent.join("term-1");
+
+        let canonical = std::fs::canonicalize(&real_handle).unwrap();
+
+        let lock_via_raw = repoint_lock_path(&via_symlink);
+        let lock_via_canonical = repoint_lock_path(&canonical);
+
+        // Both callers resolve to the SAME lock file (the #928 invariant).
+        assert_eq!(
+            lock_via_raw, lock_via_canonical,
+            "raw and canonical callers must resolve to the same rename lock; \
+             raw={lock_via_raw:?} canonical={lock_via_canonical:?}"
+        );
+        assert!(
+            lock_via_raw.ends_with(".swap.lock"),
+            "rename lock must be `.swap.lock` (dot), got {lock_via_raw:?}"
+        );
+        // And it must be under the canonical parent, not the symlinked one.
+        assert_eq!(
+            lock_via_raw,
+            canonical.join(".swap.lock"),
+            "rename lock must live under the canonicalized handle dir"
+        );
+
+        // The inner rename lock MUST stay a DIFFERENT file from the A4a
+        // `.swap-lock` (hyphen) keychain guard — merging them self-deadlocks a
+        // process that holds the outer guard across the repoint call (#928).
+        let a4a_guard = crate::credentials::keychain::swap_lock_path(&canonical);
+        assert_ne!(
+            lock_via_raw, a4a_guard,
+            "the rename lock (.swap.lock) and the A4a guard (.swap-lock) must be \
+             distinct files or a same-process re-flock self-deadlocks"
+        );
+
+        // Canonicalize-failure fallback: a non-existent (dangling) dir cannot be
+        // canonicalized, so the helper falls back to the raw path joined with
+        // `.swap.lock`. (The repoint itself fails downstream for such a dir; this
+        // only pins the fallback so it never silently drops the filename.)
+        let dangling = dir.path().join("does-not-exist").join("term-2");
+        assert_eq!(
+            repoint_lock_path(&dangling),
+            dangling.join(".swap.lock"),
+            "canonicalize-fail fallback must return raw dir joined with .swap.lock"
+        );
+    }
+
     // ── VP-final F4: concurrent swap serialization ────────────────────────
 
     /// Regression guard: VP-final F4.
@@ -4557,7 +5031,7 @@ mod tests {
 
     // ── PR-C9a CRITICAL belt-and-suspenders: repoint refuses Codex-shape ──
 
-    /// Regression guard: journal 0021 finding 1 belt-and-suspenders.
+    /// Regression guard: an internal journal entry finding 1 belt-and-suspenders.
     ///
     /// `repoint_handle_dir` is the ClaudeCode repoint path. It touches
     /// `ACCOUNT_BOUND_ITEMS` (`.credentials.json`, `.csq-account`,
@@ -4652,7 +5126,7 @@ mod tests {
         );
     }
 
-    // ── repoint_handle_dir_codex (M10 / journal 0023) ──────────────────
+    // ── repoint_handle_dir_codex (M10 / an internal journal entry) ──────────────────
 
     /// Happy path: repointing a Codex handle dir from slot A → slot B
     /// rewrites every Codex symlink to the new slot atomically. Mirrors
@@ -4978,7 +5452,7 @@ mod tests {
         }
     }
 
-    /// §5a regression — site 4 (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression — site 4 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `materialize_handle_settings`
     /// fails after the tmp file would have been created (handle dir
     /// read-only → write fails), no `.tmp.` file must remain.
@@ -5017,7 +5491,7 @@ mod tests {
         });
     }
 
-    /// §5a regression — site 5 (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression — site 5 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `rebuild_claude_json_for_swap`
     /// fails after the tmp file would have been created (handle dir
     /// read-only → write fails), no `.tmp.` file must remain.
@@ -5071,6 +5545,224 @@ mod tests {
         assert!(leaked.is_empty(), "§5a leaked tmp files: {leaked:?}");
     }
 
+    // ── #832: reconcile_handle_dir_oauth_email ───────────────────────────────
+
+    fn read_oauth_email_field(handle_dir: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(handle_dir.join(".claude.json")).ok()?;
+        let json: Value = serde_json::from_str(&content).ok()?;
+        json.get("oauthAccount")?
+            .get("emailAddress")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn reconcile_overrides_stale_email_and_preserves_other_fields() {
+        // The DA-1 case: handle .claude.json names the OLD (pre-swap) account; force
+        // it to the identity anchor while preserving projects + other caches.
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(
+            handle.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"old@a.com","accountUuid":"u-old"},"projects":{"/x":{"n":1}},"numStartups":7}"#,
+        )
+        .unwrap();
+        // pre_swap_email = the OLD account → safe to overwrite.
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", Some("old@a.com"));
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("new@b.com")
+        );
+        // Other fields preserved.
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["projects"]["/x"]["n"], 1);
+        assert_eq!(json["numStartups"], 7);
+        // Sibling oauthAccount field preserved.
+        assert_eq!(json["oauthAccount"]["accountUuid"], "u-old");
+    }
+
+    #[test]
+    fn reconcile_skips_foreign_email_not_matching_pre_swap() {
+        // M-2 (redteam R1 deep-analyst): the race case. Between the rebuild and this
+        // read, a concurrent CC `/login foreign@c.com` wrote .claude.json=foreign.
+        // pre_swap was old@a.com. The current email is NEITHER the anchor NOR the
+        // pre-swap value → it is a foreign signal the gate MUST keep seeing → SKIP.
+        // Overwriting it would blind the gate to a foreign keychain token.
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(
+            handle.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"foreign@c.com"}}"#,
+        )
+        .unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", Some("old@a.com"));
+        // Foreign email preserved — gate stays fail-closed.
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("foreign@c.com")
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_present_email_when_pre_swap_unknown() {
+        // Conservative: if pre_swap_email is None (couldn't resolve the old account),
+        // a PRESENT non-anchor email cannot be confirmed as the safe stale value →
+        // skip (do not risk clobbering a foreign signal).
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(
+            handle.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"present@a.com"}}"#,
+        )
+        .unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", None);
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("present@a.com")
+        );
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_when_already_matching() {
+        // Already-consistent (case-insensitive) → NO write (byte-identical content).
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        let body = r#"{"oauthAccount":{"emailAddress":"Me@Example.com"}}"#;
+        std::fs::write(handle.join(".claude.json"), body).unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "me@example.com", Some("old@a.com"));
+        // No rewrite: content unchanged (a rewrite would re-serialize compactly).
+        assert_eq!(
+            std::fs::read_to_string(handle.join(".claude.json")).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn reconcile_creates_oauth_account_when_absent() {
+        // Populated file with no oauthAccount → absent email is always safe to set.
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".claude.json"), r#"{"numStartups":3}"#).unwrap();
+        // Even with pre_swap unknown, an absent oauthAccount has no signal to lose.
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", None);
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("new@b.com")
+        );
+    }
+
+    #[test]
+    fn reconcile_replaces_non_object_oauth_account() {
+        // oauthAccount present but non-object → no usable email (current == None) →
+        // safe to replace with a proper object carrying the anchor.
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(
+            handle.join(".claude.json"),
+            r#"{"oauthAccount":"garbage","numStartups":3}"#,
+        )
+        .unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", None);
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("new@b.com")
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_absent_unparseable_non_object_and_empty_email() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        // Absent .claude.json → no file created.
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", Some("old@a.com"));
+        assert!(!handle.join(".claude.json").exists());
+        // Unparseable (M-1) → unchanged (never clobber a file we can't round-trip).
+        std::fs::write(handle.join(".claude.json"), r#"not json {"#).unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", Some("old@a.com"));
+        assert_eq!(
+            std::fs::read_to_string(handle.join(".claude.json")).unwrap(),
+            "not json {"
+        );
+        // Non-object → unchanged.
+        std::fs::write(handle.join(".claude.json"), r#"[1,2,3]"#).unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", Some("old@a.com"));
+        assert_eq!(
+            std::fs::read_to_string(handle.join(".claude.json")).unwrap(),
+            "[1,2,3]"
+        );
+        // Empty identity email → no-op even on a valid stale file.
+        std::fs::write(
+            handle.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"old@a.com"}}"#,
+        )
+        .unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "   ", Some("old@a.com"));
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("old@a.com")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_partial_failure_cleans_tmp_file() {
+        // §5a: a write/secure_file/atomic_replace failure must leave no tmp behind
+        // (`.claude.json` carries the account email = PII). Mirror of the sibling
+        // `rebuild_claude_json_for_swap_partial_failure_cleans_tmp_file`.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        // A stale (pre-swap-matching) file so the reconcile decides to WRITE.
+        std::fs::write(
+            handle.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"old@a.com"}}"#,
+        )
+        .unwrap();
+        // Read-only handle dir → the tmp create/write fails → no tmp may linger.
+        std::fs::set_permissions(&handle, std::fs::Permissions::from_mode(0o500)).unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", Some("old@a.com"));
+        std::fs::set_permissions(&handle, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let leaked: Vec<_> = std::fs::read_dir(&handle)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.contains(".tmp."))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(leaked.is_empty(), "§5a leaked tmp files: {leaked:?}");
+    }
+
+    #[test]
+    fn reconcile_skips_oversized_file() {
+        // A `.claude.json` past the read ceiling → read_raw None → skip (never buffer
+        // + rewrite an unbounded file). Intermediate-reviewer NIT.
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        let pad = "x".repeat(17 * 1024 * 1024);
+        let body = format!(r#"{{"oauthAccount":{{"emailAddress":"old@a.com"}},"_pad":"{pad}"}}"#);
+        std::fs::write(handle.join(".claude.json"), &body).unwrap();
+        reconcile_handle_dir_oauth_email(&handle, "new@b.com", Some("old@a.com"));
+        // Unchanged (oversized → skipped).
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("old@a.com")
+        );
+    }
+
     // ── M2-3 / M4-2 acceptance tests ─────────────────────────────────────
 
     /// M4-2 Criterion: `materialize_handle_settings_inner` prefers the
@@ -5082,7 +5774,7 @@ mod tests {
     ///
     /// (Renamed from `materialize_handle_settings_prefers_uuid_path_when_present`
     /// to match the M4-2 WBS acceptance-criterion name in
-    /// `workspaces/account-slot-decoupling/02-plans/03-phase4-plan.md`.)
+    /// `internal-design-docs`.)
     #[test]
     fn materialize_handle_settings_prefers_identities_uuid_source() {
         use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
@@ -5140,7 +5832,7 @@ mod tests {
     ///
     /// (Renamed from `materialize_handle_settings_falls_back_to_config_n_when_uuid_missing`
     /// to match the M4-2 WBS acceptance-criterion name in
-    /// `workspaces/account-slot-decoupling/02-plans/03-phase4-plan.md`.)
+    /// `internal-design-docs`.)
     #[test]
     fn materialize_handle_settings_legacy_fallback_when_uuid_absent() {
         use crate::testing::identity_fixtures::legacy_only_fixture;
@@ -5190,7 +5882,7 @@ mod tests {
     /// M3-3 AC1: Under a coexisting fixture (slot 3, account 2), `.credentials.json`
     /// symlink resolves to `identities/<UUID>/credentials.json`.
     ///
-    /// Journal 0016 OQ #2 Option A: M3-3 retargets `.credentials.json` to the
+    /// an internal journal entry OQ #2 Option A: M3-3 retargets `.credentials.json` to the
     /// identity-keyed path when a UUID is present.
     #[cfg(any(test, feature = "test-utils"))]
     #[cfg(unix)]
@@ -5304,7 +5996,7 @@ mod tests {
         // Ensure config-2/ Codex items.
         let config_dir = base.join("config-2");
         std::fs::write(config_dir.join(".csq-account"), b"2").unwrap();
-        std::fs::write(config_dir.join("config.toml"), b"").unwrap();
+        std::fs::write(config_dir.join("config.toml"), b"").unwrap(); // CI-ALLOW-fs-write-config-toml
 
         // Codex also needs the legacy canonical to exist for the precondition check.
         let creds_dir = base.join("credentials");
@@ -5349,7 +6041,7 @@ mod tests {
         // Set up Codex-required items.
         let config_dir = base.join("config-2");
         std::fs::write(config_dir.join(".csq-account"), b"2").unwrap();
-        std::fs::write(config_dir.join("config.toml"), b"").unwrap();
+        std::fs::write(config_dir.join("config.toml"), b"").unwrap(); // CI-ALLOW-fs-write-config-toml
 
         let creds_dir = base.join("credentials");
         std::fs::create_dir_all(&creds_dir).unwrap();
@@ -5642,7 +6334,7 @@ mod tests {
         // Set up Codex-required items.
         let config_dir = base.join("config-2");
         std::fs::write(config_dir.join(".csq-account"), b"2").unwrap();
-        std::fs::write(config_dir.join("config.toml"), b"").unwrap();
+        std::fs::write(config_dir.join("config.toml"), b"").unwrap(); // CI-ALLOW-fs-write-config-toml
 
         // Legacy canonical DOES exist.
         let creds_dir = base.join("credentials");
@@ -5694,7 +6386,7 @@ mod tests {
 
     // ── M3-4 acceptance criteria tests ───────────────────────────────────────
     //
-    // 9 tests from the M3-4 WBS (account-slot-decoupling Phase 3, issue #292).
+    // 9 tests from the M3-4 WBS (an internal workspace Phase 3, an internal ticket).
     // Tests cover: repoint identity UUID targeting, mtime bump on identity path,
     // Codex repoint parallel, fallback scenarios (legacy + Partial-Pass-0), and
     // concurrent writer regression guard.
@@ -5763,6 +6455,67 @@ mod tests {
         );
     }
 
+    /// #832: the real DA-1 case — `config-<target>/.claude.json` is ABSENT, so
+    /// `rebuild_claude_json_for_swap` bails and the handle retains the OLD (pre-swap)
+    /// account's stale `.claude.json`. `repoint_handle_dir` then reconciles
+    /// `oauthAccount.emailAddress` to the swap target's identity anchor (the current
+    /// email equals the captured pre-swap value → safe to overwrite), so the custodian
+    /// wrong-account gate matches on the next tick.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(unix)]
+    #[test]
+    fn repoint_reconciles_oauth_email_to_identity_anchor() {
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+
+        for slot in [2u16, 3u16] {
+            let uuid = fixture_uuid_for_slot(slot);
+            std::fs::write(
+                base.join("identities")
+                    .join(uuid.to_canonical_string())
+                    .join("credentials.json"),
+                b"{}",
+            )
+            .unwrap();
+            let cfg = base.join(format!("config-{slot}"));
+            std::fs::write(cfg.join(".csq-account"), slot.to_string()).unwrap();
+            std::fs::write(cfg.join("settings.json"), b"{}").unwrap();
+        }
+        // config-2 carries slot-2's email — the handle inherits it at create, so it
+        // becomes the pre-swap value. config-3/.claude.json is deliberately ABSENT →
+        // the rebuild bails → the handle keeps the slot-2 (pre-swap) copy → the
+        // reconcile's safety gate recognizes it as the pre-swap value and overwrites
+        // it with the slot-3 identity anchor.
+        std::fs::write(
+            base.join("config-2/.claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-2@test.invalid"},"projects":{}}"#,
+        )
+        .unwrap();
+        // (config-3/.claude.json intentionally NOT written.)
+
+        let claude_home = tempfile::TempDir::new().unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let account3 = AccountNum::try_from(3u16).unwrap();
+        let handle = create_handle_dir(base, claude_home.path(), account2, 21051).unwrap();
+        // Precondition: the handle inherited slot-2's email (the pre-swap value).
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("fixture-slot-2@test.invalid")
+        );
+
+        repoint_handle_dir(base, claude_home.path(), &handle, account3).unwrap();
+
+        // The handle's oauthAccount.emailAddress is now the slot-3 IDENTITY anchor —
+        // the gate matches; no wait for CC to rewrite.
+        assert_eq!(
+            read_oauth_email_field(&handle).as_deref(),
+            Some("fixture-slot-3@test.invalid"),
+            "AC: swap must reconcile oauthAccount.emailAddress to the identity anchor"
+        );
+    }
+
     /// M3-4 AC2 (Codex parallel): `repoint_handle_dir_codex` retargets
     /// `auth.json` to `identities/<UUID>/credentials-codex.json` when present.
     ///
@@ -5789,7 +6542,7 @@ mod tests {
         for slot in [2u16, 3u16] {
             let cfg = base.join(format!("config-{slot}"));
             std::fs::write(cfg.join(".csq-account"), slot.to_string()).unwrap();
-            std::fs::write(cfg.join("config.toml"), b"").unwrap();
+            std::fs::write(cfg.join("config.toml"), b"").unwrap(); // CI-ALLOW-fs-write-config-toml
         }
 
         // Legacy canonical codex credentials (required by precondition check).
@@ -5922,7 +6675,7 @@ mod tests {
         for slot in [2u16, 3u16] {
             let cfg = base.join(format!("config-{slot}"));
             std::fs::write(cfg.join(".csq-account"), slot.to_string()).unwrap();
-            std::fs::write(cfg.join("config.toml"), b"").unwrap();
+            std::fs::write(cfg.join("config.toml"), b"").unwrap(); // CI-ALLOW-fs-write-config-toml
         }
 
         let creds_dir = base.join("credentials");

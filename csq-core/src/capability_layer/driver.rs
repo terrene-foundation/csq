@@ -196,11 +196,15 @@ pub fn run_with_layer_toggled(
     let layer_total_timer = StageTimer::start(STAGE_LAYER_TOTAL);
 
     // Pre-classifier (spawn-mode) — argv inspection only, never errors.
+    // CU2 (an internal ticket): `surface` is now threaded in so the classifier
+    // can use surface-specific one-shot detection (Gemini `--prompt` vs
+    // CC `--print`/`-p`).
     let mut mode = SpawnMode::default();
     PreClassifyStage::run(
         PreClassifyInputs {
             argv: argv.clone(),
             stdin_is_tty,
+            surface,
         },
         &mut mode,
     )?;
@@ -281,32 +285,44 @@ pub fn run_with_layer_toggled(
 }
 
 /// Extract RULE_IDs from `coc_set` whose `applies_to` is empty
-/// (universal) or contains the target `surface`. Same filter
-/// `crate::capability_layer::scaffold::ScaffoldStage` uses — keeps
-/// the citation requirement aligned with the scaffold's emitted set.
+/// (universal) or contains the target `surface`. Shares the single
+/// surface-scope predicate `crate::coc::translate::flatten::in_scope` with
+/// the scaffold's full-body flatten (`flatten_artifacts`), so the rules
+/// that appear in the delivered scaffold are EXACTLY the rules required for
+/// citation — they cannot drift (redteam R1 DA-2). This produces a
+/// rules-only ID *set*, a different output than the full-body flatten, which
+/// is why the two functions stay distinct (CU1b boundary note); only the
+/// predicate is shared.
 ///
 /// Pure function; deterministic by `BTreeMap` iteration order +
 /// `BTreeSet` collection (spec 10 §10.3.5).
 pub fn extract_rule_ids_in_scope(coc_set: &CocSet, surface: Surface) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for (rule_id, rule) in &coc_set.rules {
-        if rule.applies_to.is_empty() || rule.applies_to.contains(&surface) {
+        if crate::coc::translate::flatten::in_scope(&rule.applies_to, surface) {
             out.insert(rule_id.as_str().to_string());
         }
     }
     out
 }
 
-/// Extract a one-shot prompt from CC's argv. Recognizes `--print
-/// PROMPT`, `--print=PROMPT`, `-p PROMPT`, and the `-pPROMPT` short
-/// combinator. Returns an empty `UserPrompt` for interactive
-/// launches (no `--print` / `-p`) — the classifier's fail-secure
-/// path then handles them.
+/// Extract a one-shot prompt from argv. Recognizes:
+///
+/// - CC/Codex: `--print PROMPT`, `--print=PROMPT`, `-p PROMPT`,
+///   `-pPROMPT` short combinator.
+/// - Gemini (CU2, an internal ticket): `--prompt PROMPT`, `--prompt=PROMPT`.
+///
+/// Surface-agnostic extraction is correct here: only Gemini argv
+/// carries `--prompt`, and only CC argv carries `--print`/`-p`, so
+/// there is no cross-surface ambiguity in practice. Returns an empty
+/// `UserPrompt` for interactive launches — the classifier's
+/// fail-secure path then handles them.
 ///
 /// Pure function; deterministic; no side effects.
 fn extract_prompt_from_argv(argv: &[String]) -> UserPrompt {
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
+        // CC / Codex: space-separated `--print PROMPT` or `-p PROMPT`.
         if arg == "--print" || arg == "-p" {
             // Next arg is the prompt; if missing, return empty.
             if let Some(next) = iter.next() {
@@ -321,11 +337,26 @@ fn extract_prompt_from_argv(argv: &[String]) -> UserPrompt {
                 text: rest.to_string(),
             };
         }
-        // `-pX` short combinator (no space). Same `-p` test the
+        // CC `-pX` short combinator (no space). Same `-p` test the
         // pre-classifier uses for one-shot mode (spec 10 §10.4.2).
         if arg.starts_with("-p") && !arg.starts_with("--") && arg.len() > 2 {
             return UserPrompt {
                 text: arg[2..].to_string(),
+            };
+        }
+        // Gemini (CU2): `--prompt PROMPT` space-separated form.
+        if arg == "--prompt" {
+            if let Some(next) = iter.next() {
+                return UserPrompt { text: next.clone() };
+            }
+            return UserPrompt {
+                text: String::new(),
+            };
+        }
+        // Gemini (CU2): `--prompt=PROMPT` single-arg form.
+        if let Some(rest) = arg.strip_prefix("--prompt=") {
+            return UserPrompt {
+                text: rest.to_string(),
             };
         }
     }
@@ -735,18 +766,22 @@ mod tests {
         }
     }
 
-    /// PR-CA7a: `extract_prompt_from_argv` recognizes all four
-    /// supported one-shot forms (`--print PROMPT`, `--print=PROMPT`,
-    /// `-p PROMPT`, `-pPROMPT`) and returns empty for interactive.
+    /// PR-CA7a + CU2: `extract_prompt_from_argv` recognizes all
+    /// supported one-shot forms — CC/Codex and Gemini.
     #[test]
     fn extract_prompt_from_argv_recognizes_all_one_shot_forms() {
         let cases: &[(&[&str], &str)] = &[
+            // CC / Codex forms (unchanged)
             (&["--print", "hello world"], "hello world"),
             (&["--print=hello world"], "hello world"),
             (&["-p", "hello world"], "hello world"),
             (&["-phello"], "hello"),
             (&[], ""),
             (&["--resume"], ""), // unrelated flag
+            // Gemini forms (CU2, an internal ticket)
+            (&["--prompt", "gemini query"], "gemini query"),
+            (&["--prompt=gemini query"], "gemini query"),
+            (&["--prompt="], ""), // empty prompt= form
         ];
         for (argv_strs, expected) in cases {
             let argv: Vec<String> = argv_strs.iter().map(|s| s.to_string()).collect();

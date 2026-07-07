@@ -18,7 +18,7 @@
 //! Per `rules/testing.md` Rule 4a: subprocess commands use `env_clear()` +
 //! whitelist to avoid inheriting live `CLAUDE_CONFIG_DIR`.
 //!
-//! Per `workspaces/multi-cli-deps/journal/0008-RISK-test-parallelism-vs-probe-timeout.md`:
+//! Per `internal-design-docs`:
 //! all tests acquire the `SERIAL` mutex to prevent CPU-saturation flakes.
 //!
 //! ## Strategy for distinguishing probe bails vs downstream errors
@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-// Workspace-local serial mutex (journal 0008): cli_deps probe has a 2s
+// Workspace-local serial mutex (an internal journal entry): cli_deps probe has a 2s
 // timeout that races under cargo's parallel test load. All tests serialize
 // on this mutex to prevent CPU-saturation flakes.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -72,6 +72,10 @@ fn sandbox_home() -> std::path::PathBuf {
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
+    // Hermetic: the spawned `csq` binary must NOT shell `security` against the
+    // operator's real login keychain (per-user, not redirected by sandbox HOME).
+    // See `rules/test-hermeticity.md` + keychain::keychain_mirror_disabled.
+    cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     // Sandbox HOME and CLAUDE_HOME — never re-inject the parent's live values.
     // Callers may still override CLAUDE_HOME per-test via `.env("CLAUDE_HOME", ...)`.
     cmd.env("HOME", sandbox_home());

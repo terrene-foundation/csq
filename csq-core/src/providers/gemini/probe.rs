@@ -7,7 +7,7 @@
 //! `reassert_api_key_selected_type[_with_system_instruction]` and framed
 //! the work as a ToS-driven defense that always pinned
 //! `security.auth.selectedType = "gemini-api-key"` on every spawn. That
-//! framing was retracted in journal 0048 — the selectedType pin is a UX
+//! framing was retracted in an internal journal entry — the selectedType pin is a UX
 //! shortcut for API-key slots so gemini-cli does not interactively
 //! prompt on first spawn, not policy enforcement. Stage 2 of journal
 //! 0048 renamed the symbols to match the actual semantic surface and
@@ -20,7 +20,7 @@
 //! (layer-OFF) and from csq-cli's `launch_gemini` with-layer arm
 //! (layer-ON, PR-CA8b commit 4).
 //!
-//! Per OPEN-G01 (journal 0003 RESOLVED): the handle-dir variant
+//! Per OPEN-G01 (an internal journal entry RESOLVED): the handle-dir variant
 //! fully wins over user-level `~/.gemini/settings.json`, so
 //! re-assertion is a cheap atomic write — NOT a rename of the
 //! user's home-directory file.
@@ -187,7 +187,7 @@ fn reassert_with_system_instruction_internal(
     // which silently dropped per-spawn directive injection on every
     // post-first spawn.
     //
-    // Stage 2 of journal 0048: for OAuth bindings (`pin == None`),
+    // Stage 2 of an internal journal entry: for OAuth bindings (`pin == None`),
     // the writer does not manage `selectedType`, so the gate skips
     // that comparison.
     if let Some(content) = &existing {
@@ -317,12 +317,12 @@ mod tests {
     }
 
     // ============================================================
-    // Stage 2 of journal 0048 — binding-mode-aware writer
+    // Stage 2 of an internal journal entry — binding-mode-aware writer
     // ============================================================
 
-    /// Journal 0054 — OAuth bindings now PIN
+    /// an internal journal entry — OAuth bindings now PIN
     /// `selectedType="oauth-personal"` on a fresh handle dir. Previously
-    /// (Stage 2 of journal 0048) the field was left unset on the
+    /// (Stage 2 of an internal journal entry) the field was left unset on the
     /// assumption that gemini-cli would auto-discover
     /// `~/.gemini/oauth_creds.json`. v0.41.2 disproved that assumption:
     /// without `selectedType` pinned, gemini-cli prompts interactively
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(
             extract_selected_type(&written).as_deref(),
             Some("oauth-personal"),
-            "OAuth binding must pin selectedType=oauth-personal (journal 0054), got: {written}"
+            "OAuth binding must pin selectedType=oauth-personal (an internal journal entry), got: {written}"
         );
         // model.name still pinned (csq-managed for all modes).
         assert_eq!(
@@ -364,7 +364,7 @@ mod tests {
         let outcome =
             reassert_settings_drift(dir.path(), "gemini-2.5-pro", &AuthMode::CodeAssistOAuth)
                 .unwrap();
-        // Journal 0054: pinned target == existing value → AlreadyCorrect.
+        // an internal journal entry: pinned target == existing value → AlreadyCorrect.
         assert_eq!(outcome, DriftOutcome::AlreadyCorrect);
         let written = std::fs::read_to_string(gemini_dir.join("settings.json")).unwrap();
         assert_eq!(
@@ -374,7 +374,7 @@ mod tests {
         );
     }
 
-    /// Journal 0054 — when an OAuth binding's handle dir has a stale
+    /// an internal journal entry — when an OAuth binding's handle dir has a stale
     /// `selectedType=gemini-api-key` (e.g. user previously had an API
     /// key in this slot, then re-bound to OAuth), reassert_settings_drift
     /// MUST overwrite with `oauth-personal` so gemini-cli does not

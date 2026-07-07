@@ -8,11 +8,11 @@
 //! [`crate::audit::types::EventKind`] session-custody events (CsqRun,
 //! OAuthRefresh, KeyRotate, …). Those events are NOT EATP authorization-envelope
 //! events; replacing their canonical form with the EATP form would be both
-//! invasive and domain-wrong (workspace journal 0010 Finding B).
+//! invasive and domain-wrong (workspace an internal journal entry Finding B).
 //!
 //! Instead, this module adds a *separate, standalone* encoder that reproduces
 //! the Foundation EATP governance audit-chain canonical form **byte-for-byte**,
-//! so that the loom↔csq seam (workspace journal 0017) can feed governance /
+//! so that the loom↔csq seam (workspace an internal journal entry) can feed governance /
 //! decision-provenance events through csq's existing sign/anchor pipeline while
 //! remaining wire-conformant to the published cross-SDK vectors.
 //!
@@ -49,9 +49,9 @@
 //!    keys, compact separators (`,` `:`), and `ensure_ascii=True` — every
 //!    codepoint ≥ U+007F escapes as `\uXXXX` (lowercase), and codepoints above
 //!    the BMP escape as a UTF-16 surrogate pair (`\uHHHH\uLLLL`), per RFC 8259
-//!    §7. This is [`escape_json_ascii`].
+//!    §7. This is `escape_json_ascii`.
 //!
-//! # Edition dialect split — empty metadata object (M2 T2.3, journal 0011/0013)
+//! # Edition dialect split — empty metadata object (M2 T2.3, an internal journal entry/0013)
 //!
 //! the enterprise edition serializes an empty object `{}` as `:{}`; kailash-py's
 //! `compute_hash` uses `if self.metadata:` truthiness, so an empty `dict` is
@@ -112,7 +112,7 @@ use serde_json::{Map, Value};
 /// is intentionally distinct from [`persist::AUDIT_SCHEMA_VERSION`] (`"2"`),
 /// which versions csq's *own* session-custody chain envelope. They are two
 /// different forms over two different domains; conflating them would be the
-/// error journal 0010 Finding A guards against.
+/// error an internal journal entry Finding A guards against.
 ///
 /// [`persist::AUDIT_SCHEMA_VERSION`]: crate::audit::persist
 pub const EATP_CANONICAL_FORM_SPEC_VERSION: &str = "1.0";
@@ -152,7 +152,7 @@ impl std::error::Error for EatpCanonicalError {}
 
 /// PACT verification level.
 ///
-/// # Edition split (M2 T2.3, journal 0010)
+/// # Edition split (M2 T2.3, an internal journal entry)
 ///
 /// The **community** edition targets kailash-py's authoritative
 /// `kailash.trust.pact.audit.VerificationLevel` — the 4-level gradient
@@ -210,10 +210,8 @@ impl VerificationLevel {
     /// `BLOCKED` — INCLUDING `"PEER_REVIEWED"`/`"SIGNED_ATTESTATION"`. This is
     /// edition-stable: it returns `None` for the two the enterprise edition levels even in a
     /// feature-unified `enterprise` build, so the community engine's level
-    /// acceptance does not drift (R1 HIGH-1 fix, journal 0013). For the
-    /// enterprise 6-level parse, see [`from_canonical_str_kailash_rs`].
-    ///
-    /// [`from_canonical_str_kailash_rs`]: Self::from_canonical_str_kailash_rs
+    /// acceptance does not drift (R1 HIGH-1 fix, an internal journal entry). For the
+    /// enterprise 6-level parse, see `from_canonical_str_kailash_rs`.
     #[must_use]
     pub fn from_canonical_str(s: &str) -> Option<Self> {
         match s {
@@ -235,6 +233,39 @@ impl VerificationLevel {
             "PEER_REVIEWED" => Some(Self::PeerReviewed),
             "SIGNED_ATTESTATION" => Some(Self::SignedAttestation),
             other => Self::from_canonical_str(other),
+        }
+    }
+}
+
+// Step 1 — Serialize / Deserialize for VerificationLevel (M3a).
+//
+// Serialize: emit the canonical wire string (e.g. `"AUTO_APPROVED"`).
+// Deserialize: edition-aware parse — enterprise 6-level in enterprise builds,
+// community 4-level otherwise. Fails closed on unrecognised strings (including
+// `"PEER_REVIEWED"` / `"SIGNED_ATTESTATION"` in a community build), preserving
+// the `community_verification_level_is_four_levels` guard intent.
+impl serde::Serialize for VerificationLevel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_canonical_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VerificationLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        #[cfg(feature = "enterprise")]
+        {
+            Self::from_canonical_str_kailash_rs(&s).ok_or_else(|| {
+                serde::de::Error::custom(format!("unknown VerificationLevel: {s:?}"))
+            })
+        }
+        #[cfg(not(feature = "enterprise"))]
+        {
+            Self::from_canonical_str(&s).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown VerificationLevel (community 4-level): {s:?}"
+                ))
+            })
         }
     }
 }
@@ -314,14 +345,12 @@ impl EatpAuditAnchor {
     /// This is the edition-stable, dependency-free default the community engine
     /// uses; its output does NOT depend on the `enterprise` crate feature — a
     /// feature-unified enterprise build still gets the community form here. For
-    /// the enterprise (the enterprise edition) dialect, see [`canonical_input_kailash_rs`].
+    /// the enterprise (the enterprise edition) dialect, see `canonical_input_kailash_rs`.
     ///
     /// Fails with [`EatpCanonicalError::MetadataContainsFloat`] if `metadata`
     /// carries a float at any depth — a load-bearing release-mode guard (see the
     /// error docs). All other field types are constrained to byte-exact-safe
     /// forms by the struct's types.
-    ///
-    /// [`canonical_input_kailash_rs`]: Self::canonical_input_kailash_rs
     pub fn canonical_input(&self) -> Result<String, EatpCanonicalError> {
         // Community dialect: empty `{}` is NOT emitted.
         self.canonical_input_form(false)
@@ -334,7 +363,7 @@ impl EatpAuditAnchor {
     /// non-empty metadata is byte-identical for both dialects. Keying the
     /// dialect on this PARAMETER (not the crate feature) keeps each engine's
     /// output stable under feature unification — the originating fix for the
-    /// `CommunityAttestationEngine` drift (R1 HIGH-1, journal 0013).
+    /// `CommunityAttestationEngine` drift (R1 HIGH-1, an internal journal entry).
     fn canonical_input_form(&self, emit_empty_braces: bool) -> Result<String, EatpCanonicalError> {
         let prev = self
             .previous_hash
@@ -600,7 +629,7 @@ mod tests {
         assert!(input.contains(&format!(":{}:", Sha256Hex::GENESIS)));
     }
 
-    /// Empty metadata object — Divergence 1 (M2 T2.3, journal 0011/0013).
+    /// Empty metadata object — Divergence 1 (M2 T2.3, an internal journal entry/0013).
     /// The DEFAULT `canonical_input` is the community (kailash-py) dialect:
     /// empty `{}` omits the segment. This holds in BOTH builds — `canonical_input`
     /// no longer keys on the crate feature (R1 HIGH-1 fix), so the test is
@@ -629,7 +658,7 @@ mod tests {
         assert!(input.ends_with(":AUTO_APPROVED::success:2026-01-15T10:00:00+00:00"));
     }
 
-    /// Empty metadata object — Divergence 1 (M2 T2.3, journal 0011/0013).
+    /// Empty metadata object — Divergence 1 (M2 T2.3, an internal journal entry/0013).
     /// The explicit enterprise (the enterprise edition) form `canonical_input_kailash_rs`
     /// emits a real `:{}` segment, and it MUST diverge from the absent-metadata
     /// (omitted) form. Enterprise edition only.
@@ -799,7 +828,7 @@ mod tests {
         }
     }
 
-    /// Community structural guard (M2 T2.3, journal 0010/0013): the community
+    /// Community structural guard (M2 T2.3, an internal journal entry/0013): the community
     /// 4-level parser `from_canonical_str` rejects the two the enterprise edition levels.
     /// This is edition-STABLE — it holds even in a feature-unified `enterprise`
     /// build (the R1 HIGH-1 fix moved the community parser off the crate-feature

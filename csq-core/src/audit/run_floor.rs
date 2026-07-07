@@ -93,6 +93,7 @@ fn build_csq_run_record(chain_id_str: &str, run_id: &str) -> Result<SignedRecord
         eatp_start_ts: None,
         eatp_end_ts: None,
         op_phase: None, // STATE/observation record — no intent/outcome envelope
+        verification_level: None,
     })
 }
 

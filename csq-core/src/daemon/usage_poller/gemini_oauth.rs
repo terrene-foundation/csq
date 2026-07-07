@@ -1,5 +1,5 @@
-//! Code Assist OAuth quota poller — Phase B' (journal 0046+0047) +
-//! Stage 2 of journal 0048.
+//! Code Assist OAuth quota poller — Phase B' (an internal journal entry+0047) +
+//! Stage 2 of an internal journal entry
 //!
 //! Per-tick: enumerate Gemini slots whose binding marker is in
 //! [`AuthMode::CodeAssistOAuth`] mode; if any exist, read the user's

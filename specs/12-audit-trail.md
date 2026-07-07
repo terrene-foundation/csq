@@ -577,6 +577,40 @@ The daemon's `audit_health` is a startup snapshot; CLI-side writers (`write_reco
 - `csq/src/desktop/daemon_supervisor.rs` — desktop verify block; sentinel set/clear; anchor gate
 - `csq/src/cli/mod.rs` — `AuditCmd::Verify` variant + `DaemonCmd::Start.audit_verify_limit` flag
 
+## 12.12 Plain-language compliance report — `csq audit compliance-report`
+
+`csq audit compliance-report [--format md|html] [--out <path>]` renders the
+signed operation chain into an auditor-readable document. Where `csq audit
+export` produces a machine-verifiable bundle (`chain.jsonl` + a `verify` script),
+this verb produces evidence a compliance officer or auditor can read directly. It
+PRESENTS verified facts off the persisted records — it never re-derives them.
+
+The command reads `csq-runs/<chain_id>.jsonl` — the same op-chain `csq audit
+verify` reads (§12.10) — parses each line into a signed record, and classifies
+each into one of two sections:
+
+- **Governed decisions** — per-turn governance verdicts. These records are not
+  produced in the community edition, so this section is empty here and the report
+  renders only the lifecycle section.
+- **Lifecycle operations** — every recorded chain event (`csq run`, account
+  swap / move / logout, identity mint, key rotate, release authorization,
+  replication, chain continuation / re-genesis, sink drift) with a non-secret
+  per-operation detail (ids, slots, hashes, redacted reasons).
+
+**Verification grounding.** The handler runs a read-only `verify_chain` (§12.10)
+and the report header states the verdict — `VERIFIED` (with the verified record
+count, chain head sequence, and the covered range `seq 0..=head` an auditor pins
+when reproducing against an exported bundle's `CUTOFF.json`) or `UNVERIFIED` (with
+the redacted failure reason and an explicit "treat records as UNCONFIRMED"
+banner). Chain lines that fail to parse are counted and the omission is surfaced
+in the header — never a silent under-report.
+
+**Redaction + formats.** The renderer reads only already-redacted or non-secret
+fields; the HTML renderer HTML-escapes every dynamic cell, and a `--out` path is
+echoed redacted. `--out` writes the document to the path (stdout stays clean for
+scripting); otherwise it prints to stdout. Formats: Markdown (default,
+portable / diff-able) and self-contained HTML.
+
 ## 12.11 Cross-references
 
 - **Spec 04 — csq Daemon Architecture** (`04-csq-daemon-architecture.md`): daemon startup sequencing, the verify-before-bind contract, sweep/drain scheduling (§4.2.8).
@@ -585,4 +619,5 @@ The daemon's `audit_health` is a startup snapshot; CLI-side writers (`write_reco
 
 ## Revisions
 
+- 1.42.0 — Added §12.12: the plain-language compliance report (`csq audit compliance-report [--format md|html] [--out <path>]`) — renders the signed op-chain into an auditor-readable Markdown/HTML document (governed decisions — empty in this edition — plus lifecycle operations), grounded in a read-only `verify_chain` verdict. Redaction-preserving, HTML-escaped, `--out`/stdout contract.
 - 1.41.0 — Current consolidated spec: v1 JSONL + v2 chain-linked records, single audited write site, csq-cli emit/drain contract, retention/sweep, the audit-trait abstraction layer, local Ed25519 signing-key custody (file-mirror + keychain-anchor DETECTOR), chain-integrity verification at daemon start, the `csq audit verify` / `csq doctor` surfaces, the `.chain-broken` sentinel, the historical-key degrade path, and the four-level verification gradient.

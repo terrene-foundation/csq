@@ -1,8 +1,8 @@
 //! M14 — Daemon tokio task for periodic external anchoring.
 //!
 //! Mirrors the `refresher.rs` pattern: a cancellable tokio loop that fires on
-//! a configurable cadence and calls [`anchor_head`] to commit the chain HEAD
-//! to the active [`LedgerSink`].
+//! a configurable cadence and calls `anchor_head` to commit the chain HEAD
+//! to the active `LedgerSink`.
 //!
 //! # Cadence
 //!
@@ -411,7 +411,7 @@ fn compute_next_regular(last_anchor_ts: Option<&str>, cadence: Duration) -> Dura
     }
 }
 
-/// Calls [`anchor_head`] and updates `anchor-state-<sink>.json` based on the
+/// Calls `anchor_head` and updates `anchor-state-<sink>.json` based on the
 /// outcome. Non-fatal: logs at WARN on failure.
 ///
 /// On success, updates BOTH `last_anchor_ts` AND `last_anchored_seq` so the
@@ -815,6 +815,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(record, Some(base_dir)).unwrap();
     }
@@ -846,6 +847,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(record, Some(base_dir)).unwrap();
     }
@@ -876,6 +878,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(record, Some(base_dir)).unwrap();
     }

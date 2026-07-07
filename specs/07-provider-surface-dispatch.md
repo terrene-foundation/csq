@@ -251,6 +251,24 @@ When the capability layer engages on a Gemini slot AND the parent env carries pr
 - `csq/src/cli/commands/run.rs::detect_host_context` + `emit_host_isolation_warning_if_needed` — per-spawn detection + emission.
 - `csq/src/cli/commands/doctor.rs::HostIsolationStatus` + `check_host_isolation_with_env` — doctor surface (testable variant takes env-name iterator to avoid `std::env` mutation in tests).
 
+#### 7.2.2.2 Codex statusline (`tui.status_line`) injection
+
+Codex renders a native TUI footer (the `/statusline` feature; openai/codex an internal ticket, in codex-cli ≥ the Feb-2026 release — verified against 0.142.3) from an ordered array of built-in item IDs at `[tui] status_line` in `config.toml`. This is NOT an external-command hook: codex never invokes a command and pipes no JSON, so csq cannot inject a csq-rendered line the way `csq statusline` does for `Surface::ClaudeCode` (that would require the unshipped openai/codex #17827).
+
+`render_config_toml_with_global` therefore injects csq's curated default into the slot's `config.toml` when the user has not configured one:
+
+```toml
+[tui]
+status_line = ["model-with-reasoning", "context-remaining", "git-branch", "current-dir"]
+```
+
+Contract (`csq-core/src/providers/codex/surface.rs::inject_default_status_line`):
+
+- **Categories.** Three classes of `config.toml` keys: (1) **csq-controlled** (`cli_auth_credentials_store`, `model`) — csq always wins; (2) **user-propagated** — every other user-global top-level key passes through verbatim; (3) **csq-default-if-absent** — `tui.status_line` is filled ONLY when the user has not set it.
+- **User-wins-if-present.** A user's own `tui.status_line` (set via codex `/statusline` or by hand) is never overwritten — unlike categories (1). The item array mirrors what csq surfaces for `Surface::ClaudeCode` (model, context, git, dir).
+- **Table-aware merge.** Injection resolves or creates the `[tui]` table and adds `status_line` only when absent, preserving sibling `[tui]` keys (e.g. `status_line_use_colors`). A non-table `tui` value (malformed user config) is left untouched (no clobber, no panic). Output is always valid TOML.
+- **All write paths.** Applies on every `write_config_toml` call (login §7.3.3, daemon startup reconciler, model-switch), so every codex slot — including one with no `~/.codex/config.toml` — gets the footer.
+
 #### 7.2.2.1 Capability-layer with-layer deviation (Codex)
 
 When `csq run --capability-layer` engages on a Codex slot AND the pre-spawn pipeline returns `LayerControl::WithLayer` (`.coc/` resolved + non-empty), `term-<pid>/config.toml` is **materialized as a regular file** (rather than the symlink to `config-<N>/config.toml` shown in the §7.2.2 layout above) for that single spawn. The regular file contains the canonical content + a per-spawn `instructions = "..."` block built by the capability layer's scaffold stage. The Inherit path (capability layer off OR `.coc/` resolves to `CocSource::Empty`) preserves the symlink layout — byte-equivalent to the pre-layer shape.
@@ -297,12 +315,12 @@ Unchanged: API-key capture into `config-<N>/settings.json` under `env.ANTHROPIC_
 Ordered sequence (any deviation is a spec violation):
 
 1. `mkdir -p config-<N>/` and `mkdir -p config-<N>/codex-sessions/`.
-2. Write `config-<N>/config.toml` with:
+2. Write `config-<N>/config.toml` via `codex::surface::render_config_toml_with_global`. The csq-controlled head is always:
    ```toml
    cli_auth_credentials_store = "file"
    model = "<default-model>"
    ```
-   This MUST happen BEFORE step 3. Rationale: without this file, `codex login` uses the keychain default and writes a credential entry under `com.openai.codex` keychain service; a later csq rewrite of `config.toml` does not retroactively move the token to a file.
+   plus (a) every non-csq-controlled top-level key propagated verbatim from `~/.codex/config.toml`, and (b) csq's curated default `tui.status_line` (see §7.2.2.2). This MUST happen BEFORE step 3. Rationale: without this file, `codex login` uses the keychain default and writes a credential entry under `com.openai.codex` keychain service; a later csq rewrite of `config.toml` does not retroactively move the token to a file.
 3. Shell out: `CODEX_HOME=config-<N> codex login --device-auth`. User completes device code in browser.
 4. On success, codex writes `config-<N>/auth.json`. Daemon moves it to `credentials/codex-<N>.json` (atomic rename), then replaces `config-<N>/auth.json` with `codex-auth.json → ../credentials/codex-<N>.json` symlink.
 5. Flip `credentials/codex-<N>.json` mode to `0400` outside refresh windows.
@@ -677,3 +695,4 @@ These are items that MUST be resolved (verified or decided) before the first Cod
 - 1.4.0 — Gemini `by_slot_identity` writer. §7.2.3 gains the "FM — Gemini `by_slot_identity` label stability" note: the channel now carries `gemini-<N>/{apikey,vertex,codeassist}` (mode-class derived from the binding marker's `AuthMode` via the shared `gemini_identity_label`), written synchronously by all 3 `provision_*` paths (marker-FIRST/identity-LAST) + the daemon backfill arm. Stability contract is the INVERSE of §7.2.2 FM-6 (Codex): Gemini is class-stable AND value-stable-within-a-mode; a value change signals a legitimate operator mode re-provision, not re-auth ambiguity. Forward-compat: binding-schema bumps must coordinate the `by_slot_identity` backfill.
 - 1.5.0 — Spec-accuracy wave: §7.2.3.1 socket-path helper citation corrected to `csq_core::daemon::paths::socket_path(base_dir)` (daemon/paths.rs). §7.2.3.2 bench-reset citation corrected to the shipped inline removal at `csq/src/cli/commands/login.rs::reset_handle_dir_gemini`. All `csq-cli/src/commands/` paths migrated to `csq/src/cli/commands/` (crate merge). No contract change.
 - 1.5.1 — Split-state purge: INV-P01 contingency bullet rewritten present-state — the interposition design is recorded as a conditional contingency, not a tracked follow-up. No shipped behavior changed.
+- 1.6.0 — Codex statusline configuration. New §7.2.2.2: `render_config_toml_with_global` injects a curated default `[tui] status_line` (`model-with-reasoning` / `context-remaining` / `git-branch` / `current-dir`) into the slot `config.toml` when the user has not set one — codex renders its native footer from it (openai/codex an internal ticket; no external-command hook exists, so a csq-rendered codex line awaits the unshipped openai/codex #17827). §7.3.3 step 2 references the full render. User-wins-if-present; table-aware merge preserves sibling `[tui]` keys; non-table `tui` left untouched. Verified against codex-cli 0.142.3.

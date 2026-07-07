@@ -146,7 +146,7 @@ membership check)."
         RosterForm::Embedded(signed)
     } else if let Ok(unsigned) = serde_json::from_str::<UnsignedRosterFile>(raw) {
         // Look for the sidecar at <file>.sig (adjacent to the supplied roster file).
-        // NOTE (PR #703 review LOW-2): this derives the SOURCE sidecar from the
+        // NOTE (an internal ticket review LOW-2): this derives the SOURCE sidecar from the
         // operator-supplied path by extension-append; the canonical LIVE sidecar
         // is `roster_sig_path(base)`. The two schemes are intentionally distinct
         // (source convention vs canonical destination) — if the canonical roster
@@ -218,7 +218,7 @@ membership check)."
     // before any write (roster file or chain.json), so the whole
     // read-modify-write (load chain -> compute activation seq -> write roster
     // -> save chain.json) is serialized against every other chain writer.
-    // This closes the TOCTOU window identified in issue #694:
+    // This closes the TOCTOU window identified in an internal ticket:
     // a daemon GUARDED append at seq == activation_seq interleaved between the
     // roster-file write and chain.json save yields a record signed by a non-
     // roster key → permanent MultiSigInvalid on the next verify_chain.
@@ -633,6 +633,7 @@ mod tests {
                 eatp_start_ts: None,
                 eatp_end_ts: None,
                 op_phase: None,
+                verification_level: None,
             };
             write_record_v2(r, Some(base)).expect("write_record_v2");
         }
@@ -782,6 +783,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
 
         // Wrap with activation_seq=5 to test enforcement.
@@ -835,6 +837,8 @@ mod tests {
     #[test]
     fn roster_install_bad_sig_leaves_prior_roster_intact() {
         let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         let dir = tmp();
         let base = dir.path();
@@ -1079,6 +1083,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
 
         // 2 enrolled signers, threshold=2 → PASS.
@@ -1132,6 +1137,8 @@ mod tests {
     #[test]
     fn roster_install_refuses_when_daemon_alive() {
         let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         let dir = tmp();
         let base = dir.path();
@@ -1176,7 +1183,7 @@ mod tests {
         );
 
         // chain.json MUST be unchanged (absent, since we never initialized it).
-        // Authoritative path: chain_state.rs::chain_json_path = base/csq-runs/chain.json.
+        // Authoritative path: chain_state.rs::chain_json_path_in(base, "csq-runs") = base/csq-runs/chain.json.
         let chain_path = base.join("csq-runs").join("chain.json");
         assert!(
             !chain_path.exists(),
@@ -1225,7 +1232,7 @@ mod tests {
         );
     }
 
-    /// Chain-lock contention test (issue #694 regression gate).
+    /// Chain-lock contention test (an internal ticket regression gate).
     ///
     /// A REAL `.chain-lock` file is held by a background thread past the
     /// 5-second deadline.  `handle_roster_install_inner` MUST:
@@ -1250,6 +1257,8 @@ mod tests {
         use std::time::Duration;
 
         let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         let dir = tmp();
         let base = dir.path();
@@ -1264,7 +1273,7 @@ mod tests {
 
         // Arrange — record pre-state bytes so we can assert nothing changed.
         let roster_on_disk = csq_core::audit::authority::roster_path(base);
-        // Authoritative path: chain_state.rs::chain_json_path = base/csq-runs/chain.json.
+        // Authoritative path: chain_state.rs::chain_json_path_in(base, "csq-runs") = base/csq-runs/chain.json.
         let chain_json_path = base.join("csq-runs").join("chain.json");
 
         assert!(!roster_on_disk.exists(), "pre: roster must not exist");

@@ -52,6 +52,7 @@
 
 pub mod anthropic;
 pub mod codex;
+pub mod deepseek;
 pub mod gemini;
 pub mod gemini_oauth;
 pub mod minimax;
@@ -305,8 +306,8 @@ async fn run_loop(cfg: RunLoopConfig) {
             gemini::drain_all(&base_dir_for_drain, &gemini_state_for_drain);
         })
         .await;
-        // Code Assist OAuth slots (Phase B' of journal 0046+0047 +
-        // Stage 2 of journal 0048): polls cloudcode-pa.googleapis.com
+        // Code Assist OAuth slots (Phase B' of an internal journal entry+0047 +
+        // Stage 2 of an internal journal entry): polls cloudcode-pa.googleapis.com
         // for per-model BucketInfo and writes a Utilization-shape row
         // to quota.json. Distinct from `gemini::drain_all` which
         // handles the event-driven Counter shape for ApiKey/VertexSa.

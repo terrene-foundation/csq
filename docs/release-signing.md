@@ -86,12 +86,12 @@ This is the maintainer-box flow that runs BEFORE pushing the release tag, so the
 > argument grammar (or on local state like build freshness) is invisible
 > to review and visible only to an inline check. Do NOT skip an assertion
 > "because the step looked fine" — that is the exact failure class these
-> guards exist to catch. (Journal 0055.)
+> guards exist to catch. (an internal journal entry)
 
 ### 1. Build the unsigned bundle
 
 ```bash
-cd ~/repos/terrene/contrib/csq
+cd ~/repos/csq
 BUILD_START=$(date +%s)              # freshness anchor — asserted below
 cd csq && npm install && cd -    # if not already installed
 
@@ -111,7 +111,7 @@ cd -
 > Plain `npx tauri build --target universal-apple-darwin` bundles;
 > `--no-bundle` would _disable_ it.
 > (Runbook-vs-tool drift, same class as the §7b/§9 defects; surfaced
-> during the v2.8.0 cut. See journal 0053.)
+> during the v2.8.0 cut. See an internal journal entry)
 
 > **Why `--target universal-apple-darwin`?** The bundled `.app` carries
 > a fat Mach-O with both arm64 and x86_64 slices, so ONE signed +
@@ -120,7 +120,7 @@ cd -
 > `darwin-x86_64` keys in `latest.json` point at the same file. This
 > closes the Intel auto-update gap without introducing a second
 > signing pass or a separate `macos-13` runner. See workspace
-> `intel-desktop-auto-update/journal/0001`.
+> `an internal workspace/an internal journal entry`.
 
 This produces:
 
@@ -137,7 +137,7 @@ This defends the j0054 defect: the `--no-bundle=false` hard-error left a
 bundle has two tells — (a) its mtime predates this build, and (b) its
 `Info.plist` `CFBundleShortVersionString` disagrees with `Cargo.toml`.
 This block asserts both. It is the ONLY defect of the three that had no
-guard before journal 0055.
+guard before an internal journal entry
 
 ```bash
 set -e
@@ -148,7 +148,7 @@ INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
 if [ ! -d "$APP_BUNDLE" ] || [ ! -f "$INFO_PLIST" ]; then
   echo "::error::No $APP_BUNDLE — the build produced no bundle. If you"
   echo "::error::passed --no-bundle=false, that hard-errors and bundles"
-  echo "::error::NOTHING (journal 0054). Re-run plain \`npx tauri build"
+  echo "::error::NOTHING (an internal journal entry). Re-run plain \`npx tauri build"
   echo "::error::--target universal-apple-darwin\`."
   exit 1
 fi
@@ -160,7 +160,7 @@ if [ "$APP_MTIME" -lt "$BUILD_START" ]; then
   echo "::error::$APP_BUNDLE mtime ($APP_MTIME) predates this build"
   echo "::error::(BUILD_START=$BUILD_START). The build did not rebuild the"
   echo "::error::bundle — it is STALE. Signing it would ship old bytes"
-  echo "::error::under a new version tag (journal 0054). Investigate the"
+  echo "::error::under a new version tag (an internal journal entry). Investigate the"
   echo "::error::build output before proceeding."
   exit 1
 fi
@@ -171,7 +171,7 @@ PLIST_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "
 if [ "$PLIST_VERSION" != "$CARGO_VERSION" ]; then
   echo "::error::Version incoherence: $APP_BUNDLE Info.plist says"
   echo "::error::'$PLIST_VERSION' but Cargo.toml says '$CARGO_VERSION'."
-  echo "::error::This is the stale-bundle signature (journal 0054):"
+  echo "::error::This is the stale-bundle signature (an internal journal entry):"
   echo "::error::a leftover .app from an older version survived the build."
   echo "::error::DO NOT sign. Clean target/universal-apple-darwin/release/bundle/"
   echo "::error::and rebuild."
@@ -202,6 +202,25 @@ echo "Bundle freshness + version coherence + universal slices OK: v$PLIST_VERSIO
 ```bash
 APP_BUNDLE="target/universal-apple-darwin/release/bundle/macos/Code Squad Q.app"
 
+# ── Standalone CLI helper for the shim refresh (an internal ticket) ──────────────
+#
+# The desktop app refreshes `~/.local/bin/csq` on launch by copying a binary
+# from its own bundle (`csq_core::cli_deps::cli_shim`). It MUST NOT copy the
+# bundle's MAIN executable (`Contents/MacOS/csq`): that binary's signature is
+# bundle-bound (Info.plist + sealed resources), so it is INVALID at a
+# standalone path → hardened-runtime Gatekeeper SIGKILLs every CLI call
+# (exit 137). Instead the shim copies `Contents/Helpers/csq-cli`, a byte copy
+# of the same binary signed as a STANDALONE Mach-O (no bundle binding) — valid
+# at any path. `resolve_shim_source` looks for exactly this path.
+#
+# Create it BEFORE the `--deep` sign below so (a) `--deep` signs it as a
+# nested standalone Mach-O (Info.plist=not bound) and (b) it is captured in the
+# bundle's sealed-resources envelope. Adding it AFTER the sign would invalidate
+# the .app seal and fail notarization.
+MAIN_BINARY=$(find "$APP_BUNDLE/Contents/MacOS" -maxdepth 1 -type f | head -1)
+mkdir -p "$APP_BUNDLE/Contents/Helpers"
+cp "$MAIN_BINARY" "$APP_BUNDLE/Contents/Helpers/csq-cli"
+
 codesign --force \
   --deep \
   --options runtime \
@@ -210,6 +229,13 @@ codesign --force \
   "$APP_BUNDLE"
 
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+
+# Confirm the helper is a STANDALONE-valid signature (Info.plist=not bound) —
+# the property that keeps it valid once copied to ~/.local/bin/csq. If this
+# shows "Info.plist=bound" or fails, the shim copy will SIGKILL (an internal ticket).
+codesign --display --verbose=4 "$APP_BUNDLE/Contents/Helpers/csq-cli" 2>&1 \
+  | grep -E 'Info.plist|Sealed Resources' || true
+codesign --verify --strict --verbose=2 "$APP_BUNDLE/Contents/Helpers/csq-cli"
 ```
 
 Key flags:
@@ -250,7 +276,7 @@ The DMG produced in step 1 contains the unsigned app. Rebuild it so the DMG carr
 **Naming note (universal-binary cut):** Tauri's bundler names the macOS
 DMG with the `_universal` suffix when building with
 `--target universal-apple-darwin`. The historical `_aarch64`/`_arm64`
-ambiguity (journal 0046) is moot under the universal flow but the
+ambiguity (an internal journal entry) is moot under the universal flow but the
 glob below remains permissive so a stale single-arch DMG from a prior
 build cannot survive next to the rebuilt universal one.
 
@@ -283,15 +309,15 @@ shopt -u nullglob
 if [ "${#DMGS[@]}" -ne 1 ]; then
   echo "::error::Expected exactly 1 DMG for v$VERSION, found ${#DMGS[@]}:"
   printf '::error::  %s\n' "${DMGS[@]}"
-  echo "::error::A stale DMG survived the rm -f glob (journal 0046)."
+  echo "::error::A stale DMG survived the rm -f glob (an internal journal entry)."
   echo "::error::Delete all but the just-built one and re-verify."
   exit 1
 fi
 if [ "${DMGS[0]}" != "$DMG_PATH" ]; then
   echo "::error::DMG path mismatch: built '${DMGS[0]}' but \$DMG_PATH is"
   echo "::error::'$DMG_PATH'. Expected _universal suffix from"
-  echo "::error::--target universal-apple-darwin (journal 0001 of"
-  echo "::error::intel-desktop-auto-update workspace)."
+  echo "::error::--target universal-apple-darwin (an internal journal entry of"
+  echo "::error::an internal workspace workspace)."
   exit 1
 fi
 if [ "$(stat -f %m "$DMG_PATH")" -lt "$(stat -f %m "$APP_BUNDLE")" ]; then
@@ -365,7 +391,7 @@ fi
 echo "Notarization gate OK: status: Accepted."
 ```
 
-**Keychain-lock troubleshooting (gap from v2.7.8 cut, journal 0046):** if `notarytool submit` or `notarytool history` reports
+**Keychain-lock troubleshooting (gap from v2.7.8 cut, an internal journal entry):** if `notarytool submit` or `notarytool history` reports
 
 ```
 Error: No Keychain password item found for profile: csq-notary
@@ -381,7 +407,7 @@ security unlock-keychain ~/Library/Keychains/login.keychain-db
 
 Note: `security show-keychain-info ... no-timeout` reports the auto-lock POLICY, not the CURRENT lock state. The keychain can be locked after screen-lock, sleep, or explicit lock despite the `no-timeout` line.
 
-**`security` CLI cannot confirm the profile's absence (gap from v2.9.0 cut, journal 0024).** Modern `notarytool store-credentials` writes to the macOS **data-protection keychain**, which the legacy `security` CLI does NOT enumerate. `security find-generic-password`, `security dump-keychain | grep notary`, and any nonexistent-service probe will ALL report "not found" whether the profile exists or not — they are structurally blind, not evidence. Do NOT conclude "the credential is genuinely gone" from a `security` probe and do NOT recommend re-running `store-credentials` on that basis. The ONLY authoritative existence check is `xcrun notarytool history --keychain-profile csq-notary` ITSELF, run AFTER `security unlock-keychain`. If you must confirm lock state before the user is available: `security find-generic-password -l <a-real-genp-label> -w ~/Library/Keychains/login.keychain-db` — it blocks on a `SecurityAgent` GUI prompt iff the keychain is locked. During the v2.9.0 cut every `security` probe showed "absent" while the profile was intact (proven the instant `unlock` + `notarytool history` ran — full submission history, last entry the v2.8.0 cut).
+**`security` CLI cannot confirm the profile's absence (gap from v2.9.0 cut, an internal journal entry).** Modern `notarytool store-credentials` writes to the macOS **data-protection keychain**, which the legacy `security` CLI does NOT enumerate. `security find-generic-password`, `security dump-keychain | grep notary`, and any nonexistent-service probe will ALL report "not found" whether the profile exists or not — they are structurally blind, not evidence. Do NOT conclude "the credential is genuinely gone" from a `security` probe and do NOT recommend re-running `store-credentials` on that basis. The ONLY authoritative existence check is `xcrun notarytool history --keychain-profile csq-notary` ITSELF, run AFTER `security unlock-keychain`. If you must confirm lock state before the user is available: `security find-generic-password -l <a-real-genp-label> -w ~/Library/Keychains/login.keychain-db` — it blocks on a `SecurityAgent` GUI prompt iff the keychain is locked. During the v2.9.0 cut every `security` probe showed "absent" while the profile was intact (proven the instant `unlock` + `notarytool history` ran — full submission history, last entry the v2.8.0 cut).
 
 ### 6. Staple the notary ticket
 
@@ -396,7 +422,7 @@ xcrun stapler validate "$APP_BUNDLE"
 ```
 
 **MANDATORY regression gate — BOTH artifacts stapled.** This is the
-journal 0046 defect (prior runbook stapled only the DMG, leaving the
+an internal journal entry defect (prior runbook stapled only the DMG, leaving the
 standalone `.app` unstapled — the auto-updater path §7a then shipped an
 unstapled `.app`). Assert `stapler validate` succeeds for BOTH.
 
@@ -407,7 +433,7 @@ for artifact in "$DMG_PATH" "$APP_BUNDLE"; do
        | tee /tmp/csq-stapler.txt | grep -q 'The validate action worked'; then
     echo "::error::stapler validate FAILED for: $artifact"
     echo "::error::An unstapled artifact forces Gatekeeper online on first"
-    echo "::error::launch (breaks offline/air-gapped users; journal 0046)."
+    echo "::error::launch (breaks offline/air-gapped users; an internal journal entry)."
     echo "::error::Re-run notarize (§5) then staple (§6). Output:"
     sed 's/^/::error::  /' /tmp/csq-stapler.txt
     exit 1
@@ -418,7 +444,7 @@ echo "Staple gate OK: BOTH the DMG and the standalone .app are stapled."
 
 Stapling embeds Apple's "notarized" receipt INTO the artifact, so Gatekeeper accepts it offline. Without stapling, Gatekeeper has to phone home on first launch — slower and breaks for users on air-gapped or restricted networks.
 
-(Gap from v2.7.8 cut, journal 0046: prior runbook stapled only the DMG, leaving the standalone `.app` unstaple-validated.)
+(Gap from v2.7.8 cut, an internal journal entry: prior runbook stapled only the DMG, leaving the standalone `.app` unstaple-validated.)
 
 ### 7. Smoke-test
 
@@ -469,7 +495,7 @@ APP_TARBALL="csq-desktop-macos.app.tar.gz"
 # top-level `._Code Squad Q.app` entry with:
 #   failed to unpack `._Code Squad Q.app` into <tmpdir>
 # breaking auto-update for every macOS user. (Root cause: v2.7.8 cut;
-# journal 0048.)
+# an internal journal entry)
 ( cd "$(dirname "$APP_BUNDLE")" && COPYFILE_DISABLE=1 tar czf "$OLDPWD/$APP_TARBALL" "$(basename "$APP_BUNDLE")" )
 
 # Verify the archive layout AND that NO AppleDouble entries leaked in.
@@ -498,7 +524,7 @@ The auto-updater verifies the tarball's minisign signature against the Foundatio
 
 **Parity check before signing** (catches a key-drift between local and GH Actions secret — runs in <1 second):
 
-The maintainer-box `~/.tauri/csq-updater.key.pub` is stored base64-encoded (Tauri `signer generate` default), NOT raw minisign text. The prior raw-text `diff` here ALWAYS false-positived "PUBKEY DRIFT" on the real box (verified 2026-05-17 during the v2.7.8 retro-fix; journal 0048-followup). This normalizes BOTH sides (base64-or-raw) to the minisign key-body line, then compares.
+The maintainer-box `~/.tauri/csq-updater.key.pub` is stored base64-encoded (Tauri `signer generate` default), NOT raw minisign text. The prior raw-text `diff` here ALWAYS false-positived "PUBKEY DRIFT" on the real box (verified 2026-05-17 during the v2.7.8 retro-fix; an internal journal entry). This normalizes BOTH sides (base64-or-raw) to the minisign key-body line, then compares.
 
 ```bash
 python3 - <<'PY'
@@ -535,7 +561,7 @@ cd -
 ls -la "$APP_TARBALL" "$APP_TARBALL.sig"
 ```
 
-(Gap from v2.7.8 cut, journal 0046: prior runbook directed the maintainer to load the key from a 1Password vault that did not exist; key was on disk all along at the Tauri default path.)
+(Gap from v2.7.8 cut, an internal journal entry: prior runbook directed the maintainer to load the key from a 1Password vault that did not exist; key was on disk all along at the Tauri default path.)
 
 ### 7c. Rename for upload
 
@@ -678,7 +704,7 @@ gh run watch --repo terrene-foundation/csq
 gh release edit "$TAG" --draft=false 2>/dev/null || true
 ```
 
-(Gap from v2.7.8 cut, journal 0046: prior runbook treated step 6 as load-bearing for the §8a verification gate. In practice softprops auto-un-drafts, so §8a checks run post-publish. Recovery if §8a finds an issue: hotfix re-release at the next patch version. The workflow's pre-publish "Validate maintainer macOS artifacts" gate is the only check that fails closed and prevents publish.)
+(Gap from v2.7.8 cut, an internal journal entry: prior runbook treated step 6 as load-bearing for the §8a verification gate. In practice softprops auto-un-drafts, so §8a checks run post-publish. Recovery if §8a finds an issue: hotfix re-release at the next patch version. The workflow's pre-publish "Validate maintainer macOS artifacts" gate is the only check that fails closed and prevents publish.)
 
 For PRERELEASE tags (`vX.Y.Z-rc.N`, `-alpha.N`, `-beta.N`), the workflow continues to use the ad-hoc-codesign fallback at `.github/workflows/release.yml` and produces the macOS artifacts itself. The maintainer does not need to sign RCs.
 
@@ -688,7 +714,7 @@ The old version of this section was a manual `- [ ]` checklist. Journal
 0053 proved that a tired operator "verifying" a string match can
 re-derive the _expected_ value with the same broken transform and pass a
 checkbox tautologically (0052's `base64(.sig)`-self-compare masked the
-double-encode bug). The fix per journal 0055: this is now a single
+double-encode bug). The fix per an internal journal entry: this is now a single
 `set -e`-guarded block whose centerpiece is a real `minisign -V` of the
 **published** `latest.json` signature against the **published** tarball
 using the **baked** pubkey — a check that _cannot_ pass on a mis-encoded
@@ -749,7 +775,7 @@ if manifest.get("version") != version:
 # Mach-O serves both arches). Verify each key independently; an asymmetric
 # manifest (one key present, the other missing or pointing elsewhere) is
 # the failure mode this loop catches. See workspace
-# `intel-desktop-auto-update/journal/0001` (security-reviewer F9,
+# `an internal workspace/an internal journal entry` (security-reviewer F9,
 # requirements-analyst F10).
 platforms = manifest.get("platforms", {})
 for required_key in ("darwin-aarch64", "darwin-x86_64"):
@@ -873,7 +899,7 @@ release, the notes SHOULD include a sentence such as:
 > stable DMG from the release page once. Subsequent updates apply
 > automatically.
 
-See workspace `intel-desktop-auto-update/journal/0001` (security-reviewer F8)
+See workspace `an internal workspace/an internal journal entry` (security-reviewer F8)
 for the structural framing.
 
 ### 9. WINDOW-CLOSE gate — release N+1 precondition (RN1-E)
@@ -886,7 +912,7 @@ If the gate prints `OPEN`, the release MUST cut without RN1-F and the
 deletion waits for the next cycle.
 
 The gate is `WINDOW-CLOSE = P1 ∧ P2 ∧ P3` (spec:
-`workspaces/account-slot-decoupling/01-analysis/02-release-n+1/04-oq-c-falsifiable-window-close-gate.md`):
+`internal-design-docs`):
 
 - **P1 — local quiescence:** `csq doctor --json` emits zero
   `legacy_compat_state` entries of the three in-scope kinds
@@ -897,7 +923,7 @@ The gate is `WINDOW-CLOSE = P1 ∧ P2 ∧ P3` (spec:
   couple release N+1 to unrelated future work.
 - **P2 — soak floor:** ≥ N consecutive stable-release cycles since the
   release-N anchor tag. **N = 2** (owner-overridable to 1 via
-  `WINDOW_CLOSE_N=1`; journal 0058 owner-approved default). Stable tag
+  `WINDOW_CLOSE_N=1`; an internal journal entry owner-approved default). Stable tag
   = `vX.Y.Z` (no pre-release suffix). v2.7.7 and v2.7.8 are treated as
   one release-N band; the anchor is v2.7.8 so v2.8.0 counts as the
   first elapsed cycle.
@@ -909,7 +935,7 @@ The gate is `WINDOW-CLOSE = P1 ∧ P2 ∧ P3` (spec:
   relocation ran in a release cycle **before** the current cut, i.e.
   has soaked across ≥ 1 full cycle on this host. (Comparing against
   the release-N anchor tag instead is structurally unsatisfiable:
-  RN1-D5b's relocation code shipped post-anchor in v2.8.0 — PR #486 —
+  RN1-D5b's relocation code shipped post-anchor in v2.8.0 — an internal ticket —
   so the sentinel's mtime is ≥ anchor by construction on every host
   that ever ran the migration. The intent is "soaked across ≥ 1 cycle";
   the most-recent stable tag is the closest predecessor that proves
@@ -925,8 +951,8 @@ Output is one line, exit-coded:
 ```bash
 #!/usr/bin/env bash
 # WINDOW-CLOSE gate — RN1-E (release N+1 / M4-13 precondition).
-# Spec: workspaces/account-slot-decoupling/01-analysis/02-release-n+1/04-oq-c-falsifiable-window-close-gate.md
-# Owner-approved default N=2 (journal 0058); override with WINDOW_CLOSE_N=1.
+# Spec: internal-design-docs
+# Owner-approved default N=2 (an internal journal entry); override with WINDOW_CLOSE_N=1.
 set -euo pipefail
 
 command -v jq >/dev/null 2>&1 || { echo "WINDOW-CLOSE: OPEN — jq missing (install jq to evaluate P1)"; exit 8; }
@@ -979,7 +1005,7 @@ fi
 # P3 — label-relocation soaked: sentinel exists AND mtime predates the
 # most-recent already-published stable tag's date. (Comparing against
 # the release-N anchor would be structurally unsatisfiable: RN1-D5b's
-# relocation code shipped post-anchor in v2.8.0 / PR #486, so the
+# relocation code shipped post-anchor in v2.8.0 / an internal ticket, so the
 # sentinel's mtime is ≥ anchor by construction on every host that ever
 # ran the migration. The intent is "soaked across ≥ 1 cycle"; the most-
 # recent stable tag is the closest predecessor that proves it.)
@@ -1070,7 +1096,7 @@ App-specific passwords have no formal expiry but should be rotated annually. Gen
 
 ## Future Work (CI-Integrated Signing)
 
-Moving signing into GitHub Actions requires amending the `.claude/rules/ci-real-oauth-prohibition.md` Rule 1 allowlist table. As of 2026-06-10 (journal 0052) the table already covers the release-signing secrets that shipped in `release.yml` (`RELEASE_SIGNING_KEY`, `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD`) plus `FOUNDATION_PAT` and the oauth-replay token — so the general publisher-signing carve-out exists. The Apple-notarization secret set below is NOT yet allowlisted. Adding it requires a Rule 1 table amendment (admin merge + per-secret justification) and an extension of Rule 1's audit-grep allowlist. The T23 self-test is not the surface to update: it only checks the bench workflow's own file, and its carrier is parked pending `csq-bench` runner provisioning (spec 10 §10.1.5).
+Moving signing into GitHub Actions requires amending the `.claude/rules/ci-real-oauth-prohibition.md` Rule 1 allowlist table. As of 2026-06-10 (an internal journal entry) the table already covers the release-signing secrets that shipped in `release.yml` (`RELEASE_SIGNING_KEY`, `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD`) plus `FOUNDATION_PAT` and the oauth-replay token — so the general publisher-signing carve-out exists. The Apple-notarization secret set below is NOT yet allowlisted. Adding it requires a Rule 1 table amendment (admin merge + per-secret justification) and an extension of Rule 1's audit-grep allowlist. The T23 self-test is not the surface to update: it only checks the bench workflow's own file, and its carrier is parked pending `csq-bench` runner provisioning (spec 10 §10.1.5).
 
 Secrets to add (when the amendment lands):
 

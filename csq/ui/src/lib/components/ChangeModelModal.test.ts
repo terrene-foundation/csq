@@ -76,7 +76,7 @@ describe("ChangeModelModal", () => {
     expect(options).toEqual(["gemma4:latest", "llama3:8b"]);
   });
 
-  // Regression for journal 0061: the modal is rendered by AccountList
+  // Regression for an internal journal entry: the modal is rendered by AccountList
   // even when closed, so mount happens with isOpen=false; the user
   // only flips it open later. Earlier code had a $effect guard that
   // skipped the load whenever modalState was already 'loading' — which

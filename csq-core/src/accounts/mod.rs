@@ -4,7 +4,7 @@
 //! accounts, and manages `profiles.json` for email/method mapping.
 
 pub mod discovery;
-// M4-3 (issue #292 Phase 4): `accounts::identity` retired. Its three
+// M4-3 (an internal ticket Phase 4): `accounts::identity` retired. Its three
 // fallback paths (marker → dir-name → `claude auth status`) violated
 // `account-terminal-separation.md` MUST NOT Rule 1 (terminal-derived
 // slot-id in credential writers) and MUST NOT Rule 3 (dir-name fallback
@@ -64,7 +64,7 @@ pub struct AccountInfo {
     pub method: String,
     /// Whether the account has valid credentials.
     pub has_credentials: bool,
-    /// Billing-mode classification (Phase A of journal 0046).
+    /// Billing-mode classification (Phase A of an internal journal entry).
     ///
     /// Distinguishes subscription billing (Claude Pro/Max/Enterprise/
     /// Team, Codex ChatGPT plans, Gemini Code Assist) from API-key
@@ -86,7 +86,7 @@ pub struct AccountInfo {
 
 /// Billing-mode classification.
 ///
-/// See `workspaces/csq-as-cli/journal/0046-DECISION-billing-mode-distinction-design.md`
+/// See `internal-design-docs`
 /// for the rationale and per-CLI investigation.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,

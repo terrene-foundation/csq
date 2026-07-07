@@ -19,7 +19,7 @@ pub const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 ///   the category name is a `&'static str` from the allowlist — immune to
 ///   prompt injection. The `error_description` is included but passes through
 ///   `redact_tokens` because it is free-form and may contain echoed token
-///   fragments (journal 0007, 0010).
+///   fragments (an internal journal entry, 0010).
 ///
 /// - **API-style** (`{"error": {"type": "rate_limit_error", "message": "..."}}`)
 ///   The `type` and `message` strings are both redacted before inclusion.
@@ -124,12 +124,12 @@ pub fn merge_refresh(existing: &CredentialFile, response: &RefreshResponse) -> C
 /// silent mass broker-failure across every account; the daemon's
 /// `is_rate_limited` heuristic does not match `invalid_scope`, so
 /// failures fell through to recovery, hammered the endpoint, and
-/// eventually got the IP rate-limited for real (journal 0052).
+/// eventually got the IP rate-limited for real (an internal journal entry).
 ///
 /// Anthropic's `/v1/oauth/token` endpoint also rejects form-encoded
 /// bodies with `400 invalid_request_error` — it requires JSON. This
 /// caused a silent mass broker-failure across every account when the
-/// endpoint switched to JSON-only (journal 0034).
+/// endpoint switched to JSON-only (an internal journal entry).
 pub fn build_refresh_body(refresh_token: &str) -> String {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
@@ -169,7 +169,7 @@ where
     // amplifies the very condition we'd be retrying through. The
     // daemon's 5-minute tick + 10-minute cooldown already provides
     // the right cadence to absorb transient throttling without a
-    // local retry storm. See journal 0034.
+    // local retry storm. See an internal journal entry
     let response_bytes =
         http_post(TOKEN_ENDPOINT, &body).map_err(|e| OAuthError::Exchange(redact_tokens(&e)))?;
 
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(parsed["client_id"], OAUTH_CLIENT_ID);
     }
 
-    /// Regression test for journal 0052: Anthropic's
+    /// Regression test for an internal journal entry: Anthropic's
     /// `/v1/oauth/token` endpoint returns `400 invalid_scope` when
     /// the refresh body includes a `scope` field, even when the
     /// scopes match what was originally granted at authorize time.
@@ -300,7 +300,7 @@ mod tests {
         assert!(
             parsed.get("scope").is_none(),
             "refresh body must NOT contain `scope` — Anthropic returns \
-             invalid_scope; see journal 0052. Got: {body}"
+             invalid_scope; see an internal journal entry Got: {body}"
         );
     }
 

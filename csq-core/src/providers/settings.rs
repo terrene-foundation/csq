@@ -14,7 +14,7 @@ use tracing::warn;
 ///
 /// **SAFETY**: `settings` contains raw API keys inside
 /// `env.ANTHROPIC_AUTH_TOKEN`. This struct MUST NOT be returned
-/// over IPC or serialized to logs. Use [`get_api_key`] (which
+/// over IPC or serialized to logs. Use `get_api_key` (which
 /// returns [`ApiKey`]) for any access that crosses a trust boundary.
 /// The `Serialize` derive exists solely for [`save_settings`] (disk).
 ///
@@ -217,12 +217,55 @@ pub fn load_settings(base_dir: &Path, provider_id: &str) -> Result<ProviderSetti
     })
 }
 
+/// Resolves the model id configured for a slot by reading
+/// `config-<slot>/settings.json`'s `env.ANTHROPIC_MODEL`.
+///
+/// This is the SAME code the daemon usage poller uses to read the slot
+/// model (`daemon::usage_poller::third_party::load_3p_model_for_slot`
+/// delegates here) — the slot's on-disk settings, NOT the process
+/// environment. Terminal
+/// surfaces (the statusline) MUST use this rather than
+/// `std::env::var("ANTHROPIC_MODEL")`: csq strips every `ANTHROPIC_*`
+/// var from CC's spawn environment (`strip_sensitive_env`), so the model
+/// id is present ONLY in the settings file, and whether CC re-exports it
+/// to a spawned statusLine subprocess is a CC-internal behavior csq does
+/// not control. Reading the file depends only on the slot number the
+/// caller already resolved.
+///
+/// Returns `None` when the file is absent/unparseable or carries no
+/// `ANTHROPIC_MODEL` (OAuth/Anthropic slots) — the caller falls back to
+/// CC's own context percentage in that case.
+pub fn model_id_for_slot(base_dir: &Path, slot: u16) -> Option<String> {
+    let path = base_dir
+        .join(format!("config-{slot}"))
+        .join("settings.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let json: Value = serde_json::from_str(&content).ok()?;
+    json.get("env")
+        .and_then(|e| e.get("ANTHROPIC_MODEL"))
+        .or_else(|| json.get("ANTHROPIC_MODEL"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Saves provider settings to disk with atomic write and 0o600 permissions.
 pub fn save_settings(base_dir: &Path, settings: &ProviderSettings) -> Result<(), ConfigError> {
     let provider =
         get_provider(&settings.provider_id).ok_or_else(|| ConfigError::ProfileNotFound {
             name: settings.provider_id.clone(),
         })?;
+
+    // M5: residency gate (enterprise-only) — the GLOBAL provider-settings write
+    // path's enforcement point. Refuse to persist a provider the operating
+    // envelope's `data_access.model_residency` policy forbids; no policy declared
+    // → no-op. `save_settings` (not `default_settings`) is the choke point ALL
+    // global callers funnel through (CLI `setkey`, desktop `set_provider_key`),
+    // including rebinds of an existing settings file. The per-slot path is gated
+    // in `accounts::third_party::bind_provider_to_slot`. The community build
+    // compiles this out (the symbol lives in the moat-stripped `phase2b` tree).
+    #[cfg(feature = "enterprise")]
+    crate::phase2b::residency::enforce_provider_write(base_dir, &settings.provider_id)?;
 
     let path = base_dir.join(provider.settings_filename);
 
@@ -337,6 +380,108 @@ mod tests {
         for key in crate::session::merge::MODEL_KEYS {
             assert_eq!(env.get(*key).unwrap().as_str().unwrap(), p.default_model);
         }
+    }
+
+    #[test]
+    fn model_id_for_slot_reads_env_anthropic_model() {
+        // #984: the statusline resolves the true context window from this
+        // on-disk source, NOT the process env.
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("config-11");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","ANTHROPIC_MODEL":"deepseek-v4-pro"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_id_for_slot(dir.path(), 11).as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn model_id_for_slot_none_when_absent_or_empty() {
+        let dir = TempDir::new().unwrap();
+        // Missing config dir entirely.
+        assert_eq!(model_id_for_slot(dir.path(), 3), None);
+        // Present but no ANTHROPIC_MODEL (OAuth/Anthropic slot).
+        let cfg = dir.path().join("config-4");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("settings.json"), r#"{"env":{}}"#).unwrap();
+        assert_eq!(model_id_for_slot(dir.path(), 4), None);
+        // Empty-string model is filtered to None.
+        let cfg5 = dir.path().join("config-5");
+        std::fs::create_dir_all(&cfg5).unwrap();
+        std::fs::write(
+            cfg5.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_MODEL":""}}"#,
+        )
+        .unwrap();
+        assert_eq!(model_id_for_slot(dir.path(), 5), None);
+    }
+
+    /// M5: write an EU-only residency activation gate so the enterprise residency
+    /// hook in `save_settings` has a policy to enforce.
+    #[cfg(feature = "enterprise")]
+    fn write_eu_only_gate(dir: &std::path::Path) {
+        let gate = serde_json::json!({
+            "provider": "claude",
+            "schema": { "type": "object" },
+            "max_tokens": 1024,
+            "envelope": {
+                "version": "1.3", "role": "D1-R1",
+                "allowed_operations": [], "denied_operations": [], "require_approval_for": [],
+                "declared_posture": "autonomous", "posture_floor": "supervised",
+                "data_access": { "model_residency": {
+                    "policy_name": "eu-only", "allowed_regions": ["eu", "on-prem"],
+                    "default_action": "deny"
+                }}
+            }
+        })
+        .to_string();
+        std::fs::write(
+            dir.join(crate::daemon::interactive_live::GATE_FILENAME),
+            gate,
+        )
+        .unwrap();
+    }
+
+    /// M5 (T5.2 global write path): with an EU-only residency policy in force,
+    /// `save_settings` for a China-resident provider (`mm`) is REFUSED before the
+    /// settings file is written.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn save_settings_blocked_by_residency_policy() {
+        let dir = TempDir::new().unwrap();
+        write_eu_only_gate(dir.path());
+        let p = get_provider("mm").unwrap();
+        let settings = ProviderSettings {
+            provider_id: "mm".to_string(),
+            settings: default_settings(p),
+        };
+        let err = save_settings(dir.path(), &settings).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ResidencyDenied { .. }),
+            "expected ResidencyDenied, got {err:?}"
+        );
+        // Fail-closed before the write: the settings file must not exist.
+        assert!(!dir.path().join(p.settings_filename).exists());
+    }
+
+    /// M5: without an activation gate (no residency policy), `save_settings`
+    /// proceeds unrestricted — enforcement is opt-in.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn save_settings_unrestricted_without_policy() {
+        let dir = TempDir::new().unwrap();
+        let p = get_provider("mm").unwrap();
+        let settings = ProviderSettings {
+            provider_id: "mm".to_string(),
+            settings: default_settings(p),
+        };
+        save_settings(dir.path(), &settings).expect("save succeeds with no residency policy");
+        assert!(dir.path().join(p.settings_filename).exists());
     }
 
     /// DeepSeek's published tier asymmetry: opus/sonnet → pro, haiku

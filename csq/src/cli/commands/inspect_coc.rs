@@ -5,7 +5,7 @@
 //! CI to verify what csq sees for a given working tree. Never writes
 //! under `.coc/` per FR-FMT-06.
 //!
-//! Per `workspaces/csq-as-cli/journal/0093` the first-pull trust gate
+//! Per `internal-design-docs` the first-pull trust gate
 //! and per-artifact signing apparatus were retracted as wrong-layer;
 //! `.coc/` is files in the user's repo (read like `.claude/`). No prompts.
 
@@ -128,7 +128,8 @@ fn hex_short(bytes: &[u8; 32]) -> String {
 
 #[derive(Default)]
 pub struct TranslateOptions {
-    /// Target Surface — accepts "claude-code", "codex", or "gemini".
+    /// Target Surface — accepts "cc" (alias of "claude-code"),
+    /// "claude-code", "codex", or "gemini".
     pub surface: String,
     /// `--json` — emit the full SpawnPayload as JSON. Otherwise prints
     /// a human-readable summary.
@@ -136,12 +137,36 @@ pub struct TranslateOptions {
     pub start: Option<PathBuf>,
 }
 
+/// Translate the loaded `.coc/` set into a `SpawnPayload` for the target
+/// Surface and print it (`--json` → full JSON, else a human summary). Backs
+/// both `csq inspect translate` and the top-level `csq translate` (CU1a,
+/// an internal ticket). Pure read: loads `.coc/` via `coc::load` and writes nothing
+/// under the `.coc/` tree.
+///
+/// **`HostContext` is deliberately `None` here (CU1a / an internal ticket).** This is a
+/// read-only conversion surface whose `--json` output is the contract the
+/// neutral `coc-run` launcher and CU5's byte-parity golden consume, so it must
+/// be stable and environment-independent.
+///
+/// CU1b resolved the live-vs-translate reconciliation (G1=UNIFY): the live
+/// capability-layer scaffold stage renders through the shared
+/// `coc::translate::flatten` module (single flatten — `flatten_artifacts` +
+/// `render_sections`, NOT the `translate::translate` dispatch), and it too
+/// uses `HostContext::None` because the DELIVERED TEXT is
+/// host-context-independent on all three Surfaces — the flattener builds text
+/// from `coc_set` + `surface` only. `HostContext`
+/// affects solely Gemini's `host_isolation_warning` payload bit, which the
+/// live spawn emits SEPARATELY (`run.rs::emit_host_isolation_warning_if_needed`
+/// via its own `detect_host_context()`), not through the delivered text. So
+/// the live-spawn text and this surface's text are byte-identical; the
+/// `host_isolation_warning` field stays intentionally host-neutral here (CU1b
+/// AC1 option b — spec 10 §10.4.6.2).
 pub fn handle_translate(base_dir: &std::path::Path, opts: TranslateOptions) -> Result<()> {
     use csq_core::coc::translate;
     use csq_core::providers::catalog::Surface;
 
     let surface = match opts.surface.as_str() {
-        "claude-code" => Surface::ClaudeCode,
+        "cc" | "claude-code" => Surface::ClaudeCode,
         "codex" => Surface::Codex,
         "gemini" => Surface::Gemini,
         other => anyhow::bail!("unknown surface `{other}`"),
@@ -151,7 +176,7 @@ pub fn handle_translate(base_dir: &std::path::Path, opts: TranslateOptions) -> R
         .start
         .clone()
         .or_else(|| std::env::current_dir().ok())
-        .context("could not resolve starting directory for `csq inspect translate`")?;
+        .context("could not resolve starting directory for `csq translate`")?;
 
     let outcome = csq_core::coc::load(&start, base_dir)?;
     let payload = translate::translate(&outcome.set, surface, &translate::HostContext::None);

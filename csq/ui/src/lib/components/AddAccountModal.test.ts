@@ -95,6 +95,10 @@ function setupMocks(overrides: Record<string, unknown> = {}) {
     set_provider_key: "abc…xyz",
     bind_keyless_provider: null,
     list_ollama_models: ["gemma4", "qwen3:latest", "gpt-oss:20b"],
+    // Bug A pre-flight: codex/gemini flows probe the CLI's presence first.
+    // Default to installed so existing flow tests proceed; the cli-missing
+    // test overrides this to false.
+    provider_cli_installed: true,
     ...overrides,
   };
   mockInvoke.mockImplementation((cmd: string) => {
@@ -155,7 +159,7 @@ describe("AddAccountModal", () => {
     expect(container.textContent).toContain("Add Account");
   });
 
-  // Regression for journal 0063 P1-6 (and journal 0061 pattern): the
+  // Regression for an internal journal entry P1-6 (and an internal journal entry pattern): the
   // modal is rendered by AccountList even when closed; the user only
   // flips it open later. Mount with isOpen=false, then flip true via
   // rerender — list_providers MUST fire on the open edge and the
@@ -521,8 +525,7 @@ describe("AddAccountModal", () => {
     const codexCard = Array.from(
       container.querySelectorAll(".provider-card"),
     ).find((el) => el.textContent?.includes("Codex")) as
-      | HTMLButtonElement
-      | undefined;
+      HTMLButtonElement | undefined;
     expect(codexCard).toBeDefined();
     await fireEvent.click(codexCard!);
     await settle();
@@ -631,6 +634,119 @@ describe("AddAccountModal", () => {
     expect(container.textContent).toContain("Purge and continue");
   });
 
+  it("renders the device code with a working copy-to-clipboard button", async () => {
+    // Bug B: the device-auth code must be selectable AND copyable.
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    setupMocks({
+      list_providers: [CODEX_PROVIDER],
+      start_codex_login: {
+        account: 3,
+        tos_required: false,
+        keychain: "absent",
+        awaiting_keychain_decision: false,
+        device_auth_prereq_message: "prereq",
+        device_auth_prereq_url: "https://chatgpt.com/#settings/Security",
+      },
+      // Never resolves → the flow stays in `codex-running` so the
+      // device-code panel remains mounted for the assertions.
+      complete_codex_login: new Promise(() => {}),
+    });
+
+    let deviceCodeHandler:
+      | ((e: {
+          payload: { user_code: string; verification_url: string };
+        }) => void)
+      | null = null;
+    mockListen.mockImplementation((event: string, handler: unknown) => {
+      if (event === "codex-device-code") {
+        deviceCodeHandler = handler as typeof deviceCodeHandler;
+      }
+      return Promise.resolve(() => {});
+    });
+
+    const { container } = renderModal();
+    await settle();
+    const codexCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Codex")) as HTMLButtonElement;
+    await fireEvent.click(codexCard);
+    await settle();
+
+    // Deliver the device code (as the backend event would).
+    expect(deviceCodeHandler).not.toBeNull();
+    deviceCodeHandler!({
+      payload: {
+        user_code: "WXYZ-7788",
+        verification_url: "https://chatgpt.com/device",
+      },
+    });
+    await settle();
+
+    // The code renders, in a selectable element.
+    const codeEl = container.querySelector(".device-code");
+    expect(codeEl).not.toBeNull();
+    expect(codeEl!.textContent).toContain("WXYZ-7788");
+
+    // The copy button exists and writes the code to the clipboard.
+    const copyBtn = container.querySelector(
+      '[data-testid="copy-device-code"]',
+    ) as HTMLButtonElement;
+    expect(copyBtn).not.toBeNull();
+    await fireEvent.click(copyBtn);
+    await settle();
+    expect(writeText).toHaveBeenCalledWith("WXYZ-7788");
+  });
+
+  it("shows an install prompt (not a login error) when codex-cli is missing", async () => {
+    // Bug A: pre-flight the CLI presence; a missing binary surfaces a friendly
+    // install prompt BEFORE launching a login that would fail mid-device-auth.
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    setupMocks({
+      list_providers: [CODEX_PROVIDER],
+      provider_cli_installed: false,
+    });
+    const { container } = renderModal();
+    await settle();
+    const codexCard = Array.from(
+      container.querySelectorAll(".provider-card"),
+    ).find((el) => el.textContent?.includes("Codex")) as HTMLButtonElement;
+    await fireEvent.click(codexCard);
+    await settle();
+
+    const prompt = container.querySelector(
+      '[data-testid="cli-missing-prompt"]',
+    );
+    expect(prompt).not.toBeNull();
+    expect(prompt!.textContent).toContain("codex-cli is not installed");
+    expect(container.textContent).toContain("npm install -g @openai/codex");
+    // The pre-flight MUST abort before launching the login.
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "start_codex_login",
+      expect.anything(),
+    );
+
+    // Copy button writes the install command; Recheck button exists.
+    const copyBtn = container.querySelector(
+      '[data-testid="copy-install-cmd"]',
+    ) as HTMLButtonElement;
+    expect(copyBtn).not.toBeNull();
+    await fireEvent.click(copyBtn);
+    await settle();
+    expect(writeText).toHaveBeenCalledWith("npm install -g @openai/codex");
+    expect(
+      container.querySelector('[data-testid="cli-missing-recheck"]'),
+    ).not.toBeNull();
+  });
+
   // ── PR-G5 Gemini flow ───────────────────────────────────────
 
   it("shows informational disclosure when Gemini picked and marker absent", async () => {
@@ -645,8 +761,7 @@ describe("AddAccountModal", () => {
     const geminiCard = Array.from(
       container.querySelectorAll(".provider-card"),
     ).find((el) => el.textContent?.includes("Gemini")) as
-      | HTMLButtonElement
-      | undefined;
+      HTMLButtonElement | undefined;
     expect(geminiCard).toBeDefined();
     await fireEvent.click(geminiCard!);
     await settle();

@@ -56,17 +56,32 @@ pub(crate) mod migrate;
 pub(crate) mod rotate;
 
 pub use chain_state::ChainState;
+
 pub use doctor::{check_signing_key, SigningKeyStatus};
 pub use file_store::KeySlot;
-pub use init::audit_init;
+pub use init::{audit_init, eatp_audit_init};
 pub use keyring_backend::{
     delete_dual, exists_any, generate_and_store_dual, is_keychain_access_error,
     load_embedded_cutoff, load_embedded_cutoff_file_first, preserve_dual, store_dual,
     try_load_signing_key, write_roster_floor_to_keychain, EmbeddedCutoff, KeyLoadOutcome,
     LocalSigningKey, SERVICE_NAME,
 };
-pub use migrate::{migrate_keys_to_file_store, repair_audit_chain, MigrateOutcome, RepairOutcome};
+pub use migrate::{
+    migrate_keys_to_file_store, repair_audit_chain, repair_audit_chain_in, MigrateOutcome,
+    RepairOutcome,
+};
 pub use rotate::rotate_key;
+/// Re-export `init_mock_keyring` so external crates (e.g., the `csq` crate's
+/// integration tests) can install the in-memory keyring backend under the
+/// `test-utils` feature without naming `keyring_backend` directly.
+///
+/// Usage (from the `csq` crate):
+/// ```rust
+/// # #[cfg(feature = "test-utils")]
+/// csq_core::audit::key_custody::init_mock_keyring();
+/// ```
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_helpers::init_mock_keyring;
 
 use thiserror::Error;
 

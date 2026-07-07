@@ -15,7 +15,7 @@
 //!   4. tty guard: stdin is a terminal -> force CLI mode.
 //!   5. Default: CLI.
 //!
-//! Security invariants (see workspaces/single-binary-csq/02-plans/02-redteam-attack-surface.md):
+//! Security invariants (see internal-design-docs):
 //! - `std::env::current_exe()` (not `argv[0]`) defeats rename attacks (V1).
 //! - The `Info.plist` sentinel rejects symlink-spoofed `Contents/MacOS/` paths.
 //! - The tty guard prevents accidental webview launch in headless contexts (V2).

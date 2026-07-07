@@ -1,6 +1,6 @@
 //! csq launch log — append-only NDJSON record of every `csq run` and `csq swap`.
 //!
-//! Per journal 0050 D2 (post-hoc time correlation attribution strategy). Each
+//! Per an internal journal entry D2 (post-hoc time correlation attribution strategy). Each
 //! line carries enough info for the daemon aggregator to attribute a CC
 //! session-meta file to a slot:
 //!

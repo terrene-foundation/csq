@@ -8,7 +8,7 @@
 //!
 //! This module is Unix-only (`cfg(unix)`). Windows named-pipe
 //! support is deferred to M8.6 — see
-//! `workspaces/csq-v2/todos/completed/M8-daemon-core.md` task M8-03.
+//! `internal-design-docs` task M8-03.
 //!
 //! # Security model
 //!
@@ -69,6 +69,8 @@ use crate::oauth::{
     exchange_code, start_login, LoginRequest, OAuthStateStore, PASTE_CODE_REDIRECT_URI,
 };
 use crate::types::AccountNum;
+#[cfg(feature = "enterprise")]
+use axum::http::HeaderMap;
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path as AxumPath, State},
@@ -86,6 +88,16 @@ use std::sync::Arc;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
+
+// #783 / #794 — interactive per-turn enforcement surface (enterprise-only). The
+// dispatch registry + request/response types live in the enterprise-gated
+// `interactive_ipc` module; `server.rs` registers the routes + holds the live
+// registry behind the same feature gate. The community build compiles none of it.
+#[cfg(feature = "enterprise")]
+use crate::daemon::interactive_ipc::{
+    AuthorizeOverrideRequest, InteractiveSessionRegistry, OpenSessionResponse, SessionKey,
+    SessionOpenParams, SessionOptionsResponse, SessionStateView, SubmitInputRequest,
+};
 
 /// Shared router state — cache + base_dir paths + OAuth state
 /// store. Cloned cheaply (every field is an `Arc` / `PathBuf`
@@ -132,6 +144,16 @@ pub struct RouterState {
     /// Other subsystems (token-refresh, usage-poller, IPC server itself)
     /// are NEVER gated on this — see spec 12 §12.13.5.
     pub audit_health: crate::audit::AuditHealth,
+    /// #783 — the interactive per-turn enforcement session registry
+    /// (enterprise-only). Seeded at daemon startup by
+    /// `crate::daemon::interactive_live::seed_registry`: a LIVE registry when the
+    /// fail-closed activation gate (`<base_dir>/.phase2b-interactive-gate.json`)
+    /// is present + valid, otherwise `InteractiveSessionRegistry::empty()` (every
+    /// `/api/interactive/*` route returns `503 Unavailable`). The daemon cannot
+    /// re-derive the four §10.5 conditions (offline bench artifacts; `specs/10`
+    /// §10.5.1) — the activation signal is operator-owned go-live authorization.
+    #[cfg(feature = "enterprise")]
+    pub interactive: Arc<InteractiveSessionRegistry>,
 }
 
 /// Maximum staleness for the discovery cache: 5 seconds.
@@ -183,12 +205,21 @@ pub struct HealthResponse {
 /// - `POST /api/oauth/exchange` — submit the paste-code and exchange it
 /// - `POST /api/invalidate-cache` — clear all caches (M8-10c)
 ///
+/// `#[cfg(feature = "enterprise")]` also mounts (spec 21 §21.7, #783/#794):
+/// - `POST /api/interactive/open` — open a new governed session → `OpenSessionResponse`
+/// - `POST /api/interactive/submit` — submit one governed turn (key via header)
+/// - `POST /api/interactive/override` — authorize a blocked turn (key via header)
+/// - `POST /api/interactive/abandon` — abandon a blocked turn (key via header)
+/// - `POST /api/interactive/close` — close a session and free its slot (key via header)
+///
+/// (Fail-closed `503` unless the §10.5 activation gate is open.)
+///
 /// The [`DefaultBodyLimit`] layer is installed here so every future
 /// route inherits the 1 MiB cap without having to remember. State
 /// is shared via `with_state` so each handler gets a cheap clone
 /// of the [`RouterState`].
 pub fn router(state: RouterState) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/accounts", get(accounts_handler))
         .route("/api/refresh-status", get(refresh_status_all_handler))
@@ -199,8 +230,53 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/slot-swap", post(slot_swap_handler))
         .route("/api/gemini/event", post(gemini_event_handler))
         .route("/api/audit/record", post(audit_record_handler))
-        .route("/api/provenance/anchor", post(provenance_anchor_handler))
-        .with_state(state)
+        .route("/api/provenance/anchor", post(provenance_anchor_handler));
+
+    // #783/#794 — interactive per-turn enforcement routes (enterprise-only,
+    // spec 21 §21.7). Registered in the enterprise build; the seeded registry is
+    // fail-closed (empty → 503) unless the §10.5 activation gate is present. The
+    // SO_PEERCRED same-UID socket auth + 1 MiB body cap apply to these routes too
+    // (no per-route auth — security.md §7; the enforcement decision originates in
+    // the daemon — account-terminal-separation.md MUST Rule 1).
+    //
+    // Session lifecycle: open → key in X-CSQ-Session-Key → submit/override/abandon
+    //                         → close.  Key is daemon-minted CSPRNG; clients echo it.
+    #[cfg(feature = "enterprise")]
+    let app = app
+        .route("/api/interactive/open", post(interactive_open_handler))
+        .route("/api/interactive/submit", post(interactive_submit_handler))
+        .route(
+            "/api/interactive/override",
+            post(interactive_override_handler),
+        )
+        .route(
+            "/api/interactive/abandon",
+            post(interactive_abandon_handler),
+        )
+        .route("/api/interactive/close", post(interactive_close_handler))
+        .route(
+            "/api/interactive/options",
+            post(interactive_options_handler),
+        )
+        // T-M4.5: signed posture-reset (the only loosening path) + the read-only
+        // sealed-audit-proof retrieval surface.
+        .route(
+            "/api/interactive/posture-reset",
+            post(interactive_posture_reset_handler),
+        )
+        .route(
+            "/api/interactive/audit-proof/{session_id}",
+            get(interactive_audit_proof_handler),
+        )
+        // M6 T6.2 Shard 4 — spawn-boundary MCP gate decision attestation. The
+        // `csq mcp-proxy` POSTs each gated tools/call decision here; the daemon
+        // builds + signs + appends the McpGateDecision chain record server-side
+        // (a subprocess never supplies a SignedRecord — account-terminal-
+        // separation.md MUST Rule 1). Same SO_PEERCRED same-UID socket auth +
+        // 1 MiB body cap as the sibling routes.
+        .route("/api/audit/mcp-gate", post(mcp_gate_handler));
+
+    app.with_state(state)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
 }
 
@@ -210,6 +286,317 @@ async fn health_handler() -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
     })
+}
+
+/// Fixed-vocabulary error body for the `/api/interactive/*` routes (#783).
+///
+/// The `error` field carries ONLY the stable `InteractiveIpcError::tag()` or a
+/// deserialize tag — never the request body or an upstream payload
+/// (`rules/security.md` §2; `rules/tauri-commands.md` MUST-6). The renderer-bound
+/// success view (`SessionStateView`) is already token-redacted at the IPC boundary
+/// inside `interactive_ipc`.
+#[cfg(feature = "enterprise")]
+#[derive(Debug, Clone, Serialize)]
+pub struct InteractiveError {
+    pub error: &'static str,
+}
+
+/// Map an [`crate::daemon::interactive_ipc::InteractiveIpcError`] to its HTTP
+/// status + fixed-vocabulary body. `from_u16` cannot fail for the variants'
+/// status set (400/409/502/503), but the fallback keeps the handler panic-free
+/// (`rules/tauri-commands.md` MUST Rule 1 / MUST NOT Rule 2).
+#[cfg(feature = "enterprise")]
+fn interactive_err_response(
+    e: crate::daemon::interactive_ipc::InteractiveIpcError,
+) -> (StatusCode, Json<InteractiveError>) {
+    let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(InteractiveError { error: e.tag() }))
+}
+
+/// Extract the `X-CSQ-Session-Key` header and validate its format.
+///
+/// Returns 400 `session_key_invalid` (via [`interactive_err_response`]) for
+/// both an ABSENT header and a syntactically malformed one — the
+/// `InteractiveIpcError` vocabulary is the single source of truth for error tags
+/// (`rules/tauri-commands.md` MUST Rule 6).  Distinct `session_key_missing`
+/// literals are intentionally NOT used: the client sees an invalid/absent key as
+/// the same actionable error ("provide a valid key from a prior `open` call").
+#[cfg(feature = "enterprise")]
+fn extract_session_key(
+    headers: &HeaderMap,
+) -> Result<SessionKey, (StatusCode, Json<InteractiveError>)> {
+    let raw = headers
+        .get("x-csq-session-key")
+        .ok_or_else(|| {
+            interactive_err_response(
+                crate::daemon::interactive_ipc::InteractiveIpcError::InvalidSessionKey,
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            interactive_err_response(
+                crate::daemon::interactive_ipc::InteractiveIpcError::InvalidSessionKey,
+            )
+        })?;
+    SessionKey::try_from_client(raw).map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/open` — open a new governed session (#794).
+///
+/// Body: `SessionOpenParams` (all fields optional; unset → gate template values).
+/// Returns `OpenSessionResponse { session_key, state: Idle }`.  The client MUST
+/// echo the `session_key` in the `X-CSQ-Session-Key` header on all subsequent
+/// calls for this session.
+#[cfg(feature = "enterprise")]
+async fn interactive_open_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<Json<OpenSessionResponse>, (StatusCode, Json<InteractiveError>)> {
+    // Empty body → default (all-None) params; non-empty → parse.
+    let params: SessionOpenParams = if body.is_empty() {
+        SessionOpenParams {
+            provider: None,
+            schema: None,
+            max_tokens: None,
+            coc_dir: None,
+            terminal_label: None,
+            terminal_pid: None,
+            slot: None,
+        }
+    } else {
+        serde_json::from_slice(&body).map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(InteractiveError {
+                    error: "interactive_deserialize_error",
+                }),
+            )
+        })?
+    };
+    state
+        .interactive
+        .open(params)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/submit` — submit one user input turn (#783/#794).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// Body: `SubmitInputRequest { input }`. Drives one governed turn end-to-end
+/// (`GovernanceLoop::execute` via `InteractiveSession::run_turn`) and returns the
+/// resulting `SessionStateView` (`Complete` / `Blocked`). Fail-closed `503`
+/// (`interactive_unavailable`) when the activation gate is not open.
+#[cfg(feature = "enterprise")]
+async fn interactive_submit_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    let req: SubmitInputRequest = serde_json::from_slice(&body).map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(InteractiveError {
+                error: "interactive_deserialize_error",
+            }),
+        )
+    })?;
+    state
+        .interactive
+        .submit(&key, req)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/override` — authorize a blocked turn (#783/#794).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// Body: `AuthorizeOverrideRequest { justification }`. The override event is
+/// emitted (emit-before-execute) ahead of the corrective turn. Returns the
+/// resulting `SessionStateView`.
+#[cfg(feature = "enterprise")]
+async fn interactive_override_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    let req: AuthorizeOverrideRequest = serde_json::from_slice(&body).map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(InteractiveError {
+                error: "interactive_deserialize_error",
+            }),
+        )
+    })?;
+    state
+        .interactive
+        .authorize_override(&key, req)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/abandon` — abandon a blocked turn; session returns to
+/// `Idle` (#783/#794).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// No request body.
+#[cfg(feature = "enterprise")]
+async fn interactive_abandon_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    state
+        .interactive
+        .abandon(&key)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/close` — close a session and free its slot (#794).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// No request body. On success returns `Idle` state view. Does NOT emit any
+/// synthetic chain record (directive 4: no `resolve(Abandon)` on close).
+#[cfg(feature = "enterprise")]
+async fn interactive_close_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    state
+        .interactive
+        .close(&key)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/posture-reset` — apply a SIGNED operator posture-reset
+/// authorization (T-M4.5), the only path that loosens a session's posture ratchet.
+///
+/// Header: `X-CSQ-Session-Key`. Body: `PostureResetAuthorization { nonce_hex,
+/// target_posture, signature_hex }`. The renderer merely TRANSPORTS the
+/// operator-signed blob; the daemon verifies it against the daemon-held org-root
+/// verifying key over a preimage it reconstructs from its OWN session key (R1-S7 —
+/// the renderer cannot forge or replay a reset). Fail-closed: `503` when no reset
+/// key is configured; `403` (`action_denied`) on a bad / forged / replayed
+/// signature; `409` (`session_wrong_state`) on a session with no posture ratchet.
+#[cfg(feature = "enterprise")]
+async fn interactive_posture_reset_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    let auth: csq_trust_contract::PostureResetAuthorization = serde_json::from_slice(&body)
+        .map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(InteractiveError {
+                    error: "interactive_deserialize_error",
+                }),
+            )
+        })?;
+    state
+        .interactive
+        .reset_posture(&key, auth)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `GET /api/interactive/audit-proof/{session_id}` — read a sealed lifecycle audit
+/// proof (T-M4.5).
+///
+/// Returns the persisted `SealedAuditProof` (only PUBLIC bytes — sealed head hash,
+/// signature, verifying key — non-secret, so no session key is required; the
+/// `SO_PEERCRED` same-UID socket auth already restricts callers). `404` when
+/// absent. The `session_id` path param is validated (charset `[A-Za-z0-9_-]`, no
+/// `..`, length-bounded) BEFORE any filesystem join so it cannot traverse out of
+/// the proofs directory.
+#[cfg(feature = "enterprise")]
+async fn interactive_audit_proof_handler(
+    State(state): State<RouterState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Result<Json<csq_trust_contract::SealedAuditProof>, (StatusCode, Json<InteractiveError>)> {
+    // Validate the path param BEFORE any filesystem join (traversal defense — the
+    // same charset discipline as `SessionKey::try_from_client`, length-relaxed for
+    // the longer `interactive-live-{label}-{pid}-{ulid}` session_id form).
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 128
+        && !session_id.contains("..")
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InteractiveError {
+                error: "audit_proof_session_id_invalid",
+            }),
+        ));
+    }
+    let dir = state
+        .base_dir
+        .join(crate::daemon::interactive_ipc::AUDIT_PROOF_SUBDIR);
+    match crate::daemon::interactive_ipc::read_sealed_proof(&dir, &session_id) {
+        Some(proof) => Ok(Json(proof)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(InteractiveError {
+                error: "audit_proof_not_found",
+            }),
+        )),
+    }
+}
+
+/// `POST /api/interactive/options` — list the subscription accounts the operator
+/// may pick BEFORE opening a session, plus the gate's default provider (#793
+/// Enforcement-tab picker, an internal journal entry §FD1).
+///
+/// Fail-closed: returns `503 interactive_unavailable` when the activation gate is
+/// closed (`registry.is_active()` false) OR the gate file is no longer readable.
+/// No session key required — this is a pre-open query that reveals only account
+/// labels (no credentials, no secrets — `rules/security.md` §2). The provider is
+/// the gate template's default; the candidate slots are the provider-matching
+/// accounts with credentials, lowest-first (the exact set the minter validates
+/// `SessionOpenParams.slot` against).
+#[cfg(feature = "enterprise")]
+async fn interactive_options_handler(
+    State(state): State<RouterState>,
+) -> Result<Json<SessionOptionsResponse>, (StatusCode, Json<InteractiveError>)> {
+    let unavailable = || {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(InteractiveError {
+                error: "interactive_unavailable",
+            }),
+        )
+    };
+    // Authoritative open/closed signal — same gate every other interactive route
+    // checks (the registry was seeded from it at startup).
+    if !state.interactive.is_active() {
+        return Err(unavailable());
+    }
+    // The gate's default provider. is_active() ⟹ this was present at seed; map a
+    // since-removed/unreadable gate to the same fail-closed 503.
+    let provider = match crate::daemon::interactive_live::load_gate(&state.base_dir) {
+        Some(cfg) => cfg.provider,
+        None => return Err(unavailable()),
+    };
+    let candidate_slots =
+        crate::daemon::interactive_live::candidate_subscription_slots(&state.base_dir, &provider);
+    Ok(Json(SessionOptionsResponse {
+        provider,
+        candidate_slots,
+    }))
 }
 
 /// Runs account discovery, hitting [`RouterState::discovery_cache`]
@@ -507,7 +894,7 @@ async fn oauth_exchange_handler(
     // Persist credentials via UUID-keyed path (M4-12: numeric
     // credentials/<N>.json retired; fail-closed if UUID absent).
     //
-    // issue #633 (legacy/daemon-exchange sibling): this exchange-based path
+    // an internal ticket (legacy/daemon-exchange sibling): this exchange-based path
     // has NO `config-N/.claude.json` (it never spawns `claude auth login`), so
     // `accounts::login::ensure_login_identity_minted` — which sources the email
     // from that file — is structurally inapplicable here. This handler relies on
@@ -901,10 +1288,12 @@ async fn audit_record_handler(
     }
 
     // Deserialize after health gate passes.
-    let record: crate::audit::AuditRecord = serde_json::from_slice(&body).map_err(|e| {
+    let record: crate::audit::AuditRecord = serde_json::from_slice(&body).map_err(|_| {
+        // Fixed-vocabulary tag only — no `{e}` interpolation (security.md §2;
+        // serde_json::Error Display can echo input fragments). The tag is the signal.
         tracing::warn!(
             error_kind = "audit_deserialize_error",
-            "audit record deserialize failed: {e}"
+            "audit record deserialize failed"
         );
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -954,6 +1343,263 @@ async fn audit_record_handler(
             Err((
                 StatusCode::BAD_REQUEST,
                 Json(AuditRecordError { error: tag }),
+            ))
+        }
+    }
+}
+
+/// Request body for `POST /api/audit/mcp-gate` (M6 T6.2 Shard 4).
+///
+/// The `csq mcp-proxy` supplies ONLY these minimal decision fields; the daemon
+/// builds, signs, and appends the `McpGateDecision` `SignedRecord` server-side.
+/// A spawned subprocess NEVER supplies a `SignedRecord` (it cannot sign, and
+/// per `account-terminal-separation.md` MUST Rule 1 the enforcement record must
+/// originate daemon-side, not from a process the renderer/CLI could influence).
+#[cfg(feature = "enterprise")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct McpGateRequest {
+    /// Per-proxy-process nonce — the dedup-key namespace component.
+    pub session_nonce: String,
+    /// Proxy-session-monotonic decision ordinal (second dedup-key component).
+    pub record_seq: u64,
+    /// The spawned CLI whose MCP traffic was gated (`"codex"` | `"gemini"`).
+    pub cli: String,
+    /// The MCP-declared tool identifier that was gated.
+    pub tool: String,
+    /// Fixed-vocabulary gate verdict (`"pass"` | `"block"` | `"escalate"`).
+    pub verdict: String,
+}
+
+/// Error body for `POST /api/audit/mcp-gate`. Fixed-vocabulary tag — the handler
+/// never echoes upstream request content per `rules/security.md` §2 +
+/// `rules/tauri-commands.md` MUST-6. Tags: `audit_chain_broken`,
+/// `mcp_gate_deserialize_error`, `mcp_gate_invalid_field`, `mcp_gate_write_error`,
+/// `mcp_gate_unconfirmed` (503 — the emit did not record the decision on the
+/// chain, e.g. a signing-cutoff skip; the proxy queues it to its durable outbox),
+/// `mcp_gate_intent_queued` (503 — the chain is uninitialised AND attestation
+/// intent is set, so the proxy queues the decision to preserve it until
+/// `csq audit init`; shard C decision 1).
+#[cfg(feature = "enterprise")]
+#[derive(Debug, Clone, Serialize)]
+pub struct McpGateError {
+    pub error: &'static str,
+}
+
+/// Handler for `POST /api/audit/mcp-gate` (M6 T6.2 Shard 4).
+///
+/// Accepts a minimal [`McpGateRequest`], validates the fixed-vocabulary fields,
+/// and appends a signed `McpGateDecision` chain record via the single daemon-side
+/// emitter [`crate::audit::mcp_gate_floor::emit_mcp_gate_record`] (which owns the
+/// `.chain-lock` + signing key — the proxy subprocess cannot).
+///
+/// **Audit-subsystem fail-closed gate:** when `audit_health` is not operational,
+/// rejects with `503` + `audit_chain_broken` (mirrors `audit_record_handler`).
+/// The health check runs BEFORE body deserialization so a broken chain returns
+/// 503 even for a malformed body.
+///
+/// Returns `204` on success (including a deduped/skipped emit — the decision is
+/// already on the chain or the chain is uninitialised, neither an error); `422`
+/// on a malformed body or invalid field; `503` on a hard chain-write error
+/// (a server-side I/O failure — the proxy queues the decision to its durable
+/// outbox). No upstream body is echoed (`rules/security.md` §2).
+#[cfg(feature = "enterprise")]
+async fn mcp_gate_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<McpGateError>)> {
+    // Fail-closed: reject new appends when the chain is not operational. Runs
+    // before deserialization so a broken chain returns 503 even for a bad body.
+    if !state.audit_health.is_operational() {
+        // Proxy queues on this 503 too — mark the outbox maybe-dirty so that once
+        // the chain is repaired + the daemon restarts (which re-evaluates
+        // audit_health), the first confirmed-on-chain emit drains it event-driven
+        // (shard B). The periodic backstop is the belt-and-braces backstop.
+        crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+        tracing::warn!(
+            error_kind = "audit_chain_broken",
+            "mcp-gate emit rejected — chain is not operational (audit_health={:?})",
+            state.audit_health
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(McpGateError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    let req: McpGateRequest = serde_json::from_slice(&body).map_err(|_| {
+        // Fixed-vocabulary tag only — no `{e}` interpolation (security.md §2;
+        // serde_json::Error Display can echo input fragments). The tag is the signal.
+        tracing::warn!(
+            error_kind = "mcp_gate_deserialize_error",
+            "mcp-gate request deserialize failed"
+        );
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(McpGateError {
+                error: "mcp_gate_deserialize_error",
+            }),
+        )
+    })?;
+
+    // Fixed-vocabulary validation via the SHARED authority (the outbox drain
+    // validates against the same function, so the two ingestion paths onto the
+    // signed chain can never diverge). Any out-of-vocab value is fail-closed
+    // rejected (the daemon is the enforcement boundary — never trust the field
+    // shape).
+    let field_ok = crate::audit::mcp_gate_floor::mcp_gate_fields_valid(
+        &req.session_nonce,
+        &req.tool,
+        &req.cli,
+        &req.verdict,
+    );
+    if !field_ok {
+        tracing::warn!(
+            error_kind = "mcp_gate_invalid_field",
+            "mcp-gate request rejected — field failed fixed-vocabulary validation"
+        );
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(McpGateError {
+                error: "mcp_gate_invalid_field",
+            }),
+        ));
+    }
+
+    match crate::audit::mcp_gate_floor::emit_mcp_gate_record(
+        &state.base_dir,
+        &req.session_nonce,
+        req.record_seq,
+        &req.cli,
+        &req.tool,
+        &req.verdict,
+    ) {
+        // The emit's Ok(true)/Ok(false) does NOT distinguish "recorded" from
+        // "skipped without recording" — Ok(false) collapses a confirmed Duplicate
+        // (on chain), a signing-cutoff skip (chain exists, keychain unavailable →
+        // NOT on chain), and the uninitialised-chain case. Classify via the
+        // authoritative dedup-index confirmation so the route honors the SAME
+        // "204 ⟺ actually on the chain" contract the outbox drain enforces
+        // (redteam #909 R3). Without this a cutoff-skip returns a false 204 and the
+        // decision is lost with no fallback — the daemon-UP twin of the gap #909
+        // closes on the daemon-down path.
+        Ok(_) => {
+            use crate::audit::mcp_gate_floor::McpGateConfirm;
+            match crate::audit::mcp_gate_floor::mcp_gate_confirm(
+                &state.base_dir,
+                &req.session_nonce,
+                req.record_seq,
+            ) {
+                // On chain (appended or confirmed Duplicate): 204. M6 #909 shard B —
+                // the live path is confirmed healthy, so fire an event-driven drain
+                // of any backlog queued during a prior outage/cutoff. The cheap
+                // relaxed maybe-dirty load is a fast-path filter: the common
+                // steady-state (nothing ever queued) skips the spawn entirely, so a
+                // burst of gated calls does not spawn a blocking task per call. The
+                // authoritative consume is the swap inside `drain_on_live_recovery`.
+                // The drain runs on a blocking thread so the 204 is not delayed by
+                // its chain I/O; the join is awaited in a detached task ONLY to log a
+                // (documented-unreachable) panic as a JoinError — symmetric with the
+                // periodic tick's panic handling, so an event-drain panic is never
+                // silently dropped.
+                McpGateConfirm::OnChain => {
+                    if crate::audit::mcp_gate_outbox::outbox_maybe_dirty() {
+                        let base = state.base_dir.as_ref().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                crate::audit::mcp_gate_outbox::drain_on_live_recovery(&base);
+                            })
+                            .await
+                            {
+                                tracing::warn!(
+                                    error_kind = "mcp_gate_event_drain_task_panicked",
+                                    error = %e,
+                                    "event-driven mcp-gate outbox drain task panicked"
+                                );
+                            }
+                        });
+                    }
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                // No chain to record to (uninitialised). M6 #909 shard C
+                // (decision 1): whether this decision is DROPPED or PRESERVED
+                // depends on the durable attestation-intent marker —
+                //   - intent SET (`csq audit intent on`): the operator will run
+                //     `csq audit init`; the decision MUST NOT be silently lost.
+                //     Return 503 so the proxy queues it to the durable outbox, and
+                //     mark the outbox maybe-dirty so shard B's continuous drain
+                //     flushes it within one interval of `csq audit init` (until
+                //     then the drain defers on the un-appendable chain and PRESERVES
+                //     the file — the pre-init queue is bounded + VISIBLE via the
+                //     recurring deferred-drain WARN + `csq doctor`, never
+                //     silently dropped).
+                //   - intent UNSET (default — non-audit host): 204, drop as the
+                //     pre-#909 uninit contract, so a host that will never init a
+                //     chain does not accumulate an unbounded outbox.
+                // A drain is NOT triggered here regardless: an uninitialised chain
+                // is not appendable, so a drain would only defer.
+                McpGateConfirm::NoChain => {
+                    if crate::audit::outbox_paths::attestation_intent_is_set(&state.base_dir) {
+                        crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+                        tracing::warn!(
+                            error_kind = "mcp_gate_intent_queued",
+                            "mcp-gate decision on an uninitialised chain with attestation \
+                             intent SET; signalling the proxy to queue it to the durable \
+                             outbox (run `csq audit init` to drain the pre-init queue)"
+                        );
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(McpGateError {
+                                error: "mcp_gate_intent_queued",
+                            }),
+                        ));
+                    }
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                // Chain exists but the decision did not land (signing-cutoff skip):
+                // signal the proxy to queue it to its durable outbox for a
+                // next-start drain. A re-queued genuine Duplicate is harmless (the
+                // drain re-confirms on-chain and deletes). Mark the outbox
+                // maybe-dirty so the next confirmed-on-chain emit drains it
+                // event-driven (shard B) instead of waiting for the periodic tick.
+                McpGateConfirm::Unrecorded => {
+                    crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+                    tracing::warn!(
+                        error_kind = "mcp_gate_unconfirmed",
+                        "mcp-gate emit did not record the decision (signing skip); \
+                         signalling the proxy to queue it to the durable outbox"
+                    );
+                    Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(McpGateError {
+                            error: "mcp_gate_unconfirmed",
+                        }),
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            let tag = e.fixed_tag();
+            // Mark the outbox maybe-dirty: the proxy queues on a server-side failure
+            // (this 503, and the sibling `mcp_gate_unconfirmed` 503) — NOT on the two
+            // 422 client-rejection arms (`mcp_gate_deserialize_error`,
+            // `mcp_gate_invalid_field`), whose records are permanently unprocessable
+            // (the drain would `invalid`-delete them, never a retryable backlog). So
+            // the next confirmed-on-chain emit fires an event-driven drain (shard B).
+            crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+            tracing::warn!(error_kind = tag, "mcp-gate record write failed");
+            // 503 (not 400): a hard emit I/O failure is a SERVER-side error, not a
+            // malformed client request. Consistent with the two sibling
+            // server-side failure arms (`mcp_gate_unconfirmed` and the
+            // `audit_chain_broken` fail-closed gate) that already return 503.
+            // Functionally the proxy queues on any non-204, so this is an
+            // accuracy fix for operator diagnosis, not a behaviour change.
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(McpGateError {
+                    error: "mcp_gate_write_error",
+                }),
             ))
         }
     }
@@ -1519,6 +2165,8 @@ mod tests {
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
     }
 
@@ -1532,6 +2180,8 @@ mod tests {
             oauth_store: None,
             gemini_consumer: GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
     }
 
@@ -1549,6 +2199,8 @@ mod tests {
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
     }
 
@@ -1760,6 +2412,383 @@ mod tests {
             .map(|i| text[i + 4..].to_string())
             .unwrap_or_default();
         (status_line, body)
+    }
+
+    /// Issues a raw HTTP POST with a JSON body AND an `X-CSQ-Session-Key` header
+    /// against the daemon's Unix socket; returns (status_line, body).
+    #[cfg(feature = "enterprise")]
+    async fn http_post_json_with_key(
+        sock: &std::path::Path,
+        path: &str,
+        body: &str,
+        session_key: &str,
+    ) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             X-CSQ-Session-Key: {session_key}\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\r\n{body}",
+            len = body.len(),
+            body = body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    // ── #783/#794 interactive route integration (enterprise-only) ─────────────
+    //
+    // These exercise the FULL production path: the registered `/api/interactive/*`
+    // routes → `RouterState::interactive` registry → `InteractiveSession::run_turn`
+    // → `GovernanceLoop::execute`, over a real Unix socket. Only the provider
+    // network is mocked (the live golden-3 leg is the §10.5 maintainer task).
+
+    #[cfg(feature = "enterprise")]
+    fn it_answer_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": { "answer": { "type": "string" } },
+            "additionalProperties": true
+        })
+    }
+
+    /// RouterState whose interactive registry is SEEDED over a mock `factory`.
+    ///
+    /// Uses [`InteractiveSessionRegistry::seeded_compat`] so the registry holds
+    /// exactly one pre-built session; returns both the state AND the session key
+    /// so tests can route subsequent dispatch calls to the right session.
+    #[cfg(feature = "enterprise")]
+    fn seeded_interactive_state(
+        base: &std::path::Path,
+        factory: crate::phase2b::interactive::ProviderFactory,
+    ) -> (RouterState, crate::daemon::interactive_ipc::SessionKey) {
+        let session = crate::phase2b::interactive::InteractiveSession::new(
+            factory,
+            it_answer_schema(),
+            256,
+            Some("route-it".into()),
+        );
+        let (reg, key) = InteractiveSessionRegistry::seeded_compat(session);
+        let state = RouterState {
+            interactive: Arc::new(reg),
+            ..test_state(base)
+        };
+        (state, key)
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_submit_blocked_override_complete() {
+        use crate::phase2b::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Turn 1 returns schema-failing content (block); the override's corrective
+        // turn returns passing content (complete). Fresh client per turn via counter.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let factory: crate::phase2b::interactive::ProviderFactory = {
+            let counter = counter.clone();
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let content = if n == 0 {
+                    serde_json::json!("not an object")
+                } else {
+                    serde_json::json!({ "answer": "ok" })
+                };
+                vec![Box::new(MockProviderClient::passing(
+                    ProviderId("mock".into()),
+                    content,
+                )) as Box<dyn ProviderClient>]
+            })
+        };
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-it.sock");
+        let (state, key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = serve(&sock, state).await.unwrap();
+        let key_str = key.as_str().to_owned();
+
+        let (status, body) = http_post_json_with_key(
+            &sock,
+            "/api/interactive/submit",
+            r#"{"input":"do the risky thing"}"#,
+            &key_str,
+        )
+        .await;
+        assert!(
+            status.contains("200"),
+            "submit status: {status} body: {body}"
+        );
+        assert!(
+            body.contains(r#""state":"blocked""#),
+            "expected blocked: {body}"
+        );
+
+        let (status, body) = http_post_json_with_key(
+            &sock,
+            "/api/interactive/override",
+            r#"{"justification":"operator accepts the risk"}"#,
+            &key_str,
+        )
+        .await;
+        assert!(
+            status.contains("200"),
+            "override status: {status} body: {body}"
+        );
+        assert!(
+            body.contains(r#""state":"complete""#),
+            "expected complete: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_fail_closed_503_on_empty_registry() {
+        // Default `test_state` seeds an EMPTY registry (production fail-closed).
+        // Probe via `POST /api/interactive/open` (no key required) — the route
+        // returns 503 `interactive_unavailable` — NOT 404 (route is present) and
+        // NOT a panic.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-it-fc.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/interactive/open", "{}").await;
+        assert!(
+            status.contains("503"),
+            "expected 503 on empty registry, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("interactive_unavailable"),
+            "expected fail-closed tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_options_fail_closed_503_on_empty_registry() {
+        // Default `test_state` seeds an EMPTY registry (gate closed). The options
+        // pre-open query is fail-closed identically to the keyed routes (#793).
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-it-opt-fc.sock");
+        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
+        assert!(
+            status.contains("503"),
+            "expected 503 on closed gate, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("interactive_unavailable"),
+            "expected fail-closed tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_options_lists_candidate_slots() {
+        // Full path: write a valid gate (provider=claude) + stage two credentialed
+        // Anthropic accounts, seed a LIVE registry, then the options route returns
+        // the provider + both slots lowest-first (#793 §FD1).
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        // Gate: provider=claude with a minimal valid schema.
+        let gate = serde_json::json!({
+            "provider": "claude",
+            "schema": it_answer_schema(),
+        });
+        std::fs::write(
+            dir.path()
+                .join(crate::daemon::interactive_live::GATE_FILENAME),
+            gate.to_string(),
+        )
+        .unwrap();
+        // Stage two credentialed accounts (out of order → expect lowest-first).
+        for id in [4u16, 2u16] {
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new(format!("at-{id}")),
+                    refresh_token: RefreshToken::new(format!("rt-{id}")),
+                    expires_at: 9999999999999,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                extra: std::collections::HashMap::new(),
+            });
+            credentials::save(
+                &dir.path().join("credentials").join(format!("{id}.json")),
+                &creds,
+            )
+            .unwrap();
+        }
+
+        let reg = crate::daemon::interactive_live::seed_registry(dir.path(), None, None, None);
+        let state = RouterState {
+            interactive: Arc::new(reg),
+            ..test_state(dir.path())
+        };
+        let sock = dir.path().join("csq-it-opt.sock");
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
+        assert!(
+            status.contains("200"),
+            "options status: {status} body: {body}"
+        );
+        assert!(
+            body.contains(r#""provider":"claude""#),
+            "expected provider claude: {body}"
+        );
+        // Both staged slots present, lowest-first (slot 2 before slot 4).
+        let two = body.find(r#""slot":2"#).expect("slot 2 present");
+        let four = body.find(r#""slot":4"#).expect("slot 4 present");
+        assert!(two < four, "candidates must be lowest-first: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_abandon_returns_idle() {
+        use crate::phase2b::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+
+        // Always-failing factory → submit blocks; abandon → idle (no body needed).
+        let factory: crate::phase2b::interactive::ProviderFactory = Box::new(|| {
+            vec![Box::new(MockProviderClient::passing(
+                ProviderId("mock".into()),
+                serde_json::json!("not an object"),
+            )) as Box<dyn ProviderClient>]
+        });
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-it-ab.sock");
+        let (state, key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = serve(&sock, state).await.unwrap();
+        let key_str = key.as_str().to_owned();
+
+        let (_s1, b1) = http_post_json_with_key(
+            &sock,
+            "/api/interactive/submit",
+            r#"{"input":"risky"}"#,
+            &key_str,
+        )
+        .await;
+        assert!(
+            b1.contains(r#""state":"blocked""#),
+            "expected blocked: {b1}"
+        );
+
+        let (s2, b2) =
+            http_post_json_with_key(&sock, "/api/interactive/abandon", "", &key_str).await;
+        assert!(s2.contains("200"), "abandon status: {s2} body: {b2}");
+        assert!(b2.contains(r#""state":"idle""#), "expected idle: {b2}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_malformed_body_422() {
+        use crate::phase2b::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+
+        // A malformed JSON body on `submit` is rejected at the handler boundary with
+        // 422 `interactive_deserialize_error` (spec 21 §21.7), BEFORE the registry
+        // is touched. We send a valid key so the key-extraction step passes.
+        let factory: crate::phase2b::interactive::ProviderFactory = Box::new(|| {
+            vec![Box::new(MockProviderClient::passing(
+                ProviderId("mock".into()),
+                serde_json::json!({ "answer": "ok" }),
+            )) as Box<dyn ProviderClient>]
+        });
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-it-422.sock");
+        let (state, key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = serve(&sock, state).await.unwrap();
+        let key_str = key.as_str().to_owned();
+
+        let (status, body) =
+            http_post_json_with_key(&sock, "/api/interactive/submit", "{ not json", &key_str).await;
+        assert!(
+            status.contains("422"),
+            "expected 422, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("interactive_deserialize_error"),
+            "expected deserialize tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_missing_key_header_400() {
+        use crate::phase2b::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+
+        // POST /api/interactive/submit with NO X-CSQ-Session-Key header must
+        // return 400 `session_key_invalid` (FIX 3: absent header → same
+        // InteractiveIpcError::InvalidSessionKey path as a malformed key).
+        let factory: crate::phase2b::interactive::ProviderFactory = Box::new(|| {
+            vec![Box::new(MockProviderClient::passing(
+                ProviderId("mock".into()),
+                serde_json::json!({ "answer": "ok" }),
+            )) as Box<dyn ProviderClient>]
+        });
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-it-missing-key.sock");
+        let (state, _key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // Send submit with no header — extract_session_key must reject it.
+        let (status, body) =
+            http_post_json(&sock, "/api/interactive/submit", r#"{"input":"hi"}"#).await;
+        assert!(
+            status.contains("400"),
+            "expected 400 for missing key header, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("session_key_invalid"),
+            "expected session_key_invalid tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 
     #[tokio::test]
@@ -2411,6 +3440,243 @@ mod tests {
         assert!(
             !status.contains("503"),
             "degraded health must not return 503, got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── M6 T6.2 Shard 4 — MCP gate decision route tests ──────────────────────
+
+    /// A well-formed MCP gate decision is accepted (not 503) under verified
+    /// health. With an uninitialised chain in the tempdir the emit skips
+    /// (`Ok(false)` — no genesis minting), which still returns 204: the route
+    /// contract is "accepted", the append is best-effort.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_accepted_when_health_verified() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-mcp-ok.sock");
+        let state = test_state(dir.path()); // Verified by default
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("204"),
+            "verified health + valid body must return 204, got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Shard C (decision 1): on an uninitialised chain with attestation intent SET,
+    /// a well-formed decision returns 503 `mcp_gate_intent_queued` (signalling the
+    /// proxy to QUEUE it to the durable outbox) instead of the default 204-drop.
+    /// This is the setup-ordering window — the operator declared intent before
+    /// `csq audit init`, so the decision must be preserved, not lost. Complements
+    /// `mcp_gate_accepted_when_health_verified` (uninit + NO intent → 204 drop).
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_uninit_with_intent_returns_503_intent_queued() {
+        let dir = TempDir::new().unwrap();
+        // Declare attestation intent BEFORE any decision (pre-init window).
+        crate::audit::outbox_paths::set_attestation_intent(dir.path()).unwrap();
+        let sock = dir.path().join("csq-mcp-intent.sock");
+        let state = test_state(dir.path()); // Verified health, chain uninitialised.
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-9-cd","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
+        let (status, resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("503"),
+            "uninit chain + intent SET must return 503 (queue), got: {status}"
+        );
+        assert!(
+            resp.contains("mcp_gate_intent_queued"),
+            "the 503 tag must be mcp_gate_intent_queued, got: {resp}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Shard C: the DEFAULT (no intent marker) uninit path still returns 204 — a
+    /// non-audit host does not queue. Explicit regression guard that intent is
+    /// OPT-IN (the `mcp_gate_accepted_when_health_verified` sibling shares the
+    /// behaviour but this pins the intent-unset precondition by name).
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_uninit_without_intent_returns_204_drop() {
+        let dir = TempDir::new().unwrap();
+        assert!(
+            !crate::audit::outbox_paths::attestation_intent_is_set(dir.path()),
+            "precondition: no intent marker"
+        );
+        let sock = dir.path().join("csq-mcp-noint.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-9-ef","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("204"),
+            "uninit chain + NO intent must drop (204), got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// R3/R4: with an INITIALISED chain a well-formed decision is appended and
+    /// CONFIRMED on chain (`mcp_gate_confirm` → OnChain) → 204, and the record is
+    /// actually present. Complements `mcp_gate_accepted_when_health_verified`
+    /// (which exercises the uninitialised NoChain → 204 path). The `Unrecorded →
+    /// 503 mcp_gate_unconfirmed` arm requires a signing-cutoff + keychain-
+    /// unavailable state that is not hermetic; it is covered by the floor unit test
+    /// `mcp_gate_floor::tests::decision_on_chain_reflects_actual_landing` (all three
+    /// `McpGateConfirm` states) plus the handler's exhaustive (wildcard-free) match.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_confirmed_on_initialised_chain_returns_204_and_records() {
+        use crate::audit::persist::write_record_v2;
+        use crate::audit::types::{
+            Ed25519Signature, EventKind, EventPayload, KeyId, McpGateDecisionPayload, RecordId,
+            Sha256Hex, SignedRecord,
+        };
+
+        let dir = TempDir::new().unwrap();
+        // Bootstrap a chain genesis so the decision has a real chain to land on.
+        let boot = SignedRecord {
+            schema_version: crate::audit::persist::AUDIT_SCHEMA_VERSION_TEST.to_string(),
+            record_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            chain_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            seq: 0,
+            prev_hash: Sha256Hex::genesis(),
+            kind: EventKind::McpGateDecision,
+            payload: EventPayload::McpGateDecision(McpGateDecisionPayload {
+                session_nonce: "bootstrap".to_string(),
+                record_seq: 0,
+                cli: "codex".to_string(),
+                tool: "bootstrap_tool".to_string(),
+                verdict: "pass".to_string(),
+                enforcement_fidelity: crate::audit::mcp_gate_floor::MCP_ENFORCEMENT_FIDELITY
+                    .to_string(),
+            }),
+            ts: crate::audit::persist::current_iso8601_utc_persist(),
+            key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
+            canonical_hash: Sha256Hex::genesis(),
+            signature: Ed25519Signature::new([0u8; 64]),
+            actor: None,
+            authority: None,
+            trust: None,
+            eatp_start_ts: None,
+            eatp_end_ts: None,
+            op_phase: None,
+            verification_level: None,
+        };
+        write_record_v2(boot, Some(dir.path())).unwrap();
+
+        let sock = dir.path().join("csq-mcp-onchain.sock");
+        let state = test_state(dir.path()); // Verified
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-9-cafe","record_seq":1,"cli":"codex","tool":"mcp__fs__read","verdict":"pass"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("204"),
+            "a decision confirmed on an initialised chain must return 204, got: {status}"
+        );
+
+        // The decision is actually on the chain (OnChain, not a false 204).
+        assert!(
+            crate::audit::mcp_gate_floor::mcp_gate_decision_on_chain(
+                dir.path(),
+                "mcp-proxy-9-cafe",
+                1
+            ),
+            "the confirmed decision must be present on the chain"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Fail-closed: an MCP gate decision is rejected (503) when the chain is
+    /// broken — no new attestation appends to a chain that failed verification.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_rejected_when_health_broken() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-mcp-broken.sock");
+        let mut state = test_state(dir.path());
+        state.audit_health = crate::audit::AuditHealth::Broken {
+            error_kind: "audit_chain_broken_at_seq_0".to_string(),
+            reason: "test broken chain".to_string(),
+        };
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"t","verdict":"block"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("503"),
+            "broken health must return 503, got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "response must carry audit_chain_broken tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// An out-of-vocabulary verdict is rejected fail-closed (422
+    /// `mcp_gate_invalid_field`) — the daemon never trusts the field shape.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_rejects_invalid_verdict() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-mcp-badverdict.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // verdict "allow" is NOT in the fixed vocabulary {pass,block,escalate}.
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"t","verdict":"allow"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("422"),
+            "invalid verdict must return 422, got: {status}"
+        );
+        assert!(
+            resp_body.contains("mcp_gate_invalid_field"),
+            "response must carry mcp_gate_invalid_field tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// An unknown `cli` value is rejected fail-closed (422) — only codex/gemini
+    /// are attributable spawn surfaces.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_rejects_unknown_cli() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-mcp-badcli.sock");
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"claude","tool":"t","verdict":"block"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("422"),
+            "unknown cli must return 422, got: {status}"
+        );
+        assert!(
+            resp_body.contains("mcp_gate_invalid_field"),
+            "got: {resp_body}"
         );
 
         handle.shutdown();

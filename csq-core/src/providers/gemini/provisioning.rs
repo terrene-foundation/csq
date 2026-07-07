@@ -87,7 +87,7 @@ pub enum AuthMode {
     /// memory: gemini-cli is the reference client; csq does not
     /// reimplement the OAuth flow).
     ///
-    /// Stage 2 of journal 0048 added this variant. v=1 binding markers
+    /// Stage 2 of an internal journal entry added this variant. v=1 binding markers
     /// remain readable; only NEW slots can be provisioned in this
     /// mode. Old binaries (compiled before this variant) error on
     /// deserialize when reading a CodeAssistOAuth-mode marker —
@@ -212,7 +212,7 @@ impl ProvisionError {
 /// Pure function of the csq-owned binding marker — it NEVER reads the
 /// Vertex SA JSON, gemini-cli's `~/.gemini/oauth_creds.json`, or the
 /// platform vault. Embedding any of those would be the
-/// `account-slot-decoupling` journal 0065 Finding 1 forbidden class
+/// `an internal workspace` an internal journal entry Finding 1 forbidden class
 /// (external/fragile/daemon-refreshed identity source). The `match` is
 /// exhaustive on purpose: a future `AuthMode` variant is a compile error
 /// here, not a silent mislabel that diverges the backfill from the
@@ -244,7 +244,7 @@ pub fn gemini_identity_label(slot: AccountNum, auth: &AuthMode) -> String {
 /// Writes `by_slot_identity[N]` for a freshly provisioned Gemini slot
 /// under `ProfilesFileLock`.
 ///
-/// Lock ordering (security review F1 / journal 0001 D3): the caller MUST
+/// Lock ordering (security review F1 / an internal journal entry D3): the caller MUST
 /// NOT already hold `ProfilesFileLock` — this helper acquires it. The
 /// daemon backfill holds the lock and only *reads* binding markers; it
 /// never calls a `provision_*` path, so acquiring here introduces no
@@ -304,7 +304,7 @@ pub fn binding_path(base_dir: &Path, slot: AccountNum) -> PathBuf {
 /// Whether `slot` has a Gemini binding marker. Single
 /// `symlink_metadata` syscall — no JSON parse, no vault touch.
 /// Treats a dangling symlink at the marker path as "bound" (same
-/// posture as `is_codex_bound_slot` per FR-CLI-05 / journal 0013).
+/// posture as `is_codex_bound_slot` per FR-CLI-05 / an internal journal entry).
 pub fn is_gemini_bound_slot(base_dir: &Path, slot: AccountNum) -> bool {
     std::fs::symlink_metadata(binding_path(base_dir, slot)).is_ok()
 }
@@ -620,7 +620,7 @@ pub fn provision_api_key_via_vault(
 /// has succeeded; if `gemini auth login` fails, the marker is not
 /// written.
 ///
-/// Stage 2 of journal 0048.
+/// Stage 2 of an internal journal entry
 pub fn provision_code_assist_oauth(
     base_dir: &Path,
     slot: AccountNum,
@@ -742,7 +742,7 @@ mod tests {
         }
     }
 
-    /// Stage 2 of journal 0048: Code Assist OAuth binding marker
+    /// Stage 2 of an internal journal entry: Code Assist OAuth binding marker
     /// round-trips through write → read intact. The marker carries
     /// no payload — its presence is the signal.
     #[test]
@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(read.model_name, "gemini-2.5-pro");
     }
 
-    /// Stage 2 of journal 0048: the on-disk JSON for OAuth mode
+    /// Stage 2 of an internal journal entry: the on-disk JSON for OAuth mode
     /// uses `mode: "code_assist_oauth"` — pinning the snake_case
     /// rename guards against accidental serde drift.
     #[test]
@@ -772,7 +772,7 @@ mod tests {
         );
     }
 
-    /// Stage 2 of journal 0048: `provision_code_assist_oauth` writes
+    /// Stage 2 of an internal journal entry: `provision_code_assist_oauth` writes
     /// a binding marker with `auth = CodeAssistOAuth` and
     /// `model_name = "auto"`. No vault interaction.
     #[test]

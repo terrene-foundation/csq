@@ -8,7 +8,7 @@
 //! exists (pre-A++ installs). The probe does NOT read `~/.codex/auth.json`
 //! — that file is codex-cli's standalone state, csq-unmanaged. Reading
 //! it would violate `account-terminal-separation.md` MUST Rule 4
-//! (diagnostic-daemon parity). Origin: issue #534.
+//! (diagnostic-daemon parity). Origin: an internal ticket.
 //!
 //! Reuses `crate::http::codex::fetch_wham_usage` (Node bridge — direct
 //! reqwest is body-stripped by Cloudflare). Six load-bearing assertions.

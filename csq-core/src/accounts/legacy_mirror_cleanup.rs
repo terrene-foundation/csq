@@ -32,7 +32,7 @@
 //! - `IoError` — `remove_file` failed (EACCES, EROFS, etc.); file stays on
 //!   disk and is retried next start.
 //!
-//! See `workspaces/legacy-credentials-mirror-cleanup/journal/0004-DECISION-analyze-r1-converged-design.md`
+//! See `internal-design-docs`
 //! D1–D9 for the full predicate convergence trail.
 //!
 //! # Lock posture (per S4)

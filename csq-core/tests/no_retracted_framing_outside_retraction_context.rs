@@ -7,10 +7,10 @@
 //!
 //! # Why this exists
 //!
-//! Journal 0049 §"Process improvement" (csq-as-cli workspace, 2026-
+//! an internal journal entry §"Process improvement" (an internal workspace workspace, 2026-
 //! 05-06) identified that single-line eradication greps cannot
 //! distinguish retraction context from live framing. The Gemini
-//! Stage 1 retraction (journal 0048) initially shipped four artifacts
+//! Stage 1 retraction (an internal journal entry) initially shipped four artifacts
 //! that still asserted the retracted EP1-EP7 / "7-layer ToS guard"
 //! policy as live truth, despite the WIP commit's verification grep
 //! returning "only intentional retraction comments remain". /redteam
@@ -98,7 +98,7 @@ struct RetractedPhrase {
 /// positive tolerance is fine, false-negative (missing a live framing)
 /// is the failure mode this test prevents.
 const RETRACTED_PHRASES: &[RetractedPhrase] = &[
-    // Journal 0048: Gemini ToS-driven defense framing retracted.
+    // an internal journal entry: Gemini ToS-driven defense framing retracted.
     RetractedPhrase {
         phrase: "EP1-EP7",
         keywords: GEMINI_TOS_RETRACTION_KEYWORDS,
@@ -150,11 +150,11 @@ const GEMINI_TOS_RETRACTION_KEYWORDS: &[&str] = &[
     "earlier revisions",
     "was wrong",
     "framing correction",
-    "journal 0048",
-    "journal 0049",
+    "an internal journal entry",
+    "an internal journal entry",
     "Retracted:",
     "RETRACTED",
-    "Stage 2 of journal 0048",
+    "Stage 2 of an internal journal entry",
 ];
 
 /// Same as above plus the legacy-drainer tag — `tos_guard_tripped`
@@ -167,11 +167,11 @@ const GEMINI_TOS_RETRACTION_KEYWORDS_PLUS_LEGACY: &[&str] = &[
     "earlier revisions",
     "was wrong",
     "framing correction",
-    "journal 0048",
-    "journal 0049",
+    "an internal journal entry",
+    "an internal journal entry",
     "Retracted:",
     "RETRACTED",
-    "Stage 2 of journal 0048",
+    "Stage 2 of an internal journal entry",
     "tos_guard_tripped",
     "legacy",
     "v1 →",
@@ -212,7 +212,7 @@ fn no_retracted_phrase_lives_outside_retraction_context() {
          agents would read as current policy.\n\n\
          Fix: either (a) wrap the phrase in explicit retraction context \
          (e.g. \"Earlier revisions framed this as ... — that framing was \
-         retracted in journal 0048\"), or (b) delete the phrase entirely \
+         retracted in an internal journal entry\"), or (b) delete the phrase entirely \
          if no longer needed.\n\n\
          If you intentionally added a phrase that should bypass this \
          check (e.g. a new retracted-policy framework documented in a \
@@ -220,6 +220,37 @@ fn no_retracted_phrase_lives_outside_retraction_context() {
          RETRACTED_PHRASES keyword set in this test file.\n\n\
          Violations:\n  {}",
         violations.join("\n  ")
+    );
+}
+
+/// Regression for the leading-word-boundary matcher (M-IC, an internal journal entry):
+/// the retracted phrase "active enforcement" must NOT match inside
+/// "interactive enforcement" (the M-IC milestone term), but MUST still catch
+/// genuine word-boundary "active enforcement" framing with no retraction
+/// keyword nearby. This proves the boundary fix narrows false positives
+/// without introducing a false negative.
+#[test]
+fn leading_word_boundary_skips_interactive_enforcement_catches_active_enforcement() {
+    let mut benign = Vec::new();
+    scan_content(
+        Path::new("doc.md"),
+        "/// Observable state of an interactive enforcement session.",
+        &mut benign,
+    );
+    assert!(
+        benign.is_empty(),
+        "'interactive enforcement' must NOT match retracted 'active enforcement': {benign:?}"
+    );
+
+    let mut genuine = Vec::new();
+    scan_content(
+        Path::new("doc.md"),
+        "csq performs active enforcement of the provider ToS on every turn.",
+        &mut genuine,
+    );
+    assert!(
+        genuine.iter().any(|v| v.contains("active enforcement")),
+        "genuine word-boundary 'active enforcement' framing must still be caught: {genuine:?}"
     );
 }
 
@@ -234,7 +265,21 @@ fn scan_content(rel_path: &Path, content: &str, violations: &mut Vec<String>) {
     let lines: Vec<&str> = content.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
         for retracted in RETRACTED_PHRASES {
-            if !line.contains(retracted.phrase) {
+            // Leading-word-boundary match. A retracted phrase that is a strict
+            // mid-word substring — immediately preceded by an ASCII letter, e.g.
+            // "active enforcement" inside "inter·active enforcement" (the M-IC
+            // interactive-enforcement term, unrelated to the retracted Gemini-ToS
+            // "active enforcement" framing) — is NOT the retracted usage. Require
+            // at least one occurrence whose preceding byte is start-of-line or a
+            // non-alphabetic char. This only suppresses suffix-of-a-word false
+            // positives; genuine retracted framing always sits at a word boundary,
+            // so detection is not weakened (the test still leans against false
+            // negatives — only letter-preceded substrings are skipped).
+            let bytes = line.as_bytes();
+            let boundary_match = line
+                .match_indices(retracted.phrase)
+                .any(|(i, _)| i == 0 || !bytes[i - 1].is_ascii_alphabetic());
+            if !boundary_match {
                 continue;
             }
             let lo = idx.saturating_sub(NEIGHBORHOOD_HALF_WINDOW);

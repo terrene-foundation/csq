@@ -56,7 +56,7 @@ pub const APPLIED_SET_CAPACITY: usize = 16_384;
 pub const SCHEMA_DRIFT_BREAKER_THRESHOLD: u32 = 5;
 
 /// Number of mismatched-effective-model observations within
-/// [`DOWNGRADE_DEBOUNCE_WINDOW`] that latches `is_downgrade = true`
+/// `DOWNGRADE_DEBOUNCE_WINDOW` that latches `is_downgrade = true`
 /// per ADR-G06.
 pub const DOWNGRADE_DEBOUNCE_THRESHOLD: u32 = 3;
 
@@ -307,7 +307,7 @@ pub fn drain_slot(
                 // EventKind enum) MUST be dropped silently — not
                 // quarantined. Without this kind-aware pre-parse, a
                 // single legacy line would quarantine the whole file
-                // and drop every subsequent valid event. Journal 0048.
+                // and drop every subsequent valid event. an internal journal entry
                 if let Ok(raw) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(kind) = raw.get("kind").and_then(|k| k.as_str()) {
                         if matches!(kind, "tos_guard_tripped") {

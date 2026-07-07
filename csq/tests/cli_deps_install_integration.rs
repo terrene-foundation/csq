@@ -17,7 +17,7 @@
 //!
 //! - Stub binary: `csq-core/tests/bin/stub_cli.rs` (extended in M4 with
 //!   `--capture-argv <path>`). Consumed via `CARGO_BIN_EXE_stub-cli`.
-//! - No shell-script stubs (per journal 0008 + M2 R1 F3 flake finding).
+//! - No shell-script stubs (per an internal journal entry + M2 R1 F3 flake finding).
 //! - Subprocess env cleared per `rules/testing.md` Rule 4a.
 //! - Serial mutex on all tests that probe real CLIs (probe has a 2s timeout
 //!   per spec/13 §8; CPU saturation under parallel load flakes).
@@ -32,7 +32,7 @@ use tempfile::TempDir;
 // ── Serial gate ────────────────────────────────────────────────────────────────
 
 // Probe has a 2s timeout per spec/13 §8. Under heavy test parallelism, CPU
-// saturation can delay the stub spawn past the deadline (journal 0008 RISK).
+// saturation can delay the stub spawn past the deadline (an internal journal entry RISK).
 // Tests that touch PATH / probe must serialize.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -83,6 +83,9 @@ fn sandbox_home() -> std::path::PathBuf {
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
+    // Hermetic: the spawned `csq` binary must NOT shell `security` against the
+    // operator's real login keychain (rules/test-hermeticity.md).
+    cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     cmd.env("HOME", sandbox_home());
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {
@@ -120,7 +123,7 @@ fn make_stub_npm_dir(
 
     // Build a wrapper that invokes stub-cli with the desired flags.
     // We need a real executable so we build a tiny shell wrapper.
-    // Per journal 0008: shell-script stubs flake. We use the compiled stub-cli
+    // Per an internal journal entry: shell-script stubs flake. We use the compiled stub-cli
     // instead, invoked via a thin shell wrapper that is as minimal as possible.
     //
     // The only "shell logic" in the wrapper is argument pass-through.

@@ -35,7 +35,7 @@ pub fn handle() -> Result<()> {
         println!("  ✓ Patched {}/settings.json", claude_home.display());
     }
 
-    // Per-slot statusline migration — journal 0059.
+    // Per-slot statusline migration — an internal journal entry
     //
     // CC merges settings with per-slot winning over global for leaf
     // fields. Earlier csq versions wrote `statusLine.command =
@@ -55,7 +55,7 @@ pub fn handle() -> Result<()> {
         println!("  ✓ Cleared stale per-slot statusLine on slot(s): {summary}");
     }
 
-    // Same hazard at handle-dir scope (issue #185): a `term-<pid>/`
+    // Same hazard at handle-dir scope (an internal ticket): a `term-<pid>/`
     // materialized BEFORE this `csq install` ran has a real
     // settings.json (not a symlink) carrying the same legacy
     // statusLine wrapper. `cleanup_v1_artifacts` below renames the
@@ -371,7 +371,7 @@ fn migrate_per_slot_statuslines(base_dir: &Path) -> Result<Vec<u16>> {
     Ok(migrated)
 }
 
-/// Per-handle-dir mirror of `migrate_per_slot_statuslines` (issue #185).
+/// Per-handle-dir mirror of `migrate_per_slot_statuslines` (an internal ticket).
 ///
 /// Walks `<base_dir>/term-<pid>/settings.json` and strips a legacy
 /// statusline wrapper command using the same predicate as the per-slot
@@ -774,7 +774,7 @@ mod tests {
     fn migrate_per_slot_does_not_touch_handle_dirs() {
         // Per-slot migration walks ONLY config-<N> entries — handle
         // dirs are the responsibility of `migrate_handle_dir_statuslines`
-        // (issue #185). Confirm the boundary holds.
+        // (an internal ticket). Confirm the boundary holds.
         let dir = TempDir::new().unwrap();
         let term_dir = dir.path().join("term-1234");
         std::fs::create_dir_all(&term_dir).unwrap();
@@ -801,7 +801,7 @@ mod tests {
         assert!(migrated.is_empty());
     }
 
-    // ── migrate_handle_dir_statuslines (issue #185) ───────────
+    // ── migrate_handle_dir_statuslines (an internal ticket) ───────────
 
     fn write_handle_settings(base: &Path, pid: u32, json: &str) {
         let dir = base.join(format!("term-{pid}"));
@@ -975,7 +975,7 @@ mod tests {
     //
     // Mirrors `csq_core::platform::fs::assert_no_tmp_leak_on_readonly_parent`.
     // Cannot import cross-crate pub(crate). Origin: security.md §5a,
-    // journal 0065 B2, /redteam round 3 (2026-05-09).
+    // an internal journal entry B2, /redteam round 3 (2026-05-09).
     #[cfg(unix)]
     fn assert_no_tmp_leak_on_readonly_parent_inline<F, E>(dir: &std::path::Path, op: F)
     where
@@ -1003,7 +1003,7 @@ mod tests {
         assert!(leaked.is_empty(), "§5a leaked tmp files: {leaked:?}");
     }
 
-    /// §5a regression — site 6 (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression — site 6 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `patch_settings_json` fails
     /// after the tmp file would have been created (parent dir read-only →
     /// write fails), no `.tmp.` file must remain.
@@ -1023,7 +1023,7 @@ mod tests {
         });
     }
 
-    /// §5a regression — site 7 (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression — site 7 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `seed_keybindings_json` fails
     /// after the tmp file would have been created (parent dir read-only →
     /// write fails), no `.tmp.` file must remain.
@@ -1064,7 +1064,7 @@ mod tests {
         drop(result); // outcome doesn't matter; only tmp-leak matters
     }
 
-    /// §5a regression — site 8 (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression — site 8 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `strip_legacy_statusline_from_file`
     /// fails after the tmp file would have been created (settings dir
     /// read-only → write fails), no `.tmp.` file must remain.

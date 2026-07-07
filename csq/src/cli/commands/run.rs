@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 
 use csq_core::daemon::{self, DetectResult};
 
-/// Phase B' billing-ledger attribution (journal 0050 D2). Best-effort append
+/// Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort append
 /// to `accounts/.csq-launch.log` so the daemon aggregator can attribute CC
 /// session-meta files to slots via post-hoc time correlation.
 ///
@@ -54,6 +54,50 @@ pub(crate) fn append_launch_log(base_dir: &Path, event: &str, account: AccountNu
     }
 }
 
+/// Mirror the bound account's Anthropic credential into the macOS keychain
+/// item Claude Code reads for `handle_dir_abs`
+/// (`credentials::keychain::sync_handle_dir`).
+///
+/// Current CC reads OAuth credentials KEYCHAIN-FIRST from that per-config-dir
+/// item, falling back to the symlinked `.credentials.json` when the keychain
+/// item is ABSENT (empirically confirmed: with the item absent, a running CC
+/// still picks up a swapped account from the repointed file). The mirror keeps
+/// the keychain copy fresh so a keychain-first read sees the current token.
+/// Best-effort: a keychain failure is logged (INFO, not WARN — see
+/// `sync_cc_keychain`) and never blocks the launch; account-switch still works
+/// via the file fallback. No-op for 3P/Codex handle dirs (no `claudeAiOauth`
+/// credential) and on non-macOS (CC reads the file directly there).
+///
+/// `account_changed` MUST be true when the handle dir's account BINDING just
+/// changed (`csq swap` repointed its symlinks) — that bypasses the
+/// newer-than-keychain guard (which compares only expiry and would otherwise
+/// leave the PREVIOUS account's token in place → 401) and clears a stale item
+/// when the new slot has no valid token. `csq run` creates a fresh handle dir
+/// (no prior item), so it passes `false`.
+pub(crate) fn sync_cc_keychain(handle_dir_abs: &Path, account_changed: bool) {
+    let result = if account_changed {
+        csq_core::credentials::keychain::sync_handle_dir_account_changed(handle_dir_abs)
+    } else {
+        csq_core::credentials::keychain::sync_handle_dir(handle_dir_abs)
+    };
+    if let Err(e) = result {
+        // Best-effort mirror — INFO, not WARN. Claude Code reads the keychain
+        // item when present but FALLS BACK to the symlinked `.credentials.json`
+        // (which run/swap repoint) when it is absent, so a failed mirror does NOT
+        // break account switching. The common cause is a non-interactive session
+        // (SSH/tmux) that can't answer the macOS authorization prompt for an
+        // ACL-set keychain item. Surfacing the redacted reason (visible under
+        // `CSQ_LOG=info`) replaces the prior alarming per-swap WARN, which made a
+        // harmless, expected condition look like a broken swap.
+        tracing::info!(
+            error_kind = "cc_keychain_mirror_skipped",
+            reason = %csq_core::error::redact_tokens(&e.to_string()),
+            "Claude Code keychain mirror not updated (best-effort); swap/run fall back \
+             to the credential file — account switch still works, no action needed"
+        );
+    }
+}
+
 /// Exit code when `csq run` cannot spawn a Codex slot because the
 /// daemon is not running (INV-P02). Distinct from anyhow's default 1
 /// so scripts can detect "daemon-down" vs other launch failures.
@@ -65,6 +109,15 @@ const EXIT_CODE_DAEMON_REQUIRED: i32 = 2;
 /// audit-write failure programmatically. The launched operation already
 /// completed; only the audit record was lost.
 const EXIT_CODE_AUDIT_WRITE_FAILED: i32 = 3;
+
+/// Exit code when `csq run` refuses to spawn a codex/gemini subprocess because
+/// the M6 T6.1 spawn-boundary governance gate returned `Block`/`Escalate`, OR
+/// because a configured operating envelope was malformed / the governor could
+/// not be built (fail-closed). Distinct from 1 (generic), 2 (daemon-required),
+/// and 3 (audit-write) so scripts can detect a governance refusal. Enterprise-only
+/// (community spawns codex/gemini ungoverned).
+#[cfg(feature = "enterprise")]
+const EXIT_CODE_SPAWN_BLOCKED: i32 = 4;
 
 // `handle` and the `launch_*` helpers exceed clippy's 7-arg threshold. Each
 // arg is an independent CLI control surface (account, profile, layer
@@ -125,7 +178,7 @@ pub fn handle(
         }
     };
 
-    // Phase B' billing-ledger attribution (journal 0050 D2). Best-effort
+    // Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort
     // append; failures MUST NOT block the launch — billing telemetry is
     // diagnostic, not load-bearing. Errors logged at WARN with redacted
     // context per security.md.
@@ -209,6 +262,10 @@ pub fn handle(
             rule_ids_cited_after_repair: vec![],
             rule_ids_dropped_invalid_format: 0,
             decision: Decision::Bypass,
+            // M6 T6.1: filled by the spawn-boundary gate (codex/gemini,
+            // enterprise) just before spawn; stays `None` for cc/3P (in-loop
+            // gated) and ungoverned spawns.
+            spawn_gate: None,
         };
         crate::cli::audit_emit::AuditEmitter::new(record, socket_path, pending_dir, operation)
     };
@@ -266,7 +323,7 @@ pub fn handle(
     // Codex dispatch: route to `launch_codex` when the captured surface is
     // Codex. The Codex path's `create_handle_dir_codex` owns the handle-dir-
     // level symlinks + marker writes (does NOT reuse the Claude-surface
-    // `create_handle_dir`). Origin: spec 07 §7.5 INV-P02 + journal 0013.
+    // `create_handle_dir`). Origin: spec 07 §7.5 INV-P02 + an internal journal entry
     if surface_for_preflight == SurfaceCli::Codex {
         if let Some(profile_id) = profile {
             return Err(anyhow!(
@@ -314,14 +371,14 @@ pub fn handle(
     // Ensure config-N exists (permanent account home)
     // PATH-BUILDER: constructs the permanent account directory path for
     // creation only; not reading credential content. Unchanged through
-    // Phase 2 — see workspaces/account-slot-decoupling/02-plans/
+    // Phase 2 — see internal-design-docs
     // 03-phase2-readiness.md § M2-7. Phase 3 retargets.
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)?;
 
     // Mark account on config-N (permanent identity).
     //
-    // M4-7 (issue #292 Phase 4, spec 02 §INV-03 + §2.3.1): the
+    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the
     // `.csq-account` marker content is the slot's identity UUID when
     // `profiles.json::by_slot` carries a mapping; otherwise we fall
     // back to the legacy decimal slot id. The filename is unchanged.
@@ -501,6 +558,96 @@ fn audit_surface_for(surface: SurfaceCli) -> csq_core::audit::Surface {
     }
 }
 
+/// `csq run N --native` dispatch (P0-B). Drives the native governed loop against
+/// the slot's 3P provider instead of spawning a CLI. Enterprise-only
+/// (`native-harness` feature); the source is moat-stripped from community.
+#[cfg(feature = "native-harness")]
+pub fn handle_native(
+    base_dir: &Path,
+    account: Option<AccountNum>,
+    model: Option<&str>,
+    governance: &str,
+    bench_json: bool,
+    rest: &[String],
+) -> Result<()> {
+    let account =
+        account.ok_or_else(|| anyhow!("--native requires a slot: `csq run N --native`"))?;
+
+    // The native loop targets the 3P substrate; resolve the slot's provider from
+    // its 3P binding (the slot IS the credential channel). `discover_*` yields the
+    // DISPLAY name (`"Z.AI"`), but every downstream consumer — `get_provider`,
+    // `load_settings` (`settings-<id>.json`), the rate table — keys on the canonical
+    // catalog id (`"zai"`), so map display-name → id here. Passing the display name
+    // straight through was the P0-B live-path bug (`unknown provider 'Z.AI'`).
+    let provider_label = discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .find(|a| a.id == account.get())
+        .and_then(|a| match a.source {
+            AccountSource::ThirdParty { provider } => Some(provider),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "slot {account} is not a 3P provider slot — `csq run --native` targets the 3P \
+                 substrate (z.ai/deepseek/minimax). Run `csq setkey <provider> --slot {account} \
+                 --key <KEY>` first."
+            )
+        })?;
+    let provider_id = csq_core::providers::catalog::id_from_display_name(&provider_label)
+        .ok_or_else(|| anyhow!("slot {account} provider {provider_label:?} has no catalog id"))?
+        .to_string();
+
+    let governance = match governance {
+        "on" => csq_core::native::Governance::On,
+        "off" => csq_core::native::Governance::Off,
+        other => return Err(anyhow!("--governance must be 'on' or 'off', got '{other}'")),
+    };
+
+    let prompt = rest.join(" ");
+    if prompt.trim().is_empty() {
+        return Err(anyhow!(
+            "--native needs a prompt: `csq run {account} --native -- <task>`"
+        ));
+    }
+
+    let workdir = std::env::current_dir().context("native: cannot resolve current dir")?;
+
+    let cfg = csq_core::native::NativeRunConfig {
+        base_dir: base_dir.to_path_buf(),
+        provider_id,
+        model: model.map(str::to_string),
+        governance,
+        workdir,
+        prompt,
+        max_iterations: 12,
+        max_tokens: 4096,
+        bench_json,
+    };
+
+    let runtime = tokio::runtime::Runtime::new().context("native: tokio runtime init")?;
+    let summary = runtime.block_on(csq_core::native::run_native(cfg))?;
+
+    if bench_json {
+        // The single contract line the P0-A bench parses (last stdout line).
+        println!("{}", summary.to_json_line());
+    } else {
+        eprintln!(
+            "\n[native] provider={} model={} governance={} round_trips={} iterations={} \
+             tokens_in={} tokens_out={} cost_usd={:.6} latency_ms={}",
+            summary.provider,
+            summary.model,
+            summary.governance,
+            summary.round_trips,
+            summary.iterations,
+            summary.tokens_in,
+            summary.tokens_out,
+            summary.cost_usd,
+            summary.latency_ns / 1_000_000,
+        );
+    }
+    Ok(())
+}
+
 // pre_flight_check removed from run.rs (H4 extraction, R1 redteam).
 // The shared implementation now lives in super::cli_deps_gate::enforce,
 // which is called from the pre-flight block in `handle` above.
@@ -520,7 +667,7 @@ fn launch_third_party(
 ) -> Result<()> {
     // PATH-BUILDER: builds the legacy config-N/settings.json path for an
     // existence check only; no content is read here. Unchanged through
-    // Phase 2 — see workspaces/account-slot-decoupling/02-plans/
+    // Phase 2 — see internal-design-docs
     // 03-phase2-readiness.md § M2-7. Phase 3 retargets.
     let settings_path = base_dir.join(format!("config-{}/settings.json", account));
     if !settings_path.exists() {
@@ -532,7 +679,7 @@ fn launch_third_party(
     let pid = std::process::id();
     let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
         .context("failed to create handle dir")?;
-    // M3-3: the defensive re-materialize (journal 0059 belt-and-suspenders)
+    // M3-3: the defensive re-materialize (an internal journal entry belt-and-suspenders)
     // was removed here.  `create_handle_dir` already calls
     // `materialize_handle_settings_inner` with the UUID-aware path (M2-3),
     // so a second call via the public `materialize_handle_settings` (no-UUID
@@ -639,7 +786,7 @@ fn launch_anthropic(
     let pid = std::process::id();
     let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
         .context("failed to create handle dir")?;
-    // M3-3: the defensive re-materialize (journal 0059 belt-and-suspenders)
+    // M3-3: the defensive re-materialize (an internal journal entry belt-and-suspenders)
     // was removed here.  `create_handle_dir` already calls
     // `materialize_handle_settings_inner` with the UUID-aware path (M2-3),
     // so a second call via the public `materialize_handle_settings` (no-UUID
@@ -647,6 +794,12 @@ fn launch_anthropic(
     // undoing the identity-keyed path for coexisting-layout slots.
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    // CC reads this account's OAuth credential from the keychain item keyed by
+    // the CLAUDE_CONFIG_DIR path below — not from the symlinked
+    // `.credentials.json`. Mirror the bound account's current token into it so
+    // CC picks up the fresh credential (it re-checks the keychain ~every 30s).
+    sync_cc_keychain(&handle_dir_abs, false);
 
     println!("Launching claude for account {} (term-{})...", account, pid);
 
@@ -765,6 +918,49 @@ fn launch_codex(
     verify_codex_config_toml(base_dir, account)?;
     verify_codex_canonical_is_regular_file(base_dir, account)?;
 
+    // Re-merge the slot's `config.toml` from the CURRENT `~/.codex` on
+    // every launch, so the user's global-config edits propagate to live
+    // slots (the `~/.codex` single-source-of-truth model, matching how CC
+    // live-links `~/.claude`). Runs BEFORE the capability-layer preflight
+    // and `create_handle_dir_codex` so BOTH the Inherit symlink and the
+    // WithLayer materialization (which reads `config-<N>/config.toml` as
+    // its base) see the fresh content. The slot's per-account `model` is
+    // preserved; existence is already guaranteed by the verify above.
+    //
+    // Degradation posture (never abort the launch on these):
+    // - present-but-malformed `~/.codex` → existing slot config is KEPT
+    //   (the helper refuses to wipe it to the 2-key fallback); tell the
+    //   operator so they know why their edit did not propagate.
+    // - write failure → `atomic_replace` leaves the prior `config.toml`
+    //   intact; warn and continue with the existing (possibly stale)
+    //   config rather than block a launch on a transient FS error.
+    match codex_surface::regenerate_slot_config_preserving_model(base_dir, account) {
+        Ok(codex_surface::RegenOutcome::AlreadyCurrent)
+        | Ok(codex_surface::RegenOutcome::Rewritten {
+            was_global_malformed: false,
+            ..
+        }) => {}
+        // Both the no-op (SkippedMalformedGlobal) AND the repaired-under-malformed
+        // (Rewritten { was_global_malformed: true }) cases mean the user's global
+        // is invalid and new edits are NOT propagating — surface the same note.
+        Ok(codex_surface::RegenOutcome::SkippedMalformedGlobal)
+        | Ok(codex_surface::RegenOutcome::Rewritten {
+            was_global_malformed: true,
+            ..
+        }) => {
+            eprintln!(
+                "note: ~/.codex/config.toml is not valid TOML — slot {account} kept its \
+                 existing config. Fix your global config so edits propagate."
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "warning: could not refresh slot {account} config from ~/.codex \
+                 (continuing with the existing config)."
+            );
+        }
+    }
+
     // PR-CA8 commit 2: capability-layer pre-flight. When the flag is
     // OFF (default for v2.4.0-alpha) or `.coc/` resolves to fallback,
     // the path is the v2.3.1 path verbatim (Inherit branch below).
@@ -808,11 +1004,69 @@ fn launch_codex(
         return handle_bench_mode_layer_only(Surface::Codex, audit_emitter);
     }
 
+    // M6 T6.1: cross-CLI spawn-boundary governance gate (enterprise-only).
+    // Evaluated BEFORE the codex subprocess is built/spawned. Block/Escalate (or a
+    // present-but-malformed/unbuildable envelope) → refuse to spawn (fail-loud
+    // audit + non-zero exit); Conditional → inject the advisory path-scope env
+    // (T6.4); Pass/Ungoverned → proceed. Community builds carry no governor and
+    // spawn ungoverned (the `Vec::new()` arm).
+    //
+    // The gate returns the RESOLVED operating envelope alongside its verdict so the
+    // Shard 3a MCP config-rewrite below can consult the SAME validated envelope
+    // WITHOUT a second `load_spawn_envelope` read (redteam R1 finding 1.1: two loads
+    // could diverge — the gate admits under an `mcp` policy while a re-read sees none
+    // and spawns un-gated MCP).
+    #[cfg(feature = "enterprise")]
+    let (codex_spawn_scope_env, codex_gate_env): (
+        Vec<(String, String)>,
+        Option<Box<csq_trust_contract::OperatingEnvelope>>,
+    ) = {
+        use crate::cli::commands::spawn_gate;
+        use csq_core::daemon::interactive_live::SpawnGate;
+        let (gate, gate_env) =
+            spawn_gate::evaluate_spawn(base_dir, csq_trust_contract::SpawnCli::Codex);
+        let scope = match gate {
+            SpawnGate::Ungoverned => Vec::new(),
+            SpawnGate::Proceed {
+                verdict,
+                action_id,
+                path_scope_env,
+            } => {
+                audit_emitter.set_spawn_gate("codex", &action_id, spawn_gate::verdict_tag(verdict));
+                path_scope_env
+            }
+            SpawnGate::Refuse { reason, action_id } => {
+                eprintln!("error: csq run codex refused by operating envelope ({reason})");
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_spawn_gate("codex", &action_id, reason);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                std::process::exit(EXIT_CODE_SPAWN_BLOCKED);
+            }
+        };
+        (scope, gate_env)
+    };
+    #[cfg(not(feature = "enterprise"))]
+    let codex_spawn_scope_env: Vec<(String, String)> = Vec::new();
+
     let pid = std::process::id();
     let handle_dir = session::create_handle_dir_codex(base_dir, account, pid)
         .with_context(|| format!("create Codex handle dir for account {account}"))?;
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    // M6 T6.2 Shard 3a: resolve whether this governed codex spawn routes its MCP
+    // servers through `csq mcp-proxy`. `Some((csq_bin, envelope_snapshot))` iff the
+    // gate's resolved envelope declares an `mcp` policy (opt-in); this stages the
+    // envelope snapshot the proxy will `--envelope`-load. Consumes the SAME envelope
+    // the M6 T6.1 gate above resolved (single load — no divergence window). `None` in
+    // the community build and for any ungoverned / no-MCP-policy session.
+    #[cfg(feature = "enterprise")]
+    let codex_mcp_rewrite = resolve_codex_mcp_rewrite(codex_gate_env.as_deref(), &handle_dir_abs)?;
+    #[cfg(not(feature = "enterprise"))]
+    let codex_mcp_rewrite: Option<(String, std::path::PathBuf)> = None;
 
     // Task 8: JWT exp pre-flight — defense-in-depth against stale tokens.
     // Delegates to `check_codex_token_freshness` so the logic is unit-testable.
@@ -848,19 +1102,60 @@ fn launch_codex(
     // strict policy layer; merging keys into config-N/config.toml
     // alone produced sessions where the model still had to request
     // escalation despite the file having approval_policy = "never" +
-    // sandbox_mode = "danger-full-access". Insertion BEFORE
-    // `cmd.args(rest)` so user-passed flags in `csq run N -- ...`
-    // override the derived ones (Codex argparse is last-wins).
-    let derived_flags =
-        codex_surface::derive_spawn_flags(codex_surface::read_user_global_config_toml().as_deref());
-    cmd.args(&derived_flags);
+    // sandbox_mode = "danger-full-access".
+    //
+    // GH #978: the derived FULL-BYPASS flag
+    // (`--dangerously-bypass-approvals-and-sandbox`) is a TERMINAL override —
+    // a later `-s read-only` in the passthrough cannot undo it (it is not a
+    // `-s` value, so codex's last-wins argparse does not apply). So a caller
+    // driving a sandboxed one-shot (`csq run N -- exec -s read-only …`) could
+    // not downscope. Fix: when the caller's passthrough ALREADY specifies a
+    // sandbox / approval policy (or `--ignore-user-config`), suppress the
+    // derived flags entirely so the caller's explicit policy is the ONLY one
+    // codex sees. Otherwise inject as before (BEFORE `rest`, last-wins for the
+    // granular `-a`/`-s` case).
+    if !codex_surface::caller_overrides_sandbox(rest) {
+        let derived_flags = codex_surface::derive_spawn_flags(
+            codex_surface::read_user_global_config_toml().as_deref(),
+        );
+        cmd.args(&derived_flags);
+    }
     cmd.args(rest);
+
+    // M6 T6.4: inject the advisory path-scope env (empty unless the gate returned
+    // Conditional with a declared path-scope). codex does NOT natively enforce
+    // this var — the constraint is advisory + attested per the M6 fidelity gap.
+    for (k, v) in &codex_spawn_scope_env {
+        cmd.env(k, v);
+    }
+
+    // The MCP-proxy rewrite (Shard 3a) as a `(csq_bin, envelope_path)` pair for the
+    // materializer, threaded into both the Inherit and WithLayer paths.
+    let mcp_wrap = codex_mcp_rewrite
+        .as_ref()
+        .map(|(bin, path)| (bin.as_str(), path.as_path()));
 
     match layer_control {
         LayerControl::Inherit => {
             // Layer-bypass result shape; exec_or_spawn handles platform-
             // conditional end_ts + flush (PR-CA10c R1 redteam HIGH fix).
             use csq_core::audit::{Decision, ResultState};
+
+            // M6 T6.2 Shard 3a: even on the layer-bypass path, a governed codex
+            // spawn with an MCP policy must route its servers through the proxy —
+            // which means materializing the handle config.toml as a regular file
+            // (breaking the Inherit symlink `create_handle_dir_codex` planted) with
+            // `[mcp_servers.*]` rewritten. No MCP policy → the v2.3.1 symlink path
+            // is preserved verbatim (no materialization, no re-stat).
+            if mcp_wrap.is_some() {
+                let skipped =
+                    materialize_handle_config_toml(base_dir, account, &handle_dir, None, mcp_wrap)
+                        .context("failed to materialize per-spawn config.toml (MCP proxy)")?;
+                warn_skipped_remote_mcp(&skipped);
+                // Post-rename re-stat closes the materialize→spawn TOCTOU window.
+                verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
+            }
+
             audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
             exec_or_spawn(cmd, &handle_dir, audit_emitter)
         }
@@ -872,9 +1167,10 @@ fn launch_codex(
         } => {
             // PR-CA8 commit 2: materialize per-spawn config.toml in the
             // handle dir with the layer's `instructions` block merged
-            // in. Replaces the symlink at handle_dir/config.toml with
-            // a regular file (spec 07 §7.2.2 deviation under the
-            // with-layer path).
+            // in (+ Shard 3a MCP-proxy rewrite when a policy is active).
+            // Replaces the symlink at handle_dir/config.toml with a
+            // regular file (spec 07 §7.2.2 deviation under the with-layer
+            // path).
             //
             // No mutex acquisition (round-2 R2-C2 retraction) — the
             // safety net is (a) atomic_replace at canonical writers,
@@ -882,20 +1178,27 @@ fn launch_codex(
             // and `daemon::startup_reconciler::pass2_codex_config_toml`
             // touch the canonical), (c) toml::from_str parse-as-
             // defense-in-depth on the merge path.
-            if let Some(s) = scaffold.as_deref() {
-                if !s.is_empty() {
-                    materialize_handle_config_toml_with_instructions(
-                        base_dir,
-                        account,
-                        &handle_dir,
-                        s,
-                    )
-                    .context("failed to materialize per-spawn config.toml overlay")?;
-                }
+            let instructions = scaffold.as_deref().filter(|s| !s.is_empty());
+            if instructions.is_some() || mcp_wrap.is_some() {
+                let skipped = materialize_handle_config_toml(
+                    base_dir,
+                    account,
+                    &handle_dir,
+                    instructions,
+                    mcp_wrap,
+                )
+                .context("failed to materialize per-spawn config.toml overlay")?;
+                warn_skipped_remote_mcp(&skipped);
+                // Round-1 C4: post-rename re-stat closes the TOCTOU window between
+                // materialization and `Command::spawn`. GUARDED by the same
+                // condition as the materialization (redteam R1 finding 3.1): when
+                // NEITHER instructions nor an MCP policy applies, no materialization
+                // ran and `handle_dir/config.toml` is still the symlink
+                // `create_handle_dir_codex` planted — re-stating it would spuriously
+                // fail-closed with a bogus "became a symlink (TOCTOU)" refusal.
+                // Symmetric with the Inherit arm's guarded re-stat.
+                verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
             }
-            // Round-1 C4: post-rename re-stat closes the TOCTOU window
-            // between materialization and `Command::spawn`.
-            verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
             let result = spawn_with_layer(
                 cmd,
                 &handle_dir,
@@ -925,23 +1228,35 @@ fn launch_codex(
     }
 }
 
-/// PR-CA8 commit 2: materialize `term-<pid>/config.toml` as a regular
-/// file containing the canonical `config-<N>/config.toml` content +
-/// per-spawn `instructions = "..."` block built by the capability
-/// layer. Replaces the symlink that `create_handle_dir_codex` planted
-/// (spec 07 §7.2.2 deviation under the with-layer path; symlink shape
-/// preserved on the Inherit path).
+/// PR-CA8 commit 2 + M6 T6.2 Shard 3a: materialize `term-<pid>/config.toml`
+/// as a regular file, composing up to two per-spawn transforms over the
+/// canonical `config-<N>/config.toml`:
 ///
-/// Idiom: `unique_tmp_path → write → secure_file → atomic_replace`,
-/// with `let _ = remove_file(&tmp);` cleanup on every error branch
-/// per `.claude/rules/security.md` §5a (matches the canonical
-/// reference shape at `csq-core/src/providers/gemini/probe.rs:91-113`).
-fn materialize_handle_config_toml_with_instructions(
+/// 1. `instructions` (capability layer, both editions): merge the per-spawn
+///    `instructions = "..."` block via `merge_instructions_via_toml_value`.
+/// 2. `mcp_wrap` (M6 T6.2 Shard 3a, enterprise-only): rewrite every STDIO
+///    `[mcp_servers.*]` table so its `command`/`args` route through
+///    `csq mcp-proxy --envelope <path> -- …`, gating the MCP tool-calls through
+///    the Shard-2 proxy. `mcp_wrap = Some((csq_bin, envelope_snapshot_path))`.
+///
+/// Either, both, or neither transform may apply; with neither this is just a
+/// symlink→regular-file copy. Replaces the symlink `create_handle_dir_codex`
+/// planted (spec 07 §7.2.2 deviation). NEVER mutates the canonical
+/// `config-<N>/config.toml` — the rewrite lives only in the ephemeral handle dir.
+///
+/// Returns the names of REMOTE (`url`-transport) MCP servers left un-gated, so the
+/// caller can warn the operator (the stdio proxy cannot interpose HTTP/SSE).
+///
+/// Idiom: `unique_tmp_path → write → secure_file → atomic_replace`, with
+/// `let _ = remove_file(&tmp);` cleanup on every error branch per
+/// `.claude/rules/security.md` §5a.
+fn materialize_handle_config_toml(
     base_dir: &Path,
     account: AccountNum,
     handle_dir: &Path,
-    scaffold_text: &str,
-) -> Result<()> {
+    instructions: Option<&str>,
+    mcp_wrap: Option<(&str, &Path)>,
+) -> Result<Vec<String>> {
     use csq_core::coc::translate::codex_merge::merge_instructions_via_toml_value;
     use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
     use std::collections::BTreeMap;
@@ -950,26 +1265,52 @@ fn materialize_handle_config_toml_with_instructions(
     // native config. config.toml is NOT part of the UUID credential/settings
     // migration (credentials.json and settings.json are migrated; config.toml
     // stays account-local). Unchanged through Phase 2 — see workspaces/
-    // account-slot-decoupling/02-plans/03-phase2-readiness.md § M2-7.
+    // an internal workspace/02-plans/03-phase2-readiness.md § M2-7.
     let canonical = base_dir
         .join(format!("config-{}", account))
         .join("config.toml");
-    let canonical_text = std::fs::read_to_string(&canonical)
+    let mut content = std::fs::read_to_string(&canonical)
         .with_context(|| format!("read {}", redact_path(&canonical)))?;
 
-    // PR-CA6c will populate `config_toml_overlay` with MCP filter
-    // parameters; today the overlay is always empty so the merge
-    // is a no-op for non-instructions keys. The plumbing is in
-    // place for the future expansion.
-    let overlay: BTreeMap<String, String> = BTreeMap::new();
+    // Transform 1 — capability-layer instructions merge.
+    if let Some(scaffold_text) = instructions {
+        // The overlay is reserved for future MCP-filter parameters; empty today
+        // so the merge is a no-op for non-instructions keys.
+        let overlay: BTreeMap<String, String> = BTreeMap::new();
+        content = merge_instructions_via_toml_value(&content, scaffold_text, &overlay)
+            .context("merging instructions into config.toml")?;
+    }
 
-    let merged = merge_instructions_via_toml_value(&canonical_text, scaffold_text, &overlay)
-        .context("merging instructions into config.toml")?;
+    // Transform 2 — MCP proxy rewrite (enterprise-only; `mcp_wrap` is always
+    // `None` in the community build so this branch never fires there).
+    let skipped_remote: Vec<String> = if let Some((csq_bin, envelope_path)) = mcp_wrap {
+        #[cfg(feature = "enterprise")]
+        {
+            let rewrite = csq_core::daemon::mcp_rewrite::rewrite_codex_config_mcp_servers(
+                &content,
+                csq_bin,
+                &envelope_path.to_string_lossy(),
+            )
+            // Fail-CLOSED: the operator declared an MCP policy, so if the rewrite
+            // fails we must NOT spawn with un-gated MCP — surface the fixed-vocab
+            // tag and abort the launch.
+            .map_err(|e| anyhow!("csq run codex: MCP proxy rewrite failed ({})", e.tag()))?;
+            content = rewrite.toml;
+            rewrite.skipped_remote
+        }
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let _ = (csq_bin, envelope_path);
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     let target = handle_dir.join("config.toml");
     let tmp = unique_tmp_path(&target);
 
-    if let Err(e) = std::fs::write(&tmp, merged.as_bytes()) {
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow!("write {}: {e}", redact_path(&tmp)));
     }
@@ -990,7 +1331,73 @@ fn materialize_handle_config_toml_with_instructions(
             redact_path(&target)
         ));
     }
-    Ok(())
+    Ok(skipped_remote)
+}
+
+/// Warn the operator (once per server) that a REMOTE (`url`-transport) MCP server
+/// is NOT routed through the governance proxy — the stdio proxy cannot interpose an
+/// HTTP/SSE transport, so its tool-calls run un-gated (spec 25 §25.11). Server
+/// names only; no host paths, so no redaction needed.
+fn warn_skipped_remote_mcp(skipped: &[String]) {
+    for name in skipped {
+        eprintln!(
+            "note: codex MCP server '{name}' uses a remote (url) transport — its tool-calls are \
+             NOT gated by csq (the MCP proxy interposes stdio servers only)."
+        );
+    }
+}
+
+/// M6 T6.2 Shard 3a: resolve whether a governed `csq run … --provider codex` spawn
+/// routes its MCP servers through `csq mcp-proxy`, and if so stage the envelope
+/// snapshot the proxy will load.
+///
+/// Takes the envelope the M6 T6.1 spawn gate ALREADY resolved and validated (single
+/// load — no re-read, so no gate-vs-rewrite divergence; redteam R1 finding 1.1).
+/// Returns `Some((csq_bin, envelope_snapshot_path))` iff that envelope is present
+/// (`Configured`) AND declares an `mcp` policy (`env.mcp.is_some()`) — MCP gating is
+/// opt-in via the envelope's `mcp` field. An ungoverned spawn (`gate_env == None`) or
+/// a governed session with no `mcp` policy → `None` (MCP servers run direct,
+/// backward-compatible). A refused/malformed envelope never reaches here — the gate
+/// exits the process fail-closed upstream, and it returns `None` for those anyway.
+///
+/// `csq_bin` is `current_exe()` VERBATIM (no canonicalize). `launch_codex` only runs
+/// inside an already-`Mode::Cli` process (the desktop app launches codex via a
+/// terminal running the CLI binary; it never calls `launch_codex` directly), so
+/// `current_exe()` is by construction a path that did NOT match the desktop-bundle
+/// sentinel and re-resolves to CLI mode — the `mcp-proxy` subprocess dispatches
+/// correctly. Canonicalizing is deliberately avoided (a symlinked CLI path can
+/// canonicalize INTO the desktop bundle and flip mode detection — memory
+/// `discovery_csq_symlink_breaks_mode_detect`). Fail-CLOSED: an unresolvable binary
+/// or a failed snapshot write aborts the launch rather than spawning un-gated MCP.
+#[cfg(feature = "enterprise")]
+fn resolve_codex_mcp_rewrite(
+    gate_env: Option<&csq_trust_contract::OperatingEnvelope>,
+    handle_dir_abs: &Path,
+) -> Result<Option<(String, std::path::PathBuf)>> {
+    use csq_core::daemon::interactive_live::materialize_envelope_snapshot;
+
+    let Some(env) = gate_env else {
+        // Ungoverned (or the gate refused upstream) → nothing to gate.
+        return Ok(None);
+    };
+    if env.mcp.is_none() {
+        // Governed, but the operator declared no MCP allow-list → not opted in.
+        return Ok(None);
+    }
+
+    let csq_bin = std::env::current_exe()
+        .map_err(|_| {
+            anyhow!("csq run codex: could not resolve the csq binary path for MCP proxy wiring")
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    let envelope_path = handle_dir_abs.join(".pact-mcp-envelope.json");
+    materialize_envelope_snapshot(env, &envelope_path).map_err(|tag| {
+        anyhow!("csq run codex: failed to stage the MCP operating-envelope snapshot ({tag})")
+    })?;
+
+    Ok(Some((csq_bin, envelope_path)))
 }
 
 /// PR-CA8 round-1 C4: post-materialization re-stat. Refuses any non-
@@ -1105,7 +1512,7 @@ fn check_codex_token_freshness(
 ///
 /// The dispatch branch in [`handle`] uses `symlink_metadata` so a
 /// dangling symlink still routes to Codex (refusing to silently fall
-/// through to the Claude path — journal 0013). But `symlink_metadata`
+/// through to the Claude path — an internal journal entry). But `symlink_metadata`
 /// also accepts a symlink-to-anywhere, which would let a same-user
 /// attacker who races a swap between dispatch and spawn inject
 /// attacker-chosen tokens into the handle dir's `auth.json` symlink
@@ -1186,7 +1593,7 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
 /// PR-C4 (H2 gate): cross-platform — `daemon::detect_daemon` already
 /// has a Windows named-pipe branch (`csq-core/src/daemon/detect.rs`
 /// `windows_health_check`), so the same DetectResult variants apply
-/// across Unix and Windows. This closes the journal 0015
+/// across Unix and Windows. This closes the an internal journal entry
 /// `#[cfg(not(unix))] Ok(())` carve-out.
 /// Launches gemini-cli for a Gemini-surface slot.
 ///
@@ -1199,7 +1606,7 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
 /// interactively prompt for an auth choice on first spawn (UX
 /// shortcut for API-key bound slots, not a ToS-driven defense —
 /// the original "EP1-EP7 / 7-layer ToS guard" framing was
-/// retracted in journal 0048). Neither task needs the daemon.
+/// retracted in an internal journal entry). Neither task needs the daemon.
 ///
 /// Handle dir layout for Gemini is minimal:
 ///
@@ -1237,7 +1644,8 @@ fn launch_gemini(
 ) -> Result<()> {
     use csq_core::platform::secret;
     use csq_core::providers::gemini::spawn::{
-        build_spawn_plan_with_system_instruction, execute_plan_as_child, spawn_gemini,
+        build_spawn_plan_with_system_instruction, execute_plan_as_child,
+        execute_plan_as_child_piped, spawn_gemini,
     };
 
     // PR-CA8b commit 4: build HostContext from the parent env BEFORE
@@ -1286,6 +1694,46 @@ fn launch_gemini(
     // --bench-mode layer-only: terminate before subprocess spawn.
     if let Some("layer-only") = bench_mode {
         return handle_bench_mode_layer_only(Surface::Gemini, audit_emitter);
+    }
+
+    // M6 T6.1: cross-CLI spawn-boundary governance gate (enterprise-only).
+    // Block/Escalate (or a malformed/unbuildable envelope) → refuse to spawn
+    // (fail-loud audit + non-zero exit); Pass/Conditional/Ungoverned → proceed.
+    // T6.4 note: gemini's `spawn_gemini` snapshots the global process env to
+    // build the child env; csq-ee declines to mutate global process state in
+    // production, so a Conditional gemini path-scope is RECORDED (attested) but
+    // NOT injected into the child — advisory-only per the M6 fidelity gap (the
+    // spec documents codex/gemini as spawn-boundary-only, not in-loop).
+    #[cfg(feature = "enterprise")]
+    {
+        use crate::cli::commands::spawn_gate;
+        use csq_core::daemon::interactive_live::SpawnGate;
+        // Gemini has no MCP config-rewrite (honest fidelity gap — spec 25 §25.11.4),
+        // so it ignores the resolved envelope the gate now returns.
+        let (gate, _gate_env) =
+            spawn_gate::evaluate_spawn(base_dir, csq_trust_contract::SpawnCli::Gemini);
+        match gate {
+            SpawnGate::Ungoverned => {}
+            SpawnGate::Proceed {
+                verdict, action_id, ..
+            } => {
+                audit_emitter.set_spawn_gate(
+                    "gemini",
+                    &action_id,
+                    spawn_gate::verdict_tag(verdict),
+                );
+            }
+            SpawnGate::Refuse { reason, action_id } => {
+                eprintln!("error: csq run gemini refused by operating envelope ({reason})");
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_spawn_gate("gemini", &action_id, reason);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                std::process::exit(EXIT_CODE_SPAWN_BLOCKED);
+            }
+        }
     }
 
     // Refuse symlink at the binding marker — same posture as
@@ -1439,34 +1887,59 @@ fn launch_gemini(
             // starting up.
             verify_gemini_handle_settings_is_regular_file(&handle_dir_abs)?;
 
-            // Spawn as child — parent stays alive for FR-CL-04
-            // post-validate. R1-H10: same security posture as
-            // execute_plan (RLIMIT_CORE=0 via pre_exec on Unix).
-            let child = match execute_plan_as_child(plan) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&handle_dir);
-                    return Err(anyhow!("failed to spawn gemini-cli: {e}"));
+            // CU2 (an internal ticket): spawn shape is mode-driven BEFORE the child
+            // is created. OneShot requires piped stdio for post-validate
+            // capture; Interactive keeps inherited stdio.
+            //
+            // GOTCHA-A: #3a alone (detection) would be a silent no-op without
+            // this dispatch branch — detecting OneShot but spawning with
+            // inherited stdio would land in a dead arm that drops inputs.
+            // Both detection AND piped-spawn MUST land together.
+            let child = match mode {
+                SpawnMode::OneShot => {
+                    // Piped stdio variant preserves the same security posture
+                    // (env_clear + allowlist, current_dir, Unix pre_exec
+                    // RLIMIT_CORE=0) as execute_plan_as_child.
+                    match execute_plan_as_child_piped(plan) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&handle_dir);
+                            return Err(anyhow!("failed to spawn gemini-cli (piped): {e}"));
+                        }
+                    }
+                }
+                SpawnMode::Interactive => {
+                    // Inherited stdio (existing behavior — INV-2 unchanged).
+                    match execute_plan_as_child(plan) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&handle_dir);
+                            return Err(anyhow!("failed to spawn gemini-cli: {e}"));
+                        }
+                    }
                 }
             };
 
+            // CU2 (#3d): audit attribution comes from the ACTUAL outcome.
+            // For OneShot, spawn_gemini_with_layer_dispatch sets all audit
+            // fields internally (including process::exit paths — GOTCHA-F).
+            // For Interactive success, the dispatch returns Ok(()) and we
+            // set Pass+Accept here (the WithLayer path completed normally).
             let result = spawn_gemini_with_layer_dispatch(
                 child,
                 &handle_dir,
                 mode,
                 class,
-                rule_ids_in_scope.clone(),
+                rule_ids_in_scope,
+                toggles,
                 debug,
                 audit_emitter,
             );
-            // WithLayer path: spawn+wait, so Drop fires normally. Populate
-            // audit fields reflecting the actual post-spawn outcome.
-            //
-            // PR-CA10c R1 redteam MEDIUM fix: cited fields stay empty until
-            // spawn_gemini_with_layer_dispatch plumbs the actual cited set
-            // — see launch_anthropic for full rationale.
-            let _ = rule_ids_in_scope;
-            {
+
+            // Interactive success path: set audit fields here so Drop
+            // flushes the complete record. OneShot and error paths set
+            // their own audit fields inside the dispatch function.
+            if result.is_ok() && mode == SpawnMode::Interactive {
                 use csq_core::audit::{Decision, ResultState};
                 let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 audit_emitter.set_end_ts(end_ts);
@@ -1478,86 +1951,217 @@ fn launch_gemini(
     }
 }
 
-/// PR-CA8b commit 4: dispatches a spawned gemini Child on the
-/// with-layer path. Mirrors `spawn_with_layer` for CC: OneShot
-/// captures stdout/stderr and runs post-validate; Interactive
-/// inherits stdio and waits on the child.
+/// CU2 (an internal ticket): dispatches a spawned gemini Child on the
+/// with-layer path. The child was spawned with the correct stdio
+/// shape for `mode` by the caller (piped for OneShot, inherited for
+/// Interactive) — this function only waits and drives post-validate.
 ///
-/// Note on OneShot detection: today's preclassifier looks for CC's
-/// `--print`/`-p` flags, which gemini-cli does not natively use
-/// (gemini's non-interactive shape is `--prompt=<text>`). Spec 08
-/// §"Gemini activation H11" line 165-171 documents the harness
-/// path. Until preclassify gains gemini-aware argv detection (R1-M1
-/// follow-up), gemini WithLayer spawns default to Interactive +
-/// inherited-stdio when no `-p`/`--print` is in argv. The directive
-/// injection (system_instruction) still reaches the model
-/// regardless of the spawn-mode classification.
+/// # OneShot path (CU2 #3c)
+///
+/// Child was spawned with `execute_plan_as_child_piped` by the
+/// caller. This function captures with `wait_with_output`, builds
+/// lossy-UTF-8 for the validator, runs `run_post_spawn_toggled`, then:
+/// - **Pass:** echo Gemini's exact stdout+stderr bytes; clean up
+///   handle_dir; propagate child exit (Fail+Accept if non-zero).
+/// - **Fail (PostValidateFailed):** do NOT echo stdout; echo stderr;
+///   print csq's structured-error line; clean up handle_dir;
+///   flush Fail/Reject audit; `process::exit(24)`.
+///
+/// # GOTCHA-D (false-reject DoS guard — enforcement defaults OFF)
+///
+/// The Gemini one-shot citation gate REJECTING uncited output is the
+/// DoS-prone half: if gemini-cli does NOT honor
+/// `settings.json::system_instruction` in `--prompt` mode, the model
+/// never receives the RULE_IDs, can never cite them, and EVERY Gemini
+/// one-shot would exit 24 (self-inflicted denial of service). CU0's
+/// probe confirming `system_instruction` delivery is still pending
+/// (external dependency), so the OneShot arm forces
+/// `disable_post_validate = true` BY DEFAULT — detection + piped capture
+/// run, but the gate does not reject. Operators whose gemini-cli is
+/// confirmed opt IN with `CSQ_GEMINI_ONE_SHOT_POST_VALIDATE=1`. When
+/// CU0's probe clears, flip enforcement default-on here (an internal ticket).
+/// Distinct from `--no-post-validate` (FR-CL-05), which disables the
+/// gate for ALL surfaces; the GOTCHA-D default-off is Gemini-one-shot-
+/// specific and DoS-motivated.
+///
+/// # Audit attribution (#3d)
+///
+/// Every exit branch sets audit result fields from the ACTUAL outcome:
+/// - Interactive pass: Pass+Accept (set by caller after return).
+/// - OneShot post-validate pass, child success: Pass+Accept (set here).
+/// - OneShot post-validate pass, child non-zero: Fail+Accept (set here,
+///   then process::exit — GOTCHA-F flush before exit).
+/// - OneShot post-validate reject: Fail+Reject (set here, then
+///   process::exit — GOTCHA-F flush before exit).
+///
+/// # INV-2 (GOTCHA-E)
+///
+/// Interactive path is UNCHANGED: inherited stdio, no post-validate,
+/// wait-then-propagate-exit.
+#[allow(clippy::too_many_arguments)]
 fn spawn_gemini_with_layer_dispatch(
     mut child: std::process::Child,
     handle_dir: &Path,
     mode: SpawnMode,
     class: PromptClass,
     rule_ids_in_scope: BTreeSet<String>,
+    toggles: &CapabilityLayerToggles,
     debug: bool,
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
 ) -> Result<()> {
     match mode {
         SpawnMode::OneShot => {
-            // We already spawned with execute_plan_as_child which
-            // uses default (inherited) stdio. Gemini OneShot post-
-            // validate would require piped stdio — but we can't
-            // re-spawn here. For PR-CA8b commit 4 minimum-viable,
-            // OneShot on gemini falls through to wait-and-exit; the
-            // post-validate gate is gated behind preclassify gaining
-            // gemini-aware argv detection (R1-M1 follow-up). The
-            // directive still reached the model via system_instruction.
-            //
-            // Drop the unused inputs so the function signature
-            // stays uniform with the CC variant for future
-            // factoring.
-            let _ = (class, rule_ids_in_scope, debug);
-            let status = child.wait().map_err(|e| {
-                let _ = std::fs::remove_dir_all(handle_dir);
-                anyhow!("failed to wait for gemini-cli: {e}")
-            })?;
-            let _ = std::fs::remove_dir_all(handle_dir);
-            if !status.success() {
-                // M06 fail-loud (H1): gemini OneShot child exited non-zero.
-                // This `process::exit` bypasses Drop — flush BEFORE exiting
-                // (csq owns this exit code). No post-validate gate ran (R1-M1
-                // follow-up), so the layer did not reject; the run result is
-                // Fail + Accept.
-                use csq_core::audit::{Decision, ResultState};
-                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                audit_emitter.set_end_ts(end_ts);
-                audit_emitter.set_result(ResultState::Fail, Decision::Accept);
-                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
-                std::process::exit(status.code().unwrap_or(1));
+            // CU2 #3c: child was spawned with piped stdio by caller.
+            // Capture full output, run post-validate, then echo/suppress.
+            let output = match child.wait_with_output() {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(handle_dir);
+                    return Err(anyhow!("failed to wait for gemini-cli: {e}"));
+                }
+            };
+
+            // UTF-8 lossy: citation / negative-evidence checks operate on
+            // textual signal; a mid-byte truncation cannot manufacture a
+            // citation nor erase a negative pattern. The bytes echoed to
+            // the user are the original output.stdout — lossy only feeds
+            // the validator. Mirrors the CC reference path exactly.
+            let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+
+            // GOTCHA-D (false-reject DoS guard): default Gemini one-shot
+            // enforcement OFF until CU0's probe confirms gemini-cli honors
+            // settings.json::system_instruction in `--prompt` mode. The
+            // gate MECHANISM (detection + piped capture) runs regardless;
+            // only REJECTION is suppressed by default. Opt in once the
+            // probe clears with CSQ_GEMINI_ONE_SHOT_POST_VALIDATE=1.
+            let gemini_enforce = std::env::var("CSQ_GEMINI_ONE_SHOT_POST_VALIDATE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let mut eff_toggles = *toggles;
+            if !gemini_enforce {
+                eff_toggles.disable_post_validate = true;
             }
-            Ok(())
+
+            match run_post_spawn_toggled(raw, class, rule_ids_in_scope, &eff_toggles) {
+                Ok(post_state) => {
+                    if debug {
+                        let cited = post_state
+                            .decoded
+                            .as_ref()
+                            .and_then(|d| d.fields.get("rule_ids_cited"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        emit_debug_post_validate(true, &cited, None);
+                    }
+                    // Post-validate passed — echo Gemini's exact bytes to
+                    // the user (no transformation). Stderr also forwarded
+                    // so gemini-cli's diagnostic output reaches the terminal.
+                    let _ = std::io::stdout().write_all(&output.stdout);
+                    let _ = std::io::stderr().write_all(&output.stderr);
+                    let _ = std::fs::remove_dir_all(handle_dir);
+
+                    if !output.status.success() {
+                        // GOTCHA-F (INV-7): this process::exit bypasses Drop →
+                        // audit_emitter never flushes. Flush BEFORE exiting.
+                        // Post-validate accepted the output (Accept); child
+                        // itself exited non-zero → Fail.
+                        use csq_core::audit::{Decision, ResultState};
+                        let end_ts =
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        audit_emitter.set_end_ts(end_ts);
+                        audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+                        audit_emitter.set_rule_ids(vec![], vec![]);
+                        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                        std::process::exit(output.status.code().unwrap_or(1));
+                    }
+
+                    // #3d: successful OneShot + post-validate pass → Pass+Accept.
+                    // Audit fields set here; caller no longer sets unconditionally.
+                    {
+                        use csq_core::audit::{Decision, ResultState};
+                        let end_ts =
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        audit_emitter.set_end_ts(end_ts);
+                        audit_emitter.set_result(ResultState::Pass, Decision::Accept);
+                        // Cited rule_ids from post-validation decoded state.
+                        let cited: Vec<String> = post_state
+                            .decoded
+                            .as_ref()
+                            .and_then(|d| d.fields.get("rule_ids_cited"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        audit_emitter.set_rule_ids(cited, vec![]);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if debug {
+                        let reason = match &e {
+                            StageError::PostValidateFailed { reason } => Some(reason.as_str()),
+                            _ => None,
+                        };
+                        emit_debug_post_validate(false, &[], reason);
+                    }
+                    // Post-validate failed — do NOT echo Gemini's stdout
+                    // (user must not act on rejected content). Stderr IS
+                    // echoed so Gemini's diagnostic context survives.
+                    let _ = std::io::stderr().write_all(&output.stderr);
+                    eprintln!("csq: capability layer rejected output: {e}");
+                    let exit_code = match &e {
+                        StageError::PostValidateFailed { .. } => 24,
+                        _ => e.exit_code() as i32,
+                    };
+                    // GOTCHA-G: clean up handle_dir on reject path too.
+                    let _ = std::fs::remove_dir_all(handle_dir);
+                    // GOTCHA-F (INV-7): flush audit BEFORE process::exit.
+                    // The capability layer rejected the output → Fail+Reject.
+                    {
+                        use csq_core::audit::{Decision, ResultState};
+                        let end_ts =
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        audit_emitter.set_end_ts(end_ts);
+                        audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                        audit_emitter.set_rule_ids(vec![], vec![]);
+                        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                    }
+                    std::process::exit(exit_code);
+                }
+            }
         }
         SpawnMode::Interactive => {
-            // Inherited stdio (default for Command::new) — child's
-            // TTY = parent's TTY. Wait for the child to exit, then
-            // propagate its exit code.
-            let _ = (class, rule_ids_in_scope, debug);
+            // INV-2 (GOTCHA-E): Interactive path is UNCHANGED.
+            // Inherited stdio (child was spawned with execute_plan_as_child
+            // by the caller). No post-validate runs on this path.
+            let _ = (class, rule_ids_in_scope, debug, toggles);
             let status = child.wait().map_err(|e| {
                 let _ = std::fs::remove_dir_all(handle_dir);
                 anyhow!("failed to wait for gemini-cli: {e}")
             })?;
             let _ = std::fs::remove_dir_all(handle_dir);
             if !status.success() {
-                // M06 fail-loud (H1): gemini Interactive child exited
-                // non-zero. This `process::exit` bypasses Drop — flush BEFORE
-                // exiting (csq owns this exit code). Fail + Accept (no
-                // post-validate rejection on the interactive path).
+                // GOTCHA-F (INV-7): gemini Interactive child exited
+                // non-zero. This process::exit bypasses Drop — flush BEFORE
+                // exiting. Fail+Accept (no post-validate rejection on the
+                // interactive path).
                 use csq_core::audit::{Decision, ResultState};
                 let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 audit_emitter.set_end_ts(end_ts);
                 audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+                audit_emitter.set_rule_ids(vec![], vec![]);
                 fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
                 std::process::exit(status.code().unwrap_or(1));
             }
+            // #3d: Interactive pass → Pass+Accept (set by caller after return).
             Ok(())
         }
     }
@@ -1645,7 +2249,7 @@ fn verify_gemini_handle_settings_is_regular_file(handle_dir: &Path) -> Result<()
     Ok(())
 }
 
-/// Maps a [`SpawnError`] to user-actionable anyhow text.
+/// Maps a `SpawnError` to user-actionable anyhow text.
 fn map_spawn_error(
     account: AccountNum,
     e: csq_core::providers::gemini::spawn::SpawnError,
@@ -1896,7 +2500,7 @@ fn run_capability_layer_preflight(
         return Ok(LayerControl::Inherit);
     }
 
-    // Resolve `.coc/` via the spec-09 fallback chain. Per journal 0093
+    // Resolve `.coc/` via the spec-09 fallback chain. Per an internal journal entry
     // the prior first-pull trust gate was retracted (`.coc/` is files
     // in the user's repo, equivalent to `.claude/`); the version-grace
     // state lives at `<base_dir>/coc-version-grace.json`.
@@ -2548,8 +3152,9 @@ fn exec_claude(rest: &[String]) -> Result<()> {
 ///
 /// Both the Claude and Codex launch paths call this so a mis-
 /// provisioned slot cannot leak credentials across surfaces via a
-/// parent-shell env var.
-fn strip_sensitive_env(cmd: &mut Command) {
+/// parent-shell env var. `csq exec` (`commands::exec`) reuses it for the
+/// same reason — it is the single source of truth for the spawn env allowlist.
+pub(crate) fn strip_sensitive_env(cmd: &mut Command) {
     // Collect into a Vec first so we don't mutate env vars during iteration.
     let to_strip: Vec<String> = std::env::vars()
         .filter_map(|(k, _)| {
@@ -3213,7 +3818,7 @@ mod tests {
         }
     }
 
-    /// Regression guard for journal 0059 invariant: csq run N MUST leave
+    /// Regression guard for an internal journal entry invariant: csq run N MUST leave
     /// term-<pid>/settings.json populated after handle dir creation.
     ///
     /// This test exercises `csq_core::session::create_handle_dir` plus the
@@ -3393,15 +3998,13 @@ mod tests {
         #[cfg(not(unix))]
         std::fs::write(handle_dir.join("config.toml"), "placeholder\n").unwrap(); // CI-ALLOW-fs-write-config-toml
 
-        // Act
+        // Act — instructions-only (no MCP wrap) exercises the same
+        // symlink→regular-file materialization path.
         let scaffold = "## Compliance rules\n\nCite RULE_IDs.\n";
-        materialize_handle_config_toml_with_instructions(
-            base.path(),
-            account,
-            &handle_dir,
-            scaffold,
-        )
-        .expect("materialize must succeed against valid canonical");
+        let skipped =
+            materialize_handle_config_toml(base.path(), account, &handle_dir, Some(scaffold), None)
+                .expect("materialize must succeed against valid canonical");
+        assert!(skipped.is_empty(), "no MCP wrap → no skipped remotes");
 
         // Assert: handle_dir/config.toml is now a REGULAR FILE
         let target = handle_dir.join("config.toml");
@@ -3426,6 +4029,69 @@ mod tests {
         assert!(
             body.contains("Cite RULE_IDs"),
             "scaffold body must reach instructions: {body}"
+        );
+    }
+
+    /// M6 T6.2 Shard 3a: the MCP-wrap materialization path rewrites the
+    /// canonical `[mcp_servers.*]` stdio tables through `csq mcp-proxy` in the
+    /// HANDLE-dir config.toml, leaving the canonical `config-<N>/config.toml`
+    /// untouched, and reports remote (url-transport) servers as skipped.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn materialize_handle_config_toml_wraps_mcp_servers_leaving_canonical_untouched() {
+        use csq_core::types::AccountNum;
+        let base = tempfile::tempdir().expect("tempdir");
+        let account = AccountNum::try_from(1u16).unwrap();
+
+        let canonical_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        let canonical_body = "cli_auth_credentials_store = \"file\"\nmodel = \"gpt-5\"\n\
+             \n[mcp_servers.github]\ncommand = \"github-mcp\"\nargs = [\"--stdio\"]\n\
+             \n[mcp_servers.remote]\nurl = \"https://mcp.example/sse\"\n";
+        let canonical_path = canonical_dir.join("config.toml");
+        std::fs::write(&canonical_path, canonical_body).unwrap();
+
+        let handle_dir = base.path().join("term-mcp");
+        std::fs::create_dir_all(&handle_dir).unwrap();
+
+        let csq_bin = "/usr/local/bin/csq";
+        let env_path = handle_dir.join(".pact-mcp-envelope.json");
+        let skipped = materialize_handle_config_toml(
+            base.path(),
+            account,
+            &handle_dir,
+            None,
+            Some((csq_bin, env_path.as_path())),
+        )
+        .expect("mcp-wrap materialize succeeds");
+
+        // Remote server reported as un-gated.
+        assert_eq!(skipped, vec!["remote".to_string()]);
+
+        // Handle-dir config.toml has the github server routed through the proxy.
+        // (String assertions — the `csq` crate does not depend on `toml`; the
+        // structural TOML shape is pinned by the csq-core `mcp_rewrite` unit tests.)
+        let written = std::fs::read_to_string(handle_dir.join("config.toml")).unwrap();
+        assert!(
+            written.contains(&format!("command = \"{csq_bin}\"")),
+            "github server command must be rewritten to the csq binary:\n{written}"
+        );
+        assert!(
+            written.contains("\"mcp-proxy\"") && written.contains("\"github-mcp\""),
+            "args must route mcp-proxy through the original github-mcp command:\n{written}"
+        );
+        // Remote untouched — its url survives and no command was injected.
+        assert!(
+            written.contains("url = \"https://mcp.example/sse\""),
+            "remote server url must be preserved:\n{written}"
+        );
+
+        // CANONICAL config.toml is byte-unchanged — the rewrite lives only in the
+        // ephemeral handle dir (never mutate the user's slot config).
+        assert_eq!(
+            std::fs::read_to_string(&canonical_path).unwrap(),
+            canonical_body,
+            "canonical config-N/config.toml must NOT be rewritten"
         );
     }
 
@@ -3682,7 +4348,7 @@ mod tests {
         assert!(cold.elapsed_ns > 0, "cold-load timing must be non-zero");
     }
 
-    /// Build a minimal `.coc/` with COC.lock. Per journal 0093 the
+    /// Build a minimal `.coc/` with COC.lock. Per an internal journal entry the
     /// per-artifact signing apparatus was retracted, so no COC.sig
     /// step is required.
     fn build_coc_dir(parent: &Path, lock_content: &[u8]) {
@@ -3824,7 +4490,7 @@ mod tests {
     /// goes to the identity-keyed path.  A regression to `config-N/` will fail
     /// this test.
     ///
-    /// See workspaces/account-slot-decoupling/02-plans/04-phase3-readiness.md
+    /// See internal-design-docs
     /// § M3-3 acceptance criterion 8.
     #[cfg(any(test, feature = "test-utils"))]
     #[cfg(unix)]

@@ -14,7 +14,7 @@
 //! 4. Shell out: `CODEX_HOME=config-<N> codex login --device-auth`.
 //!    codex-cli drives the device-code flow; csq inherits stdio so
 //!    the user sees the code + browser opens.
-//! 5. Parse `config-<N>/auth.json` as a [`CodexCredentialFile`].
+//! 5. Parse `config-<N>/auth.json` as a `CodexCredentialFile`.
 //!    Relocate to `identities/<UUID>/credentials-codex.json` at 0o600 via
 //!    [`crate::credentials::file::save_canonical_for`] (M4-12: UUID-keyed write,
 //!    numeric `credentials/codex-<N>.json` retired). Delete the original raw
@@ -494,7 +494,7 @@ where
 
     // Step 6: mark + profile update.
     //
-    // M4-7 (issue #292 Phase 4, spec 02 §INV-03 + §2.3.1): the marker
+    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the marker
     // content is the slot's identity UUID when a `by_slot` mapping
     // exists. After the `mint_for_codex_login` call above, `by_slot[N]`
     // is guaranteed to be present, so this always takes the UUID branch.
@@ -602,7 +602,7 @@ fn format_label(account: AccountNum, account_id_hint: Option<&str>) -> String {
 
 /// Codex login `profiles.json` hook — writes `by_slot_identity[N]`.
 ///
-/// **M8 (non-oauth-slot-identity, issue #292 Phase 4 → RN1-E):**
+/// **M8 (an internal workspace, an internal ticket Phase 4 → RN1-E):**
 /// records the canonical Codex identity-class label for this slot in
 /// `profiles.json::by_slot_identity`. The label comes from
 /// [`format_label`] (e.g. `"codex-3/abc12345"` when `account_id_hint`
@@ -1429,7 +1429,7 @@ mod tests {
         );
     }
 
-    /// M4-9 (release N affordance, issue #292 Phase 4):
+    /// M4-9 (release N affordance, an internal ticket Phase 4):
     /// `finalize_codex_login` (and the broader `perform_with` flow) MUST
     /// NOT populate the v1 `profiles.json::accounts[N]` map. The slot's
     /// Codex identity is now carried by `by_slot` + `by_email` +

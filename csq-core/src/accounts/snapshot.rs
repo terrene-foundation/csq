@@ -36,7 +36,7 @@ fn resolve_authority(config_dir: &Path, base_dir: &Path) -> Option<AccountNum> {
 
 /// Snapshots the current account for statusline rendering.
 ///
-/// **Authority-first** (workspace `slot-attribution-consistency`): the slot
+/// **Authority-first** (workspace `an internal workspace`): the slot
 /// is ALWAYS resolved from `.csq-account` (the SOLE authority per
 /// `account-terminal-separation.md` MUST NOT Rule 3) via [`resolve_authority`]
 /// — numeric markers resolve directly, UUID markers reverse-resolve through
@@ -199,7 +199,7 @@ mod tests {
         );
     }
 
-    /// slot-attribution-consistency: a stale `.current-account` MUST be
+    /// an internal workspace: a stale `.current-account` MUST be
     /// self-healed even when the CC PID is alive (the prior cheap path
     /// returned the stale cache forever). Authority (`.csq-account`) wins.
     #[test]

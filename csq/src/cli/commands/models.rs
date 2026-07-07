@@ -342,7 +342,7 @@ fn resolve_codex_model(query: &str, force: bool) -> Result<String> {
 /// Both CLI and desktop use `csq_core::session::write_slot_model_with_uuid_routing`
 /// so the UUID resolution logic has a single source of truth.
 /// See `csq-core/src/session/settings.rs` for the implementation and
-/// `workspaces/account-slot-decoupling/02-plans/03-phase2-readiness.md § M2-7`.
+/// `internal-design-docs § M2-7`.
 fn write_slot_model(
     base_dir: &Path,
     slot: csq_core::types::AccountNum,
@@ -606,7 +606,7 @@ mod tests {
         let slot = AccountNum::try_from(7u16).unwrap();
         bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
 
-        handle_switch(dir.path(), "mm", "m2", Some(slot), false, false).unwrap();
+        handle_switch(dir.path(), "mm", "m3", Some(slot), false, false).unwrap();
 
         let slot_path = dir.path().join("config-7/settings.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&slot_path).unwrap()).unwrap();
@@ -616,7 +616,7 @@ mod tests {
             .unwrap();
         assert!(
             model.contains("MiniMax"),
-            "alias `m2` should resolve to the catalog's MiniMax id, got: {model}"
+            "alias `m3` should resolve to the catalog's MiniMax id, got: {model}"
         );
     }
 
@@ -915,7 +915,7 @@ mod tests {
     // ── §5a regression helper (inline; csq-cli cannot reach pub(crate)) ──
     //
     // Mirrors `csq_core::platform::fs::assert_no_tmp_leak_on_readonly_parent`.
-    // Origin: security.md §5a, journal 0065 B2, /redteam round 3 (2026-05-09).
+    // Origin: security.md §5a, an internal journal entry B2, /redteam round 3 (2026-05-09).
     #[cfg(unix)]
     fn assert_no_tmp_leak_on_readonly_parent_inline<F, E>(dir: &std::path::Path, op: F)
     where
@@ -943,7 +943,7 @@ mod tests {
         assert!(leaked.is_empty(), "§5a leaked tmp files: {leaked:?}");
     }
 
-    /// §5a regression — site 9 (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression — site 9 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `write_slot_model` fails after
     /// the tmp file would have been created (settings dir read-only →
     /// write fails), no `.tmp.` file must remain.

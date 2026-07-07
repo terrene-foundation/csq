@@ -3,7 +3,7 @@
 //! authentication is whatever the user has configured the gemini CLI
 //! for (Code Assist OAuth, AI Studio API key, or Vertex SA).
 //!
-//! # ToS posture (corrected 2026-05-06 per journal 0048)
+//! # ToS posture (corrected 2026-05-06 per an internal journal entry)
 //!
 //! Earlier revisions of this module described a 7-layer "EP1-EP7"
 //! defense that pinned `security.auth.selectedType = "gemini-api-key"`
@@ -23,7 +23,7 @@
 //! Gemini's spawn machinery differs in shape from Anthropic / Codex:
 //!
 //! - **No daemon prerequisite for spawn** (INV-P02 inverted; see
-//!   `specs/07-provider-surface-dispatch.md` §7.5 + journal 0001).
+//!   `specs/07-provider-surface-dispatch.md` §7.5 + an internal journal entry).
 //!   API keys are flat and long-lived; OAuth refresh is gemini-cli's
 //!   own internal concern.
 //! - **Encryption-at-rest for API keys.** When a user binds a slot

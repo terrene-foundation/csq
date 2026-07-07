@@ -47,7 +47,7 @@
 //! `tokio::sync::Mutex` here: no lock is ever held across an
 //! `await`.
 //!
-//! # Poison recovery (PR-B7, journal 0063 P2-3)
+//! # Poison recovery (PR-B7, an internal journal entry P2-3)
 //!
 //! `std::sync::Mutex` poisons when a holder panics. Prior to PR-B7
 //! all `lock()` sites here called `.expect("...")`, which turns a
@@ -267,7 +267,7 @@ impl OAuthStateStore {
     /// exception-safe — a panic can't leave the map in a corrupt
     /// state — so we recover via `into_inner()` instead of panicking
     /// ourselves. See module doc "Poison recovery" for the full
-    /// rationale. Journal 0063 P2-3, PR-B7.
+    /// rationale. an internal journal entry P2-3, PR-B7.
     ///
     /// # Why no `expect`
     ///
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn store_recovers_from_poisoned_mutex() {
-        // Regression guard for PR-B7 (journal 0063 P2-3). Prior to
+        // Regression guard for PR-B7 (an internal journal entry P2-3). Prior to
         // PR-B7 every lock site called `.expect("state store lock
         // poisoned")`, which turned a non-fatal poison into a
         // process panic. The new `locked()` helper uses

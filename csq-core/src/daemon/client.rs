@@ -181,7 +181,7 @@ pub fn http_post_unix(
     sock_path: &Path,
     path_and_query: &str,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    http_post_unix_impl(sock_path, path_and_query, None)
+    http_post_unix_impl(sock_path, path_and_query, None, &[])
 }
 
 /// Issues a `POST path_and_query` with a JSON body against the
@@ -196,7 +196,30 @@ pub fn http_post_unix_json(
     path_and_query: &str,
     json_body: &str,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    http_post_unix_impl(sock_path, path_and_query, Some(json_body))
+    http_post_unix_impl(sock_path, path_and_query, Some(json_body), &[])
+}
+
+/// Issues a `POST path_and_query` with a JSON body AND caller-supplied
+/// extra request headers against the daemon's Unix socket.
+///
+/// Used by the interactive per-turn enforcement client (#793) to carry the
+/// daemon-minted `X-CSQ-Session-Key` capability header on
+/// `/api/interactive/{submit,override,abandon,close}` calls.
+///
+/// Each `(name, value)` pair in `extra_headers` is validated against CRLF
+/// injection: a `\r` or `\n` in either the name or the value returns
+/// [`DaemonClientError::MalformedResponse`] BEFORE any bytes are written
+/// (`rules/security.md` §9 — runtime CRLF validation on hand-rolled HTTP, not
+/// `debug_assert!`, because this is a `pub` surface future callers pass dynamic
+/// values to). `Host`, `Content-Type`, `Content-Length`, and `Connection` are
+/// emitted by this function and MUST NOT be passed in `extra_headers`.
+pub fn http_post_unix_json_with_headers(
+    sock_path: &Path,
+    path_and_query: &str,
+    json_body: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<DaemonResponse, DaemonClientError> {
+    http_post_unix_impl(sock_path, path_and_query, Some(json_body), extra_headers)
 }
 
 /// Fire-and-forget per-slot cache invalidation after `csq move FROM TO`.
@@ -208,7 +231,7 @@ pub fn http_post_unix_json(
 /// Returns `Ok(())` if the request succeeded (HTTP 200) or if the socket
 /// is absent/unreachable (fire-and-forget: connect failure is not an
 /// error from the caller's perspective). Returns `Err` only when the path
-/// contains CRLF characters (security guard, journal 0014 H3).
+/// contains CRLF characters (security guard, an internal journal entry H3).
 ///
 /// **This is the single production chokepoint for slot-swap IPC.**
 /// Both the CLI (`csq move`) and the desktop Tauri command
@@ -229,8 +252,22 @@ fn http_post_unix_impl(
     sock_path: &Path,
     path_and_query: &str,
     json_body: Option<&str>,
+    extra_headers: &[(&str, &str)],
 ) -> Result<DaemonResponse, DaemonClientError> {
     validate_path_and_query(path_and_query)?;
+
+    // Build the caller-supplied header block, CRLF-validating every name and
+    // value BEFORE connecting so a rejected header never opens a socket
+    // (`rules/security.md` §9).
+    let mut extra = String::new();
+    for (name, value) in extra_headers {
+        validate_header_field(name)?;
+        validate_header_field(value)?;
+        extra.push_str(name);
+        extra.push_str(": ");
+        extra.push_str(value);
+        extra.push_str("\r\n");
+    }
 
     let mut stream = UnixStream::connect(sock_path).map_err(DaemonClientError::Connect)?;
     stream
@@ -246,6 +283,7 @@ fn http_post_unix_impl(
              Host: localhost\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {len}\r\n\
+             {extra}\
              Connection: close\r\n\
              \r\n\
              {body}",
@@ -255,6 +293,7 @@ fn http_post_unix_impl(
             "POST {path_and_query} HTTP/1.1\r\n\
              Host: localhost\r\n\
              Content-Length: 0\r\n\
+             {extra}\
              Connection: close\r\n\
              \r\n"
         ),
@@ -296,6 +335,22 @@ fn validate_path_and_query(path_and_query: &str) -> Result<(), DaemonClientError
     if path_and_query.contains('\r') || path_and_query.contains('\n') {
         return Err(DaemonClientError::MalformedResponse(
             "path_and_query must not contain CR or LF".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a request-header name or value for HTTP request-line safety.
+///
+/// Rejects CR (`\r`) and LF (`\n`) to prevent header injection on the
+/// hand-rolled request (`rules/security.md` §9). A runtime check (not
+/// `debug_assert!`) because the only caller —
+/// [`http_post_unix_json_with_headers`] — is a `pub` surface fed dynamic
+/// values (e.g. a client-echoed session key).
+fn validate_header_field(field: &str) -> Result<(), DaemonClientError> {
+    if field.contains('\r') || field.contains('\n') {
+        return Err(DaemonClientError::MalformedResponse(
+            "header name/value must not contain CR or LF".to_string(),
         ));
     }
     Ok(())
@@ -552,5 +607,24 @@ mod tests {
     fn validate_accepts_valid_path() {
         assert!(validate_path_and_query("/api/health").is_ok());
         assert!(validate_path_and_query("/api/login/3?foo=bar").is_ok());
+    }
+
+    #[test]
+    fn validate_header_field_rejects_crlf() {
+        // CR, LF, and a full CRLF-injection payload must all be rejected so a
+        // client-echoed session key cannot smuggle extra headers (#793).
+        assert!(validate_header_field("ok\rval").is_err());
+        assert!(validate_header_field("ok\nval").is_err());
+        let err = validate_header_field("key\r\nEvil-Header: value").unwrap_err();
+        assert!(matches!(err, DaemonClientError::MalformedResponse(_)));
+    }
+
+    #[test]
+    fn validate_header_field_accepts_session_key_shape() {
+        // A daemon-minted ULID-shaped key (the real X-CSQ-Session-Key payload)
+        // and ordinary header names must pass.
+        assert!(validate_header_field("01J9ZK7C8QABCDEF0123456789").is_ok());
+        assert!(validate_header_field("X-CSQ-Session-Key").is_ok());
+        assert!(validate_header_field("abc-DEF_123").is_ok());
     }
 }

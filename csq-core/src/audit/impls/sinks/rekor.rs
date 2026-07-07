@@ -78,7 +78,7 @@ impl RekorSink {
     ///
     /// # Errors
     ///
-    /// Returns [`IdError`] when `name` fails [`SinkName::try_new`].
+    /// Returns [`IdError`] when `name` fails `SinkName::try_new`.
     pub fn new(config: RekorConfig) -> Result<Self, IdError> {
         Ok(Self {
             name: SinkName::try_new("rekor")?,
@@ -165,6 +165,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
     }
 

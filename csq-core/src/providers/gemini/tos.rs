@@ -9,7 +9,7 @@
 //! switch auth modes. Earlier revisions framed this as a ToS-driven
 //! defense ("Google ToS prohibits routing subscription OAuth through
 //! third-party tools") — that framing was wrong and has been
-//! retracted (journal 0048). The marker stays because the
+//! retracted (an internal journal entry). The marker stays because the
 //! informational walkthrough is still useful first-time content; the
 //! disclosure copy itself is now neutral.
 //!
@@ -50,7 +50,7 @@ pub struct TosMarker {
 /// Current disclosure version. Increment to force every user through
 /// the disclosure again.
 ///
-/// **v2 (2026-05-06, journal 0048):** the disclosure copy was rewritten
+/// **v2 (2026-05-06, an internal journal entry):** the disclosure copy was rewritten
 /// from a ToS-warning framing ("Google ToS prohibits OAuth subscription
 /// rerouting through third-party tools — csq actively defends against
 /// this with a 7-layer guard") to an informational walkthrough
@@ -179,7 +179,7 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 /// API-key mode means csq's spawned gemini-cli will use the API key
 /// and ignore the OAuth credentials. The note used to be framed as
 /// a warning ("csq actively defends against OAuth fall-through" —
-/// retracted in journal 0048); it is now a neutral data point so
+/// retracted in an internal journal entry); it is now a neutral data point so
 /// users who have BOTH credential types know which one csq's slot
 /// configuration will exercise.
 ///

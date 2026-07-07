@@ -5,7 +5,7 @@
 //! `verify_chain` is read-only (spec §12.13.9), and migration must run in an
 //! INTERACTIVE context where the user can grant the one-time macOS keychain
 //! prompt that a non-interactive daemon cannot answer (the brick root cause,
-//! journal 0034).
+//! an internal journal entry).
 //!
 //! - [`migrate_keys_to_file_store`] — copy the active + every historical
 //!   keychain seed into the 0o600 file store so the daemon can read them
@@ -18,12 +18,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::audit::health::{clear_chain_broken, is_chain_broken};
+use crate::audit::health::{clear_chain_broken_in, is_chain_broken_in};
 use crate::audit::key_custody::chain_state::ChainState;
 use crate::audit::key_custody::file_store::{self, KeySlot};
 use crate::audit::key_custody::keyring_backend::LocalSigningKey;
 use crate::audit::key_custody::KeyCustodyError;
-use crate::audit::verify::{verify_chain, VerifyConfig};
+use crate::audit::persist::ChainKind;
+use crate::audit::verify::{verify_chain_in, VerifyConfig};
 
 /// Result of a `csq audit migrate-keys` run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,15 +197,35 @@ pub fn repair_audit_chain(
     apply: bool,
     now_compact: &str,
 ) -> Result<RepairOutcome, KeyCustodyError> {
+    repair_audit_chain_in(base_dir, service, apply, now_compact, ChainKind::Op)
+}
+
+/// Like [`repair_audit_chain`], but repairs the `chain`'s runs-directory.
+///
+/// F1 (redteam R3): the born-canonical EATP attestation chain (`ChainKind::Eatp`,
+/// `eatp-runs/`) gets the SAME operator recovery path as the op-chain. Without
+/// this, an `eatp-runs/.chain-broken` sentinel (set by a `verify_chain_in(Eatp)`
+/// reconcile after key loss / tampering) would refuse ALL EATP appends with no
+/// command to clear or reset it — `csq audit repair` only knew the op-chain, and
+/// `csq audit init` is wedged by the broken-sentinel write-refusal. Mirrors the
+/// W2a verify-side `ChainKind` parameterization.
+pub fn repair_audit_chain_in(
+    base_dir: &Path,
+    service: &str,
+    apply: bool,
+    now_compact: &str,
+    chain: ChainKind,
+) -> Result<RepairOutcome, KeyCustodyError> {
+    let runs_subdir = chain.runs_subdir();
     let cfg = VerifyConfig {
         record_limit: 100_000,
         keychain_service: service.to_string(),
     };
-    match verify_chain(base_dir, &cfg, None) {
+    match verify_chain_in(base_dir, &cfg, None, chain) {
         Ok(_) => {
-            let had_sentinel = is_chain_broken(base_dir).is_some();
+            let had_sentinel = is_chain_broken_in(base_dir, runs_subdir).is_some();
             if had_sentinel {
-                clear_chain_broken(base_dir);
+                clear_chain_broken_in(base_dir, runs_subdir);
             }
             Ok(RepairOutcome::Healthy {
                 sentinel_cleared: had_sentinel,
@@ -218,9 +239,10 @@ pub fn repair_audit_chain(
             if !apply {
                 return Ok(RepairOutcome::ResetRequired { reason });
             }
-            let (backup_dir, failed_moves) = backup_and_reset_chain(base_dir, now_compact)?;
+            let (backup_dir, failed_moves) =
+                backup_and_reset_chain_in(base_dir, runs_subdir, now_compact)?;
             // The new (empty) chain state is clean; clear the broken sentinel.
-            clear_chain_broken(base_dir);
+            clear_chain_broken_in(base_dir, runs_subdir);
             // DA4: a partial backup (some *.jsonl / sentinel could not be moved)
             // is reported in `reason`, not masked as a clean reset.
             let reason = if failed_moves.is_empty() {
@@ -243,12 +265,13 @@ pub fn repair_audit_chain(
 /// Backs up `chain.json`, the per-chain `<chain_id>.jsonl`, and the `.chain-broken`
 /// sentinel. The file-store `keys/` directory is LEFT IN PLACE (the keys are
 /// still valid; only the ledger is reset) unless the operator deletes them.
-fn backup_and_reset_chain(
+fn backup_and_reset_chain_in(
     base_dir: &Path,
+    runs_subdir: &str,
     now_compact: &str,
 ) -> Result<(PathBuf, Vec<String>), KeyCustodyError> {
-    let csq_runs = base_dir.join("csq-runs");
-    let backup_dir = base_dir.join(format!("csq-runs-broken-backup-{now_compact}"));
+    let csq_runs = base_dir.join(runs_subdir);
+    let backup_dir = base_dir.join(format!("{runs_subdir}-broken-backup-{now_compact}"));
     std::fs::create_dir_all(&backup_dir)
         .map_err(|e| KeyCustodyError::ChainIo(format!("create backup dir: {e}")))?;
 
@@ -336,7 +359,7 @@ mod tests {
         );
     }
 
-    /// PR #702 review C1 recovery path: migrate-keys MUST succeed on a
+    /// an internal ticket review C1 recovery path: migrate-keys MUST succeed on a
     /// keychain seed entry that carries the roster_version_floor (the typed
     /// validation parses the 4-field payload).
     #[test]
@@ -401,6 +424,8 @@ mod tests {
         // the shared env lock so a concurrent edition-mutating test cannot flip
         // verify to fail-closed mid-run (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         crate::audit::key_custody::test_helpers::init_mock_keyring();
         let t = tmp();
         let service = format!("{}-repair-healthy", svc());
@@ -424,6 +449,92 @@ mod tests {
             }
             other => panic!("expected Healthy, got {other:?}"),
         }
-        assert!(is_chain_broken(t.path()).is_none(), "sentinel must be gone");
+        assert!(
+            is_chain_broken_in(t.path(), "csq-runs").is_none(),
+            "sentinel must be gone"
+        );
+    }
+
+    /// F1 (redteam R3): `repair_audit_chain_in(ChainKind::Eatp)` reconciles the
+    /// EATP chain's OWN `eatp-runs/.chain-broken` sentinel — the operator recovery
+    /// path that was missing for the born-canonical chain.
+    #[test]
+    fn repair_eatp_chain_clears_stale_sentinel() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        crate::audit::key_custody::test_helpers::init_mock_keyring();
+        let t = tmp();
+        let service = format!("{}-repair-eatp", svc());
+
+        // Establish the EATP chain (mints key + eatp-runs/chain.json; no genesis
+        // record — verify_chain_in(Eatp) is Ok for an empty JSONL → Healthy).
+        crate::audit::eatp_audit_init(t.path(), &service).expect("eatp init");
+        // Plant a stale sentinel on the EATP chain specifically.
+        crate::audit::health::set_chain_broken_in(t.path(), "eatp-runs", "audit_verify_timeout");
+        // The op-chain has no sentinel — confirm the two chains are independent.
+        assert!(
+            is_chain_broken_in(t.path(), "csq-runs").is_none(),
+            "op-chain sentinel must be untouched"
+        );
+
+        let outcome =
+            repair_audit_chain_in(t.path(), &service, false, "20260605T0000", ChainKind::Eatp)
+                .expect("eatp repair");
+        match outcome {
+            RepairOutcome::Healthy { sentinel_cleared } => {
+                assert!(sentinel_cleared, "stale EATP sentinel must be cleared");
+            }
+            other => panic!("expected Healthy, got {other:?}"),
+        }
+        assert!(
+            is_chain_broken_in(t.path(), "eatp-runs").is_none(),
+            "EATP sentinel must be gone"
+        );
+
+        // Cleanup the EATP key.
+        if let Ok(state) = ChainState::load_in(t.path(), "eatp-runs") {
+            LocalSigningKey::delete_from_keychain(&service, &state.chain_id).ok();
+        }
+    }
+
+    /// F1 (redteam R3): the reset mechanic backs up + clears the EATP runs-dir
+    /// (not the op-chain). Proves `backup_and_reset_chain_in` is correctly
+    /// parameterized by `runs_subdir`.
+    #[test]
+    fn backup_and_reset_chain_in_targets_eatp_runs() {
+        let t = tmp();
+        let eatp_runs = t.path().join("eatp-runs");
+        std::fs::create_dir_all(&eatp_runs).unwrap();
+        std::fs::write(eatp_runs.join("chain.json"), b"{}").unwrap();
+        std::fs::write(eatp_runs.join("abc.jsonl"), b"{}\n").unwrap();
+        std::fs::write(eatp_runs.join(".chain-broken"), b"x").unwrap();
+
+        let (backup_dir, failed) =
+            backup_and_reset_chain_in(t.path(), "eatp-runs", "20260605T0000").expect("reset");
+
+        assert!(
+            failed.is_empty(),
+            "no move failures expected, got {failed:?}"
+        );
+        assert!(
+            backup_dir.ends_with("eatp-runs-broken-backup-20260605T0000"),
+            "backup dir must be named for the eatp-runs subdir, got {backup_dir:?}"
+        );
+        assert!(
+            backup_dir.join("chain.json").is_file(),
+            "chain.json backed up"
+        );
+        assert!(backup_dir.join("abc.jsonl").is_file(), "ledger backed up");
+        assert!(
+            backup_dir.join(".chain-broken").is_file(),
+            "sentinel backed up"
+        );
+        // The live eatp-runs ledger + sentinel are gone (reset to a clean slate).
+        assert!(!eatp_runs.join("abc.jsonl").exists(), "ledger moved out");
+        assert!(
+            !eatp_runs.join(".chain-broken").exists(),
+            "sentinel moved out"
+        );
     }
 }

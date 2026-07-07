@@ -1,11 +1,11 @@
 //! Phase B' billing ledger — per-slot usage telemetry for pay-per-token slots.
 //!
-//! Per journal 0050 (csq-as-cli workspace). Reads CC's `~/.claude/usage-data/
+//! Per an internal journal entry (an internal workspace workspace). Reads CC's `~/.claude/usage-data/
 //! session-meta/<session-id>.json` files which CC already writes per session,
 //! attributes them to slots via the csq launch log (post-hoc time correlation
 //! per D2), estimates cost from a static per-model rate table (D3), and
 //! persists to `accounts/usage-{account_id}.ndjson` (D4 — account_id chokepoint
-//! migrates trivially when issue #292 / Option A++ ships).
+//! migrates trivially when an internal ticket / Option A++ ships).
 //!
 //! ## Module layout
 //!
@@ -20,7 +20,7 @@
 //!   story exactly. Today returns slot # as string; post-A++ returns UUID.
 //!
 //! The daemon-side aggregator that scans session-meta + writes the ledger
-//! lives at [`crate::daemon::usage_aggregator`] (separate module — depends on
+//! lives at `crate::daemon::usage_aggregator` (separate module — depends on
 //! daemon-only types).
 //!
 //! ## Privacy invariant (D6)

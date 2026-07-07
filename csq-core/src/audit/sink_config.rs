@@ -115,6 +115,10 @@ pub struct AuditSinkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "csq-ledger")]
     pub csq_ledger: Option<SinkCadenceConfig>,
+    /// Customer body-store cadence when `sink = "customer-body-store"` (M3 T3.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "customer-body-store")]
+    pub customer_body_store: Option<SinkCadenceConfig>,
 }
 
 fn default_sink_name() -> String {
@@ -131,6 +135,7 @@ impl Default for AuditSinkConfig {
             gcp: None,
             azure_sql: None,
             csq_ledger: None,
+            customer_body_store: None,
         }
     }
 }
@@ -144,6 +149,7 @@ const RECOGNISED_SINK_NAMES: &[&str] = &[
     "gcp",
     "azure-sql",
     "csq-ledger",
+    "customer-body-store",
 ];
 
 impl AuditSinkConfig {
@@ -287,6 +293,9 @@ impl AuditSinkConfig {
             "csq-ledger" => self
                 .csq_ledger
                 .get_or_insert_with(SinkCadenceConfig::default),
+            "customer-body-store" => self
+                .customer_body_store
+                .get_or_insert_with(SinkCadenceConfig::default),
             _ => unreachable!("caller validated sink name"),
         }
     }
@@ -301,6 +310,7 @@ impl AuditSinkConfig {
             "gcp" => self.gcp.as_ref(),
             "azure-sql" => self.azure_sql.as_ref(),
             "csq-ledger" => self.csq_ledger.as_ref(),
+            "customer-body-store" => self.customer_body_store.as_ref(),
             _ => None,
         }
     }
@@ -328,6 +338,8 @@ pub fn validate_sink_compiled_in(sink_name: &str) -> Result<(), SinkConfigError>
         "azure-sql" => Ok(()),
         #[cfg(feature = "csq-ledger-sink")]
         "csq-ledger" => Ok(()),
+        #[cfg(feature = "customer-body-store-sink")]
+        "customer-body-store" => Ok(()),
         name => Err(SinkConfigError::NotCompiledIn {
             sink: name.to_string(),
         }),

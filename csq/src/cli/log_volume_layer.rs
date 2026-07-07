@@ -2,7 +2,7 @@
 //! the `csq-core::capability_layer::log_volume` thread-local counter
 //! (PR-CA11c T5).
 //!
-//! Spec: workspaces/csq-as-cli/02-plans/05-pr-ca11-implementation-plan.md § 0.5 + § Group 3 T5.
+//! Spec: internal-design-docs § 0.5 + § Group 3 T5.
 //!
 //! # Why a Filter, not a Layer
 //!

@@ -5,7 +5,7 @@
 //! mode detection determines this is a terminal invocation.
 
 mod audit_emit;
-mod commands;
+pub(crate) mod commands;
 mod log_volume_layer;
 mod trace_file;
 
@@ -75,7 +75,7 @@ impl LayerIntent {
 
 /// csq — Claude Code multi-account rotation and session management
 #[derive(Parser, Debug)]
-#[command(name = "csq", version, about, long_about = None)]
+#[command(name = "csq", version = crate::VERSION_LINE, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
@@ -160,7 +160,7 @@ enum Command {
         /// from BAIL to WARN for this invocation. `Missing` and
         /// `WrongBinary` remain unconditional bails — there is nothing to
         /// proceed against. Per spec/13 §3 + §3.1. Per-invocation only;
-        /// no env var; no persistent state (journal 0006).
+        /// no env var; no persistent state (an internal journal entry).
         #[arg(long = "ignore-cli-version")]
         ignore_cli_version: bool,
         /// Disable the automatic CLI upgrade that fires when an outdated
@@ -184,7 +184,27 @@ enum Command {
         /// the gap visible).
         #[arg(long = "no-audit")]
         no_audit: bool,
-        /// Arguments passed through to `claude`
+        /// Drive the native governed coding-agent loop (P0-B) against this
+        /// slot's 3P provider instead of spawning a CLI. Enterprise-only.
+        #[cfg(feature = "native-harness")]
+        #[arg(long = "native")]
+        native: bool,
+        /// Raw model id for `--native` (overrides the catalog default;
+        /// CC-only `[...]` annotations are stripped). Enterprise-only.
+        #[cfg(feature = "native-harness")]
+        #[arg(long = "native-model")]
+        native_model: Option<String>,
+        /// Governance arm for `--native`: `on` (gated) or `off` (ungoverned).
+        /// Defaults to `on`. Enterprise-only.
+        #[cfg(feature = "native-harness")]
+        #[arg(long = "governance", default_value = "on")]
+        governance: String,
+        /// Emit only the `native_run_summary` JSON line on stdout (for the
+        /// P0-A bench); streamed text goes to stderr. Enterprise-only.
+        #[cfg(feature = "native-harness")]
+        #[arg(long = "bench-json")]
+        bench_json: bool,
+        /// Arguments passed through to `claude` (or the `--native` prompt)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
@@ -210,6 +230,51 @@ enum Command {
     /// Show the statusline string (reads CC JSON from stdin)
     Statusline,
 
+    /// Run a single non-interactive completion and print one JSON envelope
+    /// (`csq.exec.v1`). Spawn-captures `claude --print --output-format json` for a
+    /// Claude slot, normalizes the result, and re-emits it. Every outcome — success
+    /// or failure — is a single `\n`-terminated JSON line on stdout; the exit code is
+    /// 0 on success, non-zero on failure.
+    Exec {
+        /// The prompt to send (positional). Mutually exclusive with `--stdin`.
+        prompt: Option<String>,
+        /// Read the prompt from stdin instead of the positional argument.
+        #[arg(long)]
+        stdin: bool,
+        /// Target a specific slot (1-999). Mutually exclusive with `--provider`.
+        #[arg(long)]
+        slot: Option<u16>,
+        /// Target a provider by name (`claude`); resolves to a healthy slot.
+        /// Mutually exclusive with `--slot`.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model alias or id to request (`opus`, `sonnet`, or a full model id).
+        #[arg(long)]
+        model: Option<String>,
+        /// A system prompt to append (maps to Claude's `--append-system-prompt`).
+        #[arg(long)]
+        system: Option<String>,
+        /// Correlation id echoed back verbatim on the envelope's `id` field.
+        #[arg(long)]
+        id: Option<String>,
+        /// Seconds to wait before killing the child process (default 120).
+        #[arg(long = "timeout", default_value_t = 120)]
+        timeout: u64,
+    },
+
+    /// SDK surface introspection (`csq.capabilities.v1`).
+    Sdk {
+        #[command(subcommand)]
+        command: SdkCommands,
+    },
+
+    /// Refresh the macOS keychain entries Claude Code reads from csq's
+    /// on-disk credentials (fixes "Please run /login · 401" after a token
+    /// rotation). `csq run`/`csq swap` do this automatically for the session
+    /// they touch; this sweeps every live session.
+    #[command(name = "keychain-sync")]
+    KeychainSync,
+
     /// OAuth login flow for a new account
     Login {
         /// Account number to login as
@@ -220,7 +285,7 @@ enum Command {
         /// to be ENABLED in your ChatGPT Security Settings before the
         /// device code can be redeemed; if you see "Enable device code
         /// authorization" in the browser, that's the prerequisite);
-        /// `gemini` records a Code Assist OAuth binding (journal 0054 —
+        /// `gemini` records a Code Assist OAuth binding (an internal journal entry —
         /// gemini-cli v0.41.2+ has no non-interactive auth surface, so
         /// you MUST run `gemini` once interactively first to OAuth
         /// against your Google account; csq then verifies
@@ -253,7 +318,7 @@ enum Command {
         /// from BAIL to WARN for this invocation. `Missing` and
         /// `WrongBinary` remain unconditional bails — there is nothing to
         /// proceed against. Per spec/13 §3 + §3.1. Per-invocation only;
-        /// no env var; no persistent state (journal 0006).
+        /// no env var; no persistent state (an internal journal entry).
         #[arg(long = "ignore-cli-version")]
         ignore_cli_version: bool,
         /// Disable the automatic CLI upgrade that fires when an outdated
@@ -334,7 +399,7 @@ enum Command {
         /// `credentials/codex-<N>.json`) exists, byte-copies the
         /// legacy file into the identity path. Operator entry point
         /// for the v2.7.3 → v2.7.7+ upgrade-skip class documented in
-        /// journal 0040.
+        /// an internal journal entry
         ///
         /// Idempotent — already-seeded identity files are reported as
         /// `AlreadySeeded` and skipped. When the daemon is running, the
@@ -345,6 +410,18 @@ enum Command {
         /// Mutually exclusive with `--slot`.
         #[arg(long, conflicts_with = "slot")]
         repair_identities: bool,
+
+        /// Detect cross-slot OAuth token contamination (an internal ticket). For every
+        /// Anthropic slot, verifies — via one live `GET /api/oauth/profile` with
+        /// the slot's STORE token — that the token actually belongs to the
+        /// account bound to that slot (its `identity.json` anchor). A slot whose
+        /// store token belongs to a DIFFERENT account shows the right label but
+        /// polls a foreign account's quota; heal with `csq login <N>`.
+        ///
+        /// Opt-in because it makes one network call per Anthropic slot. Requires
+        /// a JS runtime (Node/Bun) for the Cloudflare-safe transport. Read-only.
+        #[arg(long, conflicts_with = "slot")]
+        check_token_owners: bool,
     },
 
     /// Live-wire `(provider × auth-mode)` contract verification per
@@ -385,6 +462,12 @@ enum Command {
         /// default (dry run).
         #[arg(long)]
         apply: bool,
+        /// Also check each Anthropic slot's STORE token against
+        /// `/api/oauth/profile` and, with `--apply`, clear any whose token
+        /// belongs to a DIFFERENT account (an internal ticket cross-slot scramble).
+        /// Network + opt-in: off by default so the offline passes stay fast.
+        #[arg(long)]
+        heal_contaminated: bool,
     },
 
     /// Generate shell completions for bash, zsh, fish, or powershell
@@ -399,6 +482,25 @@ enum Command {
         target: InspectCmd,
     },
 
+    /// Translate the project's `.coc/` set into the deterministic spawn-time
+    /// payload for a target Surface (read-only; writes nothing under `.coc/`).
+    ///
+    /// This is the top-level, contract-stable conversion surface the neutral
+    /// `coc-run` launcher and harnesses drive. It mirrors `csq inspect
+    /// translate` but is promoted out of the `inspect` diagnostic namespace and
+    /// accepts the `cc` alias for `claude-code` (the `--surface cc|codex|gemini`
+    /// spelling established by `csq classify`, spec-10 §10.7.4.1). `--json`
+    /// emits the full `SpawnPayload`.
+    Translate {
+        /// Which Surface translator to invoke. Accepts `cc` (alias of
+        /// `claude-code`), `claude-code`, `codex`, or `gemini`.
+        #[arg(long = "surface", value_parser = ["cc", "claude-code", "codex", "gemini"])]
+        surface: String,
+        /// Start the discovery walk from this path instead of CWD.
+        #[arg(long)]
+        start: Option<std::path::PathBuf>,
+    },
+
     /// Manage external CLI dependencies (claude, codex, gemini).
     ///
     /// Fully implemented since v2.7.0 (M4 PR-MCD4): `csq cli install <name>`
@@ -410,7 +512,7 @@ enum Command {
         command: CliCommand,
     },
 
-    /// Audit-trail key-custody operations (M04 csq-pact-eatp-adoption).
+    /// Audit-trail key-custody operations (M04 an internal workspace).
     ///
     /// Manages the local Ed25519 signing key used to sign audit records.
     /// All keychain access goes through the `keyring` crate
@@ -453,6 +555,44 @@ enum Command {
         #[arg(long)]
         keywords: Option<String>,
     },
+
+    /// Gate an MCP server's stdio JSON-RPC through the PACT `mcp_verdict`
+    /// allow-path (M6 T6.2 Shard 2, enterprise-only).
+    ///
+    /// Interposes on a CLI↔MCP-server channel: spawns the real server given
+    /// after `--`, forwards its traffic, and denies `tools/call`s the operator's
+    /// `mcp` policy does not clear (never-delegated actions require human review;
+    /// unlisted tools are default-denied). Denials are answered in-band
+    /// (`isError:true` result) so the channel is never torn down. With no
+    /// `--envelope`, every tool call is denied (default-deny). Shard 3 wires this
+    /// into `csq run` codex/gemini spawns; run it standalone to gate any MCP server.
+    #[cfg(feature = "enterprise")]
+    #[command(name = "mcp-proxy")]
+    McpProxy {
+        /// Path to the PACT operating envelope JSON whose `mcp.allowed_tools`
+        /// policy clears tool calls. Loaded fail-closed (a malformed or
+        /// wrong-version envelope refuses to start). Absent → default-deny.
+        #[arg(long)]
+        envelope: Option<std::path::PathBuf>,
+        /// The spawned CLI whose MCP traffic this proxy gates (`codex` | `gemini`).
+        /// Set by the `csq run` config-rewrite (Shard 3a) so each gate decision is
+        /// attested to the right surface. Absent on a standalone invocation → gate
+        /// decisions are still enforced but NOT attested to the audit chain (no CLI
+        /// identity to attribute them to).
+        #[arg(long, value_parser = ["codex", "gemini"])]
+        cli: Option<String>,
+        /// The real MCP server command to launch and proxy, given after `--`
+        /// (e.g. `-- npx -y @modelcontextprotocol/server-filesystem /tmp`).
+        #[arg(last = true, required = true, allow_hyphen_values = true)]
+        server_cmd: Vec<String>,
+    },
+}
+
+/// Subcommands for `csq sdk` — SDK surface introspection.
+#[derive(Subcommand, Debug)]
+pub enum SdkCommands {
+    /// Print the `csq.capabilities.v1` envelope: the ops this build implements + edition.
+    Capabilities,
 }
 
 /// Subcommands for `csq cli` — external CLI dependency management.
@@ -590,6 +730,28 @@ enum AuditCmd {
         apply: bool,
     },
 
+    /// Declare or clear **attestation intent** (M6 #909 shard C).
+    ///
+    /// Controls whether gated MCP decisions made BEFORE `csq audit init` are
+    /// preserved or dropped. On a host where you intend to keep the signed audit
+    /// record, run `csq audit intent on` during setup (before wiring the gate):
+    /// pre-init decisions then QUEUE to the durable outbox and flush automatically
+    /// once you run `csq audit init`, instead of being dropped. Default (unset) is
+    /// drop — so a non-audit host never accumulates a queue.
+    ///
+    /// `csq audit intent`        — print the current state (on/off) + any queued count.
+    /// `csq audit intent on`     — declare intent (idempotent).
+    /// `csq audit intent off`    — clear intent; pre-init decisions drop again.
+    ///
+    /// Intent is NOT cleared by `csq audit init` — it survives a later chain
+    /// reset/re-init (`csq audit repair --apply`) so the re-init window is covered
+    /// too. Clear it explicitly when you no longer want attestation on this host.
+    Intent {
+        /// `on` to declare intent, `off` to clear it. Omit to print the state.
+        #[arg(value_name = "STATE")]
+        state: Option<String>,
+    },
+
     /// Export the audit chain as a self-contained, verifiable bundle (M09).
     ///
     /// Produces `csq-audit-bundle-<chain_id>-<exp_id>.tar` containing the
@@ -650,7 +812,7 @@ enum AuditCmd {
     /// for deployments where BetrVG §87(1)6 or equivalent monitoring-regulation
     /// law applies.
     EnrollDev {
-        /// Principal to enroll (1..=128 chars, [A-Za-z0-9._@-]).
+        /// Principal to enroll (1..=128 chars, `[A-Za-z0-9._@-]`).
         /// Examples: "backend-team@rrps.example", "alice@example.com".
         principal: String,
 
@@ -705,6 +867,76 @@ enum AuditCmd {
     /// fingerprint, and activation seq. Works in both community (no roster)
     /// and enterprise (roster required) editions.
     RosterShow,
+
+    /// Install a signed governance policy bundle (Phase-2b, b2a — enterprise-only).
+    ///
+    /// Loads the policy bundle from a JSON file, verifies its Ed25519 detached
+    /// signature against the operator-supplied trusted pubkey (`--pubkey`), persists
+    /// the bundle + sidecar, and bumps the `policy-bundle.floor` rollback floor.
+    /// Verification runs BEFORE any write (CRIT-2: install returns Err ⇒ on-disk
+    /// state unchanged).
+    ///
+    /// The `--pubkey` argument is the OUT-OF-BAND root of trust: the customer org-admin
+    /// Ed25519 public key (32 bytes, 64 lowercase hex chars). It MUST be supplied via a
+    /// separate channel — NEVER extracted from the bundle itself (which would make the
+    /// signature check tautological).
+    ///
+    /// Requires the daemon to be stopped first (`csq daemon stop`); restart after
+    /// install to activate the new policy (`csq daemon start`).
+    #[cfg(feature = "enterprise")]
+    BundleInstall {
+        /// Path to the signed policy bundle JSON file.
+        /// A detached signature sidecar at `<file>.sig` must be present alongside it.
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// The customer org-admin Ed25519 public key (32 bytes, 64 lowercase hex chars).
+        /// This is the out-of-band root of trust for the bundle signature.
+        #[arg(long, value_name = "PUBKEY_HEX")]
+        pubkey: String,
+    },
+
+    /// Compliance report — model-residency enforcement summary (M5).
+    ///
+    /// Reads the signed audit chain and reports, per session, which providers
+    /// were used, their data-residency region, the residency policy that applied,
+    /// and each request's verdict (pass / block), plus whole-store counts and
+    /// whether any blocked request was overridden. Residency enforcement is an
+    /// enterprise feature; the community build reports that it is unavailable.
+    Report {
+        /// Output the residency summary as machine-parseable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Plain-language compliance report — auditor-readable evidence (FR-GOV).
+    ///
+    /// Renders the signed audit chain into a human-readable document distinguishing
+    /// governed decisions (pass / block / override-with-justification, residency
+    /// verdicts) from lifecycle operations, grounded in the verified canonical
+    /// records — never re-deriving facts, only presenting verified ones. The
+    /// header states the chain's verification verdict so the document is honest
+    /// about whether the facts come from a chain that verified end-to-end.
+    /// Governed decisions are produced by the enterprise Phase-2b interactive
+    /// enforcement session; a community-edition chain carries only the lifecycle
+    /// section.
+    ComplianceReport {
+        /// Output format for the report document.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Md)]
+        format: ReportFormat,
+
+        /// Write the report to this file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+/// Render format for `csq audit compliance-report`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportFormat {
+    /// Markdown (default) — portable, diff-able, greppable.
+    Md,
+    /// Self-contained HTML document.
+    Html,
 }
 
 #[derive(Subcommand, Debug)]
@@ -730,8 +962,9 @@ enum InspectCmd {
     /// FR-DISP-* family). Used by harness fixtures + cross-process
     /// determinism tests.
     Translate {
-        /// Which Surface translator to invoke.
-        #[arg(value_parser = ["claude-code", "codex", "gemini"])]
+        /// Which Surface translator to invoke. Accepts the `cc` alias for
+        /// `claude-code` (consistent with the top-level `csq translate`).
+        #[arg(value_parser = ["cc", "claude-code", "codex", "gemini"])]
         surface: String,
         /// Start the discovery walk from this path instead of CWD.
         #[arg(long)]
@@ -874,6 +1107,33 @@ enum ModelsCmd {
     },
 }
 
+/// Enforce the enterprise license gate before an enterprise-only op (W4, journal
+/// 0004). Inert while the license key is the seed-2 placeholder
+/// (`csq_core::license::is_placeholder_key`); once the real Foundation license key
+/// is baked, a missing / invalid / expired license surfaces here as a
+/// `license_required` error instead of running the op.
+///
+/// Call sites (W4): the enterprise CLI admin arms (`mcp-proxy`, `audit
+/// bundle-install`) AND the enterprise CLI moat entrypoints (`emit_eatp_genesis`
+/// for `audit init`, `report_residency` for `audit report`) — gating at the moat
+/// entrypoint covers the op regardless of the caller.
+///
+/// **NOT yet gated (W5, paired with the real key + use-only distribution):** the
+/// daemon-hosted governance / audit / EATP stack brought up by `csq daemon start`
+/// (`commands::daemon::handle_start` → `kailash_governor::make_governor_factory`
+/// etc.), the enterprise `csq run` surfaces, and the desktop enterprise surface.
+/// The gate is inert today, so no enterprise op runs differently; W5 wires these
+/// remaining surfaces when the real key lands and enforcement actually bites.
+#[cfg(feature = "enterprise")]
+pub(crate) fn enforce_enterprise_license(base_dir: &std::path::Path) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    csq_core::license::enforce(base_dir, now)
+        .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message.as_str()))
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -889,6 +1149,14 @@ pub fn run() -> Result<()> {
         ignore_cli_version: false,
         no_auto_update_cli: false,
         no_audit: false,
+        #[cfg(feature = "native-harness")]
+        native: false,
+        #[cfg(feature = "native-harness")]
+        native_model: None,
+        #[cfg(feature = "native-harness")]
+        governance: "on".to_string(),
+        #[cfg(feature = "native-harness")]
+        bench_json: false,
         rest: cli.rest,
     });
 
@@ -905,7 +1173,7 @@ pub fn run() -> Result<()> {
     //                       the trace dir computed by trace_file::trace_log_path)
     //
     // The count-gated and trace-file Layers are independent — `--trace`
-    // never lifts the stderr ceiling. See journal 0077 (Q4 resolution).
+    // never lifts the stderr ceiling. See an internal journal entry (Q4 resolution).
     let ceiling_mode = if matches!(&command, Command::Run { debug: true, .. }) {
         CeilingMode::Debug
     } else {
@@ -967,6 +1235,14 @@ pub fn run() -> Result<()> {
             ignore_cli_version,
             no_auto_update_cli,
             no_audit,
+            #[cfg(feature = "native-harness")]
+            native,
+            #[cfg(feature = "native-harness")]
+            native_model,
+            #[cfg(feature = "native-harness")]
+            governance,
+            #[cfg(feature = "native-harness")]
+            bench_json,
             rest,
         } => {
             let account_num = match account {
@@ -975,6 +1251,19 @@ pub fn run() -> Result<()> {
                 ),
                 None => None,
             };
+            // Native governed loop dispatch (P0-B) — enterprise-only; routes
+            // before the CLI-spawn surface logic.
+            #[cfg(feature = "native-harness")]
+            if native {
+                return commands::run::handle_native(
+                    &base_dir,
+                    account_num,
+                    native_model.as_deref(),
+                    &governance,
+                    bench_json,
+                    &rest,
+                );
+            }
             // M7 (2026-05-17): default flipped from opt-in to
             // auto-engage. Explicit flags still win; the no-flag
             // path is now `AutoDefault` (engage iff `.coc/` found —
@@ -1005,6 +1294,36 @@ pub fn run() -> Result<()> {
         Command::Status => commands::status::handle(&base_dir, json),
         Command::Suggest => commands::suggest::handle(&base_dir),
         Command::Statusline => commands::statusline::handle(&base_dir),
+        Command::Exec {
+            prompt,
+            stdin,
+            slot,
+            provider,
+            model,
+            system,
+            id,
+            timeout,
+        } => {
+            let claude_home = commands::claude_home()?;
+            commands::exec::handle(
+                &base_dir,
+                &claude_home,
+                commands::exec::ExecArgs {
+                    prompt,
+                    stdin,
+                    provider,
+                    slot,
+                    model,
+                    system,
+                    id,
+                    timeout_secs: timeout,
+                },
+            )
+        }
+        Command::Sdk { command } => match command {
+            SdkCommands::Capabilities => commands::exec::handle_capabilities(),
+        },
+        Command::KeychainSync => commands::keychain_sync::handle(&base_dir),
         Command::Login {
             account,
             provider,
@@ -1112,7 +1431,8 @@ pub fn run() -> Result<()> {
         Command::Doctor {
             slot,
             repair_identities,
-        } => commands::doctor::handle(&base_dir, json, slot, repair_identities),
+            check_token_owners,
+        } => commands::doctor::handle(&base_dir, json, slot, repair_identities, check_token_owners),
         Command::Probe { slot, all } => {
             if slot.is_none() && !all {
                 return Err(anyhow::anyhow!(
@@ -1149,7 +1469,10 @@ pub fn run() -> Result<()> {
             UpdateCmd::Check => commands::update::check(),
             UpdateCmd::Install => commands::update::install(),
         },
-        Command::Repair { apply } => commands::repair::handle(&base_dir, apply),
+        Command::Repair {
+            apply,
+            heal_contaminated,
+        } => commands::repair::handle(&base_dir, apply, heal_contaminated),
         Command::Completions { shell } => {
             commands::completions::handle(shell);
             Ok(())
@@ -1172,6 +1495,29 @@ pub fn run() -> Result<()> {
                 keywords,
             },
         ),
+        #[cfg(feature = "enterprise")]
+        Command::McpProxy {
+            envelope,
+            cli,
+            server_cmd,
+        } => {
+            // Enterprise op — gate on the license before spawning the proxy (W4).
+            enforce_enterprise_license(&base_dir)?;
+            // The proxy propagates the real MCP server's exit code verbatim, like
+            // the `csq run` spawn path — `process::exit` (not a `Result` return) so
+            // the parent CLI sees the child's code. The proxy already reaped the
+            // child and flushed each line; flush stdout once more before the
+            // Drop-bypassing exit.
+            use std::io::Write as _;
+            let code = commands::mcp_proxy::run(
+                &base_dir,
+                envelope.as_deref(),
+                cli.as_deref(),
+                &server_cmd,
+            );
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        }
         Command::Inspect { target } => match target {
             InspectCmd::Coc {
                 debug,
@@ -1195,6 +1541,14 @@ pub fn run() -> Result<()> {
                 },
             ),
         },
+        Command::Translate { surface, start } => commands::inspect_coc::handle_translate(
+            &base_dir,
+            commands::inspect_coc::TranslateOptions {
+                surface,
+                json,
+                start,
+            },
+        ),
         Command::Audit { command } => match command {
             AuditCmd::Init => commands::audit::handle_init(&base_dir),
             AuditCmd::RotateKey { reason } => {
@@ -1211,6 +1565,9 @@ pub fn run() -> Result<()> {
             }
             AuditCmd::MigrateKeys => commands::audit::handle_migrate_keys(&base_dir),
             AuditCmd::Repair { apply } => commands::audit::handle_repair(&base_dir, apply),
+            AuditCmd::Intent { state } => {
+                commands::audit::handle_intent(&base_dir, state.as_deref())
+            }
             AuditCmd::Export { since, until, out } => commands::audit::handle_export(
                 &base_dir,
                 since.as_deref(),
@@ -1233,6 +1590,20 @@ pub fn run() -> Result<()> {
                 activation_seq,
             } => commands::roster::handle_roster_install(&base_dir, &file, activation_seq),
             AuditCmd::RosterShow => commands::roster::handle_roster_show(&base_dir),
+            #[cfg(feature = "enterprise")]
+            AuditCmd::BundleInstall { file, pubkey } => {
+                // Enterprise op — gate on the license before installing the bundle (W4).
+                enforce_enterprise_license(&base_dir)?;
+                commands::bundle::handle_bundle_install(&base_dir, &file, &pubkey)
+            }
+            AuditCmd::Report { json } => commands::audit::handle_report(&base_dir, json),
+            AuditCmd::ComplianceReport { format, out } => {
+                commands::audit::handle_compliance_report(
+                    &base_dir,
+                    matches!(format, ReportFormat::Html),
+                    out.as_deref(),
+                )
+            }
         },
     }
 }
@@ -1287,7 +1658,7 @@ mod tests {
         }
     }
 
-    /// Stage 2 of journal 0048: `csq login N --provider gemini`
+    /// Stage 2 of an internal journal entry: `csq login N --provider gemini`
     /// shells out to `gemini auth login` (Code Assist OAuth path C).
     /// A regression in the parser's value_parser allowlist would
     /// silently drop this path; this test pins the value as accepted.

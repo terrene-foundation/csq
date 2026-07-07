@@ -1,5 +1,5 @@
 <!--
-  Phase B' (journal 0050 D5) — pay-per-token usage display.
+  Phase B' (an internal journal entry D5) — pay-per-token usage display.
 
   Renders for accounts whose `quota_kind === 'unknown'` (DeepSeek, Ollama,
   any future pay-per-token catalog entry). Replaces the 5h/7d UsageBar pair
@@ -36,7 +36,15 @@
     unestimated_cost_count: number;
   }
 
-  let { account, baseDir }: { account: number; baseDir: string } = $props();
+  // `hideWhenEmpty`: when true, render NOTHING if the slot has no recorded
+  // usage (instead of the "Run csq run N…" placeholder). Used by the balance
+  // card (DeepSeek), which already shows the remaining balance — an empty
+  // ledger placeholder there is noise, not signal.
+  let {
+    account,
+    baseDir,
+    hideWhenEmpty = false,
+  }: { account: number; baseDir: string; hideWhenEmpty?: boolean } = $props();
 
   let summary = $state<UsageSummary | null>(null);
   let loadError = $state<string | null>(null);
@@ -76,6 +84,16 @@
   }
 </script>
 
+{#if hideWhenEmpty && loadError == null && summary != null && summary.event_count === 0}
+  <!--
+    Balance card (hideWhenEmpty) with no recorded usage: render NOTHING —
+    not even the wrapper div — so no empty padded box paints below the
+    balance row (redteam #984 L2). The balance row already carries the signal.
+    The `loadError == null` guard keeps a future poll error surfacing through
+    the inner {#if loadError} branch rather than being swallowed by this gate
+    (forward-looking: today load() fires once per mount, so unreachable).
+  -->
+{:else}
 <div class="billing-ledger" data-testid="billing-ledger">
   {#if loadError}
     <div class="ledger-error" title={loadError}>usage data unavailable</div>
@@ -108,6 +126,7 @@
     {/if}
   {/if}
 </div>
+{/if}
 
 <style>
   .billing-ledger {

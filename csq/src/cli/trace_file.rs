@@ -1,6 +1,6 @@
 //! Per-pid trace log file Layer for `csq run --trace` (PR-CA11c T6).
 //!
-//! Spec: workspaces/csq-as-cli/02-plans/05-pr-ca11-implementation-plan.md § Group 3 T6.
+//! Spec: internal-design-docs § Group 3 T6.
 //!
 //! When the user passes `--trace`, csq-cli opens a fresh log file at
 //! `<base>/csq-runs/.trace/<pid>-<ts>.log` and installs this Layer

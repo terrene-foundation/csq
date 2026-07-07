@@ -265,6 +265,7 @@ fn build_matrix_record(
         eatp_start_ts: None,
         eatp_end_ts: None,
         op_phase: None, // STATE record — no op_phase envelope
+        verification_level: None,
     })
 }
 
@@ -505,6 +506,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(bootstrap, Some(base.path())).expect("bootstrap chain genesis");
 
@@ -713,6 +715,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(seed, Some(base.path())).expect("seed write must succeed");
 
@@ -782,6 +785,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(seed, Some(base.path())).unwrap();
 

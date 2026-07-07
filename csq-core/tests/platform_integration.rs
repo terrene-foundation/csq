@@ -101,9 +101,24 @@ fn try_lock_returns_none_when_held_cross_process() {
 
 #[test]
 fn atomic_replace_no_partial_reads() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    // The invariant under test: a concurrent reader of `target` NEVER observes a
+    // torn/partial write — it always sees either the prior complete content or a
+    // complete new payload (the assertion in the reader loop). The previous version
+    // ran the workers for a fixed `sleep(500ms)` and then asserted `reads > 0`; on a
+    // contended CI host (notably Windows) the reader thread could be starved and
+    // complete zero reads inside that window, flaking the guard with no real defect.
+    // Fix: drive the run by a DETERMINISTIC read count — wait until the reader has
+    // completed `MIN_READS` well-formed reads (proving it exercised the path under
+    // contention), bounded by a generous safety deadline that only trips on genuine
+    // starvation. No fixed-window sleep → no scheduler-timing flake. (Discipline:
+    // ordering/count-proof, not an elapsed lower bound.)
+    const MIN_READS: u64 = 200;
+    const DEADLINE: Duration = Duration::from_secs(30);
 
     let dir = TempDir::new().unwrap();
     let target = dir.path().join("contended.txt");
@@ -111,9 +126,10 @@ fn atomic_replace_no_partial_reads() {
 
     let target_arc = Arc::new(target.clone());
     let dir_path = Arc::new(dir.path().to_path_buf());
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
 
-    // Writer threads: continuously replace the file
+    // Writer threads: continuously replace the file under contention.
     let writer_handles: Vec<_> = (0..4)
         .map(|i| {
             let target = Arc::clone(&target_arc);
@@ -121,7 +137,7 @@ fn atomic_replace_no_partial_reads() {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 let mut iter = 0u64;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                while !stop.load(Ordering::Relaxed) {
                     let payload = format!("w{i}_{iter:08}");
                     let tmp = dir_path.join(format!("wr_{i}_{iter}.tmp"));
                     fs::write(&tmp, &payload).unwrap();
@@ -132,32 +148,46 @@ fn atomic_replace_no_partial_reads() {
         })
         .collect();
 
-    // Reader thread: continuously reads the file and checks for partial content
+    // Reader thread: reads `target` and asserts well-formed content on every read,
+    // publishing its progress through the shared `reads` counter so the main thread
+    // can wait on a deterministic threshold rather than a fixed sleep.
     let reader_target = Arc::clone(&target_arc);
     let reader_stop = Arc::clone(&stop);
+    let reader_reads = Arc::clone(&reads);
     let reader = thread::spawn(move || {
-        let mut reads = 0u64;
-        while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+        while !reader_stop.load(Ordering::Relaxed) {
             if let Ok(content) = fs::read_to_string(&*reader_target) {
-                // Content must be well-formed: either "initial_value" or "wN_NNNNNNNN"
+                // Content must be well-formed: either "initial_value" or "wN_NNNNNNNN".
                 assert!(
                     content == "initial_value" || (content.starts_with('w') && content.len() >= 4),
                     "partial read detected: {content:?}"
                 );
-                reads += 1;
+                reader_reads.fetch_add(1, Ordering::Relaxed);
             }
         }
-        reads
     });
 
-    thread::sleep(Duration::from_millis(500));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Run until the reader has completed MIN_READS well-formed reads (each ran the
+    // torn-read assertion), or fail loudly if it is starved past the deadline.
+    let deadline = Instant::now() + DEADLINE;
+    while reads.load(Ordering::Relaxed) < MIN_READS {
+        assert!(
+            Instant::now() < deadline,
+            "reader starved: only {} reads in {:?} under contention",
+            reads.load(Ordering::Relaxed),
+            DEADLINE,
+        );
+        thread::yield_now();
+    }
+    stop.store(true, Ordering::Relaxed);
 
     for h in writer_handles {
         h.join().unwrap();
     }
-    let reads = reader.join().unwrap();
-    assert!(reads > 0, "reader should have completed at least one read");
+    reader.join().unwrap();
+    // Reaching here means the reader observed >= MIN_READS complete (never torn)
+    // values while four writers hammered `atomic_replace` on the same target.
+    assert!(reads.load(Ordering::Relaxed) >= MIN_READS);
 }
 
 // ── Secure file permissions ───────────────────────────────────────────

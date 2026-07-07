@@ -12,7 +12,7 @@
 //! that `exchange_code` already takes — see
 //! [`oauth_e2e::fake_transport`].
 //!
-//! Component-level tests (1594 of them as of PR #213) cover each
+//! Component-level tests (1594 of them as of an internal ticket) cover each
 //! piece in isolation. This harness wires them together so a future
 //! refactor that breaks the integration — without breaking any
 //! component test — fails CI here.

@@ -2,8 +2,8 @@
 //! gemini-cli OAuth state at `~/.gemini/oauth_creds.json` and records
 //! a binding marker in `CodeAssistOAuth` mode.
 //!
-//! Stage 2 of journal 0048, **rewritten for gemini-cli v0.41.2+**
-//! (journal 0054). gemini-cli v0.41.2 removed the `gemini auth login`
+//! Stage 2 of an internal journal entry, **rewritten for gemini-cli v0.41.2+**
+//! (an internal journal entry). gemini-cli v0.41.2 removed the `gemini auth login`
 //! subcommand: positional args now default to interactive mode and
 //! `gemini auth login` is parsed as a prompt to the model rather than
 //! an OAuth subcommand. There is no longer ANY non-interactive surface
@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 // with `env_clear()` + a strict allowlist of browser-open env vars
 // (HOME/PATH/DISPLAY/WAYLAND_DISPLAY/...) so OAuth tokens / API keys
 // from the parent shell could not leak into the child gemini process.
-// Journal 0054 removed the shell-out: there is no longer a child
+// an internal journal entry removed the shell-out: there is no longer a child
 // process to env-scrub. The allowlist had no remaining caller and
 // `#[allow(dead_code)]` on it (with a "for future re-introduction"
 // comment) is the deferred-implementation pattern that
@@ -58,14 +58,14 @@ use std::path::{Path, PathBuf};
 //
 // If gemini-cli ever restores a non-interactive auth surface, the
 // security analysis (round-1 + round-2 redteam MED) is preserved in
-// journal 0054 and can be reconstructed by listing the env vars
+// an internal journal entry and can be reconstructed by listing the env vars
 // gemini-cli's documented "browser-open" needs vs the workspace's
 // known-secret-bearing env vars.
 
 /// Errors raised by the Code Assist OAuth binding flow.
 #[derive(Debug, thiserror::Error)]
 pub enum OauthLoginError {
-    /// `~/.gemini/oauth_creds.json` is absent. Per journal 0054, the
+    /// `~/.gemini/oauth_creds.json` is absent. Per an internal journal entry, the
     /// user must run `gemini` once interactively (gemini-cli's first-run
     /// prompt), select "Sign in with Google", complete the browser
     /// OAuth flow, and quit. Then re-run `csq login N --provider gemini`.
@@ -155,7 +155,7 @@ pub enum OauthLoginError {
 /// Verifies the user's prior interactive gemini-cli OAuth state and
 /// writes a Code Assist OAuth binding marker for the slot.
 ///
-/// **Behavioral change from Stage 2 of journal 0048** (journal 0054
+/// **Behavioral change from Stage 2 of an internal journal entry** (an internal journal entry
 /// codifies the regression discovery): csq no longer shells out to
 /// `gemini auth login`. gemini-cli v0.41.2 removed the `auth`
 /// subcommand; positional args default to interactive mode and the
@@ -337,7 +337,7 @@ mod tests {
         AccountNum::try_from(n).unwrap()
     }
 
-    /// Journal 0048 + 0054 — verify the binary-name constant is still
+    /// an internal journal entry + 0054 — verify the binary-name constant is still
     /// importable. csq no longer shells out to gemini-cli from this
     /// module (v0.41.2 removed the auth subcommand), but `spawn::spawn_gemini`
     /// continues to pin the binary name; this assertion stays here as
@@ -405,7 +405,7 @@ mod tests {
             OauthLoginError::GeminiCliNotInstalled.to_string(),
             "gemini-cli not installed: install from https://github.com/google-gemini/gemini-cli"
         );
-        // Journal 0054 — replaced OauthFlowDidNotComplete (was raised
+        // an internal journal entry — replaced OauthFlowDidNotComplete (was raised
         // when `gemini auth login` shell-out exited non-zero; v0.41.2
         // has no such subcommand) with three preflight-check variants.
         let err = OauthLoginError::GeminiOauthCredsNotFound { slot: 13 };
@@ -449,7 +449,7 @@ mod tests {
         );
     }
 
-    /// Journal 0054 — verify_oauth_creds is the new core check.
+    /// an internal journal entry — verify_oauth_creds is the new core check.
     /// Tests cover the three failure modes + the success path.
     #[test]
     fn verify_oauth_creds_succeeds_on_fresh_token() {

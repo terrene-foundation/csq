@@ -208,9 +208,9 @@ pub fn move_lock_path(base: &Path) -> PathBuf {
 /// `pid` is read from the lock file's first line; `None` when the file is
 /// empty or the line cannot be parsed.
 ///
-/// Origin: `workspaces/account-slot-decoupling/journal/0015-RISK-phase3-wbs-redteam-r1-findings-and-adoption.md`
+/// Origin: `internal-design-docs`
 /// § Delta J (SEC-3-H1 0o600 chmod, SEC-3-M2 fail-closed on EROFS) +
-/// `journal/0016-DECISION-owner-resolved-phase3-open-questions-defaults.md`
+/// `an internal journal entry`
 /// § OQ #4 (lock scope: only `csq move`, NOT `csq login`/`csq logout`).
 fn acquire_move_lock(base: &Path) -> Result<MoveLockGuard, MoveError> {
     let lock_path = move_lock_path(base);
@@ -295,7 +295,7 @@ pub fn move_account(
 
     let from_canonical_cc = canonical_path_for(base_dir, from, Surface::ClaudeCode);
     let from_canonical_codex = canonical_path_for(base_dir, from, Surface::Codex);
-    // FM-2 (journal 0001 D5): Gemini was absent from the move surface
+    // FM-2 (an internal journal entry D5): Gemini was absent from the move surface
     // table. `swap_slot_mapping` swaps `by_slot_identity[FROM↔TO]`
     // generically, so after this workspace populates it for Gemini, a
     // `csq move` that did NOT also move `credentials/gemini-<N>.json`
@@ -876,7 +876,7 @@ mod tests {
         assert!(creds_dir.join("codex-12.json").exists());
     }
 
-    /// G5/AC-13 (FM-2, journal 0001 D5): `csq move` MUST rename the
+    /// G5/AC-13 (FM-2, an internal journal entry D5): `csq move` MUST rename the
     /// Gemini binding marker alongside the `by_slot_identity` swap.
     /// Without this, `swap_slot_mapping`'s generic identity swap left a
     /// phantom `by_slot_identity[TO]` pointing at a `gemini-FROM.json`
@@ -1301,7 +1301,7 @@ mod tests {
     /// M3-6 AC-3: `csq move` runs without the daemon. The flow at
     /// `move_slot.rs::move_account` is daemon-independent — IPC notification
     /// is the CLI/desktop renderer's concern, not the core primitive.
-    /// (journal 0015 Delta J, N-4 deep.)
+    /// (an internal journal entry Delta J, N-4 deep.)
     #[test]
     fn move_account_succeeds_when_daemon_is_down() {
         let dir = TempDir::new().unwrap();
@@ -1451,7 +1451,7 @@ mod tests {
         std::fs::write(config_3.join(".current-account"), "3").unwrap();
         std::fs::write(config_3.join(".quota-cursor"), "{}").unwrap();
         // Codex slot-state items (file + dir).
-        std::fs::write(config_3.join("config.toml"), b"# codex").unwrap();
+        std::fs::write(config_3.join("config.toml"), b"# codex").unwrap(); // CI-ALLOW-fs-write-config-toml
         std::fs::create_dir_all(config_3.join("codex-sessions")).unwrap();
         std::fs::write(config_3.join("codex-history.jsonl"), "").unwrap();
 
@@ -1501,7 +1501,7 @@ mod tests {
         let marker = std::fs::read_to_string(handle_dir.join(".csq-account")).unwrap();
         assert_eq!(marker.trim(), "8");
 
-        // C2 regression (workspace slot-attribution-consistency): Step 6b MUST
+        // C2 regression (workspace an internal workspace): Step 6b MUST
         // rewrite `.current-account` to the NEW slot too. The seed wrote
         // config-3/.current-account = "3"; after the 3→8 move it must read "8"
         // through the rewritten handle-dir symlink. Before the fix this stayed
@@ -2051,7 +2051,7 @@ mod tests {
     /// The Windows higher-level serialization is exercised by the
     /// cross-process `move_account_concurrent_invocations_serialize_under_move_lock`
     /// test, which spawns separate threads/processes that DO contend.
-    /// Issue #437.
+    /// an internal ticket.
     #[cfg(unix)]
     #[test]
     fn move_lock_serializes_via_flock() {
@@ -2313,7 +2313,7 @@ mod tests {
         );
     }
 
-    /// M4-9 (release N affordance, issue #292 Phase 4): `csq move`
+    /// M4-9 (release N affordance, an internal ticket Phase 4): `csq move`
     /// MUST NOT populate the v1 `profiles.json::accounts` map. The
     /// move semantic (relocating identity from slot FROM to slot TO)
     /// is now carried entirely by `by_slot` (swapped via
@@ -2376,6 +2376,14 @@ mod tests {
     /// AC-C1 + AC-C2 (move): INTENT seq N < OUTCOME seq N+1; chain verifies.
     #[test]
     fn move_audit_intent_before_outcome_chain_verifies() {
+        // Hermeticity: verify_chain (below) transitively reads CSQ_AUDIT_EDITION;
+        // hold the shared env lock + pin a clean community baseline so this test
+        // cannot race a concurrent enterprise-edition test (testing.md Rule 6 /
+        // test-hermeticity.md MUST 1 — reader side).
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
         let dir = TempDir::new().unwrap();
         make_slot(dir.path(), 3);
         let base = dir.path();

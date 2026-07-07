@@ -112,7 +112,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// SEC-R1-10 / L4.
 const ABORT_GRACE: Duration = Duration::from_millis(50);
 
-/// Lifecycle of an in-flight race. Used by [`RaceSlot::cancel`] to
+/// Lifecycle of an in-flight race. Used by `RaceSlot::cancel` to
 /// suppress spurious `cancelled` events after credentials have
 /// already been persisted. REV-R1-01 / M7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1281,7 +1281,7 @@ async fn finalize_login(
             )
         })?;
 
-        // issue #633 (unregistered race-flow sibling): this exchange-based path
+        // an internal ticket (unregistered race-flow sibling): this exchange-based path
         // has NO `config-N/.claude.json`, so the subprocess-flow helper
         // `ensure_login_identity_minted` (which reads the email from that file)
         // does not apply. This command is currently unregistered (renderer uses
@@ -2558,7 +2558,7 @@ mod tests {
     // pins (credential persistence is decoupled from emit delivery) is
     // platform-independent, so Linux + macOS coverage is sufficient
     // until upstream Tauri's mock_app supports Windows. Tracked as
-    // pre-existing CI failure introduced by PR #213; fixed by this
+    // pre-existing CI failure introduced by an internal ticket; fixed by this
     // commit's Cargo.toml gate + cfg(unix) guard.
     #[cfg(unix)]
     #[tokio::test]

@@ -1744,7 +1744,7 @@ mod tests {
     /// any absolute path, OS username, home-dir layout, or UUID-bearing identity-store
     /// fragment (`security.md` §2). The sibling fix for `ambiguous_binding` (#514) is
     /// the template — slot number is on `ProbeRecord.slot`; `observed_shape` is
-    /// path-free. This test is the AC-1 requirement from issue #516.
+    /// path-free. This test is the AC-1 requirement from an internal ticket.
     ///
     /// Contract: `observed_shape` == `"missing"` (byte-for-byte).
     #[test]
@@ -2205,7 +2205,7 @@ mod tests {
 
     /// Stage a valid Codex slot with BOTH the legacy + identity-store
     /// credential files. Mirrors what `csq login N --provider codex`
-    /// actually produces post-A++ / PR #500: the mint flow writes both
+    /// actually produces post-A++ / an internal ticket: the mint flow writes both
     /// `credentials/codex-<N>.json` (legacy marker) and
     /// `identities/<UUID>/credentials-codex.json` (identity-store) plus
     /// the `profiles.json::by_slot[N] = uuid` mapping. Without the legacy
@@ -2253,7 +2253,7 @@ mod tests {
     // ── #534 M3 tests ─────────────────────────────────────────────────────────
 
     /// M3-2 (F1 + F6): `probe --all` across slots 12 / 16 / 17 (the user's
-    /// empirical slot triple from journal 0001) routed through different
+    /// empirical slot triple from an internal journal entry) routed through different
     /// cells PER SLOT, derived from per-slot credential state. Pre-#534 all
     /// three slots probed against the shared `~/.codex/auth.json` and
     /// returned IDENTICAL records (only `slot` differed). This test pins

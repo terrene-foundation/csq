@@ -9,17 +9,13 @@ pub mod env;
 pub mod error;
 pub mod http;
 pub mod oauth;
-// Phase-2b direct-API provider client infrastructure (enterprise edition only).
-// Compiled only when the `enterprise` feature is active.  Community builds
-// (`cargo build -p csq-core`) MUST NOT depend on this module or any type it
-// exports.  Gate verification: `cargo build -p csq-core` (no --features) must
-// succeed with this declaration present.
 pub mod platform;
 pub mod probe;
 pub mod providers;
 pub mod quota;
 pub mod refresh;
 pub mod rotation;
+pub mod sdk;
 pub mod session;
 pub mod sessions;
 #[cfg(any(test, feature = "test-utils"))]

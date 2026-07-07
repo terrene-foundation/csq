@@ -1,6 +1,6 @@
 //! M13b — shared signed-when-possible emit helper (OD-2 signing posture).
 //!
-//! `emit_intent` / `emit_outcome` encode the OD-2 decision from journal 0031,
+//! `emit_intent` / `emit_outcome` encode the OD-2 decision from an internal journal entry,
 //! with the FIX-1 cutoff-aware signing posture (M13b r1 redteam):
 //!
 //! ## Signing posture (cutoff-aware, two-tier)
@@ -26,7 +26,7 @@
 //! This two-tier posture is the ONLY safe behaviour under a signing cutoff:
 //! unsigned post-cutoff = chain bricked; unsigned pre-cutoff = graceful.
 //!
-//! ## Trust boundary (SEC-1, journal 0031)
+//! ## Trust boundary (SEC-1, an internal journal entry)
 //!
 //! Records emitted via this helper give crash/kill orphan-detection evidence
 //! and external-anchor provenance. They do NOT provide same-user
@@ -501,6 +501,7 @@ fn build_lifecycle_record(
         eatp_start_ts: None,
         eatp_end_ts: None,
         op_phase: Some(op_phase),
+        verification_level: None,
     })
 }
 
@@ -619,6 +620,14 @@ mod tests {
     /// the chain verifies at seq ≥ 1.
     #[test]
     fn intent_outcome_share_correlation_id_and_chain_verifies() {
+        // Hermeticity: verify_chain (below) transitively reads CSQ_AUDIT_EDITION;
+        // hold the shared env lock + pin a clean community baseline so this test
+        // cannot race a concurrent enterprise-edition test (testing.md Rule 6 /
+        // test-hermeticity.md MUST 1 — reader side).
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
         let dir = TempDir::new().unwrap();
         let base = dir.path();
 
@@ -1085,5 +1094,122 @@ mod tests {
             !chain_jsonl.exists(),
             "no chain record must be written when chain is broken (degrade path): {chain_jsonl:?}"
         );
+    }
+
+    // === M3a Acceptance Criterion Tests ===
+
+    /// Helper: read the first record from the chain JSONL after `emit_*`.
+    fn read_first_chain_record(base: &std::path::Path) -> crate::audit::types::SignedRecord {
+        let chain_id = crate::audit::key_custody::ChainState::load(base)
+            .expect("chain state must exist")
+            .chain_id;
+        let jsonl_path = base.join("csq-runs").join(format!("{chain_id}.jsonl"));
+        let content = std::fs::read_to_string(&jsonl_path).expect("chain JSONL must exist");
+        let first_line = content.lines().next().expect("at least one record");
+        serde_json::from_str(first_line).expect("record must deserialize")
+    }
+
+    /// AC-2 — `op_emit_lifecycle_records_carry_auto_approved`.
+    /// Enterprise builds: every record written through `write_record_v2_impl`
+    /// (via `emit_intent` / `emit_outcome`) carries
+    /// `verification_level = AutoApproved`.
+    /// Community builds: the field is absent (None).
+    #[test]
+    fn op_emit_lifecycle_records_carry_auto_approved() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let chain_id = load_chain_id(base);
+        let correlation_id = gen_correlation_id().expect("correlation_id");
+
+        // Write a lifecycle INTENT record.
+        emit_intent(
+            base,
+            &chain_id,
+            crate::audit::types::EventKind::AccountLogout,
+            crate::audit::types::EventPayload::AccountLogout(AccountLogoutPayload {
+                slot: acct(1),
+                orphaned_uuid: None,
+            }),
+            correlation_id,
+        )
+        .expect("emit_intent must succeed");
+
+        let record = read_first_chain_record(base);
+
+        #[cfg(feature = "enterprise")]
+        {
+            use crate::audit::eatp_canonical::VerificationLevel;
+            assert_eq!(
+                record.verification_level,
+                Some(VerificationLevel::AutoApproved),
+                "enterprise: every lifecycle record must carry AutoApproved level; got: {:?}",
+                record.verification_level
+            );
+        }
+
+        #[cfg(not(feature = "enterprise"))]
+        assert_eq!(
+            record.verification_level, None,
+            "community: verification_level must be absent (None); got: {:?}",
+            record.verification_level
+        );
+    }
+
+    /// AC-6 — `op_record_level_is_never_above_auto_approved`.
+    /// The verification level stamped on lifecycle records is ONLY `AutoApproved`.
+    /// `PeerReviewed` and `SignedAttestation` must never appear on records
+    /// emitted by the `op_emit` path.
+    #[test]
+    fn op_record_level_is_never_above_auto_approved() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let chain_id = load_chain_id(base);
+        let correlation_id = gen_correlation_id().expect("correlation_id");
+
+        emit_intent(
+            base,
+            &chain_id,
+            crate::audit::types::EventKind::AccountLogout,
+            crate::audit::types::EventPayload::AccountLogout(AccountLogoutPayload {
+                slot: acct(2),
+                orphaned_uuid: None,
+            }),
+            correlation_id.clone(),
+        )
+        .expect("emit_intent must succeed");
+
+        emit_outcome(
+            base,
+            &chain_id,
+            crate::audit::types::EventKind::AccountLogout,
+            crate::audit::types::EventPayload::AccountLogout(AccountLogoutPayload {
+                slot: acct(2),
+                orphaned_uuid: None,
+            }),
+            correlation_id,
+            crate::audit::types::OpOutcome::Ok,
+        )
+        .expect("emit_outcome must succeed");
+
+        // Read back both records and verify neither has a level above AutoApproved.
+        let chain_id_str = crate::audit::key_custody::ChainState::load(base)
+            .expect("chain state")
+            .chain_id;
+        let jsonl_path = base.join("csq-runs").join(format!("{chain_id_str}.jsonl"));
+        let content = std::fs::read_to_string(&jsonl_path).unwrap();
+        for line in content.lines() {
+            let record: crate::audit::types::SignedRecord =
+                serde_json::from_str(line).expect("record deserializes");
+            match record.verification_level {
+                #[cfg(feature = "enterprise")]
+                Some(crate::audit::eatp_canonical::VerificationLevel::AutoApproved) => {
+                    /* expected */
+                }
+                None => { /* pre-M3a or community — ok */ }
+                other => {
+                    panic!("op_emit must never stamp a level above AutoApproved; got: {other:?}");
+                }
+            }
+        }
     }
 }

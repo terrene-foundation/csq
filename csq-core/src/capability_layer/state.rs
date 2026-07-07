@@ -16,6 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::coc::translate::SurfaceArtifacts;
+
 /// User prompt — the input to the pipeline before any classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserPrompt {
@@ -64,11 +66,17 @@ pub struct PreSpawnState {
     /// MCP tool-name denylist intersection (`.coc/` policy ∩ user
     /// policy per spec 10 §10.8.2).
     pub mcp_filter: McpFilter,
-    /// Per-Surface translator output — `BTreeMap` for determinism by
-    /// type (spec 10 §10.3.5). Real surfaces wired in M2/PR-CA3 (see
-    /// `csq-core::coc::translate`); pipeline integration is the
-    /// `PreSpawnState::translator_output` field.
-    pub translator_output: BTreeMap<String, serde_json::Value>,
+    /// Per-kind flattened artifacts in scope for the target Surface
+    /// (rules / agents / skills / commands), produced by the shared
+    /// `coc::translate::flatten_artifacts` — the SAME flatten the
+    /// scaffold's delivered prose (`scaffold`) is built from. CU1b (issue
+    /// #764) establishes this as the substrate CU3's native-materialization
+    /// leg extends: today only the prose blob is DELIVERED, but the
+    /// per-kind breakdown (with full artifact bodies) is recorded here so
+    /// CU3 can add a native-emit variant without re-architecting the
+    /// pipeline state. Deterministic by construction — each list sorted
+    /// `(precedence DESC, id ASC)` (spec 10 §10.3.5).
+    pub artifacts: SurfaceArtifacts,
 }
 
 /// MCP gate filter — denylisted tool invocation names. The
@@ -158,7 +166,7 @@ mod tests {
         let s = PreSpawnState::default();
         assert!(s.scaffold.is_none());
         assert!(s.mcp_filter.denied.is_empty());
-        assert!(s.translator_output.is_empty());
+        assert!(s.artifacts.is_empty());
     }
 
     #[test]

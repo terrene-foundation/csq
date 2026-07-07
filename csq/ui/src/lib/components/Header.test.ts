@@ -29,7 +29,7 @@ vi.mock("@tauri-apps/api/path", () => ({
 }));
 
 // `getVersion()` backs the dynamic version string rendered in the
-// header (journal 0063 P1-5 replaced the hardcoded alpha.21 literal).
+// header (an internal journal entry P1-5 replaced the hardcoded alpha.21 literal).
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: () => Promise.resolve("2.0.0-test"),
 }));
@@ -157,5 +157,44 @@ describe("Header", () => {
     const trigger = container.querySelector('[data-testid="settings-trigger"]');
     expect(trigger).not.toBeNull();
     expect(trigger?.getAttribute("aria-label")).toBe("Settings");
+  });
+
+  // ── Edition badge (get_build_edition) ─────────────────────────
+
+  it("renders a Community edition badge (no enterprise class)", async () => {
+    setupMocks({ get_build_edition: "community" });
+    const { container } = render(Header);
+    await tick();
+    await tick();
+    await tick();
+    const badge = container.querySelector(".edition");
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent?.trim()).toBe("Community");
+    expect(badge?.classList.contains("enterprise")).toBe(false);
+  });
+
+  it("renders an Enterprise edition badge with the enterprise class", async () => {
+    setupMocks({ get_build_edition: "enterprise" });
+    const { container } = render(Header);
+    await tick();
+    await tick();
+    await tick();
+    const badge = container.querySelector(".edition");
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent?.trim()).toBe("Enterprise");
+    expect(badge?.classList.contains("enterprise")).toBe(true);
+  });
+
+  it("hides the edition badge when get_build_edition rejects", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_build_edition")
+        return Promise.reject(new Error("ipc failure"));
+      return Promise.resolve(mockResponses[cmd]);
+    });
+    const { container } = render(Header);
+    await tick();
+    await tick();
+    await tick();
+    expect(container.querySelector(".edition")).toBeNull();
   });
 });

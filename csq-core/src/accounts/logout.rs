@@ -487,7 +487,7 @@ fn remove_profiles_entry(
 
     // Extract email and UUID before removing so we can clean by_email.
     //
-    // M4-9 (release N affordance, issue #292 Phase 4): the v1
+    // M4-9 (release N affordance, an internal ticket Phase 4): the v1
     // `accounts[N].email` is empty-write in production, so the email
     // source-of-truth shifted to the `by_email` reverse-lookup. We
     // resolve it via the slot's UUID. If a populated `accounts[N]`
@@ -1367,6 +1367,14 @@ mod tests {
     /// the same correlation_id; the chain verifies after both records land.
     #[test]
     fn logout_audit_intent_before_outcome_chain_verifies() {
+        // Hermeticity: verify_chain (below) transitively reads CSQ_AUDIT_EDITION;
+        // hold the shared env lock + pin a clean community baseline so this test
+        // cannot race a concurrent enterprise-edition test (testing.md Rule 6 /
+        // test-hermeticity.md MUST 1 — reader side).
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
         let dir = TempDir::new().unwrap();
         provision_account(dir.path(), 3);
         let base = dir.path();

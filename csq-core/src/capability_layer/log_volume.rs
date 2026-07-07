@@ -1,7 +1,7 @@
 //! Log-volume gate primitives for the capability-layer + binary-wide
 //! tracing surface (PR-CA11c T5).
 //!
-//! Spec: workspaces/csq-as-cli/02-plans/05-pr-ca11-implementation-plan.md § 0.5 + § Group 3 T5.
+//! Spec: internal-design-docs § 0.5 + § Group 3 T5.
 //! NFR: NFR-OBS-01 (≤ 10 events default per `csq run`; ≤ 50 with `--debug`).
 //!
 //! This module is the stdlib-only primitive layer. The
@@ -20,7 +20,7 @@
 //! fn run`; zero `tokio::spawn` in the stage implementations) confirms
 //! the whole `csq run` invocation runs on a single OS thread. Pure
 //! `thread_local!` therefore covers the full lifecycle of one `csq run`
-//! invocation — see journal 0077 (PR-CA11c R1 Q3 resolution).
+//! invocation — see an internal journal entry (PR-CA11c R1 Q3 resolution).
 //!
 //! # Reentrancy and the ceiling-notice
 //!
@@ -61,7 +61,7 @@ thread_local! {
 
 /// Volume mode for the gate. `--trace` does NOT pick a different
 /// ceiling here — `--trace` adds an unbounded trace-file Layer alongside
-/// the count-gated stderr Layer. See journal 0077 (Q4 resolution).
+/// the count-gated stderr Layer. See an internal journal entry (Q4 resolution).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CeilingMode {
     /// 10 events (NFR-OBS-01 default).

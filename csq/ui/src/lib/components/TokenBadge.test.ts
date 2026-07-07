@@ -56,7 +56,7 @@ describe("TokenBadge", () => {
     expect(container.textContent).toContain("2d");
   });
 
-  // journal 0062 Q3: the 1h–2h pending-refresh band must read as a live
+  // an internal journal entry Q3: the 1h–2h pending-refresh band must read as a live
   // minute countdown, not a static "1h" that looks stuck.
   it("shows minutes (not 1h) through the final 2h band", () => {
     const { container } = render(TokenBadge, {

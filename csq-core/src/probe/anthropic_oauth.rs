@@ -7,7 +7,7 @@
 //! 2. Body parses as JSON object.
 //! 3. Body has both `five_hour` and `seven_day` keys, each an object.
 //! 4. Each window object has `utilization` (f64) AND `resets_at` (RFC3339).
-//! 5. `0.0 <= utilization <= 100.0` (the 5800% bug from journal 0028
+//! 5. `0.0 <= utilization <= 100.0` (the 5800% bug from an internal journal entry
 //!    was a missing-multiply inversion; a value > 100 means a regression).
 //! 6. `resets_at` parses as a UTC timestamp in the future (`> now()`).
 
@@ -44,7 +44,7 @@ pub(super) fn probe_with_token(
     let extra_headers = [("Anthropic-Beta", ANTHROPIC_BETA_HEADER)];
 
     // Use the Node-bridge transport — direct reqwest is body-stripped
-    // by Cloudflare on api.anthropic.com (journal csq-v2/0056). Same
+    // by Cloudflare on api.anthropic.com (journal an internal workspace/0056). Same
     // transport the daemon's usage poller uses.
     let result = http::get_bearer_node(ENDPOINT_URL, token, &extra_headers);
     let elapsed_ms = started.elapsed().as_millis() as u64;

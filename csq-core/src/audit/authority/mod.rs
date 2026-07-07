@@ -24,15 +24,15 @@
 //!
 //! # Modules
 //!
-//! - [`op_class`]: `OpClass` enum (KeyRotate, IdentityMint, ReleaseAuth) and
+//! - `op_class`: `OpClass` enum (KeyRotate, IdentityMint, ReleaseAuth) and
 //!   `from_event_kind` mapper.
-//! - [`grant`]: `EnrolledKey` (pubkey + validity window), `PactDefinition`
+//! - `grant`: `EnrolledKey` (pubkey + validity window), `PactDefinition`
 //!   (PACT-D envelope), `AuthorityGrant` (keys + envelope).
-//! - [`registry`]: `AuthorityRegistry` trait, `LocalOperatorRegistry`
+//! - `registry`: `AuthorityRegistry` trait, `LocalOperatorRegistry`
 //!   (community), `EnterpriseRegistry` (wrapper), `resolve_registry` factory.
-//! - [`roster`]: `Roster`, `RosterEntry`, `SignedRoster`, `RosterFileRegistry`,
+//! - `roster`: `Roster`, `RosterEntry`, `SignedRoster`, `RosterFileRegistry`,
 //!   `save_roster`, path helpers.
-//! - [`error`]: `AuthorityError` (#[non_exhaustive]).
+//! - `error`: `AuthorityError` (`#[non_exhaustive]`).
 //!
 //! # Op-class scoping (PRIMARY METHODOLOGICAL DIRECTIVE)
 //!
@@ -73,7 +73,7 @@
 //! defended boundary because (a) the roster is org-root-signed, so an FS-write
 //! attacker cannot forge a valid replacement; (b) rollback additionally
 //! requires a compromised revoked member key; (c) the FS-based floor catches
-//! naive rollback. Keychain-anchoring the floor is tracked in issue #694.
+//! naive rollback. Keychain-anchoring the floor is tracked in an internal ticket.
 //!
 //! # LDAP/AD source
 //!

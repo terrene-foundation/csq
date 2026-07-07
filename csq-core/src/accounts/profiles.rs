@@ -34,7 +34,7 @@ use std::path::Path;
 /// Used internally to source the OAuth email from the authenticated credential
 /// record rather than from the `by_email` map (which could be polluted if a
 /// rename label happened to equal another slot's OAuth email — the C2 class
-/// of cross-contamination from journal 0029).
+/// of cross-contamination from an internal journal entry).
 fn read_oauth_email_from_cred(cred_path: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(cred_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -422,7 +422,7 @@ pub fn resolve_slot_to_uuid(base_dir: &Path, slot: u16) -> Option<IdentityId> {
 /// OAuth slots) back to a numeric slot. Without it, a UUID marker has no
 /// numeric channel and the (drift-prone) `.current-account` cache became
 /// load-bearing — the root cause of the `csq swap N` → wrong-slot bug
-/// (workspace `slot-attribution-consistency`).
+/// (workspace `an internal workspace`).
 ///
 /// Only `by_slot` (slot→UUID, Anthropic OAuth) is searched. `by_slot_identity`
 /// holds human-readable labels (`"codex-8/3bf322e8"`, `"apikey:mm"`), NOT
@@ -461,7 +461,7 @@ pub fn resolve_uuid_to_slot(base_dir: &Path, uuid: IdentityId) -> Option<crate::
 /// (`audit_coexistence`, which takes the first) and `csq repair`
 /// (`scan_attribution`, which repairs all) so the two surfaces cannot drift
 /// apart (`reconciler-cleanup-parity.md` Rule 4 — one keep-set across
-/// consumers). Workspace slot-attribution-consistency.
+/// consumers). Workspace an internal workspace.
 pub fn current_account_drifts(base_dir: &Path) -> Vec<(u16, u16)> {
     let mut slots: Vec<u16> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(base_dir) {
@@ -623,6 +623,25 @@ pub fn set_slot_label(
         .by_slot_label
         .insert(slot.to_string(), label.to_string());
     save(&path, &profiles)
+}
+
+/// Returns the user-chosen rename label for `slot` from the `by_slot_label`
+/// channel, if one is set.
+///
+/// `by_slot_label` is the highest-precedence display name: `csq rename` and the
+/// desktop rename command write here (via [`set_slot_label`]), so it MUST win
+/// over every provider-derived default (OAuth email, `codex-N`, `gemini-N`, the
+/// 3P provider name). Anthropic OAuth slots already honor it through
+/// [`ProfilesFile::get_email`] step 1; this accessor lets the Codex / Gemini /
+/// 3P discovery branches — which do NOT route through `get_email` — apply the
+/// same "user rename wins" precedence.
+///
+/// Returns `None` (no rename) when profiles.json is missing/unreadable or the
+/// slot has no `by_slot_label` entry. Never invents a label.
+#[must_use]
+pub fn slot_rename_label(base_dir: &Path, slot: u16) -> Option<String> {
+    let profiles = load(&profiles_path(base_dir)).ok()?;
+    profiles.by_slot_label.get(&slot.to_string()).cloned()
 }
 
 /// Sets the identity-class label for a slot in `by_slot_identity`.
@@ -1336,7 +1355,7 @@ pub enum CoexistenceState {
 /// `Vec<ConsistencyState>` — an empty vec is the consistent signal (there is
 /// deliberately no `Consistent` variant: `[Consistent]` would be incoherent
 /// and a single-issue field re-creates the unmask treadmill this list shape
-/// exists to end). See `workspaces/doctor-consistency-audit/journal/0001`.
+/// exists to end). See `internal-design-docs`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "PascalCase")]
 pub enum ConsistencyState {
@@ -1381,7 +1400,7 @@ pub enum ConsistencyState {
     /// `csq swap N` surface `cached` in the statusline instead of N.
     /// `snapshot_account` self-heals this lazily; this surfaces it for
     /// `csq repair`. Returns the FIRST drifted slot found. (Workspace
-    /// slot-attribution-consistency, M5/H3.)
+    /// an internal workspace, M5/H3.)
     CurrentAccountDrift { slot: u16, cached: u16 },
     // NOTE: a `DualMapSlot` variant (slot present in both `by_slot` and
     // `by_slot_identity`) was prototyped and REMOVED (2026-06-01). That is the
@@ -1586,7 +1605,7 @@ pub fn audit_coexistence(base: &Path) -> Result<IdentityStoreReport, crate::erro
     // Collect one entry per detected issue KIND into a Vec rather than
     // returning on the first — `csq doctor` surfaces every kind at once, so
     // fixing one stale predicate can no longer hide a different one (the
-    // cross-predicate "unmask treadmill" — doctor-consistency-audit journal
+    // cross-predicate "unmask treadmill" — an internal workspace journal
     // 0001). Each check still uses `find` (first instance of its kind) to
     // keep the list bounded; an empty Vec means consistent.
     let mut consistency: Vec<ConsistencyState> = match &state {
@@ -1618,11 +1637,11 @@ pub fn audit_coexistence(base: &Path) -> Result<IdentityStoreReport, crate::erro
             }
 
             // Issue — orphan legacy slot (config-N/ but no recovery
-            // channel). FM-1 (journal 0001 D4): the original predicate
+            // channel). FM-1 (an internal journal entry D4): the original predicate
             // tested ONLY `by_slot` (the OAuth UUID map), so every
             // non-OAuth slot (3P API-key, Codex, Gemini) was a false
-            // `OrphanLegacySlot` candidate even after PR #500 shipped the
-            // `by_slot_identity` recovery channel — a pre-existing PR #500
+            // `OrphanLegacySlot` candidate even after an internal ticket shipped the
+            // `by_slot_identity` recovery channel — a pre-existing an internal ticket
             // defect (verified on the maintainer host: slots 9/11/12/14
             // carry `by_slot_identity` yet were orphan-flagged). A slot is
             // recovery-backed (NOT an orphan) when ANY holds:
@@ -1637,7 +1656,7 @@ pub fn audit_coexistence(base: &Path) -> Result<IdentityStoreReport, crate::erro
             //       synchronously in the same lock as the bind, so (b)
             //       fully covers them. A genuine orphan (no by_slot, no
             //       by_slot_identity, no binding — e.g. slot 10) stays
-            //       correctly flagged → owned by slot-10-orphan-investigation.
+            //       correctly flagged → owned by an internal workspace.
             // A slot is an orphan when it is NOT recovery-backed by any
             // identity channel. The three-way predicate (by_slot ∪
             // by_slot_identity ∪ regular-file gemini-<N>.json marker) lives
@@ -1720,7 +1739,7 @@ pub fn audit_coexistence(base: &Path) -> Result<IdentityStoreReport, crate::erro
             // too, so it tripped on every multi-slot host, AND both its
             // comparisons are fully redundant with the per-slot
             // OrphanIdentity / OrphanLegacySlot / Missing* checks above.
-            // See workspaces/doctor-consistency-audit/01-analysis predicate 5.
+            // See internal-design-docs predicate 5.
 
             // (A `DualMapSlot` check — slot in both by_slot and by_slot_identity
             // — was prototyped and REMOVED: that is the NORMAL codex-slot shape,
@@ -2384,7 +2403,7 @@ mod tests {
         }
     }
 
-    /// §5a regression (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `save` fails after the tmp
     /// file would have been created (parent dir read-only → write
     /// fails), no `.tmp.` file must remain on disk.
@@ -2531,6 +2550,25 @@ mod tests {
             !loaded.by_slot_label.contains_key("1"),
             "by_slot_label[1] must remain absent"
         );
+    }
+
+    #[test]
+    fn slot_rename_label_returns_by_slot_label_entry_or_none() {
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        set_slot_label(&lock, dir.path(), 9, "renamed-codex").unwrap();
+        drop(lock);
+
+        assert_eq!(
+            slot_rename_label(dir.path(), 9).as_deref(),
+            Some("renamed-codex"),
+            "slot_rename_label must surface the by_slot_label entry"
+        );
+        // A slot with no rename returns None (never invents a label).
+        assert_eq!(slot_rename_label(dir.path(), 8), None);
+        // Missing profiles.json → None, not an error.
+        let empty = TempDir::new().unwrap();
+        assert_eq!(slot_rename_label(empty.path(), 1), None);
     }
 
     /// M4-13: `get_email` uses a 2-step resolution (by_slot_label FIRST,
@@ -2971,7 +3009,7 @@ mod tests {
         // `oauthAccount.emailAddress` (CC backfills it only on first API
         // call). Arm 3 MUST resolve via by_email reverse-lookup (mirroring
         // get_email step 3), independent of the cred file. A cred-file
-        // predicate would silently never fire here — the bug journal 0064
+        // predicate would silently never fire here — the bug an internal journal entry
         // round-2 fixed; this test is the anti-fixture-masking regression.
         save(&profiles_path(dir.path()), &pf).unwrap();
 
@@ -3213,7 +3251,7 @@ mod tests {
         );
     }
 
-    /// slot-attribution-consistency M5: `CurrentAccountDrift` fires when a
+    /// an internal workspace M5: `CurrentAccountDrift` fires when a
     /// `config-N/.current-account` holds a slot id ≠ N (the reported bug's
     /// on-disk shape). Absent `.current-account` is NOT drift.
     #[cfg(any(test, feature = "test-utils"))]
@@ -3407,7 +3445,7 @@ mod tests {
         }
     }
 
-    /// G4/AC-7 (FM-1, journal 0001 D4): a `config-N/` slot with a
+    /// G4/AC-7 (FM-1, an internal journal entry D4): a `config-N/` slot with a
     /// `by_slot_identity[N]` entry (3P/Codex/Gemini recovery channel) OR
     /// #578: direct contract test for the canonical `is_slot_recovery_backed`
     /// predicate shared by `audit_coexistence`, `detect_decimal_marker`, and
@@ -3459,7 +3497,7 @@ mod tests {
     }
 
     /// a `credentials/gemini-N.json` binding marker is NOT a false
-    /// `OrphanLegacySlot`. This is the pre-existing PR #500 defect fix —
+    /// `OrphanLegacySlot`. This is the pre-existing an internal ticket defect fix —
     /// verified on the maintainer host where slots 9/11/12/14 carry
     /// `by_slot_identity` yet were orphan-flagged because the predicate
     /// tested only `by_slot`.
@@ -3731,7 +3769,7 @@ mod tests {
         );
     }
 
-    /// RC1 regression guard (doctor-consistency-audit): `audit_coexistence`
+    /// RC1 regression guard (an internal workspace): `audit_coexistence`
     /// surfaces MULTIPLE issues at once. A host with both an orphan legacy
     /// slot AND a missing UUID-keyed credentials file reports BOTH in the
     /// consistency list — proving the list shape ended the single-issue
@@ -3866,7 +3904,7 @@ mod tests {
         );
     }
 
-    /// RC2 regression guard (doctor-consistency-audit): a healthy host with
+    /// RC2 regression guard (an internal workspace): a healthy host with
     /// BOTH OAuth slots AND a non-OAuth (`by_slot_identity`) slot reports an
     /// EMPTY consistency list. The retired count-based `SlotCountMismatch`
     /// would have false-flagged this — `config_slot_count` (4) counted the
@@ -3905,7 +3943,7 @@ mod tests {
         );
     }
 
-    /// Round-1 redteam LOW-1 regression guard (doctor-consistency-audit): the
+    /// Round-1 redteam LOW-1 regression guard (an internal workspace): the
     /// LegacyOnly-branch `SlotCountMismatch` — a populated `by_slot` in a
     /// LegacyOnly layout (no `store-version` sentinel, no `identities/` dir)
     /// — is a genuine half-written state and the ONLY `SlotCountMismatch`
@@ -3978,7 +4016,7 @@ mod tests {
         }
     }
 
-    // ─── M4-9 (release N affordance, issue #292 Phase 4) ─────────────────────
+    // ─── M4-9 (release N affordance, an internal ticket Phase 4) ─────────────────────
     //
     // The v1 `profiles.accounts` field is empty-write in production. The
     // tests below cover:

@@ -369,7 +369,7 @@ fn prereq_fail(slot: AccountNum, elapsed_ms: u64, e: &OauthCredsError) -> ProbeR
         OauthCredsError::Malformed { reason, .. } => (
             "prerequisite: ~/.gemini/oauth_creds.json parses",
             format!("malformed: {reason}"),
-            "the file is partial or corrupt; run `gemini` interactively once (gemini-cli v0.41.2+ has no auth subcommand — auth happens in the first-run picker) to rewrite. Journal 0054.",
+            "the file is partial or corrupt; run `gemini` interactively once (gemini-cli v0.41.2+ has no auth subcommand — auth happens in the first-run picker) to rewrite. an internal journal entry",
         ),
         OauthCredsError::ReadFailed { reason, .. } => (
             "prerequisite: ~/.gemini/oauth_creds.json readable",
@@ -399,7 +399,7 @@ fn prereq_fail(slot: AccountNum, elapsed_ms: u64, e: &OauthCredsError) -> ProbeR
 fn non_200_hint(status: u16, call: &str) -> &'static str {
     match (status, call) {
         (401, _) => "401 — Code Assist OAuth token stale. Run `gemini` once interactively to refresh; csq is read-only on ~/.gemini/oauth_creds.json.",
-        (403, _) => "403 — token lacks Code Assist scope. Run `gemini` interactively once (the v0.41.2+ first-run picker re-grants scopes); journal 0054.",
+        (403, _) => "403 — token lacks Code Assist scope. Run `gemini` interactively once (the v0.41.2+ first-run picker re-grants scopes); an internal journal entry",
         (429, _) => "429 — rate limited by Cloudcode-PA. Wait and retry; not a code regression.",
         _ => "non-200 status from cloudcode-pa.googleapis.com. Check status page and retry.",
     }

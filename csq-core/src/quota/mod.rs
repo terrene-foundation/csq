@@ -103,6 +103,10 @@ pub struct AccountQuota {
     /// Rate-limit data from 3P providers (extracted from response headers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limits: Option<RateLimitData>,
+    /// Account balance for pay-per-token providers (e.g. DeepSeek).
+    /// `None` for subscription-based or rate-limited providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceInfo>,
     pub updated_at: f64,
 
     // -- v2 Gemini-reserved counter fields (all optional, nested structs) ----
@@ -156,6 +160,7 @@ impl Default for AccountQuota {
             five_hour: None,
             seven_day: None,
             rate_limits: None,
+            balance: None,
             updated_at: 0.0,
             counter: None,
             rate_limit: None,
@@ -212,6 +217,18 @@ impl AccountQuota {
             .map(|w| w.used_percentage)
             .unwrap_or(0.0)
     }
+}
+
+/// Account balance from a pay-per-token provider (e.g. DeepSeek).
+///
+/// Polled via a direct balance endpoint; rendered in place of a usage
+/// percentage bar because pay-per-token providers have no reset window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BalanceInfo {
+    /// ISO 4217 currency code (e.g. `"USD"`).
+    pub currency: String,
+    /// Remaining balance in the given currency.
+    pub remaining: f64,
 }
 
 /// Rate-limit data extracted from anthropic-ratelimit-* response headers.

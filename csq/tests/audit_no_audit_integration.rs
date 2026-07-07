@@ -1,6 +1,6 @@
 //! Integration (binary-smoke) tests for the M06 `--no-audit` flag on
 //! `csq run` (.pending/ fail-loud tightening, workspace
-//! csq-pact-eatp-adoption).
+//! an internal workspace).
 //!
 //! These exercise the BUILT `csq` binary against a TempDir-rooted
 //! `CSQ_BASE_DIR` per `rules/user-path-verification.md` (binary smoke) and
@@ -59,6 +59,9 @@ fn sandbox_home() -> std::path::PathBuf {
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
+    // Hermetic: the spawned `csq` binary must NOT shell `security` against the
+    // operator's real login keychain (rules/test-hermeticity.md).
+    cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     cmd.env("HOME", sandbox_home());
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {

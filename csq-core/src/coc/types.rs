@@ -46,10 +46,10 @@ impl CocSet {
 pub enum CocSource {
     /// Loaded from `.coc/` with a `COC.lock` content hash recorded.
     ///
-    /// Per `workspaces/csq-as-cli/journal/0093`, the prior `sig` field
+    /// Per `internal-design-docs`, the prior `sig` field
     /// (Ed25519 over `COC.lock`) was retracted — per-artifact signing is
     /// the wrong layer; deterministic attestation belongs at the runtime
-    /// lifecycle (Step 3, `workspaces/csq-pact-eatp-adoption`).
+    /// lifecycle (Step 3, `internal-design-docs`).
     Coc {
         #[serde(with = "hex_array_32")]
         lock_sha256: [u8; 32],

@@ -14,7 +14,7 @@
 //! `LedgerSink::append` is called from daemon-shared async tasks and a
 //! panic kills the daemon worker. NoopSink demonstrates the safe shape.
 //!
-//! Constructor validates the sink name via [`SinkName::try_new`] —
+//! Constructor validates the sink name via `SinkName::try_new` —
 //! production sinks should do the same so the `[a-z0-9-]{1,64}` shape
 //! invariant is enforced at construction, not only documented.
 
@@ -44,7 +44,7 @@ impl NoopSink {
     ///
     /// # Errors
     ///
-    /// Returns [`IdError`] when `name` fails [`SinkName::try_new`].
+    /// Returns [`IdError`] when `name` fails `SinkName::try_new`.
     pub fn new(name: impl Into<String>) -> Result<Self, IdError> {
         Ok(Self {
             name: SinkName::try_new(name)?,
@@ -142,6 +142,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
     }
 

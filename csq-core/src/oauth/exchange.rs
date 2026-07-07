@@ -155,7 +155,7 @@ impl std::fmt::Debug for TokenResponse {
 ///   `csq_core::http::post_json`. Anthropic's `/v1/oauth/token`
 ///   endpoint requires a JSON body with `client_id` + `scope` as
 ///   of 2026-04; form-encoded bodies are rejected with
-///   `400 invalid_request_error`. See journal 0034.
+///   `400 invalid_request_error`. See an internal journal entry
 ///
 /// # Errors
 ///
@@ -201,7 +201,7 @@ where
     // and firing another request at it in 2s makes everything
     // worse. If the exchange fails, the login flow surfaces the
     // error to the user and they can retry at human cadence.
-    // See journal 0034.
+    // See an internal journal entry
     let response_bytes = http_post(OAUTH_TOKEN_URL, &body_str)
         .map_err(|e| OAuthError::Exchange(redact_tokens(&e)))?;
 

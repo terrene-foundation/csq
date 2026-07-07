@@ -36,7 +36,7 @@
 use csq_core::accounts::login::{finalize_login, find_claude_binary};
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::accounts::{markers, profiles};
-use csq_core::credentials::{file as cred_file, keychain};
+use csq_core::credentials::file as cred_file;
 use csq_core::error::redact_tokens;
 use csq_core::types::AccountNum;
 use serde::Serialize;
@@ -70,6 +70,8 @@ pub struct SubprocessLoginResponse {
 /// * `"SPAWN_FAILED:..."` — exec error from `tokio::process::Command`
 /// * `"CC_EXITED_NONZERO:..."` — user cancelled in the browser, or CC failed
 /// * `"NO_CREDENTIALS:..."` — CC exited 0 but wrote no credentials
+/// * `"STALE_CREDENTIALS:..."` — CC exited 0 but only an expired credential
+///   was readable after retry (keychain commit raced / access denied)
 /// * `"CRED_WRITE_FAILED:..."` / `"MARKER_WRITE_FAILED:..."` /
 ///   `"FINALIZE_FAILED:..."` — post-subprocess persistence faults
 ///
@@ -157,15 +159,36 @@ pub async fn start_claude_login_subprocess(
         ));
     }
 
-    let creds = keychain::read(&config_dir)
-        .or_else(|| cred_file::load(&config_dir.join(".credentials.json")).ok())
-        .ok_or_else(|| {
-            "NO_CREDENTIALS: no credentials captured after `claude auth login` — \
-             keychain and .credentials.json both empty"
-                .to_string()
-        })?;
+    // CC commits the freshly minted token to the macOS Keychain, and that
+    // write can land a beat AFTER `claude auth login` exits — racing an
+    // immediate read. `read_fresh_after_login` reads both keychain and file,
+    // keeps whichever has the later `expiresAt`, retries to let CC commit, and
+    // errors rather than persisting a stale token (the twin of the CLI fix —
+    // `csq_core::credentials::post_login`). Without it the desktop Re-auth flow
+    // silently saved the 35-day-old `.credentials.json` and the card stayed
+    // Expired forever.
+    //
+    // The helper is SYNCHRONOUS: each attempt spawns a blocking `security`
+    // subprocess (macOS keychain read) and, on a lost race, `thread::sleep`s
+    // up to ~2.2 s. Run it on a blocking pool so the Tauri runtime worker stays
+    // responsive — same convention as the gemini login twin
+    // (`gemini_provision_oauth`) and `start_claude_login`. `tauri-commands.md`
+    // MUST-NOT-3 (no blocking the async runtime thread).
+    let config_dir_for_read = config_dir.clone();
+    let creds = tokio::task::spawn_blocking(move || {
+        csq_core::credentials::read_fresh_after_login(&config_dir_for_read)
+    })
+    .await
+    .map_err(|e| format!("INTERNAL: credential-read task join failed: {e}"))?
+    .map_err(|e| {
+        let tag = match e {
+            csq_core::credentials::FreshLoginError::NoCredentials => "NO_CREDENTIALS",
+            csq_core::credentials::FreshLoginError::OnlyStale => "STALE_CREDENTIALS",
+        };
+        format!("{tag}: {e}")
+    })?;
 
-    // issue #633 (mirror of the CLI fix): mint the slot's identity UUID BEFORE
+    // an internal ticket (mirror of the CLI fix): mint the slot's identity UUID BEFORE
     // save — save_canonical_for is fail-closed on an absent UUID (M4-12), which
     // the fresh-install / macOS-keychain-only flow otherwise can't satisfy until
     // finalize_login (later). Idempotent + no-op when already minted / no email.
@@ -179,7 +202,7 @@ pub async fn start_claude_login_subprocess(
         )
     })?;
 
-    // M4-7 (issue #292 Phase 4, spec 02 §INV-03 + §2.3.1): seed the
+    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): seed the
     // `.csq-account` marker now so the post-credential state can be
     // identified by readers even if `finalize_login` fails halfway
     // through. The marker content is the slot's identity UUID when a
@@ -202,8 +225,18 @@ pub async fn start_claude_login_subprocess(
         })?,
     }
 
-    let email = finalize_login(&base, account_num)
-        .map_err(|e| format!("FINALIZE_FAILED: {}", redact_tokens(&e.to_string())))?;
+    // `finalize_login` is SYNCHRONOUS and now mirrors the bound account's token
+    // into the macOS keychain (`sync_all_handle_dirs` — one blocking `security`
+    // subprocess per live handle dir, no timeout). Run it on the blocking pool so
+    // the Tauri runtime worker stays responsive — same convention as the
+    // `read_fresh_after_login` call above and `tauri-commands.md` MUST-NOT-3 (no
+    // blocking the async runtime thread).
+    let base_for_finalize = base.clone();
+    let email =
+        tokio::task::spawn_blocking(move || finalize_login(&base_for_finalize, account_num))
+            .await
+            .map_err(|e| format!("INTERNAL: finalize task join failed: {e}"))?
+            .map_err(|e| format!("FINALIZE_FAILED: {}", redact_tokens(&e.to_string())))?;
 
     // Best-effort: nudge the daemon's account-discovery cache so the
     // dashboard's next poll sees the new slot immediately rather than

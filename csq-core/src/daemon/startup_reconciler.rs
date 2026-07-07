@@ -73,6 +73,11 @@ pub struct ReconcileSummary {
     /// Number of `config.toml` files rewritten because the directive
     /// was missing or had drifted to a non-`"file"` value.
     pub config_tomls_repaired: usize,
+    /// Number of `config.toml` files left UNTOUCHED because the
+    /// user-global `~/.codex/config.toml` is present but not valid TOML.
+    /// The slot config is KEPT rather than wiped to the degraded 2-key
+    /// fallback (see `surface::regenerate_slot_config_preserving_model`).
+    pub config_tomls_skipped_malformed_global: usize,
     /// PR-C6: whether a v1→v2 `quota.json` migration ran this start.
     /// `None` means no file existed (fresh install); `Some(false)` means
     /// the file was already at v2; `Some(true)` means the reconciler
@@ -81,11 +86,11 @@ pub struct ReconcileSummary {
     /// Number of account records that survived the v1→v2 quota migration
     /// (0 if no migration ran).
     pub quota_accounts_migrated: usize,
-    /// Issue #184: number of 3P settings files inspected for the
+    /// an internal ticket: number of 3P settings files inspected for the
     /// legacy `apiKeyHelper` field (`config-N/settings.json` +
     /// `settings-*.json`).
     pub api_key_helper_files_seen: usize,
-    /// Issue #184: number of 3P settings files actually rewritten to
+    /// an internal ticket: number of 3P settings files actually rewritten to
     /// strip the legacy `apiKeyHelper`.
     pub api_key_helper_files_migrated: usize,
     /// PR-CA10c T9: number of `.pending/*.jsonl` files seen during audit drain.
@@ -99,6 +104,38 @@ pub struct ReconcileSummary {
     /// PR-CA10c T9: number of `.pending/` files left in place because their
     /// `schema_version` was unknown (awaiting a future-version daemon).
     pub audit_pending_files_unknown_version: usize,
+    /// M6 #909: number of `.pending-mcp-gate/*.json` outbox files seen during the
+    /// MCP-gate attestation drain. Always 0 in the community edition (the proxy
+    /// producer is enterprise-only, so the outbox is never written).
+    pub mcp_gate_pending_files_seen: usize,
+    /// M6 #909: MCP-gate outbox files whose decision was appended to the chain OR
+    /// was already accounted for (deduped / no chain) — source deleted.
+    pub mcp_gate_pending_files_drained: usize,
+    /// M6 #909: MCP-gate outbox files deleted as unrecoverable (malformed / wrong
+    /// shape).
+    pub mcp_gate_pending_files_invalid: usize,
+    /// M6 #909: MCP-gate outbox files left in place (unknown `schema_version`).
+    pub mcp_gate_pending_files_unknown_version: usize,
+    /// M6 #909: MCP-gate outbox files left in place because the decision could not
+    /// be confirmed on the chain (a transient/deterministic emit error, or a
+    /// signing-cutoff skip) — fail-closed retry on next start.
+    pub mcp_gate_pending_files_write_failed: usize,
+    /// M6 #914: the subset of `mcp_gate_pending_files_write_failed` whose emit
+    /// error was DETERMINISTIC (not a `ChainLockTimeout` and not a signing-cutoff
+    /// skip). A lock-timeout / cutoff backlog self-heals on the next start; a
+    /// deterministic-error backlog is operator-actionable. Always 0 in the
+    /// community edition.
+    pub mcp_gate_pending_files_write_failed_terminal: usize,
+    /// M6 #909: the MCP-gate drain was deferred because the chain was not
+    /// appendable (broken sentinel, uninitialised, or malformed `chain_id`) — every
+    /// outbox file was left for a next-start retry after the operator repairs /
+    /// initialises the chain.
+    pub mcp_gate_drain_deferred_chain_unavailable: bool,
+    /// M6 #914: the number of `.json` outbox files present when the drain was
+    /// deferred. Distinguishes "0 files queued" from "N files ALL left
+    /// unprocessed" (the deferred path never enters the per-file loop, so
+    /// `mcp_gate_pending_files_seen` stays 0). Always 0 in the community edition.
+    pub mcp_gate_drain_deferred_pending_count: usize,
     /// M1-4: identity mint pass summary. `None` means the pass was not
     /// attempted (e.g. skipped due to build-time feature gate).
     /// `Some(summary)` carries per-slot counters and any non-fatal slot
@@ -137,7 +174,7 @@ pub struct ReconcileSummary {
     /// `crate::accounts::orphan_identity_gc`.
     pub orphan_identity_gc: Option<crate::accounts::orphan_identity_gc::OrphanIdentityGcReport>,
     /// Number of orphan `coc-trust.json` files removed this start.
-    /// Per `workspaces/csq-as-cli/journal/0093` the first-pull trust gate
+    /// Per `internal-design-docs` the first-pull trust gate
     /// was retracted; this pass removes the pre-retraction state file
     /// (private trust history of `(realpath, lock_sha)` decisions) when
     /// found. Idempotent — 0 on every start after the file is gone.
@@ -154,7 +191,7 @@ pub struct ReconcileSummary {
 pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     let mut summary = ReconcileSummary::default();
 
-    // Pass 0 — A++ identity minting (M1-4, issue #292 Phase 1).
+    // Pass 0 — A++ identity minting (M1-4, an internal ticket Phase 1).
     // Non-fatal: a mint error logs a warning and lets daemon continue.
     // The pass is idempotent: presence of `store-version` sentinel causes
     // an immediate no-op on every subsequent daemon start.
@@ -250,6 +287,31 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     pass3_quota_v1_to_v2(base_dir, &mut summary);
     pass4_strip_legacy_api_key_helper(base_dir, &mut summary);
     pass5_audit_drain(base_dir, &mut summary);
+    // M6 #909: drain the MCP gate-decision durable outbox onto the chain. Sibling
+    // of pass5 (both are audit drains) but a SEPARATE `.pending-mcp-gate/` dir +
+    // record shape, so ordering vs pass5 is independent. No other pass reads that
+    // dir, so it satisfies `reconciler-cleanup-parity.md` Rule 2 trivially.
+    // Enterprise-only — the outbox producer (`csq mcp-proxy`) and the
+    // `mcp_gate_floor` chain writer are both enterprise-gated.
+    #[cfg(feature = "enterprise")]
+    pass6_mcp_gate_drain(base_dir, &mut summary);
+
+    // M6 #909 shard B: stamp this drain cycle so shard D's `csq doctor`
+    // daemon-aware "stuck" predicate can distinguish an actively-draining daemon
+    // (recent stamp → a persistent backlog is genuinely STUCK) from a down daemon
+    // (stale stamp → backlog merely PENDING, no false alarm). Startup is one of
+    // three drain-cycle stamp sites (with the periodic refresher backstop + the
+    // event-driven live-path-recovery drain). Best-effort + only when the chain
+    // dir exists — nothing can be queued without it, so a missing stamp there is
+    // harmless. Placed after both drain passes so it reflects "the drain ran".
+    if base_dir.join("csq-runs").exists() {
+        if let Err(e) = crate::audit::outbox_paths::stamp_outbox_drain(base_dir) {
+            warn!(
+                error_kind = "outbox_drain_stamp_failed",
+                "reconciler: outbox drain-stamp write failed: {e}"
+            );
+        }
+    }
 
     // RN1-C R2: idempotent legacy-mirror cleanup pass. Closes the OTHER
     // half of the WINDOW-CLOSE P1 gate gap (paired with RN1-D R3): removes
@@ -278,7 +340,7 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     // live-mint namespace — see the module's lock-posture note).
     pass_orphan_identity_gc(base_dir, &mut summary);
 
-    // Orphan `coc-trust.json` cleanup. Per `workspaces/csq-as-cli/journal/0093`
+    // Orphan `coc-trust.json` cleanup. Per `internal-design-docs`
     // the first-pull trust gate was retracted; any `coc-trust.json` written
     // by a pre-retraction csq build is now an orphan (no consumer reads it).
     // The file's content is privacy-sensitive (`(realpath, lock_sha) ->
@@ -300,6 +362,15 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
         audit_pending_files_drained = summary.audit_pending_files_drained,
         audit_pending_files_invalid = summary.audit_pending_files_invalid,
         audit_pending_files_unknown_version = summary.audit_pending_files_unknown_version,
+        mcp_gate_pending_files_seen = summary.mcp_gate_pending_files_seen,
+        mcp_gate_pending_files_drained = summary.mcp_gate_pending_files_drained,
+        mcp_gate_pending_files_invalid = summary.mcp_gate_pending_files_invalid,
+        mcp_gate_pending_files_unknown_version = summary.mcp_gate_pending_files_unknown_version,
+        mcp_gate_pending_files_write_failed = summary.mcp_gate_pending_files_write_failed,
+        mcp_gate_pending_files_write_failed_terminal =
+            summary.mcp_gate_pending_files_write_failed_terminal,
+        mcp_gate_drain_deferred_chain_unavailable = summary.mcp_gate_drain_deferred_chain_unavailable,
+        mcp_gate_drain_deferred_pending_count = summary.mcp_gate_drain_deferred_pending_count,
         by_slot_identity_backfilled = summary.by_slot_identity_backfilled,
         legacy_mirrors_pruned = summary
             .legacy_mirror_prune
@@ -449,7 +520,7 @@ pub enum Phase4GateError {
     },
 }
 
-/// Phase 4 fail-closed gate (journal 0015 Delta F / OQ #7; extended for
+/// Phase 4 fail-closed gate (an internal journal entry Delta F / OQ #7; extended for
 /// M4-5).
 ///
 /// MUST be called by the daemon binary AFTER `run_reconciler` returns.
@@ -480,7 +551,7 @@ pub enum Phase4GateError {
 ///    (M4-1).
 ///
 /// Check 3 and Check 5 use the same structural binding signal: legacy
-/// canonical's presence on disk. Codex-only slots (PR #530 mint path —
+/// canonical's presence on disk. Codex-only slots (an internal ticket mint path —
 /// UUID minted for `csq login N --provider codex` without any prior
 /// Anthropic OAuth) legitimately lack the Anthropic legacy canonical
 /// and identity-keyed credentials.json; Check 3 MUST allow them.
@@ -502,7 +573,7 @@ pub fn phase4_gate_check(base_dir: &Path) -> Result<(), Phase4GateError> {
         });
     }
 
-    // Journal 0040 §Follow-up #1: best-effort legacy→identity self-heal
+    // an internal journal entry §Follow-up #1: best-effort legacy→identity self-heal
     // for installs that jumped over the daemon starts that would have
     // seeded identity-keyed files (v2.7.3 → v2.7.7 upgrade class). The
     // pass is idempotent and best-effort; if a slot's legacy source is
@@ -539,7 +610,7 @@ pub fn phase4_gate_check(base_dir: &Path) -> Result<(), Phase4GateError> {
         // ONLY for slots that are ClaudeCode-bound on disk. Parallel to Check 5's
         // codex-binding guard below: a slot's binding to a surface is structurally
         // signalled by the presence of that surface's legacy canonical at
-        // `canonical_path_for`. Codex-only slots (PR #530 mint path — UUID minted
+        // `canonical_path_for`. Codex-only slots (an internal ticket mint path — UUID minted
         // for `csq login N --provider codex` without any prior Anthropic OAuth)
         // legitimately have NO Anthropic credentials.json and MUST NOT block
         // daemon start. The structural shape mirrors Check 5 exactly so the gate
@@ -694,7 +765,7 @@ impl Phase4HealReport {
 /// One identity-keyed file that is currently absent for a UUID-mapped
 /// slot — the read-only sibling of [`Phase4HealSlotRecord`].
 ///
-/// Origin: workspace `account-slot-decoupling` journal 0041 §For
+/// Origin: workspace `an internal workspace` an internal journal entry §For
 /// Discussion #2 (top-level `csq doctor` alarm when phase-4 incomplete).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phase4MissingFile {
@@ -716,7 +787,7 @@ pub struct Phase4MissingFile {
 /// (profiles.json absent / has no `by_slot` entries — pure-legacy install
 /// that the gate passes without the M4-5 walk).
 ///
-/// Origin: workspace `account-slot-decoupling` journal 0041 §For
+/// Origin: workspace `an internal workspace` an internal journal entry §For
 /// Discussion #2.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Phase4GateStatus {
@@ -790,7 +861,7 @@ impl Phase4GateStatus {
 /// the next file. The §5a tmp-cleanup contract is preserved on every
 /// failure branch.
 ///
-/// Origin: workspace `account-slot-decoupling` journal 0040 §Follow-up
+/// Origin: workspace `an internal workspace` an internal journal entry §Follow-up
 /// #1 (v2.7.3 → v2.7.7 upgrade-skip class).
 pub fn phase4_gate_self_heal(base_dir: &Path) -> Phase4HealReport {
     let mut report = Phase4HealReport::default();
@@ -846,7 +917,7 @@ pub fn phase4_gate_self_heal(base_dir: &Path) -> Phase4HealReport {
 
         // ── File 1: identity ClaudeCode credentials (only for Anthropic-bound slots) ──
         // Symmetric with File 3 below: legacy canonical's presence is the
-        // structural binding signal. Codex-only slots (PR #530 mint) have no
+        // structural binding signal. Codex-only slots (an internal ticket mint) have no
         // Anthropic legacy and legitimately have no identity credentials.json;
         // recording a MissingLegacySource for them is noise and inflates the
         // `unhealed` count in the operator-visible info log.
@@ -1045,7 +1116,7 @@ fn heal_copy_legacy_to_identity(
 /// **Absent / malformed `profiles.json`:** returns the default (empty)
 /// status — parity with the gate's behavior in the same conditions.
 ///
-/// Origin: workspace `account-slot-decoupling` journal 0041 §For
+/// Origin: workspace `an internal workspace` an internal journal entry §For
 /// Discussion #2.
 pub fn phase4_gate_status(base_dir: &Path) -> Phase4GateStatus {
     let mut status = Phase4GateStatus::default();
@@ -1195,7 +1266,7 @@ fn pass0_m3_7_legacy_handle_dir_advisory(base_dir: &Path) {
 /// embedded CR/LF or ANSI escape sequences would otherwise break the log
 /// envelope or smuggle terminal escape sequences into operator views.
 ///
-/// Origin: R1 H2-Sec fix-wave (workspaces/account-slot-decoupling/journal/
+/// Origin: R1 H2-Sec fix-wave (internal-design-docs
 /// 0021), generalized from the warn-site at `pass0_m3_7_legacy_handle_dir_advisory`.
 fn escape_log(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1242,11 +1313,41 @@ fn floor_emit_is_retryable(e: &crate::audit::persist::AuditV2Error) -> bool {
     )
 }
 
+/// Per-drain tally for the `csq run` audit-floor outbox (`csq-runs/.pending/`),
+/// returned by [`drain_run_floor`] and copied into the reconciler's
+/// `ReconcileSummary` by the startup wrapper [`pass5_audit_drain`]. Extracted so
+/// the same drain runs on the periodic refresher-tick backstop (M6 #909 shard B),
+/// not only at daemon start.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RunFloorDrainSummary {
+    /// `.jsonl` files seen (excludes `.tmp.` in-flight writes and subdirs).
+    pub seen: usize,
+    /// Files whose v1 record was durably written to the chain — source deleted.
+    pub drained: usize,
+    /// Files deleted as unrecoverable (malformed JSON / wrong-shape v1 /
+    /// unparseable `start_ts`).
+    pub invalid: usize,
+    /// Files left in place because their `schema_version` is missing / unknown to
+    /// this daemon (forward-compat — a future daemon drains them).
+    pub unknown_version: usize,
+}
+
+/// Drain the `csq run` audit-floor outbox (`csq-runs/.pending/*.jsonl`) onto the
+/// chain, returning a per-drain tally. Shared by the daemon-start reconciler
+/// (via [`pass5_audit_drain`]) and the periodic refresher-tick backstop (M6 #909
+/// shard B — [`crate::daemon::refresher`]). Best-effort: never panics, never
+/// propagates. Single-threaded-safe on both call sites (startup runs before socket
+/// bind; the periodic tick runs the drain under `spawn_blocking`, and each drained
+/// record's chain write is serialized by the `.chain-lock`, so a concurrent live
+/// `POST /api/audit/record` cannot double-append — every write is idempotent by
+/// filename + `run:<run_id>` dedup).
+///
 /// See spec 12 §12.7 and spec 04 §4.2.8.
-fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
+pub(crate) fn drain_run_floor(base_dir: &Path) -> RunFloorDrainSummary {
+    let mut summary = RunFloorDrainSummary::default();
     let pending_dir = base_dir.join("csq-runs").join(".pending");
     if !pending_dir.exists() {
-        return;
+        return summary;
     }
 
     let entries = match std::fs::read_dir(&pending_dir) {
@@ -1257,7 +1358,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                 dir = %pending_dir.display(),
                 "pass 5 audit drain: read_dir failed: {e}"
             );
-            return;
+            return summary;
         }
     };
 
@@ -1288,7 +1389,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
             continue;
         }
 
-        summary.audit_pending_files_seen += 1;
+        summary.seen += 1;
 
         // Read the file content.
         let content = match std::fs::read(&path) {
@@ -1315,7 +1416,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                     "pass 5 audit drain: malformed JSON — deleting"
                 );
                 let _ = std::fs::remove_file(&path);
-                summary.audit_pending_files_invalid += 1;
+                summary.invalid += 1;
                 continue;
             }
         };
@@ -1330,7 +1431,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                     schema_version = "missing",
                     "pass 5 audit drain: unknown schema_version — leaving for future daemon"
                 );
-                summary.audit_pending_files_unknown_version += 1;
+                summary.unknown_version += 1;
                 continue;
             }
         };
@@ -1343,7 +1444,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                 schema_version = %version,
                 "pass 5 audit drain: unknown schema_version — leaving for future daemon"
             );
-            summary.audit_pending_files_unknown_version += 1;
+            summary.unknown_version += 1;
             continue;
         }
 
@@ -1358,7 +1459,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                     "pass 5 audit drain: v1 record fails strict deserialization — deleting: {e}"
                 );
                 let _ = std::fs::remove_file(&path);
-                summary.audit_pending_files_invalid += 1;
+                summary.invalid += 1;
                 continue;
             }
         };
@@ -1373,7 +1474,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                 "pass 5 audit drain: unparseable start_ts — deleting"
             );
             let _ = std::fs::remove_file(&path);
-            summary.audit_pending_files_invalid += 1;
+            summary.invalid += 1;
             continue;
         }
 
@@ -1402,7 +1503,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
         let record: AuditRecord = match serde_json::from_slice(&entry.content) {
             Ok(r) => r,
             Err(_) => {
-                summary.audit_pending_files_invalid += 1;
+                summary.invalid += 1;
                 let _ = std::fs::remove_file(&entry.path);
                 continue;
             }
@@ -1461,11 +1562,11 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                             path = %entry.path.display(),
                             "pass 5 audit drain: drained successfully"
                         );
-                        summary.audit_pending_files_drained += 1;
+                        summary.drained += 1;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         // Already removed (concurrent sweep) — still counts as drained.
-                        summary.audit_pending_files_drained += 1;
+                        summary.drained += 1;
                     }
                     Err(e) => {
                         warn!(
@@ -1476,7 +1577,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                         // The record IS drained; count it. On next start the
                         // source file will cause a duplicate-write attempt
                         // which is idempotent (same run_id → same file).
-                        summary.audit_pending_files_drained += 1;
+                        summary.drained += 1;
                     }
                 }
             }
@@ -1488,10 +1589,43 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
                     error_kind = e.fixed_tag(),
                     "pass 5 audit drain: write_record failed — leaving for next start"
                 );
-                // Do NOT increment audit_pending_files_drained.
+                // Do NOT increment summary.drained.
             }
         }
     }
+
+    summary
+}
+
+/// Pass 5 — drain the `csq run` audit floor at daemon start. Thin wrapper over
+/// [`drain_run_floor`] that copies the per-drain tally into the reconciler summary
+/// (the drain body is shared with the periodic refresher-tick backstop, M6 #909
+/// shard B). See spec 12 §12.7 and spec 04 §4.2.8.
+fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
+    let s = drain_run_floor(base_dir);
+    summary.audit_pending_files_seen += s.seen;
+    summary.audit_pending_files_drained += s.drained;
+    summary.audit_pending_files_invalid += s.invalid;
+    summary.audit_pending_files_unknown_version += s.unknown_version;
+}
+
+/// Pass 6 — M6 #909: drain the MCP gate-decision durable outbox onto the chain.
+///
+/// Thin wrapper over [`crate::audit::mcp_gate_outbox::drain_pending`] (which owns
+/// the read/dispatch/emit/delete logic + the fail-closed disposition) that copies
+/// the per-file tally into the reconciler summary. Enterprise-only — the outbox
+/// producer and the `mcp_gate_floor` chain writer are both enterprise-gated.
+#[cfg(feature = "enterprise")]
+fn pass6_mcp_gate_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
+    let s = crate::audit::mcp_gate_outbox::drain_pending(base_dir);
+    summary.mcp_gate_pending_files_seen = s.seen;
+    summary.mcp_gate_pending_files_drained = s.drained;
+    summary.mcp_gate_pending_files_invalid = s.invalid;
+    summary.mcp_gate_pending_files_unknown_version = s.unknown_version;
+    summary.mcp_gate_pending_files_write_failed = s.write_failed;
+    summary.mcp_gate_pending_files_write_failed_terminal = s.write_failed_terminal;
+    summary.mcp_gate_drain_deferred_chain_unavailable = s.deferred_chain_unavailable;
+    summary.mcp_gate_drain_deferred_pending_count = s.deferred_pending_count;
 }
 
 /// Minimal RFC3339 / ISO-8601 UTC timestamp parser.
@@ -1517,7 +1651,7 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-/// Pass 4 — issue #184: strip the legacy `apiKeyHelper` field from
+/// Pass 4 — an internal ticket: strip the legacy `apiKeyHelper` field from
 /// 3P settings files written by pre-alpha.8 csq.
 ///
 /// Idempotent + safe to run on every daemon start. See
@@ -1835,55 +1969,58 @@ fn pass2_codex_config_toml(base_dir: &Path, summary: &mut ReconcileSummary) {
 
         summary.config_tomls_seen += 1;
 
+        // Read the pre-write content so the drift_reason log below can
+        // describe WHY the rewrite was needed. The actual read-model +
+        // re-merge + write is delegated to the shared helper, which is
+        // the SAME operation `csq run` performs per-launch — one
+        // canonical re-merge path, not two divergent copies.
+        //
+        // This read is LOG-ONLY: the counters and the write itself are driven
+        // entirely by the helper's own internal snapshot, so even if a
+        // concurrent writer changed the file between this read and the
+        // helper's read, the worst outcome is a cosmetically mislabeled
+        // drift_reason — never a miscount or mis-write. Such a concurrent
+        // write is itself unlikely but NOT impossible: of the four
+        // config.toml writers (spec 07 §7.2.2.1), `csq run`'s per-launch
+        // regen is gated behind `require_daemon_healthy` (false during
+        // startup reconcile), but `csq login --provider codex` and
+        // `csq models` are ungated and could race. The log-only property is
+        // what makes that race benign here.
         let toml_path = codex_surface::config_toml_path(base_dir, account);
         let existing = std::fs::read_to_string(&toml_path).ok();
-        let existing_model = existing.as_deref().and_then(extract_model_key);
 
-        // Repair model: preserve the existing model when present, fall
-        // back to the catalog default otherwise.
-        let model: String = match existing_model.as_deref() {
-            Some(m) => m.to_string(),
-            None => codex_surface::default_model().to_string(),
-        };
-
-        // Render the desired content with user-global merge so the
-        // reconciler re-asserts user preferences from ~/.codex/config.toml
-        // on every daemon start. The byte-equality check catches both
-        // (a) the original "directive missing or drifted" case AND
-        // (b) the user-edited-their-global-config case — the original
-        //     skip predicate (`has_file_backed_directive`) silently
-        //     left stale merged content in place if the user changed
-        //     their global config after a slot's first login.
-        let user_global = codex_surface::read_user_global_config_toml();
-        let desired_content =
-            codex_surface::render_config_toml_with_global(&model, user_global.as_deref());
-
-        if existing.as_deref() == Some(&desired_content) {
-            summary.config_tomls_already_ok += 1;
-            continue;
-        }
-
-        let drift_reason = if existing.is_none() {
-            "missing"
-        } else if !existing
-            .as_deref()
-            .map(has_file_backed_directive)
-            .unwrap_or(false)
-        {
-            "cli_auth_credentials_store_drift"
-        } else {
-            "user_global_merge_outdated"
-        };
-
-        match codex_surface::write_config_toml(base_dir, account, &model) {
-            Ok(()) => {
+        match codex_surface::regenerate_slot_config_preserving_model(base_dir, account) {
+            Ok(codex_surface::RegenOutcome::AlreadyCurrent) => {
+                summary.config_tomls_already_ok += 1;
+            }
+            Ok(codex_surface::RegenOutcome::Rewritten { model, .. }) => {
                 summary.config_tomls_repaired += 1;
+                let drift_reason = if existing.is_none() {
+                    "missing"
+                } else if !existing
+                    .as_deref()
+                    .map(has_file_backed_directive)
+                    .unwrap_or(false)
+                {
+                    "cli_auth_credentials_store_drift"
+                } else {
+                    "user_global_merge_outdated"
+                };
                 info!(
                     account = id,
                     surface = "codex",
                     model = %model,
                     drift_reason = drift_reason,
                     "reconciler rewrote config.toml"
+                );
+            }
+            Ok(codex_surface::RegenOutcome::SkippedMalformedGlobal) => {
+                summary.config_tomls_skipped_malformed_global += 1;
+                warn!(
+                    account = id,
+                    surface = "codex",
+                    error_kind = "codex_user_global_unparseable_skip_rewrite",
+                    "kept existing config.toml — ~/.codex/config.toml is not valid TOML"
                 );
             }
             Err(e) => {
@@ -1941,29 +2078,9 @@ fn has_file_backed_directive(toml: &str) -> bool {
     false
 }
 
-/// Extracts the value of the top-level `model = "..."` key, if
-/// present. Returns the unquoted string. Tolerates leading/trailing
-/// whitespace and inline `# comments`.
-fn extract_model_key(toml: &str) -> Option<String> {
-    for raw in toml.lines() {
-        let line = raw.split('#').next().unwrap_or(raw).trim();
-        let Some(rest) = line.strip_prefix("model") else {
-            continue;
-        };
-        let after_eq = rest.trim_start().strip_prefix('=').map(|s| s.trim())?;
-        // Strip quotes (double or single) on both ends.
-        if let Some(inner) = after_eq.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-            return Some(inner.to_string());
-        }
-        if let Some(inner) = after_eq
-            .strip_prefix('\'')
-            .and_then(|s| s.strip_suffix('\''))
-        {
-            return Some(inner.to_string());
-        }
-    }
-    None
-}
+// `extract_model_key` moved to `providers::codex::surface` (shared with
+// `regenerate_slot_config_preserving_model`); the reconciler now reaches
+// the re-merge through that helper.
 
 // ─── RN1-D5b label relocation pass ───────────────────────────────────────────
 
@@ -2081,15 +2198,15 @@ fn pass_rn1_d5_label_relocation(base_dir: &Path, summary: &mut ReconcileSummary)
 ///
 /// 3P API-key slots are likewise not guaranteed an `accounts[N]` row: once
 /// `pass_rn1_d_r3_prune_accounts` has emptied `accounts`, or for a slot bound
-/// before PR #500's M7 synchronous hook, Arm 1 has nothing to migrate.
+/// before an internal ticket's M7 synchronous hook, Arm 1 has nothing to migrate.
 /// `discover_per_slot_third_party` walks `config-<N>/settings.json` and the
 /// provider id is mapped from the discovered display name. Unlike Gemini
 /// slots, a 3P slot CAN also carry an `accounts[N]` row, so this arm dedups
 /// against Arm 1's queued slots (Arm 1's verbatim email wins). Like the
 /// Gemini arm, it self-heals a stale literal (FM-5): a stored value that
 /// differs from the one derived from the current `settings.json` is
-/// overwritten, not skipped. Origin: `slot-10-orphan-investigation`
-/// journal 0001 (slot 10 = a live Z.AI slot Arm 1 could not see).
+/// overwritten, not skipped. Origin: `an internal workspace`
+/// an internal journal entry (slot 10 = a live Z.AI slot Arm 1 could not see).
 ///
 /// The pass acquires `ProfilesFileLock` once and calls `set_slot_identity`
 /// (which saves atomically and idempotently) for each qualifying slot.
@@ -2205,7 +2322,7 @@ fn pass_rn1_e_backfill_by_slot_identity(base_dir: &Path, summary: &mut Reconcile
         // the slot to a non-prefix string; we do not overwrite.
     }
 
-    // ── Gemini arm (journal 0001 D2 — FM-3/3a/3b/5) ─────────────────────────
+    // ── Gemini arm (an internal journal entry D2 — FM-3/3a/3b/5) ─────────────────────────
     //
     // Gemini slots have NO `accounts[N]` entry — they exist only as
     // `credentials/gemini-<N>.json` binding markers, so the accounts walk
@@ -2249,11 +2366,11 @@ fn pass_rn1_e_backfill_by_slot_identity(base_dir: &Path, summary: &mut Reconcile
         to_backfill.push((slot_key, label));
     }
 
-    // ── 3P API-key arm (slot-10-orphan-investigation journal 0001) ──────────
+    // ── 3P API-key arm (an internal workspace an internal journal entry) ──────────
     //
     // 3P API-key slots are NOT structurally guaranteed to have an
     // `accounts[N]` entry: once `pass_rn1_d_r3_prune_accounts` has emptied
-    // `accounts`, and for any slot bound before PR #500's M7 synchronous
+    // `accounts`, and for any slot bound before an internal ticket's M7 synchronous
     // `set_slot_identity` hook, arm 1's `accounts` walk has nothing to
     // migrate. This is the 3P analogue of the accounts-less Gemini case the
     // arm above handles. Reuse `discover_per_slot_third_party` (already
@@ -2489,7 +2606,7 @@ fn pass_orphan_identity_gc(base_dir: &Path, summary: &mut ReconcileSummary) {
 }
 
 /// Best-effort removal of pre-retraction `coc-trust.json` files. Per
-/// `workspaces/csq-as-cli/journal/0093` the first-pull trust gate was
+/// `internal-design-docs` the first-pull trust gate was
 /// retracted; the persisted state file (`(realpath, lock_sha) →
 /// trust_decision`) is no longer read by any consumer and is privacy-
 /// sensitive. Idempotent: absence is the success state; subsequent
@@ -2635,7 +2752,7 @@ mod tests {
     /// AND `identities/<UUID>/credentials.json` is missing AND the
     /// self-heal cannot recover (legacy is unreadable).
     ///
-    /// **Why the unreadable-legacy mechanic:** journal 0040 §Follow-up #1
+    /// **Why the unreadable-legacy mechanic:** an internal journal entry §Follow-up #1
     /// added a self-heal pass that copies legacy → identity for
     /// upgrade-skip cases. The gate's refusal contract is "refuse when
     /// no recovery is possible", not "refuse on every Phase-4-fresh
@@ -2705,7 +2822,7 @@ mod tests {
     }
 
     /// **2026-05-22 codex-only regression** — the gate MUST pass for a
-    /// codex-only slot. PR #530 (codex login UUID-mint for codex-only
+    /// codex-only slot. an internal ticket (codex login UUID-mint for codex-only
     /// slots) introduced a state where `profiles.json::by_slot[N]` has
     /// a UUID minted at `csq login N --provider codex` but the slot has
     /// no Anthropic OAuth ever attempted: no legacy `credentials/<N>.json`,
@@ -2945,7 +3062,7 @@ mod tests {
         );
     }
 
-    /// **Journal 0040 §Follow-up #1 acceptance test — Codex self-heal.**
+    /// **an internal journal entry §Follow-up #1 acceptance test — Codex self-heal.**
     ///
     /// When a Codex-bound slot has a UUID mapping AND the legacy
     /// `credentials/codex-<N>.json` exists AND the identity-keyed
@@ -3030,7 +3147,7 @@ mod tests {
         );
     }
 
-    /// **Journal 0040 §Follow-up #1 acceptance test — heal-fails fallback.**
+    /// **an internal journal entry §Follow-up #1 acceptance test — heal-fails fallback.**
     ///
     /// When the self-heal cannot copy the legacy file (legacy file is
     /// unreadable, write fails, etc.), the gate MUST still refuse with
@@ -3102,7 +3219,7 @@ mod tests {
         );
     }
 
-    /// **Journal 0041 §FD #3 acceptance test — INV-P08 0o400 parity on
+    /// **an internal journal entry §FD #3 acceptance test — INV-P08 0o400 parity on
     /// healed Codex identity files.**
     ///
     /// `save_canonical_for` flips `Surface::Codex` canonicals to `0o400`
@@ -3159,7 +3276,7 @@ mod tests {
         );
     }
 
-    /// **Journal 0041 §FD #3 acceptance test — non-Codex identity files
+    /// **an internal journal entry §FD #3 acceptance test — non-Codex identity files
     /// stay at 0o600.**
     ///
     /// The 0o400 flip is Codex-specific. The heal MUST NOT narrow the
@@ -3285,10 +3402,10 @@ mod tests {
         );
     }
 
-    /// **Journal 0040 §Follow-up #1 headline test — v2.7.3 → v2.7.7
+    /// **an internal journal entry §Follow-up #1 headline test — v2.7.3 → v2.7.7
     /// upgrade-skip scenario.**
     ///
-    /// Reproduces the exact on-disk state journal 0040 documented:
+    /// Reproduces the exact on-disk state an internal journal entry documented:
     /// 8 OAuth slots all carry `profiles.json::by_slot[N] = <uuid>` +
     /// `identities/<uuid>/identity.json` + `identities/<uuid>/settings.json`
     /// BUT `identities/<uuid>/credentials.json` is missing for every
@@ -3371,7 +3488,7 @@ mod tests {
         }
     }
 
-    /// **Journal 0040 §Follow-up #1 acceptance test — settings.json
+    /// **an internal journal entry §Follow-up #1 acceptance test — settings.json
     /// self-heal from legacy `config-<N>/settings.json`.**
     ///
     /// Mirrors the v2.7.3 upgrade-skip case for the M4-2 settings
@@ -3423,7 +3540,7 @@ mod tests {
         );
     }
 
-    /// **Journal 0040 §Follow-up #1 — `Phase4HealReport` per-record
+    /// **an internal journal entry §Follow-up #1 — `Phase4HealReport` per-record
     /// outcomes are surfaced for the doctor entry point.**
     ///
     /// `phase4_gate_self_heal` returns a `Phase4HealReport` whose
@@ -3947,6 +4064,70 @@ mod tests {
         );
     }
 
+    /// A present-but-malformed `~/.codex/config.toml` MUST leave existing
+    /// slot configs UNTOUCHED (not wiped to the degraded fallback) and
+    /// increment the dedicated skip counter — the same wipe-prevention
+    /// property the run path relies on.
+    #[test]
+    fn pass2_skips_malformed_global_keeping_existing_slot_config() {
+        let shared = crate::platform::test_env::lock();
+        let fixture_dir = TempDir::new().unwrap();
+        let fixture_path = fixture_dir.path().join("user-config.toml");
+        // Present but NOT valid TOML.
+        std::fs::write(&fixture_path, "approval_policy = \"never\nbroken [[[").unwrap();
+        let prev_env = std::env::var_os(codex_surface::USER_CONFIG_ENV_OVERRIDE);
+        // SAFETY: test_env::lock held by `shared`.
+        unsafe {
+            std::env::set_var(codex_surface::USER_CONFIG_ENV_OVERRIDE, &fixture_path);
+        }
+
+        let dir = TempDir::new().unwrap();
+        install_codex_canonical(dir.path(), 12);
+
+        // Seed a CANONICAL slot config (incl. csq's injected statusline) via
+        // the same writer csq uses, with an explicit valid global (the arg
+        // bypasses the env, which is the malformed fixture). Because the slot
+        // is already canonical, the malformed-global re-merge is a true no-op
+        // → SkippedMalformedGlobal + byte-identical. (A NON-canonical seed
+        // would instead be repaired → Rewritten; that path is covered by
+        // surface.rs::regenerate_repairs_csq_keys_under_malformed_global.)
+        let toml_path =
+            codex_surface::config_toml_path(dir.path(), AccountNum::try_from(12u16).unwrap());
+        codex_surface::write_config_toml_with_global(
+            dir.path(),
+            AccountNum::try_from(12u16).unwrap(),
+            "gpt-existing",
+            Some("sandbox_mode = \"read-only\"\n"),
+        )
+        .unwrap();
+        let seeded = std::fs::read_to_string(&toml_path).unwrap();
+
+        let s = run_reconciler(dir.path());
+
+        // Restore env BEFORE any panic-able assertion.
+        unsafe {
+            match prev_env {
+                Some(v) => std::env::set_var(codex_surface::USER_CONFIG_ENV_OVERRIDE, v),
+                None => std::env::remove_var(codex_surface::USER_CONFIG_ENV_OVERRIDE),
+            }
+        }
+        drop(shared);
+
+        assert_eq!(
+            s.config_tomls_skipped_malformed_global, 1,
+            "malformed ~/.codex must increment the skip counter"
+        );
+        assert_eq!(
+            s.config_tomls_repaired, 0,
+            "malformed ~/.codex must NOT trigger a repair-rewrite"
+        );
+        let after = std::fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(
+            after, seeded,
+            "malformed ~/.codex must leave the existing slot config byte-identical"
+        );
+    }
+
     #[test]
     fn has_file_backed_directive_accepts_canonical_form() {
         assert!(has_file_backed_directive(
@@ -3975,19 +4156,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn extract_model_key_round_trips() {
-        assert_eq!(
-            extract_model_key("model = \"gpt-test\"\n"),
-            Some("gpt-test".into())
-        );
-        assert_eq!(
-            extract_model_key("model='gpt-single'\n"),
-            Some("gpt-single".into())
-        );
-        assert_eq!(extract_model_key("# model = \"x\"\n"), None);
-        assert_eq!(extract_model_key("nomodel = \"x\"\n"), None);
-    }
+    // `extract_model_key_round_trips` moved with the function to
+    // `providers::codex::surface` tests.
 
     /// Files at non-`codex-N.json` paths in `credentials/` are
     /// ignored by both passes (no false positives on Anthropic
@@ -4170,6 +4340,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(boot, Some(base)).unwrap();
 
@@ -4202,6 +4373,188 @@ mod tests {
         assert_eq!(
             count, 1,
             "drain must emit exactly one CsqRun floor record for the drained run"
+        );
+    }
+
+    /// M6 #909 shard B: the extracted `drain_run_floor` drains a staged `.pending/`
+    /// v1 record directly (proving the extraction preserves pass5's behaviour for
+    /// the periodic-backstop caller, not only via the reconciler wrapper).
+    #[test]
+    fn drain_run_floor_drains_staged_pending_record() {
+        use crate::audit::persist::write_record_v2;
+        use crate::audit::types::{
+            CsqRunPayload, Ed25519Signature, EventKind, EventPayload, KeyId, RecordId, Sha256Hex,
+            SignedRecord,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let boot = SignedRecord {
+            schema_version: crate::audit::persist::AUDIT_SCHEMA_VERSION_TEST.to_string(),
+            record_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            chain_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            seq: 0,
+            prev_hash: Sha256Hex::genesis(),
+            kind: EventKind::CsqRun,
+            payload: EventPayload::CsqRun(CsqRunPayload {
+                run_id: "bootstrap-genesis".to_string(),
+            }),
+            ts: crate::audit::persist::current_iso8601_utc_persist(),
+            key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
+            canonical_hash: Sha256Hex::genesis(),
+            signature: Ed25519Signature::new([0u8; 64]),
+            actor: None,
+            authority: None,
+            trust: None,
+            eatp_start_ts: None,
+            eatp_end_ts: None,
+            op_phase: None,
+            verification_level: None,
+        };
+        write_record_v2(boot, Some(base)).unwrap();
+
+        let pending = setup_pending(base);
+        let id = "44444444-0000-4000-8000-000000000001";
+        std::fs::write(
+            pending.join(format!("{id}.jsonl")),
+            sample_record_json(id, "2026-05-09T10:00:00Z"),
+        )
+        .unwrap();
+
+        let s = drain_run_floor(base);
+        assert_eq!(s.seen, 1);
+        assert_eq!(s.drained, 1, "extracted drain must drain the staged record");
+        assert_eq!(s.invalid, 0);
+        assert!(
+            !pending.join(format!("{id}.jsonl")).exists(),
+            "source deleted after drain"
+        );
+    }
+
+    /// M6 #909 shard B: `run_reconciler` writes the last-drain-cycle stamp when the
+    /// chain dir exists, so shard D's daemon-aware "stuck" predicate has a
+    /// drain-liveness signal.
+    #[test]
+    fn run_reconciler_stamps_drain_cycle_when_csq_runs_exists() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("csq-runs")).unwrap();
+        assert!(
+            crate::audit::outbox_paths::read_outbox_drain_stamp(base).is_none(),
+            "no stamp before the reconciler runs"
+        );
+        let _ = run_reconciler(base);
+        assert!(
+            crate::audit::outbox_paths::read_outbox_drain_stamp(base).is_some(),
+            "reconciler must stamp the drain cycle when csq-runs/ exists"
+        );
+    }
+
+    /// M6 #909 shard B: `run_reconciler` on a base with NO `csq-runs/` writes no
+    /// stamp (nothing could be queued) and does not create the dir.
+    #[test]
+    fn run_reconciler_no_stamp_without_csq_runs() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let _ = run_reconciler(base);
+        assert!(
+            crate::audit::outbox_paths::read_outbox_drain_stamp(base).is_none(),
+            "no csq-runs → no stamp"
+        );
+    }
+
+    /// M6 #909: `run_reconciler` drains the MCP gate-decision durable outbox via
+    /// `pass6_mcp_gate_drain` — proving the pass is WIRED, not just the unit
+    /// `drain_pending`. Bootstraps a chain, stages one outbox file, runs the full
+    /// reconciler, and asserts the decision landed on the chain, the source was
+    /// deleted, and the summary counters populated. Enterprise-only (the pass is
+    /// gated to match the outbox producer).
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn pass6_run_reconciler_drains_mcp_gate_outbox() {
+        use crate::audit::mcp_gate_outbox::{write_pending, McpGatePendingRecord};
+        use crate::audit::persist::write_record_v2;
+        use crate::audit::types::{
+            Ed25519Signature, EventKind, EventPayload, KeyId, McpGateDecisionPayload, RecordId,
+            Sha256Hex, SignedRecord,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Bootstrap a chain genesis (an McpGateDecision seed — stands in for init).
+        let boot = SignedRecord {
+            schema_version: crate::audit::persist::AUDIT_SCHEMA_VERSION_TEST.to_string(),
+            record_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            chain_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            seq: 0,
+            prev_hash: Sha256Hex::genesis(),
+            kind: EventKind::McpGateDecision,
+            payload: EventPayload::McpGateDecision(McpGateDecisionPayload {
+                session_nonce: "bootstrap".to_string(),
+                record_seq: 0,
+                cli: "codex".to_string(),
+                tool: "bootstrap_tool".to_string(),
+                verdict: "pass".to_string(),
+                enforcement_fidelity: crate::audit::mcp_gate_floor::MCP_ENFORCEMENT_FIDELITY
+                    .to_string(),
+            }),
+            ts: crate::audit::persist::current_iso8601_utc_persist(),
+            key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
+            canonical_hash: Sha256Hex::genesis(),
+            signature: Ed25519Signature::new([0u8; 64]),
+            actor: None,
+            authority: None,
+            trust: None,
+            eatp_start_ts: None,
+            eatp_end_ts: None,
+            op_phase: None,
+            verification_level: None,
+        };
+        write_record_v2(boot, Some(base)).unwrap();
+
+        // Stage one pending outbox decision (as the proxy would on daemon-down).
+        write_pending(
+            base,
+            &McpGatePendingRecord::new("mcp-proxy-1-abcd", 7, "codex", "mcp__shell__exec", "block"),
+        )
+        .unwrap();
+
+        let s = run_reconciler(base);
+        assert_eq!(s.mcp_gate_pending_files_seen, 1);
+        assert_eq!(s.mcp_gate_pending_files_drained, 1);
+        assert!(!s.mcp_gate_drain_deferred_chain_unavailable);
+
+        // The decision must be on the chain.
+        let chain_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(base.join("csq-runs").join("chain.json")).unwrap(),
+        )
+        .unwrap();
+        let chain_id = chain_json["chain_id"].as_str().unwrap();
+        let chain_text =
+            std::fs::read_to_string(base.join("csq-runs").join(format!("{chain_id}.jsonl")))
+                .unwrap();
+        let count = chain_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<SignedRecord>(l).ok())
+            .filter(|r| {
+                matches!(&r.payload, EventPayload::McpGateDecision(p)
+                if p.session_nonce == "mcp-proxy-1-abcd" && p.record_seq == 7)
+            })
+            .count();
+        assert_eq!(
+            count, 1,
+            "the drained decision must appear once on the chain"
+        );
+
+        // The outbox source must be gone.
+        let outbox = base.join("csq-runs").join(".pending-mcp-gate");
+        let remaining: Vec<_> = std::fs::read_dir(&outbox)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            remaining.is_empty(),
+            "outbox source deleted after drain: {remaining:?}"
         );
     }
 
@@ -4607,7 +4960,7 @@ mod tests {
         );
     }
 
-    // ── Journal 0042 (§FD #2 of 0041): phase4_gate_status read-only tests ──
+    // ── an internal journal entry (§FD #2 of 0041): phase4_gate_status read-only tests ──
 
     /// Healthy Phase-4 layout — every UUID-mapped slot has all three
     /// identity files. Status MUST be empty and `is_incomplete() == false`.
@@ -5515,7 +5868,7 @@ mod tests {
         assert_eq!(sync_label.as_deref(), Some("gemini-2/codeassist"));
     }
 
-    // ── Arm 3: 3P API-key backfill disk-walk (slot-10-orphan-investigation) ──
+    // ── Arm 3: 3P API-key backfill disk-walk (an internal workspace) ──
 
     /// Arm 3 AC-1: the backfill discovers a 3P API-key slot from disk
     /// (`config-N/settings.json`) and writes its `by_slot_identity` entry even
@@ -5523,7 +5876,7 @@ mod tests {
     /// `accounts` walk) cannot see, and the state the maintainer host's
     /// slot 10 (Z.AI) was in.
     ///
-    /// Anti-fixture-masking (journal 0065 FM-1): uses `daemon_refreshed_only_state`,
+    /// Anti-fixture-masking (an internal journal entry FM-1): uses `daemon_refreshed_only_state`,
     /// which writes NO `accounts[N]` row. `legacy_pre_m4_9_state` would add
     /// that row and let the pre-Arm-3 code pass, masking the slot-10 bug.
     #[cfg(any(test, feature = "test-utils"))]
@@ -5870,33 +6223,81 @@ mod tests {
         );
     }
 
-    /// RN1-E AC: lost-update guard — when thread A holds `ProfilesFileLock`
-    /// and overwrites `by_slot_identity["9"]` to a sentinel value, then
-    /// releases, thread B's backfill (which blocked on lock acquire) sees
-    /// the sentinel already present and SKIPS by the idempotency guard.
-    /// Final value matches thread A's write — proving serialization with
-    /// thread B observing thread A's commit, not racing past it.
+    /// RN1-E AC: lost-update guard — proves `ProfilesFileLock` serializes a
+    /// concurrent login (thread A) against the reconciler backfill (thread B),
+    /// so B's `pass_rn1_e_backfill_by_slot_identity` cannot read-modify-write
+    /// `by_slot_identity["9"]` while A holds the lock.
     ///
-    /// F-M-4 R1A: this test uses an OVERLAPPING-FIELD-WRITE on
-    /// `by_slot_identity["9"]` to prove serialization order. If the lock
-    /// were a no-op, thread B's backfill could observe a snapshot WITHOUT
-    /// thread A's write present (B's `profiles::load` happens before A's
-    /// `save`) and would write `"apikey:mm"`. A's later commit would then
-    /// either lose B's write or interleave. With the lock, B's
-    /// `profiles::load` happens AFTER A's commit and B's idempotency guard
-    /// (line 1963 above) skips the slot — final value is A's sentinel.
+    /// ## Why this is deterministic, not a timing race
     ///
-    /// We ALSO assert the timing: thread B's `pass_rn1_e_backfill...` call
-    /// MUST take at least the 50ms thread A holds the lock, proving the
-    /// blocking actually happened (not just that A's write happened to win
-    /// some race we didn't observe).
+    /// The test exercises contention by CONSTRUCTION and proves serialization
+    /// with a single ordering comparison between two OBSERVED instants — there is
+    /// no fixed-duration lower-bound assertion, so there is no timing-flake class.
+    ///
+    /// 1. A acquires the lock, commits `by_slot_identity["9"] = "apikey:mm"`, and
+    ///    sends on a one-shot `committed` channel. (A channel, not a barrier:
+    ///    if A's fallible setup — acquire/write — panics, the dropped sender makes
+    ///    B's `recv()` return Err, so B surfaces the panic rather than hanging.)
+    /// 2. Both threads then pass `barrier_b_acquiring`. A waits on it BEFORE it
+    ///    begins its `HOLD_MS` sleep, so A's hold window opens only once B is
+    ///    about to call the backfill — guaranteeing B contends for the lock while
+    ///    A holds it, rather than racing in after A already released.
+    /// 3. B calls the backfill, whose FIRST action is `ProfilesFileLock::acquire`,
+    ///    so B BLOCKS until A drops the lock.
+    /// 4. A sleeps `HOLD_MS`, records `a_release_at = Instant::now()` immediately
+    ///    before `drop(lock)`, then releases. B acquires, finishes, and records
+    ///    `backfill_return`.
+    ///
+    /// The serialization proof is the single ordering assertion:
+    ///
+    /// ```text
+    /// a_release_at  <=  backfill_return
+    /// ```
+    ///
+    /// With a real (blocking) flock this is DETERMINISTIC: B cannot return from
+    /// the backfill before it acquires the lock, and cannot acquire before A drops
+    /// it — which A does AFTER recording `a_release_at`. The ordering proof is
+    /// CAUSAL (A records → A drops → B's flock unblocks → B returns → B records),
+    /// not a raw cross-clock-domain comparison, so it holds under any monotonic
+    /// clock — even per-CPU TSCs without hardware sync. No scheduler jitter can
+    /// flip it. A NON-serializing (no-op) lock is caught by the SAME assertion:
+    /// B's backfill returns in microseconds while A is still inside
+    /// `sleep(HOLD_MS)`, so `backfill_return` lands ~`HOLD_MS` BEFORE
+    /// `a_release_at` and the inequality is false. `HOLD_MS` is the margin that
+    /// makes a broken lock unmistakable; it gates no assertion in the correct
+    /// case, so it cannot itself cause a flake.
+    ///
+    /// The earlier form asserted `elapsed >= HOLD_MS`, where `elapsed` was
+    /// measured from B's OWN post-barrier `Instant::now()`. That instant and A's
+    /// hold-countdown both began after the shared barrier, unsynchronized: on a
+    /// CPU-saturated runner A could start its `sleep(HOLD_MS)` before B recorded
+    /// `start`, so B's measured `elapsed` came out `< HOLD_MS` even though B
+    /// genuinely blocked — a timing flake. Bracketing against A's OWN observed
+    /// release instant removes the dependence on B's wall clock entirely.
+    ///
+    /// ## Why the canonical literal (not an arbitrary sentinel)
+    ///
+    /// A writes `"apikey:mm"` — the SAME literal the backfill derives for a
+    /// MiniMax slot. It MUST be the canonical literal: the 3P arm's FM-5
+    /// self-heal overwrites any `by_slot_identity` value that diverges from the
+    /// one `config-N/settings.json` implies, so an arbitrary sentinel would be
+    /// (correctly) healed away and could not model a legitimate concurrent write.
+    ///
+    /// ## What the counter assertion does (and does NOT) prove
+    ///
+    /// `summary.by_slot_identity_backfilled == 0` is a CONSISTENCY check, not the
+    /// serialization proof. The `committed` channel already forces A's commit to
+    /// land before B's backfill loads its snapshot, so B's idempotency guard fires
+    /// (stored value == derived literal → skip) whether or not the lock serializes.
+    /// If it fails while the ordering assertion passes, the bug is in the
+    /// idempotency guard, not the flock.
     #[cfg(any(test, feature = "test-utils"))]
     #[test]
     fn concurrent_login_and_backfill_no_lost_update_legacy() {
         use crate::accounts::profiles::{profiles_path, set_slot_identity};
         use crate::accounts::profiles_lock::ProfilesFileLock;
         use crate::testing::identity_fixtures::{legacy_pre_m4_9_state, NonOauthKind};
-        use std::sync::{Arc, Barrier};
+        use std::sync::{mpsc, Arc, Barrier, OnceLock};
         use std::thread;
         use std::time::{Duration, Instant};
 
@@ -5905,77 +6306,100 @@ mod tests {
         let base_path = dir.path().to_path_buf();
         legacy_pre_m4_9_state(&base_path, 9, NonOauthKind::ApiKeyMm, "apikey:mm").unwrap();
 
-        // Two-phase barrier: (1) thread A has acquired lock + committed its
-        // write; (2) thread A releases lock.
-        let barrier_a_committed = Arc::new(Barrier::new(2));
-        let barrier_a_released = Arc::new(Barrier::new(2));
+        // committed channel: A sends once it has acquired the lock + committed its
+        // write. Using a channel (not a barrier) means a panic in A's FALLIBLE
+        // setup (acquire / write) drops the sender, so B's `recv()` returns Err and
+        // B surfaces A's real panic via join()+resume_unwind instead of hanging.
+        // barrier_b_acquiring: B is about to call the backfill (and thus acquire
+        // the lock); A waits on it BEFORE its hold-sleep, so A's hold window opens
+        // only once B is contending — making contention structural rather than
+        // timing-dependent. A reaches this barrier only AFTER the commit send and
+        // has no fallible op in between, so the barrier cannot hang.
+        let (committed_tx, committed_rx) = mpsc::channel::<()>();
+        let barrier_b_acquiring = Arc::new(Barrier::new(2));
+        // A records the instant it releases the lock; B reads it after join and
+        // asserts `a_release_at <= backfill_return` (see doc comment).
+        let a_release_at: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
 
         let base_a = base_path.clone();
-        let b_committed = Arc::clone(&barrier_a_committed);
-        let b_released = Arc::clone(&barrier_a_released);
+        let b_acquiring = Arc::clone(&barrier_b_acquiring);
+        let release_cell = Arc::clone(&a_release_at);
 
-        // Hold-time long enough to be unambiguously distinguishable from
-        // OS scheduling jitter on slow CI runners.
-        const HOLD_MS: u64 = 100;
+        // Hold long enough that a no-op lock's microsecond backfill return is
+        // unmistakably earlier than A's release. With a real lock the hold
+        // duration gates NO assertion (the proof is an ordering comparison, not
+        // an elapsed-time lower bound), so it cannot cause a flake.
+        const HOLD_MS: u64 = 200;
 
         // Thread A models a concurrent login committing slot 9's canonical
-        // identity. It writes `by_slot_identity["9"] = "apikey:mm"` — the
-        // SAME literal the backfill derives for a MiniMax slot. The value
-        // MUST be the canonical literal, not an arbitrary sentinel: the 3P
-        // arm's FM-5 self-heal overwrites any `by_slot_identity` value that
-        // diverges from the one its `config-N/settings.json` implies, so an
-        // arbitrary sentinel would be (correctly) healed away and could not
-        // model a legitimate concurrent write. A acquires the lock, writes,
-        // signals the barrier, holds the lock for HOLD_MS, then releases.
+        // identity (see doc comment for why the literal must be canonical).
         let handle_a = thread::spawn(move || {
             let lock = ProfilesFileLock::acquire(&base_a).unwrap();
             set_slot_identity(&lock, &base_a, 9, "apikey:mm").unwrap();
-            // Signal that A has committed; B will now try to acquire the lock.
-            b_committed.wait();
-            // Hold the lock — B's acquire MUST block at least this long.
+            // Signal A has committed; B advances to the acquire barrier. A's only
+            // fallible ops (acquire + the write above) are now past, so from here
+            // A reaches every subsequent barrier. `let _` is safe: main holds
+            // `committed_rx` and has not yet called recv(), so the receiver is live
+            // and send() cannot return Err at this point.
+            let _ = committed_tx.send(());
+            // Open the hold window only once B is about to acquire.
+            b_acquiring.wait();
             std::thread::sleep(Duration::from_millis(HOLD_MS));
-            // Release lock by dropping.
+            // Record the release instant BEFORE dropping, so the assertion is
+            // measured against A's actual release.
+            release_cell
+                .set(Instant::now())
+                .expect("a_release_at set exactly once");
             drop(lock);
-            // Signal that A has released.
-            b_released.wait();
         });
 
-        // Wait for A to commit its sentinel before starting B's backfill.
-        barrier_a_committed.wait();
-
-        // Thread B (main thread): call backfill — must BLOCK on lock acquire
-        // until A releases. Measure the wall-clock so we can assert blocking
-        // happened (not just that the lock-ordering bookkeeping lined up).
+        // Wait for A's commit. If A panicked during its fallible setup it dropped
+        // the sender without sending, so `recv()` returns Err — surface A's real
+        // panic via join()+resume_unwind rather than hanging here. Both paths out
+        // of this block diverge — the if-let Err arm `resume_unwind`s and the
+        // trailing `unreachable!()` is `-> !` — so `handle_a` is consumed here and
+        // the end-of-test join is reached only on the recv-Ok path.
+        if committed_rx.recv().is_err() {
+            if let Err(panic) = handle_a.join() {
+                std::panic::resume_unwind(panic);
+            }
+            unreachable!("thread A closed the commit channel without sending or panicking");
+        }
+        // Signal B is about to acquire, then call the backfill (whose first action
+        // BLOCKS on lock acquire until A releases).
+        barrier_b_acquiring.wait();
         let base_b = base_path.clone();
         let mut summary = ReconcileSummary::default();
-        let start = Instant::now();
         pass_rn1_e_backfill_by_slot_identity(&base_b, &mut summary);
-        let elapsed = start.elapsed();
+        let backfill_return = Instant::now();
 
-        // Wait for thread A to finish cleanly.
-        barrier_a_released.wait();
-        handle_a.join().unwrap();
+        // Join A (establishes the happens-before that makes the OnceLock write
+        // visible) and surface any thread-A panic with its ORIGINAL payload
+        // rather than the opaque `Any { .. }` a bare `.unwrap()` would print.
+        if let Err(panic) = handle_a.join() {
+            std::panic::resume_unwind(panic);
+        }
+        let release_at = *a_release_at
+            .get()
+            .expect("thread A must have recorded its release instant");
 
-        // Assert (1): the BLOCKING actually happened. B's call must have
-        // waited at least HOLD_MS for A to release the lock. If the lock
-        // were a no-op, this would complete in microseconds.
+        // Assert (1) — serialization proof (DETERMINISTIC for a correct lock).
+        // B cannot return from the backfill before acquiring the lock, and cannot
+        // acquire before A dropped it (which A does immediately after recording
+        // `a_release_at`). A no-op lock would let B return ~HOLD_MS before A's
+        // release, flipping this to false.
         assert!(
-            elapsed >= Duration::from_millis(HOLD_MS),
-            "thread B's backfill must have blocked on the lock for at least {HOLD_MS}ms, \
-             elapsed = {elapsed:?} — if shorter, the lock did not serialize"
+            release_at <= backfill_return,
+            "thread B's backfill returned BEFORE thread A released the lock \
+             (a_release_at={release_at:?}, backfill_return={backfill_return:?}) — \
+             the flock did not serialize the two writers"
         );
 
-        // Assert (2): the counter is the serialization discriminator. B's
-        // backfill ran AFTER A's commit (proven by the timing above), so it
-        // loaded a profiles snapshot that ALREADY contained
-        // `by_slot_identity[9] = "apikey:mm"`. The idempotency guard — stored
-        // value equals the settings.json-derived literal — skipped slot 9,
-        // so `by_slot_identity_backfilled == 0`. With a no-op lock B could
-        // instead load a PRE-commit snapshot (empty `by_slot_identity`),
-        // queue slot 9, and report `counter == 1`. The lock makes
-        // `counter == 0` deterministic. The final value is `"apikey:mm"`
-        // either way (both writers commit the same canonical literal), so it
-        // is a consistency check, not the serialization proof.
+        // Assert (2) — CONSISTENCY check (NOT the serialization proof; see doc
+        // comment). B loaded a snapshot already containing A's commit (forced by
+        // the `committed` channel), so its idempotency guard skipped slot 9. A
+        // failure here while assert (1) passed indicates an idempotency-guard bug,
+        // not a flock-ordering bug.
         let pf_final = crate::accounts::profiles::load(&profiles_path(&base_path)).unwrap();
         assert_eq!(
             pf_final.by_slot_identity.get("9").map(|s| s.as_str()),
@@ -5984,12 +6408,12 @@ mod tests {
         );
         assert_eq!(
             summary.by_slot_identity_backfilled, 0,
-            "thread B's backfill must have skipped slot 9 — it observed A's lock-serialized \
-             commit and the idempotency guard fired (a no-op lock would race to counter == 1)"
+            "CONSISTENCY (not serialization): thread B's backfill must have skipped \
+             slot 9 — it observed A's committed value and the idempotency guard fired"
         );
     }
 
-    /// Journal 0093 retraction: a pre-retraction `coc-trust.json` written
+    /// an internal journal entry retraction: a pre-retraction `coc-trust.json` written
     /// by an older csq build MUST be removed on first daemon start under
     /// the retracted layout. Per `rules/reconciler-cleanup-parity.md`
     /// Rule 6, retiring a writer/lifecycle without paired cleanup leaves

@@ -8,7 +8,7 @@ const fs = require("fs");
 const path = require("path");
 
 /**
- * Detect the active workspace under workspaces/.
+ * Detect the active workspace under internal-design-docs
  * Returns the most recently modified project directory, or null if none.
  *
  * @param {string} cwd - Project root directory

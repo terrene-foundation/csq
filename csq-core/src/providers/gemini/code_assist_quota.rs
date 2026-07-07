@@ -1,5 +1,5 @@
 //! Code Assist (Gemini OAuth) quota retrieval — Phase B' of journal
-//! 0046+0047, landed alongside Stage 2 of journal 0048.
+//! 0046+0047, landed alongside Stage 2 of an internal journal entry
 //!
 //! Polls Google's `cloudcode-pa.googleapis.com` to get per-model token
 //! / request quota for users on a Gemini Code Assist subscription.
@@ -16,7 +16,7 @@
 //!   — returns per-model `BucketInfo` (remainingFraction, resetTime,
 //!   tokenType, modelId). Called every poll tick.
 //!
-//! Source references in `~/repos/contrib/gemini-cli`:
+//! Source references in `~/repos/gemini-cli`:
 //! `packages/core/src/code_assist/server.ts:73,363-370,420-423`,
 //! `packages/core/src/code_assist/types.ts:250-265`,
 //! `packages/core/src/config/storage.ts:206-207` (oauth_creds path).
@@ -674,7 +674,7 @@ mod tests {
     /// SCHEMA-DRIFT signal from upstream (Google's contract is
     /// `[0, 1]`). Earlier revisions clamped it to `0.0 → 100% used`,
     /// which silently rounded broken data into a UI-renderable
-    /// percentage and hid the upstream bug. Stage 2 of journal 0048
+    /// percentage and hid the upstream bug. Stage 2 of an internal journal entry
     /// rejects out-of-range fractions instead — they're skipped from
     /// aggregation so the limiting bucket comes from valid rows.
     #[test]

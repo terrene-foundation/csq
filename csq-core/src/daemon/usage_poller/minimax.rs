@@ -65,9 +65,14 @@ pub(crate) fn poll_minimax_quota(
         .and_then(|v| v.as_array())
         .ok_or_else(|| PollError::Parse("missing model_remains array".into()))?;
 
-    // Find the matching model entry. Accept prefix match so
-    // "MiniMax-M2" matches "MiniMax-M2.7-highspeed". Also match
-    // the wildcard "MiniMax-M*" which is the coding plan entry.
+    // Select the model entry whose quota Claude Code consumes:
+    //  1. prefix match on the configured model (`MiniMax-M2` ↔ `MiniMax-M2.7`) —
+    //     the count-metered coding-plan shape whose model_name is a `MiniMax-M*`;
+    //  2. else the `general` text-generation entry — the percentage-metered
+    //     coding-plan shape (model_name is `general`, not a `MiniMax-M*` name);
+    //  3. else the first entry. Preferring `general` over `.first()` avoids
+    //     depending on the array order (the response also carries `video`/`music`
+    //     rows whose quota is irrelevant to CC text usage).
     let entry = model_remains
         .iter()
         .find(|e| {
@@ -75,55 +80,82 @@ pub(crate) fn poll_minimax_quota(
                 .and_then(|v| v.as_str())
                 .is_some_and(|name| name.starts_with(model) || model.starts_with(name))
         })
+        .or_else(|| {
+            model_remains
+                .iter()
+                .find(|e| e.get("model_name").and_then(|v| v.as_str()) == Some("general"))
+        })
         .or_else(|| model_remains.first())
         .ok_or_else(|| PollError::Parse("model_remains array is empty".into()))?;
 
-    // 5-hour interval window.
-    // CRITICAL: "usage_count" is the REMAINING count (endpoint = /remains).
-    // used = total - remaining.
-    let five_hour = match (
-        entry
-            .get("current_interval_total_count")
-            .and_then(|v| v.as_u64()),
-        entry
-            .get("current_interval_usage_count")
-            .and_then(|v| v.as_u64()),
-        entry.get("end_time").and_then(|v| v.as_u64()),
-    ) {
-        (Some(total), Some(remaining), Some(end_ms)) if total > 0 => {
-            let used = total.saturating_sub(remaining);
-            Some(UsageWindow {
-                used_percentage: used as f64 / total as f64 * 100.0,
-                resets_at: end_ms / 1000, // ms → epoch seconds
-            })
-        }
-        _ => None,
-    };
-
-    // 7-day weekly window (same remaining semantics).
-    let seven_day = match (
-        entry
-            .get("current_weekly_total_count")
-            .and_then(|v| v.as_u64()),
-        entry
-            .get("current_weekly_usage_count")
-            .and_then(|v| v.as_u64()),
-        entry.get("weekly_end_time").and_then(|v| v.as_u64()),
-    ) {
-        (Some(total), Some(remaining), Some(end_ms)) if total > 0 => {
-            let used = total.saturating_sub(remaining);
-            Some(UsageWindow {
-                used_percentage: used as f64 / total as f64 * 100.0,
-                resets_at: end_ms / 1000,
-            })
-        }
-        _ => None,
-    };
+    let five_hour = window_from_entry(
+        entry,
+        "current_interval_total_count",
+        "current_interval_usage_count",
+        "current_interval_remaining_percent",
+        "end_time",
+    );
+    let seven_day = window_from_entry(
+        entry,
+        "current_weekly_total_count",
+        "current_weekly_usage_count",
+        "current_weekly_remaining_percent",
+        "weekly_end_time",
+    );
 
     Ok(MiniMaxQuota {
         five_hour,
         seven_day,
     })
+}
+
+/// Builds a [`UsageWindow`] from a `model_remains` entry, handling BOTH MiniMax
+/// coding-plan metering shapes:
+///
+///  - **count-metered** (`*_total_count` > 0): `used = total - remaining` where
+///    "usage_count" is the REMAINING count (the endpoint is `/remains`).
+///  - **percentage-metered** (`*_total_count` is 0/absent — the coding plan's
+///    `general` shape): `used = 100 - *_remaining_percent`. Without this fallback
+///    a percentage-metered plan (the live 2026-07 coding-plan shape) yielded no
+///    window at all, so slot rendered `not quota-polled` despite valid usage data.
+///
+/// Returns `None` only when neither signal is present or the reset timestamp is
+/// missing (parity with the prior count-only behavior).
+fn window_from_entry(
+    entry: &serde_json::Value,
+    total_key: &str,
+    usage_key: &str,
+    remaining_pct_key: &str,
+    end_key: &str,
+) -> Option<UsageWindow> {
+    let resets_at = entry
+        .get(end_key)
+        .and_then(|v| v.as_u64())
+        .map(|ms| ms / 1000)?;
+
+    // Count-metered plans: used = total - remaining (guarded total > 0).
+    if let (Some(total), Some(remaining)) = (
+        entry.get(total_key).and_then(|v| v.as_u64()),
+        entry.get(usage_key).and_then(|v| v.as_u64()),
+    ) {
+        if total > 0 {
+            let used = total.saturating_sub(remaining);
+            return Some(UsageWindow {
+                used_percentage: used as f64 / total as f64 * 100.0,
+                resets_at,
+            });
+        }
+    }
+
+    // Percentage-metered plans (coding plan): used = 100 - remaining_percent.
+    if let Some(rem_pct) = entry.get(remaining_pct_key).and_then(|v| v.as_f64()) {
+        return Some(UsageWindow {
+            used_percentage: (100.0 - rem_pct).clamp(0.0, 100.0),
+            resets_at,
+        });
+    }
+
+    None
 }
 
 /// Writes MiniMax quota data (both 5h and 7d windows) into `quota.json`.
@@ -238,5 +270,42 @@ mod tests {
         // Falls back to first entry: used = 5000-4900 = 100 → 2%
         let fh = mm.five_hour.unwrap();
         assert!((fh.used_percentage - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn poll_minimax_percentage_metered_coding_plan() {
+        // The live 2026-07 coding-plan `/remains` shape: percentage-metered,
+        // `total_count` is 0, quota is in `*_remaining_percent`. The `general`
+        // (text) entry is the one CC consumes; the `video` entry is irrelevant.
+        // Regression for slot rendering `not quota-polled` despite valid usage.
+        let response = r#"{"model_remains":[
+            {"model_name":"general","current_interval_total_count":0,"current_interval_usage_count":0,"end_time":1783350000000,"current_interval_remaining_percent":99,"current_weekly_total_count":0,"current_weekly_usage_count":0,"weekly_end_time":1783900800000,"current_weekly_remaining_percent":97},
+            {"model_name":"video","current_interval_total_count":5,"current_interval_usage_count":5,"end_time":1783350000000,"current_interval_remaining_percent":100,"current_weekly_total_count":35,"current_weekly_usage_count":35,"weekly_end_time":1783900800000,"current_weekly_remaining_percent":100}
+        ]}"#;
+        let http = mock_minimax_get(response);
+        // Configured model "MiniMax-M3" matches no entry → prefers `general`.
+        let mm = poll_minimax_quota("key", None, "MiniMax-M3", &http).unwrap();
+
+        let fh = mm
+            .five_hour
+            .expect("five_hour must be populated from remaining_percent");
+        // used = 100 - 99 = 1%
+        assert!(
+            (fh.used_percentage - 1.0).abs() < 0.01,
+            "got {}",
+            fh.used_percentage
+        );
+        assert_eq!(fh.resets_at, 1783350000);
+
+        let sd = mm
+            .seven_day
+            .expect("seven_day must be populated from remaining_percent");
+        // used = 100 - 97 = 3%
+        assert!(
+            (sd.used_percentage - 3.0).abs() < 0.01,
+            "got {}",
+            sd.used_percentage
+        );
+        assert_eq!(sd.resets_at, 1783900800);
     }
 }

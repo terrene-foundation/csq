@@ -8,8 +8,10 @@ pub mod completions;
 pub mod daemon;
 pub mod dev_identity;
 pub mod doctor;
+pub mod exec;
 pub mod inspect_coc;
 pub mod install;
+pub mod keychain_sync;
 pub mod listkeys;
 pub mod login;
 pub mod logout;
@@ -59,7 +61,7 @@ pub fn current_config_dir() -> Option<PathBuf> {
     std::env::var("CLAUDE_CONFIG_DIR").ok().map(PathBuf::from)
 }
 
-// M4-8 (Phase 4 issue #292): `validated_config_dir` and its supporting
+// M4-8 (Phase 4 an internal ticket): `validated_config_dir` and its supporting
 // `validate_config_dir` helper were retired with the
 // `rotation::swap_to` legacy fallback. The handle-dir model's source
 // detection lives in `csq/src/cli/commands/swap.rs::detect_source_handle`

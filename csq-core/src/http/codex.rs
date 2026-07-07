@@ -6,9 +6,9 @@
 //! full OpenAI JSON envelope to `{"error": {}, "status": 401}`). This
 //! prevents the refresher and wham/usage poller from routing on the
 //! `error.code` field they need to distinguish `token_expired` from
-//! `refresh_token_reused`. See `workspaces/codex/journal/0007` for the
+//! `refresh_token_reused`. See `internal-design-docs` for the
 //! empirical verification and the PR-C0.5 decision to reuse the Node
-//! subprocess pattern originally built for Anthropic (journal csq-v2/0056).
+//! subprocess pattern originally built for Anthropic (journal an internal workspace/0056).
 //!
 //! This module is a THIN wrapper: it does not re-implement HTTP. All
 //! transport work is delegated to [`super::post_json_node`] and
@@ -42,7 +42,7 @@ use serde::Deserialize;
 pub(crate) const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 /// ChatGPT subscription usage endpoint. Observed response shape pinned
-/// by spec 05 §5.7 / journal 0010.
+/// by spec 05 §5.7 / an internal journal entry
 pub(crate) const WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Codex-CLI's bundled OAuth client_id. Hardcoded in the upstream Node
@@ -70,7 +70,7 @@ pub struct CodexTokens {
     #[serde(default)]
     pub id_token: Option<String>,
     /// OpenAI account identifier surfaced in post-login auth.json per
-    /// journal 0010. Kept as-is — not PII in the same class as email.
+    /// an internal journal entry Kept as-is — not PII in the same class as email.
     #[serde(default)]
     pub account_id: Option<String>,
     #[serde(default)]

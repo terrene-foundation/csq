@@ -2,7 +2,7 @@
 //! pre-seeds `gemini-cli` to use API-key auth (not OAuth) before
 //! every spawn.
 //!
-//! Per OPEN-G01 (journal 0003 RESOLVED) the handle-dir
+//! Per OPEN-G01 (an internal journal entry RESOLVED) the handle-dir
 //! `GEMINI_CLI_HOME/.gemini/settings.json` fully isolates from the
 //! user-level `~/.gemini/settings.json` — no fallback observed when
 //! the handle-dir variant exists. Pre-seeding is therefore a cheap
@@ -30,7 +30,7 @@
 //! `selectedType` is written for every Gemini binding mode as a UX
 //! shortcut so gemini-cli does not interactively prompt for auth
 //! choice on first spawn (NOT a ToS-driven defense — the original EP1
-//! framing was retracted in journal 0048). The pinned value depends
+//! framing was retracted in an internal journal entry). The pinned value depends
 //! on the binding's auth mode:
 //!
 //! - **ApiKey** / **VertexSa** → `selectedType = "gemini-api-key"`.
@@ -63,7 +63,7 @@ use serde_json::{json, Map, Value};
 pub const SELECTED_TYPE_API_KEY: &str = "gemini-api-key";
 
 /// The selected-type value csq writes for Code Assist OAuth bindings.
-/// Journal 0054: gemini-cli v0.41.2 prompts interactively for auth
+/// an internal journal entry: gemini-cli v0.41.2 prompts interactively for auth
 /// method when `selectedType` is unset (it does NOT auto-discover
 /// `~/.gemini/oauth_creds.json`). Pinning this value tells gemini-cli
 /// to use the existing OAuth creds without showing the first-run
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(v["system_instruction"], "layer body");
     }
 
-    /// Stage 2 of journal 0048: render() with `pin_selected_type =
+    /// Stage 2 of an internal journal entry: render() with `pin_selected_type =
     /// None` (OAuth-mode binding) emits NO `security.auth.selectedType`
     /// field. gemini-cli auto-discovers `~/.gemini/oauth_creds.json`.
     #[test]
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(v["model"]["name"], "gemini-2.5-pro");
     }
 
-    /// Stage 2 of journal 0048: merge_managed_into_existing with
+    /// Stage 2 of an internal journal entry: merge_managed_into_existing with
     /// `pin_selected_type = None` PRESERVES any existing selectedType
     /// value verbatim — does NOT overwrite to gemini-api-key. This is
     /// the binding-mode-aware writer behavior for OAuth slots.
@@ -431,7 +431,7 @@ mod tests {
         );
     }
 
-    /// Stage 2 of journal 0048: merge_managed_into_existing with
+    /// Stage 2 of an internal journal entry: merge_managed_into_existing with
     /// `pin_selected_type = None` and a fresh (empty) existing leaves
     /// the field unset entirely.
     #[test]

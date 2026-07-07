@@ -107,6 +107,43 @@ pub(crate) fn intent_hash(chain_id: &str, kind: &EventKind, payload: &EventPaylo
     sha256_32(&bytes)
 }
 
+/// The intent-hash pre-image view for a record whose `EventKind` is UNKNOWN to
+/// this binary (GH #910). `kind` is the raw tag string and `payload` is the
+/// verbatim payload bytes — see [`intent_hash_raw`].
+#[derive(Serialize)]
+struct IntentViewRaw<'a> {
+    chain_id: &'a str,
+    kind: &'a str,
+    payload: &'a serde_json::value::RawValue,
+}
+
+/// Forward-compat (GH #910): the 32-byte intent hash for a record whose
+/// `EventKind` is unknown to this binary, computed from the raw kind string and
+/// the verbatim payload bytes.
+///
+/// Byte-identical to [`intent_hash`] for a KNOWN record: [`IntentView`] and
+/// [`IntentViewRaw`] share field order, `kind` serializes to the same snake_case
+/// string, and `payload` (a `RawValue`) re-emits the same adjacently-tagged
+/// object the typed `EventPayload` produced. So the inner multi-sig
+/// authorization signatures — which a NEWER writer computed over the typed
+/// intent hash — verify against this reader's re-derived hash unchanged. Pinned
+/// by `intent_hash_raw_matches_typed`.
+pub(crate) fn intent_hash_raw(
+    chain_id: &str,
+    kind: &str,
+    payload: &serde_json::value::RawValue,
+) -> [u8; 32] {
+    let view = IntentViewRaw {
+        chain_id,
+        kind,
+        payload,
+    };
+    // Same halt-on-fatal rationale as `intent_bytes`.
+    let bytes = serde_json::to_vec(&view)
+        .expect("IntentViewRaw serialization must not fail on valid inputs");
+    sha256_32(&bytes)
+}
+
 /// SHA-256 producing 32 raw bytes.
 ///
 /// Uses the `sha2` crate (already a csq-core dependency via persist.rs).
@@ -123,9 +160,26 @@ pub(crate) fn sha256_32(input: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::audit::types::{
-        Ed25519PublicKey, EventPayload, KeyId, KeyRotatePayload, ReleaseAuthPayload,
+        Ed25519PublicKey, EventKind, EventPayload, KeyId, KeyRotatePayload, ReleaseAuthPayload,
         RotationReason, Sha256Hex,
     };
+
+    /// GH #910 — `intent_hash_raw` (unknown-kind path) reproduces `intent_hash`
+    /// (typed path) byte-for-byte for a KNOWN record, so a newer writer's inner
+    /// multi-sig authorization signatures verify against an older reader's
+    /// re-derived hash. This is the pin that keeps the two views in lockstep.
+    #[test]
+    fn intent_hash_raw_matches_typed_for_known_record() {
+        let payload = sample_key_rotate_payload();
+        let typed = intent_hash(CHAIN_A, &EventKind::KeyRotate, &payload);
+        // The verbatim payload bytes as a future record would carry them.
+        let payload_raw = serde_json::value::to_raw_value(&payload).unwrap();
+        let raw = intent_hash_raw(CHAIN_A, "key_rotate", &payload_raw);
+        assert_eq!(
+            typed, raw,
+            "intent_hash_raw must equal intent_hash for a known (KeyRotate) record"
+        );
+    }
 
     fn sample_key_rotate_payload() -> EventPayload {
         EventPayload::KeyRotate(KeyRotatePayload {

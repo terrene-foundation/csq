@@ -65,8 +65,8 @@ pub fn probe_residue() -> ProbeResult {
 }
 
 /// Attempts to purge the `com.openai.codex` entry from the user's
-/// login keychain. Returns [`Ok(true)`] if an entry was deleted,
-/// [`Ok(false)`] if none existed, or [`Err`] with the underlying
+/// login keychain. Returns `Ok(true)` if an entry was deleted,
+/// `Ok(false)` if none existed, or [`Err`] with the underlying
 /// `security` invocation failure.
 #[cfg(target_os = "macos")]
 pub fn purge_residue() -> Result<bool, String> {
@@ -166,6 +166,13 @@ pub(crate) fn purge_residue_with(
 
 #[cfg(target_os = "macos")]
 fn run_security_find(service: &str) -> SecurityExit {
+    // Test/hermetic guard — never shell `security` against the operator's real
+    // login keychain from a test. NotFound = "no residue" (probe → Absent), the
+    // safe no-op. Shares the CC-mirror guard so the two `security` surfaces can't
+    // drift (partial coverage was the gate-leak this closes).
+    if crate::credentials::keychain::keychain_mirror_disabled() {
+        return SecurityExit::NotFound;
+    }
     // `security find-generic-password -s <svc>` returns exit 0 when
     // found, exit 44 ("The specified item could not be found") when
     // absent. We match on both the exit code AND a substring so that
@@ -179,6 +186,10 @@ fn run_security_find(service: &str) -> SecurityExit {
 
 #[cfg(target_os = "macos")]
 fn run_security_delete(service: &str) -> SecurityExit {
+    // Test/hermetic guard — NotFound = "nothing to delete" (delete → Ok(false)).
+    if crate::credentials::keychain::keychain_mirror_disabled() {
+        return SecurityExit::NotFound;
+    }
     let out = std::process::Command::new("security")
         .args(["delete-generic-password", "-s", service])
         .output();

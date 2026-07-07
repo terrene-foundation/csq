@@ -1,4 +1,4 @@
-//! Dispatcher prototype for the single-binary csq (issue #295, Option F2).
+//! Dispatcher prototype for the single-binary csq (an internal ticket, Option F2).
 //!
 //! This example demonstrates mode detection logic for the merged csq binary.
 //! It is STANDALONE — it does NOT touch csq-cli/src/main.rs or

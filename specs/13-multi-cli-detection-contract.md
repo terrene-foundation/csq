@@ -1,6 +1,6 @@
 # 13 — Multi-CLI Detection Contract
 
-**Spec version:** 1.5.1
+**Spec version:** 1.6.0
 **Status:** active
 
 ## 1. Purpose
@@ -141,7 +141,7 @@ Bumping to a 1.x minimum is gated on csq's CI exercising the new major. csq MUST
 
 ## 9. Schema versioning
 
-`csq doctor --json` emits `"schema_version": 8` at the top level. The current schema is v8; the subsections below document each schema version's additions in turn. Version history at a glance: v1 was unversioned (absence of the field is the v1 signal); v2 and v3 added per-surface keys and the `identity_store` field; v4 added the identity-store consistency variants and the `legacy_compat_state` field; v5 added the `phase4_incomplete` alarm; v6 added `pass0_skipped_slots`; v7 retired the `MirrorDriftAtSlot` consistency variant; v8 changed `identity_store.consistency` from a single object to an array.
+`csq doctor --json` emits a top-level `"schema_version"` whose current value is **19**. `schema_version` is one monotonic counter; a small number of intermediate versions (v17–v18) correspond to fields this edition does not emit, so the community ceiling advances only when the community build actually serializes a newly-added field. v19 (`mcp_partial_coverage`) is the first such addition after v16, so the current community ceiling is **19** (the jump 16 → 19 is expected — v17 and v18 are skipped, not missing). Versions 1–8 evolved the identity-store / multi-CLI-detection surface this spec owns; versions 9–16 add audit-chain fields whose semantics are owned by the audit-chain domain (`12-audit-trail.md`), cross-referenced where that spec documents the field and summarized inline otherwise (see the `v9–v16` subsection below); v19 adds the MCP partial-coverage advisory documented in the `v19` subsection below. Every additive field is either `#[serde(skip_serializing_if = …)]` (omitted when empty) or always-serialized with a concrete value (e.g. v19's `mcp_partial_coverage`, present on every report from v19 onward); a new key is therefore never emitted as `null`, and a consumer targeting an older shape treats any unrecognized top-level key as an ignorable unknown. Version history at a glance: v1 was unversioned (absence of the field is the v1 signal); v2 and v3 added per-surface keys and the `identity_store` field; v4 added the identity-store consistency variants and the `legacy_compat_state` field; v5 added the `phase4_incomplete` alarm; v6 added `pass0_skipped_slots`; v7 retired the `MirrorDriftAtSlot` consistency variant; v8 changed `identity_store.consistency` from a single object to an array; v9–v16 add the audit-chain surfaces enumerated in the `v9–v16` subsection below; v19 adds `mcp_partial_coverage` (see the `v19` subsection below).
 
 Per-surface keys (`claude_code`, `codex_cli`, `gemini_cli`) populated as objects when the surface has authenticated slots; OMITTED entirely (NOT null) when no authenticated slots. Suppression tightens to "slot has authenticated `.credentials.json` present" — not just dir presence.
 
@@ -396,6 +396,55 @@ is the only known consumer. External consumers that read `consistency.kind`
 directly must adapt to iterating the array; the `schema_version` bump 7 → 8
 is the signal. The individual issue-object shapes (`kind` + fields) are
 unchanged from v7.
+
+### v9–v16: audit-chain fields
+
+Versions 9 through 16 add audit-trail fields to the doctor report. These belong to the audit-chain domain owned by `12-audit-trail.md`; the entries below record only the doctor JSON schema-version contract (which version introduced which field). Where spec 12 documents the field (v9–v11), its full semantics and JSON shape live there at the cross-referenced section; the provenance-seam surfaces (v13–v16) are summarized inline below. Each field is either `#[serde(skip_serializing_if = …)]` (omitted when empty — e.g. `seam_quarantine_count`, `seam_held_predecessor_count`, `audit_roster_floor_anchor`) or always-serialized with a concrete value (e.g. `signing_key`, `audit_chain_state`, `audit_keychain_anchor`, `seam_registry_status`, `seam_capture_conformance`); either way a consumer reading an older shape sees an omitted key as absent and an always-serialized key as a concrete value — never null.
+
+- **v9 — `signing_key`** (bumps 8 → 9). Reports the local Ed25519 audit-signing key id (`ed25519:<sha256_pubkey_hex>`). Local key custody. Authority: `12-audit-trail.md` §12.9 (Local Ed25519 signing-key custody).
+- **v10 — `audit_chain_state`** (bumps 9 → 10). `AuditHealth` classification (`verified` / `degraded` / `broken` / `unknown`) from the CLI-side `verify_chain` run; a separate axis that never bricks the daemon. Authority: `12-audit-trail.md` §12.10.6 (audit-verify decoupling).
+- **v11 — `audit_keychain_anchor`** (bumps 10 → 11). `KeychainAnchorStatus` (`confirmed` / `unconfirmed` / `mismatch`) — a non-fatal tamper DETECTOR cross-checking the file / keychain / `chain.json` signing-cutoff anchor. Authority: `12-audit-trail.md` §12.9.4 (file-vs-keychain cross-check).
+- **v13 — provenance-seam surfaces** (bumps 11 → 13; v12 is never emitted). Adds `seam_quarantine_count`, `seam_pending_provenance_count`, and `seam_registry_status` for the provenance ingestion frontier — the audit subsystem that validates and chain-links externally-supplied provenance anchors before they enter the local chain. The two new `EventKind`s (`SeamEventRejected`, `ProvenanceAnchored`) and these doctor surfaces landed in one commit, so the counter advanced two steps at once.
+- **v14 — capture-conformance** (bumps 13 → 14). Adds the provenance capture-capability matrix / `SeamConformanceState` surface (`NotConfigured` / `Conformant` / `Drift` / `PolicyUnreadable`).
+- **v15 — `seam_held_predecessor_count`** (bumps 14 → 15). Count of seam events held pending an out-of-order intra-source predecessor (degraded-reconcile outbox drain).
+- **v16 — `audit_roster_floor_anchor`** (bumps 15 → 16). `RosterFloorAnchorStatus` — a keychain-anchored authority-roster version-floor rollback DETECTOR (mirrors the v11 keychain-anchor detector posture). This is the last audit-chain field; the schema ceiling later advanced to v19 with the MCP partial-coverage advisory (`v19` subsection below).
+
+The provenance-seam surfaces (v13–v16) are on-disk custody counters for the ingestion frontier; an install with no configured provenance source emits `seam_registry_status: "ok"` with the counts at zero or omitted. Their deep contract is part of the audit subsystem; this spec records only the doctor-schema-version mapping. Every audit-chain field is additive (each either omitted-when-empty via `skip_serializing_if` or always-serialized with a concrete value), so a consumer that handles only the identity-store surface (v1–v8) sees the v9–v16 keys as unknown top-level keys and, per JSON's standard "ignore-unknown-fields" contract, MUST NOT error on their presence.
+
+### v19: MCP partial-coverage advisory
+
+- **v19 — `mcp_partial_coverage`** (raises the community ceiling 16 → 19; the intervening v17–v18 are fields this edition does not emit). Like several of the audit-chain fields above (`audit_chain_state`, `audit_keychain_anchor`, `seam_registry_status`, `seam_capture_conformance`), this is an always-serialized object — present on every `csq doctor --json`, never omitted:
+
+  ```json
+  {
+    "mcp_partial_coverage": {
+      "warn": <bool>,
+      "cli_sources": ["claude", "codex", "gemini"]
+    }
+  }
+  ```
+
+  `cli_sources` lists the CLI surfaces that have their own native MCP servers configured, detected under `$HOME` regardless of `warn` (empty array when none). `warn` is `true` when `cli_sources` is non-empty AND csq's COC capability layer is not fully disabled. It is an advisory, not an error: csq's tool-policy gate governs the COC prompt-edit tool allow/deny surface it manages, but a CLI's own MCP servers exchange runtime tool traffic outside that surface — so `warn: true` tells the operator that some MCP activity sits beyond csq's governed view. Impl: `csq/src/cli/commands/doctor.rs::check_mcp_partial_coverage` + `csq-core/src/capability_layer/mcp_coverage.rs`.
+
+### Shared-`$HOME` cross-edition read: `mcp_gate_outbox_backlog`
+
+A pure community install NEVER produces the `csq-runs/.pending-mcp-gate/` outbox — that durable governance-record outbox is written only by the enterprise edition — so the optional top-level `mcp_gate_outbox_backlog` object is ABSENT from a community `csq doctor --json`, and it does NOT advance the community `schema_version` ceiling (which stays at **19**).
+
+However, the community `csq doctor` outbox READ is **edition-agnostic**: it inspects the outbox directory under `$HOME` with no edition-specific logic. So when a community `csq` and the enterprise edition share a `$HOME` (both resolve `~/.claude/accounts/`), a community `csq doctor` run FAITHFULLY reports the enterprise-written backlog — a benign, edition-neutral count + oldest-file age + a daemon-liveness `state` (`stuck` / `draining` / `pending_daemon_down`), with no proprietary logic and no enterprise-only content in the reported values:
+
+```json
+{
+  "mcp_gate_outbox_backlog": {
+    "pending_count": <u32>,
+    "oldest_age_secs": <u64|null>,
+    "state": "stuck" | "draining" | "pending_daemon_down",
+    "last_drain_age_secs": <u64|null>,
+    "warn": <bool>
+  }
+}
+```
+
+This is the ONLY way the field appears on a community build, and it is a read-only diagnostic reflecting what the co-resident enterprise daemon has (or has not) drained — never something the community edition itself writes or governs. A community-only user who never runs the enterprise edition never sees this key.
 
 ## 10. Security boundary
 

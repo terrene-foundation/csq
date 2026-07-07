@@ -318,6 +318,10 @@ mod tests {
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new(
+                crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),
+            ),
         }
     }
 

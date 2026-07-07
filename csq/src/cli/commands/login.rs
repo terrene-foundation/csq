@@ -29,7 +29,7 @@ use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::accounts::markers;
 use csq_core::cli_deps::sanitize::redact_path;
 use csq_core::cli_deps::SurfaceCli;
-use csq_core::credentials::{self, file, keychain};
+use csq_core::credentials::{self, file};
 use csq_core::oauth::{self, RaceResult};
 use csq_core::types::AccountNum;
 use std::io::{BufRead, Write};
@@ -71,7 +71,7 @@ pub fn handle(
 
     match provider {
         "codex" => return handle_codex(base_dir, account, ignore_cli_version, no_auto_update_cli),
-        // Stage 2 of journal 0048: Gemini has THREE auth paths today.
+        // Stage 2 of an internal journal entry: Gemini has THREE auth paths today.
         // OAuth (Code Assist subscription) is the `csq login` entry;
         // AI Studio API keys and Vertex SA still go through `csq
         // setkey gemini` because those are non-OAuth credential paste
@@ -777,7 +777,7 @@ fn handle_codex(
 }
 
 /// `csq login N --provider gemini` — Code Assist OAuth binding
-/// (journal 0054 design — gemini-cli v0.41.2+ has no non-interactive
+/// (an internal journal entry design — gemini-cli v0.41.2+ has no non-interactive
 /// auth surface). Delegates to
 /// `csq_core::providers::gemini::oauth_login::perform` which:
 ///
@@ -795,9 +795,9 @@ fn handle_codex(
 /// reference client per `feedback_delegate_to_reference_client`.
 /// Subsequent `csq run <slot>` invocations pin
 /// `selectedType=oauth-personal` in the per-slot settings.json so
-/// gemini-cli skips the first-run picker (journal 0054).
+/// gemini-cli skips the first-run picker (an internal journal entry).
 ///
-/// Stage 2 of journal 0048.
+/// Stage 2 of an internal journal entry
 fn handle_gemini_oauth(
     base_dir: &Path,
     account: AccountNum,
@@ -1191,23 +1191,21 @@ fn handle_direct_post_subprocess(
         return Err(anyhow!("claude auth login exited with non-zero status"));
     }
 
-    // CC's modern `claude auth login` writes credentials to ONE of
-    // two places, depending on platform / version:
+    // CC's modern `claude auth login` writes the freshly minted token to ONE
+    // of two places, depending on platform / version:
     //   * macOS: the system keychain at the hashed service name
-    //     (`Claude Code-credentials-{hash}`) — sometimes ALSO
-    //     mirrored to `.credentials.json`, sometimes not.
+    //     (`Claude Code-credentials-{hash}`) — the commit can land a beat
+    //     AFTER the subprocess exits, racing an immediate read.
     //   * Linux/Windows: always `.credentials.json`.
     //
-    // We read keychain first, fall back to file. Either source is
-    // authoritative — they hold the same payload — and at least one
-    // is guaranteed to exist after a successful auth.
-    let creds = keychain::read(config_dir)
-        .or_else(|| credentials::load(&config_dir.join(".credentials.json")).ok())
-        .ok_or_else(|| {
-            anyhow!("no credentials captured after login — keychain and file both empty")
-        })?;
+    // `read_fresh_after_login` absorbs that race: it reads both sources,
+    // keeps whichever has the later `expiresAt` (a stale `.credentials.json`
+    // can never shadow a fresh keychain token), retries to let CC commit, and
+    // errors rather than persisting an already-expired token. See
+    // `csq_core::credentials::post_login` for the full rationale.
+    let creds = credentials::read_fresh_after_login(config_dir).map_err(|e| anyhow!("{e}"))?;
 
-    // issue #633: mint the slot's identity UUID BEFORE save. `save_canonical_for`
+    // an internal ticket: mint the slot's identity UUID BEFORE save. `save_canonical_for`
     // is fail-closed on an absent UUID (M4-12), but on a fresh install the UUID is
     // minted only by `finalize_login` — which runs in `finalize()`, AFTER this.
     // On macOS the daemon Pass-0 fallback can't mint from a keychain-only cred
@@ -1247,6 +1245,11 @@ fn finalize(base_dir: &Path, account: AccountNum) -> Result<()> {
         .with_context(|| format!("finalize for account {account}"))?;
 
     notify_daemon_cache_invalidation(base_dir);
+
+    // NOTE: the CC keychain mirror now lives in the shared
+    // `csq_core::accounts::login::finalize_login` (called above) so every login
+    // twin — this CLI path AND the desktop subprocess/paste-code/race flows —
+    // sweeps the keychain. Do NOT re-add a sweep here (would double-sweep).
 
     println!("Logged in as {} (account {}).", email, account);
     Ok(())

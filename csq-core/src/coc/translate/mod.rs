@@ -3,7 +3,7 @@
 //!
 //! Authoritative spec: `specs/09-unified-coc-artifact-standard.md` §9.2.4
 //! (CocSet) + the FR-DISP-* family in
-//! `workspaces/csq-as-cli/01-analysis/01-research/01-functional-requirements.md`.
+//! `internal-design-docs`.
 //!
 //! Three translators exist (one per Surface):
 //! - `cc`     — Claude Code: settings.json overlay + system-prompt-append
@@ -18,9 +18,13 @@
 pub mod cc;
 pub mod codex;
 pub mod codex_merge;
+pub mod flatten;
 pub mod gemini;
 pub mod types;
 
+pub use flatten::{
+    flatten_artifacts, render_sections, surface_header, FlatArtifact, SurfaceArtifacts,
+};
 pub use types::{
     ApprovalMode, ClaudeSpawnPayload, CodexSpawnPayload, GeminiSpawnPayload, HostContext,
     McpFilter, SandboxMode, SpawnPayload,

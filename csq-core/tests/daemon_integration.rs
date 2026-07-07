@@ -50,6 +50,8 @@ fn make_router_state(base: &Path) -> RouterState {
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
         audit_health: csq_core::audit::AuditHealth::Verified,
+        #[cfg(feature = "enterprise")]
+        interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     }
 }
 
@@ -341,6 +343,8 @@ async fn gemini_event_live_ipc_then_ndjson_drain_does_not_double_count() {
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: gemini_consumer::GeminiConsumerState::default(),
         audit_health: csq_core::audit::AuditHealth::Verified,
+        #[cfg(feature = "enterprise")]
+        interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     };
     let consumer = state.gemini_consumer.clone();
 
@@ -469,6 +473,7 @@ fn sample_audit_record(run_id: &str, _base_dir: &Path) -> csq_core::audit::Audit
         rule_ids_cited_after_repair: vec!["RULE-A".to_string()],
         rule_ids_dropped_invalid_format: 0,
         decision: Decision::Accept,
+        spawn_gate: None,
         // base_dir is supplied so the handler writes to our tmpdir.
         // NOTE: the handler uses the production `write_record` (which
         // reads $CSQ_BASE_DIR). We override that via the env var below.

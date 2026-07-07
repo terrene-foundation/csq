@@ -11,76 +11,31 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::coc::types::{AgentDef, CocSet, CommandDef, RuleDef, SkillDef};
+use crate::coc::types::CocSet;
 use crate::providers::catalog::Surface;
 
+use super::flatten::{flatten_artifacts, render_sections};
 use super::types::{ClaudeSpawnPayload, McpFilter};
 
 const SURFACE_HEADER: &str = "# csq capability layer (claude-code)\n";
 
 /// Translate a `CocSet` to a `ClaudeSpawnPayload`. Pure function; no I/O.
+///
+/// CU1b: the surface-filter + precedence-sort + section-render is the
+/// shared `super::flatten` flattener (the single flattener the live
+/// capability-layer scaffold stage also uses), so `csq run`, `csq
+/// translate`, and the neutral launcher all derive from one code path.
 pub fn translate(coc_set: &CocSet) -> ClaudeSpawnPayload {
-    let target = Surface::ClaudeCode;
-
-    let rules = filter_rules(coc_set, target);
-    let agents = filter_agents(coc_set, target);
-    let skills = filter_skills(coc_set, target);
-    let commands = filter_commands(coc_set, target);
-
-    let mut prompt = String::new();
-    prompt.push_str(SURFACE_HEADER);
-
-    let mut contributing_ids: BTreeSet<String> = BTreeSet::new();
-
-    if !rules.is_empty() {
-        prompt.push_str("\n## Rules\n");
-        for rule in &rules {
-            push_artifact_section(&mut prompt, &rule.id.0, rule.precedence, &rule.body);
-            contributing_ids.insert(rule.id.0.clone());
-        }
-    }
-
-    if !agents.is_empty() {
-        prompt.push_str("\n## Agents\n");
-        for agent in &agents {
-            push_artifact_section(&mut prompt, &agent.id.0, agent.precedence, &agent.body);
-            contributing_ids.insert(agent.id.0.clone());
-        }
-    }
-
-    if !skills.is_empty() {
-        prompt.push_str("\n## Skills\n");
-        for skill in &skills {
-            push_artifact_section(&mut prompt, &skill.id.0, skill.precedence, &skill.body);
-            contributing_ids.insert(skill.id.0.clone());
-        }
-    }
-
-    if !commands.is_empty() {
-        prompt.push_str("\n## Commands\n");
-        for command in &commands {
-            push_artifact_section(
-                &mut prompt,
-                &command.id.0,
-                command.precedence,
-                &command.body,
-            );
-            contributing_ids.insert(command.id.0.clone());
-        }
-    }
-
-    let permissions_allow = BTreeSet::new();
-    let mcp_filter = McpFilter::default();
-    let settings_overlay = BTreeMap::new();
-    let output_schema_directive = Some(build_output_schema_directive());
+    let arts = flatten_artifacts(coc_set, Surface::ClaudeCode);
+    let (system_prompt_append, contributing_ids) = render_sections(SURFACE_HEADER, &arts);
 
     ClaudeSpawnPayload {
-        system_prompt_append: prompt,
-        permissions_allow,
-        mcp_filter,
-        settings_overlay,
+        system_prompt_append,
+        permissions_allow: BTreeSet::new(),
+        mcp_filter: McpFilter::default(),
+        settings_overlay: BTreeMap::new(),
         contributing_ids,
-        output_schema_directive,
+        output_schema_directive: Some(build_output_schema_directive()),
     }
 }
 
@@ -95,75 +50,12 @@ pub fn translate(coc_set: &CocSet) -> ClaudeSpawnPayload {
 /// working via this re-export.
 pub use super::build_output_schema_directive;
 
-fn push_artifact_section(out: &mut String, id: &str, precedence: i32, body: &str) {
-    out.push('\n');
-    out.push_str("### ");
-    out.push_str(id);
-    out.push_str(" (precedence=");
-    let s = precedence.to_string();
-    out.push_str(&s);
-    out.push_str(")\n");
-    out.push_str(body.trim_end());
-    out.push('\n');
-}
-
-fn filter_rules(coc_set: &CocSet, surface: Surface) -> Vec<&RuleDef> {
-    let mut v: Vec<&RuleDef> = coc_set
-        .rules
-        .values()
-        .filter(|r| r.applies_to.is_empty() || r.applies_to.contains(&surface))
-        .collect();
-    sort_artifacts(&mut v, |r| (r.precedence, r.id.0.as_str()));
-    v
-}
-
-fn filter_agents(coc_set: &CocSet, surface: Surface) -> Vec<&AgentDef> {
-    let mut v: Vec<&AgentDef> = coc_set
-        .agents
-        .values()
-        .filter(|a| a.applies_to.is_empty() || a.applies_to.contains(&surface))
-        .collect();
-    sort_artifacts(&mut v, |a| (a.precedence, a.id.0.as_str()));
-    v
-}
-
-fn filter_skills(coc_set: &CocSet, surface: Surface) -> Vec<&SkillDef> {
-    let mut v: Vec<&SkillDef> = coc_set
-        .skills
-        .values()
-        .filter(|s| s.applies_to.is_empty() || s.applies_to.contains(&surface))
-        .collect();
-    sort_artifacts(&mut v, |s| (s.precedence, s.id.0.as_str()));
-    v
-}
-
-fn filter_commands(coc_set: &CocSet, surface: Surface) -> Vec<&CommandDef> {
-    let mut v: Vec<&CommandDef> = coc_set
-        .commands
-        .values()
-        .filter(|c| c.applies_to.is_empty() || c.applies_to.contains(&surface))
-        .collect();
-    sort_artifacts(&mut v, |c| (c.precedence, c.id.0.as_str()));
-    v
-}
-
-/// Sort artifacts by (precedence DESC, id ASC). Higher precedence first;
-/// stable on id for tie-break.
-fn sort_artifacts<T, F>(v: &mut [&T], key: F)
-where
-    F: Fn(&T) -> (i32, &str),
-{
-    v.sort_by(|a, b| {
-        let (pa, ia) = key(a);
-        let (pb, ib) = key(b);
-        pb.cmp(&pa).then_with(|| ia.cmp(ib))
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coc::types::{AgentId, CocSet, CocSource, RuleId, SkillId};
+    use crate::coc::types::{
+        AgentDef, AgentId, CocSet, CocSource, RuleDef, RuleId, SkillDef, SkillId,
+    };
     use crate::coc::version::CocVersion;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;

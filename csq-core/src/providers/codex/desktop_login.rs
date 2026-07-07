@@ -26,7 +26,9 @@ use super::surface;
 use super::tos;
 use crate::accounts::markers;
 use crate::accounts::profiles;
+use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::credentials::{self, file as cred_file, CredentialFile};
+use crate::daemon::identity_mint;
 use crate::error::redact_tokens;
 use crate::types::AccountNum;
 use anyhow::{anyhow, Context, Result};
@@ -49,7 +51,7 @@ pub struct StartLoginView {
     /// True when the user must make an explicit decision about the
     /// keychain residue before proceeding — i.e. `keychain == "present"`.
     pub awaiting_keychain_decision: bool,
-    /// Journal 0054 / round-2 redteam MEDIUM-5 — Codex device-auth
+    /// an internal journal entry / round-2 redteam MEDIUM-5 — Codex device-auth
     /// requires "Device code authorization" to be ENABLED in the
     /// user's ChatGPT Security Settings before the device code can
     /// be redeemed; otherwise OpenAI's browser flow rejects with
@@ -102,7 +104,7 @@ pub struct DeviceCodeInfo {
 /// [`complete_login`].
 ///
 /// `probe` is factored out for tests; production wiring is
-/// [`keychain::probe_residue`].
+/// `keychain::probe_residue`.
 pub fn start_login<P>(base_dir: &Path, account: AccountNum, probe: P) -> Result<StartLoginView>
 where
     P: FnOnce() -> ProbeResult,
@@ -140,7 +142,7 @@ where
 /// DI parameters mirror [`crate::providers::codex::login::perform_with`]:
 ///
 /// * `purge_keychain` — pre-collected user decision; `true` runs
-///   [`keychain::purge_residue`] before spawn, `false` is a noop.
+///   `keychain::purge_residue` before spawn, `false` is a noop.
 /// * `purge` — the purge implementation (test seam).
 /// * `spawn_codex` — spawns the subprocess, captures stdout, and
 ///   must invoke `on_device_code` as soon as the verification URL +
@@ -185,7 +187,7 @@ where
         match purge() {
             Ok(_) => {}
             Err(e) => {
-                // Journal 0021 finding M4: the `security` CLI's
+                // an internal journal entry finding M4: the `security` CLI's
                 // stderr echoes service names and adjacent keychain
                 // bytes on some failure modes — route through
                 // `redact_tokens` before surfacing to the caller.
@@ -236,8 +238,63 @@ where
         .codex()
         .ok_or_else(|| anyhow!("auth.json written by codex is not a Codex credential file"))?
         .clone();
-    let account_id_hint = codex_creds.tokens.account_id.clone();
+    // Filter empty-string hints at the boundary so `mint_for_codex_login`
+    // only ever sees `Some(non_empty)` or `None` — mirrors the CLI path in
+    // `login::perform_with`. The same filtered hint feeds `format_label`.
+    let account_id_hint = codex_creds
+        .tokens
+        .account_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
     let canonical = CredentialFile::Codex(codex_creds);
+
+    // Mint a `by_slot` UUID for this slot BEFORE the fail-closed
+    // `save_canonical_for`. Symmetric with the CLI codex login path
+    // (`login::perform_with`): daemon Pass 0 only mints UUIDs for Anthropic
+    // accounts (`discover_anthropic` skips codex-only slots), so a codex-only
+    // slot re-authed from the desktop has no `by_slot[N]` entry, and
+    // `save_canonical_for` is fail-closed without one (returns
+    // `CredentialError::NoCredentials`). The desktop twin previously omitted
+    // this mint, surfacing the misleading "could not write
+    // credentials/codex-N.json — check permissions" error (the numeric path
+    // is a retired M4-12 write destination). Acquire the lock ONCE and hold it
+    // across mint + save so both writes are atomic cross-process; on save
+    // failure roll back the `by_slot[N]` mapping (CRIT-2) so the slot is not
+    // left partial-minted (`by_email` is preserved for retry idempotency).
+    let mint_lock = ProfilesFileLock::acquire(base_dir).map_err(|_| {
+        tracing::warn!(
+            account = %account,
+            error_kind = "codex_desktop_login_profiles_lock_failed",
+            "could not acquire profiles lock for UUID mint — login cannot complete"
+        );
+        anyhow!(
+            "could not acquire profiles.json lock for Codex slot {} — check profiles.json permissions",
+            account
+        )
+    })?;
+
+    if let Err(e) = identity_mint::mint_for_codex_login(
+        &mint_lock,
+        base_dir,
+        account.get(),
+        account_id_hint.as_deref(),
+    ) {
+        tracing::warn!(
+            account = %account,
+            error_kind = "codex_desktop_login_uuid_mint_failed",
+            reason = %redact_tokens(&e),
+            "could not mint UUID for Codex slot — login cannot complete"
+        );
+        // Scrub the raw auth.json before returning (live tokens must not sit
+        // readable between attempts) — the mint failed, so no canonical write
+        // happened; the retry path expects `written` absent.
+        scrub_and_remove_written(&written, account, "mint_failed");
+        return Err(anyhow!(
+            "could not mint identity UUID for Codex slot {} — check profiles.json permissions and disk space",
+            account
+        ));
+    }
 
     if let Err(e) = cred_file::save_canonical_for(base_dir, account, &canonical) {
         let redacted = redact_tokens(&e.to_string());
@@ -247,17 +304,29 @@ where
             reason = %redacted,
             "could not persist codex canonical credential"
         );
-        // R4 cleanup (journal 0021 finding 15): scrub the raw
-        // auth.json before returning. The canonical save failed, so
-        // the retry path expects `written` to be absent — if we
-        // leave it on disk, live access+refresh tokens sit readable
-        // between the failed attempt and the next one.
+        // CRIT-2: roll back the by_slot mapping the mint just wrote so the slot
+        // is not left partial-minted. by_email is preserved so a retry reuses
+        // the same UUID. Best-effort — log on failure but propagate the
+        // original save error.
+        if let Err(rb_err) = profiles::remove_slot_mapping(&mint_lock, base_dir, account.get()) {
+            tracing::warn!(
+                account = %account,
+                error_kind = "codex_desktop_login_rollback_failed",
+                reason = %redact_tokens(&rb_err.to_string()),
+                "could not roll back partial-mint by_slot mapping after save_canonical_for failure"
+            );
+        }
+        // R4 cleanup (an internal journal entry finding 15): scrub the raw auth.json before
+        // returning so live access+refresh tokens don't sit readable between
+        // the failed attempt and the next one.
         scrub_and_remove_written(&written, account, "save_failed");
         return Err(anyhow!(
-            "could not write credentials/codex-{}.json — check `credentials/` permissions and retry",
+            "could not write identities/<UUID>/credentials-codex.json for account {} — check `identities/` permissions",
             account
         ));
     }
+    // Lock released after save completes (minted + written atomically).
+    drop(mint_lock);
 
     // Cleanup: secure_file + unlink the raw auth.json codex wrote.
     scrub_and_remove_written(&written, account, "post_save");
@@ -269,7 +338,7 @@ where
 
     // Step 6: marker + profile entry.
     //
-    // M4-7 (issue #292 Phase 4, spec 02 §INV-03 + §2.3.1): the marker
+    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the marker
     // content is the slot's identity UUID when a `by_slot` mapping
     // exists, falling back to the legacy decimal slot id for pure-legacy
     // installs. Symmetric to the CLI codex login path in
@@ -616,7 +685,7 @@ pub fn parse_device_code_line(line: &str) -> Option<DeviceCodeInfo> {
 }
 
 fn is_device_code_shape(token: &str) -> bool {
-    // Journal 0021 finding M1 narrowed this to EXACTLY 4-4. codex-cli
+    // an internal journal entry finding M1 narrowed this to EXACTLY 4-4. codex-cli
     // 0.128.0 emits 4-5 (e.g. `PDZD-0XC93`) — observed verbatim
     // 2026-05-08. Widen to 4 + dash + {4..=5}: tight enough to reject
     // help-output tokens (`NOTICE`, `WARNING`, `ID-ABCDE`) and the
@@ -658,7 +727,7 @@ pub(crate) fn format_label(account: AccountNum, account_id_hint: Option<&str>) -
 /// Scrubs and removes the raw `auth.json` that codex-cli wrote into
 /// `config-<N>/`. Called from two sites: after a successful
 /// `save_canonical_for` (expected cleanup) AND from the
-/// `save_canonical_for` error branch (R4 cleanup — journal 0021
+/// `save_canonical_for` error branch (R4 cleanup — an internal journal entry
 /// finding 15; without this the live access+refresh tokens persist
 /// on disk between failed attempts).
 ///
@@ -943,6 +1012,54 @@ mod tests {
         );
         assert!(dir.path().join("config-3/.csq-account").exists());
         assert!(dir.path().join("config-3/codex-sessions").is_dir());
+    }
+
+    /// Regression for the desktop codex re-auth write failure (slot 12):
+    /// a codex-only slot has NO `by_slot[N]` UUID mapping (daemon Pass 0 skips
+    /// codex-only slots), and `save_canonical_for` is fail-closed without one.
+    /// `complete_login` MUST mint the UUID itself (mirroring the CLI path) — it
+    /// previously did not, surfacing "could not write credentials/codex-N.json
+    /// — check permissions". This test does NOT pre-provision the UUID, so it
+    /// fails on the pre-fix code and passes once the mint is wired.
+    #[test]
+    fn complete_login_mints_uuid_for_codex_only_slot_without_preprovision() {
+        let dir = TempDir::new().unwrap();
+        tos::acknowledge(dir.path()).unwrap();
+        // Deliberately NO provision_uuid_for_account — this is the codex-only
+        // slot scenario the desktop re-auth hits.
+
+        let view = complete_login(
+            dir.path(),
+            acc(12),
+            false,
+            || Ok(false),
+            |config_dir, _| {
+                stub_codex_auth_json(config_dir, "acct-codex-only");
+                Ok(fake_success())
+            },
+            |_| {},
+        )
+        .expect("complete_login must mint the UUID and succeed for a codex-only slot");
+
+        assert_eq!(view.account, 12);
+
+        // (a) by_slot[12] mapping now exists (minted by complete_login).
+        let uuid = crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), 12)
+            .expect("by_slot[12] UUID must exist after complete_login mints it");
+
+        // (b) the UUID-keyed identity credential was written.
+        let cred_path =
+            crate::accounts::identity_store::credentials_codex_path_for(dir.path(), uuid);
+        assert!(
+            cred_path.exists(),
+            "identities/<UUID>/credentials-codex.json must exist post-mint; path: {cred_path:?}"
+        );
+
+        // (c) the retired numeric mirror is NOT written.
+        assert!(
+            !dir.path().join("credentials/codex-12.json").exists(),
+            "retired numeric credentials/codex-12.json must NOT be written"
+        );
     }
 
     #[test]
@@ -1328,7 +1445,7 @@ mod tests {
         assert!(parse_device_code_line(line).is_none());
     }
 
-    /// Journal 0021 finding M1: narrow `is_device_code_shape` to
+    /// an internal journal entry finding M1: narrow `is_device_code_shape` to
     /// exactly `XXXX-XXXX`. The prior 6-16-char predicate would
     /// match routine stderr tokens like `NOTICE`, `WARNING`,
     /// `FATAL7`, `ID-ABCDE`. This test pins the refusal.
@@ -1413,7 +1530,7 @@ mod tests {
         assert!(parse_device_code_line(line).is_none());
     }
 
-    // ── R4 scrub regression (journal 0021 finding 15) ─────────
+    // ── R4 scrub regression (an internal journal entry finding 15) ─────────
 
     /// If `save_canonical_for` fails AFTER codex has written
     /// `auth.json`, the raw auth.json MUST be removed before the
@@ -1421,24 +1538,35 @@ mod tests {
     /// disk between the failed attempt and the next retry.
     ///
     /// We simulate save failure by making the `credentials/`
-    /// directory read-only before the login runs. The spawn closure
-    /// writes a stub auth.json; `credentials::save` then fails on
-    /// the atomic rename into the read-only dir; the scrub helper
-    /// removes the raw auth.json before the Err returns.
+    /// identity-store tree read-only before the login runs. The spawn closure
+    /// writes a stub auth.json; the per-identity write (UUID mint's identity.json
+    /// or `save_canonical_for`'s credentials-codex.json under
+    /// `identities/<UUID>/`) then fails on the read-only dir, and the scrub
+    /// helper removes the raw auth.json before the Err returns.
+    ///
+    /// NOTE: post-M4-12 the credential write target is
+    /// `identities/<UUID>/credentials-codex.json`, NOT the retired numeric
+    /// `credentials/codex-N.json`. The mint (added so codex-only slots get a
+    /// `by_slot` UUID) runs first and also writes under `identities/`, so a
+    /// read-only `identities/` exercises the persist-failure scrub branch
+    /// regardless of which write trips first. The invariant under test — raw
+    /// auth.json scrubbed + no token leak on failure (an internal journal entry finding 15) —
+    /// holds for both the mint-failure and save-failure scrub branches.
     #[cfg(unix)]
     #[test]
-    fn complete_login_scrubs_written_auth_json_when_canonical_save_fails() {
+    fn complete_login_scrubs_written_auth_json_when_identity_persist_fails() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().unwrap();
         tos::acknowledge(dir.path()).unwrap();
 
-        // Pre-create credentials/ and make it read-only so the
-        // atomic_replace inside save_canonical_for fails.
-        let creds_dir = dir.path().join("credentials");
-        std::fs::create_dir_all(&creds_dir).unwrap();
+        // Pre-create identities/ read-only so the per-identity write under
+        // identities/<UUID>/ (mint's identity.json or the codex credential)
+        // fails to create the UUID subdir.
+        let identities_dir = dir.path().join("identities");
+        std::fs::create_dir_all(&identities_dir).unwrap();
         std::fs::set_permissions(
-            &creds_dir,
+            &identities_dir,
             std::fs::Permissions::from_mode(0o500), // r-x, no write
         )
         .unwrap();
@@ -1458,11 +1586,10 @@ mod tests {
             |_| {},
         );
 
-        // Must return Err — the canonical save fails on the
-        // read-only dir.
+        // Must return Err — the per-identity write fails on the read-only dir.
         assert!(
             result.is_err(),
-            "expected Err when credentials/ is read-only, got: {result:?}"
+            "expected Err when identities/ is read-only, got: {result:?}"
         );
         let err_msg = format!("{}", result.unwrap_err());
         // The outward-facing message is operator-readable and does
@@ -1474,15 +1601,15 @@ mod tests {
         );
 
         // Restore permissions so TempDir cleanup works.
-        std::fs::set_permissions(&creds_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&identities_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         // Invariant: the raw auth.json that codex wrote MUST be
         // gone (R4 fix). Pre-fix this file would sit on disk at
         // whatever mode codex-cli wrote, with live tokens in it.
         assert!(
             !written.exists(),
-            "raw auth.json at {} must be scrubbed after save_canonical_for failure \
-             (journal 0021 finding 15)",
+            "raw auth.json at {} must be scrubbed after identity-persist failure \
+             (an internal journal entry finding 15)",
             written.display()
         );
     }

@@ -1,7 +1,7 @@
 //! PR-C4 H2 merge gate — Windows named-pipe surface-dispatched refresher.
 //!
-//! Per workspaces/codex/02-plans/01-implementation-plan.md PR-C4 and
-//! journal 0067 H2, the merge gate for PR-C4 is "a Windows named-pipe
+//! Per internal-design-docs PR-C4 and
+//! an internal journal entry H2, the merge gate for PR-C4 is "a Windows named-pipe
 //! integration test exercising the surface-dispatched refresher cycle".
 //!
 //! This test stands up a real Windows named-pipe daemon server, plants
@@ -81,7 +81,7 @@ fn now_secs() -> u64 {
 
 #[tokio::test]
 async fn windows_named_pipe_surface_dispatch_refresher_cycle() {
-    // RN1-C (M4-12, PR #487) retired the numeric-keyed credential WRITE
+    // RN1-C (M4-12, an internal ticket) retired the numeric-keyed credential WRITE
     // in `save_canonical_for` (it is now fail-closed without a
     // `by_slot[N]` UUID). The pre-RN1-C version of this test relied on
     // `save_canonical_for` writing `credentials/codex-7.json`, which is
@@ -162,6 +162,8 @@ async fn windows_named_pipe_surface_dispatch_refresher_cycle() {
         oauth_store: None,
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
         audit_health: csq_core::audit::AuditHealth::Verified,
+        #[cfg(feature = "enterprise")]
+        interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     };
     let (server_handle, server_join) = server_windows::serve(&pipe_name, state).await.unwrap();
 

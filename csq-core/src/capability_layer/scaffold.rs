@@ -3,25 +3,30 @@
 //! Authoritative spec: `specs/10-capability-layer-architecture.md`
 //! §10.2 (technique catalog) + §10.3 (typing). Authoritative FR:
 //! FR-CL-02 in
-//! `workspaces/csq-as-cli/01-analysis/01-research/01-functional-requirements.md`.
+//! `internal-design-docs`.
 //!
-//! # PR-CA4 ship state
+//! # Ship state
 //!
-//! This is the **real** PR-CA4 stage (the others under
-//! `capability_layer/` are stubs). The minimum-viable scaffold:
+//! The scaffold stage delivers the live `csq run` system-prompt-append
+//! block. Since CU1b (an internal ticket, G1=UNIFY) it does NOT build the block
+//! itself — it delegates to the shared `coc::translate` flattener so the
+//! live spawn, `csq translate`, and the neutral launcher all derive from
+//! ONE code path:
 //!
-//! 1. Iterate the `CocSet`'s rules in deterministic `BTreeMap` order.
-//! 2. Filter by `applies_to`: include rules whose `applies_to` is
-//!    empty (universal) OR contains the target Surface.
-//! 3. Emit a system-prompt-append block that cites each kept rule
-//!    by its `RULE_ID`, followed by the rule body.
+//! 1. `translate::flatten_artifacts` + `render_sections(surface_header(..))`
+//!    flatten rules + agents + skills + commands in scope for the Surface, in
+//!    deterministic `(precedence DESC, id ASC)` order, into the per-Surface
+//!    system-prompt text — the SAME shared flattener `csq translate`'s
+//!    `system_text()` renders through (byte-identical; flattened ONCE).
+//! 2. The structured-output directive (FR-CL-01) is appended ONLY when the
+//!    prompt classifies as `Compliance` (spec 10 §10.4.6.1).
+//! 3. The per-kind breakdown is recorded on `PreSpawnState::artifacts` (the
+//!    substrate CU3's native-materialization leg extends).
 //!
-//! This is enough to wire the FR-CL-02 stage into the pipeline so
-//! the next-stage stubs (mcp_gate, struct_out, post_validate) can
-//! demonstrate the StubUnimplemented propagation pattern. M4/PR-CA6
-//! extends scaffold to include agents/skills/commands and applies
-//! the per-`.coc/`-artifact `coc.disable: ["scaffold"]` opt-out from
-//! spec 09 §9.2.2.
+//! Before CU1b this stage iterated `coc_set.rules` only, so agents, skills,
+//! and commands reached no model on the live path — the divergence CU1b
+//! fixes. The per-`.coc/`-artifact `coc.disable: ["scaffold"]` opt-out from
+//! spec 09 §9.2.2 remains future work tracked outside this module.
 
 use crate::capability_layer::errors::StageError;
 use crate::capability_layer::pipeline::PipelineStage;
@@ -47,7 +52,33 @@ impl PipelineStage for ScaffoldStage {
     type Writes = PreSpawnState;
 
     fn run(input: Self::Reads, output: &mut Self::Writes) -> Result<(), StageError> {
-        let mut scaffold = build_scaffold(&input.coc_set, input.surface);
+        // CU1b (an internal ticket, G1=UNIFY — owner-ratified 2026-06-19): the live
+        // `csq run` spawn delivers the SAME all-four-kinds (rules + agents +
+        // skills + commands) prose the `csq translate` / neutral-launcher
+        // path produces — ONE flattener (`coc::translate`), no drift.
+        // Pre-CU1b this stage iterated `coc_set.rules` ONLY, so agents,
+        // skills, and commands declared in `.coc/` reached NO model on the
+        // live path. Collapsing onto the translator fixes that.
+        //
+        // The delivered TEXT is host-context-INDEPENDENT on all three
+        // Surfaces — the flattener builds text from `coc_set` + `surface`
+        // only; `HostContext` affects solely Gemini's
+        // `host_isolation_warning` payload bit, which the live spawn emits
+        // SEPARATELY (`run.rs::emit_host_isolation_warning_if_needed`).
+        //
+        // Single flatten (redteam R1 IR-1): flatten the `.coc/` ONCE and
+        // render the per-Surface text from it via the shared
+        // `render_sections` + `surface_header`, rather than dispatching
+        // through `translate::translate` (which would re-flatten for the
+        // text and then again for the per-kind channel below). The result is
+        // byte-identical to `csq translate`'s `system_text()` — both render
+        // through `render_sections(surface_header(surface), flatten_artifacts(..))`
+        // — pinned by `flatten::surface_header_matches_translator_empty_output`
+        // + `scaffold_text_byte_equals_translate_system_text_freeform` (CU5
+        // byte-parity counterparty).
+        let arts = translate_root::flatten_artifacts(&input.coc_set, input.surface);
+        let (mut scaffold, _contributing_ids) =
+            translate_root::render_sections(translate_root::surface_header(input.surface), &arts);
 
         // PR-CA8 commit 1a: Surface gate dropped. The structured-output
         // directive is Surface-agnostic — same JSON envelope shape works
@@ -57,57 +88,30 @@ impl PipelineStage for ScaffoldStage {
         // compliance prompts") — belt-and-suspenders if a misclassified
         // FreeForm prompt routes through Compliance via fail-secure.
         //
-        // Spec 10 §10.4.6.1 (PR-CA8). Per-Surface delivery (CC env var /
-        // Codex config.toml / Gemini settings.json) lives in csq-cli; the
-        // scaffold stage outputs the same text regardless.
+        // `csq translate` keeps the directive as the SEPARATE
+        // `output_schema_directive` payload field; the live spawn inlines it
+        // here because each Surface's carrier (CC env var / Codex
+        // config.toml `instructions` / Gemini settings.json
+        // `system_instruction`) is a single string.
         if input.class.class == PromptClassKind::Compliance {
             scaffold.push_str(&translate_root::build_output_schema_directive());
         }
 
         output.scaffold = Some(scaffold);
-        // `prompt` is received but not consumed — the classifier (which
-        // reads the prompt) lands in PR-CA7a; the scaffold uses the
-        // class verdict produced by that stage.
+
+        // CU1b WB1/AC4 — per-kind channel: record the per-kind breakdown the
+        // delivered prose was built from (full artifact bodies, sorted
+        // deterministically). This is the code substrate CU3's native
+        // materialization leg extends; it is the SAME `arts` the delivered
+        // text above was rendered from (single flatten), so the channel and
+        // the delivered text can never disagree.
+        output.artifacts = arts;
+
+        // `prompt` is received but consumed by the classifier stage
+        // (PR-CA7), not by scaffold.
         let _ = input.prompt;
         Ok(())
     }
-}
-
-/// Build the rule-citation block. Returns the empty string when no
-/// rules apply (still wraps in `Some(_)` at the call site so the
-/// state field reflects "scaffold ran, produced nothing").
-fn build_scaffold(coc_set: &CocSet, surface: Surface) -> String {
-    let mut out = String::new();
-    out.push_str("# Compliance rules from .coc/\n\n");
-    out.push_str(
-        "Cite the relevant RULE_ID(s) when explaining decisions. \
-         Refuse explicitly when a rule prohibits the requested action.\n\n",
-    );
-    let mut included = 0u32;
-    for (rule_id, rule) in &coc_set.rules {
-        if !applies_to_surface(&rule.applies_to, surface) {
-            continue;
-        }
-        included += 1;
-        out.push_str("## ");
-        out.push_str(rule_id.as_str());
-        out.push('\n');
-        out.push_str(rule.body.trim_end());
-        out.push_str("\n\n");
-    }
-    if included == 0 {
-        // Still leave the header so harness tests can detect "scaffold
-        // ran" even when no rules matched the surface filter.
-        out.push_str("(no rules in scope for this surface)\n");
-    }
-    out
-}
-
-/// `applies_to` semantics per spec 09 §9.2.4: an empty set means
-/// "universal — applies to every Surface"; a non-empty set means
-/// "applies only to the listed surfaces".
-fn applies_to_surface(applies_to: &std::collections::BTreeSet<Surface>, surface: Surface) -> bool {
-    applies_to.is_empty() || applies_to.contains(&surface)
 }
 
 #[cfg(test)]
@@ -253,21 +257,34 @@ mod tests {
         );
     }
 
+    /// CU1b: an empty `.coc/` set produces the Surface header only (no
+    /// `## Rules`/`## Agents`/… sections) — the unified flattener's
+    /// header-only shape, identical to `csq translate` for an empty set.
+    /// (The old "(no rules in scope for this surface)" marker is gone; the
+    /// driver short-circuits a truly-`Empty` `.coc/` to `Disabled` before
+    /// the scaffold stage runs, so this is the no-in-scope-artifact shape.)
     #[test]
-    fn scaffold_emits_no_rules_marker_when_set_is_empty() {
+    fn scaffold_empty_set_is_header_only_no_sections() {
         let mut state = PreSpawnState::default();
         ScaffoldStage::run(
             ScaffoldInputs {
                 coc_set: CocSet::empty(),
                 prompt: UserPrompt { text: "x".into() },
-                class: PromptClass::PR_CA4_DEFAULT,
+                // FreeForm so the directive is not appended — isolate the
+                // header-only shape.
+                class: PromptClass {
+                    class: PromptClassKind::FreeForm,
+                    conf: 0.9,
+                },
                 surface: Surface::ClaudeCode,
             },
             &mut state,
         )
         .unwrap();
         let scaffold = state.scaffold.unwrap();
-        assert!(scaffold.contains("(no rules in scope for this surface)"));
+        assert_eq!(scaffold, "# csq capability layer (claude-code)\n");
+        assert!(!scaffold.contains("## Rules"));
+        assert!(state.artifacts.is_empty());
     }
 
     /// PR-CA7c: when surface == ClaudeCode AND class == Compliance, the
@@ -457,5 +474,222 @@ mod tests {
                 "{surface:?}: free-form prompt MUST NOT see the directive (chat UX): {scaffold}"
             );
         }
+    }
+
+    // ====================================================================
+    // CU1b (an internal ticket) — unify the live spawn flattener onto translate
+    // ====================================================================
+
+    use crate::coc::types::{AgentDef, AgentId, CommandDef, CommandId, SkillDef, SkillId};
+
+    /// Build a `.coc/` set carrying one rule, one agent, one skill, and one
+    /// command — all universal (`applies_to: []`) so they reach every
+    /// Surface.
+    fn full_kind_set() -> CocSet {
+        let mut set = CocSet::empty();
+        set.rules.insert(
+            RuleId("RULE-X".into()),
+            rule_with_applies_to("RULE-X", "rule body text", &[]).1,
+        );
+        set.agents.insert(
+            AgentId("AGENT-Y".into()),
+            AgentDef {
+                id: AgentId("AGENT-Y".into()),
+                applies_to: BTreeSet::new(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "agent body text".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        set.skills.insert(
+            SkillId("SKILL-Z".into()),
+            SkillDef {
+                id: SkillId("SKILL-Z".into()),
+                applies_to: BTreeSet::new(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "skill body text".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        set.commands.insert(
+            CommandId("COMMAND-W".into()),
+            CommandDef {
+                id: CommandId("COMMAND-W".into()),
+                applies_to: BTreeSet::new(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "command body text".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        set
+    }
+
+    fn run_scaffold(set: CocSet, surface: Surface, class: PromptClass) -> PreSpawnState {
+        let mut state = PreSpawnState::default();
+        ScaffoldStage::run(
+            ScaffoldInputs {
+                coc_set: set,
+                prompt: UserPrompt { text: "x".into() },
+                class,
+                surface,
+            },
+            &mut state,
+        )
+        .unwrap();
+        state
+    }
+
+    const FREEFORM: PromptClass = PromptClass {
+        class: PromptClassKind::FreeForm,
+        conf: 0.9,
+    };
+    const COMPLIANCE: PromptClass = PromptClass {
+        class: PromptClassKind::Compliance,
+        conf: 0.9,
+    };
+
+    /// CU1b AC1: a live scaffold now delivers rules + agents + skills +
+    /// commands as prose on ALL three Surfaces (pre-CU1b: rules only).
+    #[test]
+    fn scaffold_delivers_all_four_kinds_on_every_surface() {
+        for surface in [Surface::ClaudeCode, Surface::Codex, Surface::Gemini] {
+            let state = run_scaffold(full_kind_set(), surface, FREEFORM);
+            let s = state.scaffold.expect("scaffold set");
+            assert!(s.contains("rule body text"), "{surface:?}: rule missing");
+            assert!(s.contains("agent body text"), "{surface:?}: agent missing");
+            assert!(s.contains("skill body text"), "{surface:?}: skill missing");
+            assert!(
+                s.contains("command body text"),
+                "{surface:?}: command missing"
+            );
+            assert!(s.contains("## Rules"));
+            assert!(s.contains("## Agents"));
+            assert!(s.contains("## Skills"));
+            assert!(s.contains("## Commands"));
+        }
+    }
+
+    /// CU1b AC1 / WB6 — parity (FreeForm, no directive): the live-delivered
+    /// scaffold text is byte-identical to `translate::translate(..)
+    /// .system_text()` for the same `.coc/` + Surface. This is the "one
+    /// flattener" proof — the live spawn and `csq translate` derive from
+    /// the same code path. HostContext::None matches the translate path's
+    /// host-neutral text (the text is host-independent — see ScaffoldStage
+    /// doc).
+    #[test]
+    fn scaffold_text_byte_equals_translate_system_text_freeform() {
+        for surface in [Surface::ClaudeCode, Surface::Codex, Surface::Gemini] {
+            let set = full_kind_set();
+            let expected =
+                translate_root::translate(&set, surface, &translate_root::HostContext::None)
+                    .system_text()
+                    .to_string();
+            let state = run_scaffold(set, surface, FREEFORM);
+            assert_eq!(
+                state.scaffold.unwrap(),
+                expected,
+                "{surface:?}: live scaffold text must byte-equal translate system_text (FreeForm)"
+            );
+        }
+    }
+
+    /// CU1b AC1+AC2 / WB6 — parity (Compliance): the live-delivered text
+    /// equals `system_text()` PLUS the class-gated structured-output
+    /// directive. The directive is the documented live-path super-set
+    /// (`csq translate` carries it as the separate `output_schema_directive`
+    /// field, not inlined into `system_text()`).
+    #[test]
+    fn scaffold_text_equals_translate_system_text_plus_directive_compliance() {
+        for surface in [Surface::ClaudeCode, Surface::Codex, Surface::Gemini] {
+            let set = full_kind_set();
+            let expected = format!(
+                "{}{}",
+                translate_root::translate(&set, surface, &translate_root::HostContext::None)
+                    .system_text(),
+                translate_root::build_output_schema_directive(),
+            );
+            let state = run_scaffold(set, surface, COMPLIANCE);
+            assert_eq!(
+                state.scaffold.unwrap(),
+                expected,
+                "{surface:?}: Compliance scaffold = system_text + directive"
+            );
+        }
+    }
+
+    /// CU1b AC4: the per-kind channel (`PreSpawnState::artifacts`) is
+    /// populated with all four kinds, with full (untrimmed) bodies — the
+    /// substrate CU3 extends.
+    #[test]
+    fn scaffold_populates_per_kind_channel() {
+        let state = run_scaffold(full_kind_set(), Surface::ClaudeCode, FREEFORM);
+        let arts = &state.artifacts;
+        assert_eq!(arts.rules.len(), 1, "rules channel");
+        assert_eq!(arts.agents.len(), 1, "agents channel");
+        assert_eq!(arts.skills.len(), 1, "skills channel");
+        assert_eq!(arts.commands.len(), 1, "commands channel");
+        assert_eq!(arts.rules[0].id, "RULE-X");
+        assert_eq!(arts.agents[0].body, "agent body text");
+        assert_eq!(arts.commands[0].id, "COMMAND-W");
+    }
+
+    /// CU1b AC5: the reconciled all-kinds payload (scaffold text AND the
+    /// per-kind channel) is byte-identical across 30+ invocations
+    /// (spec 10 §10.3.5 determinism).
+    #[test]
+    fn scaffold_all_kinds_payload_deterministic_30_runs() {
+        let first = run_scaffold(full_kind_set(), Surface::Gemini, COMPLIANCE);
+        for _ in 0..30 {
+            let next = run_scaffold(full_kind_set(), Surface::Gemini, COMPLIANCE);
+            assert_eq!(
+                next.scaffold, first.scaffold,
+                "scaffold text not deterministic"
+            );
+            assert_eq!(
+                next.artifacts, first.artifacts,
+                "per-kind channel not deterministic"
+            );
+        }
+    }
+
+    /// CU1b AC3: the live scaffold text and the post-validate rule-id set
+    /// (`extract_rule_ids_in_scope` — the single rule-id source) cover
+    /// exactly the same rules. Both use the identical `applies_to`
+    /// predicate, so a CC-only rule appears in the CC scaffold + CC rule-id
+    /// set but NOT in the Codex ones.
+    #[test]
+    fn scaffold_rules_align_with_extract_rule_ids_in_scope() {
+        use crate::capability_layer::driver::extract_rule_ids_in_scope;
+        let mut set = CocSet::empty();
+        set.rules.insert(
+            RuleId("RULE-UNIVERSAL".into()),
+            rule_with_applies_to("RULE-UNIVERSAL", "u", &[]).1,
+        );
+        set.rules.insert(
+            RuleId("RULE-CC-ONLY".into()),
+            rule_with_applies_to("RULE-CC-ONLY", "cc", &[Surface::ClaudeCode]).1,
+        );
+        let cc_ids = extract_rule_ids_in_scope(&set, Surface::ClaudeCode);
+        let cc = run_scaffold(set.clone(), Surface::ClaudeCode, FREEFORM)
+            .scaffold
+            .unwrap();
+        for id in &cc_ids {
+            assert!(
+                cc.contains(id.as_str()),
+                "CC scaffold missing in-scope {id}"
+            );
+        }
+        let codex_ids = extract_rule_ids_in_scope(&set, Surface::Codex);
+        assert!(!codex_ids.contains("RULE-CC-ONLY"));
+        let codex = run_scaffold(set, Surface::Codex, FREEFORM)
+            .scaffold
+            .unwrap();
+        assert!(
+            !codex.contains("RULE-CC-ONLY"),
+            "CC-only rule leaked to Codex"
+        );
     }
 }

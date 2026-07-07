@@ -70,7 +70,7 @@ fn setup_handle_dir(base: &Path, claude_home: &Path, pid: u32, account: u16) -> 
 /// Registers a deterministic UUID in `profiles.json::by_slot[slot]` AND
 /// seeds `identities/<UUID>/credentials.json`.
 ///
-/// Post-M3-4 (PR #432, journal 0019), `find_target` skips candidates without
+/// Post-M3-4 (an internal ticket, an internal journal entry), `find_target` skips candidates without
 /// UUIDs to defend against partial-Pass-0 state where `resolve_slot_to_uuid`
 /// returns `None` mid-tick. Integration tests that exercise the
 /// `tick → find_target → repoint_handle_dir` chain MUST register UUIDs for
@@ -121,9 +121,9 @@ fn two_terminals_rotate_independently() {
     setup_quota(dir.path(), 2, 10.0);
     setup_config_dir(dir.path(), 1);
     setup_config_dir(dir.path(), 2);
-    // Post-M3-4 (PR #432): auto_rotate::find_target filters slots without UUIDs.
+    // Post-M3-4 (an internal ticket): auto_rotate::find_target filters slots without UUIDs.
     // Register both slots' UUIDs so the rotation candidate selection sees them
-    // as valid targets. See journal/0019 + M3-4 verification block.
+    // as valid targets. See an internal journal entry + M3-4 verification block.
     setup_slot_uuid(dir.path(), 1);
     setup_slot_uuid(dir.path(), 2);
 
@@ -212,9 +212,9 @@ fn two_terminals_diverge_after_independent_cooldown_expiry() {
     setup_quota(dir.path(), 2, 10.0);
     setup_config_dir(dir.path(), 1);
     setup_config_dir(dir.path(), 2);
-    // Post-M3-4 (PR #432): auto_rotate::find_target filters slots without UUIDs.
+    // Post-M3-4 (an internal ticket): auto_rotate::find_target filters slots without UUIDs.
     // Register both slots' UUIDs so the rotation candidate selection sees them
-    // as valid targets. See journal/0019 + M3-4 verification block.
+    // as valid targets. See an internal journal entry + M3-4 verification block.
     setup_slot_uuid(dir.path(), 1);
     setup_slot_uuid(dir.path(), 2);
 
@@ -295,9 +295,9 @@ fn sweep_races_rotate_on_dead_handle_dir() {
     setup_quota(dir.path(), 2, 10.0);
     setup_config_dir(dir.path(), 1);
     setup_config_dir(dir.path(), 2);
-    // Post-M3-4 (PR #432): auto_rotate::find_target filters slots without UUIDs.
+    // Post-M3-4 (an internal ticket): auto_rotate::find_target filters slots without UUIDs.
     // Register both slots' UUIDs so the rotation candidate selection sees them
-    // as valid targets. See journal/0019 + M3-4 verification block.
+    // as valid targets. See an internal journal entry + M3-4 verification block.
     setup_slot_uuid(dir.path(), 1);
     setup_slot_uuid(dir.path(), 2);
 

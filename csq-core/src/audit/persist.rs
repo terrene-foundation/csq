@@ -71,6 +71,35 @@ pub enum Decision {
     Bypass,
 }
 
+/// The M6 T6.1 cross-CLI spawn-boundary governance verdict recorded on a
+/// `csq run` of codex/gemini.
+///
+/// Present ONLY when an operating envelope gated the spawn (enterprise edition,
+/// codex/gemini surface). `None` for cc/3P runs (gated in-loop via M-IC /
+/// Phase 2b, not at spawn) and for ungoverned spawns (no envelope configured),
+/// so the serialized record stays byte-identical for every pre-M6 run.
+/// Kailash-FREE plain data; `additionalProperties: true` in the v1 schema makes
+/// the field additive (old records lacking it deserialize to `None`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnGateRecord {
+    /// The spawned CLI surface: `"codex"` | `"gemini"`.
+    pub cli: String,
+    /// The kailash action id evaluated: `"spawn_codex"` | `"spawn_gemini"`.
+    pub action: String,
+    /// The governance disposition, a fixed-vocab tag (no envelope internals per
+    /// `rules/security.md` §2):
+    ///
+    /// - `"pass"` | `"conditional"` — a PERMITTED spawn (the `SpawnGate::Proceed`
+    ///   branch).
+    /// - the refusal reason (e.g. `"spawn_blocked_by_operating_envelope"`) — a
+    ///   REFUSED spawn (the `SpawnGate::Refuse` branch). `csq run` sets this
+    ///   `verdict`, sets the audit result to `Fail`/`Reject`, and durably flushes
+    ///   the record (`AuditEmitter::try_flush_now`) BEFORE exiting
+    ///   `EXIT_CODE_SPAWN_BLOCKED` — so a refusal IS on the audit trail, not
+    ///   stderr-only. (The reason is also printed to stderr for the operator.)
+    pub verdict: String,
+}
+
 /// Per-`csq run` audit record.
 ///
 /// Field names and types mirror `coc-eval/schemas/csq-runs-schema-v1.json`
@@ -110,6 +139,12 @@ pub struct AuditRecord {
     pub rule_ids_dropped_invalid_format: u32,
     /// Capability-layer decision for this run.
     pub decision: Decision,
+    /// M6 T6.1 — the cross-CLI spawn-boundary governance verdict (codex/gemini,
+    /// enterprise). `None` for cc/3P (in-loop gated) and ungoverned spawns.
+    /// Additive `Option` (`skip_serializing_if`): pre-M6 records omit the key and
+    /// deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_gate: Option<SpawnGateRecord>,
 }
 
 /// Errors returned by [`write_record`].
@@ -169,12 +204,21 @@ fn validate_rule_id(s: &str) -> bool {
 
 // ── Filesystem helpers ─────────────────────────────────────────────────────────
 
-/// Returns `~/.claude/accounts/csq-runs/` as an absolute path.
+/// Returns `~/.claude/accounts/csq-runs/` as an absolute path (the op-chain).
+///
+/// Convenience wrapper over [`audit_dir_for`] for `ChainKind::Op`.
+fn audit_dir() -> PathBuf {
+    audit_dir_for(ChainKind::Op)
+}
+
+/// Returns the production runs-directory for `chain`
+/// (`~/.claude/accounts/csq-runs/` for the op-chain, `.../eatp-runs/` for the
+/// EATP attestation chain) as an absolute path.
 ///
 /// Uses `$HOME` (or the `CSQ_BASE_DIR` override used in tests) to locate the
 /// csq base dir.  In tests, callers should pass a `TempDir`-backed path
 /// directly to the internal writer rather than relying on this function.
-fn audit_dir() -> PathBuf {
+fn audit_dir_for(chain: ChainKind) -> PathBuf {
     // Production: $HOME/.claude/accounts
     let base = std::env::var_os("CSQ_BASE_DIR")
         .map(PathBuf::from)
@@ -182,7 +226,7 @@ fn audit_dir() -> PathBuf {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("accounts"))
         })
         .unwrap_or_else(|| std::env::temp_dir().join("csq-accounts"));
-    base.join("csq-runs")
+    base.join(chain.runs_subdir())
 }
 
 /// Maximum persisted record size per NFR-OBS-03.
@@ -297,6 +341,14 @@ pub enum AuditV2Error {
     /// the `.chain-broken` sentinel (which would refuse all subsequent writes).
     #[error("internal audit logic error: {reason}")]
     Internal { reason: String },
+    /// A genesis-required write ([`write_genesis_v2_signed_in`]) found the chain
+    /// already had a record (`seq >= 1`), so it refused IN-LOCK rather than
+    /// appending a duplicate genesis. This is a BENIGN idempotency outcome (a
+    /// concurrent `csq audit init` won the race) — NOT corruption. The caller
+    /// maps it to the "genesis already present" no-op; it MUST NOT trip the
+    /// `.chain-broken` sentinel.
+    #[error("genesis already exists — chain is not empty, born-canonical genesis already written")]
+    GenesisAlreadyExists,
 }
 
 impl AuditV2Error {
@@ -311,6 +363,7 @@ impl AuditV2Error {
             AuditV2Error::ChainLockTimeout { .. } => "audit_chain_lock_timeout",
             AuditV2Error::ChainBrokenRefuseAppend { .. } => "audit_chain_broken_refuse_append",
             AuditV2Error::Internal { .. } => "audit_internal_error",
+            AuditV2Error::GenesisAlreadyExists => "audit_genesis_already_exists",
         }
     }
 }
@@ -445,6 +498,11 @@ struct CanonicalView<'a> {
     // breaking the signature.
     #[serde(skip_serializing_if = "Option::is_none")]
     op_phase: Option<&'a crate::audit::types::OpPhase>,
+    // M3a: explicit PACT verification level. Skipped when None so every
+    // pre-M3a record's canonical form is byte-identical. When Some, the
+    // level is part of the signed canonical bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_level: Option<&'a crate::audit::eatp_canonical::VerificationLevel>,
 }
 
 /// Returns the canonical JSON bytes for `r` (excludes `signature`).
@@ -486,6 +544,7 @@ pub(crate) fn canonical_bytes_for(r: &SignedRecord) -> Vec<u8> {
         eatp_start_ts: r.eatp_start_ts.as_deref(),
         eatp_end_ts: r.eatp_end_ts.as_deref(),
         op_phase: r.op_phase.as_ref(),
+        verification_level: r.verification_level.as_ref(),
     };
     // R2-RS-5: halt-on-fatal. `CanonicalView` is structurally composed
     // of `&str`/u64/`EventKind`/`EventPayload`/`Option<EatpActor/Authority/Trust>`
@@ -508,7 +567,7 @@ const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Each output character encodes 5 bits; 26 × 5 = 130 bits, so the last character
 /// encodes only 2 of its 5 bits from the entropy pool (top 3 bits forced to 0).
 /// This matches the ULID specification's 128-bit identifier encoding.
-pub(crate) fn gen_chain_id() -> String {
+pub fn gen_chain_id() -> String {
     let mut bytes = [0u8; 16]; // 128 bits
                                // R2-RS-6: halt-on-fatal — see `gen_run_id` rationale. A chain_id
                                // produced from non-CSPRNG bytes would be predictable and would
@@ -543,7 +602,7 @@ pub(crate) fn gen_chain_id() -> String {
 }
 
 /// Returns a minimal ISO-8601 UTC timestamp for v2 records.
-pub(crate) fn current_iso8601_utc_persist() -> String {
+pub fn current_iso8601_utc_persist() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or(std::time::Duration::ZERO);
@@ -604,7 +663,17 @@ pub(crate) fn read_or_init_chain_genesis(
         return Ok(genesis);
     }
 
-    // Not found → create.
+    // Not found → create a fresh genesis. A stale `.seam-dedup-index` sidecar from
+    // a PRIOR chain (e.g. an operator manually deleted chain.json then re-ran
+    // `csq audit init`) would carry dedup keys that do NOT belong to this new
+    // chain — its flat, chain_id-unscoped keys would produce false-positive hits
+    // for any `seam_dedup_index_contains(_or_rebuild)` consumer (the gap-check in
+    // `seam::reconcile`, and the `mcp_gate_outbox` drain's confirmed-on-chain
+    // delete). Clear it here so the new chain starts with no stale dedup state.
+    // Fires ONLY when a genesis is actually minted (inside `.chain-lock`), never on
+    // an existing chain. Redteam #909 R2 (rust-specialist F3).
+    let _ = std::fs::remove_file(csq_runs_dir.join(SEAM_DEDUP_INDEX));
+
     let genesis = ChainGenesis {
         chain_id: gen_chain_id(),
         genesis_seq: 0,
@@ -671,6 +740,53 @@ fn read_last_canonical_bytes(
     }
 }
 
+/// Which audit chain a write targets. Each kind lives in its OWN runs-directory
+/// under `base_dir`, giving fully isolated fault domains: a separate
+/// `chain.json` genesis, `<chain_id>.jsonl` log, `.chain-lock`, `.chain-broken`
+/// sentinel, and `.seam-dedup-index`. A broken op-chain therefore never blocks
+/// EATP attestation writes, and vice versa.
+///
+/// The default for every pre-existing writer is [`ChainKind::Op`] (the
+/// `csq-runs/` op-chain) — the public `write_record_v2` / `write_record_v2_signed`
+/// entry points are byte-identical to before this parameterization. The
+/// born-canonical EATP attestation chain (M3 §10.5) is written via the `*_in`
+/// entry points with [`ChainKind::Eatp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainKind {
+    /// The op-chain: lifecycle (`logout`/`move_slot`/`csq run` floor) +
+    /// Phase-2b governance-turn records. Lives in `csq-runs/`. Honest-host grade.
+    Op,
+    /// The born-canonical EATP attestation chain (M3 §10.5): record #0 is a
+    /// signed `SIGNED_ATTESTATION` genesis in the enterprise edition canonical form; appends
+    /// are per-session close attestations. Lives in `eatp-runs/`.
+    ///
+    /// W1 added the writer + per-chain sentinel READER (`is_chain_broken_in`);
+    /// W2a parameterized the verify side — `verify_chain_in` (`audit/verify.rs`)
+    /// plus the four verify→sentinel callsites (daemon startup, `csq audit
+    /// verify`, `csq doctor`, desktop daemon) now ALSO verify `eatp-runs/` and
+    /// set/clear `eatp-runs/.chain-broken`. The prior W2-BLOCKER (a written EATP
+    /// chain that nothing verifies) is therefore resolved.
+    ///
+    /// **Remaining W2b work before the first production `ChainKind::Eatp` write:**
+    /// the EATP chain has its OWN `chain_id`, and `verify_chain_in` resolves the
+    /// verifying key by that `chain_id`, so W2b's born-canonical genesis writer
+    /// MUST establish the EATP chain's key custody (its own `chain.json` +
+    /// file-store seed under the EATP `chain_id`, mirroring `csq audit init`)
+    /// before emitting the `seq==0` signed genesis. There are no production
+    /// `ChainKind::Eatp` writers yet — W2b is the first.
+    Eatp,
+}
+
+impl ChainKind {
+    /// The runs-subdirectory name (under `base_dir`) holding this chain's files.
+    pub const fn runs_subdir(self) -> &'static str {
+        match self {
+            ChainKind::Op => "csq-runs",
+            ChainKind::Eatp => "eatp-runs",
+        }
+    }
+}
+
 // ── v2 public write site ───────────────────────────────────────────────────────
 
 /// Writes a v2 ledger record to `<csq_runs_dir>/<chain_id>.jsonl`.
@@ -708,7 +824,18 @@ fn read_last_canonical_bytes(
 /// signature. For real-key records use [`write_record_v2_signed`], which
 /// signs AFTER seq assignment.
 pub fn write_record_v2(record: SignedRecord, base_dir: Option<&Path>) -> Result<(), AuditV2Error> {
-    write_record_v2_impl(record, base_dir, None, None, false).map(|_| ())
+    write_record_v2_impl(record, base_dir, ChainKind::Op, None, None, false, false).map(|_| ())
+}
+
+/// Like [`write_record_v2`], but targets `chain`'s runs-directory. Used by the
+/// EATP attestation chain (`ChainKind::Eatp`); `ChainKind::Op` is identical to
+/// [`write_record_v2`].
+pub fn write_record_v2_in(
+    record: SignedRecord,
+    base_dir: Option<&Path>,
+    chain: ChainKind,
+) -> Result<(), AuditV2Error> {
+    write_record_v2_impl(record, base_dir, chain, None, None, false, false).map(|_| ())
 }
 
 /// TEST-ONLY: append an unsigned record while SKIPPING the M19b in-lock
@@ -723,7 +850,7 @@ pub fn write_record_v2_unchecked(
     record: SignedRecord,
     base_dir: Option<&Path>,
 ) -> Result<(), AuditV2Error> {
-    write_record_v2_impl(record, base_dir, None, None, true).map(|_| ())
+    write_record_v2_impl(record, base_dir, ChainKind::Op, None, None, true, false).map(|_| ())
 }
 
 /// Acquires the chain-wide `.chain-lock` sidecar with a bounded 5-second polled
@@ -793,7 +920,7 @@ pub struct SeamWriteSpec<'a> {
     pub dedup_key: &'a str,
 }
 
-/// Outcome of [`write_seam_record_signed`].
+/// Outcome of `write_seam_record_signed`.
 #[derive(Debug)]
 pub enum SeamWriteOutcome {
     /// The record was anchored. Carries the finalized on-disk record.
@@ -821,7 +948,15 @@ pub fn write_seam_record(
     signing_key: Option<&dyn crate::audit::traits::SigningKey>,
     spec: &SeamWriteSpec<'_>,
 ) -> Result<SeamWriteOutcome, AuditV2Error> {
-    match write_record_v2_impl(record, base_dir, signing_key, Some(spec), false)? {
+    match write_record_v2_impl(
+        record,
+        base_dir,
+        ChainKind::Op,
+        signing_key,
+        Some(spec),
+        false,
+        false,
+    )? {
         WriteV2Outcome::Written(r) => Ok(SeamWriteOutcome::Written(r)),
         WriteV2Outcome::Duplicate => Ok(SeamWriteOutcome::Duplicate),
     }
@@ -852,11 +987,66 @@ pub fn write_record_v2_signed(
     base_dir: Option<&Path>,
     signing_key: &dyn crate::audit::traits::SigningKey,
 ) -> Result<SignedRecord, AuditV2Error> {
-    match write_record_v2_impl(record, base_dir, Some(signing_key), None, false)? {
+    write_record_v2_signed_in(record, base_dir, ChainKind::Op, signing_key)
+}
+
+/// Like [`write_record_v2_signed`], but targets `chain`'s runs-directory. The
+/// EATP attestation chain (`ChainKind::Eatp`) uses this to write its
+/// born-canonical signed genesis (M3 §10.5 W2) and session-close attestations
+/// (W3); `ChainKind::Op` is identical to [`write_record_v2_signed`].
+pub fn write_record_v2_signed_in(
+    record: SignedRecord,
+    base_dir: Option<&Path>,
+    chain: ChainKind,
+    signing_key: &dyn crate::audit::traits::SigningKey,
+) -> Result<SignedRecord, AuditV2Error> {
+    match write_record_v2_impl(
+        record,
+        base_dir,
+        chain,
+        Some(signing_key),
+        None,
+        false,
+        false,
+    )? {
         WriteV2Outcome::Written(r) => Ok(*r),
         // Unreachable: dedup is only consulted when `seam` is Some. Surface as
         // a logic error (NOT ChainCorrupt — that would brick the chain via the
         // .chain-broken sentinel for what is a programmer error).
+        WriteV2Outcome::Duplicate => {
+            debug_assert!(false, "dedup outcome without seam spec");
+            Err(AuditV2Error::Internal {
+                reason: "dedup outcome without seam spec".to_string(),
+            })
+        }
+    }
+}
+
+/// Like [`write_record_v2_signed_in`], but REQUIRES the write to land at the
+/// chain genesis (`seq == 0`). If the chain already has a record, the write is
+/// refused IN-LOCK with [`AuditV2Error::GenesisAlreadyExists`] rather than
+/// appending a duplicate genesis at `seq >= 1`.
+///
+/// M1 (redteam R1): closes the TOCTOU where two concurrent `csq audit init`
+/// runs both pass an out-of-lock emptiness check and both append a "genesis".
+/// The EATP born-canonical genesis writer is the sole caller; it maps
+/// `GenesisAlreadyExists` to the idempotent "genesis already present" no-op.
+pub fn write_genesis_v2_signed_in(
+    record: SignedRecord,
+    base_dir: Option<&Path>,
+    chain: ChainKind,
+    signing_key: &dyn crate::audit::traits::SigningKey,
+) -> Result<SignedRecord, AuditV2Error> {
+    match write_record_v2_impl(
+        record,
+        base_dir,
+        chain,
+        Some(signing_key),
+        None,
+        false,
+        true,
+    )? {
+        WriteV2Outcome::Written(r) => Ok(*r),
         WriteV2Outcome::Duplicate => {
             debug_assert!(false, "dedup outcome without seam spec");
             Err(AuditV2Error::Internal {
@@ -876,12 +1066,13 @@ enum WriteV2Outcome {
 
 /// Shared implementation for [`write_record_v2`] (no signing),
 /// [`write_record_v2_signed`] (sign-after-assign), and
-/// [`write_seam_record_signed`] (sign + in-lock dedup). Returns the finalized
+/// `write_seam_record_signed` (sign + in-lock dedup). Returns the finalized
 /// record (writer-assigned `seq`/`prev_hash`/`canonical_hash`/`signature`), or
 /// `Duplicate` when a seam dedup key was supplied and already present.
 fn write_record_v2_impl(
     mut record: SignedRecord,
     base_dir: Option<&Path>,
+    chain: ChainKind,
     signing_key: Option<&dyn crate::audit::traits::SigningKey>,
     seam: Option<&SeamWriteSpec<'_>>,
     // M19b M3: when `true`, skip the in-lock unsigned-after-cutoff guard. ONLY
@@ -890,13 +1081,23 @@ fn write_record_v2_impl(
     // chain state that the production writer now structurally refuses to create,
     // so they can assert `verify_chain` still CATCHES it (tamper/corruption path).
     bypass_cutoff_guard: bool,
+    // M1 (redteam R1): when `true`, this write MUST land at `seq == 0` (chain
+    // genesis). Checked IN-LOCK after seq assignment — if the chain already has a
+    // record, the write is refused with `GenesisAlreadyExists` rather than
+    // appending a duplicate "genesis" at `seq >= 1`. Closes the TOCTOU where two
+    // concurrent `csq audit init` both pass an out-of-lock emptiness check. Only
+    // the EATP genesis wrapper passes `true`; every other caller passes `false`.
+    require_genesis_empty: bool,
 ) -> Result<WriteV2Outcome, AuditV2Error> {
     use crate::audit::types::{Ed25519Signature, RecordId, Sha256Hex};
 
-    // Step 1 — ensure csq-runs/ dir.
+    // Step 1 — ensure the chain's runs-dir (`csq-runs/` op-chain, `eatp-runs/`
+    // EATP attestation chain). Each chain's lock/sentinel/genesis/dedup are
+    // scoped to this directory, so the two chains are fully isolated fault
+    // domains (W1).
     let csq_runs = match base_dir {
-        Some(b) => b.join("csq-runs"),
-        None => audit_dir(),
+        Some(b) => b.join(chain.runs_subdir()),
+        None => audit_dir_for(chain),
     };
 
     #[cfg(unix)]
@@ -921,13 +1122,13 @@ fn write_record_v2_impl(
     // M13b-T2: replaced unbounded blocking flock with a bounded 5s polled
     // try_lock (mirrors `acquire_move_lock` in `move_slot.rs:213-246`).
     // A wedged lock fails the write CLOSED with `ChainLockTimeout` rather
-    // than hanging the user-facing command (FM-3 from journal 0031).
+    // than hanging the user-facing command (FM-3 from an internal journal entry).
     // The lock is held only over the critical section (steps 2–8); it is NOT
     // held across any await point (this function is synchronous — structural).
     //
     // The polling loop is extracted into `acquire_chain_lock` so that
     // `csq audit roster-install` can reuse the same bounded acquire semantics
-    // without duplicating the deadline/interval constants (issue #694).
+    // without duplicating the deadline/interval constants (an internal ticket).
     let _chain_lock = acquire_chain_lock(&csq_runs)?;
 
     // Step 1.5 — fail-closed sentinel check (inside the `.chain-lock` critical
@@ -942,7 +1143,7 @@ fn write_record_v2_impl(
     // `base_dir` here is `csq_runs.parent()` (i.e. `~/.claude/accounts/` or
     // the temp dir in tests). The sentinel lives at `base_dir/csq-runs/.chain-broken`.
     if let Some(base) = csq_runs.parent() {
-        if let Some(kind) = crate::audit::health::is_chain_broken(base) {
+        if let Some(kind) = crate::audit::health::is_chain_broken_in(base, chain.runs_subdir()) {
             tracing::error!(
                 error_kind = "chain_write_refused_broken_sentinel",
                 broken_kind = kind.as_str(),
@@ -985,6 +1186,16 @@ fn write_record_v2_impl(
         Some((bytes, last_seq)) => (last_seq.saturating_add(1), sha256_hex(&bytes)),
     };
 
+    // M1 (redteam R1): genesis-empty precondition, checked IN-LOCK so it is atomic
+    // with the seq assignment and the append. A caller requiring the chain genesis
+    // (EATP born-canonical genesis) refuses cleanly if a record already exists —
+    // the second of two concurrent `csq audit init` runs gets this Err instead of
+    // appending a duplicate genesis-shaped payload at seq 1. The caller maps it to
+    // the idempotent "genesis already present" no-op.
+    if require_genesis_empty && seq != 0 {
+        return Err(AuditV2Error::GenesisAlreadyExists);
+    }
+
     // Step 4.5 — IN-LOCK unsigned-after-cutoff guard (M19b security review M3).
     //
     // The signed-vs-unsigned decision is made by the CALLER OUTSIDE this
@@ -1017,7 +1228,17 @@ fn write_record_v2_impl(
     // writes in that state, silently aborting `csq swap`/`logout`/`move`
     // lifecycle ops (they fail closed on a non-`ChainBrokenRefuseAppend` Err).
     // Require BOTH so the guard's refusal set == verify's rejection set.
-    if !bypass_cutoff_guard && signing_key.is_none() {
+    //
+    // W1: the cutoff guard is an OP-CHAIN concern. `ChainState::load(base)`
+    // resolves `base/csq-runs/chain.json` (the op-chain's key-custody state)
+    // regardless of `chain`, so consulting it for an EATP write would compare
+    // the EATP chain's `seq` against the OP-chain's cutoff — a cross-chain leak.
+    // The EATP attestation chain is born-canonical and ALWAYS signed (W2/W3), so
+    // it has no unsigned-before-cutoff history and no op-chain-derived cutoff
+    // applies. Gate the guard on `ChainKind::Op` so the two chains stay fully
+    // isolated fault domains (the `ChainKind` doc invariant) and a future
+    // unsigned EATP path can never be governed by op-chain cutoff state.
+    if chain == ChainKind::Op && !bypass_cutoff_guard && signing_key.is_none() {
         if let Some(base) = csq_runs.parent() {
             if let Ok(cs) = crate::audit::key_custody::ChainState::load(base) {
                 if let (Some(cutoff), true) =
@@ -1035,6 +1256,21 @@ fn write_record_v2_impl(
                 }
             }
         }
+    }
+
+    // Step 4b — M3a: stamp AUTO_APPROVED on every record (enterprise builds).
+    //
+    // The `is_none()` guard preserves any explicit higher level a future M3
+    // phase sets. Community builds skip this block entirely: `verification_level`
+    // stays `None`, so the community chain is byte-identical to pre-M3a.
+    //
+    // PRIMARY METHODOLOGICAL DIRECTIVE 3: the ONLY level stamped here is
+    // `AutoApproved`. `SignedAttestation` and `PeerReviewed` are reserved for
+    // Phase-2b turn-events (M3 T3.2) and MUST NOT appear on op-records.
+    #[cfg(feature = "enterprise")]
+    if record.verification_level.is_none() {
+        record.verification_level =
+            Some(crate::audit::eatp_canonical::VerificationLevel::AutoApproved);
     }
 
     // Step 5 — patch record with chain identity.
@@ -1216,6 +1452,26 @@ fn load_or_rebuild_dedup_index(
                 // replay would double-anchor, re-opening the TOCTOU M20 closes.
                 crate::audit::types::EventPayload::CsqRun(p) => {
                     set.insert(format!("run:{}", p.run_id));
+                }
+                // #784: the `GovernanceTurn` per-turn attestation record reuses
+                // this in-lock dedup index (keyed `gov:<session_id>:<record_seq>`)
+                // so a re-flush of the same governance events appends exactly one
+                // record per event. Both key components are mirrored into the
+                // payload precisely so this rebuild can re-derive the key — without
+                // this arm a Step-9 sidecar-drop would lose every prior gov: key on
+                // rebuild and a replay would double-append, re-opening the very
+                // TOCTOU M20 closes (sibling-contract with the `run:` arm above).
+                crate::audit::types::EventPayload::GovernanceTurn(p) => {
+                    set.insert(format!("gov:{}:{}", p.session_id, p.record_seq));
+                }
+                // M6 T6.2 Shard 4: the `McpGateDecision` spawn-boundary attestation
+                // reuses this in-lock dedup index (keyed
+                // `mcp:<session_nonce>:<record_seq>`) so a proxy re-POST of the same
+                // decision appends exactly one record. Both key components are
+                // mirrored into the payload precisely so this rebuild can re-derive
+                // the key — sibling-contract with the `run:` / `gov:` arms above.
+                crate::audit::types::EventPayload::McpGateDecision(p) => {
+                    set.insert(format!("mcp:{}:{}", p.session_nonce, p.record_seq));
                 }
                 _ => {}
             }
@@ -1469,6 +1725,7 @@ mod tests {
             rule_ids_cited_after_repair: vec![],
             rule_ids_dropped_invalid_format: 0,
             decision: Decision::Accept,
+            spawn_gate: None,
         }
     }
 
@@ -1671,6 +1928,37 @@ mod tests {
         assert_eq!(parsed.rule_ids_dropped_invalid_format, 0);
     }
 
+    /// Redteam R1 (#3): the additive `spawn_gate` field round-trips, and `None`
+    /// serializes the key away — a pre-M6 record (no `spawn_gate` key) deserializes
+    /// to `None`, byte-compatible with the existing JSONL audit stream.
+    #[test]
+    fn spawn_gate_round_trips_and_is_omitted_when_none() {
+        let mut rec = sample_record();
+        rec.spawn_gate = Some(SpawnGateRecord {
+            cli: "codex".to_string(),
+            action: "spawn_codex".to_string(),
+            verdict: "conditional".to_string(),
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        let parsed: AuditRecord = serde_json::from_str(&json).unwrap();
+        let sg = parsed
+            .spawn_gate
+            .expect("spawn_gate must round-trip as Some");
+        assert_eq!(sg.cli, "codex");
+        assert_eq!(sg.action, "spawn_codex");
+        assert_eq!(sg.verdict, "conditional");
+
+        // `None` omits the key, and a JSON string without the key deserializes
+        // back to `None` (pre-M6 forward-compatibility).
+        let none_json = serde_json::to_string(&sample_record()).unwrap();
+        assert!(
+            !none_json.contains("spawn_gate"),
+            "spawn_gate: None must serialize the key away"
+        );
+        let reparsed: AuditRecord = serde_json::from_str(&none_json).unwrap();
+        assert!(reparsed.spawn_gate.is_none());
+    }
+
     // ── Mode bits (T3 / NFR-AUDIT-03 / NFR-OBS-04) ───────────────────────
 
     #[cfg(unix)]
@@ -1828,7 +2116,136 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
+    }
+
+    // ── W1: chain-id parameterization — op-chain / EATP-chain isolation ──────
+
+    /// W1: `ChainKind::Eatp` writes land in `eatp-runs/`, NOT `csq-runs/`. The
+    /// op-chain runs-dir is not even created by an EATP-only write.
+    #[test]
+    fn eatp_write_targets_eatp_runs_dir_not_csq_runs() {
+        let dir = TempDir::new().unwrap();
+        write_record_v2_in(sample_v2_record(), Some(dir.path()), ChainKind::Eatp).unwrap();
+
+        assert!(
+            dir.path().join("eatp-runs/chain.json").exists(),
+            "EATP write must create eatp-runs/chain.json"
+        );
+        assert!(
+            !dir.path().join("csq-runs").exists(),
+            "an EATP-only write must NOT create the op-chain's csq-runs/ dir"
+        );
+    }
+
+    /// W1: the op-chain and the EATP chain maintain INDEPENDENT genesis,
+    /// chain_id, and seq counters in the same base_dir — neither cross-links the
+    /// other's records.
+    #[test]
+    fn op_and_eatp_chains_are_independent() {
+        let dir = TempDir::new().unwrap();
+        // Two records on each chain.
+        write_record_v2(sample_v2_record(), Some(dir.path())).unwrap();
+        write_record_v2(sample_v2_record(), Some(dir.path())).unwrap();
+        write_record_v2_in(sample_v2_record(), Some(dir.path()), ChainKind::Eatp).unwrap();
+        write_record_v2_in(sample_v2_record(), Some(dir.path()), ChainKind::Eatp).unwrap();
+
+        let op_genesis: ChainGenesis = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("csq-runs/chain.json")).unwrap(),
+        )
+        .unwrap();
+        let eatp_genesis: ChainGenesis = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("eatp-runs/chain.json")).unwrap(),
+        )
+        .unwrap();
+
+        // Distinct chain identities.
+        assert_ne!(
+            op_genesis.chain_id, eatp_genesis.chain_id,
+            "op-chain and EATP chain must have distinct chain_ids"
+        );
+
+        // Each chain's JSONL has exactly its own two records at seq 0,1 — no
+        // cross-link: the EATP records did not advance the op-chain seq and
+        // vice versa.
+        for (runs, chain_id) in [
+            ("csq-runs", &op_genesis.chain_id),
+            ("eatp-runs", &eatp_genesis.chain_id),
+        ] {
+            let jsonl = dir.path().join(format!("{runs}/{chain_id}.jsonl"));
+            let seqs: Vec<u64> = std::fs::read_to_string(&jsonl)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<SignedRecord>(l).unwrap().seq)
+                .collect();
+            assert_eq!(seqs, vec![0, 1], "{runs}: each chain owns seq 0,1 only");
+        }
+    }
+
+    /// W1: a broken op-chain sentinel refuses op-chain appends but does NOT
+    /// block the EATP chain (separate fault domains), and symmetrically.
+    #[test]
+    fn broken_sentinel_is_per_chain() {
+        let dir = TempDir::new().unwrap();
+
+        // Break the op-chain only.
+        crate::audit::health::set_chain_broken_in(dir.path(), "csq-runs", "test_break");
+        let op_err = write_record_v2(sample_v2_record(), Some(dir.path())).unwrap_err();
+        assert!(
+            matches!(op_err, AuditV2Error::ChainBrokenRefuseAppend { .. }),
+            "op write must be refused by the op-chain sentinel"
+        );
+        // EATP chain is unaffected.
+        write_record_v2_in(sample_v2_record(), Some(dir.path()), ChainKind::Eatp)
+            .expect("EATP write must succeed despite a broken op-chain");
+
+        // Now break the EATP chain only; clear the op-chain.
+        crate::audit::health::clear_chain_broken_in(dir.path(), "csq-runs");
+        crate::audit::health::set_chain_broken_in(dir.path(), "eatp-runs", "test_break");
+        let eatp_err =
+            write_record_v2_in(sample_v2_record(), Some(dir.path()), ChainKind::Eatp).unwrap_err();
+        assert!(
+            matches!(eatp_err, AuditV2Error::ChainBrokenRefuseAppend { .. }),
+            "EATP write must be refused by the EATP-chain sentinel"
+        );
+        // Op chain now writes fine.
+        write_record_v2(sample_v2_record(), Some(dir.path()))
+            .expect("op write must succeed despite a broken EATP chain");
+    }
+
+    /// W1: an unsigned EATP write is NOT governed by the OP-chain's signing
+    /// cutoff (the cutoff guard is gated on `ChainKind::Op`). Without that gate,
+    /// `ChainState::load(base)` reads the op-chain's cutoff for an EATP write and
+    /// wrongly refuses any EATP append at `eatp_seq >= op_cutoff` — a cross-chain
+    /// leak. This pins the fix: the EATP chain stays a fully isolated fault
+    /// domain even for unsigned writes.
+    #[test]
+    fn eatp_unsigned_write_not_governed_by_op_chain_cutoff() {
+        use crate::audit::key_custody::ChainState;
+        let dir = TempDir::new().unwrap();
+
+        // Op-chain genesis at seq 0, then a REAL cutoff active from seq 1.
+        write_record_v2(sample_v2_record(), Some(dir.path())).unwrap();
+        let mut cs = ChainState::load(dir.path()).unwrap();
+        cs.signing_active_since_seq = Some(1);
+        cs.signing_key_id = Some(KeyId::try_new(format!("ed25519:{}", "1".repeat(64))).unwrap());
+        cs.save(dir.path()).unwrap();
+
+        // Two UNSIGNED EATP writes: the second lands at EATP seq 1, which under a
+        // leaking guard would be `1 >= op_cutoff(1)` → wrongly refused. Both MUST
+        // succeed: the EATP chain has its own (cutoff-free) fault domain.
+        write_record_v2_in(sample_v2_record(), Some(dir.path()), ChainKind::Eatp)
+            .expect("EATP seq 0 unsigned write must succeed");
+        write_record_v2_in(sample_v2_record(), Some(dir.path()), ChainKind::Eatp)
+            .expect("EATP seq 1 unsigned write must NOT be refused by the op-chain cutoff");
+
+        // Sanity: the op-chain's own cutoff still refuses an unsigned op append
+        // at seq 1 (the guard is intact for ChainKind::Op).
+        let op_err = write_record_v2(sample_v2_record(), Some(dir.path()))
+            .expect_err("unsigned op append at seq >= cutoff must still be refused");
+        assert!(matches!(op_err, AuditV2Error::Signing { .. }));
     }
 
     /// M02 test 1: v1 write path is unchanged after v2 introduction.
@@ -2189,6 +2606,15 @@ mod tests {
     fn concurrent_chain_writers_do_not_lose_records() {
         use std::sync::Arc;
 
+        // Hermeticity: verify_chain (called below) transitively reads
+        // CSQ_AUDIT_EDITION via resolve_registry/resolve_edition. Hold the shared
+        // env lock and pin a clean community baseline so this test cannot race a
+        // concurrent enterprise-edition test that has CSQ_AUDIT_EDITION=enterprise
+        // set (testing.md Rule 6 / test-hermeticity.md MUST 1 — reader side).
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
         let dir = tempfile::TempDir::new().unwrap();
         let base = Arc::new(dir.path().to_path_buf());
 
@@ -2261,7 +2687,7 @@ mod tests {
     /// AC-T2: A held `.chain-lock` past the deadline causes `write_record_v2`
     /// to fail closed with `AuditV2Error::ChainLockTimeout` — never hangs.
     ///
-    /// This test verifies the FM-3 fix from journal 0031: an unbounded blocking
+    /// This test verifies the FM-3 fix from an internal journal entry: an unbounded blocking
     /// `flock` is replaced by a 5-second polled `try_lock_file` so a wedged
     /// lock fails the write closed rather than parking the user-facing command
     /// indefinitely.
@@ -2333,6 +2759,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
 
         let start = Instant::now();
@@ -2388,6 +2815,35 @@ mod tests {
         assert!(
             chain_files.is_empty(),
             "no record must land when chain is broken; found: {chain_files:?}"
+        );
+    }
+
+    /// Redteam #909 R2 (rust-specialist F3): minting a fresh genesis (chain.json
+    /// absent) must CLEAR any stale `.seam-dedup-index` sidecar left by a prior
+    /// chain (manual chain.json deletion + re-init), so its chain_id-unscoped keys
+    /// cannot false-positive for a `seam_dedup_index_contains(_or_rebuild)`
+    /// consumer against the NEW chain.
+    #[test]
+    fn new_genesis_clears_stale_dedup_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let csq_runs = dir.path().join("csq-runs");
+        std::fs::create_dir_all(&csq_runs).unwrap();
+
+        // A stale sidecar key from a prior (deleted) chain.
+        std::fs::write(csq_runs.join(SEAM_DEDUP_INDEX), b"mcp:old-chain:0\n").unwrap();
+        assert!(
+            seam_dedup_index_contains(&csq_runs, "mcp:old-chain:0"),
+            "precondition: the stale key is present before re-genesis"
+        );
+
+        // No chain.json present → mint a fresh genesis.
+        let g =
+            read_or_init_chain_genesis(&csq_runs, "2026-07-02T00:00:00Z").expect("mint genesis");
+        assert!(!g.chain_id.is_empty(), "a fresh chain_id was minted");
+
+        assert!(
+            !seam_dedup_index_contains(&csq_runs, "mcp:old-chain:0"),
+            "new genesis must clear the stale dedup sidecar (no false-positive on the new chain)"
         );
     }
 }

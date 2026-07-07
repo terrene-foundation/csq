@@ -1,0 +1,25 @@
+[package]
+name = "csq-redact"
+version.workspace = true
+edition.workspace = true
+# csq-redact is a COMMUNITY (Apache-2.0) leaf crate — the edition-uniform token
+# redaction layer. Both editions depend on it (error redaction + the audit-chain
+# `RedactedString`), and it is the future dependency of the PUBLIC `csq-sdk`
+# crate (crates.io), so it MUST stay Apache-2.0 and moat-free. It is NOT in
+# `scripts/extract-community-edition.sh` MOAT_PATHS — it ships to the community
+# fork verbatim. See internal-design-docs (W1).
+license.workspace = true
+description = "csq token redaction — redact_tokens + the RedactedString newtype. Zero csq-core deps; serde-only. Shared by both editions and the public csq-sdk."
+repository.workspace = true
+# Publishable (W3): csq-redact is the crates.io redaction leaf that the public
+# csq-sdk depends on, so it must be published FIRST (dependency order) for csq-sdk
+# to resolve it from crates.io. As a genuine published Apache-2.0 crate it now
+# appears in THIRD-PARTY-LICENSES.md: cargo-about keys first-party exclusion
+# (`[private] ignore`) on `publish = false`, so a publishable crate is attributed —
+# the correct redistribution attribution for a standalone crates.io crate
+# (over-inclusive attribution is safe — see about.toml). serde is its only dep.
+
+[dependencies]
+# serde only — RedactedString is a wire type (Serialize/Deserialize that
+# re-redacts on the way in). redact_tokens itself is pure std.
+serde.workspace = true

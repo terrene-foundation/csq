@@ -5,7 +5,8 @@
 //!  2. Checks the in-memory per-process cache.
 //!  3. Resolves the binary via PATH walk + `std::fs::canonicalize`.
 //!  4. Applies the install-path blocklist gate.
-//!  5. Spawns `<name> --version` with a 2-second timeout.
+//!  5. Spawns `<name> --version` with a surface-aware timeout
+//!     (`probe_timeout`: Claude 2s, Codex/Gemini 6s).
 //!  6. Reads up to 8 KiB of stdout, kills the subprocess if exceeded.
 //!  7. Parses the first complete `\n`-terminated line.
 //!  8. Applies the prefix gate (codex-only).
@@ -156,8 +157,12 @@ fn run_probe(cli: SurfaceCli) -> CliStatus {
     let manager = classify_install_manager(&canonical_path);
     let spawn_start = Instant::now();
 
-    let (stdout_bytes, elapsed_ms, timed_out) =
-        spawn_version_subprocess(&canonical_path, child_path_env, spawn_start);
+    let (stdout_bytes, elapsed_ms, timed_out) = spawn_version_subprocess(
+        &canonical_path,
+        child_path_env,
+        spawn_start,
+        probe_timeout(cli),
+    );
 
     if timed_out {
         return CliStatus::ProbeTimedOut {
@@ -186,10 +191,43 @@ fn run_probe(cli: SurfaceCli) -> CliStatus {
 ///
 /// Uses a background reader thread + channel to implement wall-clock timeout
 /// without blocking the probe thread indefinitely on a slow/hung subprocess.
+/// Wall-clock budget for the `<binary> --version` probe, per surface.
+///
+/// spec/13 §8: the probe must not block a launch indefinitely. The budget is
+/// **surface-specific** because the CLIs have very different cold-start costs:
+///
+/// - **Claude** — 2s. A fast native-ish binary; 2s is ample.
+/// - **Codex / Gemini** — 6s. Both are Node programs
+///   (`@openai/codex`, `@google/gemini-cli`) whose cold-start routinely exceeds
+///   2s (observed: `codex --version` at 2222ms on a warm host, higher under
+///   load). At 2s the probe times out → `ProbeTimedOut` → csq proceeds WITHOUT a
+///   version, so the `Outdated → auto-update` branch of the disposition table
+///   never evaluates and a stale codex/gemini is never auto-updated. 6s (≈2.7×
+///   the observed cold-start) lets the version read complete so auto-update can
+///   actually fire, while still bounding a genuinely-hung CLI. The probe result
+///   is cached per process, so the cost is paid at most once per `csq` process.
+///
+/// Test builds (`--features test-utils`) use 30s uniformly to absorb cargo-test
+/// parallelism CPU saturation (integration stubs in `csq/tests/cli_deps_*`); the
+/// runtime spec invariant holds only in non-test builds.
+#[cfg(not(feature = "test-utils"))]
+pub(crate) fn probe_timeout(cli: SurfaceCli) -> Duration {
+    match cli {
+        SurfaceCli::Claude => Duration::from_secs(2),
+        SurfaceCli::Codex | SurfaceCli::Gemini => Duration::from_secs(6),
+    }
+}
+
+#[cfg(feature = "test-utils")]
+pub(crate) fn probe_timeout(_cli: SurfaceCli) -> Duration {
+    Duration::from_secs(30)
+}
+
 fn spawn_version_subprocess(
     canonical_path: &std::path::Path,
     child_path_env: Option<std::ffi::OsString>,
     spawn_start: Instant,
+    timeout: Duration,
 ) -> (Vec<u8>, u64, bool) {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -211,16 +249,9 @@ fn spawn_version_subprocess(
         }
     };
 
-    // Production: 2s per spec/13 §8. Test builds (`--features test-utils`)
-    // use 30s to absorb cargo test parallelism CPU saturation. Without this,
-    // integration tests in csq/tests/cli_deps_*_integration.rs flake under
-    // load — the doctor + login + run + install test binaries running concurrently
-    // can delay shell-script stub spawns past the 2s wall-clock budget.
-    // Spec/13 §8 invariant holds at runtime; this is test-build-only.
-    #[cfg(not(feature = "test-utils"))]
-    let timeout = Duration::from_secs(2);
-    #[cfg(feature = "test-utils")]
-    let timeout = Duration::from_secs(30);
+    // `timeout` is the per-surface wall-clock budget from `probe_timeout(cli)`
+    // (spec/13 §8): 2s for Claude, 6s for the Node-based Codex/Gemini CLIs,
+    // 30s uniformly under `--features test-utils`.
     // Use an explicit match instead of unwrap so we return cleanly when
     // the child was spawned without stdout (should not happen given
     // Stdio::piped(), but is not statically guaranteed by the type).
@@ -385,6 +416,23 @@ mod tests {
 
     fn fake_path() -> PathBuf {
         PathBuf::from("/fake/path/codex")
+    }
+
+    #[test]
+    fn probe_timeout_gives_every_surface_a_usable_budget() {
+        // Under `--features test-utils` (always on in test builds) every surface
+        // gets the uniform 30s budget; this locks that the accessor compiles and
+        // returns a usable (non-zero, >= the Claude floor) budget per surface.
+        // The production per-surface split (Claude 2s / Codex+Gemini 6s) is a
+        // non-test-build constant documented on `probe_timeout` + spec/13 §8; it
+        // is only observable against the shipped binary (a slow codex probe that
+        // now completes instead of timing out — user-path verification).
+        for cli in [SurfaceCli::Claude, SurfaceCli::Codex, SurfaceCli::Gemini] {
+            assert!(
+                probe_timeout(cli) >= Duration::from_secs(2),
+                "{cli:?} must get at least the Claude floor"
+            );
+        }
     }
 
     #[test]

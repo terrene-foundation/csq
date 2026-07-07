@@ -1,10 +1,10 @@
-//! Daemon first-start identity minting — issue #292 (A++) Phase 1, M1-4.
+//! Daemon first-start identity minting — an internal ticket (A++) Phase 1, M1-4.
 //!
 //! # Purpose
 //!
 //! On the first daemon start after an upgrade to a v2.7.x (or later) build,
 //! this pass walks every Anthropic `config-<N>/` directory found by
-//! [`accounts::discovery::discover_anthropic`], derives (or reuses) a UUID
+//! `accounts::discovery::discover_anthropic`, derives (or reuses) a UUID
 //! identity for each slot, writes `identities/<UUID>/identity.json`,
 //! updates `profiles.json` (`by_slot` + `by_email`), and — when every slot
 //! has been processed without error — atomically writes the idempotency
@@ -1833,25 +1833,31 @@ mod tests {
     #[test]
     fn pass0_serializes_against_concurrent_login() {
         use std::path::PathBuf;
-        use std::sync::{Arc, Barrier};
+        use std::sync::{mpsc, Arc};
         use std::time::Duration;
 
         let dir = TempDir::new().unwrap();
         let base: Arc<PathBuf> = Arc::new(dir.path().to_path_buf());
 
-        // Barrier: ensures t1 holds the lock BEFORE t2 tries to acquire it.
-        let barrier = Arc::new(Barrier::new(2));
+        // holding channel: t1 sends once it holds the lock, so t2 acquires only
+        // after t1 holds. Using a channel (not a 2-party Barrier) means a panic in
+        // t1's FALLIBLE `acquire` drops the sender, so t2's `recv()` returns Err and
+        // t2 returns instead of deadlocking on a barrier — main then surfaces t1's
+        // real panic via join()+resume_unwind. (Same hang-class fix as
+        // startup_reconciler.rs `concurrent_login_and_backfill_no_lost_update_legacy`.)
+        let (holding_tx, holding_rx) = mpsc::channel::<()>();
 
         let base1 = Arc::clone(&base);
-        let barrier1 = Arc::clone(&barrier);
         let uuid_pass0 = IdentityId::new_v4();
 
         let t1 = std::thread::spawn(move || {
             let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(&base1)
                 .expect("pass0: acquire lock");
-            // Signal t2 that we hold the lock, then sleep briefly to ensure
-            // t2 is blocking on acquire before we release.
-            barrier1.wait();
+            // Signal t2 that we hold the lock (the fallible acquire above is now
+            // past), then sleep briefly so t2 is blocking on acquire before we
+            // release. `let _`: t2 holds the receiver until its recv(), so send
+            // cannot return Err here.
+            let _ = holding_tx.send(());
             std::thread::sleep(Duration::from_millis(20));
             profiles::add_identity_mapping(&lock, &base1, 1, "pass0@test.invalid", uuid_pass0)
                 .unwrap();
@@ -1859,12 +1865,15 @@ mod tests {
         });
 
         let base2 = Arc::clone(&base);
-        let barrier2 = Arc::clone(&barrier);
         let uuid_login = IdentityId::new_v4();
 
         let t2 = std::thread::spawn(move || {
-            // Wait for t1 to hold the lock.
-            barrier2.wait();
+            // Wait for t1 to hold the lock. If t1 panicked during its fallible
+            // acquire it dropped the sender, so recv() returns Err — return and let
+            // main surface t1's real panic rather than blocking forever.
+            if holding_rx.recv().is_err() {
+                return;
+            }
             // Now acquire — this MUST block until t1 releases.
             let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(&base2)
                 .expect("login: acquire lock after pass0 releases");
@@ -1872,8 +1881,14 @@ mod tests {
                 .unwrap();
         });
 
-        t1.join().unwrap();
-        t2.join().unwrap();
+        // Surface either thread's panic with its ORIGINAL payload (not the opaque
+        // `Any { .. }` a bare `.unwrap()` prints) and without hanging.
+        if let Err(panic) = t1.join() {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = t2.join() {
+            std::panic::resume_unwind(panic);
+        }
 
         // Both writes must have landed — serialized, not lost.
         let result = profiles::load(&profiles::profiles_path(dir.path()))
@@ -2496,7 +2511,7 @@ mod tests {
         );
     }
 
-    /// M4-9 (release N affordance, issue #292 Phase 4): daemon Pass 0
+    /// M4-9 (release N affordance, an internal ticket Phase 4): daemon Pass 0
     /// (`run_if_unsentineled`) MUST NOT add NEW entries to the v1
     /// `profiles.json::accounts` map. The mint flow's
     /// `profiles::add_identity_mapping` writes ONLY `by_slot` and

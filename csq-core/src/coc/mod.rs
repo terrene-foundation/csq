@@ -7,12 +7,12 @@
 //! legacy. Writes never happen under `.coc/` per FR-FMT-06 (enforced by
 //! `csq-core/tests/coc_readonly.rs`).
 //!
-//! Per `workspaces/csq-as-cli/journal/0093` the prior per-artifact signing
+//! Per `internal-design-docs` the prior per-artifact signing
 //! apparatus (`COC.sig`, `COC_SIGNING_PUBLIC_KEY_BYTES`) and the first-pull
 //! trust gate (`coc-trust.json`) were retracted: `.coc/` is files in the
 //! user's repo, structurally equivalent to `.claude/`. Deterministic
 //! attestation belongs at the runtime lifecycle layer (Step 3, see
-//! `workspaces/csq-pact-eatp-adoption`).
+//! `internal-design-docs`).
 //!
 //! Module layout:
 //! - `types` — `CocSet` and helpers (the canonical in-memory shape).
@@ -363,7 +363,7 @@ mod tests {
     }
 
     /// Build a minimal valid `.coc/` tree with COC.md + COC.lock. No
-    /// signature step — per journal 0093 the per-artifact signing
+    /// signature step — per an internal journal entry the per-artifact signing
     /// apparatus was retracted.
     fn build_coc_dir(parent: &Path, lock_content: &[u8]) {
         let coc = parent.join(".coc");
@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(state.records[0].observed_version, "99.0.0");
     }
 
-    // ── load_with_cache (PR-CA9b Shard 2; issue #258) ─────────────────
+    // ── load_with_cache (PR-CA9b Shard 2; an internal ticket) ─────────────────
 
     /// Cache miss on first invocation returns Cold and populates the
     /// cache. Verified by checking the cache file lands on disk.

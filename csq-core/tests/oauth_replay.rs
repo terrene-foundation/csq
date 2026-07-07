@@ -1,6 +1,6 @@
 //! Live OAuth refresh contract test against Anthropic.
 //!
-//! WHY THIS EXISTS: journal 0052 documents the 2026-04-13 incident where
+//! WHY THIS EXISTS: an internal journal entry documents the 2026-04-13 incident where
 //! Anthropic silently started rejecting refresh bodies that contained a
 //! `scope` field. Our unit tests with mocked HTTP did not catch it — they
 //! asserted what _our client sends_, not what _the upstream server accepts_.
@@ -211,7 +211,7 @@ fn refresh_body_shape_assertions_unit_rejects_empty_access_token() {
 /// successful run so the next scheduled run starts with a valid token.
 ///
 /// WHAT THIS CATCHES: Any change to the accepted body shape at
-/// `https://platform.claude.com/v1/oauth/token`. Journal 0052 is the
+/// `https://platform.claude.com/v1/oauth/token`. an internal journal entry is the
 /// canonical incident — Anthropic started rejecting `scope` in the body,
 /// our mocked tests all passed, and every account silently expired for ~8h.
 #[test]

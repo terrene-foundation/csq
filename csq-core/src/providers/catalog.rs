@@ -4,7 +4,7 @@
 //! spec 07 §7.1.1. It tags each provider with the upstream CLI binary
 //! (Claude Code vs `codex` vs `gemini`) and controls per-surface
 //! behaviour across the daemon, handle-dir, rotation, and refresher
-//! paths. See journal 0067 H3 + workspaces/codex/journal/0001.
+//! paths. See an internal journal entry H3 + internal-design-docs
 
 use serde::{Deserialize, Serialize};
 
@@ -20,12 +20,12 @@ use serde::{Deserialize, Serialize};
 ///   contract.
 /// - `Codex` — `codex` CLI (OpenAI ChatGPT subscription). OAuth
 ///   refresh via `auth.openai.com`; quota via `wham/usage`; handle-dir
-///   uses `CODEX_HOME` (OPEN-C02 RESOLVED POSITIVE, journal 0005).
+///   uses `CODEX_HOME` (OPEN-C02 RESOLVED POSITIVE, an internal journal entry).
 ///
-/// Reserved for future: `Gemini` (per workspaces/gemini plan §PR-G1).
+/// Reserved for future: `Gemini` (per internal-design-docs plan §PR-G1).
 ///
 /// THRESHOLD — when a 4th variant lands (Bedrock, Vertex AI, etc.),
-/// revisit journal 0014 §FD #1: the `provider-integration` skill is
+/// revisit an internal journal entry §FD #1: the `provider-integration` skill is
 /// 335 lines covering the current 3 surfaces with quick-reference
 /// tables fronting the prose. At N=4 surfaces (or when any single
 /// surface section grows past ~150 lines on its own), reconsider
@@ -43,14 +43,14 @@ pub enum Surface {
     #[serde(rename = "claude-code")]
     ClaudeCode,
     /// OpenAI Codex CLI (`codex`). v2.1 Codex surface — see
-    /// `workspaces/codex/02-plans/01-implementation-plan.md`.
+    /// `internal-design-docs`.
     #[serde(rename = "codex")]
     Codex,
     /// Google Gemini CLI (`gemini`). v2.3 Gemini surface — API-key only
     /// (NO OAuth subscription rerouting per Google ToS); event-driven
     /// quota via CLI-durable NDJSON event log; encryption-at-rest via
     /// `platform::secret::Vault`. See
-    /// `workspaces/gemini/02-plans/01-implementation-plan.md`.
+    /// `internal-design-docs`.
     #[serde(rename = "gemini")]
     Gemini,
 }
@@ -112,6 +112,11 @@ pub enum QuotaKind {
     /// Surface declines to expose quota (e.g. keyless Ollama) or the
     /// signal is currently unavailable (schema drift / circuit-breaker).
     Unknown,
+    /// Pay-per-token provider exposing a remaining account balance, not a
+    /// % quota — DeepSeek. Polled via a direct balance endpoint
+    /// (`GET https://api.deepseek.com/user/balance`) using the slot's
+    /// Bearer API key; the Anthropic-bridge returns no rate-limit headers.
+    Balance,
 }
 
 /// A provider definition with defaults for new profiles.
@@ -257,8 +262,8 @@ pub const PROVIDERS: &[Provider] = &[
     //
     // Three auth paths (spec 07 §7.3.4): AI Studio API key (Vault-
     // backed), Vertex SA (file path), Code Assist OAuth (gemini-cli-
-    // managed). Stage 2 of journal 0048 resolved the auth-type
-    // taxonomy via the per-binding chokepoint pattern (journal 0050
+    // managed). Stage 2 of an internal journal entry resolved the auth-type
+    // taxonomy via the per-binding chokepoint pattern (an internal journal entry
     // D4-style): the catalog represents single-mode auth metadata
     // (`OAuth | Bearer | None`); per-slot mode lives in
     // `GeminiBinding::auth: AuthMode` (see `gemini::provisioning`).
@@ -314,11 +319,11 @@ pub const PROVIDERS: &[Provider] = &[
         // DeepSeek's Anthropic-bridge endpoint does NOT echo
         // `anthropic-ratelimit-*` response headers (verified
         // 2026-05-06 with live `max_tokens=1` probe — HTTP 200 with
-        // no rate-limit headers). Pay-per-token billing has no
-        // account-level quota signal worth a progress bar; UI should
-        // render "API-key billing" instead. Same shape as Ollama.
-        // Security review MEDIUM-3.
-        quota_kind: QuotaKind::Unknown,
+        // no rate-limit headers). However, DeepSeek exposes a direct
+        // balance endpoint (`GET https://api.deepseek.com/user/balance`)
+        // that IS polled — the poller reads remaining USD balance and
+        // renders it instead of a % quota bar. Security review MEDIUM-3.
+        quota_kind: QuotaKind::Balance,
         auth_type: AuthType::Bearer,
         key_env_var: Some("ANTHROPIC_AUTH_TOKEN"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
@@ -353,7 +358,7 @@ pub const PROVIDERS: &[Provider] = &[
         key_env_var: Some("ANTHROPIC_AUTH_TOKEN"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
         default_base_url: Some("https://api.z.ai/api/anthropic"),
-        default_model: "glm-5.1",
+        default_model: "glm-5.2[1m]",
         validation_endpoint: Some("https://api.z.ai/api/anthropic/v1/messages"),
         settings_filename: "settings-zai.json",
         system_primer: Some(
@@ -373,7 +378,7 @@ pub const PROVIDERS: &[Provider] = &[
         key_env_var: Some("ANTHROPIC_AUTH_TOKEN"),
         base_url_env_var: Some("ANTHROPIC_BASE_URL"),
         default_base_url: Some("https://api.minimax.io/anthropic"),
-        default_model: "MiniMax-M2.7-highspeed",
+        default_model: "MiniMax-M3",
         validation_endpoint: Some("https://api.minimax.io/anthropic/v1/messages"),
         settings_filename: "settings-mm.json",
         system_primer: Some(

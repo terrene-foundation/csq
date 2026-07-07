@@ -465,6 +465,7 @@ fn build_keyrotate_record(
         eatp_start_ts: None,
         eatp_end_ts: None,
         op_phase: Some(op_phase),
+        verification_level: None,
     })
 }
 
@@ -603,6 +604,8 @@ mod tests {
         // env lock so this test doesn't race a sibling that mutates it
         // (testing.md Rule 6 — read-side tests share the risk).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("rotate_record");
         // Valid 26-char Crockford Base32 ULID required by RecordId::try_new.
@@ -726,6 +729,8 @@ mod tests {
         // env lock so this test doesn't race a sibling that mutates it
         // (testing.md Rule 6 — read-side tests share the risk).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("rotate_rollback");
         // Valid 26-char Crockford Base32 ULID — distinct from the ULID
@@ -806,6 +811,8 @@ mod tests {
 
         super::super::test_helpers::init_mock_keyring();
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("rollback_restore_fail");
         // Valid 26-char Crockford Base32 ULID (alphabet excludes I/L/O/U).
@@ -909,6 +916,8 @@ mod tests {
         // env lock so this test doesn't race a sibling that mutates it
         // (testing.md Rule 6 — read-side tests share the risk).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("rotate_state_invariants");
         // Valid Crockford Base32 ULID (alphabet excludes I/L/O/U).
@@ -970,6 +979,8 @@ mod tests {
         // env lock so this test doesn't race a sibling that mutates it
         // (testing.md Rule 6 — read-side tests share the risk).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("rotate_no_key");
         // Valid ULID — passes the chain_id-empty guard so we reach the
@@ -998,6 +1009,8 @@ mod tests {
         // env lock so this test doesn't race a sibling that mutates it
         // (testing.md Rule 6 — read-side tests share the risk).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("rotate_kid_mismatch");
         // Valid Crockford Base32 ULID (alphabet excludes I/L/O/U).
@@ -1045,6 +1058,8 @@ mod tests {
         // env lock so this test doesn't race a sibling that mutates it
         // (testing.md Rule 6 — read-side tests share the risk).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc();
 
@@ -1079,7 +1094,7 @@ mod tests {
             .collect()
     }
 
-    /// PR #702 review HIGH: rotation MUST carry the keychain-anchored
+    /// an internal ticket review HIGH: rotation MUST carry the keychain-anchored
     /// roster_version_floor into the incoming key's payload — a 3-field
     /// rewrite silently drops the anchor and degrades the detector to
     /// permanent Unconfirmed.
@@ -1087,6 +1102,8 @@ mod tests {
     fn rotate_preserves_roster_floor() {
         super::super::test_helpers::init_mock_keyring();
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("rotate_preserves_floor");
         let chain_id = "01ARZ3NDEKTSV4RRFFQ69G5F0R";
@@ -1135,6 +1152,8 @@ mod tests {
     fn test_m13_rotate_emits_intent_then_outcome() {
         super::super::test_helpers::init_mock_keyring();
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("m13_intent_outcome");
         let chain_id = "01ARZ3NDEKTSV4RRFFQ69G5M13";
@@ -1213,6 +1232,8 @@ mod tests {
     fn test_m13_rotate_save_failure_emits_failed_outcome() {
         super::super::test_helpers::init_mock_keyring();
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("m13_failed_outcome");
         let chain_id = "01ARZ3NDEKTSV4RRFFQ69G5M14";
@@ -1272,6 +1293,8 @@ mod tests {
 
         super::super::test_helpers::init_mock_keyring();
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let tmp = tmp_base();
         let svc = svc_for("m13_intent_failclosed");
         let chain_id = "01ARZ3NDEKTSV4RRFFQ69G5M15";

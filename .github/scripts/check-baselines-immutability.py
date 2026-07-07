@@ -72,6 +72,23 @@ def _git_show(ref: str, path: str) -> str | None:
     return result.stdout
 
 
+def _read_base_text(base_ref: str, path: str) -> str | None:
+    """Read `path` at the base ref, falling back to its remote-tracking ref.
+
+    `actions/checkout` checks out only the PR ref locally; the base branch
+    (`github.base_ref`, a bare name like `main`) exists only as the
+    remote-tracking ref `origin/main`. Without the fallback `git show main:…`
+    fails on CI, so the gate misfires into Mode (b) ("baselines.json added")
+    on EVERY normal PR that touches a trigger path — falsely demanding
+    `[init-baselines]`. The fallback is skipped when `base_ref` already names
+    a remote/SHA (contains `/`), so `origin/origin/main` is never attempted.
+    """
+    text = _git_show(base_ref, path)
+    if text is None and "/" not in base_ref:
+        text = _git_show(f"origin/{base_ref}", path)
+    return text
+
+
 def _diff_protected_cells(base: dict, head: dict) -> list[str]:
     """Return list of mutation paths under PROTECTED_BLOCKS."""
     errors: list[str] = []
@@ -144,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         base_text = args.base_content.read_text() if base_present else None
         head_text = args.head_content.read_text() if head_present else None
     else:
-        base_text = _git_show(args.base_ref, args.repo_relative_path)
+        base_text = _read_base_text(args.base_ref, args.repo_relative_path)
         head_path = REPO_ROOT / args.repo_relative_path
         head_text = head_path.read_text() if head_path.exists() else None
 

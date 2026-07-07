@@ -22,7 +22,7 @@
 //!   but NEVER blocks csq operation. The local chain remains valid without the
 //!   anchor; the anchor is a witness, not the spine.
 //!
-//! - **Dependency-injected core**: [`anchor_head`] accepts `&dyn LedgerSink`
+//! - **Dependency-injected core**: `anchor_head` accepts `&dyn LedgerSink`
 //!   and a `now_ts` string. The daemon tokio loop is a thin wrapper.
 //!   Failure-branch tests inject a returning-`Err` sink instead of filesystem
 //!   tricks.
@@ -55,7 +55,7 @@ use crate::audit::types::{
 };
 use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
 
-/// Outcome of a single [`anchor_head`] call. Returned to the tokio
+/// Outcome of a single `anchor_head` call. Returned to the tokio
 /// loop so it can update the `anchor-state-<sink>.json` state file.
 #[derive(Debug)]
 pub enum AnchorOutcome {
@@ -438,6 +438,44 @@ fn build_outcome_record(kind: EventKind, payload: EventPayload, now_ts: &str) ->
         eatp_start_ts: None,
         eatp_end_ts: None,
         op_phase: None,
+        verification_level: None,
+    }
+}
+
+/// Append a single locally-produced outcome record (`kind` + `payload`) to the
+/// Op audit chain, signing it when a chain-signing cutoff is active (else an
+/// unsigned pre-cutoff record, mirroring [`anchor_head`]'s
+/// [`load_signing_key_if_active`] fallback). The writer assigns `seq`,
+/// `prev_hash`, `canonical_hash`, and `ts`; the caller supplies only `now_ts`
+/// (stamped into the record before the writer overwrites `ts`, kept for callers
+/// that stamp their own producer-clock field inside the payload).
+///
+/// # Locking (self-deadlock hazard)
+///
+/// This acquires the chain-wide `.chain-lock` INTERNALLY via the write path
+/// ([`crate::audit::persist::write_record_v2`] →
+/// `acquire_chain_lock`). **Callers MUST NOT hold `.chain-lock` across this
+/// call**: `flock` locks are per-open-file-description, so a second acquisition
+/// from the same process blocks until the bounded 5 s timeout and returns
+/// `ChainLockTimeout` (see `platform::lock::try_lock_file`). The
+/// `bundle-install` handler drops its install lock before calling this.
+///
+/// # Errors
+///
+/// Returns a fixed-vocabulary tag (`security.md` §2 — never a raw serde/IO body
+/// near chain-write code) if the append fails.
+pub fn append_local_outcome_record(
+    base_dir: &Path,
+    kind: EventKind,
+    payload: EventPayload,
+    now_ts: &str,
+) -> Result<(), String> {
+    let record = build_outcome_record(kind, payload, now_ts);
+    match load_signing_key_if_active(base_dir) {
+        Some(key) => write_record_v2_signed(record, Some(base_dir), &*key)
+            .map(|_| ())
+            .map_err(|e| e.fixed_tag().to_string()),
+        None => write_record_v2(record, Some(base_dir)).map_err(|e| e.fixed_tag().to_string()),
     }
 }
 
@@ -820,6 +858,7 @@ pub mod test_helpers {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
     }
 }
@@ -1032,7 +1071,18 @@ mod tests {
             record_limit: 10_000,
             keychain_service: crate::audit::AUDIT_SIGNING_SERVICE_NAME.to_string(),
         };
-        match crate::audit::verify_chain(base, &verify_cfg, None) {
+        // Hermeticity: verify_chain transitively reads CSQ_AUDIT_EDITION. Scope the
+        // shared env lock tightly around the synchronous call (NOT across the earlier
+        // `.await`, to avoid clippy::await_holding_lock) and pin a clean community
+        // baseline so this test cannot race a concurrent enterprise-edition test
+        // (testing.md Rule 6 / test-hermeticity.md MUST 1 — reader side).
+        let verify_result = {
+            let _env_guard = crate::platform::test_env::lock();
+            std::env::remove_var("CSQ_AUDIT_EDITION");
+            std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+            crate::audit::verify_chain(base, &verify_cfg, None)
+        };
+        match verify_result {
             Ok(_) => {} // Chain valid — B1 is fixed.
             Err(crate::audit::LedgerError::UnsignedRecordAfterCutoff { seq, cutoff }) => {
                 if key_available {
@@ -1214,6 +1264,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
 
         // Compute the canonical hash of the fake seq=1 (what its `canonical_hash`
@@ -1410,6 +1461,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(key_rotate, Some(base)).unwrap();
 

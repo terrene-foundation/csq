@@ -192,7 +192,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_prefers_xdg_runtime_dir() {
-        // Journal 0021 finding 11: acquire the shared env-test mutex
+        // an internal journal entry finding 11: acquire the shared env-test mutex
         // so this test does not race `detect::*` tests that also
         // mutate XDG_RUNTIME_DIR.
         let _env_guard = crate::platform::test_env::lock();
@@ -238,7 +238,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_socket_path_is_pipe() {
-        // Journal 0021 finding 12: save + restore USERNAME under the
+        // an internal journal entry finding 12: save + restore USERNAME under the
         // shared env-test mutex so this test does not poison later
         // tests that read USERNAME.
         let _env_guard = crate::platform::test_env::lock();
@@ -260,7 +260,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_falls_back_without_xdg_runtime_dir() {
-        // Journal 0021 finding 11: acquire the shared env-test
+        // an internal journal entry finding 11: acquire the shared env-test
         // mutex (same reason as `linux_prefers_xdg_runtime_dir`).
         let _env_guard = crate::platform::test_env::lock();
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();

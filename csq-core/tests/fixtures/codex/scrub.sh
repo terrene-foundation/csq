@@ -4,7 +4,7 @@
 # Replaces `user_id`, `account_id`, `email`, and any `sub` JWT claim at the
 # top level with fixed REDACTED sentinels. Input is a raw curl capture from
 # `GET chatgpt.com/backend-api/wham/usage`; output is safe to commit as a
-# test fixture. See workspaces/codex/journal/0010 for the captured schema
+# test fixture. See internal-design-docs for the captured schema
 # and redteam H5 for the redaction target set.
 #
 # Usage:

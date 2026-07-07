@@ -1,8 +1,11 @@
 name: Test
 
 # Github-hosted CI for the community edition. Every PR and push to main runs
-# formatting, lint, and the full test suite on Linux + macOS. No secrets and
-# no real OAuth: the suite is hermetic (sandbox HOME, stub spawns).
+# formatting, lint, and the full test suite on Linux + macOS + Windows. No
+# secrets and no real OAuth: the suite is hermetic (sandbox HOME, stub spawns).
+# Windows coverage replaces the stripped enterprise Windows workflow — the
+# community workspace pulls no private enterprise dependencies, so no
+# private-auth step is needed.
 on:
   push:
     branches: [main]
@@ -23,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 

@@ -43,6 +43,38 @@ pub fn fmt_time(secs: u64) -> String {
     }
 }
 
+/// Formats a "resets in" duration for the `csq status` table — finer-grained
+/// than [`fmt_time`] (which the space-constrained statusline uses).
+///
+/// Keeps a two-unit resolution so an operator can tell `3h12m` from `3h58m`
+/// when deciding whether to wait out a 5-hour window, and `1d9h` from `6d1h`
+/// for the weekly window. Max width is 6 (`23h59m`).
+///
+/// Examples: `now`, `31m`, `3h12m`, `4h` (zero minutes elide), `1d9h`, `6d`.
+pub fn fmt_reset(secs: u64) -> String {
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m == 0 {
+            format!("{}h", h)
+        } else {
+            format!("{}h{:02}m", h, m)
+        }
+    } else {
+        let d = secs / 86_400;
+        let h = (secs % 86_400) / 3600;
+        if h == 0 {
+            format!("{}d", d)
+        } else {
+            format!("{}d{}h", d, h)
+        }
+    }
+}
+
 /// Formats a token count as a compact string.
 ///
 /// Examples: 500 → "500", 1200 → "1k", 1500000 → "1.5M"
@@ -79,6 +111,20 @@ pub fn statusline_str(
     let prefix = if broker_failed { "LOGIN-NEEDED " } else { "" };
 
     match quota {
+        // Balance-metered providers (DeepSeek) carry a $-balance, not 5h/7d
+        // windows. Detect them by the record's own `kind` ("balance", written
+        // by the poller atomically with the balance) OR a present balance, so a
+        // balance slot NEVER falls through to the 5h/7d arm and renders the
+        // spurious `5h:0% 7d:0%` that #52 set out to kill.
+        Some(q) if q.kind == "balance" || q.balance.is_some() => {
+            let body = match q.balance.as_ref() {
+                Some(b) => fmt_balance(b),
+                // kind=balance but no successful poll yet — show a pending
+                // marker rather than a fabricated 0% window.
+                None => "balance n/a".to_string(),
+            };
+            format!("{}#{}:{} {}", prefix, account, label, body)
+        }
         Some(q) => {
             format!(
                 "{}#{}:{} 5h:{:.0}% 7d:{:.0}%",
@@ -92,6 +138,29 @@ pub fn statusline_str(
         None => {
             format!("{}#{}:{} no data", prefix, account, label)
         }
+    }
+}
+
+/// Formats a [`BalanceInfo`](crate::quota::BalanceInfo) for display: `$196.42` for USD, else
+/// `196.42 EUR`. Shared by the CC statusline and the desktop IPC view
+/// (`get_accounts` → `AccountView::balance_display`) so currency
+/// formatting has a single source of truth.
+///
+/// The `currency` string originates from a remote provider API
+/// (`/user/balance`), so on the non-USD path it is control-char-stripped
+/// via [`sanitize_for_display`] and length-bounded before rendering —
+/// the same defense the account label already gets. Without it a hostile
+/// or garbled API response (e.g. `"USD\x1b[2J"`, an embedded newline)
+/// would render verbatim to the operator's terminal via the statusline's
+/// `println!`, rewriting the display. Real ISO currency codes are 3 chars;
+/// the 12-char cap leaves slack for symbols while bounding the sink.
+pub fn fmt_balance(b: &crate::quota::BalanceInfo) -> String {
+    if b.currency == "USD" {
+        format!("${:.2}", b.remaining)
+    } else {
+        let cur = sanitize_for_display(&b.currency);
+        let cur: String = cur.chars().take(12).collect();
+        format!("{:.2} {}", b.remaining, cur)
     }
 }
 
@@ -168,8 +237,18 @@ pub struct StatuslineContext {
     /// from `context_window.current_usage`. Formatted with
     /// [`fmt_tokens`] for compact display.
     pub ctx_total_tokens: Option<u64>,
-    /// `context_window.used_percentage`.
+    /// `context_window.used_percentage` — CC's OWN percentage, computed against
+    /// the window CC assumes for the model (~200k for the Anthropic-compatible
+    /// endpoint). Trusted only when `ctx_window_true` is None.
     pub ctx_used_pct: Option<f64>,
+    /// The model's TRUE context window from csq's catalog (e.g. 1M for
+    /// deepseek-v4-pro), resolved by the CLI from the slot's settings.json
+    /// model id (`providers::settings::model_id_for_slot`). When set,
+    /// the context % is RECOMPUTED as `ctx_total_tokens / ctx_window_true` — CC
+    /// mis-computes it against its own ~200k assumption for 3P models with a
+    /// larger real window (deepseek/minimax/glm = 1M). Origin: #52 / models.rs
+    /// deepseek-v4-pro note (the deferred recompute shard).
+    pub ctx_window_true: Option<u64>,
     /// `cost.total_cost_usd`. Rendered as `$0.12` alongside the
     /// context tokens.
     pub session_cost_usd: Option<f64>,
@@ -225,7 +304,18 @@ pub fn rich_statusline(
     // don't render a stub "ctx:0 0%" segment.
     if let Some(total) = ctx.ctx_total_tokens {
         if total > 0 {
-            let pct = ctx.ctx_used_pct.unwrap_or(0.0);
+            // Recompute the context % against the model's TRUE window when csq
+            // knows it (3P models where CC assumes ~200k — deepseek/minimax/glm
+            // are 1M). Otherwise trust CC's own used_percentage.
+            let pct = match ctx.ctx_window_true {
+                // Clamp to 100%: a session can't hold more tokens than the
+                // window. For a model whose TRUE window is SMALLER than CC's
+                // ~200k assumption (e.g. deepseek-v4-flash = 128k), a large
+                // context makes the recompute exceed 100% — cap it so the
+                // statusline never renders a nonsensical ">100%".
+                Some(w) if w > 0 => ((total as f64 / w as f64) * 100.0).min(100.0),
+                _ => ctx.ctx_used_pct.unwrap_or(0.0),
+            };
             let cost = ctx.session_cost_usd.unwrap_or(0.0);
             parts.push(format!(
                 "ctx:{} {:.0}% | ${:.2}",
@@ -337,6 +427,10 @@ pub fn parse_cc_stdin(raw: &str) -> StatuslineContext {
             .context_window
             .as_ref()
             .and_then(|w| w.used_percentage),
+        // Populated by the CLI (statusline.rs) from the slot's settings.json
+        // model id — the stdin JSON carries no true-window signal, so
+        // parse_cc_stdin leaves it None.
+        ctx_window_true: None,
         session_cost_usd: parsed.cost.and_then(|c| c.total_cost_usd),
         git: None,
         is_csq_terminal: false,
@@ -387,6 +481,20 @@ mod tests {
         assert_eq!(fmt_time(86399), "23h");
         assert_eq!(fmt_time(86400), "1d");
         assert_eq!(fmt_time(172800), "2d");
+    }
+
+    #[test]
+    fn fmt_reset_edge_cases() {
+        assert_eq!(fmt_reset(0), "now");
+        assert_eq!(fmt_reset(59), "now");
+        assert_eq!(fmt_reset(60), "1m");
+        assert_eq!(fmt_reset(1860), "31m");
+        assert_eq!(fmt_reset(3600), "1h"); // zero minutes elide
+        assert_eq!(fmt_reset(11_520), "3h12m");
+        assert_eq!(fmt_reset(86_340), "23h59m"); // max h-case width = 6
+        assert_eq!(fmt_reset(86_400), "1d"); // zero hours elide
+        assert_eq!(fmt_reset(118_800), "1d9h");
+        assert_eq!(fmt_reset(531_360), "6d3h");
     }
 
     #[test]
@@ -489,6 +597,7 @@ mod tests {
             project_name: Some("csq".into()),
             ctx_total_tokens: Some(45_000),
             ctx_used_pct: Some(30.0),
+            ctx_window_true: None,
             session_cost_usd: Some(0.1234),
             git: Some(GitStatus {
                 branch: "main".into(),
@@ -507,6 +616,128 @@ mod tests {
             s,
             "⚡csq #1:user@test.com 5h:10% 7d:15% | ctx:45k 30% | $0.12 | 🤖Claude Opus 4.7 | 📁csq | git:main●"
         );
+    }
+
+    #[test]
+    fn rich_statusline_recomputes_ctx_against_true_window() {
+        // #52: 180k tokens against CC's ~200k assumption reads 89%; against the
+        // model's TRUE 1M window (ctx_window_true) it is ~18%. The recompute wins.
+        let quota = demo_quota();
+        let ctx = StatuslineContext {
+            ctx_total_tokens: Some(180_000),
+            ctx_used_pct: Some(89.0), // CC's wrong number — must be ignored
+            ctx_window_true: Some(1_000_000),
+            session_cost_usd: Some(0.0),
+            ..Default::default()
+        };
+        let s = rich_statusline(
+            AccountNum::try_from(11u16).unwrap(),
+            "DeepSeek",
+            Some(&quota),
+            false,
+            &ctx,
+        );
+        // 180000 / 1_000_000 = 18%, NOT 89%.
+        assert!(
+            s.contains("ctx:180k 18%"),
+            "expected 18% recompute, got: {s}"
+        );
+        assert!(!s.contains("89%"), "must not show CC's 89%: {s}");
+    }
+
+    #[test]
+    fn statusline_str_renders_balance_for_balance_quota() {
+        let q = AccountQuota {
+            balance: Some(crate::quota::BalanceInfo {
+                currency: "USD".into(),
+                remaining: 196.42,
+            }),
+            ..Default::default()
+        };
+        let s = statusline_str(
+            AccountNum::try_from(11u16).unwrap(),
+            "DeepSeek",
+            Some(&q),
+            false,
+        );
+        assert_eq!(s, "#11:DeepSeek $196.42");
+    }
+
+    #[test]
+    fn statusline_str_balance_kind_without_balance_shows_pending_not_5h7d() {
+        // #984 redteam (intermediate M1): a balance-kind record whose balance
+        // hasn't been polled yet must NOT fall through to the 5h/7d arm and
+        // render the spurious `5h:0% 7d:0%`. It shows a pending marker instead.
+        let q = AccountQuota {
+            kind: "balance".into(),
+            balance: None,
+            ..Default::default()
+        };
+        let s = statusline_str(
+            AccountNum::try_from(11u16).unwrap(),
+            "DeepSeek",
+            Some(&q),
+            false,
+        );
+        assert_eq!(s, "#11:DeepSeek balance n/a");
+        assert!(!s.contains("5h:"), "must not render a 5h/7d window: {s}");
+    }
+
+    #[test]
+    fn fmt_balance_strips_control_chars_in_currency() {
+        // #984 redteam (security M1): the currency string comes from a remote
+        // API and must be control-char-stripped on the terminal render path.
+        let b = crate::quota::BalanceInfo {
+            currency: "CNY\x1b[2J\n".into(),
+            remaining: 1400.50,
+        };
+        let s = fmt_balance(&b);
+        // The ESC (0x1b) that initiates an ANSI sequence and the newline are
+        // removed; the printable residual ("[2J") is inert without a leading ESC.
+        assert!(
+            !s.bytes().any(|c| c < 0x20),
+            "no control bytes may reach the terminal: {s:?}"
+        );
+        assert_eq!(s, "1400.50 CNY[2J");
+    }
+
+    #[test]
+    fn fmt_balance_bounds_currency_length() {
+        // The 12-char cap bounds a hostile over-long currency string.
+        let b = crate::quota::BalanceInfo {
+            currency: "ABCDEFGHIJKLMNOPQRSTUVWXYZ".into(),
+            remaining: 1.0,
+        };
+        let s = fmt_balance(&b);
+        assert_eq!(s, "1.00 ABCDEFGHIJKL", "currency capped at 12 chars: {s:?}");
+    }
+
+    #[test]
+    fn rich_statusline_clamps_ctx_recompute_at_100pct() {
+        // #984 redteam (deep-analyst F3): for a model whose TRUE window is
+        // SMALLER than CC's ~200k assumption (deepseek-v4-flash = 128k), a
+        // large context makes tokens/window exceed 100% — it must clamp, not
+        // render ">100%".
+        let quota = demo_quota();
+        let ctx = StatuslineContext {
+            ctx_total_tokens: Some(200_000),
+            ctx_used_pct: Some(75.0), // CC's number against 200k — ignored
+            ctx_window_true: Some(128_000), // 200k/128k = 156% before clamp
+            session_cost_usd: Some(0.0),
+            ..Default::default()
+        };
+        let s = rich_statusline(
+            AccountNum::try_from(11u16).unwrap(),
+            "DeepSeek",
+            Some(&quota),
+            false,
+            &ctx,
+        );
+        assert!(
+            s.contains("ctx:200k 100%"),
+            "expected clamp to 100%, got: {s}"
+        );
+        assert!(!s.contains("156%"), "must not render >100%: {s}");
     }
 
     #[test]
@@ -532,6 +763,7 @@ mod tests {
         let ctx = StatuslineContext {
             ctx_total_tokens: Some(0),
             ctx_used_pct: Some(0.0),
+            ctx_window_true: None,
             session_cost_usd: Some(0.0),
             is_csq_terminal: true,
             ..Default::default()
@@ -602,7 +834,7 @@ mod tests {
     fn parse_cc_stdin_full_payload() {
         let raw = r#"{
             "model": { "display_name": "Claude Opus 4.7" },
-            "workspace": { "current_dir": "/Users/esperie/repos/terrene/contrib/csq" },
+            "workspace": { "current_dir": "/Users/example/repos/csq" },
             "context_window": {
                 "current_usage": {
                     "input_tokens": 10000,

@@ -15,11 +15,12 @@
 //! deterministic golden-file tests; M3+ wiring uses
 //! `translate_with_options` to feed the host-context check in.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use crate::coc::types::{AgentDef, CocSet, CommandDef, RuleDef, SkillDef};
+use crate::coc::types::CocSet;
 use crate::providers::catalog::Surface;
 
+use super::flatten::{flatten_artifacts, render_sections};
 use super::types::{ApprovalMode, GeminiSpawnPayload, McpFilter};
 
 /// FR-CL-01 system-prompt directive — re-exported from
@@ -67,48 +68,14 @@ pub fn translate_with_options(
     coc_set: &CocSet,
     host_ctx: Option<&HostContext>,
 ) -> GeminiSpawnPayload {
-    let target = Surface::Gemini;
-
-    let mut system_instruction = String::new();
-    system_instruction.push_str(SURFACE_HEADER);
-
-    let mut contributing_ids: BTreeSet<String> = BTreeSet::new();
-
-    let rules = filter_rules(coc_set, target);
-    if !rules.is_empty() {
-        system_instruction.push_str("\n## Rules\n");
-        for r in &rules {
-            push_section(&mut system_instruction, &r.id.0, r.precedence, &r.body);
-            contributing_ids.insert(r.id.0.clone());
-        }
-    }
-
-    let agents = filter_agents(coc_set, target);
-    if !agents.is_empty() {
-        system_instruction.push_str("\n## Agents\n");
-        for a in &agents {
-            push_section(&mut system_instruction, &a.id.0, a.precedence, &a.body);
-            contributing_ids.insert(a.id.0.clone());
-        }
-    }
-
-    let skills = filter_skills(coc_set, target);
-    if !skills.is_empty() {
-        system_instruction.push_str("\n## Skills\n");
-        for s in &skills {
-            push_section(&mut system_instruction, &s.id.0, s.precedence, &s.body);
-            contributing_ids.insert(s.id.0.clone());
-        }
-    }
-
-    let commands = filter_commands(coc_set, target);
-    if !commands.is_empty() {
-        system_instruction.push_str("\n## Commands\n");
-        for c in &commands {
-            push_section(&mut system_instruction, &c.id.0, c.precedence, &c.body);
-            contributing_ids.insert(c.id.0.clone());
-        }
-    }
+    // CU1b: the system_instruction text is built by the shared
+    // `super::flatten` flattener (the single flattener the CC + codex
+    // translators and the live capability-layer scaffold stage also use).
+    // The text is host-context-INDEPENDENT — `host_ctx` affects only the
+    // `host_isolation_warning` + `detected_var_first` payload bits below,
+    // never the flattened prose.
+    let arts = flatten_artifacts(coc_set, Surface::Gemini);
+    let (system_instruction, contributing_ids) = render_sections(SURFACE_HEADER, &arts);
 
     let host_isolation_warning = host_ctx
         .map(|c| c.production_secrets_present)
@@ -148,73 +115,6 @@ pub fn translate_with_options(
 /// scope. Backwards-compat re-export so existing call sites keep
 /// working.
 pub use crate::env::looks_like_production_secret;
-
-fn push_section(out: &mut String, id: &str, precedence: i32, body: &str) {
-    out.push('\n');
-    out.push_str("### ");
-    out.push_str(id);
-    out.push_str(" (precedence=");
-    out.push_str(&precedence.to_string());
-    out.push_str(")\n");
-    out.push_str(body.trim_end());
-    out.push('\n');
-}
-
-fn filter_rules(coc_set: &CocSet, surface: Surface) -> Vec<&RuleDef> {
-    let mut v: Vec<&RuleDef> = coc_set
-        .rules
-        .values()
-        .filter(|r| r.applies_to.is_empty() || r.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
-}
-
-fn filter_agents(coc_set: &CocSet, surface: Surface) -> Vec<&AgentDef> {
-    let mut v: Vec<&AgentDef> = coc_set
-        .agents
-        .values()
-        .filter(|x| x.applies_to.is_empty() || x.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
-}
-
-fn filter_skills(coc_set: &CocSet, surface: Surface) -> Vec<&SkillDef> {
-    let mut v: Vec<&SkillDef> = coc_set
-        .skills
-        .values()
-        .filter(|x| x.applies_to.is_empty() || x.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
-}
-
-fn filter_commands(coc_set: &CocSet, surface: Surface) -> Vec<&CommandDef> {
-    let mut v: Vec<&CommandDef> = coc_set
-        .commands
-        .values()
-        .filter(|x| x.applies_to.is_empty() || x.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
-}
 
 #[cfg(test)]
 mod tests {
@@ -460,5 +360,37 @@ mod tests {
             p.system_instruction.contains("COMMAND-UNIVERSAL"),
             "universal command must appear in gemini translator output"
         );
+    }
+
+    /// CU1b redteam R1 IR-2 — host-independence guard. The AC1 disposition
+    /// (option b) rests on the delivered TEXT (`system_instruction`) being
+    /// host-context-independent: `HostContext` must affect ONLY the
+    /// `host_isolation_warning` + `detected_var_first` payload bits, never
+    /// the text. The scaffold flattens host-neutral (`HostContext::None`)
+    /// while the live spawn detects a real host; if a future change ever
+    /// wired host context into the text, the scaffold would silently diverge
+    /// from the live host. This pins the invariant: same `.coc/`, the text is
+    /// byte-equal across host contexts; only the warning bit differs.
+    #[test]
+    fn system_instruction_is_host_context_independent() {
+        let set = build_set(vec![
+            rule("RULE-A", 5, &[Surface::Gemini], "alpha body"),
+            rule("RULE-B", 0, &[], "beta body universal"),
+        ]);
+        let neutral = translate_with_options(&set, None);
+        let with_secrets = translate_with_options(
+            &set,
+            Some(&HostContext {
+                production_secrets_present: true,
+                detected_var_names: ["ANTHROPIC_API_KEY".to_string()].into_iter().collect(),
+            }),
+        );
+        assert_eq!(
+            neutral.system_instruction, with_secrets.system_instruction,
+            "system_instruction TEXT must be identical across host contexts (AC1 option b)"
+        );
+        // The payload BIT, by contrast, MUST reflect the host context.
+        assert!(!neutral.host_isolation_warning);
+        assert!(with_secrets.host_isolation_warning);
     }
 }

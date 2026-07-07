@@ -68,7 +68,7 @@ pub fn save(path: &Path, creds: &CredentialFile) -> Result<(), CredentialError> 
     // write MUST best-effort `remove_file(&tmp)` before returning. Without
     // cleanup, an early `?` leaves an OAuth-token-bearing file at
     // umask-default (typically 0o644) until the next GC. Same B2 class
-    // closed elsewhere in journal 0065.
+    // closed elsewhere in an internal journal entry
     if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(CredentialError::Io {
@@ -616,7 +616,7 @@ pub fn write_uuid_settings(
 /// M3-3/M3-4) resolves to `identities/<UUID>/credentials.json`. The
 /// `config-N` mirror is no longer a credential reader for any
 /// production code path. See the writer-surface retirement table in
-/// `workspaces/account-slot-decoupling/02-plans/04-phase3-readiness.md`.
+/// `internal-design-docs`.
 ///
 /// The 0o600-first-then-0o400 ordering matters on POSIX: `atomic_replace`
 /// overwrites the target's inode, so the newly-written tmp file's mode
@@ -670,6 +670,67 @@ pub fn save_canonical_for(
     // ── End UUID write (M4-12: numeric write fully retired) ───────────────────
 
     Ok(())
+}
+
+/// TOCTOU-safe adopt write for the keychain custodian (Option A, A2).
+///
+/// Acquires the per-account write mutex, RE-READS the current canonical store
+/// expiry UNDER THE LOCK, and writes `creds` ONLY if its Anthropic token is
+/// strictly fresher than BOTH the current store token AND `min_expiry_exclusive`.
+/// Returns `Ok(true)` when the write happened, `Ok(false)` when the guard rejected
+/// it (store already at-or-fresher — a concurrent `csq login`/refresh won the race,
+/// or the candidate was no longer fresher; fail-closed, never an overwrite).
+///
+/// **Anthropic-only + fail-closed.** A non-Anthropic `creds`, a candidate not
+/// strictly fresher than `min_expiry_exclusive`, a non-Anthropic store, or an
+/// unreadable/corrupt store under the lock ALL return `Ok(false)` WITHOUT writing —
+/// only an absent UUID returns `Err`. The custodian must never clobber a healthy
+/// store token on doubt (an internal journal entry risk #1: account-global blast radius).
+pub fn save_canonical_for_if_fresher(
+    base_dir: &Path,
+    account: AccountNum,
+    creds: &CredentialFile,
+    min_expiry_exclusive: u64,
+) -> Result<bool, CredentialError> {
+    // Anthropic-only; reject a candidate that does not even beat the pre-lock baseline.
+    let new_expiry = match creds.anthropic() {
+        Some(a) => a.claude_ai_oauth.expires_at,
+        None => return Ok(false),
+    };
+    if new_expiry <= min_expiry_exclusive {
+        return Ok(false);
+    }
+
+    let slot_mutex = AccountMutexTable::global().get_or_insert(Surface::ClaudeCode, account);
+    let _guard = slot_mutex.lock().expect("per-account write mutex poisoned");
+
+    let uuid = match resolve_uuid_for_account(base_dir, account) {
+        Some(u) => u,
+        None => return Err(CredentialError::NoCredentials(account.get())),
+    };
+
+    // Re-read the CURRENT store expiry UNDER THE LOCK (TOCTOU close): if a concurrent
+    // login/refresh wrote a token at-or-fresher than ours since we harvested, do NOT
+    // overwrite it. Fail-closed: an unreadable/unparseable/non-Anthropic store is
+    // treated as "cannot prove older" → abort, never overwrite.
+    let store_path = credentials_path_for(base_dir, uuid);
+    let current_expiry: Option<u64> = match load(&store_path) {
+        Ok(c) => match c.anthropic() {
+            Some(a) => Some(a.claude_ai_oauth.expires_at),
+            None => return Ok(false), // store is non-Anthropic — refuse to clobber
+        },
+        Err(CredentialError::NotFound { .. }) => None, // no store token yet → ok to write
+        Err(_) => return Ok(false), // unreadable/corrupt → fail-closed, do not overwrite
+    };
+    if let Some(cur) = current_expiry {
+        if new_expiry <= cur {
+            return Ok(false); // store already at-or-fresher → keep theirs
+        }
+    }
+
+    // Guard passed: write the freshest token via the same UUID chokepoint.
+    save_uuid_credentials(base_dir, uuid, creds)?;
+    Ok(true)
 }
 
 /// Returns the canonical credential file path for the
@@ -768,6 +829,13 @@ mod tests {
         })
     }
 
+    /// `sample_creds()` with a chosen `expiresAt` — for the custodian fresher-guard tests.
+    fn creds_with_expiry(expires_at: u64) -> CredentialFile {
+        let mut c = sample_creds();
+        c.expect_anthropic_mut().claude_ai_oauth.expires_at = expires_at;
+        c
+    }
+
     fn sample_codex_creds() -> CredentialFile {
         CredentialFile::Codex(crate::credentials::CodexCredentialFile {
             auth_mode: Some("chatgpt".into()),
@@ -861,7 +929,7 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// Regression: per security.md MUST Rule 5a (journal 0065 B2 class),
+    /// Regression: per security.md MUST Rule 5a (an internal journal entry B2 class),
     /// every failure branch in `save` after the tmp file would-be-write
     /// must best-effort `remove_file(&tmp)` before propagating. This test
     /// drives the atomic_replace failure branch by making the parent dir
@@ -1319,6 +1387,138 @@ mod tests {
                 .expose_secret(),
             "sk-ant-oat01-test",
             "UUID path must carry the OAuth payload"
+        );
+    }
+
+    // ── A2: save_canonical_for_if_fresher (custodian TOCTOU guard) ────────────
+
+    #[test]
+    fn save_if_fresher_writes_when_strictly_fresher() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        save_canonical_for(base, account, &creds_with_expiry(1000)).unwrap();
+
+        let wrote =
+            save_canonical_for_if_fresher(base, account, &creds_with_expiry(2000), 1000).unwrap();
+
+        assert!(wrote, "strictly fresher candidate must be written");
+        let loaded = load(&uuid_creds_path(base, uuid)).unwrap();
+        assert_eq!(loaded.expect_anthropic().claude_ai_oauth.expires_at, 2000);
+    }
+
+    #[test]
+    fn save_if_fresher_refuses_when_store_already_fresher() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        save_canonical_for(base, account, &creds_with_expiry(2000)).unwrap();
+
+        // Candidate 1500 ≤ store 2000 → no write (TOCTOU: a concurrent login/refresh
+        // wrote a fresher token between harvest and adopt; keep theirs).
+        let wrote =
+            save_canonical_for_if_fresher(base, account, &creds_with_expiry(1500), 0).unwrap();
+
+        assert!(!wrote, "candidate not fresher than store must be refused");
+        let loaded = load(&uuid_creds_path(base, uuid)).unwrap();
+        assert_eq!(
+            loaded.expect_anthropic().claude_ai_oauth.expires_at,
+            2000,
+            "store must be left unchanged"
+        );
+    }
+
+    #[test]
+    fn save_if_fresher_refuses_when_not_above_min_exclusive() {
+        use crate::testing::identity_fixtures::coexisting_fixture;
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        save_canonical_for(base, account, &creds_with_expiry(1000)).unwrap();
+
+        // Candidate 1500, min_exclusive 1500 → 1500 ≤ 1500 → no write (pre-lock baseline).
+        let wrote =
+            save_canonical_for_if_fresher(base, account, &creds_with_expiry(1500), 1500).unwrap();
+
+        assert!(
+            !wrote,
+            "candidate not strictly above min_exclusive must be refused"
+        );
+    }
+
+    #[test]
+    fn save_if_fresher_writes_when_store_absent() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        // Simulate an absent store credential (no token yet for this account).
+        let _ = std::fs::remove_file(uuid_creds_path(base, uuid));
+
+        let wrote =
+            save_canonical_for_if_fresher(base, account, &creds_with_expiry(1234), 0).unwrap();
+
+        assert!(wrote, "absent store → candidate is written");
+        let loaded = load(&uuid_creds_path(base, uuid)).unwrap();
+        assert_eq!(loaded.expect_anthropic().claude_ai_oauth.expires_at, 1234);
+    }
+
+    #[test]
+    fn save_if_fresher_refuses_when_store_is_non_anthropic() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        // Stage a NON-Anthropic (Codex-shaped) credential at the Anthropic store path.
+        let p = uuid_creds_path(base, uuid);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        save(&p, &sample_codex_creds()).unwrap();
+
+        // Fail-closed: a non-Anthropic store is NOT clobbered, even by a fresher token.
+        let wrote =
+            save_canonical_for_if_fresher(base, account, &creds_with_expiry(9999), 0).unwrap();
+
+        assert!(!wrote, "non-Anthropic store must not be clobbered");
+        assert!(
+            load(&p).unwrap().codex().is_some(),
+            "store still Codex-shaped"
+        );
+    }
+
+    #[test]
+    fn save_if_fresher_refuses_when_store_is_corrupt() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        // Stage a corrupt (unparseable) store file.
+        let p = uuid_creds_path(base, uuid);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, b"{ this is not valid json").unwrap();
+
+        // Fail-closed: an unreadable/corrupt store is NOT overwritten on doubt.
+        let wrote =
+            save_canonical_for_if_fresher(base, account, &creds_with_expiry(9999), 0).unwrap();
+
+        assert!(
+            !wrote,
+            "corrupt store must not be overwritten (fail-closed)"
         );
     }
 

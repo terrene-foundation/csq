@@ -19,7 +19,7 @@
     /// Round-1-redteam-fix: tightened from `string` to a literal
     /// union so a missing-surface bug surfaces as a TS error rather
     /// than as a silently-missing badge. Origin: redteam round 1 M4
-    /// (journal 0058).
+    /// (an internal journal entry).
     surface: 'claude-code' | 'codex' | 'gemini';
     has_credentials: boolean;
     five_hour_pct: number;
@@ -39,17 +39,23 @@
     /// provider type (e.g. only Ollama slots get a "Change model"
     /// button).
     provider_id: string | null;
-    /// Billing-mode classification (Phase B of journal 0046).
+    /// Billing-mode classification (Phase B of an internal journal entry).
     /// Drives the quota render: `subscription` shows 5h/7d bars,
     /// `api-key` shows "API-key billing" with no bars, `local`
     /// shows "Local provider — no billing". Renderers MUST branch
     /// on this — `provider_id` / `surface` / `source` are
     /// credential-origin fields, not user-visible-quota-shape.
     billing_mode: 'subscription' | 'api-key' | 'local';
-    /// Phase B' (journal 0050 D5) — catalog quota_kind:
-    /// "utilization" | "counter" | "unknown". `unknown` slots render the
-    /// new tokens-and-cost-over-time ledger view instead of the 5h/7d bars.
-    quota_kind?: 'utilization' | 'counter' | 'unknown';
+    /// Phase B' (an internal journal entry D5) — catalog quota_kind:
+    /// "utilization" | "counter" | "unknown" | "balance". `unknown` slots
+    /// render the tokens-and-cost-over-time ledger view; `balance` slots
+    /// render the formatted balance string from `balance_display`.
+    quota_kind?: 'utilization' | 'counter' | 'unknown' | 'balance';
+    /// Formatted remaining balance for pay-per-token providers (e.g. DeepSeek).
+    /// Present when `quota_kind === "balance"`. Format: "$196.42" (USD) or
+    /// "196.42 CNY" (other currencies). Absent (null/undefined) for every
+    /// non-balance slot.
+    balance_display?: string | null;
     // ── PR-G5 — Gemini-specific quota fields ──────────────────
     // None on non-Gemini slots; populated by the daemon's NDJSON
     // event drain. The card renders these instead of the 5h/7d
@@ -279,9 +285,9 @@
   async function getBaseDir(): Promise<string> {
     // Use `join` so the platform's path separator is honored.
     // Tauri 2.10's `homeDir()` returns the home path without a
-    // trailing separator (`/Users/esperie`, not `/Users/esperie/`),
+    // trailing separator (`/Users/example`, not `/Users/example/`),
     // so naive string concatenation produces an invalid path like
-    // `/Users/esperie.claude/accounts`.
+    // `/Users/example.claude/accounts`.
     const home = await homeDir();
     return await join(home, '.claude', 'accounts');
   }
@@ -632,7 +638,7 @@
               `surface` is now a visible bug (a card with an UNKNOWN
               badge) rather than an invisible inconsistency (some
               cards show badges, one card doesn't). Origin: M4
-              (journal 0058). The new TS type literal-union prevents
+              (an internal journal entry). The new TS type literal-union prevents
               this at compile time; the runtime fallback covers any
               IPC-side patch that bypasses the typecheck.
             -->
@@ -709,14 +715,37 @@
             </div>
           {:else if account.quota_kind === 'unknown'}
             <!--
-              Phase B' (journal 0050 D5): pay-per-token slots whose
+              Phase B' (an internal journal entry D5): pay-per-token slots whose
               quota_kind is Unknown have no quota signal — the 5h/7d
               bars would render stuck-at-zero. Render the tokens-and-
-              cost-over-time ledger instead. See journal 0047 for the
+              cost-over-time ledger instead. See an internal journal entry for the
               "don't hide bars without a replacement" feedback that
               motivated this design.
             -->
             <BillingLedger account={account.id} baseDir={baseDirCached} />
+          {:else if account.quota_kind === 'balance' || account.balance_display}
+            <!--
+              Balance-based providers (e.g. DeepSeek): no 5h/7d reset
+              windows — the daemon populates `balance_display` with the
+              formatted remaining credit instead. Render it in the usage
+              area in place of the bars, then show the spend ledger below.
+            -->
+            <div class="balance-row">
+              <span class="balance-label">Balance</span>
+              {#if account.balance_display}
+                <span class="balance-value" data-testid="balance-display">{account.balance_display}</span>
+                <span class="balance-suffix">remaining</span>
+              {:else}
+                <!--
+                  quota_kind is `balance` but the daemon hasn't polled
+                  `/user/balance` yet (balance_display is null). Show a
+                  checking state rather than a bare "—", which reads as a
+                  failure indistinguishable from a genuine error (redteam #984 F4).
+                -->
+                <span class="balance-value balance-pending" data-testid="balance-display">checking…</span>
+              {/if}
+            </div>
+            <BillingLedger account={account.id} baseDir={baseDirCached} hideWhenEmpty={true} />
           {:else}
             <div class="usage-bars">
               <UsageBar label="5h" pct={account.five_hour_pct} />
@@ -1059,7 +1088,7 @@
        TS literal-union prevents at compile time, but the runtime
        fallback catches IPC patches that bypass the typecheck) reads
        as "this is wrong" rather than "this is some new feature."
-       Origin: redteam round 1 M4 (journal 0058). */
+       Origin: redteam round 1 M4 (an internal journal entry). */
     background: rgba(255, 167, 38, 0.15);
     color: #ffa726;
     border: 1px solid rgba(255, 167, 38, 0.4);
@@ -1115,6 +1144,28 @@
     color: var(--red);
     font-family: ui-monospace, monospace;
     margin-top: -0.15rem;
+  }
+  .balance-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    font-size: 0.72rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    margin-top: -0.1rem;
+  }
+  .balance-label,
+  .balance-suffix {
+    color: var(--text-tertiary);
+    font-weight: 400;
+  }
+  .balance-value {
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+  .balance-pending {
+    color: var(--text-tertiary);
+    font-weight: 400;
+    font-style: italic;
   }
   .usage-bars { display: flex; gap: 1rem; }
   .reset-info {

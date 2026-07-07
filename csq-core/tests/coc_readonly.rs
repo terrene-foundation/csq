@@ -5,7 +5,7 @@
 //!
 //! Note on the parse cache: the cache lives at `<workspace_root>/.cache/`
 //! — OUTSIDE `.coc/` — per `csq-core/src/coc/integrity.rs::cache_dir`,
-//! ratified in PR-CA9 design 08:151 + journal 0030 §7. `<workspace>/.cache/`
+//! ratified in PR-CA9 design 08:151 + an internal journal entry §7. `<workspace>/.cache/`
 //! is a sibling of `.coc/`, not a subdirectory of it, so cache writes
 //! trivially satisfy this read-only invariant without needing a special
 //! exemption: no source line that writes the cache mentions `.coc/`.
@@ -21,7 +21,7 @@
 //! vestigial; see note above).
 //!
 //! Spec authority: `specs/09-unified-coc-artifact-standard.md` §9.10 +
-//! `specs/10-capability-layer-architecture.md` §10.9.4. Issue #262 tracks
+//! `specs/10-capability-layer-architecture.md` §10.9.4. an internal ticket tracks
 //! the spec-text amendment that aligned §10.9.2 + §10.9.4 with the
 //! `<workspace_root>/.cache/` implementation.
 

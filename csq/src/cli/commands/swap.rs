@@ -18,7 +18,7 @@
 //!    renaming the source handle dir to a sweep tombstone BEFORE
 //!    `exec`ing the target binary. Conversation does not transfer.
 //!
-//! # Legacy mode retirement (M4-8, Phase 4 issue #292)
+//! # Legacy mode retirement (M4-8, Phase 4 an internal ticket)
 //!
 //! The pre-handle-dir `CLAUDE_CONFIG_DIR=config-<N>` swap mode is
 //! **fully retired**. If `CLAUDE_CONFIG_DIR` points at a `config-<N>`
@@ -85,7 +85,7 @@ enum RouteKind {
     /// symlink repoint; no exec, no tombstone.
     SameSurfaceClaudeCode,
     /// Source + target both Codex. In-flight symlink repoint via the
-    /// Codex-aware mirror (M10 / journal 0023). No exec, no tombstone.
+    /// Codex-aware mirror (M10 / an internal journal entry). No exec, no tombstone.
     SameSurfaceCodex,
     /// Source ≠ target surface. INV-P05 confirm + INV-P10 tombstone +
     /// `exec` of the target binary. Conversation does not transfer.
@@ -115,7 +115,7 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     let source = detect_source_handle(target)?;
     let target_surface = resolve_target_surface(base_dir, target)?;
 
-    // Phase B' billing-ledger attribution (journal 0050 D2). Best-effort
+    // Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort
     // append; failures MUST NOT block the swap.
     super::run::append_launch_log(base_dir, "swap", target);
 
@@ -124,7 +124,40 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     // unavailable → no intent emitted, consistent with the WBS T4 invariant).
     let from_slot = read_slot_from_handle_dir(source.path());
 
-    match route(source.surface(), target_surface) {
+    // Capture the handle-dir path before `source` is moved into the route arms.
+    // After a Claude-surface swap we mirror the new account's credential into
+    // the keychain item CC reads for this handle dir (current CC reads OAuth
+    // from the keychain, not the symlinked `.credentials.json`).
+    let handle_dir_path = source.path().to_path_buf();
+
+    let route_kind = route(source.surface(), target_surface);
+
+    // A4a — close the daemon-custodian mid-swap race for a same-surface ClaudeCode
+    // swap (the only path that repoints an EXISTING dir whose keychain still holds
+    // the PREVIOUS account's token). Two coordinated guards, held across the whole
+    // [repoint → sync] transition:
+    //
+    //   1. Hold the per-dir swap lock so the daemon custodian's harvest (which
+    //      try-locks the same file) SKIPS this dir until it settles — it can never
+    //      read a token that disagrees with the freshly-repointed symlink.
+    //   2. Clear the keychain item BEFORE the repoint, so the transition window (and
+    //      any crash within it) leaves the item ABSENT — which harvest also skips —
+    //      rather than the wrong account's token. sync_cc_keychain below writes the
+    //      new account's token, ending the transition with a consistent dir.
+    //
+    // Cross-surface / Codex routes create a FRESH handle dir (keychain absent from
+    // birth), so they have no such race and need neither guard.
+    let _swap_guard = if matches!(route_kind, RouteKind::SameSurfaceClaudeCode) {
+        let abs =
+            std::fs::canonicalize(&handle_dir_path).unwrap_or_else(|_| handle_dir_path.clone());
+        let guard = csq_core::credentials::keychain::lock_handle_dir_for_swap(&abs);
+        csq_core::credentials::keychain::clear_handle_dir(&abs);
+        guard
+    } else {
+        None
+    };
+
+    let result = match route_kind {
         RouteKind::SameSurfaceClaudeCode => {
             same_surface_claude_code_audited(base_dir, source.path(), target, from_slot)
         }
@@ -134,7 +167,16 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
         RouteKind::CrossSurface => {
             cross_surface_exec(base_dir, source, target, target_surface, yes, from_slot)
         }
+    };
+
+    if result.is_ok() && matches!(target_surface, Surface::ClaudeCode) {
+        let abs = std::fs::canonicalize(&handle_dir_path).unwrap_or(handle_dir_path);
+        super::run::sync_cc_keychain(&abs, true);
     }
+    // `_swap_guard` (if any) drops here, AFTER sync_cc_keychain — the dir is now
+    // consistent (symlink + keychain agree), so the next harvest may read it.
+
+    result
 }
 
 // ─── M13b audit helpers ──────────────────────────────────────────────
@@ -276,7 +318,7 @@ fn detect_source_handle(target: AccountNum) -> Result<SourceHandle> {
         if is_term_handle_dir(&p) {
             return Ok(SourceHandle::ClaudeCode(p));
         }
-        // M4-8 (Phase 4 issue #292): legacy `CLAUDE_CONFIG_DIR=config-N`
+        // M4-8 (Phase 4 an internal ticket): legacy `CLAUDE_CONFIG_DIR=config-N`
         // swap mode is fully retired. The pre-M4-8 fallback through
         // `rotation::swap_to` would write credentials into config-N
         // and silently move every terminal sharing that dir; the
@@ -358,7 +400,7 @@ fn same_surface_claude_code_audited(
 }
 
 fn same_surface_claude_code(base_dir: &Path, source_dir: &Path, target: AccountNum) -> Result<()> {
-    // M4-8 (Phase 4 issue #292): the only valid same-surface ClaudeCode
+    // M4-8 (Phase 4 an internal ticket): the only valid same-surface ClaudeCode
     // swap path is the handle-dir model. `detect_source_handle` already
     // refuses legacy `config-N` sources with the spec 02 §2.6 message,
     // so any source reaching this function MUST be a `term-<pid>` dir.
@@ -397,7 +439,7 @@ fn same_surface_claude_code(base_dir: &Path, source_dir: &Path, target: AccountN
 /// Without this refresh the next statusline render on any sibling terminal
 /// bound to slot N would surface the stale slot until `snapshot_account`'s
 /// lazy self-heal runs — the exact `csq swap N → wrong slot` bug (workspace
-/// slot-attribution-consistency, C2/M4).
+/// an internal workspace, C2/M4).
 ///
 /// Writes the canonical `config-N` file directly (never the handle dir, whose
 /// `.current-account` is a symlink into config-N). Non-fatal: snapshot's
@@ -416,7 +458,7 @@ fn refresh_current_account_cache(base_dir: &Path, target: AccountNum) {
     }
 }
 
-// ─── Same-surface Codex (M10 / journal 0023) ────────────────────────
+// ─── Same-surface Codex (M10 / an internal journal entry) ────────────────────────
 
 /// Same-surface Codex→Codex symlink repoint. Mirrors
 /// `same_surface_claude_code` but uses the Codex-aware
@@ -537,7 +579,7 @@ fn cross_surface_exec(
 
     // ── Step 2: tombstone source handle dir (INV-P10) ────────────────────────
     //
-    // NOTE (slot-attribution-consistency, R1 review LOW-3): unlike the
+    // NOTE (an internal workspace, R1 review LOW-3): unlike the
     // same-surface paths, cross-surface does NOT eagerly call
     // `refresh_current_account_cache` here. The exec'd launch path
     // (`run::launch_*` → `markers::write_current_account`) writes
@@ -711,8 +753,18 @@ fn exec_claude_code_after_binding(base_dir: &Path, target: AccountNum, pid: u32)
                 anyhow!("failed to access ClaudeCode handle dir for slot {target}: {e}")
             })?;
 
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    // Mirror the target account's credential into the keychain CC reads for this
+    // FRESH handle dir before exec — current CC reads OAuth keychain-first, and a
+    // cross-surface swap creates a brand-new term-<pid> dir with no keychain item
+    // yet (the post-route sync in `handle` covers only the same-surface paths,
+    // which don't exec). Without this, a Codex/Gemini→Claude swap launches CC
+    // against an unwritten keychain → "Please run /login · 401". Mirrors run.rs.
+    super::run::sync_cc_keychain(&handle_dir_abs, true);
+
     let mut cmd = std::process::Command::new("claude");
-    cmd.env("CLAUDE_CONFIG_DIR", &handle_dir);
+    cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
     cmd.env_remove(codex_surface::HOME_ENV_VAR);
 
     let err = cmd.exec();
@@ -911,7 +963,7 @@ mod tests {
     }
 
     /// Pinning: Codex→Codex MUST stay on the same-surface in-flight
-    /// repoint path (M10 / journal 0023). Regression guard against any
+    /// repoint path (M10 / an internal journal entry). Regression guard against any
     /// future refactor that re-routes through cross_surface_exec and
     /// silently drops the user's conversation again.
     #[test]
@@ -992,7 +1044,7 @@ mod tests {
         assert_eq!(g.surface(), Surface::Gemini);
     }
 
-    // ── PR-C9a journal 0021 finding 10 — rename-to-tombstone ─
+    // ── PR-C9a an internal journal entry finding 10 — rename-to-tombstone ─
 
     /// The tombstone rename MUST atomically move the source handle
     /// dir to a sibling path with the `.sweep-tombstone-` prefix so
@@ -1071,7 +1123,7 @@ mod tests {
         assert_eq!(std::fs::read(tomb.join("b")).unwrap(), b"two");
     }
 
-    // ── M4-8 (Phase 4 issue #292) — legacy-fallback retirement ─────
+    // ── M4-8 (Phase 4 an internal ticket) — legacy-fallback retirement ─────
 
     /// Serializes the env-var-driven tests below — `CLAUDE_CONFIG_DIR`,
     /// `CODEX_HOME`, and `GEMINI_CLI_HOME` are process-globals, so

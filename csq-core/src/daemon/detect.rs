@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn detect_missing_pid_file_is_not_running() {
-        // Journal 0021 finding 11: acquire the SHARED env-test mutex
+        // an internal journal entry finding 11: acquire the SHARED env-test mutex
         // so this test serializes with `paths.rs` tests that also
         // mutate XDG_RUNTIME_DIR (Linux) / USERNAME (Windows). The
         // module-local `WINDOWS_ENV_TEST_MUTEX` only protects against
@@ -671,7 +671,7 @@ mod tests {
     /// `$XDG_RUNTIME_DIR/csq.sock` file regardless of their
     /// per-test TempDir. Running them concurrently produces a flaky
     /// Healthy / Stale outcome depending on scheduler order. Origin:
-    /// PR-C3c CI flake surfaced on PR #174; pre-existing latent race
+    /// PR-C3c CI flake surfaced on an internal ticket; pre-existing latent race
     /// but never manifested until new tests changed parallel timing.
     #[cfg(unix)]
     static SOCKET_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -701,7 +701,7 @@ mod tests {
         // mutates `XDG_RUNTIME_DIR`, and `pid_file_path` / `socket_path` resolve through
         // that env var. Without this guard the paths test can flip the env mid-flight,
         // so this test's pid_file_path() resolves to a different directory than the one
-        // it just wrote to → `NotRunning` instead of `Stale`. PR #204 surfaced this on
+        // it just wrote to → `NotRunning` instead of `Stale`. an internal ticket surfaced this on
         // Ubuntu CI (mac/Windows did not race because `paths::linux_prefers_xdg_runtime_dir`
         // is `#[cfg(target_os = "linux")]`). Mirrors the Windows pattern below.
         let _shared_env_guard = crate::platform::test_env::lock();
@@ -769,6 +769,10 @@ mod tests {
             oauth_store: None,
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            #[cfg(feature = "enterprise")]
+            interactive: std::sync::Arc::new(
+                crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),
+            ),
         };
         let (handle, join) = match server::serve(&sock_path, state).await {
             Ok(r) => r,
@@ -802,7 +806,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn detect_windows_live_pid_but_no_pipe_is_stale() {
-        // Shared cross-module mutex first (journal 0021 finding 11/12).
+        // Shared cross-module mutex first (an internal journal entry finding 11/12).
         let _shared_env_guard = crate::platform::test_env::lock();
         let _env_guard = WINDOWS_ENV_TEST_MUTEX
             .lock()
@@ -842,7 +846,7 @@ mod tests {
     async fn detect_windows_live_daemon_returns_healthy() {
         use crate::daemon::server_windows;
 
-        // Shared cross-module mutex first (journal 0021 finding 11/12).
+        // Shared cross-module mutex first (an internal journal entry finding 11/12).
         let _shared_env_guard = crate::platform::test_env::lock();
         let _env_guard = WINDOWS_ENV_TEST_MUTEX
             .lock()
@@ -868,6 +872,10 @@ mod tests {
             oauth_store: None,
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            #[cfg(feature = "enterprise")]
+            interactive: std::sync::Arc::new(
+                crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),
+            ),
         };
         let (handle, join) = server_windows::serve(&pipe_name, state).await.unwrap();
 

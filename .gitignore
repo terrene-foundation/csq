@@ -133,3 +133,8 @@ coc-eval/bench/stubs/stub-gemini
 coc-eval/bench/stubs/claude
 coc-eval/bench/stubs/codex
 coc-eval/bench/stubs/gemini
+
+# Transient side file from scripts/generate-third-party-licenses.sh
+# (mktemp "THIRD-PARTY-LICENSES.md.XXXXXX"; trap-cleaned on every exit, this is
+# defense-in-depth against a SIGKILL leaving one staged).
+THIRD-PARTY-LICENSES.md.*

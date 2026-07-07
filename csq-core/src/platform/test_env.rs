@@ -64,7 +64,7 @@
 //! depends on the mutated env — hold it past the point where the
 //! code-under-test reads the variable.
 //!
-//! Origin: journal 0021 finding 11 (round-1 redteam of PR-C8).
+//! Origin: an internal journal entry finding 11 (round-1 redteam of PR-C8).
 
 use std::sync::{Mutex, MutexGuard};
 

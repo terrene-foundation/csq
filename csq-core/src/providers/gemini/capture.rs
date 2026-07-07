@@ -59,7 +59,7 @@ pub const EVENT_SCHEMA_VERSION: u8 = 2;
 
 /// Surface tag in every envelope. v1 only carries `"gemini"`;
 /// future surfaces adopting the NDJSON pattern declare their own.
-/// Resolved from [`crate::providers::catalog::Surface::Gemini::as_str`]
+/// Resolved from `crate::providers::catalog::Surface::Gemini::as_str`
 /// to keep the wire string and the enum in lock-step (PR-G2b).
 pub const EVENT_SURFACE_GEMINI: &str = super::SURFACE_GEMINI;
 
@@ -111,7 +111,7 @@ pub enum EventKind {
     // would otherwise fail deserialize and quarantine the whole
     // file. The drainer at `drain_slot` performs a kind-aware
     // pre-parse and silently skips known-legacy tags before the
-    // structured `EventEnvelope` deserialize. See journal 0048.
+    // structured `EventEnvelope` deserialize. See an internal journal entry
 }
 
 /// Empty payload that serialises as `{}`. Used by the two event

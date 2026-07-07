@@ -1,7 +1,7 @@
 //! Version-AGNOSTIC pre-validation for inbound F101-1 events.
 //!
 //! The precheck runs BEFORE any version-specific decode. It validates:
-//! 1. Body size (max [`frontier::MAX_BODY_BYTES`]).
+//! 1. Body size (max `frontier::MAX_BODY_BYTES`).
 //! 2. JSON well-formedness.
 //! 3. `schema_version` field exists and is an integer.
 //!

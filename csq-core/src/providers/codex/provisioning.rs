@@ -42,7 +42,7 @@ pub fn is_codex_corrupt_bound(base_dir: &Path, slot: AccountNum) -> bool {
 ///
 /// Distinguishes the **wrong-variant** case (operator wrote an
 /// Anthropic-shape `claudeAiOauth` payload to a Codex-prefixed
-/// path; issue #520) from the **corrupt** case (`is_codex_corrupt_bound`;
+/// path; an internal ticket) from the **corrupt** case (`is_codex_corrupt_bound`;
 /// #515). Today's `CredentialFile` parser is 2-variant untagged
 /// (Anthropic + Codex) at `csq-core/src/credentials/mod.rs:38-48`;
 /// a wrong-variant `Ok(cf)` therefore always means `cf` is the

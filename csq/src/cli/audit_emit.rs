@@ -245,6 +245,22 @@ impl AuditEmitter {
         }
     }
 
+    /// Record the M6 T6.1 cross-CLI spawn-boundary governance verdict on the held
+    /// record. `cli` is `"codex"` | `"gemini"`; `action_id` is the kailash action
+    /// (`spawn_codex` | `spawn_gemini`); `verdict` is a fixed-vocab tag (`pass` |
+    /// `conditional` for a permitted spawn, or the refusal tag for a refused one).
+    /// No-op on a `--no-audit` (disabled) emitter.
+    #[allow(dead_code)]
+    pub fn set_spawn_gate(&mut self, cli: &str, action_id: &str, verdict: &str) {
+        if let Some(r) = self.record.as_mut() {
+            r.spawn_gate = Some(csq_core::audit::SpawnGateRecord {
+                cli: cli.to_owned(),
+                action: action_id.to_owned(),
+                verdict: verdict.to_owned(),
+            });
+        }
+    }
+
     /// Emit the record immediately, surfacing a typed error when even the
     /// `.pending/` fallback write fails (M06 fail-loud path).
     ///
@@ -351,7 +367,7 @@ fn flush_record(
     };
 
     // Attempt live IPC with the total deadline.
-    if post_to_daemon(socket_path, &body).is_ok() {
+    if post_to_daemon(socket_path, "/api/audit/record", &body).is_ok() {
         return Ok(()); // happy path — daemon accepted the record.
     }
 
@@ -391,12 +407,19 @@ fn flush_record(
 /// always returns `Err(())` so the caller falls through to the `.pending/`
 /// writer. A named-pipe transport for Windows is tracked separately.
 #[cfg(not(unix))]
-fn post_to_daemon(_socket_path: &Path, _body: &str) -> Result<(), ()> {
+pub(crate) fn post_to_daemon(_socket_path: &Path, _route: &str, _body: &str) -> Result<(), ()> {
     Err(())
 }
 
 #[cfg(unix)]
-fn post_to_daemon(socket_path: &Path, body: &str) -> Result<(), ()> {
+pub(crate) fn post_to_daemon(socket_path: &Path, route: &str, body: &str) -> Result<(), ()> {
+    // `route` is interpolated into the HTTP request line below. All current callers
+    // pass static string literals, but guard the CRLF-injection invariant explicitly
+    // (security.md §9) so a future dynamic-route caller cannot smuggle headers.
+    debug_assert!(
+        !route.contains('\r') && !route.contains('\n'),
+        "post_to_daemon route must not contain CR/LF (CRLF injection guard)"
+    );
     let io_timeout = Duration::from_millis(IPC_TOTAL_DEADLINE_MS);
 
     // `UnixStream::connect` is synchronous; the socket is either present or not.
@@ -409,7 +432,7 @@ fn post_to_daemon(socket_path: &Path, body: &str) -> Result<(), ()> {
     stream.set_write_timeout(Some(io_timeout)).map_err(|_| ())?;
 
     let request = format!(
-        "POST /api/audit/record HTTP/1.1\r\n\
+        "POST {route} HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
@@ -545,6 +568,7 @@ mod tests {
             rule_ids_cited_after_repair: vec![],
             rule_ids_dropped_invalid_format: 0,
             decision: Decision::Accept,
+            spawn_gate: None,
         }
     }
 
@@ -694,6 +718,7 @@ mod tests {
             rule_ids_cited_after_repair: vec![],
             rule_ids_dropped_invalid_format: 0,
             decision: Decision::Bypass,
+            spawn_gate: None,
         };
 
         let emitter = AuditEmitter::new(
@@ -761,6 +786,7 @@ mod tests {
             rule_ids_cited_after_repair: vec![],
             rule_ids_dropped_invalid_format: 0,
             decision: Decision::Bypass,
+            spawn_gate: None,
         };
 
         let mut emitter = AuditEmitter::new(
@@ -853,6 +879,7 @@ mod tests {
                 rule_ids_cited_after_repair: vec![],
                 rule_ids_dropped_invalid_format: 0,
                 decision: Decision::Bypass,
+                spawn_gate: None,
             },
             dir.path().join("csq.sock"),
             pending_dir.clone(),

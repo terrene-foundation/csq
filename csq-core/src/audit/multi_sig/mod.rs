@@ -8,15 +8,15 @@
 //!
 //! # Architecture
 //!
-//! - [`edition`]: `Edition` (Community / Enterprise), `MultiSigPolicy`,
+//! - `edition`: `Edition` (Community / Enterprise), `MultiSigPolicy`,
 //!   `resolve_edition()`, `resolve_policy()`. Config-driven via environment
 //!   variables; no new runtime dependency.
-//! - [`intent`]: `intent_hash(chain_id, kind, payload)` — SHA-256 of the
+//! - `intent`: `intent_hash(chain_id, kind, payload)` — SHA-256 of the
 //!   canonical `(chain_id, EventKind, EventPayload)` JSON. Each authorizing
 //!   signer signs this hash. The verifier re-derives it from the stored record.
 //!   `chain_id` binds the intent to the specific chain (SEC-3: closes
 //!   cross-chain replay).
-//! - [`gate`]: `authorize_op(chain_id, kind, payload, signers, policy)` — the
+//! - `gate`: `authorize_op(chain_id, kind, payload, signers, policy)` — the
 //!   single collection call-site. Fail-closed: returns
 //!   `Err(MultiSigError::InsufficientSignatures)` if fewer than
 //!   `policy.threshold` valid signatures are collected. Rejects duplicate signer
@@ -25,7 +25,7 @@
 //!   Records with `authority: None` are unaffected (fast `Ok(())`). Records
 //!   claiming multi-sig with a broken or under-threshold blob are rejected.
 //!   Duplicate signer pubkeys in a blob cause immediate rejection (SEC-1).
-//! - [`error`]: `MultiSigError` — all variants use fixed-vocabulary messages.
+//! - `error`: `MultiSigError` — all variants use fixed-vocabulary messages.
 //!
 //! # The authority blob shape
 //!
@@ -73,8 +73,8 @@
 //!
 //! # Roster trait seam for M12
 //!
-//! [`gate::SignerSet`] is the minimal trait the gate consumes. M12 will add an
-//! `AuthorityRegistry`-backed impl. [`gate::InMemorySignerSet`] is the M11
+//! `gate::SignerSet` is the minimal trait the gate consumes. M12 will add an
+//! `AuthorityRegistry`-backed impl. `gate::InMemorySignerSet` is the M11
 //! in-memory impl used by tests and the community/enterprise default path.
 //!
 //! # Backward compatibility
@@ -92,6 +92,9 @@ pub mod verify;
 pub use edition::{resolve_edition, resolve_policy, Edition, MultiSigPolicy};
 pub use error::MultiSigError;
 pub use gate::{authorize_op, InMemorySignerSet, SignerSet};
+/// GH #910 — forward-compat opaque multi-sig verification (pure-M11 inner
+/// threshold for a record whose `EventKind` this binary does not know).
+pub(crate) use verify::verify_opaque_multi_sig;
 pub use verify::verify_record_multi_sig;
 
 // Test-utils re-exports.

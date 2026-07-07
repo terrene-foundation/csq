@@ -1,6 +1,6 @@
 //! Account rotation — pick best, auto-rotate.
 //!
-//! **M4-8 (Phase 4, issue #292):** the `swap` submodule was deleted and
+//! **M4-8 (Phase 4, an internal ticket):** the `swap` submodule was deleted and
 //! `swap_to` retired. The legacy `CLAUDE_CONFIG_DIR=config-N` swap mode
 //! is fully gone: every swap now flows through
 //! [`crate::session::handle_dir::repoint_handle_dir`] (Anthropic) or

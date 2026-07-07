@@ -150,6 +150,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         }
     }
 

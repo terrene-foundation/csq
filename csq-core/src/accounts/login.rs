@@ -8,7 +8,7 @@
 //!   `claude` (typically in `/usr/local/bin`, `/opt/homebrew/bin`, or
 //!   `~/.npm-global/bin`) is invisible to plain `Command::new("claude")`.
 //!   The desktop's `start_claude_login` Tauri command was disabled in
-//!   alpha.5 (per journal 0040 §2) precisely because of this PATH gap.
+//!   alpha.5 (per an internal journal entry §2) precisely because of this PATH gap.
 //!
 //! - [`read_email_from_claude_json`] reads the OAuth account email
 //!   that CC writes to `<config_dir>/.claude.json` after a successful
@@ -84,7 +84,7 @@ pub fn find_claude_binary() -> Option<PathBuf> {
 /// subprocess and no race window — it's the preferred source over
 /// `claude auth status --json`, which has a documented timing
 /// window where stdout can lack `email` if csq runs it too soon
-/// after auth completes (see journal 0040 §1).
+/// after auth completes (see an internal journal entry §1).
 ///
 /// Returns `None` if the file is missing, malformed, or has no
 /// non-empty `emailAddress` field. Callers should fall back to
@@ -105,7 +105,7 @@ pub fn read_email_from_claude_json(config_dir: &Path) -> Option<String> {
 }
 
 /// Ensures the slot's identity UUID is minted into `profiles.json::by_slot`
-/// BEFORE the canonical credential save (issue #633).
+/// BEFORE the canonical credential save (an internal ticket).
 ///
 /// `credentials::file::save_canonical_for` is fail-closed on an absent UUID
 /// (M4-12), but on a fresh install the UUID is only minted by `finalize_login`
@@ -160,7 +160,7 @@ pub fn ensure_login_identity_minted(base_dir: &Path, account: AccountNum) -> Res
 ///    will create it).
 /// 2. **Unbinds any third-party provider pinned to this slot.** If a
 ///    user ran `csq setkey mm --slot N` earlier (intentionally or by
-///    accidentally submitting a junk key, journal 0058), slot N's
+///    accidentally submitting a junk key, an internal journal entry), slot N's
 ///    `settings.json` contains `ANTHROPIC_BASE_URL` +
 ///    `ANTHROPIC_AUTH_TOKEN` env vars that override OAuth
 ///    credentials at CC startup. Strip them here so the fresh OAuth
@@ -178,7 +178,7 @@ pub fn ensure_login_identity_minted(base_dir: &Path, account: AccountNum) -> Res
 /// the credential file is not.
 pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, ConfigError> {
     let config_dir = base_dir.join(format!("config-{}", account));
-    // M4-7 (issue #292 Phase 4, spec 02 §INV-03 + §2.3.1): the
+    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the
     // `.csq-account` marker is written AFTER `mint_for_login` below so
     // we can resolve the slot's identity UUID and emit it as the
     // marker content. For pure-legacy installs (mint deferred to
@@ -245,7 +245,7 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
         }
     }
 
-    // M4-9 (release N affordance, issue #292 Phase 4): the v1
+    // M4-9 (release N affordance, an internal ticket Phase 4): the v1
     // `profiles.accounts` field is empty-write in production. The email
     // is captured in `profiles.json::by_email` by `mint_for_login`
     // below — that is the post-M4-9 source of truth for the slot's
@@ -385,48 +385,94 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
     }
 
     // HIGH-2 (M2-2 redteam): seed identities/<UUID>/credentials.json immediately
-    // after mint succeeds, while still holding the ProfilesFileLock.
-    //
-    // Without this step, the identity dir exists but credentials.json is missing
-    // until the daemon's first refresh tick — csq doctor reports
+    // after mint succeeds, while still holding the ProfilesFileLock — a fresh
+    // login that did NOT pre-seed the store (legacy callers, or a UUID minted
+    // for the first time just above) otherwise leaves credentials.json missing
+    // until the daemon's first refresh tick, and csq doctor reports
     // MissingCredentialsAtUuidPath on every freshly-logged-in slot.
     //
-    // The `live_path` read here (`config-N/.credentials.json`) is sourced
-    // by CC itself — the `claude auth login` subprocess writes its OAuth
-    // payload there before csq's post-subprocess hook runs (see
-    // `handle_direct_post_subprocess` in `csq/src/cli/commands/login.rs`).
-    // **M3-7 invariant:** csq no longer treats this file as a credential
-    // reader for terminals (handle dirs symlink to `identities/<UUID>/`),
-    // but it remains the seed source for finalize_login because that's
-    // where CC's auth subprocess deposits the freshly-minted tokens.
-    // Route them through save_canonical_for (the M2-2 chokepoint), which
-    // writes identities/<UUID>/credentials.json FIRST.
+    // **The freshness guard (config-N login-overwrite fix, 2026-06-24).** The
+    // `live_path` read here (`config-N/.credentials.json`) was, pre-keychain-CC,
+    // the freshest token: the `claude auth login` subprocess wrote its OAuth
+    // payload there before csq's post-subprocess hook ran. That assumption is
+    // no longer reliable — modern keychain-first CC commits the fresh token to
+    // the macOS keychain and may leave `config-N/.credentials.json` STALE or
+    // absent (empirically observed: refreshed daemon stores while config-N sat
+    // weeks behind). EVERY production caller of finalize_login now pre-seeds the
+    // store with the freshest token the flow produced BEFORE calling us — the
+    // subprocess flows via `read_fresh_after_login` (keychain ∪ config-N, later
+    // `expiresAt` wins) and the paste/race flows via `oauth::exchange_code`
+    // (which never writes config-N) → `save_canonical_for` — so the store is
+    // already ≥ config-N here. An UNCONDITIONAL re-seed from config-N (the prior
+    // `save_canonical_for` call) therefore REGRESSED the store back to a
+    // stale/rotated-dead token, 401-ing every session of the account.
     //
-    // Non-fatal: if the live creds are missing (e.g. CC did not finish writing
-    // them before finalize_login was called) we log and skip; the next daemon
-    // tick's backsync will seed the UUID path from live on its next pass.
+    // Fix: route the re-seed through `save_canonical_for_if_fresher`, which
+    // re-reads the store expiry UNDER the write lock and writes config-N's token
+    // ONLY when it is strictly fresher (fail-closed — Ok(false), no write — on a
+    // non-Anthropic/corrupt store). The seed is now MONOTONIC: it can advance a
+    // store that a non-pre-seeding caller left empty/older (the HIGH-2 safety
+    // net), but it can NEVER regress the fresh token a pre-seeding caller already
+    // wrote. On the happy path (store already holds the caller's fresh token) it
+    // cleanly no-ops. `min_expiry_exclusive = 0` because we carry no harvested
+    // baseline; the under-lock store re-read is the SOLE guard for this caller.
+    //
+    // Scope of the guard: this is a FRESHNESS guard, not an IDENTITY guard.
+    // config-N is per-slot-path-keyed (`config-<N>/.credentials.json`), so under
+    // the same-account threat model it cannot carry a FOREIGN account's token —
+    // unlike the keychain custodian, whose harvest source is account-anonymous
+    // and so carries an explicit same-account email gate. The residual the
+    // monotonic guard does NOT cover is shared with `read_fresh_after_login`:
+    // `expiresAt` is a recency proxy, not a chain-liveness proof, so a
+    // dead-but-later-expiry token could in principle be selected upstream. That
+    // is a pre-existing limitation of expiry-based selection (post_login.rs),
+    // not introduced here; `if_fresher` is strictly more conservative than the
+    // unconditional write it replaces.
+    //
+    // Non-fatal: if the live creds are missing (e.g. CC wrote only the keychain)
+    // we log and skip; the caller's pre-seed already populated the store.
     let live_path = cred_file::live_path(base_dir, account);
     match credentials::load(&live_path) {
         Ok(live_creds) => {
-            // RN1-C (M4-12): save_canonical_for is fail-closed — returns Err(NoCredentials)
-            // when no UUID mapping exists in by_slot.
+            // RN1-C (M4-12): the UUID-keyed write is fail-closed — an absent
+            // by_slot mapping yields Err(NoCredentials).
             //
-            // Propagation policy:
-            // - When by_slot IS populated (mint succeeded above), save_canonical_for MUST
-            //   succeed. Propagate the error fail-closed: the caller sees "login bookkeeping
-            //   failed" rather than Ok(email) while no UUID-keyed credential file exists.
-            //   broker_check reads the UUID path — a missing UUID credentials.json means
-            //   LOGIN_REQUIRED on the very next daemon tick.
-            // - When by_slot is NOT populated (legacy/pure-legacy install, email="unknown"
-            //   so mint was skipped), save_canonical_for returns NoCredentials which is still
-            //   "non-fatal" in that context: broker_check falls back to the numeric path
-            //   for legacy accounts. Preserve the non-fatal behaviour for this case.
+            // Propagation policy (unchanged by the freshness guard):
+            // - When by_slot IS populated (mint succeeded above), an Err MUST be
+            //   propagated fail-closed: the caller sees "login bookkeeping failed"
+            //   rather than Ok(email) while no UUID-keyed credential file exists.
+            //   broker_check reads the UUID path — a missing UUID credentials.json
+            //   means LOGIN_REQUIRED on the very next daemon tick.
+            // - When by_slot is NOT populated (legacy/pure-legacy install,
+            //   email="unknown" so mint was skipped), Err(NoCredentials) is
+            //   "non-fatal": broker_check falls back to the numeric path for
+            //   legacy accounts. Preserve the non-fatal behaviour for this case.
+            //
+            // Ok(true) = config-N was strictly fresher and was written;
+            // Ok(false) = the store already held an at-or-fresher token (the
+            // pre-seed, a daemon refresh) OR the store was non-Anthropic/corrupt
+            // (fail-closed) — either way the seed is correctly a no-op.
             let uuid_populated = profiles::resolve_slot_to_uuid(base_dir, account.get()).is_some();
-            match credentials::save_canonical_for(base_dir, account, &live_creds) {
-                Ok(_) => {
+            // No harvested baseline at this callsite: the under-lock store re-read
+            // inside `save_canonical_for_if_fresher` is the sole TOCTOU guard.
+            const NO_HARVEST_BASELINE: u64 = 0;
+            match cred_file::save_canonical_for_if_fresher(
+                base_dir,
+                account,
+                &live_creds,
+                NO_HARVEST_BASELINE,
+            ) {
+                Ok(true) => {
                     tracing::debug!(
                         account = account.get(),
-                        "finalize_login: UUID credentials seeded from live"
+                        "finalize_login: UUID credentials seeded from live (config-N was fresher)"
+                    );
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        account = account.get(),
+                        "finalize_login: live re-seed skipped \
+                         (store at-or-fresher, or non-Anthropic/corrupt — fail-closed)"
                     );
                 }
                 Err(cred_err) if uuid_populated => {
@@ -471,6 +517,17 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
     drop(profiles_lock);
 
     crate::refresh::sentinel::clear_broker_failed(base_dir, account);
+
+    // Mirror the freshly-logged-in token into the keychain CC reads for every
+    // live handle dir (current CC is keychain-first). `claude auth login` wrote
+    // the keychain only for the LOGIN config dir, so a session already bound to
+    // this account on a different `term-<pid>` path keeps the stale token until
+    // its next launch. Done HERE (the shared finalize) — not in the CLI wrapper —
+    // so every caller gets it: `csq login` AND all three desktop login twins
+    // (subprocess, paste-code, race). Account-agnostic sweep; the
+    // newer-than-keychain guard no-ops unaffected dirs. Best-effort; never blocks
+    // login. Test-safe: a base with no `term-*` dirs sweeps nothing.
+    let _ = crate::credentials::keychain::sync_all_handle_dirs(base_dir);
 
     Ok(email)
 }
@@ -778,6 +835,326 @@ mod tests {
         );
     }
 
+    /// config-N login-overwrite regression (HIGH, 2026-06-24): a STALE
+    /// `config-N/.credentials.json` MUST NOT regress a fresher store token.
+    ///
+    /// Every production caller pre-seeds the store with the authoritative
+    /// token (`read_fresh_after_login` → `save_canonical_for`) before calling
+    /// `finalize_login`. Modern keychain-first CC may leave
+    /// `config-N/.credentials.json` stale or weeks-old. The prior unconditional
+    /// `save_canonical_for` re-seed reverted the store to that stale token,
+    /// 401-ing every session. The freshness guard
+    /// (`save_canonical_for_if_fresher`) makes the re-seed monotonic.
+    ///
+    /// Arrange:
+    /// - store `identities/<UUID>/credentials.json` pre-seeded FRESH (expiry 2100)
+    /// - `config-1/.credentials.json` STALE (expiry 2033, different access_token)
+    ///
+    /// After `finalize_login`, the store MUST still carry the FRESH token.
+    #[test]
+    fn finalize_login_stale_config_n_does_not_regress_fresh_store() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        fn anthropic_creds(access: &str, expires_at: u64) -> crate::credentials::CredentialFile {
+            crate::credentials::CredentialFile::Anthropic(
+                crate::credentials::AnthropicCredentialFile {
+                    claude_ai_oauth: crate::credentials::OAuthPayload {
+                        access_token: crate::types::AccessToken::new(access.into()),
+                        refresh_token: crate::types::RefreshToken::new(format!(
+                            "sk-ant-ort01-{access}"
+                        )),
+                        expires_at,
+                        scopes: vec!["user:inference".into()],
+                        subscription_type: Some("max".into()),
+                        rate_limit_tier: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    extra: std::collections::HashMap::new(),
+                },
+            )
+        }
+
+        const FRESH_EXPIRY: u64 = 4102444800000; // 2100-01-01
+        const STALE_EXPIRY: u64 = 2000000000000; // 2033-05-18 (< FRESH)
+
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let uuid = fixture_uuid_for_slot(1);
+        let config_dir = base.join("config-1");
+
+        // .claude.json with the fixture email → mint reuses the fixture UUID.
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
+
+        // Pre-seed the store with the FRESH token (what a caller's
+        // read_fresh_after_login → save_canonical_for would have written).
+        credentials::save_canonical_for(
+            base,
+            account,
+            &anthropic_creds("sk-ant-oat01-FRESH", FRESH_EXPIRY),
+        )
+        .expect("pre-seed store with fresh token");
+
+        // config-N holds a STALE token (older expiry, different access_token) —
+        // the leftover keychain-first CC never refreshed.
+        credentials::save(
+            &cred_file::live_path(base, account),
+            &anthropic_creds("sk-ant-oat01-STALE", STALE_EXPIRY),
+        )
+        .unwrap();
+
+        // Act
+        let result = finalize_login(base, account);
+        assert!(result.is_ok(), "finalize_login must succeed: {result:?}");
+
+        // Assert: the store STILL carries the FRESH token — NOT regressed to STALE.
+        let store = credentials::load(&uuid_creds_path(base, uuid)).expect("store readable");
+        assert_eq!(
+            store
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
+            "sk-ant-oat01-FRESH",
+            "config-N login-overwrite: a stale config-N must NOT regress the fresher store token"
+        );
+        assert_eq!(
+            store.expect_anthropic().claude_ai_oauth.expires_at,
+            FRESH_EXPIRY,
+            "store expiry must remain the fresh value after finalize_login"
+        );
+    }
+
+    /// config-N login-overwrite — monotonic-UP direction (R1 deep-analyst MED-2):
+    /// a config-N STRICTLY FRESHER than the store MUST advance the store. Pins the
+    /// `<=` boundary in `save_canonical_for_if_fresher` so a future operator flip
+    /// (`<` vs `<=`) or a regression to "never write" is caught. This is the
+    /// HIGH-2 safety net's general case: a non-pre-seeding caller (or a store left
+    /// behind an older token) is still seeded from a genuinely-fresh config-N.
+    #[test]
+    fn finalize_login_fresher_config_n_advances_store() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        fn anthropic_creds(access: &str, expires_at: u64) -> crate::credentials::CredentialFile {
+            crate::credentials::CredentialFile::Anthropic(
+                crate::credentials::AnthropicCredentialFile {
+                    claude_ai_oauth: crate::credentials::OAuthPayload {
+                        access_token: crate::types::AccessToken::new(access.into()),
+                        refresh_token: crate::types::RefreshToken::new(format!(
+                            "sk-ant-ort01-{access}"
+                        )),
+                        expires_at,
+                        scopes: vec!["user:inference".into()],
+                        subscription_type: Some("max".into()),
+                        rate_limit_tier: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    extra: std::collections::HashMap::new(),
+                },
+            )
+        }
+
+        const OLD_EXPIRY: u64 = 2000000000000; // 2033
+        const NEWER_EXPIRY: u64 = 4102444800000; // 2100 (> OLD)
+
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let uuid = fixture_uuid_for_slot(1);
+        let config_dir = base.join("config-1");
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
+
+        // Store holds an OLDER token; config-N holds a strictly NEWER token.
+        credentials::save_canonical_for(
+            base,
+            account,
+            &anthropic_creds("sk-ant-oat01-OLD", OLD_EXPIRY),
+        )
+        .expect("pre-seed older store token");
+        credentials::save(
+            &cred_file::live_path(base, account),
+            &anthropic_creds("sk-ant-oat01-NEWER", NEWER_EXPIRY),
+        )
+        .unwrap();
+
+        let result = finalize_login(base, account);
+        assert!(result.is_ok(), "finalize_login must succeed: {result:?}");
+
+        let store = credentials::load(&uuid_creds_path(base, uuid)).expect("store readable");
+        assert_eq!(
+            store
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
+            "sk-ant-oat01-NEWER",
+            "a strictly-fresher config-N MUST advance the store (monotonic-up)"
+        );
+        assert_eq!(
+            store.expect_anthropic().claude_ai_oauth.expires_at,
+            NEWER_EXPIRY,
+            "store expiry must advance to the fresher config-N value"
+        );
+    }
+
+    /// config-N login-overwrite — fail-closed on a corrupt store (R1 code-review
+    /// LOW): the new `save_canonical_for_if_fresher` path returns Ok(false) WITHOUT
+    /// writing when the store is unreadable/corrupt, whereas the old unconditional
+    /// `save_canonical_for` would have overwritten it from config-N. This pins the
+    /// fail-closed posture (an account-global store must never be clobbered on
+    /// doubt) so a future refactor cannot silently reintroduce the overwrite.
+    #[test]
+    fn finalize_login_corrupt_store_no_ops_fail_closed() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        fn anthropic_creds(access: &str, expires_at: u64) -> crate::credentials::CredentialFile {
+            crate::credentials::CredentialFile::Anthropic(
+                crate::credentials::AnthropicCredentialFile {
+                    claude_ai_oauth: crate::credentials::OAuthPayload {
+                        access_token: crate::types::AccessToken::new(access.into()),
+                        refresh_token: crate::types::RefreshToken::new(format!(
+                            "sk-ant-ort01-{access}"
+                        )),
+                        expires_at,
+                        scopes: vec!["user:inference".into()],
+                        subscription_type: Some("max".into()),
+                        rate_limit_tier: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    extra: std::collections::HashMap::new(),
+                },
+            )
+        }
+
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let uuid = fixture_uuid_for_slot(1);
+        let config_dir = base.join("config-1");
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
+
+        // Corrupt the store file (exists but unparseable) and place a valid,
+        // fresher token in config-N. if_fresher must read the corrupt store,
+        // fail closed (Ok(false)), and leave it untouched.
+        let store_path = uuid_creds_path(base, uuid);
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let corrupt_bytes = b"{ this is not valid credential json ";
+        std::fs::write(&store_path, corrupt_bytes).unwrap();
+        credentials::save(
+            &cred_file::live_path(base, account),
+            &anthropic_creds("sk-ant-oat01-CONFIGN", 4102444800000),
+        )
+        .unwrap();
+
+        let result = finalize_login(base, account);
+        assert!(
+            result.is_ok(),
+            "finalize_login must remain Ok (non-fatal) on a corrupt store: {result:?}"
+        );
+
+        let after = std::fs::read(&store_path).expect("store file still present");
+        assert_eq!(
+            after.as_slice(),
+            corrupt_bytes,
+            "fail-closed: a corrupt store MUST NOT be overwritten from config-N"
+        );
+    }
+
+    /// config-N login-overwrite — ABSENT config-N path (R2 completeness NIT):
+    /// keychain-first CC may leave NO `config-N/.credentials.json` at all. That
+    /// routes to the Err(NotFound) deferral branch, which MUST NOT write the
+    /// store. Pins "absent config-N => no store write, finalize_login still Ok"
+    /// so a future refactor cannot make the NotFound branch seed a default cred.
+    #[test]
+    fn finalize_login_absent_config_n_defers_without_touching_store() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        fn anthropic_creds(access: &str, expires_at: u64) -> crate::credentials::CredentialFile {
+            crate::credentials::CredentialFile::Anthropic(
+                crate::credentials::AnthropicCredentialFile {
+                    claude_ai_oauth: crate::credentials::OAuthPayload {
+                        access_token: crate::types::AccessToken::new(access.into()),
+                        refresh_token: crate::types::RefreshToken::new(format!(
+                            "sk-ant-ort01-{access}"
+                        )),
+                        expires_at,
+                        scopes: vec!["user:inference".into()],
+                        subscription_type: Some("max".into()),
+                        rate_limit_tier: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    extra: std::collections::HashMap::new(),
+                },
+            )
+        }
+
+        const FRESH_EXPIRY: u64 = 4102444800000; // 2100
+
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let uuid = fixture_uuid_for_slot(1);
+        let config_dir = base.join("config-1");
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
+
+        // Pre-seed a FRESH store, then ensure config-N/.credentials.json is ABSENT.
+        credentials::save_canonical_for(
+            base,
+            account,
+            &anthropic_creds("sk-ant-oat01-FRESH", FRESH_EXPIRY),
+        )
+        .expect("pre-seed fresh store");
+        let live = cred_file::live_path(base, account);
+        let _ = std::fs::remove_file(&live);
+        assert!(
+            !live.exists(),
+            "precondition: config-N/.credentials.json must be absent"
+        );
+
+        let result = finalize_login(base, account);
+        assert!(
+            result.is_ok(),
+            "finalize_login must remain Ok when config-N is absent: {result:?}"
+        );
+
+        let store = credentials::load(&uuid_creds_path(base, uuid)).expect("store readable");
+        assert_eq!(
+            store
+                .expect_anthropic()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
+            "sk-ant-oat01-FRESH",
+            "absent config-N: the fresh store token MUST be left untouched"
+        );
+    }
+
     /// M4-2 Criterion: `finalize_login` writes `identities/<UUID>/settings.json`
     /// byte-equivalent to `config-<N>/settings.json`.
     ///
@@ -1028,7 +1405,7 @@ mod tests {
         );
     }
 
-    /// M4-9 (release N affordance, issue #292 Phase 4):
+    /// M4-9 (release N affordance, an internal ticket Phase 4):
     /// `finalize_login` MUST NOT populate the v1
     /// `profiles.json::accounts[N]` map. After login, the map is `{}`.
     /// The slot's email is carried by `by_email` (written by

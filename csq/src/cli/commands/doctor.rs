@@ -25,13 +25,17 @@ use std::path::Path;
 
 #[derive(Serialize)]
 struct DoctorReport {
-    /// spec/13 §9 — `7` adds `audit_chain_state` (AuditHealth classification
-    /// from verify_chain; mirrors daemon startup posture). `6` adds the optional
-    /// top-level `pass0_skipped_slots` field (RN1-D R1 polish). `5` from
-    /// journal 0042 (Phase-4-incomplete alarm). `4` was M2-6 full + M4-11
-    /// (Phase 2 consistency variants + `legacy_compat_state`). `3` was
-    /// v2.8.0/M1-8 (adds `identity_store`). v2 was v2.7.0. v1 was
-    /// unversioned (absence of the field is the v1 signal).
+    /// Top-level doctor JSON schema version. The community build reports `19`
+    /// and the enterprise build reports `21` — the `mcp_gate_outbox_backlog` field
+    /// (v20 #914, gaining the v21 M6 #909 shard-D daemon-aware `state` +
+    /// `last_drain_age_secs`) is enterprise-only, so it raises only the enterprise
+    /// ceiling (see `DOCTOR_SCHEMA_VERSION` below). The full per-version history (v1–v21,
+    /// which version introduced which field, and which fields are
+    /// enterprise-only) is the contract in
+    /// `specs/13-multi-cli-detection-contract.md` §9 — the single source of
+    /// truth. Do NOT re-enumerate it here: the prior inline history drifted
+    /// (it stalled at v7 while fields landed through v18), which is exactly the
+    /// drift §9 exists to prevent.
     schema_version: u32,
     version: String,
     platform: PlatformInfo,
@@ -69,11 +73,11 @@ struct DoctorReport {
     /// parses successfully but does NOT carry a Codex-variant payload —
     /// i.e. `is_codex_wrong_variant_bound` returns `true`. These slots
     /// were written with an Anthropic-shape (`claudeAiOauth`) credential
-    /// at the Codex-prefixed path (issue #520). NOT serialized in JSON
+    /// at the Codex-prefixed path (an internal ticket). NOT serialized in JSON
     /// (mirrors `gemini_unreadable_slots`); drives the wrong-variant
     /// row in `print_report` so the operator gets a self-sufficient
     /// remediation hint without delegating to `csq probe --all`
-    /// (issue #525).
+    /// (an internal ticket).
     #[serde(skip)]
     codex_wrong_variant_slots: Vec<u16>,
     js_runtime: JsRuntimeInfo,
@@ -95,12 +99,12 @@ struct DoctorReport {
     /// `<base_dir>/coc-cache-sweeper-state.json`; absent when the
     /// daemon has never run a tick on this machine.
     cache_sweeper: CacheSweeperInfo,
-    /// M1-8 (issue #292 A++ Phase 1): A++ identity-store coexistence state.
+    /// M1-8 (an internal ticket A++ Phase 1): A++ identity-store coexistence state.
     /// Present when the layout can be read (always attempted). Absent (`null`)
     /// when the lock cannot be acquired — diagnostic non-fatal fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_store: Option<IdentityStoreReport>,
-    /// M4-11 (issue #292 Phase 4 release N): compat-bridge surfaces still
+    /// M4-11 (an internal ticket Phase 4 release N): compat-bridge surfaces still
     /// emitting v1-era footprints on disk during the v2.6.x downgrade window.
     /// Always emitted; empty `[]` is the canonical post-Phase-4 final state.
     ///
@@ -111,7 +115,7 @@ struct DoctorReport {
     /// - `decimal_marker_content_present` — retires when a future shard makes
     ///   `phase4_gate_check` refuse pure-legacy installs
     legacy_compat_state: Vec<LegacyCompatEntry>,
-    /// Journal 0042 (issue #292 §FD #2 of journal 0041): top-level
+    /// an internal journal entry (an internal ticket §FD #2 of an internal journal entry): top-level
     /// "phase-4 incomplete" alarm. Present when at least one UUID-mapped
     /// slot in `profiles.json::by_slot` has an identity-keyed file missing
     /// (the same condition that would cause `phase4_gate_check` to refuse
@@ -155,7 +159,7 @@ struct DoctorReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pass0_skipped_slots: Vec<Pass0SkippedSlot>,
 
-    /// M04 (csq-pact-eatp-adoption): signing key presence status.
+    /// M04 (an internal workspace): signing key presence status.
     ///
     /// Reports whether the Ed25519 audit-trail signing key is present in the
     /// OS keychain. Remediation: run `csq audit init` to generate and store
@@ -164,7 +168,7 @@ struct DoctorReport {
     /// JSON shape: `"present"` | `"absent"`.
     signing_key: SigningKeyStatus,
 
-    /// M07 (csq-pact-eatp-adoption): active audit sink + replication status.
+    /// M07 (an internal workspace): active audit sink + replication status.
     ///
     /// `active_sink`: name of the configured sink (`"none"` = local-only, the default).
     /// `last_anchor_ts`: ISO-8601 UTC of the last successful anchor, or null.
@@ -175,7 +179,7 @@ struct DoctorReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     audit_sink: Option<AuditSinkDoctorInfo>,
 
-    /// M13 (csq-pact-eatp-adoption): F-LEDGER-02 orphan intent records.
+    /// M13 (an internal workspace): F-LEDGER-02 orphan intent records.
     ///
     /// Each entry is a pre-op INTENT record on the committed chain whose
     /// `correlation_id` has no matching OUTCOME — the side effect may have
@@ -228,16 +232,28 @@ struct DoctorReport {
     /// (`"COMPATIBLE"` / `"CONFORMANT"` / `"COMPLETE"`). Added in **enterprise**
     /// schema v17.
     ///
-    /// **Enterprise edition only.** The schema version is edition-specific: the
-    /// enterprise build reports `schema_version: 17` and MAY carry this field;
-    /// the community build stays at `schema_version: 16`, always emits `None`
-    /// here, and `skip_serializing_if` omits the field — so the community wire
-    /// output is byte-identical to pre-T2.5 (dog/tail model,
-    /// `rules/independence.md`). `None` (omitted) when the chain did not verify
-    /// (`broken`/`unknown` `audit_chain_state`), or in any community build.
+    /// **Enterprise edition only.** The schema version is edition-specific
+    /// (community `19` / enterprise `22`; see `DOCTOR_SCHEMA_VERSION` + spec 13 §9
+    /// for the authoritative current values + full history): this grade field
+    /// arrived at v17, so the enterprise build carries it and reports the higher
+    /// ceiling, while the community build always emits `None` here and
+    /// `skip_serializing_if` omits the field — so the community wire output is
+    /// byte-identical to pre-T2.5 (dog/tail model, `rules/independence.md`).
+    /// `None` (omitted) when the chain did not verify (`broken`/`unknown`
+    /// `audit_chain_state`), or in any community build.
     /// Mirrors the `csq audit verify --json` `trust_plane_grade` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     audit_trust_plane_grade: Option<&'static str>,
+    /// M3a — per-level record counts that accompany `audit_trust_plane_grade`.
+    /// Present whenever the grade is (never a bare grade — surfacing CONFORMANT
+    /// without the level distribution would over-claim on the honest-host
+    /// boundary; redteam R1 HIGH, 2026-06-17). **Enterprise only**: the
+    /// community build always emits `None`, `skip_serializing_if` omits the
+    /// field, so the community `--json` schema stays byte-identical. Keys are
+    /// the UPPERCASE canonical wire form (`"AUTO_APPROVED"`, etc.); mirrors the
+    /// `csq audit verify --json` `verification_level_summary` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_verification_level_summary: Option<std::collections::BTreeMap<String, u64>>,
     /// Keychain integrity-anchor verdict for this run (a DETECTOR — never bricks
     /// the chain). `confirmed` = file/keychain agree; `unconfirmed` = the anchor
     /// could not be read+compared (keychain locked / absent / legacy — forge-
@@ -259,6 +275,23 @@ struct DoctorReport {
     /// JSON shape: `{ "audit_roster_floor_anchor": "confirmed" }` (omitted when None).
     #[serde(skip_serializing_if = "Option::is_none")]
     audit_roster_floor_anchor: Option<csq_core::audit::RosterFloorAnchorStatus>,
+
+    /// #787 b2b — the policy-bundle version-floor keychain-anchor cross-check
+    /// (DETECTOR posture; enforcement always uses the FILE floor). One of:
+    /// `confirmed` (file floor ↔ keychain anchor agree), `unavailable` (no
+    /// keychain anchor readable — file-only tamper-detection), `corrupt` (the
+    /// floor file exists but is unreadable — the gate fails closed), or
+    /// `mismatch (...)` (keychain anchor disagrees with the file floor —
+    /// possible on-disk floor tamper/rollback; investigate).
+    ///
+    /// `None` (omitted) until a policy bundle has been installed
+    /// (`csq audit bundle-install`), and ALWAYS `None` in the community edition
+    /// (the phase-2b bundle floor is enterprise-only, moat-stripped from the
+    /// community tree). A plain string (not the enterprise-only
+    /// `BundleFloorAnchor` enum) so the shared `DoctorReport` shape compiles in
+    /// both editions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_bundle_floor_anchor: Option<String>,
 
     /// M18 seam: count of events quarantined under `csq-runs/.quarantine/`.
     ///
@@ -341,7 +374,119 @@ struct DoctorReport {
     /// Always serialized (never skip_serializing_if) so the state is always
     /// present in `csq doctor --json`.
     seam_capture_conformance: SeamConformanceState,
+
+    /// CU4 (spec 10 §10.8.3): MCP partial-coverage advisory. `warn` is true
+    /// when the user has ≥1 CLI-bound MCP server configured AND the capability
+    /// layer is enabled — csq's MCP gate covers prompt-edit tool allow/deny
+    /// only, not the runtime MCP traffic of the CLIs' own servers. Always
+    /// serialized so the state is present in `csq doctor --json`.
+    mcp_partial_coverage: McpPartialCoverage,
+
+    /// M6 #914: MCP-gate attestation outbox backlog — enforced `tools/call`
+    /// decisions durably queued in `csq-runs/.pending-mcp-gate/` that the daemon
+    /// startup drain has not yet landed on the signed audit chain. `Some` with
+    /// `warn=true` signals a STUCK backlog (an enforced-but-unrecorded
+    /// compliance-record set the operator must clear); `warn=false` is a benign
+    /// transient (drains on the next daemon start). `None` when the outbox is
+    /// absent or empty — the case for any build a community `csq` produces (the
+    /// proxy producer is enterprise-only, so a community build never WRITES the
+    /// outbox). The read is edition-agnostic, so a community `csq doctor` run
+    /// against a `$HOME` an enterprise `csq-ee` populated will faithfully report
+    /// that enterprise-written backlog (count + age are edition-neutral, not
+    /// proprietary logic) — the M6 #909 shard-D daemon-aware fields bump only the
+    /// enterprise `schema_version` ceiling (v20 → v21), never the community one (v19).
+    /// JSON shape: `{ pending_count, oldest_age_secs, state, last_drain_age_secs, warn }`
+    /// (omitted when None).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_gate_outbox_backlog: Option<McpGateOutboxBacklog>,
+
+    /// an internal ticket: custodian-identity canary. Detects the degraded state where
+    /// Claude Code has stopped writing `oauthAccount.emailAddress` into a live
+    /// Anthropic session's `.claude.json` — the local signal the daemon
+    /// custodian's wrong-account gate depends on. Without the field the gate
+    /// refuses EVERY token adoption for the account and the credential
+    /// refresh war silently returns. NOT serialized in `--json` (drives only
+    /// the printed canary line, so it adds no `schema_version` bump / spec-13
+    /// §9 contract change); the printed WARN is the operator-facing signal.
+    #[serde(skip)]
+    custodian_identity_canary: CustodianIdentityCanary,
 }
+
+/// CU4 MCP partial-coverage advisory state for `csq doctor` (spec 10 §10.8.3).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct McpPartialCoverage {
+    /// True iff `cli_sources` is non-empty AND the capability layer is enabled.
+    warn: bool,
+    /// CLI surfaces with native MCP servers configured (the advisory's evidence;
+    /// e.g. `["claude","gemini"]`). Detected regardless of `warn`.
+    cli_sources: Vec<String>,
+}
+
+/// M6 #914: MCP-gate attestation outbox backlog surfaced by `csq doctor`.
+///
+/// The outbox (`csq-runs/.pending-mcp-gate/`) durably queues gated `tools/call`
+/// decisions when the live POST to the daemon fails; the startup reconciler
+/// drains it onto the signed chain on the next daemon start. A record that
+/// lingers means an enforced decision is not yet recorded — a governance gap the
+/// operator should see, not just have silently preserved on disk (the #909 fix
+/// guarantees no record is LOST; #914 makes a stuck backlog VISIBLE).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct McpGateOutboxBacklog {
+    /// `.pending-mcp-gate/*.json` files queued (enforced MCP-gate decisions not
+    /// yet on the signed chain). Excludes `.tmp.` in-flight writes and subdirs,
+    /// mirroring the drain's own filter.
+    pending_count: u32,
+    /// Age in seconds of the OLDEST queued file, taken as the max of each file's
+    /// `now - mtime`. A file whose mtime is unreadable OR in the future
+    /// (`duration_since` errs — clock skew) contributes NO age, so it does not
+    /// raise this value; `None` means every counted file's age was unreadable
+    /// (never `Some(_)` with `pending_count == 0` — the whole struct is `None`
+    /// then). The count axis (`pending_count`) is computed BEFORE the mtime read,
+    /// so it always reflects every queued file even when ages are missing — a
+    /// backlog can never be fully hidden from `warn` via mtime alone. A genuinely
+    /// stuck backlog (daemon not restarting / chain not appendable) carries normal
+    /// PAST mtimes, so the age axis fires as intended; a same-user actor forging a
+    /// future mtime is out of the threat model (they can delete the file outright).
+    oldest_age_secs: Option<u64>,
+    /// M6 #909 shard D: the daemon-aware disposition — `stuck` (actionable),
+    /// `draining` (daemon up, young backlog), or `pending_daemon_down` (daemon not
+    /// draining; drains when it resumes). Replaces #914's fixed-6h age judgment.
+    state: McpGateBacklogState,
+    /// M6 #909 shard D: seconds since the daemon last ran a drain cycle (the
+    /// `.outbox-drain-stamp`), or `None` when no drain has stamped on this base. A
+    /// small value ⟺ the daemon is actively draining; a large/absent value ⟺ the
+    /// daemon is down — the signal that distinguishes a genuinely-STUCK backlog from
+    /// one merely PENDING behind a stopped daemon.
+    last_drain_age_secs: Option<u64>,
+    /// `true` iff `state == Stuck` — the single operator-actionable axis (chain not
+    /// appendable while the daemon drains, OR the count cap exceeded). Retained for
+    /// consumers of the pre-shard-D shape; `false` is a benign `draining` /
+    /// `pending_daemon_down` transient.
+    warn: bool,
+}
+
+/// M6 #909 shard D: a drain stamp (`csq-runs/.outbox-drain-stamp`, written by every
+/// drain cycle) newer than this (seconds) means the daemon is UP and its continuous
+/// drain loop is running. Set to ~3 refresher intervals (the drain rides the 5-min
+/// refresher tick), so a stamp within 15 min ⟺ "daemon actively draining", and a
+/// staler stamp ⟺ "daemon down / drain not running" (→ PENDING, not a false STUCK
+/// alarm during a maintenance window). Replaces #914's fixed 6h wall-clock.
+const MCP_GATE_DRAIN_STAMP_FRESH_SECS: u64 = 15 * 60;
+
+/// M6 #909 shard D: with the daemon actively draining (a fresh stamp), a queued file
+/// older than this (seconds) is STUCK — the drain has run several cycles and still
+/// cannot land the record, so the chain is not appendable (`csq audit verify` /
+/// `csq audit init`). ~3 drain cycles; far faster + more accurate than #914's 6h
+/// (which had to be generous precisely because it could not tell an up-and-draining
+/// daemon from a down one).
+const MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS: u64 = 15 * 60;
+
+/// #914: a queued-file count above this flips the doctor surface to WARN
+/// regardless of age OR daemon state — a large backlog is itself a signal, even
+/// behind a down daemon (so an unbounded pending queue is never silently tolerated;
+/// M6 #909 shard D keeps this axis unconditional). Mirrors the seam custody soft
+/// cap ([`check_seam_pending_backlog`]'s 1 000-file threshold).
+const MCP_GATE_OUTBOX_STUCK_COUNT: u32 = 1_000;
 
 /// M19 hook-conformance state for `csq doctor` (Finding D fix).
 ///
@@ -418,7 +563,7 @@ struct AuditSinkDoctorInfo {
 
 /// JSON representation of one unrecoverable rename label slot.
 ///
-/// Mirrors [`UnrecoverableSlot`] from `csq_core::accounts::profiles` but uses
+/// Mirrors `UnrecoverableSlot` from `csq_core::accounts::profiles` but uses
 /// serde-friendly field names (`snake_case` matching spec/13 §9 conventions).
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 struct UnrecoverableSlotJson {
@@ -440,7 +585,7 @@ struct Pass0SkippedSlot {
     reason: &'static str,
 }
 
-/// Journal 0042: top-level "phase-4 incomplete" alarm payload. Renders
+/// an internal journal entry: top-level "phase-4 incomplete" alarm payload. Renders
 /// near the top of the text-mode doctor report and emits as a structured
 /// JSON object when at least one UUID-mapped slot has a missing
 /// identity-keyed file. Empty/absent means no alarm needed.
@@ -458,7 +603,7 @@ struct Phase4IncompleteAlarm {
     missing_file_count: usize,
 }
 
-/// M4-11 (issue #292 Phase 4 release N) — one compat-bridge surface that still
+/// M4-11 (an internal ticket Phase 4 release N) — one compat-bridge surface that still
 /// emits a v1-era footprint on disk. The shape is fixed by spec/13 §9.
 ///
 /// Each variant has a specific, actionable description and a documented
@@ -659,7 +804,7 @@ struct HostIsolationStatus {
 
 /// Whether a JS runtime (`node` or `bun`) is available for the
 /// Anthropic HTTP subprocess path. `reqwest/rustls` is blocked by
-/// Cloudflare's JA3/JA4 fingerprint (journal 0056), so the token
+/// Cloudflare's JA3/JA4 fingerprint (an internal journal entry), so the token
 /// refresher and usage poller shell out via Node — without one the
 /// daemon cannot refresh OAuth tokens or pull quota.
 #[derive(Serialize)]
@@ -674,7 +819,7 @@ struct JsRuntimeInfo {
 /// but the pre-existing 3P env block was not stripped, so CC still
 /// routes to the 3P endpoint despite having OAuth creds. Resolve by
 /// running `csq login N` on a build that includes the automatic
-/// unbind (PR #130) or manually removing the env block.
+/// unbind (an internal ticket) or manually removing the env block.
 #[derive(Serialize)]
 struct MixedStateSlot {
     account: u16,
@@ -784,9 +929,14 @@ pub fn handle(
     json: bool,
     slot: Option<u16>,
     repair_identities: bool,
+    check_token_owners: bool,
 ) -> Result<()> {
     if repair_identities {
         return run_repair_identities(base_dir, json);
+    }
+
+    if check_token_owners {
+        return run_token_owner_check(base_dir, json);
     }
 
     if let Some(n) = slot {
@@ -820,7 +970,7 @@ pub fn handle(
 /// running — per-slot per-file write contention is bounded to a single
 /// `unique_tmp_path → write → secure_file → atomic_replace` sequence,
 /// and the heal skips slots whose identity files already exist
-/// (`AlreadySeeded`). Origin: journal 0040 §Follow-up #2.
+/// (`AlreadySeeded`). Origin: an internal journal entry §Follow-up #2.
 fn run_repair_identities(base_dir: &Path, json: bool) -> Result<()> {
     use csq_core::daemon::startup_reconciler::{
         phase4_gate_self_heal, Phase4HealFile, Phase4HealOutcome,
@@ -924,6 +1074,125 @@ fn run_repair_identities(base_dir: &Path, json: bool) -> Result<()> {
              gate will continue to refuse daemon start until every UUID-mapped slot has its \n  \
              identity-keyed credentials/settings/codex files seeded."
         );
+    }
+    Ok(())
+}
+
+// ── `csq doctor --check-token-owners` (an internal ticket contamination detector) ───
+
+/// One Anthropic slot's store-token ownership verdict (JSON shape).
+#[derive(Serialize)]
+struct TokenOwnerSlot {
+    account: u16,
+    /// The slot's display label (email) — NOT a filesystem path.
+    label: String,
+    /// `"owned"` | `"contaminated"` | `"unknown"`.
+    status: String,
+}
+
+/// `csq doctor --check-token-owners` report.
+#[derive(Serialize)]
+struct TokenOwnerReport {
+    checked: usize,
+    contaminated: Vec<u16>,
+    unknown: Vec<u16>,
+    slots: Vec<TokenOwnerSlot>,
+}
+
+/// Build the report from per-slot verdicts. Pure — unit-testable without the
+/// network.
+fn build_token_owner_report(
+    results: &[(u16, String, csq_core::daemon::custodian::SlotOwnership)],
+) -> TokenOwnerReport {
+    use csq_core::daemon::custodian::SlotOwnership;
+    let mut contaminated = Vec::new();
+    let mut unknown = Vec::new();
+    let mut slots = Vec::with_capacity(results.len());
+    for (id, label, verdict) in results {
+        let status = match verdict {
+            SlotOwnership::Owned => "owned",
+            SlotOwnership::Contaminated => {
+                contaminated.push(*id);
+                "contaminated"
+            }
+            SlotOwnership::Unknown => {
+                unknown.push(*id);
+                "unknown"
+            }
+        };
+        slots.push(TokenOwnerSlot {
+            account: *id,
+            label: label.clone(),
+            status: status.into(),
+        });
+    }
+    TokenOwnerReport {
+        checked: results.len(),
+        contaminated,
+        unknown,
+        slots,
+    }
+}
+
+fn print_token_owner_report(r: &TokenOwnerReport) {
+    println!(
+        "\nToken ownership ({} Anthropic slot(s) checked):",
+        r.checked
+    );
+    if r.contaminated.is_empty() {
+        println!("  {} no contaminated slots", ok());
+    } else {
+        for id in &r.contaminated {
+            let label = r
+                .slots
+                .iter()
+                .find(|s| s.account == *id)
+                .map(|s| s.label.as_str())
+                .unwrap_or("");
+            println!(
+                "  {} slot {id} ({label}): store token belongs to a DIFFERENT account \
+                 — heal with `csq login {id}`",
+                fail()
+            );
+        }
+    }
+    if !r.unknown.is_empty() {
+        println!(
+            "  {} {} slot(s) could not be verified (revoked token, no JS runtime, or \
+             transport error): {:?}",
+            warn(),
+            r.unknown.len(),
+            r.unknown
+        );
+    }
+}
+
+/// `csq doctor --check-token-owners`: per-Anthropic-slot store-token ownership
+/// check. Reuses the daemon's Cloudflare-safe Node transport
+/// (`get_bearer_node`) and the `check_slot_store_token_ownership` detector.
+/// Read-only — one `GET /api/oauth/profile` per slot, mutates nothing.
+fn run_token_owner_check(base_dir: &Path, json: bool) -> Result<()> {
+    // Same transport the daemon refresher/custodian use (reqwest is blocked by
+    // Cloudflare's JA3/JA4 fingerprint — `discovery_cloudflare_tls_fingerprint`).
+    let http_get: csq_core::daemon::usage_poller::HttpGetFn =
+        std::sync::Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+            csq_core::http::get_bearer_node(url, token, headers)
+        });
+    let accounts = discovery::discover_anthropic(base_dir);
+    let mut results = Vec::new();
+    for a in &accounts {
+        if let Ok(slot) = csq_core::types::AccountNum::try_from(a.id) {
+            let verdict = csq_core::daemon::custodian::check_slot_store_token_ownership(
+                base_dir, slot, &http_get,
+            );
+            results.push((a.id, a.label.clone(), verdict));
+        }
+    }
+    let report = build_token_owner_report(&results);
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        print_token_owner_report(&report);
     }
     Ok(())
 }
@@ -1064,7 +1333,7 @@ fn gemini_unreadable_slots(base_dir: &Path) -> Vec<u16> {
 /// Slots whose Codex binding file is spawn-admissible
 /// (`is_codex_bound_slot`) and parses successfully but does NOT carry a
 /// Codex variant — operator wrote an Anthropic-shape credential to the
-/// Codex-prefixed path (wrong-variant, issue #520 / #525). These slots
+/// Codex-prefixed path (wrong-variant, an internal ticket / #525). These slots
 /// are invisible to quota polling and CLI surface checks yet the daemon
 /// WILL attempt to use them. Named directly with a self-sufficient
 /// remediation instead of delegating to `csq probe --all`.
@@ -1077,24 +1346,87 @@ fn codex_wrong_variant_slots(base_dir: &Path) -> Vec<u16> {
         .collect()
 }
 
-/// `csq doctor --json` schema version. **Edition-specific** (M2 T2.5): the
-/// enterprise build is v17 (adds `audit_trust_plane_grade`); the community build
-/// stays at v16 with a byte-identical wire schema. spec/13 §9.
+/// `csq doctor --json` schema version. Per the shared monotonic counter
+/// (spec/13 §9), `schema_version` is the highest field-version an edition
+/// actually emits. v17 (`audit_trust_plane_grade`) and v18
+/// (`audit_verification_level_summary`) are enterprise-only + `skip_serializing_if`,
+/// so the community build skipped them (its ceiling was v16). v19
+/// (`mcp_partial_coverage`, CU4 #764) ships on BOTH editions, raising the
+/// community ceiling 16 → 19. **v20** (`mcp_gate_outbox_backlog`, #914) is the
+/// next enterprise-only + `skip_serializing_if` field — it serializes on the
+/// enterprise build when the MCP-gate outbox is non-empty. **v21** (M6 #909 shard D)
+/// extends that SAME enterprise-only field with the daemon-aware `state`
+/// (`stuck` / `draining` / `pending_daemon_down`) + `last_drain_age_secs`,
+/// replacing #914's fixed-6h stuck judgment — a shape change to an enterprise-only
+/// field, so the enterprise ceiling rises 20 → **21** while the community ceiling
+/// stays at **19** (the field is never emitted there — the outbox producer is
+/// enterprise-only). **v22** (`audit_bundle_floor_anchor`, #787 b2b) is the next
+/// enterprise-only + `skip_serializing_if` field — the policy-bundle floor
+/// keychain-anchor DETECTOR verdict, emitted on the enterprise build once a bundle
+/// is installed. The enterprise ceiling rises 21 → **22**; the community ceiling
+/// stays at **19** (the phase-2b bundle floor is moat-stripped). The `#[cfg]` split
+/// carries that edition delta.
 #[cfg(feature = "enterprise")]
-const DOCTOR_SCHEMA_VERSION: u32 = 17;
+const DOCTOR_SCHEMA_VERSION: u32 = 22;
 #[cfg(not(feature = "enterprise"))]
-const DOCTOR_SCHEMA_VERSION: u32 = 16;
+const DOCTOR_SCHEMA_VERSION: u32 = 19;
 
-/// M2 T2.5 — trust-plane grade for the `csq doctor` schema, derived from the
-/// chain's `AuditHealth`. **Enterprise edition only**; the community build
-/// compiles this to `None` so the field is omitted.
+/// M2 T2.5 / M3a — trust-plane grade for the `csq doctor` schema, derived
+/// from the chain's `AuditHealth` and the M3a `verification_levels_populated`
+/// signal. **Enterprise edition only**; the community build compiles this to
+/// `None` so the field is omitted.
 #[cfg(feature = "enterprise")]
-fn doctor_trust_plane_grade(health: &csq_core::audit::AuditHealth) -> Option<&'static str> {
-    csq_core::audit::grade_for_audit_health(health).map(|g| g.as_str())
+fn doctor_trust_plane_grade(
+    health: &csq_core::audit::AuditHealth,
+    verification_levels_populated: bool,
+) -> Option<&'static str> {
+    csq_core::audit::grade_for_audit_health(health, verification_levels_populated)
+        .map(|g| g.as_str())
 }
 
 #[cfg(not(feature = "enterprise"))]
-fn doctor_trust_plane_grade(_health: &csq_core::audit::AuditHealth) -> Option<&'static str> {
+fn doctor_trust_plane_grade(
+    _health: &csq_core::audit::AuditHealth,
+    _verification_levels_populated: bool,
+) -> Option<&'static str> {
+    None
+}
+
+/// #787 b2b — project the policy-bundle floor keychain-anchor cross-check into
+/// the doctor report. DETECTOR posture: reports the anchor status but never
+/// changes the enforced (file) floor. Returns `None` (field omitted) until a
+/// bundle has been installed. Enterprise-only; the community variant is always
+/// `None` (the phase-2b bundle floor is moat-stripped).
+#[cfg(feature = "enterprise")]
+fn doctor_bundle_floor_anchor(base_dir: &Path) -> Option<String> {
+    use csq_core::phase2b::bundle_floor::{
+        bundle_floor_path, effective_bundle_floor, BundleFloorAnchor,
+    };
+    // Only meaningful once a bundle has been installed (floor file present).
+    if !bundle_floor_path(base_dir).exists() {
+        return None;
+    }
+    let chain_id = csq_core::audit::ChainState::load(base_dir)
+        .ok()
+        .map(|c| c.chain_id);
+    match effective_bundle_floor(
+        base_dir,
+        csq_core::audit::AUDIT_SIGNING_SERVICE_NAME,
+        chain_id.as_deref(),
+    ) {
+        Some((_floor, BundleFloorAnchor::Confirmed)) => Some("confirmed".to_string()),
+        Some((_floor, BundleFloorAnchor::Unavailable)) => Some("unavailable".to_string()),
+        Some((_floor, BundleFloorAnchor::Mismatch { file, keychain })) => Some(format!(
+            "mismatch (file floor {file}, keychain anchor {keychain})"
+        )),
+        // Floor file exists (gated above) but is unreadable/unparseable — the
+        // gate fails closed; surface it as a distinct doctor finding.
+        None => Some("corrupt".to_string()),
+    }
+}
+
+#[cfg(not(feature = "enterprise"))]
+fn doctor_bundle_floor_anchor(_base_dir: &Path) -> Option<String> {
     None
 }
 
@@ -1131,19 +1463,30 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         }
     };
 
-    // Journal 0042 (§FD #2 of 0041): top-level phase-4-incomplete alarm.
+    // an internal journal entry (§FD #2 of 0041): top-level phase-4-incomplete alarm.
     // Read-only walk of profiles.json::by_slot × three identity files;
     // populated only when at least one (slot, file) is missing — empty
     // status omits the field per its `skip_serializing_if`.
     let phase4_incomplete = build_phase4_incomplete_alarm(base_dir);
     // Run verify_chain once; derive gaps list, health classification, the
-    // keychain integrity-anchor verdict, and the roster floor anchor verdict.
+    // keychain integrity-anchor verdict, the roster floor anchor verdict, and
+    // the M3a verification_levels_populated signal.
     let (
         audit_historical_key_gaps,
         audit_chain_state,
         audit_keychain_anchor,
         audit_roster_floor_anchor,
+        audit_verification_levels_populated,
+        audit_level_summary_raw,
     ) = check_audit_chain(base_dir);
+
+    // M3a: compute the trust-plane grade once, then attach the per-level
+    // disclosure ONLY when the grade is surfaced — a CONFORMANT grade must never
+    // appear bare (honest-host boundary; redteam R1 HIGH, 2026-06-17). In the
+    // community build the grade is always None, so the summary is omitted too.
+    let audit_trust_plane_grade =
+        doctor_trust_plane_grade(&audit_chain_state, audit_verification_levels_populated);
+    let audit_verification_level_summary = audit_trust_plane_grade.and(audit_level_summary_raw);
 
     DoctorReport {
         schema_version: DOCTOR_SCHEMA_VERSION,
@@ -1176,16 +1519,45 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         audit_sink: check_audit_sink_m07(base_dir),
         audit_orphan_intents: check_audit_orphan_intents_m13(base_dir),
         audit_historical_key_gaps,
-        audit_trust_plane_grade: doctor_trust_plane_grade(&audit_chain_state),
+        audit_trust_plane_grade,
+        audit_verification_level_summary,
         audit_chain_state,
         audit_keychain_anchor,
         audit_roster_floor_anchor,
+        audit_bundle_floor_anchor: doctor_bundle_floor_anchor(base_dir),
         seam_quarantine_count: check_seam_custody_count(base_dir, ".quarantine"),
-        seam_pending_provenance_count: check_seam_custody_count(base_dir, ".pending/provenance"),
+        seam_pending_provenance_count: check_seam_custody_count(
+            base_dir,
+            csq_core::audit::outbox_paths::SEAM_PROVENANCE_SUBDIR,
+        ),
         seam_held_predecessor_count: check_seam_held_predecessor_count(base_dir),
         seam_registry_status: check_seam_registry_status(base_dir),
         seam_pending_backlog_note: check_seam_pending_backlog(base_dir),
         seam_capture_conformance: check_seam_capture_conformance(base_dir),
+        mcp_partial_coverage: check_mcp_partial_coverage(base_dir),
+        mcp_gate_outbox_backlog: check_mcp_gate_outbox_backlog(base_dir),
+        custodian_identity_canary: check_custodian_identity_canary(base_dir),
+    }
+}
+
+/// CU4 (spec 10 §10.8.3): build the MCP partial-coverage advisory. Detects
+/// CLI-bound MCP servers under the user's real `$HOME` (the CLIs read their
+/// native config there, independent of `CSQ_BASE_DIR`); `warn` additionally
+/// requires the capability layer to be enabled.
+fn check_mcp_partial_coverage(base_dir: &Path) -> McpPartialCoverage {
+    use csq_core::capability_layer::mcp_coverage::detect_cli_bound_mcp_servers;
+    use csq_core::capability_layer::settings::load_capability_layer_toggles;
+
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let sources = home
+        .as_deref()
+        .map(detect_cli_bound_mcp_servers)
+        .unwrap_or_default();
+    let cli_sources: Vec<String> = sources.iter().map(|s| s.as_str().to_string()).collect();
+    let enabled = !load_capability_layer_toggles(base_dir).is_layer_fully_disabled();
+    McpPartialCoverage {
+        warn: !cli_sources.is_empty() && enabled,
+        cli_sources,
     }
 }
 
@@ -1243,6 +1615,150 @@ fn check_seam_registry_status(base_dir: &Path) -> String {
     }
 }
 
+/// M6 #914: inspect the MCP-gate attestation outbox for a stuck backlog.
+///
+/// Reads `<base>/csq-runs/.pending-mcp-gate/*.json` directly (independent of the
+/// daemon — `csq doctor` runs whether or not the daemon is up) and reports the
+/// queued count + the OLDEST file's age + the daemon-aware `state` (M6 #909 shard D,
+/// via [`classify_mcp_gate_backlog`]). WARNs (`state == Stuck`) when the daemon is
+/// draining yet the oldest file persists past
+/// [`MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS`], or the count exceeds the soft
+/// cap ([`MCP_GATE_OUTBOX_STUCK_COUNT`]) — either signals an enforced-but-unrecorded
+/// compliance backlog the drain cannot land (chain not appendable).
+///
+/// Returns `None` when the outbox directory is absent OR empty — the healthy
+/// steady state, and ALWAYS the case in the community edition (the proxy
+/// producer is enterprise-only). No host paths are surfaced (only count + age),
+/// so this is exempt from the operator-surface path-leak class. The directory is
+/// resolved by `csq_core::audit::outbox_paths::mcp_gate_outbox_dir` — the single
+/// shared full-path helper that both this (community) reader and the
+/// enterprise-gated writer (`mcp_gate_outbox::outbox_dir`) call, so neither the
+/// subdir name nor the `csq-runs/` prefix can drift between them. Keeps this
+/// check edition-agnostic (the community build reads a dir an enterprise
+/// `csq-ee` wrote under a shared `$HOME`); parallels the `SEAM_PROVENANCE_SUBDIR`
+/// custody count.
+fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog> {
+    let dir = csq_core::audit::outbox_paths::mcp_gate_outbox_dir(base_dir);
+    // Absent dir → None (never written in community; healthy when daemon is up).
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let now = std::time::SystemTime::now();
+    let mut pending_count: u32 = 0;
+    let mut oldest_age_secs: Option<u64> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Same effective filter as the drain (regular `.json` file, no `.tmp.`
+        // in-flight). The drain excludes directories via `!path.is_dir()`; here we
+        // require a regular file via `entry.metadata().is_file()` below, which ALSO
+        // excludes a symlink — stricter, but the producer (`write_pending`) only
+        // ever emits regular files via atomic rename, so the two agree on every
+        // real outbox file.
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if fname.contains(".tmp.") {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+        pending_count += 1;
+        if let Ok(modified) = meta.modified() {
+            if let Ok(age) = now.duration_since(modified) {
+                let secs = age.as_secs();
+                // Track the OLDEST (largest age) file.
+                oldest_age_secs = Some(oldest_age_secs.map_or(secs, |o| o.max(secs)));
+            }
+        }
+    }
+    if pending_count == 0 {
+        // Dir exists but empty (drained clean) → nothing to report.
+        return None;
+    }
+    // M6 #909 shard D: read the last-drain stamp (shard B) as the daemon-liveness +
+    // drain-activity signal, and classify. `now_secs` shares the `now` used for the
+    // per-file mtime ages above.
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last_drain_secs = csq_core::audit::outbox_paths::read_outbox_drain_stamp(base_dir);
+    let last_drain_age_secs = last_drain_secs.map(|s| now_secs.saturating_sub(s));
+    let state =
+        classify_mcp_gate_backlog(pending_count, oldest_age_secs, last_drain_secs, now_secs);
+    Some(McpGateOutboxBacklog {
+        pending_count,
+        oldest_age_secs,
+        state,
+        last_drain_age_secs,
+        warn: matches!(state, McpGateBacklogState::Stuck),
+    })
+}
+
+/// M6 #909 shard D: the daemon-aware disposition of a non-empty mcp-gate outbox
+/// backlog, replacing #914's fixed-6h wall-clock. Serialized in the doctor JSON
+/// (v21). Only `Stuck` is operator-actionable (`warn`); the other two are info.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum McpGateBacklogState {
+    /// Operator-actionable. Either the count cap is exceeded, OR the daemon is
+    /// actively draining (a fresh drain stamp) yet the backlog persists past a few
+    /// drain cycles — the chain is not appendable (`csq audit verify` /
+    /// `csq audit init`).
+    Stuck,
+    /// The daemon is actively draining and the backlog is young — a benign
+    /// transient that will drain within a cycle or two. Info.
+    Draining,
+    /// No fresh drain stamp — the daemon is down (or its drain loop is not running),
+    /// so the backlog is merely PENDING until the daemon resumes (it drains on the
+    /// next start / tick). Info: no false STUCK alarm during a maintenance window.
+    /// The daemon-not-running condition is surfaced separately by the daemon-status
+    /// check, and the count cap still escalates to `Stuck` if the backlog grows
+    /// unbounded behind a down daemon (`classify_mcp_gate_backlog`).
+    PendingDaemonDown,
+}
+
+/// Pure daemon-aware backlog classifier (M6 #909 shard D), replacing #914's fixed-6h
+/// `mcp_gate_outbox_is_stuck`. The `last_drain_secs` stamp (shard B) is the
+/// daemon-liveness + drain-activity signal. Disposition:
+///
+/// - count > cap → `Stuck` ALWAYS (a large backlog is a problem even behind a down
+///   daemon — the one axis that ignores the stamp, so an unbounded pending queue is
+///   never silently tolerated).
+/// - fresh stamp (daemon draining) + oldest file older than a few drain cycles →
+///   `Stuck` (chain not appendable); fresh stamp + young backlog → `Draining`.
+/// - stale/absent stamp (daemon down / drain not running) → `PendingDaemonDown`.
+///
+/// `now_secs` and `last_drain_secs` are Unix epoch seconds; extracted pure so the
+/// thresholds are unit-testable without a live daemon or backdated mtimes. Uses
+/// `saturating_sub` so a stamp in the future (clock skew) reads as age 0 (fresh),
+/// never a giant age — a skewed stamp cannot manufacture a false `Stuck`/`Pending`.
+fn classify_mcp_gate_backlog(
+    pending_count: u32,
+    oldest_age_secs: Option<u64>,
+    last_drain_secs: Option<u64>,
+    now_secs: u64,
+) -> McpGateBacklogState {
+    if pending_count > MCP_GATE_OUTBOX_STUCK_COUNT {
+        return McpGateBacklogState::Stuck;
+    }
+    let draining = last_drain_secs
+        .is_some_and(|s| now_secs.saturating_sub(s) <= MCP_GATE_DRAIN_STAMP_FRESH_SECS);
+    if draining {
+        if oldest_age_secs.is_some_and(|a| a > MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS) {
+            McpGateBacklogState::Stuck
+        } else {
+            McpGateBacklogState::Draining
+        }
+    } else {
+        McpGateBacklogState::PendingDaemonDown
+    }
+}
+
 /// Return `Some("seam_pending_backlog_high")` when the pending-provenance
 /// directory has more than 1 000 files, `None` otherwise.
 ///
@@ -1250,7 +1766,10 @@ fn check_seam_registry_status(base_dir: &Path) -> String {
 /// (`CUSTODY_CAP_FILES`). The doctor note complements the daemon's WARN log
 /// with a visible signal at every `csq doctor` invocation.
 fn check_seam_pending_backlog(base_dir: &Path) -> Option<String> {
-    let count = check_seam_custody_count(base_dir, ".pending/provenance")?;
+    let count = check_seam_custody_count(
+        base_dir,
+        csq_core::audit::outbox_paths::SEAM_PROVENANCE_SUBDIR,
+    )?;
     if count > 1_000 {
         Some("seam_pending_backlog_high".to_string())
     } else {
@@ -1378,7 +1897,7 @@ fn check_seam_capture_conformance(base_dir: &Path) -> SeamConformanceState {
     }
 }
 
-/// Journal 0042: build the optional phase-4-incomplete alarm by calling
+/// an internal journal entry: build the optional phase-4-incomplete alarm by calling
 /// `csq_core::daemon::startup_reconciler::phase4_gate_status`. Returns
 /// `Some` only when at least one UUID-mapped slot has a missing identity
 /// file; `None` is the healthy state (no alarm needed).
@@ -1455,7 +1974,7 @@ fn check_pass0_skipped_slots(base_dir: &Path) -> Vec<Pass0SkippedSlot> {
         .collect()
 }
 
-/// M04 (csq-pact-eatp-adoption): check whether the Ed25519 audit-trail
+/// M04 (an internal workspace): check whether the Ed25519 audit-trail
 /// signing key is present in the OS keychain.
 ///
 /// Uses the production service name `csq-audit-signing`. Returns
@@ -1473,7 +1992,7 @@ fn check_signing_key_m04(base_dir: &Path) -> SigningKeyStatus {
     }
 }
 
-/// M13 (csq-pact-eatp-adoption): F-LEDGER-02 orphan-intent scan.
+/// M13 (an internal workspace): F-LEDGER-02 orphan-intent scan.
 ///
 /// Returns every pre-op INTENT record on the committed chain with no matching
 /// OUTCOME (a crash/kill between the intent drain and the outcome append). A
@@ -1494,6 +2013,22 @@ fn check_audit_orphan_intents_m13(base_dir: &Path) -> Vec<csq_core::audit::Orpha
     }
 }
 
+/// Return shape of [`check_audit_chain`]: historical-key gaps, the chain-health
+/// classification, the keychain + roster-floor anchor verdicts, the M3a
+/// `verification_levels_populated` signal, and the M3a per-level disclosure map
+/// (`Some` only in the enterprise build; community → `None` → the doctor field
+/// is omitted, surfaced beside `audit_trust_plane_grade` so a CONFORMANT grade
+/// is never shown bare — honest-host boundary, redteam R1 HIGH 2026-06-17).
+/// Factored into an alias to satisfy `clippy::type_complexity`.
+type AuditChainCheck = (
+    Vec<AuditHistoricalKeyGap>,
+    csq_core::audit::AuditHealth,
+    csq_core::audit::KeychainAnchorStatus,
+    Option<csq_core::audit::RosterFloorAnchorStatus>,
+    bool,
+    Option<std::collections::BTreeMap<String, u64>>,
+);
+
 /// Runs a lightweight `verify_chain` scan (tail 1,000 records) and returns
 /// any historical signing-key gaps found.
 ///
@@ -1510,14 +2045,7 @@ fn check_audit_orphan_intents_m13(base_dir: &Path) -> Vec<csq_core::audit::Orpha
 ///   `LedgerError::KeychainUnavailable` (transient keychain access error;
 ///   `from_verify_result` maps it to `Unknown`); also daemon-startup-only on a
 ///   verify timeout/panic. The `.chain-broken` sentinel is left unchanged.
-fn check_audit_chain(
-    base_dir: &Path,
-) -> (
-    Vec<AuditHistoricalKeyGap>,
-    csq_core::audit::AuditHealth,
-    csq_core::audit::KeychainAnchorStatus,
-    Option<csq_core::audit::RosterFloorAnchorStatus>,
-) {
+fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
     use csq_core::audit::{verify_chain, AuditHealth, VerifyConfig, AUDIT_SIGNING_SERVICE_NAME};
     // Align to CSQ_AUDIT_VERIFY_LIMIT (daemon default: 10_000) so doctor does
     // not under-report gaps older than 1_000 records. (FIX-2b)
@@ -1561,6 +2089,16 @@ fn check_audit_chain(
         }
     }
 
+    // M3 §10.5 (W2a): reconcile the born-canonical EATP attestation chain's own
+    // `.chain-broken` sentinel (independent fault domain; does not affect the
+    // op-chain health reported by `csq doctor`). Inert until the EATP chain
+    // exists (`verify_chain_in` returns Ok(default) for an absent `eatp-runs/`).
+    {
+        use csq_core::audit::ChainKind;
+        let eatp = csq_core::audit::verify_chain_in(base_dir, &cfg, None, ChainKind::Eatp);
+        csq_core::audit::reconcile_chain_sentinel(base_dir, ChainKind::Eatp.runs_subdir(), &eatp);
+    }
+
     use csq_core::audit::{KeychainAnchorStatus, LedgerError};
     match result {
         Ok(summary) => {
@@ -1581,21 +2119,48 @@ fn check_audit_chain(
             // default would be misleading (nothing to confirm against).
             let floor_anchor = (chain_json_exists && summary.roster_floor_present)
                 .then_some(summary.roster_floor_anchor);
-            (gaps, health, summary.keychain_anchor, floor_anchor)
+            let vl_populated = summary.verification_levels_populated;
+            // M3a: the per-level disclosure map. `verification_level_summary` is
+            // an enterprise-only field on VerifySummary, so source it under cfg;
+            // community returns None → the doctor field is omitted.
+            #[cfg(feature = "enterprise")]
+            let vl_summary = Some(summary.verification_level_summary.clone());
+            #[cfg(not(feature = "enterprise"))]
+            let vl_summary = None;
+            (
+                gaps,
+                health,
+                summary.keychain_anchor,
+                floor_anchor,
+                vl_populated,
+                vl_summary,
+            )
         }
         // KeychainUnavailable is the transient case where the keychain genuinely
         // was NOT read → the truthful anchor verdict is Unconfirmed (not a
         // self-contradictory "chain unverified + anchor confirmed"). For a
         // genuinely-fatal Broken error there is no anchor verdict; default to
         // Confirmed (N/A) — the Broken health line carries the failure.
-        Err(LedgerError::KeychainUnavailable { .. }) => {
-            (Vec::new(), health, KeychainAnchorStatus::Unconfirmed, None)
-        }
-        Err(_) => (Vec::new(), health, KeychainAnchorStatus::Confirmed, None),
+        Err(LedgerError::KeychainUnavailable { .. }) => (
+            Vec::new(),
+            health,
+            KeychainAnchorStatus::Unconfirmed,
+            None,
+            false,
+            None,
+        ),
+        Err(_) => (
+            Vec::new(),
+            health,
+            KeychainAnchorStatus::Confirmed,
+            None,
+            false,
+            None,
+        ),
     }
 }
 
-/// M07 (csq-pact-eatp-adoption): reads `audit-sink.json` and the on-disk
+/// M07 (an internal workspace): reads `audit-sink.json` and the on-disk
 /// anchor state to surface the active-sink diagnostics.
 ///
 /// Returns `None` when the sink is `"none"` (local-only default) so the
@@ -1697,7 +2262,7 @@ fn detect_prior_anchor_via_sidecar(base_dir: &Path) -> Option<(String, String)> 
     None
 }
 
-/// M4-11 (issue #292 Phase 4 release N): assemble the `legacy_compat_state`
+/// M4-11 (an internal ticket Phase 4 release N): assemble the `legacy_compat_state`
 /// field by surveying compat-bridge surfaces on disk.
 ///
 /// Four spec/13 §9 enumeration kinds are surveyed independently. Any
@@ -2534,6 +3099,126 @@ fn check_accounts(base_dir: &Path) -> AccountsInfo {
     }
 }
 
+/// an internal ticket custodian-identity canary result. Carries the `term-<pid>` tags of
+/// live Anthropic-bound handle dirs partitioned by `.claude.json` `oauthAccount`
+/// state. `term-<pid>` is a directory basename (no host-path bytes), safe to
+/// print (`operator-surface-verification.md`).
+#[derive(Debug, Default, Clone)]
+struct CustodianIdentityCanary {
+    /// `false` when the scan cannot run (non-unix — handle dirs are a unix
+    /// symlink construct — or an unreadable base dir).
+    check_available: bool,
+    /// Live Anthropic-bound dirs whose `.claude.json` is POPULATED but lacks a
+    /// usable `oauthAccount.emailAddress` — the format-drift signal. A non-empty
+    /// list means the custodian's wrong-account gate is refusing adoptions.
+    drift_dirs: Vec<String>,
+    /// Live Anthropic-bound dirs whose `.claude.json` is absent/empty — a benign
+    /// fresh / not-yet-populated session. Tracked only to distinguish drift from
+    /// fresh (an internal ticket AC bullet 2); not alarmed on.
+    fresh_dirs: Vec<String>,
+}
+
+/// Is `dir` a handle dir bound to an Anthropic account? True when its
+/// `.credentials.json` is a symlink resolving through `identities/<uuid>/` (with
+/// a NON-EMPTY uuid segment) and ending in `credentials.json` — the exact shape
+/// the daemon custodian harvests
+/// (`credentials::keychain::harvest_account_candidates`). Excludes Codex
+/// (`auth.json`), legacy `config-N` links, and any non-Anthropic link so the
+/// canary never false-flags a non-Claude session that legitimately has no
+/// `oauthAccount`.
+///
+/// The `identities/<uuid>/` extraction mirrors the producer's non-empty-segment
+/// check rather than a bare `contains("identities/")`, so a future rename of the
+/// credential-link shape regresses both predicates in lockstep
+/// (`reconciler-cleanup-parity.md` Rule 4 — enumerate the exact names the producer
+/// creates; redteam R1 LOW L1/F4).
+/// Sort `term-<pid>` handle-dir labels by NUMERIC pid (so `term-999` precedes
+/// `term-1000`, not lexicographically) and drop the pid key. Extracted as a pure
+/// fn so the numeric ordering is unit-testable without live PIDs (redteam R2
+/// testing-specialist F2).
+#[cfg(unix)]
+fn sorted_dir_names(mut pairs: Vec<(u32, String)>) -> Vec<String> {
+    pairs.sort_by_key(|(pid, _)| *pid);
+    pairs.into_iter().map(|(_, name)| name).collect()
+}
+
+#[cfg(unix)]
+fn is_anthropic_bound_handle_dir(dir: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(dir.join(".credentials.json")) else {
+        return false;
+    };
+    let s = target.to_string_lossy();
+    let has_identity_uuid = s
+        .split("identities/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|uuid| !uuid.is_empty());
+    has_identity_uuid && s.ends_with("credentials.json")
+}
+
+/// an internal ticket: scan live Anthropic-bound handle dirs and classify each session's
+/// `.claude.json` `oauthAccount.emailAddress` presence. Surfaces the degraded
+/// state where Claude Code has stopped writing that field — the local signal the
+/// custodian's wrong-account gate depends on. Scoped to LIVE (alive-PID)
+/// Anthropic-bound dirs.
+///
+/// Scope note (redteam R1 F1/L2): this is a SUPERSET of the custodian's harvest
+/// scope on one benign edge — the shared `is_pid_alive` treats an EPERM (live but
+/// unsignalable) PID as alive, whereas the harvest's raw `kill(pid,0) != 0` skips
+/// it. Under csq's same-user threat model a handle-dir PID is always the same UID
+/// that owns the 0600 credentials, so EPERM does not arise for these PIDs and the
+/// two scopes coincide in practice; where they would diverge, the canary
+/// OVER-surfaces (a live-but-unsignalable Anthropic session with real drift is
+/// still worth reporting), never under-surfaces.
+#[cfg(not(unix))]
+fn check_custodian_identity_canary(_base_dir: &Path) -> CustodianIdentityCanary {
+    CustodianIdentityCanary::default()
+}
+
+#[cfg(unix)]
+fn check_custodian_identity_canary(base_dir: &Path) -> CustodianIdentityCanary {
+    use csq_core::credentials::claude_json::{classify_oauth_account, OauthAccountState};
+
+    let entries = match std::fs::read_dir(base_dir) {
+        Ok(e) => e,
+        Err(_) => return CustodianIdentityCanary::default(),
+    };
+
+    // (pid, "term-<pid>") pairs so the display list sorts numerically by PID
+    // (term-999 before term-1000), not lexicographically (redteam R1 NIT N7).
+    let mut drift: Vec<(u32, String)> = Vec::new();
+    let mut fresh: Vec<(u32, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Only live term-<pid> handle dirs (the custodian's harvest scope).
+        let Some(pid) = name
+            .strip_prefix("term-")
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !is_pid_alive(pid) {
+            continue;
+        }
+        let dir = entry.path();
+        if !is_anthropic_bound_handle_dir(&dir) {
+            continue;
+        }
+        match classify_oauth_account(&dir) {
+            OauthAccountState::Present => {}
+            OauthAccountState::FieldMissing => drift.push((pid, name)),
+            OauthAccountState::NotYetPopulated => fresh.push((pid, name)),
+        }
+    }
+    let drift_dirs = sorted_dir_names(drift);
+    let fresh_dirs = sorted_dir_names(fresh);
+    CustodianIdentityCanary {
+        check_available: true,
+        drift_dirs,
+        fresh_dirs,
+    }
+}
+
 /// Scans `credentials/N.broker-failed` sentinel files and returns the list of
 /// accounts that require re-login.
 ///
@@ -2923,10 +3608,7 @@ fn render_cli_row(label: &str, surface_name: &str, info: &CliSurfaceInfo, auth_s
         }
         "probe_timed_out" => {
             let p = info.path.as_deref().unwrap_or("?");
-            println!(
-                "  {label}: {icon} probe timed out (>2s) at {p}",
-                icon = warn()
-            );
+            println!("  {label}: {icon} probe timed out at {p}", icon = warn());
         }
         "probe_disabled" => {
             println!(
@@ -2952,9 +3634,13 @@ fn print_report(r: &DoctorReport) {
 
     // Platform
     println!("  Platform:    {} / {}", r.platform.os, r.platform.arch);
+    // Build edition (compile-time const from the `enterprise` Cargo feature;
+    // community = csq, enterprise = csq-ee). The hardcoded label is
+    // injection-safe (no user input). Distinct from the runtime audit dialect.
+    println!("  Edition:     {}", crate::edition_label());
     println!();
 
-    // Journal 0042: top-level phase-4-incomplete alarm. Rendered BEFORE
+    // an internal journal entry: top-level phase-4-incomplete alarm. Rendered BEFORE
     // the CLI surface rows so an operator scanning the report sees the
     // impending daemon-start refusal first, with the actionable
     // remediation command on the same screen.
@@ -3096,6 +3782,39 @@ fn print_report(r: &DoctorReport) {
         }
     }
 
+    // Custodian-identity canary (an internal ticket). Fires only on FORMAT DRIFT — a live
+    // Anthropic session whose `.claude.json` is present with content the
+    // wrong-account gate cannot read an `oauthAccount.emailAddress` from (field
+    // omitted/renamed/emptied, an unparseable/non-object shape, or a file past the
+    // read ceiling). That field is the local identity signal the daemon custodian's
+    // gate requires; while the gate cannot read it, it refuses every token adoption
+    // and the credential refresh war silently returns. A fresh / not-yet-populated
+    // dir (absent/empty file) is NOT alarmed on (benign, self-heals).
+    {
+        let c = &r.custodian_identity_canary;
+        if c.check_available && !c.drift_dirs.is_empty() {
+            println!(
+                "  Custodian:   {} {} live Claude session(s) [{}] have a .claude.json the account-identity gate can't read oauthAccount.emailAddress from",
+                warn(),
+                c.drift_dirs.len(),
+                c.drift_dirs.join(", "),
+            );
+            println!(
+                "               → the gate will refuse all token adoptions for those accounts (refresh war returns). If this persists across runs, Claude Code changed format — file a csq issue (#833)."
+            );
+            // Show the fresh/not-yet-populated sessions the discriminator excluded,
+            // so the operator can see drift was distinguished from benign fresh dirs
+            // (an internal ticket AC bullet 2) rather than a blanket "field absent" alarm.
+            if !c.fresh_dirs.is_empty() {
+                println!(
+                    "               ({} fresh/not-yet-populated session(s) excluded from the count: {})",
+                    c.fresh_dirs.len(),
+                    c.fresh_dirs.join(", "),
+                );
+            }
+        }
+    }
+
     // Terminals
     let t = &r.terminals;
     if !t.check_available {
@@ -3180,7 +3899,7 @@ fn print_report(r: &DoctorReport) {
         );
     }
 
-    // Issue #525: Codex slots where the credential file parsed but contains
+    // an internal ticket: Codex slots where the credential file parsed but contains
     // an Anthropic-shape payload (wrong-variant binding). Mirrors the Gemini
     // unreadable row. Remediation: re-login to the Codex provider.
     if !r.codex_wrong_variant_slots.is_empty() {
@@ -3319,6 +4038,38 @@ fn print_report(r: &DoctorReport) {
         println!("{floor_line}");
     }
 
+    // #787 b2b — policy-bundle version-floor keychain-anchor verdict (DETECTOR —
+    // enforcement always uses the FILE floor; the anchor is a tamper tripwire).
+    if let Some(ref bundle_floor) = r.audit_bundle_floor_anchor {
+        let line = if bundle_floor == "confirmed" {
+            format!(
+                "  Bundle floor:  {} confirmed (file floor ↔ keychain anchor agree)",
+                ok()
+            )
+        } else if bundle_floor == "unavailable" {
+            format!(
+                "  Bundle floor:  {} UNAVAILABLE — keychain anchor absent or unreadable; \
+                 tamper-detection is file-floor-only for now",
+                warn()
+            )
+        } else if bundle_floor == "corrupt" {
+            format!(
+                "  Bundle floor:  {} CORRUPT — the policy-bundle floor file is unreadable; \
+                 the gate fails closed. Re-run `csq audit bundle-install` to rewrite the floor",
+                fail()
+            )
+        } else {
+            // "mismatch (file floor N, keychain anchor M)"
+            format!(
+                "  Bundle floor:  {} MISMATCH — {bundle_floor}; possible on-disk floor \
+                 tamper/rollback. Enforcement uses the file floor; reinstalling the authentic \
+                 bundle re-anchors it",
+                fail()
+            )
+        };
+        println!("{line}");
+    }
+
     // M07 audit sink status.
     if let Some(ref sink_info) = r.audit_sink {
         let (sink_icon, pending_note) =
@@ -3390,7 +4141,81 @@ fn print_report(r: &DoctorReport) {
         }
     }
 
+    // CU4 (spec 10 §10.8.3) — MCP partial-coverage advisory. Prints only when
+    // the user has CLI-bound MCP servers AND the capability layer is enabled.
+    if r.mcp_partial_coverage.warn {
+        println!(
+            "  MCP coverage:  {} partial — CLI-bound MCP servers configured ({}); \
+             csq's capability-layer gate covers prompt-edit tool allow/deny only, \
+             not runtime MCP traffic from these servers (spec 10 §10.8.3)",
+            warn(),
+            r.mcp_partial_coverage.cli_sources.join(", ")
+        );
+    }
+
+    // M6 #914 — MCP-gate attestation outbox backlog. Printed only when the
+    // outbox is non-empty (None in the community edition — never written there).
+    if let Some(ref backlog) = r.mcp_gate_outbox_backlog {
+        let age_note = match backlog.oldest_age_secs {
+            Some(secs) => format!(", oldest {}", fmt_age_secs(secs)),
+            None => String::new(),
+        };
+        // M6 #909 shard D: three daemon-aware dispositions replace the fixed-6h
+        // warn/info split. Only `Stuck` is operator-actionable.
+        match backlog.state {
+            McpGateBacklogState::Stuck => {
+                println!(
+                    "  MCP gate outbox: {} {} decision(s) stuck{} — enforced MCP-gate \
+                     decisions not yet on the audit chain; the daemon is draining but \
+                     cannot land them — repair/initialise the chain (`csq audit verify` \
+                     / `csq audit init`)",
+                    warn(),
+                    backlog.pending_count,
+                    age_note
+                );
+            }
+            McpGateBacklogState::Draining => {
+                println!(
+                    "  MCP gate outbox: {} {} decision(s) queued{} — the daemon is \
+                     draining them onto the audit chain",
+                    info(),
+                    backlog.pending_count,
+                    age_note
+                );
+            }
+            McpGateBacklogState::PendingDaemonDown => {
+                let drain_note = match backlog.last_drain_age_secs {
+                    Some(secs) => format!("last drain {} ago", fmt_age_secs(secs)),
+                    None => "no drain has run".to_string(),
+                };
+                println!(
+                    "  MCP gate outbox: {} {} decision(s) pending{} — the daemon is not \
+                     draining ({}); they drain when it next runs (`csq daemon start`)",
+                    info(),
+                    backlog.pending_count,
+                    age_note,
+                    drain_note
+                );
+            }
+        }
+    }
+
     println!();
+}
+
+/// Compact human-readable age from a second count: `45s`, `12m`, `6h`, `3d`.
+/// Used by the #914 MCP-gate outbox backlog line so the operator sees "oldest
+/// 8h" rather than a raw second count.
+fn fmt_age_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 60 * 60 {
+        format!("{}m", secs / 60)
+    } else if secs < 24 * 60 * 60 {
+        format!("{}h", secs / (60 * 60))
+    } else {
+        format!("{}d", secs / (24 * 60 * 60))
+    }
 }
 
 /// M4-11: render the legacy-compat-state one-liner in text mode.
@@ -3499,7 +4324,7 @@ fn kind_from_str(s: &str) -> Option<LegacyCompatKind> {
 ///   `Identity store: legacy-only (no Phase 1 daemon-mint observed yet)`
 ///   `Identity store: coexisting (3 identities, 3 legacy slots, consistent)`
 ///   `Identity store: coexisting (3 identities, 3 legacy slots, INCONSISTENT: OrphanLegacySlot(4))`
-/// Journal 0042: render the top-level phase-4-incomplete alarm. Two
+/// an internal journal entry: render the top-level phase-4-incomplete alarm. Two
 /// lines: a `fail()` header naming the impending daemon refusal, and a
 /// remediation hint pointing at `csq doctor --repair-identities`. The
 /// counts are pre-computed by `build_phase4_incomplete_alarm`.
@@ -3658,6 +4483,35 @@ fn info() -> &'static str {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn build_token_owner_report_partitions_verdicts() {
+        use csq_core::daemon::custodian::SlotOwnership;
+        let results = vec![
+            (1u16, "a@x.com".to_string(), SlotOwnership::Owned),
+            (2u16, "b@x.com".to_string(), SlotOwnership::Contaminated),
+            (3u16, "c@x.com".to_string(), SlotOwnership::Unknown),
+        ];
+        let r = build_token_owner_report(&results);
+        assert_eq!(r.checked, 3);
+        assert_eq!(r.contaminated, vec![2]);
+        assert_eq!(r.unknown, vec![3]);
+        // JSON status strings are stable + machine-parseable.
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"status\":\"contaminated\""));
+        assert!(json.contains("\"status\":\"owned\""));
+        assert!(json.contains("\"status\":\"unknown\""));
+        // The label is echoed verbatim (it's an email, not a path).
+        assert!(json.contains("b@x.com"));
+    }
+
+    #[test]
+    fn build_token_owner_report_empty_is_clean() {
+        let r = build_token_owner_report(&[]);
+        assert_eq!(r.checked, 0);
+        assert!(r.contaminated.is_empty());
+        assert!(r.unknown.is_empty());
+    }
 
     // ── helpers ───────────────────────────────────────────────────────────
 
@@ -4080,7 +4934,12 @@ mod tests {
             audit_historical_key_gaps: Vec::new(),
             audit_trust_plane_grade: doctor_trust_plane_grade(
                 &csq_core::audit::AuditHealth::Verified,
+                false,
             ),
+            // Test fixture has no leveled chain → grade is COMPATIBLE (no
+            // summary). The grade↔summary co-presence invariant is asserted by
+            // `doctor_grade_surface_includes_level_summary` (M3a AC-7, doctor).
+            audit_verification_level_summary: None,
             // No chain on disk → verify_chain returns Ok(default) → Verified.
             // (Unknown IS reachable in production via KeychainUnavailable; this
             // test fixture just has no chain, so Verified.)
@@ -4088,6 +4947,7 @@ mod tests {
             audit_keychain_anchor: csq_core::audit::KeychainAnchorStatus::Confirmed,
             // No roster installed in test fixtures → None (omitted from JSON).
             audit_roster_floor_anchor: None,
+            audit_bundle_floor_anchor: None,
             // M18 seam: no custody dirs in test fixtures.
             seam_quarantine_count: None,
             seam_pending_provenance_count: None,
@@ -4096,7 +4956,94 @@ mod tests {
             seam_pending_backlog_note: None,
             // M19: no required-hooks.json in test fixtures → NotConfigured.
             seam_capture_conformance: SeamConformanceState::NotConfigured,
+            mcp_partial_coverage: McpPartialCoverage {
+                warn: false,
+                cli_sources: Vec::new(),
+            },
+            mcp_gate_outbox_backlog: None,
+            custodian_identity_canary: CustodianIdentityCanary::default(),
         }
+    }
+
+    // ============================================================
+    // #787 b2b — policy-bundle floor keychain-anchor doctor projection
+    // ============================================================
+
+    /// No policy bundle installed (no floor file) → the field is omitted.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bundle_floor_anchor_absent_when_no_bundle() {
+        let tmp = TempDir::new().unwrap();
+        assert!(
+            doctor_bundle_floor_anchor(tmp.path()).is_none(),
+            "no floor file → None (field omitted)"
+        );
+    }
+
+    /// A present-but-unparseable floor file → `corrupt` (the gate fails closed;
+    /// doctor surfaces it as a distinct finding).
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bundle_floor_anchor_corrupt_when_floor_unreadable() {
+        use csq_core::phase2b::bundle_floor::bundle_floor_path;
+        let tmp = TempDir::new().unwrap();
+        let p = bundle_floor_path(tmp.path());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"garbage").unwrap();
+        assert_eq!(
+            doctor_bundle_floor_anchor(tmp.path()).as_deref(),
+            Some("corrupt"),
+            "corrupt floor file → \"corrupt\""
+        );
+    }
+
+    /// A valid floor with no readable keychain anchor → `unavailable`
+    /// (no chain initialized → no anchor tripwire; file floor stands alone).
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bundle_floor_anchor_unavailable_without_keychain_anchor() {
+        use csq_core::phase2b::bundle_floor::write_bundle_floor;
+        csq_core::audit::key_custody::init_mock_keyring();
+        let tmp = TempDir::new().unwrap();
+        write_bundle_floor(tmp.path(), 5).unwrap();
+        assert_eq!(
+            doctor_bundle_floor_anchor(tmp.path()).as_deref(),
+            Some("unavailable"),
+            "floor present, no chain/keychain anchor → \"unavailable\""
+        );
+    }
+
+    /// A keychain anchor that DISAGREES with the file floor → `mismatch (...)`
+    /// — the tamper tripwire the b1 LOW folded into doctor. Enforcement still
+    /// uses the FILE floor; doctor reports the disagreement.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bundle_floor_anchor_mismatch_is_projected() {
+        use csq_core::phase2b::bundle_floor::write_bundle_floor;
+        csq_core::audit::key_custody::init_mock_keyring();
+        let tmp = TempDir::new().unwrap();
+        // doctor reads the chain id from ChainState — initialize one so the
+        // keychain anchor (written under the same chain id) is discoverable.
+        // Keychain isolation: the mock keyring is process-global keyed by
+        // (service, chain_id); "chain-doctor-b2b" MUST stay unique across every
+        // test in this binary that writes to AUDIT_SIGNING_SERVICE_NAME, or a
+        // sibling's floor write would poison this mismatch assertion.
+        let chain_id = "chain-doctor-b2b";
+        csq_core::audit::ChainState::new(chain_id)
+            .save(tmp.path())
+            .unwrap();
+        csq_core::phase2b::bundle_floor::write_bundle_floor_to_keychain(
+            csq_core::audit::AUDIT_SIGNING_SERVICE_NAME,
+            chain_id,
+            20,
+        );
+        write_bundle_floor(tmp.path(), 3).unwrap();
+        let got = doctor_bundle_floor_anchor(tmp.path());
+        assert_eq!(
+            got.as_deref(),
+            Some("mismatch (file floor 3, keychain anchor 20)"),
+            "file 3 vs anchor 20 → mismatch projection; got {got:?}"
+        );
     }
 
     // ============================================================
@@ -4396,7 +5343,7 @@ mod tests {
         }
     }
 
-    /// Issue #525: `codex_wrong_variant_slots` populator returns the slot
+    /// an internal ticket: `codex_wrong_variant_slots` populator returns the slot
     /// number(s) for any slot whose `credentials/codex-<N>.json` file
     /// parses successfully but carries an Anthropic-shape payload
     /// (`is_codex_wrong_variant_bound` == true). Mirrors the
@@ -4437,7 +5384,7 @@ mod tests {
         );
     }
 
-    /// Issue #525: `codex_wrong_variant_slots` returns empty for a healthy
+    /// an internal ticket: `codex_wrong_variant_slots` returns empty for a healthy
     /// (valid Codex-variant) binding and for a base dir with no Codex
     /// credentials at all.
     #[test]
@@ -4881,6 +5828,146 @@ mod tests {
         assert_eq!(info.entries[2].account, 7);
     }
 
+    // ── custodian-identity canary tests (an internal ticket) ──────────────────────────
+
+    /// Build a `term-<pid>` handle dir under `base` with an Anthropic-shape
+    /// `.credentials.json` symlink (dangling target is fine — `read_link` reads
+    /// the target string without following it) and optional `.claude.json` body.
+    #[cfg(unix)]
+    fn mk_canary_handle_dir(base: &Path, pid: u32, link_name: &str, claude_json: Option<&str>) {
+        let handle = base.join(format!("term-{pid}"));
+        std::fs::create_dir_all(&handle).unwrap();
+        let target = base.join(format!("identities/uuid-{pid}/{link_name}"));
+        std::os::unix::fs::symlink(&target, handle.join(".credentials.json")).unwrap();
+        if let Some(body) = claude_json {
+            std::fs::write(handle.join(".claude.json"), body).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_flags_populated_claude_json_without_oauth_account() {
+        // The #833 drift signal: a live Anthropic session whose `.claude.json`
+        // is populated but has no oauthAccount.emailAddress.
+        let tmp = TempDir::new().unwrap();
+        let pid = std::process::id(); // self → alive
+        mk_canary_handle_dir(
+            tmp.path(),
+            pid,
+            "credentials.json",
+            Some(r#"{"numStartups":3,"userID":"abc"}"#),
+        );
+        let c = check_custodian_identity_canary(tmp.path());
+        assert!(c.check_available);
+        assert_eq!(c.drift_dirs, vec![format!("term-{pid}")]);
+        assert!(c.fresh_dirs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_flags_unparseable_claude_json_as_drift() {
+        // R1 security-reviewer MEDIUM: an unparseable present `.claude.json` breaks
+        // the gate identically to a missing field → must surface as drift through
+        // the canary path, not be mistaken for a benign fresh dir.
+        let tmp = TempDir::new().unwrap();
+        let pid = std::process::id();
+        mk_canary_handle_dir(tmp.path(), pid, "credentials.json", Some("not json {"));
+        let c = check_custodian_identity_canary(tmp.path());
+        assert_eq!(c.drift_dirs, vec![format!("term-{pid}")]);
+        assert!(c.fresh_dirs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_healthy_when_oauth_account_present() {
+        let tmp = TempDir::new().unwrap();
+        let pid = std::process::id();
+        mk_canary_handle_dir(
+            tmp.path(),
+            pid,
+            "credentials.json",
+            Some(r#"{"numStartups":3,"oauthAccount":{"emailAddress":"u@x.com"}}"#),
+        );
+        let c = check_custodian_identity_canary(tmp.path());
+        assert!(c.drift_dirs.is_empty());
+        assert!(c.fresh_dirs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_fresh_when_claude_json_absent() {
+        let tmp = TempDir::new().unwrap();
+        let pid = std::process::id();
+        // Absent .claude.json → fresh (not-yet-populated), not drift.
+        mk_canary_handle_dir(tmp.path(), pid, "credentials.json", None);
+        let c = check_custodian_identity_canary(tmp.path());
+        assert!(c.drift_dirs.is_empty());
+        assert_eq!(c.fresh_dirs, vec![format!("term-{pid}")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_fresh_when_claude_json_empty_object() {
+        // R2 testing-specialist F4: an empty `{}` .claude.json → fresh through the
+        // integration path (not just the classifier unit test), NOT drift.
+        let tmp = TempDir::new().unwrap();
+        let pid = std::process::id();
+        mk_canary_handle_dir(tmp.path(), pid, "credentials.json", Some("{}"));
+        let c = check_custodian_identity_canary(tmp.path());
+        assert!(c.drift_dirs.is_empty());
+        assert_eq!(c.fresh_dirs, vec![format!("term-{pid}")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sorted_dir_names_orders_by_numeric_pid_not_lexicographically() {
+        // R2 testing-specialist F2: proves the N7 numeric-sort fix. Lexicographic
+        // order would give term-100 < term-9 < term-90; numeric gives 9, 90, 100.
+        let out = sorted_dir_names(vec![
+            (100, "term-100".to_string()),
+            (9, "term-9".to_string()),
+            (90, "term-90".to_string()),
+        ]);
+        assert_eq!(out, vec!["term-9", "term-90", "term-100"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_ignores_codex_bound_dir() {
+        // A Codex session (`auth.json` link) legitimately has no oauthAccount —
+        // it MUST NOT be flagged as drift.
+        let tmp = TempDir::new().unwrap();
+        let pid = std::process::id();
+        mk_canary_handle_dir(
+            tmp.path(),
+            pid,
+            "auth.json",
+            Some(r#"{"numStartups":3,"userID":"abc"}"#),
+        );
+        let c = check_custodian_identity_canary(tmp.path());
+        assert!(c.drift_dirs.is_empty());
+        assert!(c.fresh_dirs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_ignores_dead_pid() {
+        // A dir whose PID is not alive is out of the custodian's harvest scope.
+        let tmp = TempDir::new().unwrap();
+        // 2_000_000_000 is positive as i32 yet above every OS pid ceiling
+        // (macOS 99_999, Linux pid_max ≤ 2^22) → deterministically not alive.
+        mk_canary_handle_dir(
+            tmp.path(),
+            2_000_000_000,
+            "credentials.json",
+            Some(r#"{"numStartups":3,"userID":"abc"}"#),
+        );
+        let c = check_custodian_identity_canary(tmp.path());
+        assert!(c.check_available);
+        assert!(c.drift_dirs.is_empty());
+        assert!(c.fresh_dirs.is_empty());
+    }
+
     // ── mixed-state slot tests ─────────────────────────────────
 
     #[test]
@@ -5146,7 +6233,7 @@ mod tests {
 
     // ─── M1-8 / M2-6 doctor tests ────────────────────────────────────────────
 
-    /// Journal 0042 (was M2-6 full): `csq doctor --json` emits the current
+    /// an internal journal entry (was M2-6 full): `csq doctor --json` emits the current
     /// `schema_version` on a coexisting layout where all Phase 2 UUID-path
     /// files are present (an empty consistency list). Bumped 4 → 5 by journal
     /// 0042 when the `phase4_incomplete` top-level field landed; 5 → 6 by
@@ -5156,6 +6243,12 @@ mod tests {
     #[cfg(any(test, feature = "test-utils"))]
     #[test]
     fn doctor_json_emits_current_schema_version() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         use csq_core::accounts::identity_store::identity_path;
         use csq_core::accounts::profiles::{load, profiles_path};
         use csq_core::testing::identity_fixtures::coexisting_fixture;
@@ -5175,13 +6268,15 @@ mod tests {
         // Act: build the report (read-only; no daemon / CLI probe invocations).
         let report = build_report(base);
 
-        // Assert: schema_version is edition-specific (M2 T2.5) — community v16,
-        // enterprise v17 (adds audit_trust_plane_grade). Pinned to the
-        // build-active const so the test is correct under both feature sets.
+        // Assert: schema_version is edition-specific — community v19, enterprise
+        // v22 (enterprise-only fields: mcp_gate_outbox_backlog v20 #914 + v21 M6
+        // #909 shard-D daemon-aware fields + audit_bundle_floor_anchor v22 #787
+        // b2b, raising only the enterprise ceiling). Pinned to the build-active
+        // const so the test is correct under both feature sets.
         assert_eq!(
             report.schema_version, DOCTOR_SCHEMA_VERSION,
             "schema_version must equal the edition-active DOCTOR_SCHEMA_VERSION \
-             (community 16 / enterprise 17)"
+             (community 19 / enterprise 22)"
         );
 
         // Assert: identity_store is present and state is Coexisting.
@@ -5334,7 +6429,7 @@ mod tests {
         }
     }
 
-    /// Binary-smoke regression (workspace slot-attribution-consistency): the
+    /// Binary-smoke regression (workspace an internal workspace): the
     /// extracted `identity_store_detail` MUST surface consistency findings for
     /// a LegacyOnly host too. A prior version hardcoded the LegacyOnly detail
     /// and dropped `CurrentAccountDrift`, so `csq doctor`'s icon flipped to ⚠
@@ -5392,12 +6487,12 @@ mod tests {
 
     // ─── M4-11 doctor tests (Phase 4 release N: schema v4 + legacy_compat_state)
 
-    /// M4-11 acceptance criterion (a) [updated by journal 0042]:
+    /// M4-11 acceptance criterion (a) [updated by an internal journal entry]:
     /// `csq doctor --json` emits the current `schema_version`.
     /// Verifies both the struct field and the serialized JSON shape —
     /// downstream consumers (statusline, validate-doctor-json.py, future
     /// tooling) read the JSON, so the JSON-level assertion is the
-    /// load-bearing one. Journal 0042 bumped the schema 4 → 5 when
+    /// load-bearing one. an internal journal entry bumped the schema 4 → 5 when
     /// `phase4_incomplete` landed.
     ///
     /// The fixture has no compat-bridge footprint, so
@@ -5408,6 +6503,12 @@ mod tests {
     #[cfg(any(test, feature = "test-utils"))]
     #[test]
     fn doctor_json_schema_version_is_current() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
 
@@ -5416,7 +6517,8 @@ mod tests {
         // structurally valid report.
         let report = build_report(base);
 
-        // Assert: struct field is 16 (audit_roster_floor_anchor added).
+        // Assert: schema_version equals the edition-active const (community 19 /
+        // enterprise 22). Pinned to the const so it stays correct across bumps.
         assert_eq!(
             report.schema_version, DOCTOR_SCHEMA_VERSION,
             "schema_version must equal the edition-active DOCTOR_SCHEMA_VERSION"
@@ -5461,6 +6563,12 @@ mod tests {
     #[cfg(any(test, feature = "test-utils"))]
     #[test]
     fn doctor_emits_legacy_compat_state_field() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         use csq_core::accounts::profiles::{profiles_path, save, AccountProfile, ProfilesFile};
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -5798,13 +6906,19 @@ mod tests {
         );
     }
 
-    // ── Journal 0042 (§FD #2 of 0041): phase4_incomplete alarm tests ──
+    // ── an internal journal entry (§FD #2 of 0041): phase4_incomplete alarm tests ──
 
     /// Healthy / pre-Phase-1 install — no UUID-mapped slots → alarm is
     /// `None` and JSON serialization omits the field entirely (the
     /// canonical "no alarm needed" state).
     #[test]
     fn phase4_incomplete_alarm_absent_when_no_uuid_mapped_slots() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let report = build_report(dir.path());
         assert!(
@@ -5829,6 +6943,12 @@ mod tests {
     /// with the correct affected_slot_count + missing_file_count.
     #[test]
     fn phase4_incomplete_alarm_surfaces_with_correct_counts() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         use csq_core::accounts::identity_store::IdentityId;
 
         let dir = TempDir::new().unwrap();
@@ -5879,6 +6999,12 @@ mod tests {
     /// explicitly in the spec/12 §12.11.5 record.
     #[test]
     fn doctor_report_schema_version_is_current() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let report = build_report(dir.path());
         assert_eq!(report.schema_version, DOCTOR_SCHEMA_VERSION);
@@ -5887,9 +7013,17 @@ mod tests {
     // ── #694 item 2: audit_roster_floor_anchor field ──────────────────────
 
     /// When no roster is installed `audit_roster_floor_anchor` is omitted from
-    /// the JSON (None → skip_serializing_if).  Schema_version is 16.
+    /// the JSON (None → skip_serializing_if). The assertion pins to the
+    /// build-active `DOCTOR_SCHEMA_VERSION` const (edition-specific), never a
+    /// literal — so it stays correct across schema bumps.
     #[test]
     fn doctor_audit_roster_floor_anchor_absent_when_no_roster() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         // Arrange
         let dir = TempDir::new().unwrap();
 
@@ -5909,11 +7043,17 @@ mod tests {
         assert_eq!(report.schema_version, DOCTOR_SCHEMA_VERSION);
     }
 
-    /// PR #702 review MED-2: an INITIALIZED install (chain.json present)
+    /// an internal ticket review MED-2: an INITIALIZED install (chain.json present)
     /// that has never run `csq audit roster install` (floor None) must ALSO
     /// omit the field — `chain.json exists` alone is the wrong predicate.
     #[test]
     fn doctor_floor_anchor_omitted_when_initialized_but_no_roster() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         // chain.json present, roster_version_floor None (audit init, no roster).
         csq_core::audit::ChainState::new("01ARZ3NDEKTSV4RRFFQ69G5D0C")
@@ -5960,6 +7100,12 @@ mod tests {
     /// Regression guard for the bug where the path was "quarantine" (no dot).
     #[test]
     fn doctor_seam_custody_counts_read_correct_dirs() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let base = dir.path();
 
@@ -5985,12 +7131,188 @@ mod tests {
         );
     }
 
+    // ── M6 #914: MCP-gate attestation outbox backlog predicate ───────────────
+
+    /// Absent outbox dir → None (healthy steady state; always the community case).
+    #[test]
+    fn mcp_gate_outbox_backlog_none_when_dir_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(
+            check_mcp_gate_outbox_backlog(dir.path()).is_none(),
+            "absent .pending-mcp-gate/ must yield None"
+        );
+    }
+
+    /// Empty outbox dir (drained clean) → None.
+    #[test]
+    fn mcp_gate_outbox_backlog_none_when_dir_empty() {
+        let dir = TempDir::new().unwrap();
+        let outbox = dir.path().join("csq-runs").join(".pending-mcp-gate");
+        std::fs::create_dir_all(&outbox).unwrap();
+        assert!(
+            check_mcp_gate_outbox_backlog(dir.path()).is_none(),
+            "empty outbox dir must yield None (nothing to report)"
+        );
+    }
+
+    /// A small, fresh backlog → Some with warn=false (drains on next start).
+    /// `.tmp.` in-flight writes and subdirs are excluded, mirroring the drain.
+    #[test]
+    fn mcp_gate_outbox_backlog_counts_json_excludes_tmp_and_subdirs() {
+        let dir = TempDir::new().unwrap();
+        let outbox = dir.path().join("csq-runs").join(".pending-mcp-gate");
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::fs::write(outbox.join("sess-a.0.json"), b"{}").unwrap();
+        std::fs::write(outbox.join("sess-a.1.json"), b"{}").unwrap();
+        // An in-flight tmp write and a non-json file must NOT be counted.
+        std::fs::write(outbox.join("sess-a.2.tmp.1234.json"), b"{}").unwrap();
+        std::fs::write(outbox.join("README"), b"x").unwrap();
+        std::fs::create_dir_all(outbox.join("subdir.json")).unwrap();
+
+        let backlog =
+            check_mcp_gate_outbox_backlog(dir.path()).expect("non-empty outbox must yield Some");
+        assert_eq!(
+            backlog.pending_count, 2,
+            "only the two real .json files count"
+        );
+        assert!(
+            !backlog.warn,
+            "a fresh 2-file backlog is a benign transient (warn=false)"
+        );
+        assert_eq!(
+            backlog.state,
+            McpGateBacklogState::PendingDaemonDown,
+            "no drain stamp written in the test → daemon-down disposition (info, not stuck)"
+        );
+        assert!(
+            backlog.oldest_age_secs.is_some(),
+            "oldest_age_secs is populated when files carry readable mtimes"
+        );
+    }
+
+    /// M6 #909 shard D wiring: `check_mcp_gate_outbox_backlog` reads the last-drain
+    /// stamp (shard B) and classifies. A fresh stamp + a young backlog → `Draining`
+    /// (daemon actively draining), with a small `last_drain_age_secs`. This proves
+    /// the read is wired, complementing the pure-classifier unit test below.
+    #[test]
+    fn mcp_gate_outbox_backlog_draining_when_stamp_fresh() {
+        let dir = TempDir::new().unwrap();
+        let outbox = dir.path().join("csq-runs").join(".pending-mcp-gate");
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::fs::write(outbox.join("sess-a.0.json"), b"{}").unwrap();
+        // A fresh drain-cycle stamp ⟺ the daemon is actively draining.
+        csq_core::audit::outbox_paths::stamp_outbox_drain(dir.path()).unwrap();
+
+        let backlog = check_mcp_gate_outbox_backlog(dir.path()).expect("non-empty outbox → Some");
+        assert_eq!(
+            backlog.state,
+            McpGateBacklogState::Draining,
+            "fresh stamp + young backlog → Draining (daemon draining, benign)"
+        );
+        assert!(!backlog.warn, "Draining is not operator-actionable");
+        assert!(
+            backlog.last_drain_age_secs.is_some_and(|a| a <= 5),
+            "last_drain_age_secs reflects the just-written stamp"
+        );
+    }
+
+    /// M6 #909 shard D: the daemon-aware classifier across the count-cap,
+    /// drain-freshness, and age axes — Stuck / Draining / PendingDaemonDown.
+    #[test]
+    fn classify_mcp_gate_backlog_daemon_aware() {
+        use McpGateBacklogState::{Draining, PendingDaemonDown, Stuck};
+        let now = 1_000_000u64;
+        let fresh = now - 60; // stamp 60s ago → daemon actively draining
+        let stale = now - (MCP_GATE_DRAIN_STAMP_FRESH_SECS + 60); // daemon down
+
+        // Count cap → Stuck ALWAYS, regardless of stamp/age (even daemon-down: an
+        // unbounded pending queue is never silently tolerated).
+        assert_eq!(
+            classify_mcp_gate_backlog(MCP_GATE_OUTBOX_STUCK_COUNT + 1, Some(0), None, now),
+            Stuck
+        );
+        assert_eq!(
+            classify_mcp_gate_backlog(MCP_GATE_OUTBOX_STUCK_COUNT + 1, Some(0), Some(stale), now),
+            Stuck
+        );
+
+        // Daemon draining (fresh stamp) + young backlog → Draining (benign).
+        assert_eq!(
+            classify_mcp_gate_backlog(2, Some(60), Some(fresh), now),
+            Draining
+        );
+        // Daemon draining + oldest past the stuck window → Stuck (chain not appendable).
+        assert_eq!(
+            classify_mcp_gate_backlog(
+                2,
+                Some(MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS + 1),
+                Some(fresh),
+                now
+            ),
+            Stuck
+        );
+        // Exactly at the age window is NOT stuck (strict `>`).
+        assert_eq!(
+            classify_mcp_gate_backlog(
+                2,
+                Some(MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS),
+                Some(fresh),
+                now
+            ),
+            Draining
+        );
+
+        // Stale stamp (daemon down) → PendingDaemonDown even for a very old backlog
+        // (no false STUCK alarm during a maintenance window) — the count cap above
+        // is the only escalation behind a down daemon.
+        assert_eq!(
+            classify_mcp_gate_backlog(2, Some(10 * 60 * 60), Some(stale), now),
+            PendingDaemonDown
+        );
+        // No stamp at all (never drained on this base) → PendingDaemonDown.
+        assert_eq!(
+            classify_mcp_gate_backlog(2, Some(10 * 60 * 60), None, now),
+            PendingDaemonDown
+        );
+        // Exactly at the freshness window still counts as draining (stale is strict `>`).
+        assert_eq!(
+            classify_mcp_gate_backlog(
+                2,
+                Some(60),
+                Some(now - MCP_GATE_DRAIN_STAMP_FRESH_SECS),
+                now
+            ),
+            Draining
+        );
+        // A future stamp (clock skew) reads as age 0 (fresh), never a giant age —
+        // saturating_sub cannot manufacture a false disposition.
+        assert_eq!(
+            classify_mcp_gate_backlog(2, Some(60), Some(now + 500), now),
+            Draining
+        );
+    }
+
+    /// `fmt_age_secs` renders compact human units across the boundaries.
+    #[test]
+    fn fmt_age_secs_compact_units() {
+        assert_eq!(fmt_age_secs(45), "45s");
+        assert_eq!(fmt_age_secs(90), "1m");
+        assert_eq!(fmt_age_secs(3 * 60 * 60), "3h");
+        assert_eq!(fmt_age_secs(2 * 24 * 60 * 60), "2d");
+    }
+
     // ── M19: seam_capture_conformance (Finding D enum) ───────────────────────
 
     /// Finding D: when `required-hooks.json` is absent, the conformance field
     /// is `NotConfigured` — operator-visible info line (never silent).
     #[test]
     fn m19_capture_conformance_not_configured_when_no_required_hooks_json() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let report = build_report(dir.path());
         assert_eq!(
@@ -6014,6 +7336,12 @@ mod tests {
     /// the conformance field is `Drift` with the unwired surface names.
     #[test]
     fn m19_capture_conformance_drift_when_required_surfaces_unwired() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         // Write a required-hooks.json requesting ["cc","codex"].
@@ -6050,6 +7378,12 @@ mod tests {
     /// Documented in spec §12.20: empty array ≡ NotConfigured.
     #[test]
     fn m19_capture_conformance_not_configured_when_required_hooks_json_empty_array() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let audit_dir = base.join("audit");
@@ -6074,6 +7408,12 @@ mod tests {
     /// invalid JSON (unreadable/unparseable policy → operator-visible ⚠).
     #[test]
     fn m19_capture_conformance_policy_unreadable_when_json_invalid() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let audit_dir = base.join("audit");
@@ -6108,6 +7448,12 @@ mod tests {
     /// via a planted oversized file.
     #[test]
     fn m19_capture_conformance_policy_unreadable_when_required_hooks_too_large() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let audit_dir = base.join("audit");
@@ -6130,12 +7476,19 @@ mod tests {
         }
     }
 
-    /// AC-7 / schema-version pin: schema_version is current (16 since #694 item 2)
+    /// AC-7 / schema-version pin: schema_version equals the edition-active
+    /// `DOCTOR_SCHEMA_VERSION` const (the assertion pins to it, never a literal)
     /// regardless of conformance
     /// state.  `seam_capture_conformance` is always serialized (no
     /// skip_serializing_if), so the key is always present in `--json` output.
     #[test]
     fn m19_schema_version_14_with_and_without_conformance() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
         let base = dir.path();
 
@@ -6201,6 +7554,12 @@ mod tests {
     /// drop" requirement per G1 of the verification pass.
     #[test]
     fn relocation_warns_unrecoverable_legacy_slots_no_silent_drop() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         use csq_core::accounts::profiles::{
             label_relocation_sentinel_path, profiles_path, save, AccountProfile, ProfilesFile,
         };
@@ -6333,6 +7692,12 @@ mod tests {
     /// were deleted.
     #[test]
     fn doctor_surfaces_pass0_skipped_slot_post_sentinel() {
+        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
+        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
+        // so this test cannot race a concurrent enterprise-edition setter.
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
 
@@ -6554,6 +7919,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(seed, Some(base)).unwrap();
 
@@ -6579,6 +7945,7 @@ mod tests {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         };
         write_record_v2(ack, Some(base)).unwrap();
 
@@ -6605,6 +7972,80 @@ mod tests {
         assert_eq!(
             sink_name, "rekor",
             "detected sink name must be 'rekor' (from ReplicationAck payload)"
+        );
+    }
+
+    /// M3a AC-7 (doctor surface) — `csq doctor` MUST NOT surface the trust-plane
+    /// grade bare: whenever `audit_trust_plane_grade` is `Some`, the companion
+    /// `audit_verification_level_summary` MUST also be `Some` (honest-host
+    /// boundary; redteam R1 HIGH, 2026-06-17). The sibling AC-7 test in
+    /// verify.rs covers only the `csq audit verify --json` surface
+    /// (`to_json_output`); this covers the doctor surface that shipped bare.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn doctor_grade_surface_includes_level_summary() {
+        use csq_core::audit::persist::write_record_v2;
+        use csq_core::audit::types::{
+            Ed25519Signature, EventKind, EventPayload, KeyId, RecordId, Sha256Hex, SignedRecord,
+        };
+
+        // Hermeticity: build_report (called below) transitively reaches verify_chain
+        // → resolve_registry → resolve_edition, which reads CSQ_AUDIT_EDITION. Hold
+        // the shared env lock + pin a clean community baseline so this enterprise test
+        // cannot race a concurrent enterprise-edition setter (testing.md Rule 6 /
+        // test-hermeticity.md MUST 1b — reader side, transitive via build_report).
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Write a CsqRun record via the production writer. In the enterprise
+        // build the central stamp (write_record_v2_impl) fills
+        // verification_level = AUTO_APPROVED, so the chain is leveled-to-head.
+        let seed = SignedRecord {
+            schema_version: "2".to_string(),
+            record_id: RecordId::try_new("01MED3000000000000000000S0").unwrap(),
+            chain_id: RecordId::try_new("01MED3000000000000000000XY").unwrap(),
+            seq: 0,
+            prev_hash: Sha256Hex::genesis(),
+            kind: EventKind::CsqRun,
+            payload: EventPayload::CsqRun(csq_core::audit::types::CsqRunPayload {
+                run_id: "ac7-doctor".to_string(),
+            }),
+            ts: "2100-01-01T00:00:00+00:00".to_string(),
+            key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
+            canonical_hash: Sha256Hex::genesis(),
+            signature: Ed25519Signature::new([0u8; 64]),
+            actor: None,
+            authority: None,
+            trust: None,
+            eatp_start_ts: None,
+            eatp_end_ts: None,
+            op_phase: None,
+            verification_level: None, // central stamp fills AUTO_APPROVED (enterprise)
+        };
+        write_record_v2(seed, Some(base)).unwrap();
+
+        let report = build_report(base);
+
+        // The grade must be reachable (the leveled chain → CONFORMANT or better).
+        assert!(
+            report.audit_trust_plane_grade.is_some(),
+            "leveled chain must surface a trust-plane grade"
+        );
+        // THE invariant this test defends: grade present ⇒ summary present.
+        assert!(
+            report.audit_verification_level_summary.is_some(),
+            "doctor surfaced the grade ({:?}) WITHOUT the verification_level_summary \
+             — a bare grade over-claims on the honest-host boundary",
+            report.audit_trust_plane_grade
+        );
+        let summary = report.audit_verification_level_summary.unwrap();
+        assert!(
+            summary.get("AUTO_APPROVED").copied().unwrap_or(0) >= 1,
+            "summary must count the AUTO_APPROVED record(s): {summary:?}"
         );
     }
 }

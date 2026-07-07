@@ -1,4 +1,4 @@
-//! Identity-keyed account storage primitives — issue #292 (A++) Phase 1.
+//! Identity-keyed account storage primitives — an internal ticket (A++) Phase 1.
 //!
 //! This module is the entry surface for the A++ migration to identity-keyed
 //! account paths. In Phase 1 it is **additive**: no production reader
@@ -14,8 +14,8 @@
 //! 3. The daemon's first-start mint flow (M1-4, lands later) materializes
 //!    `identities/<UUID>/identity.json` via these helpers.
 //!
-//! See `workspaces/account-slot-decoupling/02-plans/02-phase1-readiness.md`
-//! and `journal/0003-DISCOVERY-aplusplus-post-consolidation-freshness-audit.md`
+//! See `internal-design-docs`
+//! and `an internal journal entry`
 //! for the design context.
 
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,7 @@ impl FromStr for IdentityId {
 impl From<Uuid> for IdentityId {
     /// Wraps a `Uuid` as an `IdentityId`.
     ///
-    /// Used by the test fixture surface ([`crate::testing::identity_fixtures`])
+    /// Used by the test fixture surface (`crate::testing::identity_fixtures`)
     /// to construct deterministic identities from seeded byte arrays via
     /// `Uuid::from_bytes`. Not intended for production use.
     fn from(uuid: Uuid) -> Self {
@@ -94,7 +94,7 @@ pub fn identity_path(base: &Path, id: IdentityId) -> PathBuf {
 ///
 /// `identity.json` carries the **immutable** side of an account in Phase 1:
 /// email, provider, created_at, key_id. Mutable state (credentials,
-/// settings, usage) stays slot-keyed through Phase 1 — see journal 0003 D4.
+/// settings, usage) stays slot-keyed through Phase 1 — see an internal journal entry D4.
 pub fn identity_json_path_for(base: &Path, id: IdentityId) -> PathBuf {
     identity_path(base, id).join("identity.json")
 }
@@ -148,7 +148,7 @@ pub fn store_version_path(base: &Path) -> PathBuf {
 /// whether a UUID was resolved.  This is a deliberate, load-bearing constant
 /// per:
 ///
-/// - Journal 0016 OQ #2 resolution (Option A): markers stay at `config-N/`
+/// - an internal journal entry OQ #2 resolution (Option A): markers stay at `config-N/`
 ///   through Phase 4 per cross-phase constraint #3.
 /// - `rules/account-terminal-separation.md` MUST NOT Rule 3: "The
 ///   `.csq-account` marker is the SOLE authority for 'which account is this
@@ -177,7 +177,7 @@ pub struct IdentityPaths {
     ///
     /// **Always** `<base>/config-<N>/.csq-account`, regardless of
     /// `is_identity_keyed`.  See struct-level doc comment for rationale
-    /// (journal 0016 OQ #2 + cross-phase constraint #3).
+    /// (an internal journal entry OQ #2 + cross-phase constraint #3).
     pub marker_source_path: std::path::PathBuf,
 
     /// `true` when the slot had a UUID in `profiles.json::by_slot` and the
@@ -206,7 +206,7 @@ pub struct IdentityPaths {
 ///    - `is_identity_keyed` = `false`
 /// 4. **In both cases**, `marker_source_path` is hardcoded to
 ///    `<base>/config-<N>/.csq-account`.  See [`IdentityPaths`] doc for the
-///    cross-phase constraint rationale (journal 0016 OQ #2 + cross-phase
+///    cross-phase constraint rationale (an internal journal entry OQ #2 + cross-phase
 ///    constraint #3 from `rules/account-terminal-separation.md` MUST NOT
 ///    Rule 3).
 ///
@@ -219,7 +219,7 @@ pub fn account_to_identity_paths(base: &Path, account: crate::types::AccountNum)
     let slot = account.get();
     let config_dir = base.join(format!("config-{slot}"));
 
-    // marker_source_path: HARDCODED to config-N/.csq-account per journal 0016
+    // marker_source_path: HARDCODED to config-N/.csq-account per an internal journal entry
     // OQ #2 (Option A — markers stay at config-N/ through Phase 4) and
     // cross-phase constraint #3 (rules/account-terminal-separation.md MUST NOT
     // Rule 3).  Do NOT route this through the identity path even when
@@ -245,7 +245,7 @@ pub fn account_to_identity_paths(base: &Path, account: crate::types::AccountNum)
 /// Returns `<base>/identities/<uuid>/credentials-codex.json`.
 ///
 /// Phase 3 ADDS this as the canonical UUID-keyed path for the Codex surface
-/// (parallel to [`credentials_path_for`] for ClaudeCode).  Per journal 0016
+/// (parallel to [`credentials_path_for`] for ClaudeCode).  Per an internal journal entry
 /// OQ #3, Phase 3 retargets Codex handle-dir symlinks to this path; the
 /// legacy `credentials/codex-N.json` canonical is RETAINED through Phase 4
 /// for downgrade safety.
@@ -271,6 +271,33 @@ pub fn read_identity_provider(base: &Path, id: IdentityId) -> Option<String> {
     let bytes = std::fs::read(&path).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     json.get("provider")?.as_str().map(str::to_owned)
+}
+
+/// Reads the `email` field from `identities/<uuid>/identity.json` — the account's
+/// authenticated OAuth email captured at mint (write-once per
+/// [`crate::daemon::identity_mint`]). For an Anthropic identity this is the same
+/// OAuth email CC writes to a handle dir's `.claude.json` `oauthAccount.emailAddress`.
+///
+/// This is the **wrong-account adopt anchor** for the daemon keychain custodian
+/// (`crate::daemon::custodian`): a harvested keychain token is account-anonymous
+/// (the opaque `sk-ant-oat01-` access token and the `claudeAiOauth` payload carry
+/// NO account identity), so the custodian compares the candidate session's
+/// CC-recorded account (`.claude.json` email) against THIS value before adopting
+/// the token into the account-global store.
+///
+/// Returns `None` if the file is absent, unreadable, unparseable, or the `email`
+/// field is missing / empty / non-string. Callers MUST treat `None` as "cannot
+/// confirm identity → do not adopt" (fail-closed), never as a match.
+pub fn read_identity_email(base: &Path, id: IdentityId) -> Option<String> {
+    let path = identity_json_path_for(base, id);
+    let bytes = std::fs::read(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let email = json.get("email")?.as_str()?;
+    if email.is_empty() {
+        None
+    } else {
+        Some(email.to_owned())
+    }
 }
 
 /// Returns `true` when `slot` (mapped to `uuid` in `profiles.json::by_slot`) is
@@ -714,6 +741,58 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let uuid = IdentityId::new_v4();
         assert_eq!(read_identity_provider(dir.path(), uuid), None);
+    }
+
+    /// Helper: write an `identity.json` carrying the given email for `uuid`.
+    fn write_identity_email(base: &Path, uuid: IdentityId, email: &str) {
+        let dir = identity_path(base, uuid);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(
+                r#"{{"email":{},"provider":"anthropic","created_at":"t","key_id":null}}"#,
+                serde_json::to_string(email).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    // read_identity_email is the custodian's wrong-account anchor — its
+    // fail-closed contract (empty/absent/unparseable → None) is load-bearing.
+    #[test]
+    fn read_identity_email_returns_email_when_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        write_identity_email(dir.path(), uuid, "user@example.com");
+        assert_eq!(
+            read_identity_email(dir.path(), uuid).as_deref(),
+            Some("user@example.com")
+        );
+    }
+
+    #[test]
+    fn read_identity_email_returns_none_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        assert_eq!(read_identity_email(dir.path(), uuid), None);
+    }
+
+    #[test]
+    fn read_identity_email_returns_none_when_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        write_identity_email(dir.path(), uuid, "");
+        assert_eq!(read_identity_email(dir.path(), uuid), None);
+    }
+
+    #[test]
+    fn read_identity_email_returns_none_on_unparseable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        let d = identity_path(dir.path(), uuid);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("identity.json"), b"{not json").unwrap();
+        assert_eq!(read_identity_email(dir.path(), uuid), None);
     }
 
     /// Post-A++ Codex slot: `identity.json` provider=codex, NO legacy

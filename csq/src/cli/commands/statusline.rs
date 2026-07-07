@@ -56,7 +56,7 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     // reverse-resolved via by_slot) and self-heals a drifted cache, so the
     // statusline no longer second-guesses it with a numeric-only re-read that
     // returned None for UUID markers and trusted a stale cache otherwise
-    // (workspace slot-attribution-consistency).
+    // (workspace an internal workspace).
     let account: AccountNum = match snapshot::snapshot_account(&config_dir, base_dir) {
         Some(a) => a,
         None => {
@@ -121,6 +121,30 @@ fn build_rich_line(
 
     let mut ctx: StatuslineContext = parse_cc_stdin(stdin_buf);
     ctx.is_csq_terminal = is_csq_managed_terminal(base_dir);
+    // Resolve the model's TRUE context window from csq's catalog so the context %
+    // is recomputed against it. CC computes `used_percentage` against its own ~200k
+    // assumption for the Anthropic-compatible endpoint; 3P models with a larger real
+    // window (deepseek-v4-pro / minimax / glm = 1M) otherwise render a wildly inflated
+    // % (e.g. 177k → 89% against 200k instead of 18% against 1M).
+    //
+    // Source of the model id: the slot's `config-<slot>/settings.json`
+    // (`model_id_for_slot`) — the SAME on-disk source the daemon poller reads.
+    // NOT `std::env::var("ANTHROPIC_MODEL")`: `csq run` strips every `ANTHROPIC_*`
+    // var from CC's spawn env (`strip_sensitive_env`), so the process env is an
+    // unreliable channel (whether CC re-exports settings.json `env` to the
+    // spawned statusLine subprocess is a CC-internal behavior csq doesn't control).
+    // Env var kept only as a last-resort fallback. Keyed on the model id/alias.
+    let model_id = csq_core::providers::settings::model_id_for_slot(base_dir, account.get())
+        .or_else(|| {
+            std::env::var("ANTHROPIC_MODEL")
+                .ok()
+                .filter(|m| !m.is_empty())
+        });
+    ctx.ctx_window_true = model_id.and_then(|m| {
+        csq_core::providers::ModelCatalog::default_catalog()
+            .find(&m)
+            .and_then(|mi| mi.context_window)
+    });
     ctx.git = parse_workspace_dir(stdin_buf)
         .as_deref()
         .and_then(git_status);
@@ -251,9 +275,9 @@ mod tests {
     /// test's `EnvVarGuard::set` and its `detect_source_handle` call
     /// made the swap test observe statusline's value and return the
     /// wrong error variant. macOS-only by CI thread-scheduling luck
-    /// (green on PR #472 macOS + #473 ubuntu/windows, red on #473
+    /// (green on an internal ticket macOS + #473 ubuntu/windows, red on #473
     /// macOS). Root-caused + fixed per `zero-tolerance.md` Rule 1
-    /// during the v2.8.0-rc.1 cut; see journal 0050.
+    /// during the v2.8.0-rc.1 cut; see an internal journal entry
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         csq_core::platform::test_env::lock()
     }

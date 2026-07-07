@@ -394,7 +394,7 @@ pub(in crate::desktop) fn load_desktop_prefs(base_dir: &Path) -> (DesktopPrefs, 
                         Err(_e) => {
                             // R2 security-reviewer MED: `serde_json::Error::Display`
                             // echoes a substring of the offending JSON near the
-                            // parse-error position (per journal 0010). Today
+                            // parse-error position (per an internal journal entry). Today
                             // desktop-prefs.json holds no secrets, but the module
                             // docstring at lines 19-22 explicitly anticipates a
                             // future secret-bearing field; pre-hardening the log
@@ -1440,7 +1440,7 @@ mod tests {
         drop(_guard);
     }
 
-    // ── LoadOutcome tests (issue #572) ───────────────────────────────
+    // ── LoadOutcome tests (an internal ticket) ───────────────────────────────
     //
     // These six tests assert the tagged outcome returned by
     // `load_desktop_prefs`, covering each distinct code-path so the

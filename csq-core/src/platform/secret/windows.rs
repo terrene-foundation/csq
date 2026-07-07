@@ -5,7 +5,7 @@
 //! `CRED_TYPE_GENERIC` with `CRED_PERSIST_LOCAL_MACHINE` so they
 //! survive a logoff but stay tied to the user's DPAPI master key
 //! (NOT the roaming `CRED_PERSIST_ENTERPRISE` flavor — see Q7 in
-//! workspaces/gemini/journal/0005, which closes the iCloud/AD
+//! internal-design-docs, which closes the iCloud/AD
 //! "deleted entries may resurrect" class of bugs by refusing to use
 //! the roaming persistence type).
 //!
@@ -440,7 +440,7 @@ pub fn is_running_as_local_system() -> bool {
 /// Windows backend selector called from [`super::open_native_default`].
 ///
 /// - `CSQ_SECRET_BACKEND=file` → refuse: file backend is Linux-only
-///   per journal 0005 §1 (no silent fallback when DPAPI exists).
+///   per an internal journal entry §1 (no silent fallback when DPAPI exists).
 /// - Default / `keychain` / `auto` → check for `LocalSystem` posture
 ///   (fail-CLOSED on token query failure per security review M2),
 ///   then return [`WindowsCredentialVault`].

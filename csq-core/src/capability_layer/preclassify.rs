@@ -6,7 +6,7 @@
 //! inspection (`--print` / `-p` / piped stdin → one-shot; otherwise
 //! interactive). Pre-classification IS a `PipelineStage<Reads =
 //! UserPrompt + Argv, Writes = SpawnMode>`; same data-flow typing
-//! applies (per journal 0008 § For Discussion #2).").
+//! applies (per an internal journal entry § For Discussion #2).").
 //!
 //! # PR-CA5 ship state
 //!
@@ -23,6 +23,7 @@
 
 use crate::capability_layer::errors::StageError;
 use crate::capability_layer::pipeline::PipelineStage;
+use crate::providers::catalog::Surface;
 
 /// Inputs to the pre-classifier.
 #[derive(Debug, Clone)]
@@ -33,6 +34,10 @@ pub struct PreClassifyInputs {
     /// Whether stdin is a TTY at csq launch time. False = stdin is
     /// piped or redirected → one-shot per spec 10 §10.4.2.
     pub stdin_is_tty: bool,
+    /// Target surface. Used to select surface-specific one-shot
+    /// detection arms (e.g. Gemini uses `--prompt` / `--prompt=`,
+    /// CC uses `--print` / `-p`). Added in CU2 (an internal ticket).
+    pub surface: Surface,
 }
 
 /// Spawn-mode decision per spec 10 §10.4.2 — fork+pipe vs PTY at
@@ -65,7 +70,7 @@ impl PipelineStage for PreClassifyStage {
     type Writes = SpawnMode;
 
     fn run(input: Self::Reads, output: &mut Self::Writes) -> Result<(), StageError> {
-        *output = classify(&input.argv, input.stdin_is_tty);
+        *output = classify(&input.argv, input.stdin_is_tty, input.surface);
         Ok(())
     }
 }
@@ -74,13 +79,42 @@ impl PipelineStage for PreClassifyStage {
 /// produces the same output (FR-DISP-05 determinism applies here too,
 /// even though the classifier output is not part of the translator
 /// surface).
-fn classify(argv: &[String], stdin_is_tty: bool) -> SpawnMode {
+///
+/// Surface-aware one-shot detection (CU2, spec 10 §10.4.2):
+/// - CC / Codex: `--print` / `-p` / `-pX` combinator.
+/// - Gemini: `--prompt=<text>` (single-arg) or `--prompt <text>`
+///   (space-separated). Match EXACT `--prompt` / `--prompt=`, never
+///   `starts_with("--prompt")` to avoid false positives on
+///   `--prompt-fallback` or similar flags.
+fn classify(argv: &[String], stdin_is_tty: bool, surface: Surface) -> SpawnMode {
     // Non-TTY stdin always means one-shot regardless of argv —
     // piped input has no human at the terminal to interact with.
     if !stdin_is_tty {
         return SpawnMode::OneShot;
     }
-    // CC's `--print` / `-p` flag is documented as one-shot mode —
+
+    // Surface-specific one-shot flag detection.
+    if surface == Surface::Gemini {
+        // Gemini CLI's non-interactive flag is `--prompt` (space-sep or `=`).
+        // Match EXACTLY to avoid false positives on similar-looking flags.
+        for arg in argv {
+            if arg == "--prompt" {
+                // Space-separated form: `--prompt <text>` — argv carries
+                // the flag; the next element is the prompt text. We detect
+                // on the flag alone; prompt extraction is in
+                // `extract_prompt_from_argv` (driver.rs).
+                return SpawnMode::OneShot;
+            }
+            if arg.starts_with("--prompt=") {
+                // Single-arg form: `--prompt=<text>`.
+                return SpawnMode::OneShot;
+            }
+        }
+        // Gemini does NOT use `-p` / `--print` — those are CC-only.
+        return SpawnMode::Interactive;
+    }
+
+    // CC / Codex: `--print` / `-p` flag is documented as one-shot mode —
     // CC emits the model's output and exits.
     for arg in argv {
         if arg == "--print" || arg == "-p" {
@@ -100,34 +134,43 @@ fn classify(argv: &[String], stdin_is_tty: bool) -> SpawnMode {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------
+    // CC / Codex surface tests (existing behavior, unchanged by CU2)
+    // ---------------------------------------------------------------
+
     #[test]
     fn print_long_flag_is_one_shot() {
-        let mode = classify(&["--print".into(), "hello".into()], true);
+        let mode = classify(
+            &["--print".into(), "hello".into()],
+            true,
+            Surface::ClaudeCode,
+        );
         assert_eq!(mode, SpawnMode::OneShot);
     }
 
     #[test]
     fn p_short_flag_is_one_shot() {
-        let mode = classify(&["-p".into(), "hello".into()], true);
+        let mode = classify(&["-p".into(), "hello".into()], true, Surface::ClaudeCode);
         assert_eq!(mode, SpawnMode::OneShot);
     }
 
     #[test]
     fn p_combinator_short_form_is_one_shot() {
         // `-phello` is the combinator form (some CLIs accept this).
-        let mode = classify(&["-phello".into()], true);
+        let mode = classify(&["-phello".into()], true, Surface::ClaudeCode);
         assert_eq!(mode, SpawnMode::OneShot);
     }
 
     #[test]
     fn non_tty_stdin_is_one_shot_even_without_print_flag() {
-        let mode = classify(&["chat".into()], false);
+        // Non-TTY stdin triggers OneShot for ALL surfaces (surface-agnostic).
+        let mode = classify(&["chat".into()], false, Surface::ClaudeCode);
         assert_eq!(mode, SpawnMode::OneShot);
     }
 
     #[test]
     fn empty_argv_with_tty_stdin_is_interactive() {
-        let mode = classify(&[], true);
+        let mode = classify(&[], true, Surface::ClaudeCode);
         assert_eq!(mode, SpawnMode::Interactive);
     }
 
@@ -141,6 +184,7 @@ mod tests {
                 "--continue".into(),
             ],
             true,
+            Surface::ClaudeCode,
         );
         assert_eq!(mode, SpawnMode::Interactive);
     }
@@ -150,7 +194,7 @@ mod tests {
         // `--port` should NOT be classified as one-shot just because
         // it starts with `-p`. Our combinator rule excludes `--`
         // long-flag forms.
-        let mode = classify(&["--port=8080".into()], true);
+        let mode = classify(&["--port=8080".into()], true, Surface::ClaudeCode);
         assert_eq!(mode, SpawnMode::Interactive);
     }
 
@@ -161,6 +205,7 @@ mod tests {
         let inputs = PreClassifyInputs {
             argv: vec!["--print".into(), "x".into()],
             stdin_is_tty: true,
+            surface: Surface::ClaudeCode,
         };
         let mut mode = SpawnMode::default();
         PreClassifyStage::run(inputs, &mut mode).unwrap();
@@ -173,5 +218,86 @@ mod tests {
         // (visible regression); spec 10 §10.4.2 picks Interactive as
         // the safer default.
         assert_eq!(SpawnMode::default(), SpawnMode::Interactive);
+    }
+
+    // ---------------------------------------------------------------
+    // CU2 (an internal ticket): Gemini surface one-shot detection
+    // AC-1: --prompt=<text> single-arg form → OneShot
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cu2_gemini_prompt_equals_form_is_one_shot() {
+        // Spec 10 §10.4.2 (CU2): `--prompt=<text>` is gemini-cli's
+        // non-interactive flag and MUST classify as OneShot on
+        // Surface::Gemini.
+        let mode = classify(
+            &["--prompt=explain the rules".into()],
+            true,
+            Surface::Gemini,
+        );
+        assert_eq!(mode, SpawnMode::OneShot);
+    }
+
+    // AC-1: --prompt <text> space-separated form → OneShot
+    #[test]
+    fn cu2_gemini_prompt_space_form_is_one_shot() {
+        // Spec 10 §10.4.2 (CU2): `--prompt <text>` space-separated form
+        // MUST classify as OneShot on Surface::Gemini.
+        let mode = classify(
+            &["--prompt".into(), "explain the rules".into()],
+            true,
+            Surface::Gemini,
+        );
+        assert_eq!(mode, SpawnMode::OneShot);
+    }
+
+    // AC-5: bare gemini interactive (no --prompt) → Interactive (INV-2 guard)
+    #[test]
+    fn cu2_gemini_bare_interactive_stays_interactive() {
+        // INV-2 (GOTCHA-E): Interactive Gemini MUST keep inherited stdio
+        // and NOT be classified as OneShot just because the surface is Gemini.
+        let mode = classify(&[], true, Surface::Gemini);
+        assert_eq!(mode, SpawnMode::Interactive);
+    }
+
+    // AC-5: CC / Codex are not affected by Gemini detection (GOTCHA-C guard)
+    #[test]
+    fn cu2_cc_is_not_affected_by_gemini_detection() {
+        // `--prompt` in CC argv MUST NOT trigger OneShot on
+        // Surface::ClaudeCode — CC uses `--print`, not `--prompt`.
+        let mode = classify(&["--prompt=hello".into()], true, Surface::ClaudeCode);
+        assert_eq!(mode, SpawnMode::Interactive);
+    }
+
+    // AC-5: Codex is not affected either
+    #[test]
+    fn cu2_codex_is_not_affected_by_gemini_detection() {
+        let mode = classify(&["--prompt".into(), "hello".into()], true, Surface::Codex);
+        assert_eq!(mode, SpawnMode::Interactive);
+    }
+
+    // GOTCHA-B: piped-stdin Gemini MUST classify OneShot (surface-agnostic
+    // non-TTY arm fires first, before surface-specific check).
+    #[test]
+    fn cu2_gemini_piped_stdin_classifies_one_shot() {
+        // Non-TTY stdin → OneShot regardless of surface or argv.
+        // This is the regression case for GOTCHA-B: the dead arm that
+        // would silently drop inputs even when stdin is piped.
+        let mode = classify(&[], false, Surface::Gemini);
+        assert_eq!(mode, SpawnMode::OneShot);
+    }
+
+    // Exact-match guard: `--prompt-fallback` must NOT trigger OneShot.
+    #[test]
+    fn cu2_gemini_prompt_prefix_does_not_classify_one_shot() {
+        // MUST match `--prompt` exactly, not `starts_with("--prompt")`.
+        // `--prompt-fallback` is a hypothetical Gemini flag that MUST
+        // remain classified as Interactive.
+        let mode = classify(
+            &["--prompt-fallback".into(), "some text".into()],
+            true,
+            Surface::Gemini,
+        );
+        assert_eq!(mode, SpawnMode::Interactive);
     }
 }

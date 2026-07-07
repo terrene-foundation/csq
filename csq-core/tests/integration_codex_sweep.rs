@@ -7,7 +7,7 @@
 //! WITHOUT walking into the target (which would delete the user's persisted
 //! Codex history).
 //!
-//! Journal 0006 already proved the basic case via the existing image-cache
+//! an internal journal entry already proved the basic case via the existing image-cache
 //! regression test (`csq-core/src/session/handle_dir.rs:sweep_handles_image_cache_symlink`).
 //! This file covers the Codex-specific edge cases identified in the journal's
 //! "Decision impact" section:

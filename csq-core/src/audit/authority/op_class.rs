@@ -64,7 +64,26 @@ impl OpClass {
             // M20 duplicate-suppression is a custody/observation record (the
             // daemon noting a replayed event was dropped). Unguarded — same
             // rationale as SeamEventRejected.
-            | EventKind::SeamDuplicateSuppressed => None,
+            | EventKind::SeamDuplicateSuppressed
+            // #784 per-turn governance attestation is a passive observation of a
+            // turn the live session already governed — single-sig chain-signed,
+            // not an own-ops decision requiring the M12 multi-sig roster.
+            | EventKind::GovernanceTurn
+            // M3 §10.5 W2b EATP attestation records live on the EATP chain, not
+            // the op-chain; the EATP chain has its own born-canonical genesis guard.
+            // Unguarded for op-class purposes (no multi-sig roster role).
+            | EventKind::EatpAttestation
+            // M6 T6.2 Shard 4 MCP gate decision is a passive observation of a
+            // spawn-boundary tool-call the proxy already gated — single-sig
+            // chain-signed, not an own-ops decision requiring the M12 multi-sig
+            // roster (same rationale as GovernanceTurn).
+            | EventKind::McpGateDecision
+            // #787 b2b policy-bundle install is a passive own-op observation:
+            // the bundle's own detached signature (verified against the
+            // out-of-band --pubkey) IS its authority, so the record is
+            // single-sig chain-signed, not an M12 multi-sig-roster decision
+            // (same rationale as GovernanceTurn).
+            | EventKind::PolicyBundleInstall => None,
         }
     }
 }
@@ -113,6 +132,10 @@ mod tests {
             EventKind::ProvenanceAnchored,
             EventKind::ProvenanceCaptureMatrix,
             EventKind::SeamDuplicateSuppressed,
+            EventKind::GovernanceTurn,
+            EventKind::EatpAttestation,
+            EventKind::McpGateDecision,
+            EventKind::PolicyBundleInstall,
         ] {
             assert!(
                 OpClass::from_event_kind(&kind).is_none(),

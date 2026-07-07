@@ -7,7 +7,7 @@
 //!
 //! ### Why in-process
 //!
-//! Journal 0026 (this session): every OAuth account on the author's
+//! an internal journal entry (this session): every OAuth account on the author's
 //! machine had been expired for 6–80 hours because the user had to
 //! remember to run `csq daemon start` manually. Shipping the daemon
 //! as a separate CLI process was a solvable foot-gun — the desktop
@@ -68,7 +68,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// each failed attempt, caps at [`BACKOFF_MAX`], resets to
 /// `BACKOFF_MIN` whenever the supervisor successfully takes over.
 ///
-/// Addresses journal 0026 design question 1: the fixed 60s poll
+/// Addresses an internal journal entry design question 1: the fixed 60s poll
 /// burns a full minute of refresh downtime every time an external
 /// daemon crashes, and hot-loops under pathological contention.
 /// Exponential backoff gives instant recovery in the common case
@@ -153,7 +153,7 @@ pub fn start(base_dir: PathBuf) -> SupervisorHandle {
 /// - On clean daemon exit (we owned it, cancellation not fired):
 ///   stay at the reset value and retry after 5s
 async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
-    // Windows honesty guard — journal 0063 P1-3. The non-unix path
+    // Windows honesty guard — an internal journal entry P1-3. The non-unix path
     // of `run_daemon` is a stub with no subsystems. Without this
     // guard the supervisor would still acquire the PidFile, making
     // `detect_daemon` and the tray both report "daemon running"
@@ -374,6 +374,23 @@ async fn run_daemon(
         };
         let base_for_verify = base_dir.to_path_buf();
         let verify_future = tokio::task::spawn_blocking(move || {
+            // M3 §10.5 (W2a): reconcile the born-canonical EATP attestation chain's
+            // own `.chain-broken` sentinel inside the SAME spawn_blocking so the
+            // startup timeout covers both chains. Side pass — the EATP chain does
+            // not gate daemon startup (the op-chain result below is the authority).
+            // Inert until the EATP chain exists (`verify_chain_in` returns
+            // Ok(default) for absent `eatp-runs/`).
+            let eatp = csq_core::audit::verify_chain_in(
+                &base_for_verify,
+                &verify_cfg,
+                None,
+                csq_core::audit::ChainKind::Eatp,
+            );
+            csq_core::audit::reconcile_chain_sentinel(
+                &base_for_verify,
+                csq_core::audit::ChainKind::Eatp.runs_subdir(),
+                &eatp,
+            );
             csq_core::audit::verify_chain(&base_for_verify, &verify_cfg, None)
         });
         let health = match tokio::time::timeout(
@@ -489,6 +506,37 @@ Run `csq audit verify --full` for diagnosis."
         oauth_store: Some(Arc::clone(&oauth_store)),
         gemini_consumer: gemini_consumer.clone(),
         audit_health,
+        // #783 — seed the interactive enforcement registry from the fail-closed
+        // §10.5 activation gate (absent → empty/503).
+        // #784 follow-up — inject the cross-SDK kailash projector (the csq crate
+        // owns the seam; csq-core cannot name it).
+        // T-M4.3 — inject the PACT governor factory (twin of the CLI daemon path)
+        // so a configured operating envelope wires the first production
+        // ActionGovernor (fail-closed: an unloadable envelope refuses to open).
+        #[cfg(feature = "enterprise")]
+        interactive: Arc::new({
+            let reg = csq_core::daemon::interactive_live::seed_registry(
+                base_dir,
+                Some(crate::kailash_projector::make_kailash_projector()),
+                Some(crate::kailash_governor::make_governor_factory()),
+                // T-M4.5 — inject the lifecycle-audit-sink factory (twin of the CLI
+                // daemon path) so every session records a signed audit trail.
+                Some(crate::kailash_audit_sink::make_audit_sink_factory()),
+            );
+            // M3 §10.5 W2b — inject the EATP born-canonical genesis guard (twin
+            // of the CLI daemon path). Classifies the genesis record on every
+            // session open; non-BornCanonical refuses EATP chain appends but
+            // the session still proceeds.
+            // M3 §10.5 W3 — inject the EATP session-close attestation writer (twin
+            // of the CLI daemon path). Appends a born-canonical session-close
+            // attestation on every close (fail-closed-NON-FATAL).
+            reg.with_eatp_genesis_guard(crate::kailash_eatp_genesis::make_eatp_genesis_guard(
+                base_dir,
+            ))
+            .with_eatp_attestor(
+                crate::kailash_eatp_attest::make_eatp_session_close_attestor(base_dir),
+            )
+        }),
     };
 
     // PR-C4: reconciler clamps Codex invariants (canonical 0o400 +
@@ -496,7 +544,7 @@ Run `csq audit verify --full` for diagnosis."
     // subsystem touches them. Mutex-coordinated with the refresher.
     let _reconcile_summary = daemon::run_reconciler(base_dir);
 
-    // M3-7 + M4-5: Phase 4 fail-closed gate (journal 0015 Delta F / OQ #7;
+    // M3-7 + M4-5: Phase 4 fail-closed gate (an internal journal entry Delta F / OQ #7;
     // strengthened in M4-5). Refuse to start if the on-disk store predates
     // Phase 4 layout — the live-mirror retirement assumes identity
     // credentials + settings + (where Codex-bound) credentials-codex are
@@ -606,7 +654,7 @@ Run `csq audit verify --full` for diagnosis."
     Ok(())
 }
 
-/// Resolves the active [`LedgerSink`] from `sink_cfg` for the desktop daemon.
+/// Resolves the active `LedgerSink` from `sink_cfg` for the desktop daemon.
 /// Mirrors `resolve_anchor_sink` in `cli/commands/daemon.rs` — keep the two in sync.
 fn resolve_anchor_sink_desktop(
     sink_cfg: &csq_core::audit::AuditSinkConfig,

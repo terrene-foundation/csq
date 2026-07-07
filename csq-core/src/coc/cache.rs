@@ -21,10 +21,10 @@
 //! - Partial-failure cleanup per security.md §5a: `remove_file(&tmp)` before
 //!   propagating any error from `secure_file` or `atomic_replace`.
 //!
-//! Per `workspaces/csq-as-cli/journal/0093` the per-artifact signing
+//! Per `internal-design-docs` the per-artifact signing
 //! apparatus (`COC.sig`, `COC_SIGNING_PUBLIC_KEY_BYTES`, first-pull trust
 //! gate) was retracted as wrong-layer; deterministic attestation belongs
-//! at the runtime lifecycle layer (Step 3, `workspaces/csq-pact-eatp-adoption`).
+//! at the runtime lifecycle layer (Step 3, `internal-design-docs`).
 //! This module is now scoped to cache-key derivation and parse-cache I/O.
 
 use std::io;

@@ -18,6 +18,7 @@
 //! - `csq run N`   → probes once at startup; cached for the process lifetime.
 
 pub mod auto_update;
+pub mod cli_shim;
 pub mod install_path;
 pub mod minimum;
 pub mod probe;

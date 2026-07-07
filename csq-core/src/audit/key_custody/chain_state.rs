@@ -121,11 +121,12 @@ pub struct ChainState {
     pub roster_version_floor: Option<u64>,
 }
 
-/// Path to `chain.json` for a given `base_dir`.
-///
-/// Unified with M02's location per spec 12 §12.10.4 — `csq-runs/chain.json`.
-pub fn chain_json_path(base_dir: &Path) -> PathBuf {
-    base_dir.join("csq-runs").join("chain.json")
+/// Path to `chain.json` for the chain whose records live under
+/// `<base_dir>/<runs_subdir>/` (`csq-runs` for the op-chain — unified with M02's
+/// location per spec 12 §12.10.4 — `eatp-runs` for the born-canonical EATP
+/// attestation chain, M3 §10.5 W1 chain-id parameterization).
+pub fn chain_json_path_in(base_dir: &Path, runs_subdir: &str) -> PathBuf {
+    base_dir.join(runs_subdir).join("chain.json")
 }
 
 impl ChainState {
@@ -144,12 +145,21 @@ impl ChainState {
         }
     }
 
-    /// Read `chain.json` from disk.
+    /// Read the op-chain's `chain.json` from disk.
     ///
     /// Returns a fresh default state (with empty `chain_id`) when the file
     /// does not exist yet — callers must set `chain_id` before writing back.
+    /// For the EATP attestation chain (M3 §10.5) use [`ChainState::load_in`].
     pub fn load(base_dir: &Path) -> Result<Self, KeyCustodyError> {
-        let path = chain_json_path(base_dir);
+        Self::load_in(base_dir, "csq-runs")
+    }
+
+    /// Read the `chain.json` for the chain under `<base_dir>/<runs_subdir>/`.
+    ///
+    /// Returns a fresh default state (with empty `chain_id`) when the file
+    /// does not exist yet — callers must set `chain_id` before writing back.
+    pub fn load_in(base_dir: &Path, runs_subdir: &str) -> Result<Self, KeyCustodyError> {
+        let path = chain_json_path_in(base_dir, runs_subdir);
         if !path.exists() {
             return Ok(Self::new(""));
         }
@@ -163,12 +173,20 @@ impl ChainState {
         })
     }
 
-    /// Write `chain.json` atomically, with §5a tmp cleanup on every failure
-    /// branch (PRIMARY METHODOLOGICAL DIRECTIVE, M04).
+    /// Write the op-chain's `chain.json` atomically, with §5a tmp cleanup on
+    /// every failure branch (PRIMARY METHODOLOGICAL DIRECTIVE, M04).
     ///
-    /// Creates `<base_dir>/audit/` if it does not exist.
+    /// Creates `<base_dir>/csq-runs/` if it does not exist. For the EATP
+    /// attestation chain (M3 §10.5) use [`ChainState::save_in`].
     pub fn save(&self, base_dir: &Path) -> Result<(), KeyCustodyError> {
-        let path = chain_json_path(base_dir);
+        self.save_in(base_dir, "csq-runs")
+    }
+
+    /// Write the `chain.json` for the chain under `<base_dir>/<runs_subdir>/`
+    /// atomically, with §5a tmp cleanup on every failure branch. Creates the
+    /// runs-directory (mode 0o700 on Unix) if it does not exist.
+    pub fn save_in(&self, base_dir: &Path, runs_subdir: &str) -> Result<(), KeyCustodyError> {
+        let path = chain_json_path_in(base_dir, runs_subdir);
 
         // Ensure parent directory exists.
         // M-19: use mode 0o700 on Unix so the csq-runs/ directory is
@@ -183,7 +201,7 @@ impl ChainState {
                     .create(parent)
                     .map_err(|e| {
                         KeyCustodyError::ChainIo(format!(
-                            "create csq-runs/ {}: {e}",
+                            "create runs-dir {}: {e}",
                             parent.display()
                         ))
                     })?;
@@ -302,6 +320,39 @@ mod tests {
         let loaded = ChainState::load(tmp.path()).expect("load");
         assert_eq!(loaded.signing_key_id.unwrap().as_str(), kid.as_str());
         assert_eq!(loaded.pubkey.unwrap().0, [0xab; 32]);
+    }
+
+    /// M3 §10.5 (W2a): `save_in` / `load_in` round-trip the EATP attestation
+    /// chain's `chain.json` under `eatp-runs/`, fully isolated from the op-chain
+    /// `chain.json` under `csq-runs/`. Writing the EATP chain does not create or
+    /// disturb the op-chain file, and vice versa.
+    #[test]
+    fn test_chain_state_save_load_in_eatp_subdir_isolated_from_op() {
+        let tmp = tmp_base();
+        let base = tmp.path();
+
+        let eatp = ChainState::new("eatp-chain-id");
+        eatp.save_in(base, "eatp-runs").expect("save eatp");
+
+        // The EATP write lands under eatp-runs/, NOT csq-runs/.
+        assert!(base.join("eatp-runs").join("chain.json").exists());
+        assert!(!base.join("csq-runs").join("chain.json").exists());
+
+        // load_in reads back the EATP chain; load (op-chain) is still absent →
+        // default empty chain_id.
+        let loaded_eatp = ChainState::load_in(base, "eatp-runs").expect("load eatp");
+        assert_eq!(loaded_eatp.chain_id, "eatp-chain-id");
+        let loaded_op = ChainState::load(base).expect("load op");
+        assert_eq!(loaded_op.chain_id, "", "op-chain untouched by EATP write");
+
+        // Writing the op-chain afterwards does not disturb the EATP chain.
+        ChainState::new("op-chain-id").save(base).expect("save op");
+        assert_eq!(
+            ChainState::load_in(base, "eatp-runs").unwrap().chain_id,
+            "eatp-chain-id",
+            "EATP chain untouched by op-chain write"
+        );
+        assert_eq!(ChainState::load(base).unwrap().chain_id, "op-chain-id");
     }
 
     #[test]

@@ -462,9 +462,9 @@ describe("AccountList", () => {
 
   // ── PR-C8 surface badge ──────────────────────────────────────
 
-  it("renders 'claude' surface badge for claude-code slots (universal badges, PR #310)", async () => {
+  it("renders 'claude' surface badge for claude-code slots (universal badges, an internal ticket)", async () => {
     // Pre-PR-#310, the badge hid for `claude-code` ("the default
-    // doesn't need a tag"). PR #310 dropped that exclusion so all
+    // doesn't need a tag"). an internal ticket dropped that exclusion so all
     // three CLIs (CLAUDE / CODEX / GEMINI) appear consistently. The
     // displayed text maps `claude-code` → `claude`.
     const { container } = render(AccountList);
@@ -659,11 +659,143 @@ describe("AccountList", () => {
     expect(btn?.getAttribute("title")).toContain("Gemini");
   });
 
+  // ── Balance-display (DeepSeek) ──────────────────────────────
+
+  it("renders balance_display string and no usage bars for a balance-kind slot", async () => {
+    const deepseekAccount = {
+      ...ACCOUNT_1,
+      id: 11,
+      label: "DeepSeek",
+      source: "third_party",
+      surface: "claude-code" as const,
+      billing_mode: "api-key" as const,
+      quota_kind: "balance" as const,
+      balance_display: "$196.42",
+      // Balance slots have no 5h/7d windows.
+      five_hour_pct: 0,
+      five_hour_resets_in: null,
+      seven_day_pct: 0,
+      seven_day_resets_in: null,
+    };
+    // BillingLedger self-fetches get_account_usage — mock it so the component
+    // renders without an unhandled-rejection in the test environment.
+    setupMocks({
+      get_accounts: [deepseekAccount],
+      get_account_usage: {
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cost_usd: 0,
+        last_30d_input_tokens: 0,
+        last_30d_output_tokens: 0,
+        last_30d_cost_usd: 0,
+        last_7d_input_tokens: 0,
+        last_7d_output_tokens: 0,
+        last_7d_cost_usd: 0,
+        last_5d_input_tokens: 0,
+        last_5d_output_tokens: 0,
+        last_5d_cost_usd: 0,
+        today_input_tokens: 0,
+        today_output_tokens: 0,
+        today_cost_usd: 0,
+        event_count: 0,
+        unestimated_cost_count: 0,
+      },
+    });
+    const { container } = render(AccountList);
+    await settle();
+
+    // The balance value span is still discoverable via data-testid.
+    const balanceEl = container.querySelector(
+      '[data-testid="balance-display"]',
+    );
+    expect(balanceEl).not.toBeNull();
+    expect(balanceEl?.textContent).toContain("$196.42");
+
+    // Label and suffix text appear in the rendered card.
+    expect(container.textContent).toContain("Balance");
+    expect(container.textContent).toContain("remaining");
+
+    // The 5h/7d UsageBar elements MUST NOT be rendered for a balance slot.
+    expect(container.querySelector(".usage-bars")).toBeNull();
+
+    // The balance row renders below the usage area.
+    expect(container.querySelector(".balance-row")).not.toBeNull();
+    // With no recorded usage (event_count: 0) the balance card passes
+    // hideWhenEmpty=true, so BillingLedger renders NOTHING — no empty padded
+    // wrapper below the balance row (redteam #984 L2).
+    expect(
+      container.querySelector('[data-testid="billing-ledger"]'),
+    ).toBeNull();
+  });
+
+  it("renders a checking state when balance_display is absent on a balance-kind slot", async () => {
+    // quota_kind=balance but daemon hasn't polled yet → balance_display is null.
+    const deepseekAccount = {
+      ...ACCOUNT_1,
+      id: 12,
+      label: "DeepSeek",
+      source: "third_party",
+      surface: "claude-code" as const,
+      billing_mode: "api-key" as const,
+      quota_kind: "balance" as const,
+      balance_display: null,
+      five_hour_pct: 0,
+      five_hour_resets_in: null,
+      seven_day_pct: 0,
+      seven_day_resets_in: null,
+    };
+    setupMocks({
+      get_accounts: [deepseekAccount],
+      get_account_usage: {
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cost_usd: 0,
+        last_30d_input_tokens: 0,
+        last_30d_output_tokens: 0,
+        last_30d_cost_usd: 0,
+        last_7d_input_tokens: 0,
+        last_7d_output_tokens: 0,
+        last_7d_cost_usd: 0,
+        last_5d_input_tokens: 0,
+        last_5d_output_tokens: 0,
+        last_5d_cost_usd: 0,
+        today_input_tokens: 0,
+        today_output_tokens: 0,
+        today_cost_usd: 0,
+        event_count: 0,
+        unestimated_cost_count: 0,
+      },
+    });
+    const { container } = render(AccountList);
+    await settle();
+
+    const balanceEl = container.querySelector(
+      '[data-testid="balance-display"]',
+    );
+    expect(balanceEl).not.toBeNull();
+    // Before the first /user/balance poll, show a checking state — NOT a bare
+    // "—" that reads as a failure (redteam #984 F4).
+    expect(balanceEl?.textContent?.trim()).toBe("checking…");
+    // Usage bars still suppressed.
+    expect(container.querySelector(".usage-bars")).toBeNull();
+    // Label still appears alongside the checking state.
+    expect(container.textContent).toContain("Balance");
+  });
+
+  it("does not render balance-display for a subscription (non-balance) slot", async () => {
+    // ACCOUNT_1 is a plain subscription account — balance_display should be absent.
+    const { container } = render(AccountList);
+    await settle();
+    expect(
+      container.querySelector('[data-testid="balance-display"]'),
+    ).toBeNull();
+  });
+
   // Phase B billing-mode badge tests removed — the static
   // "API-key billing" / "Local provider" labels were a regression
   // that hid quota data MiniMax + Z.AI's subscription modes
   // expose via direct endpoints, and offered no usage-tracking
-  // signal in their place. Proper usage UI tracked in journal 0047.
+  // signal in their place. Proper usage UI tracked in an internal journal entry
 
   // ── RN1-D — inline rename error surface (D8) ────────────────
 

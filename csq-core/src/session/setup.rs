@@ -10,7 +10,7 @@
 //! refreshed by the daemon (`broker_check` → `save_canonical`). The legacy
 //! mirror is no longer a credential reader for any production code path, so
 //! a per-run copy was a dead write. See the writer-surface retirement table
-//! in `workspaces/account-slot-decoupling/02-plans/04-phase3-readiness.md`.
+//! in `internal-design-docs`.
 
 use super::isolation;
 use crate::error::CredentialError;
@@ -149,7 +149,7 @@ mod tests {
         );
     }
 
-    /// §5a regression (security.md MUST Rule 5a, journal 0065 B2,
+    /// §5a regression (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `mark_onboarding_complete`
     /// fails after the tmp file would have been created (parent dir
     /// read-only → write fails), no `.tmp.` file must remain.

@@ -9,11 +9,12 @@
 //! MCP gating is performed csq-side at the prompt-edit boundary by the
 //! capability layer (spec 10 §10.8.1).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use crate::coc::types::{AgentDef, CocSet, CommandDef, RuleDef, SkillDef};
+use crate::coc::types::CocSet;
 use crate::providers::catalog::Surface;
 
+use super::flatten::{flatten_artifacts, render_sections};
 use super::types::{CodexSpawnPayload, McpFilter, SandboxMode};
 
 /// FR-CL-01 system-prompt directive — re-exported from
@@ -23,49 +24,13 @@ pub use super::build_output_schema_directive;
 
 const SURFACE_HEADER: &str = "# csq capability layer (codex)\n";
 
+/// CU1b: shares `super::flatten` with the CC + Gemini translators and the
+/// live capability-layer scaffold stage — one flattener, no per-surface
+/// drift. Only the Surface header + the codex-specific payload fields
+/// (sandbox mode, config overlay) differ.
 pub fn translate(coc_set: &CocSet) -> CodexSpawnPayload {
-    let target = Surface::Codex;
-
-    let mut instructions = String::new();
-    instructions.push_str(SURFACE_HEADER);
-
-    let mut contributing_ids: BTreeSet<String> = BTreeSet::new();
-
-    let rules = filter_rules(coc_set, target);
-    if !rules.is_empty() {
-        instructions.push_str("\n## Rules\n");
-        for rule in &rules {
-            push_section(&mut instructions, &rule.id.0, rule.precedence, &rule.body);
-            contributing_ids.insert(rule.id.0.clone());
-        }
-    }
-
-    let agents = filter_agents(coc_set, target);
-    if !agents.is_empty() {
-        instructions.push_str("\n## Agents\n");
-        for a in &agents {
-            push_section(&mut instructions, &a.id.0, a.precedence, &a.body);
-            contributing_ids.insert(a.id.0.clone());
-        }
-    }
-
-    let skills = filter_skills(coc_set, target);
-    if !skills.is_empty() {
-        instructions.push_str("\n## Skills\n");
-        for s in &skills {
-            push_section(&mut instructions, &s.id.0, s.precedence, &s.body);
-            contributing_ids.insert(s.id.0.clone());
-        }
-    }
-
-    let commands = filter_commands(coc_set, target);
-    if !commands.is_empty() {
-        instructions.push_str("\n## Commands\n");
-        for c in &commands {
-            push_section(&mut instructions, &c.id.0, c.precedence, &c.body);
-            contributing_ids.insert(c.id.0.clone());
-        }
-    }
+    let arts = flatten_artifacts(coc_set, Surface::Codex);
+    let (instructions, contributing_ids) = render_sections(SURFACE_HEADER, &arts);
 
     CodexSpawnPayload {
         config_toml_overlay: BTreeMap::new(),
@@ -75,77 +40,11 @@ pub fn translate(coc_set: &CocSet) -> CodexSpawnPayload {
         contributing_ids,
         // PR-CA8 commit 1a: Surface-agnostic structured-output directive.
         // Delivered into config.toml::instructions by csq-cli's
-        // materialize_handle_config_toml_with_instructions helper at spawn
-        // time (PR-CA8 commit 2).
+        // materialize_handle_config_toml helper at spawn time (PR-CA8
+        // commit 2; renamed from _with_instructions in M6 T6.2 Shard 3a
+        // when the MCP-proxy rewrite transform was composed in).
         output_schema_directive: Some(build_output_schema_directive()),
     }
-}
-
-fn push_section(out: &mut String, id: &str, precedence: i32, body: &str) {
-    out.push('\n');
-    out.push_str("### ");
-    out.push_str(id);
-    out.push_str(" (precedence=");
-    out.push_str(&precedence.to_string());
-    out.push_str(")\n");
-    out.push_str(body.trim_end());
-    out.push('\n');
-}
-
-fn filter_rules(coc_set: &CocSet, surface: Surface) -> Vec<&RuleDef> {
-    let mut v: Vec<&RuleDef> = coc_set
-        .rules
-        .values()
-        .filter(|r| r.applies_to.is_empty() || r.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
-}
-
-fn filter_agents(coc_set: &CocSet, surface: Surface) -> Vec<&AgentDef> {
-    let mut v: Vec<&AgentDef> = coc_set
-        .agents
-        .values()
-        .filter(|x| x.applies_to.is_empty() || x.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
-}
-
-fn filter_skills(coc_set: &CocSet, surface: Surface) -> Vec<&SkillDef> {
-    let mut v: Vec<&SkillDef> = coc_set
-        .skills
-        .values()
-        .filter(|x| x.applies_to.is_empty() || x.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
-}
-
-fn filter_commands(coc_set: &CocSet, surface: Surface) -> Vec<&CommandDef> {
-    let mut v: Vec<&CommandDef> = coc_set
-        .commands
-        .values()
-        .filter(|x| x.applies_to.is_empty() || x.applies_to.contains(&surface))
-        .collect();
-    v.sort_by(|a, b| {
-        b.precedence
-            .cmp(&a.precedence)
-            .then_with(|| a.id.0.as_str().cmp(b.id.0.as_str()))
-    });
-    v
 }
 
 #[cfg(test)]

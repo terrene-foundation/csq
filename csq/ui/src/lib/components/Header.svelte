@@ -11,13 +11,25 @@
 
   let daemonRunning = $state(false);
   let appVersion = $state<string | null>(null);
+  // Build edition: 'community' | 'enterprise' (from the compile-time
+  // crate::BUILD_EDITION const). null until loaded — guard the badge with
+  // {#if} so a failed/pending fetch renders nothing rather than a wrong label.
+  let edition = $state<string | null>(null);
+
+  async function fetchEdition() {
+    try {
+      edition = await invoke<string>('get_build_edition');
+    } catch {
+      edition = null;
+    }
+  }
 
   async function fetchDaemonStatus() {
     try {
       // Use `join` so the platform's path separator is honored.
       // Tauri 2.10's `homeDir()` returns a path without a trailing
       // separator, so naive concatenation produces an invalid path
-      // like `/Users/esperie.claude/accounts` (see journal 0021).
+      // like `/Users/example.claude/accounts` (see an internal journal entry).
       const home = await homeDir();
       const baseDir = await join(home, '.claude', 'accounts');
       const status = await invoke<DaemonStatusView>('get_daemon_status', { baseDir });
@@ -32,7 +44,7 @@
       appVersion = await getVersion();
     } catch {
       // Version lookup should never fail — but if it does, hide
-      // the span rather than show misleading text (journal 0063 P1-5:
+      // the span rather than show misleading text (an internal journal entry P1-5:
       // alpha.21 shipped with a literal that drifted).
       appVersion = null;
     }
@@ -41,6 +53,7 @@
   $effect(() => {
     fetchDaemonStatus();
     fetchVersion();
+    fetchEdition();
     const interval = setInterval(fetchDaemonStatus, 10000);
     return () => clearInterval(interval);
   });
@@ -50,6 +63,17 @@
   <div class="left">
     <h1>Code Squad Q</h1>
     {#if appVersion}<span class="version">v{appVersion}</span>{/if}
+    {#if edition}
+      <span
+        class="edition"
+        class:enterprise={edition === 'enterprise'}
+        title={edition === 'enterprise'
+          ? 'Enterprise edition (csq-ee)'
+          : 'Community edition (csq)'}
+      >
+        {edition === 'enterprise' ? 'Enterprise' : 'Community'}
+      </span>
+    {/if}
   </div>
   <div class="right">
     <div
@@ -98,6 +122,27 @@
     font-size: 0.72rem;
     color: var(--text-secondary);
     white-space: nowrap;
+  }
+
+  /* Edition badge. Community is subtle (neutral chip); enterprise is
+     prominent (accent) so the distinction is unmistakable at a glance. */
+  .edition {
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    background: var(--surface-2, rgba(127, 127, 127, 0.15));
+    border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  }
+
+  .edition.enterprise {
+    color: #fff;
+    background: var(--accent, #6366f1);
+    border-color: var(--accent, #6366f1);
   }
   .right {
     display: flex;

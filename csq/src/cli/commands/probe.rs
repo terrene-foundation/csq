@@ -30,7 +30,7 @@ pub fn handle(base_dir: &Path, slot: Option<u16>, json: bool) -> Result<()> {
     // Round-2 redteam C7 — HOME is required: Cell 09 (Gemini Code Assist
     // OAuth) reads `~/.gemini/oauth_creds.json` (gemini-cli's
     // authoritative per-user state file, which csq does NOT relocate
-    // — see journal 0005 + journal 0006 FD-1). With `unwrap_or_default()`
+    // — see an internal journal entry + an internal journal entry FD-1). With `unwrap_or_default()`
     // an unset $HOME silently became `PathBuf::new()`, which then
     // resolves that path CWD-relative — an information-disclosure
     // footgun if the operator runs probe from inside a directory that

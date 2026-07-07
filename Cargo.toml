@@ -2,19 +2,43 @@
 resolver = "2"
 members = [
   "csq-core",
-  "csq",                      # Single-binary csq (issue #295).
+  "csq",                      # Single-binary csq (an internal ticket).
+  "csq-redact",              # W1 community leaf: token redaction + RedactedString (dep of csq-sdk).
+  "csq-sdk",                 # W2 public wire contract: SDK envelope/error/adapter + payload DTOs.
   "csq-ledger",              # M10 Foundation-owned transparency-log server.
 ]
 
 [workspace.package]
-version = "2.16.2"
+version = "2.17.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/terrene-foundation/csq"
 
 [workspace.dependencies]
+# csq-redact — community (Apache-2.0) leaf crate: token redaction + the
+# RedactedString newtype, extracted from csq-core (W1). csq-core re-exports it so
+# existing callsites are unchanged; the public csq-sdk (W2) depends on it directly.
+# `version` is REQUIRED alongside `path` (W3): csq-sdk is now publishable and
+# depends on csq-redact via `.workspace = true`, so `cargo publish -p csq-sdk`
+# needs a crates.io version on this dep (a bare path dep fails publish). Local
+# builds use the path; the published crate carries the version. This literal MUST
+# equal workspace.package.version. `/release` bumps workspace.package.version but
+# NOT these dep literals (nor the enterprise SDK crate's `=X.Y.Z` pin), so the
+# `version_pins_match_workspace` test in the enterprise SDK crate fails closed on drift
+# until W5 automates the bump — do NOT trust the /release flow to keep these in sync.
+csq-redact = { path = "csq-redact", version = "2.17.0" }
+# csq-sdk — public (Apache-2.0) SDK wire contract (W2): envelope/error/adapter +
+# payload DTOs. csq-core depends on it and re-exports it (crate::sdk::*); the
+# builders (EDITION + audit->DTO mapping) live app-side in csq-core. `version`
+# alongside `path` for the same publishability reason as csq-redact above; the same
+# `version_pins_match_workspace` guard covers this literal.
+csq-sdk = { path = "csq-sdk", version = "2.17.0" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` enables `serde_json::value::RawValue` — verbatim JSON capture used
+# by the audit-chain forward-compat path (`csq-core/src/audit/opaque.rs`) to
+# preserve byte-identity of unknown-kind records for canonical-hash recompute.
+# Declared explicitly rather than relying on a transitive activation (fail-safe).
+serde_json = { version = "1", features = ["raw_value"] }
 # `toml` parses + serializes TOML 1.0 documents. Added in PR-CA8 commit 2
 # for codex `config.toml` per-spawn merge per spec 10 §10.4.6.1. Exact-
 # minor-version pin per round-2 R2-H1: `toml::to_string` output is not
@@ -42,17 +66,17 @@ secrecy = { version = "0.10", features = ["serde"] }
 libc = "0.2"
 tempfile = "3"
 urlencoding = "2"
-# Date/time math for the Phase B' billing ledger (journal 0050). Used in
+# Date/time math for the Phase B' billing ledger (an internal journal entry). Used in
 # usage::ledger::summarize for rolling time-window aggregation. `default-
 # features = false` drops the platform-clock backend we don't need; we
 # pass our own `now` into summarize so deterministic tests work without
 # touching the real clock.
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
-# UUID v4 for identity-keyed account storage (issue #292 / A++ Phase 1).
+# UUID v4 for identity-keyed account storage (an internal ticket / A++ Phase 1).
 # `v4` is the only variant used (random UUIDs); `serde` enables round-trip
 # through identity store JSON files. First new runtime dep added since
-# v2.0.0; approval recorded in journal 0004 of the
-# account-slot-decoupling workspace per rules/independence.md Rule 3.
+# v2.0.0; approval recorded in an internal journal entry of the
+# an internal workspace workspace per rules/independence.md Rule 3.
 uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -99,14 +123,14 @@ secret-service = { version = "4", default-features = false, features = ["rt-toki
 # workspace dep gives a stable API surface and version pin in one place.
 regex = "1"
 # `async-trait` enables async methods on traits with object-safe vtables.
-# M01 (workspace `csq-pact-eatp-adoption`) introduces `audit::LedgerSink`
+# M01 (workspace `an internal workspace`) introduces `audit::LedgerSink`
 # whose `append` / `verify_at` methods are async and reachable through
 # `dyn LedgerSink` from the daemon. Until rustc stabilises async fn in
 # trait objects (rust-lang/rust#91611), the macro is the standard path.
 async-trait = "0.1"
 # `keyring` provides a single cross-platform API for OS keychain storage:
 # macOS Keychain, Linux Secret Service (D-Bus), Windows Credential Manager.
-# M04 (csq-pact-eatp-adoption) uses it for signing-key custody under the
+# M04 (an internal workspace) uses it for signing-key custody under the
 # `csq-audit-signing` service name. The per-platform-fidelity argument for
 # native crates doesn't apply to signing-key storage (simpler than OAuth
 # tokens); `keyring` ships one API across 3 platforms in one milestone.

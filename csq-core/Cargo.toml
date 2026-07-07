@@ -3,8 +3,22 @@ name = "csq-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# First-party workspace library, consumed as a path dep by `csq` — never
+# published to crates.io. Matches the `publish = false` on the sibling workspace
+# crates; also keeps csq-core out of the third-party attribution surface
+# (scripts/generate-third-party-licenses.sh).
+publish = false
 
 [dependencies]
+# csq-redact — community leaf holding `redact_tokens` + `RedactedString` (W1
+# extraction). Non-optional: both editions need error redaction + the audit
+# chain's RedactedString. csq-core re-exports it (crate::error::redact_tokens,
+# crate::audit::types::RedactedString) so existing callsites are unchanged.
+csq-redact.workspace = true
+# csq-sdk — the SDK wire contract (W2). csq-core re-exports it at crate::sdk and
+# supplies the app-side builders (EDITION + audit->DTO mapping). Non-optional: the
+# `csq exec/audit verify/sdk capabilities --json` surfaces are edition-uniform.
+csq-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -52,7 +66,7 @@ toml.workspace = true
 # `regex` is used by `audit::persist` to validate RULE_ID strings
 # against `^[A-Z][A-Z0-9-]{1,32}$` (B6 mitigation, spec 12 §12.5).
 regex.workspace = true
-# UUID v4 for identity-keyed account storage (issue #292 / A++ Phase 1).
+# UUID v4 for identity-keyed account storage (an internal ticket / A++ Phase 1).
 # Consumed only by `accounts::identity_store` in Phase 1; production
 # readers continue using slot-keyed paths until Phase 2. See workspace
 # todo `M1-phase1-identity-coexistence.md` for the migration trajectory.
@@ -63,7 +77,7 @@ uuid.workspace = true
 # only when `test-utils` feature is active. Never compiled into production binaries.
 tempfile = { workspace = true, optional = true }
 # `async-trait` is a hard requirement for the `audit::LedgerSink` trait
-# introduced in M01 (workspace `csq-pact-eatp-adoption`). The daemon
+# introduced in M01 (workspace `an internal workspace`). The daemon
 # drives sinks through `dyn LedgerSink`, which requires object-safe
 # async vtables. The macro is a build-time-only expansion; it adds no
 # runtime cost beyond the `Pin<Box<dyn Future>>` shape it generates.
@@ -79,6 +93,10 @@ keyring.workspace = true
 # The governance enforcement loop (phase2b::governance_loop) uses it to
 # validate provider responses against the response_format JSON Schema.
 jsonschema = { workspace = true, optional = true }
+# `futures-util` — `StreamExt::next` to consume the LLM token stream. Already in
+# the graph via reqwest; declared directly so the native loop can import it.
+futures-util = { version = "0.3", optional = true }
+shlex = { version = "1.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -92,6 +110,8 @@ security-framework.workspace = true
 # crate is unbuildable on macOS / Windows.
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service.workspace = true
+landlock = { version = "0.4.5", optional = true, default-features = false }
+seccompiler = { version = "0.5.0", optional = true, default-features = false }
 
 # Windows-only: low-level syscalls for session discovery (PEB
 # walking via NtQueryInformationProcess + ReadProcessMemory). The
@@ -178,6 +198,14 @@ azure-sql-sink = []
 # crate to the graph; the default build simply never compiles the sink body.
 # See spec 17 (csq-ledger protocol) and the `csq-ledger/` workspace crate.
 csq-ledger-sink = []
+# customer-body-store-sink: operator-residency sink (M3 T3.5). Enabling this
+# feature compiles `audit::impls::sinks::customer_body_store::CustomerBodyStoreSink`
+# (a `reqwest`-backed `LedgerSink` that POSTs full records to an operator-named
+# endpoint with optional bearer auth) and makes
+# `validate_sink_compiled_in("customer-body-store")` return Ok. Like
+# `csq-ledger-sink`, it reuses the non-optional `reqwest` dep — no new crate in
+# the graph; the default build never compiles the sink body.
+customer-body-store-sink = []
 
 [[bin]]
 name = "stub-cli"

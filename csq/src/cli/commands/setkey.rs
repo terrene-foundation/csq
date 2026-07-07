@@ -217,7 +217,7 @@ fn provision_vertex(base_dir: &Path, slot: AccountNum, sa_path: &Path) -> Result
     // and the synchronous `by_slot_identity` write fires for both. The
     // prior direct-`write_binding` shortcut was the FM-7 dual-path trap
     // (verbatim Codex F-C-2 class): wiring the identity write into core
-    // would have silently skipped this CLI path. Origin: journal 0001 D3.
+    // would have silently skipped this CLI path. Origin: an internal journal entry D3.
     let canon =
         provisioning::provision_vertex_sa(base_dir, slot, sa_path).map_err(map_provision_error)?;
 
@@ -436,7 +436,7 @@ enum KeyInputStep {
 ///   hit the wrong command. A previous revision pushed ESC into the
 ///   buffer as data, so `csq setkey mm --slot N` followed by ESC then
 ///   ENTER silently submitted a 1-byte key `"\x1b"` and left the slot
-///   bound to MiniMax with a garbage token. Journal 0058.
+///   bound to MiniMax with a garbage token. an internal journal entry
 /// * `0x04` (Ctrl-D) — cancel if buffer is empty, submit if non-empty
 /// * `0x08`, `0x7f` (backspace, DEL) — pop the last byte
 /// * `MAX_KEY_LEN` reached — `Err("key input too large")`

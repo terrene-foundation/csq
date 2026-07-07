@@ -5,7 +5,7 @@
 //!
 //! 1. Caller invokes [`start_login`] with a reference to the
 //!    [`OAuthStateStore`] and the target account number.
-//! 2. `start_login` generates a fresh [`CodeVerifier`], computes
+//! 2. `start_login` generates a fresh `CodeVerifier`, computes
 //!    its [`CodeChallenge`], stores the verifier + account in the
 //!    state store (keyed by a random state token), and returns a
 //!    [`LoginRequest`] containing the Anthropic authorize URL the

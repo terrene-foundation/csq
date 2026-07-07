@@ -6,7 +6,7 @@ use csq_core::rotation;
 use std::path::Path;
 
 pub fn handle(base_dir: &Path) -> Result<()> {
-    // Authority-first resolution (workspace slot-attribution-consistency):
+    // Authority-first resolution (workspace an internal workspace):
     // route through snapshot_account so `csq suggest` sees the same
     // self-healed slot as the statusline, not a raw (drift-prone) cache read.
     let current = super::current_config_dir()

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Foundation-owned, self-hostable transparency-log server for csq audit anchoring (M10)."
+# Server binary distributed as a built artifact, not a crates.io library.
+# publish = false is also REQUIRED for cargo-deny's `[bans] allow-wildcard-paths`
+# to exempt the `csq-core` path dep: allow-wildcard-paths does NOT apply to
+# publishable crates (crates.io disallows path deps). Both clear the bans check.
+publish = false
 
 # M10 — csq-ledger. A standalone HTTP/JSON transparency-log server built on
 # the RFC 6962 Merkle tree, native to csq's existing crypto (ed25519-dalek +

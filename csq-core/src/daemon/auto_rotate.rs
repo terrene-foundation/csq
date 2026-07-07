@@ -4,7 +4,7 @@
 //! repoints the active account whenever the current account's 5-hour
 //! quota exceeds the configured threshold.
 //!
-//! # PR-A1 structural fix (journal 0064, Option A); M4-8 retirement
+//! # PR-A1 structural fix (an internal journal entry, Option A); M4-8 retirement
 //!
 //! v2.0.0 shipped `rotation::swap::swap_to(base_dir, config_dir, target)`
 //! which writes target account M's `.credentials.json` INTO `config-N/`.
@@ -15,7 +15,7 @@
 //! that guard (which refused to run when any `term-*/` exists) with the
 //! structural fix: walk `term-<pid>/` handle dirs and call
 //! `handle_dir::repoint_handle_dir`, which atomically repoints symlinks
-//! WITHOUT touching `config-<N>/`. M4-8 (Phase 4, issue #292) deletes
+//! WITHOUT touching `config-<N>/`. M4-8 (Phase 4, an internal ticket) deletes
 //! the `rotation::swap::swap_to` writer entirely so the legacy path
 //! cannot resurface from any code site.
 //!
@@ -160,7 +160,7 @@ async fn run_loop(
 /// `Surface::ClaudeCode` account cannot be silently rotated to a
 /// `Surface::Codex` account because the two surfaces execute different
 /// CLI binaries with different `HOME`-like env contracts. Cross-surface
-/// rotation is explicitly a `csq swap` action (journal 0067 H3; spec 07
+/// rotation is explicitly a `csq swap` action (an internal journal entry H3; spec 07
 /// INV-P11).
 ///
 /// PR-C1 flip: pre-C1 this function trivially accepted every candidate
@@ -369,8 +369,32 @@ pub fn tick(
         // M3-4: `target_identity` is the UUID that `find_target` resolved
         // for this candidate at selection time.  Used for INFO telemetry
         // (not re-resolved here — avoids the TOCTOU race from HIGH-3).
+        //
+        // A4a — keychain treatment on the rotation event (review finding,
+        // race-interleaving lens). `repoint_handle_dir` rewrites the Anthropic
+        // symlinks but NOT the macOS keychain item CC reads (current CC is
+        // keychain-first). Without the same treatment `csq swap` applies, after the
+        // repoint this dir holds symlink=target while the PREVIOUS account's token
+        // lingers in the keychain — PERSISTENTLY, because the post-refresh sweep's
+        // newer-than guard (`sync_handle_dir`, account_changed=false) can REFUSE to
+        // overwrite a later-expiry stale token. Two consequences, both closed here:
+        //   1. CC keeps consuming the OLD (exhausted) account under the new-account
+        //      config until the stale token's TTL lapses — silently defeating the
+        //      rotation (pre-existing bug, independent of the custodian).
+        //   2. The daemon custodian's harvest could read that old token under the
+        //      new-account symlink and adopt it into the new account's GLOBAL store
+        //      (cross-account corruption).
+        // Mirror the swap path exactly: hold the per-dir swap lock so harvest skips
+        // this dir mid-rotation; clear the keychain BEFORE the repoint so the window
+        // (and any crash within it) leaves the item ABSENT rather than the wrong
+        // account's token; after a successful repoint, write the new account's token
+        // via the account-changed path (which bypasses the newer-than guard —
+        // Write, or ClearStale-delete when the new account has no valid token).
+        let _rebind_guard = crate::credentials::keychain::lock_handle_dir_for_swap(&handle_dir);
+        crate::credentials::keychain::clear_handle_dir(&handle_dir);
         match repoint_handle_dir(base_dir, claude_home, &handle_dir, target) {
             Ok(()) => {
+                let _ = crate::credentials::keychain::sync_handle_dir_account_changed(&handle_dir);
                 info!(
                     dir = %handle_dir.display(),
                     from = current_account.get(),
@@ -409,7 +433,7 @@ pub fn tick(
 /// first candidate is in the exclusion list, we iterate until we find
 /// one that isn't — or return None if no eligible account exists.
 ///
-/// # v2.1 scope (PR-C9a round-1 CRITICAL fix, journal 0021)
+/// # v2.1 scope (PR-C9a round-1 CRITICAL fix, an internal journal entry)
 ///
 /// Auto-rotate is **ClaudeCode-only** in v2.1. Pre-C9a this function
 /// used [`discovery::discover_anthropic`], which returned no records for
@@ -425,7 +449,7 @@ pub fn tick(
 ///    is resolved correctly.
 /// 2. Short-circuit (return `None`) if the current account's surface is
 ///    not `ClaudeCode`. Codex rotation, if ever added, requires an
-///    exec-replace pathway (journal 0019 §Q1 INV-P05 amendment, pending
+///    exec-replace pathway (an internal journal entry §Q1 INV-P05 amendment, pending
 ///    human approval) that the repoint-based rotator cannot deliver —
 ///    so the explicit refusal here is the correct v2.1 semantics.
 ///
@@ -1427,7 +1451,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Regression guard: journal 0021 finding 1 (CRITICAL).
+    /// Regression guard: an internal journal entry finding 1 (CRITICAL).
     ///
     /// A handle dir bound to a Codex slot MUST NOT be rotated by the
     /// auto-rotater. Pre-fix, `find_target` used `discover_anthropic`,
@@ -1505,7 +1529,7 @@ mod tests {
         );
     }
 
-    /// Regression guard: journal 0021 finding 1 second half.
+    /// Regression guard: an internal journal entry finding 1 second half.
     ///
     /// `find_target` must return `None` for a Codex current account
     /// regardless of what candidates exist. Before the fix, a Codex

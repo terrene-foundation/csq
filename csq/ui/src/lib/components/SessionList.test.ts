@@ -31,8 +31,8 @@ async function settle() {
 
 const SESSION_1 = {
   pid: 1234,
-  cwd: "/Users/esperie/repos/project-a",
-  config_dir: "/Users/esperie/.claude/accounts/term-1234",
+  cwd: "/Users/example/repos/project-a",
+  config_dir: "/Users/example/.claude/accounts/term-1234",
   account_id: 1,
   account_label: "Work",
   five_hour_pct: 25.0,
@@ -48,8 +48,8 @@ const SESSION_1 = {
 
 const SESSION_2 = {
   pid: 5678,
-  cwd: "/Users/esperie/repos/project-b",
-  config_dir: "/Users/esperie/.claude/accounts/term-5678",
+  cwd: "/Users/example/repos/project-b",
+  config_dir: "/Users/example/.claude/accounts/term-5678",
   account_id: 2,
   account_label: "Personal",
   five_hour_pct: 90.0,

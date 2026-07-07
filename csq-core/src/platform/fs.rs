@@ -10,7 +10,7 @@
 //! and `providers/gemini/provisioning.rs`. When a 5th subsystem adopts
 //! the pattern (e.g. Bedrock or Vertex provisioning), move the
 //! canonical doc into a doc-block on `unique_tmp_path` here per
-//! journal 0014 §FD #2 and journal 0073 §FD #2 so there is a single
+//! an internal journal entry §FD #2 and an internal journal entry §FD #2 so there is a single
 //! source of truth for the pipeline shape.
 
 use crate::error::PlatformError;
@@ -54,7 +54,7 @@ pub fn secure_file(path: &Path) -> Result<(), PlatformError> {
 /// acquires the per-account mutex, flips to 0o600 via [`secure_file`],
 /// writes via [`atomic_replace`], then calls this helper to flip back to
 /// 0o400 before releasing the mutex. Derived from spec 07 INV-P08
-/// (credential mode-flip mutex coordination) + workspaces/codex/01-analysis
+/// (credential mode-flip mutex coordination) + internal-design-docs
 /// risk-analysis §2 R7 / ADR-C13.
 ///
 /// No-op on Windows — ACL defaults produce read/write for the owner, and
@@ -174,7 +174,7 @@ fn atomic_replace_windows(tmp_path: &Path, target: &Path) -> Result<(), Platform
 /// Creates a symlink at `link` pointing to `target`, failing if `link` already exists.
 ///
 /// This is the cross-platform primitive for atomic-exclusive symlink creation.
-/// It underpins the handle-dir model (Phase 3 of issue #292 A++): each
+/// It underpins the handle-dir model (Phase 3 of an internal ticket A++): each
 /// `term-<pid>/` handle dir's symlinks are created via this function so that
 /// two concurrent `csq swap` calls against the same link path produce exactly
 /// one winner.
@@ -220,7 +220,7 @@ pub fn symlink_exclusive(target: &Path, link: &Path) -> Result<(), PlatformError
 /// Bumps `path`'s modification time strictly above `min_mtime_ns` and the
 /// file's current mtime, advancing to at least `now()`.
 ///
-/// Issue #270 fix: `csq swap N` repoints `handle_dir/.credentials.json`'s
+/// an internal ticket fix: `csq swap N` repoints `handle_dir/.credentials.json`'s
 /// symlink to `config-<N>/.credentials.json`. CC re-stats the symlink before
 /// every API call and reloads credentials only when
 /// `mtimeMs !== lastCredentialsMtimeMs` (spec 01 §1.4 — strict inequality).
@@ -268,7 +268,7 @@ pub fn bump_mtime_above(path: &Path, min_mtime_ns: i128) -> Result<(), PlatformE
     // the strict-advance invariant. POSIX nanosecond-resolution filesystems
     // (ext4, APFS, btrfs) preserve 100ns increments trivially, so 100 is the
     // smallest cross-platform value that guarantees strict advance. Origin:
-    // issue #437 (Windows test `bump_mtime_above_advances_when_baseline_is_in_future`).
+    // an internal ticket (Windows test `bump_mtime_above_advances_when_baseline_is_in_future`).
     const MTIME_TICK_NS: i128 = 100;
     let target_ns = now_ns
         .max(min_mtime_ns.saturating_add(MTIME_TICK_NS))
@@ -303,7 +303,7 @@ pub fn bump_mtime_above(path: &Path, min_mtime_ns: i128) -> Result<(), PlatformE
     //   require it implicitly for any attribute manipulation). This is the
     //   minimum-privilege handle that satisfies `SetFileTime` and does NOT
     //   require `GENERIC_WRITE`, so files whose Windows ACLs deny write data
-    //   still allow the mtime bump. Origin: issue #437.
+    //   still allow the mtime bump. Origin: an internal ticket.
     #[cfg(unix)]
     let file = std::fs::OpenOptions::new().read(true).open(path)?;
 
@@ -331,7 +331,7 @@ pub fn bump_mtime_above(path: &Path, min_mtime_ns: i128) -> Result<(), PlatformE
 /// have a test using this helper (or an inline duplicate in csq-cli /
 /// csq-desktop, which cannot reach `pub(crate)` across crate boundaries).
 ///
-/// Origin: security.md §5a, journal 0065 B2, /redteam round 3 (2026-05-09).
+/// Origin: security.md §5a, an internal journal entry B2, /redteam round 3 (2026-05-09).
 #[cfg(all(test, unix))]
 pub(crate) fn assert_no_tmp_leak_on_readonly_parent<F, E>(dir: &std::path::Path, op: F)
 where
@@ -539,11 +539,11 @@ mod tests {
     /// path (`identities/<UUID>/credentials.json`).  The file is placed under
     /// an identity-style directory structure to prove that `bump_mtime_above`
     /// works correctly regardless of whether the file is at a slot path or an
-    /// identity path.  This pins journal 0013 D3 (test fixture matches production
+    /// identity path.  This pins an internal journal entry D3 (test fixture matches production
     /// permission mode) for the identity-keyed case.
     ///
     /// The key invariant: `bump_mtime_above` uses `OpenOptions::new().read(true)`
-    /// (POSIX `futimens` requires ownership, not write permission — journal 0013 D1).
+    /// (POSIX `futimens` requires ownership, not write permission — an internal journal entry D1).
     /// Using `O_RDONLY` means a 0o400 file owned by the caller is accessible;
     /// `O_WRONLY` would fail with `EACCES` even for the owner on POSIX.
     #[cfg(unix)]

@@ -47,22 +47,25 @@ src-tauri/                   — Rust backend
 
 ## Rules
 
-| Concern                   | Rule File                              |
-| ------------------------- | -------------------------------------- |
-| Account/Terminal arch     | `rules/account-terminal-separation.md` |
-| No stubs/placeholders     | `rules/no-stubs.md`                    |
-| Security (secrets)        | `rules/security.md`                    |
-| Git workflow              | `rules/git.md`                         |
-| Zero tolerance            | `rules/zero-tolerance.md`              |
-| Testing                   | `rules/testing.md`                     |
-| User-path verification    | `rules/user-path-verification.md`      |
-| Sentinel-clearing parity  | `rules/sentinel-clearing-parity.md`    |
-| Reconciler cleanup parity | `rules/reconciler-cleanup-parity.md`   |
-| Svelte patterns           | `rules/svelte-patterns.md`             |
-| Tauri patterns            | `rules/tauri-patterns.md`              |
-| Tauri commands            | `rules/tauri-commands.md`              |
-| Rule authoring            | `rules/rule-authoring.md`              |
-| Specs authority           | `rules/specs-authority.md`             |
+| Concern                    | Rule File                              |
+| -------------------------- | -------------------------------------- |
+| Account/Terminal arch      | `rules/account-terminal-separation.md` |
+| No stubs/placeholders      | `rules/no-stubs.md`                    |
+| Security (secrets)         | `rules/security.md`                    |
+| Git workflow               | `rules/git.md`                         |
+| Zero tolerance             | `rules/zero-tolerance.md`              |
+| Testing                    | `rules/testing.md`                     |
+| User-path verification     | `rules/user-path-verification.md`      |
+| Sentinel-clearing parity   | `rules/sentinel-clearing-parity.md`    |
+| Reconciler cleanup parity  | `rules/reconciler-cleanup-parity.md`   |
+| Svelte patterns            | `rules/svelte-patterns.md`             |
+| Tauri patterns             | `rules/tauri-patterns.md`              |
+| Tauri commands             | `rules/tauri-commands.md`              |
+| Rule authoring             | `rules/rule-authoring.md`              |
+| Specs authority            | `rules/specs-authority.md`             |
+| Evidence-first claims      | `rules/evidence-first-claims.md`       |
+| Verify claims before write | `rules/verify-claims-before-write.md`  |
+| Value prioritization       | `rules/value-prioritization.md`        |
 
 ## Agents
 

@@ -172,7 +172,7 @@ where
             // include `serde_json::Error` or upstream HTTP body bytes that
             // echo the submitted refresh token back. Redact before storing
             // in the `reason` field (which is surfaced via `RefreshStatus`
-            // → IPC → frontend). Per security.md MUST Rule 8 / journal 0010.
+            // → IPC → frontend). Per security.md MUST Rule 8 / an internal journal entry
             Ok(BrokerResult::Failed(BrokerError::RefreshFailed {
                 account: account.get(),
                 reason: crate::error::redact_tokens(&primary_err.to_string()),

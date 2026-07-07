@@ -535,6 +535,7 @@ fn build_seam_record(
         eatp_start_ts: None,
         eatp_end_ts: None,
         op_phase: None,
+        verification_level: None,
     })
 }
 
@@ -802,6 +803,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         init_mock_keyring();
         let dir = tmp();
         let base = dir.path();
@@ -840,6 +843,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         init_mock_keyring();
         let dir = tmp();
         let base = dir.path();
@@ -950,6 +955,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         use crate::audit::dev_identity::enrollment::{enroll_developer, Granularity};
         use crate::audit::seam::registry::TEST_VERSION;
 
@@ -1134,6 +1141,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         use crate::audit::seam::registry::TEST_VERSION;
 
         let dir = tmp();
@@ -1284,6 +1293,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = tmp();
         let base = dir.path();
         init_test_signing_key(base);
@@ -1380,6 +1391,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = tmp();
         let base = dir.path();
         init_test_signing_key(base);
@@ -1435,6 +1448,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = tmp();
         let base = dir.path();
         init_test_signing_key(base);
@@ -1498,6 +1513,8 @@ mod tests {
         // verify_chain -> resolve_registry reads CSQ_AUDIT_EDITION; hold the shared env
         // lock so this test does not race the enterprise-edition tests (testing.md Rule 6).
         let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         use crate::audit::seam::frontier::canonical_ts_for_test;
         let dir = tmp();
         let base = dir.path();

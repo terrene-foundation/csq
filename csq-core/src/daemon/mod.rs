@@ -41,6 +41,7 @@ pub mod client;
 #[cfg(windows)]
 pub mod client_windows;
 pub mod coc_cache_sweeper;
+pub mod custodian;
 pub mod detect;
 pub mod identity_mint;
 pub mod lifecycle;
@@ -81,7 +82,8 @@ pub use usage_poller::{spawn as spawn_usage_poller, HttpGetFn, HttpPostProbeFn, 
 #[cfg(unix)]
 pub use client::{
     http_get_unix, http_get_unix_with_timeout, http_post_unix, http_post_unix_json,
-    notify_slot_swap, DaemonClientError, DaemonResponse, DEFAULT_TIMEOUT,
+    http_post_unix_json_with_headers, notify_slot_swap, DaemonClientError, DaemonResponse,
+    DEFAULT_TIMEOUT,
 };
 // Cross-platform router types.
 pub use server::{router, HealthResponse, ServerHandle};

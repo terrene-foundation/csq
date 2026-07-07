@@ -20,7 +20,7 @@
     // Show minutes through the entire final 2h. A healthy token is topped up
     // by the daemon at the 2h refresh window, so the 1h–2h band is the live
     // pending-refresh countdown — flooring it to a static "1h" (the old
-    // `< 3600` cutoff) read as a stuck token (journal 0062 Q3). Minutes make
+    // `< 3600` cutoff) read as a stuck token (an internal journal entry Q3). Minutes make
     // it legible as a countdown: "119m" → "61m".
     if (secs < 7200) return `${Math.floor(secs / 60)}m`;
     if (secs < 86400) return `${Math.floor(secs / 3600)}h`;

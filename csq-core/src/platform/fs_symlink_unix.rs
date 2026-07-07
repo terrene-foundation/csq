@@ -23,7 +23,7 @@
 //! parent is rejected (`ENOTDIR` / `ELOOP`), preventing directory traversal
 //! via a malicious parent symlink.
 //!
-//! Origin: issue #292 Phase 1 M1-3.
+//! Origin: an internal ticket Phase 1 M1-3.
 
 use crate::error::PlatformError;
 use libc::c_int;

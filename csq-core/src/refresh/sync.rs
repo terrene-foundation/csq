@@ -77,7 +77,7 @@ pub fn backsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     let _guard = lock::lock_file(&lock_path)?;
 
     // Re-read canonical inside lock (monotonicity guard AND
-    // subscription-metadata preservation source, journal 0063 P1-1).
+    // subscription-metadata preservation source, an internal journal entry P1-1).
     //
     // VP-H2 (HIGH): distinguish NotFound from Corrupt. Previously `.ok()`
     // collapsed both into None. If the canonical file is CORRUPT (not
@@ -369,7 +369,7 @@ mod tests {
         );
     }
 
-    /// Regression for journal 0063 P1-1: when live.subscription_type is
+    /// Regression for an internal journal entry P1-1: when live.subscription_type is
     /// None (Anthropic's token endpoint doesn't include it; CC backfills
     /// on first API call), backsync must preserve canonical's Some(max)
     /// rather than overwriting with None. Without the guard, the user's

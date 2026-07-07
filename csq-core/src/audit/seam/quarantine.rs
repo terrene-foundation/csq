@@ -91,7 +91,9 @@ pub fn quarantine_event(
 ///
 /// Returns the path written on success.
 pub fn park_unknown_version(base: &Path, raw: &[u8], version: &str) -> Result<PathBuf, SeamError> {
-    let dir = base.join("csq-runs").join(".pending").join("provenance");
+    let dir = base
+        .join("csq-runs")
+        .join(crate::audit::outbox_paths::SEAM_PROVENANCE_SUBDIR);
     std::fs::create_dir_all(&dir).inspect_err(|_| {
         tracing::warn!(
             error_kind = "seam_pending_mkdir_failed",

@@ -1,7 +1,7 @@
 //! Per-slot lifecycle sentinels: config-dir scanning + broker-failed
 //! flag persistence.
 //!
-//! Phase 4 M4-6 (issue #292): migrated from `broker::fanout` to
+//! Phase 4 M4-6 (an internal ticket): migrated from `broker::fanout` to
 //! `refresh::sentinel`. The module's surviving responsibility is the
 //! per-slot failure marker (`credentials/{N}.broker-failed`) plus the
 //! `scan_config_dirs` helper used by the desktop swap command to find
@@ -141,7 +141,7 @@ pub fn read_broker_failed_reason(base_dir: &Path, account: AccountNum) -> Option
 /// success boundaries that should clear the flag MUST be added BOTH here
 /// AND at the callsite (paired update, never one without the other).
 ///
-/// **Current callers (9 sites — keep this list current):**
+/// **Current callers (11 sites — keep this list current):**
 ///
 /// 1. `refresh::check::broker_check` early-return Valid path
 ///    (`csq-core/src/refresh/check.rs:89`) — daemon-tick observed that
@@ -167,9 +167,19 @@ pub fn read_broker_failed_reason(base_dir: &Path, account: AccountNum) -> Option
 ///    (`csq-core/src/providers/codex/desktop_login.rs:268`) — desktop
 ///    counterpart to (7).
 /// 9. `accounts::login::finalize_login`
-///    (`csq-core/src/accounts/login.rs:426`) — Anthropic OAuth login
+///    (`csq-core/src/accounts/login.rs`) — Anthropic OAuth login
 ///    success; the rule's first instance (predates `sentinel-clearing-
 ///    parity.md`).
+/// 10. `daemon::custodian::reconcile_account` adopt-success
+///     (`csq-core/src/daemon/custodian.rs`) — the custodian adopted a
+///     server-confirmed-live+owned token into the store; any prior
+///     broker_failed flag is obsolete.
+/// 11. `cli::commands::repair::apply_contaminated_heal`
+///     (`csq/src/cli/commands/repair.rs`) — `csq repair
+///     --heal-contaminated --apply` cleared a slot's
+///     cross-account-contaminated store token (an internal ticket heal); the flag
+///     from that dead token is now obsolete. `sentinel-clearing-parity.md`
+///     Rule 1 names `csq repair --apply` as a resolution boundary.
 ///
 /// **Audit primitive (per `sentinel-clearing-parity.md` Rule 1):**
 ///
@@ -178,7 +188,7 @@ pub fn read_broker_failed_reason(base_dir: &Path, account: AccountNum) -> Option
 ///   | grep -v test | grep -v '/sentinel.rs'
 /// ```
 ///
-/// Should return exactly 9 callsites matching the enumeration above. A
+/// Should return exactly 11 callsites matching the enumeration above. A
 /// match outside the enumeration is either a new caller that MUST be
 /// added to this docstring (paired-update discipline) or an unauthorized
 /// site to investigate.

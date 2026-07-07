@@ -50,32 +50,24 @@ impl ModelCatalog {
                 },
                 // MiniMax
                 ModelInfo {
-                    id: "MiniMax-M2.7-highspeed".into(),
-                    name: "MiniMax M2.7 (high-speed)".into(),
+                    id: "MiniMax-M3".into(),
+                    name: "MiniMax M3".into(),
                     provider: "mm".into(),
-                    context_window: Some(245_760),
+                    context_window: Some(1_000_000),
                     output_limit: Some(8_192),
-                    aliases: vec![
-                        "m2".into(),
-                        "m2.7".into(),
-                        "minimax-m2".into(),
-                        "minimax-m2.7".into(),
-                        "highspeed".into(),
-                    ],
+                    aliases: vec!["m3".into(), "minimax-m3".into(), "mm-m3".into()],
                 },
-                // Z.AI
+                // Z.AI — `glm-5.2[1m]` is the 1M-context variant (Z.AI docs:
+                // append the `[1m]` suffix to enable the 1,000,000-token window).
+                // Bracket-free aliases (`glm`, `glm-5.2`) let `csq models switch`
+                // resolve it without shell-quoting the `[1m]` glob.
                 ModelInfo {
-                    id: "glm-5.1".into(),
-                    name: "GLM 5.1".into(),
+                    id: "glm-5.2[1m]".into(),
+                    name: "GLM 5.2 (1M context)".into(),
                     provider: "zai".into(),
-                    context_window: Some(200_000),
+                    context_window: Some(1_000_000),
                     output_limit: Some(8_192),
-                    aliases: vec![
-                        "glm".into(),
-                        "glm-4".into(),
-                        "glm-4.6".into(),
-                        "glm-5".into(),
-                    ],
+                    aliases: vec!["glm".into(), "glm-5.2".into(), "glm-5".into()],
                 },
                 // Gemini — static list per FR-G-UI-02 / ADR-G08.
                 // `auto` is handled as a literal in the
@@ -122,7 +114,14 @@ impl ModelCatalog {
                     id: "deepseek-v4-pro".into(),
                     name: "DeepSeek V4 Pro".into(),
                     provider: "deepseek".into(),
-                    context_window: Some(128_000),
+                    // DeepSeek V4 Pro ships a 1M-token context window (maintainer-confirmed
+                    // 2026-07-05). CONSUMED by the statusline context-% recompute: the CLI
+                    // (`statusline.rs`) resolves this window from the slot's settings.json
+                    // model id (`providers::settings::model_id_for_slot`) and sets
+                    // `StatuslineContext::ctx_window_true`, so `format.rs` recomputes the %
+                    // against 1M instead of trusting CC's ~200k assumption for the
+                    // Anthropic-compatible endpoint (which rendered 177k → 89% instead of ~18%).
+                    context_window: Some(1_000_000),
                     output_limit: Some(8_192),
                     aliases: vec!["ds-pro".into(), "deepseek-pro".into(), "v4-pro".into()],
                 },
@@ -223,6 +222,20 @@ mod tests {
 
         let mm = cat.by_provider("mm");
         assert!(mm.iter().all(|m| m.provider == "mm"));
+    }
+
+    #[test]
+    fn deepseek_v4_pro_context_window_is_1m() {
+        // DeepSeek V4 Pro is a 1M-token context model (maintainer-confirmed 2026-07-05);
+        // a stale 128k value under-states the true window (and would drive a wrong
+        // context-% once the statusline consumes the catalog window).
+        let cat = ModelCatalog::default_catalog();
+        let m = cat
+            .find("deepseek-v4-pro")
+            .expect("deepseek-v4-pro in catalog");
+        assert_eq!(m.context_window, Some(1_000_000));
+        // aliases still resolve to the 1M entry.
+        assert_eq!(cat.find("ds-pro").unwrap().context_window, Some(1_000_000));
     }
 
     #[test]

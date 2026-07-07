@@ -22,7 +22,7 @@ Patch release making `csq doctor` honest on healthy, fully-migrated hosts. Two d
 
 ## [2.13.0] — 2026-05-26
 
-**A++ CLOSEOUT** plus two desktop-prefs robustness shards. The headline is the M4-13 deletion of the v1 `profiles.json::accounts` field (deprecated v2.10.0 / M4-9, soaked 6 minor versions v2.6 → v2.12; issue #292 closed). The soak gate is satisfied: the RN1-D R3 reconciler pass (`prune_redundant_accounts_entries`, shipped v2.12.0) drained all recoverable populated `accounts` maps from every upgraded host on daemon start, so the `detect_v1_accounts_field` (`accounts.len() > 0`) WINDOW-CLOSE predicate cannot fire on any v2.12.0+ host. The field is gone from the production struct; pre-M4-13 on-disk files load cleanly via the `#[serde(flatten)]` backward-compat hatch. Bundled in the same cut: a corrupt-`desktop-prefs.json` disclosure banner and the typed `PrefsLock` / `mutate_prefs` refactor.
+**A++ CLOSEOUT** plus two desktop-prefs robustness shards. The headline is the M4-13 deletion of the v1 `profiles.json::accounts` field (deprecated v2.10.0 / M4-9, soaked 6 minor versions v2.6 → v2.12; an internal ticket closed). The soak gate is satisfied: the RN1-D R3 reconciler pass (`prune_redundant_accounts_entries`, shipped v2.12.0) drained all recoverable populated `accounts` maps from every upgraded host on daemon start, so the `detect_v1_accounts_field` (`accounts.len() > 0`) WINDOW-CLOSE predicate cannot fire on any v2.12.0+ host. The field is gone from the production struct; pre-M4-13 on-disk files load cleanly via the `#[serde(flatten)]` backward-compat hatch. Bundled in the same cut: a corrupt-`desktop-prefs.json` disclosure banner and the typed `PrefsLock` / `mutate_prefs` refactor.
 
 ### Added
 
@@ -30,19 +30,19 @@ Patch release making `csq doctor` honest on healthy, fully-migrated hosts. Two d
 
 ### Removed
 
-- **`profiles.json::accounts` field deleted from `ProfilesFile`.** The `pub accounts: HashMap<String, AccountProfile>` struct field and the `pub struct AccountProfile` type are removed from production code. Pre-M4-13 on-disk files containing `accounts: {...}` are absorbed into `ProfilesFile::extra` via `#[serde(flatten)]`; the data is still accessible to reconciler passes through `legacy_accounts_email_map`. The `AccountProfile` struct and test helpers (`set_profile`, `accounts_for_test`) are retained under `#[cfg(any(test, feature = "test-utils"))]` for test fixtures that need to stage pre-M4-13 on-disk shapes. (issue #292 M4-13)
+- **`profiles.json::accounts` field deleted from `ProfilesFile`.** The `pub accounts: HashMap<String, AccountProfile>` struct field and the `pub struct AccountProfile` type are removed from production code. Pre-M4-13 on-disk files containing `accounts: {...}` are absorbed into `ProfilesFile::extra` via `#[serde(flatten)]`; the data is still accessible to reconciler passes through `legacy_accounts_email_map`. The `AccountProfile` struct and test helpers (`set_profile`, `accounts_for_test`) are retained under `#[cfg(any(test, feature = "test-utils"))]` for test fixtures that need to stage pre-M4-13 on-disk shapes. (an internal ticket M4-13)
 
 ### Changed
 
-- **`get_email()` resolution order simplified.** The former step (2) — `accounts[N].email` legacy compat — is removed. The method now resolves: (1) `by_slot_label[N]`, (2) `by_slot_identity[N]`, (3) `by_slot[N] → UUID → by_email`. Every slot that had an `accounts[N]` entry recoverable via another channel has had it pruned by the RN1-D R3 pass; genuinely unrecoverable entries were already holding the WINDOW-CLOSE gate open (correct behavior — they needed re-login). (issue #292 M4-13)
+- **`get_email()` resolution order simplified.** The former step (2) — `accounts[N].email` legacy compat — is removed. The method now resolves: (1) `by_slot_label[N]`, (2) `by_slot_identity[N]`, (3) `by_slot[N] → UUID → by_email`. Every slot that had an `accounts[N]` entry recoverable via another channel has had it pruned by the RN1-D R3 pass; genuinely unrecoverable entries were already holding the WINDOW-CLOSE gate open (correct behavior — they needed re-login). (an internal ticket M4-13)
 
 ### Internal
 
-- **New public API `legacy_accounts_email_map(pf: &ProfilesFile) -> HashMap<String, String>`.** Reads `extra["accounts"]` for any reconciler pass that needs to inspect legacy data still present in the flatten hatch. Made `pub` (not `pub(crate)`) to allow `doctor.rs` in the `csq` crate to call it. (issue #292 M4-13)
-- **4 production callsites migrated.** `identity_mint.rs`, `doctor.rs`, and the `prune_redundant_accounts_entries` internal reader all updated to use `legacy_accounts_email_map`. Test-only callsites across 9 files updated to use `set_profile` / `accounts_for_test`. (issue #292 M4-13)
-- **2 new regression tests** for the backward-compat hatch: `profiles_load_tolerates_v1_accounts_field_via_flatten` and `profiles_round_trip_preserves_v1_accounts_via_extra`. Both cover the `#[serde(flatten)]` absorption path that prevents data loss on load of a pre-M4-13 profiles file. (issue #292 M4-13)
-- **Spec 02 rev 1.19.0.** INV-07 retitled to record A++ completion and issue #292 closure. M4-13 deletion record added. `get_email()` priority table updated. Per `rules/specs-authority.md` MUST Rule 4.
-- **CLOSEOUT journal** `workspaces/account-slot-decoupling/journal/0068-CLOSEOUT-a-plus-plus-shipped.md` documents the full A++ roadmap (23 milestones across 10 sessions), the M4-13 implementation record, and the reconciler-cleanup-parity Rule 6 consumer-detection audit. Issue #292 is declared CLOSED.
+- **New public API `legacy_accounts_email_map(pf: &ProfilesFile) -> HashMap<String, String>`.** Reads `extra["accounts"]` for any reconciler pass that needs to inspect legacy data still present in the flatten hatch. Made `pub` (not `pub(crate)`) to allow `doctor.rs` in the `csq` crate to call it. (an internal ticket M4-13)
+- **4 production callsites migrated.** `identity_mint.rs`, `doctor.rs`, and the `prune_redundant_accounts_entries` internal reader all updated to use `legacy_accounts_email_map`. Test-only callsites across 9 files updated to use `set_profile` / `accounts_for_test`. (an internal ticket M4-13)
+- **2 new regression tests** for the backward-compat hatch: `profiles_load_tolerates_v1_accounts_field_via_flatten` and `profiles_round_trip_preserves_v1_accounts_via_extra`. Both cover the `#[serde(flatten)]` absorption path that prevents data loss on load of a pre-M4-13 profiles file. (an internal ticket M4-13)
+- **Spec 02 rev 1.19.0.** INV-07 retitled to record A++ completion and an internal ticket closure. M4-13 deletion record added. `get_email()` priority table updated. Per `rules/specs-authority.md` MUST Rule 4.
+- **CLOSEOUT journal** `internal-design-docs` documents the full A++ roadmap (23 milestones across 10 sessions), the M4-13 implementation record, and the reconciler-cleanup-parity Rule 6 consumer-detection audit. an internal ticket is declared CLOSED.
 - **Typed `PrefsLock` newtype + `mutate_prefs` helper for `desktop-prefs.json`.** Replaces the manually acquired `Arc<Mutex<()>>` pattern in `AppState.desktop_prefs_lock` with a `PrefsLock` newtype whose `mutate_prefs` helper enforces lock acquisition in the type system. `load_desktop_prefs` / `save_desktop_prefs` visibility tightened to `pub(in crate::desktop)` so the only write path crossing the module boundary is `mutate_prefs`. The two production mutation callsites (`apply_and_persist_dock_hidden` + `apply_and_persist_dashboard_at_launch`) are refactored to use the helper; `apply_and_persist_dock_hidden_locked` removed. Five new tests cover persistence, pre-mutation state observation, concurrent serialization (`Barrier`-coordinated), save-failure propagation, and mutex poison recovery. (#573)
 
 ---
@@ -104,7 +104,7 @@ Patch release closing the per-identity probe correctness work begun in v2.10.0 a
 
 ### Fixed
 
-- **`csq probe --provider codex` reads per-identity credentials.** Before this release, the codex probe loaded `~/.codex/auth.json` regardless of which slot was being probed — a leftover of the pre-A++ user-global model that survived the per-identity refactor at PR #500. Multi-codex-slot installs were structurally incapable of per-slot diagnosis. The dispatcher now resolves the slot to its UUID via `resolve_slot_to_uuid` and reads `identities/<UUID>/credentials-codex.json` (post-A++ path), falling back to `credentials/codex-<N>.json` only when the `by_slot` mapping is empty (pre-A++ installs). Spec 11 §11.2 updated to document the per-identity prerequisite. Closes `rules/account-terminal-separation.md` MUST NOT Rule 4 ("Diagnostic Surfaces Read From The Same Credential Channel As Daemon Production Paths") — adopted across `csq doctor` and `csq status` in the same cycle. (#540, closes #534)
+- **`csq probe --provider codex` reads per-identity credentials.** Before this release, the codex probe loaded `~/.codex/auth.json` regardless of which slot was being probed — a leftover of the pre-A++ user-global model that survived the per-identity refactor at an internal ticket. Multi-codex-slot installs were structurally incapable of per-slot diagnosis. The dispatcher now resolves the slot to its UUID via `resolve_slot_to_uuid` and reads `identities/<UUID>/credentials-codex.json` (post-A++ path), falling back to `credentials/codex-<N>.json` only when the `by_slot` mapping is empty (pre-A++ installs). Spec 11 §11.2 updated to document the per-identity prerequisite. Closes `rules/account-terminal-separation.md` MUST NOT Rule 4 ("Diagnostic Surfaces Read From The Same Credential Channel As Daemon Production Paths") — adopted across `csq doctor` and `csq status` in the same cycle. (#540, closes #534)
 - **`codex-wrong-variant-binding` classification + `csq doctor` surfacing.** Closes the v2.10.0 #520 follow-up. A codex-prefixed credential file whose payload parses as Anthropic shape (the `cf.codex().is_none()` arm at `discover_codex`) was previously `continue`d silently; now classified as `Skipped` with `cell="codex-wrong-variant-binding"` and exit 64, and `csq doctor` surfaces such slots in its report. Spec 11 → rev 1.0.4. (#524, #528, closes #520)
 - **`SkipReason::NoCredentials` path leak fixed across the probe module + `$HOME` redaction across CLI operator surfaces.** Closes the v2.10.0 #516 follow-up. The `NoCredentials` diagnostic previously interpolated the absolute identity-store path; now uses path-free fixed-vocabulary. Companion sweep redacts `$HOME` prefixes from operator-facing path output across the CLI surface. (#527, #529, closes #516)
 - **Codex-only slot UUID minting at `csq login` + Phase-4 gate codex-only-aware.** `csq login N --provider codex` on a codex-only slot now mints a UUID at login time; the daemon's Phase-4 gate Check 3 no longer false-fails on slots that legitimately have no Anthropic credentials (codex-only slots by design). Resolves the regression where the v2.10.0 install of the daemon refused to start against a codex-only-slot host state. (#530, #531)
@@ -169,14 +169,14 @@ Minor release making non-OAuth slots durable. Before this release, slots authent
 
 - **M4-12 numeric-writer retirement (#487).** Retired the legacy numeric canonical writer alongside the RN1-C reader-fallback removal — load-bearing prerequisite for the v2.11.0 paired-cleanup half (`prune_legacy_credential_mirrors`).
 - **RN1-F (terminal `accounts`-field deletion) advances one soak cycle** — soak-gated by design (WINDOW-CLOSE N=2). The `by_slot_identity` channel shipped here is its prerequisite; RN1-F itself lands a later cycle.
-- Changelog backfill v2.7.6→v2.8.0; workspace closeouts for the by_slot_identity and non-oauth-slot-identity efforts; the WINDOW-CLOSE release-N+1 runbook gate; two repo-wide `/sweep` audits.
+- Changelog backfill v2.7.6→v2.8.0; workspace closeouts for the by_slot_identity and an internal workspace efforts; the WINDOW-CLOSE release-N+1 runbook gate; two repo-wide `/sweep` audits.
 - **macOS auto-updater trust chain unchanged** — Developer ID signed + notarized + stapled; minisign pubkey `F1C2F7FD79F952DD` (since v2.7.0).
 
 ---
 
 ## [2.8.0] — 2026-05-16
 
-Minor release closing the v2.7.8 retro-fix arc and shipping `.coc/`-gated capability auto-engage. First stable cut that exercises the maintainer-signed-macOS pipeline introduced in v2.7.8 end-to-end; three updater-pipeline defects surfaced by the v2.7.8 retro-fix execution are resolved at the source so subsequent cuts no longer need post-hoc patching. Closing journal 0054, tag `60d29d1`.
+Minor release closing the v2.7.8 retro-fix arc and shipping `.coc/`-gated capability auto-engage. First stable cut that exercises the maintainer-signed-macOS pipeline introduced in v2.7.8 end-to-end; three updater-pipeline defects surfaced by the v2.7.8 retro-fix execution are resolved at the source so subsequent cuts no longer need post-hoc patching. Closing an internal journal entry, tag `60d29d1`.
 
 ### Fixed
 
@@ -212,7 +212,7 @@ First maintainer-signed stable macOS bundle. Introduces Developer ID signing and
 - **Maintainer-signed macOS release bundles via Developer ID + notarization.** `release.yml` gains a stable-tag-only job that imports the maintainer's Developer ID certificate from the runner keychain, signs both the `.app` and the updater `.tar.gz`, submits to Apple notarization, and staples the ticket. The DMG and updater artifacts attached to the GitHub release are first-class signed-and-notarized bundles — Gatekeeper accepts them without right-click-Open ceremony. (#466)
 - **macOS Developer ID signing + notarization runbook.** New `docs/release-signing.md` documents the 1Password-managed signing identity, notarytool credential profile, end-to-end signing sequence, and recovery steps for common failures (keychain locked, certificate expired, notarization rejection). (#465)
 - **Top-level `phase-4-incomplete` alarm in `csq doctor`; doctor `schema_version` bumped to 5.** Surfaces partial-migration state at the top of the doctor output instead of buried inside per-slot rows, so users on a partial v2.7.3→v2.7.7 upgrade see the alarm immediately. (#463)
-- **`csq doctor --repair-identities` + Phase-4 gate self-heal from legacy credentials.** When `phase4_gate_check` detects an unseeded `identities/<UUID>/credentials.json` with the legacy `credentials/<N>.json` still on disk, the daemon now self-heals by materializing the identity-keyed file from the legacy source. `csq doctor --repair-identities` exposes the same self-heal on demand for users skipping daemon startup. Closes the v2.7.3→v2.7.7 upgrade-skip class surfaced by journal 0040. (#462)
+- **`csq doctor --repair-identities` + Phase-4 gate self-heal from legacy credentials.** When `phase4_gate_check` detects an unseeded `identities/<UUID>/credentials.json` with the legacy `credentials/<N>.json` still on disk, the daemon now self-heals by materializing the identity-keyed file from the legacy source. `csq doctor --repair-identities` exposes the same self-heal on demand for users skipping daemon startup. Closes the v2.7.3→v2.7.7 upgrade-skip class surfaced by an internal journal entry (#462)
 
 ### Internal
 
@@ -222,7 +222,7 @@ First maintainer-signed stable macOS bundle. Introduces Developer ID signing and
 
 ## [2.7.7] — 2026-05-15
 
-**Phase-4 release N for #292** — completes the slot-to-identity decoupling rollout: profiles.json's v1 `accounts` field is emptied on every write, the `.csq-account` marker writers flip from decimal to UUID, the rotation legacy fallback is retired, and `csq doctor` gains a `legacy_compat_state` field with `schema_version: 4` so partial-migration state is observable. Closing journal 0041, tag `e98a7f0`. The v2.7.3→v2.7.7 upgrade-skip class surfaced after release (journal 0040) is healed in v2.7.8.
+**Phase-4 release N for #292** — completes the slot-to-identity decoupling rollout: profiles.json's v1 `accounts` field is emptied on every write, the `.csq-account` marker writers flip from decimal to UUID, the rotation legacy fallback is retired, and `csq doctor` gains a `legacy_compat_state` field with `schema_version: 4` so partial-migration state is observable. Closing an internal journal entry, tag `e98a7f0`. The v2.7.3→v2.7.7 upgrade-skip class surfaced after release (an internal journal entry) is healed in v2.7.8.
 
 ### Fixed
 
@@ -257,7 +257,7 @@ First maintainer-signed stable macOS bundle. Introduces Developer ID signing and
 
 ## [2.7.6] — 2026-05-12
 
-Patch release on v2.7.5. Ships #389 Phase 2 — the AddAccountModal in the desktop UI now shells out to `claude auth login` via the `start_claude_login_subprocess` Tauri command introduced in v2.7.4, matching the CLI's #388 default. Brings the desktop flow into parity with the CLI on the "delegate to the reference client" pattern. Closing reference journal 0036, tag `cac9e56`.
+Patch release on v2.7.5. Ships #389 Phase 2 — the AddAccountModal in the desktop UI now shells out to `claude auth login` via the `start_claude_login_subprocess` Tauri command introduced in v2.7.4, matching the CLI's #388 default. Brings the desktop flow into parity with the CLI on the "delegate to the reference client" pattern. Closing reference an internal journal entry, tag `cac9e56`.
 
 ### Changed
 
@@ -267,7 +267,7 @@ Patch release on v2.7.5. Ships #389 Phase 2 — the AddAccountModal in the deskt
 
 ## [2.7.5] — 2026-05-12
 
-Patch release on v2.7.4. Two follow-up fixes surfaced by real-world testing on a headless Linux server (esperie-ai over Tailscale):
+Patch release on v2.7.4. Two follow-up fixes surfaced by real-world testing on a headless Linux server (the host over Tailscale):
 
 ### Fixed
 
@@ -303,7 +303,7 @@ Patch release on v2.7.2. Closes the v2.7.0 user-visible gap where codex slot quo
 
 ### Fixed
 
-- **Codex 5h / 7d utilization windows now reach the desktop UI.** The `get_accounts` IPC gate at `csq/src/desktop/commands/mod.rs` used to filter quota fields on `AccountSource::Anthropic`, leaving codex slots with `five_hour_pct: 0.0` / `seven_day_pct: 0.0` in the payload — codex users saw blank usage bars despite the daemon writing correct numbers to `~/.claude/accounts/quota.json`. The gate now matches on the quota record's `surface` field against the account's surface, so codex slots surface codex quota, anthropic slots surface claude-code quota, and the journal 0058 H2 leakage defense (slot-rebound-across-surfaces must not show prior occupant's numbers) is preserved AND strengthened — it's now structural surface-match rather than a source-based heuristic. (#367)
+- **Codex 5h / 7d utilization windows now reach the desktop UI.** The `get_accounts` IPC gate at `csq/src/desktop/commands/mod.rs` used to filter quota fields on `AccountSource::Anthropic`, leaving codex slots with `five_hour_pct: 0.0` / `seven_day_pct: 0.0` in the payload — codex users saw blank usage bars despite the daemon writing correct numbers to `~/.claude/accounts/quota.json`. The gate now matches on the quota record's `surface` field against the account's surface, so codex slots surface codex quota, anthropic slots surface claude-code quota, and the an internal journal entry H2 leakage defense (slot-rebound-across-surfaces must not show prior occupant's numbers) is preserved AND strengthened — it's now structural surface-match rather than a source-based heuristic. (#367)
 
 ### Internal
 
@@ -340,13 +340,13 @@ Patch release on v2.7.0. Refreshes the bundled codex model catalog to promote `g
 
 ### Added
 
-- `csq cli install <name>` and `csq cli upgrade <name>` subcommands registered (stub today; full implementation lands in v2.7.0 final). Allowlist: `claude | codex | gemini`. Other inputs rejected at the clap layer before the handler is reached. (issue #362, M3 PR-MCD3)
-- README "CLI dependency management" section documents doctor row meanings, pre-flight gates, `--ignore-cli-version`, minimum versions table, and `CSQ_CLI_DEPS_PROBE_DISABLE` escape hatch. (issue #362, M3 PR-MCD3)
-- `csq doctor` reports presence + version + minimum + status for `claude`, `codex`, and `gemini` binaries, with row variants `✓ ok` / `⚠ outdated` / `✗ missing` / `⚠ wrong binary` / `⚠ probe timed out` / `⚠ probe disabled`. Surface rows are suppressed when no authenticated slots of that surface exist. (issue #362, AC 1; spec/13)
+- `csq cli install <name>` and `csq cli upgrade <name>` subcommands registered (stub today; full implementation lands in v2.7.0 final). Allowlist: `claude | codex | gemini`. Other inputs rejected at the clap layer before the handler is reached. (an internal ticket, M3 PR-MCD3)
+- README "CLI dependency management" section documents doctor row meanings, pre-flight gates, `--ignore-cli-version`, minimum versions table, and `CSQ_CLI_DEPS_PROBE_DISABLE` escape hatch. (an internal ticket, M3 PR-MCD3)
+- `csq doctor` reports presence + version + minimum + status for `claude`, `codex`, and `gemini` binaries, with row variants `✓ ok` / `⚠ outdated` / `✗ missing` / `⚠ wrong binary` / `⚠ probe timed out` / `⚠ probe disabled`. Surface rows are suppressed when no authenticated slots of that surface exist. (an internal ticket, AC 1; spec/13)
 - `csq doctor --json` emits `"schema_version": 2` at the top level. v1 was unversioned (the absence of the field is the v1 signal). Per-surface keys (`claude_code`, `codex_cli`, `gemini_cli`) populated as objects when slots exist; OMITTED when not.
-- `csq login N` and `csq run N` gain a pre-flight version gate spawn-adjacent to the existing CLI spawn. Outdated codex (<0.40.0) / gemini (<0.41.2) / claude (<2.0.0) bails with a structured remediation message naming `csq cli upgrade <name>` instead of the upstream's opaque clap error. (issue #362, AC 3)
+- `csq login N` and `csq run N` gain a pre-flight version gate spawn-adjacent to the existing CLI spawn. Outdated codex (<0.40.0) / gemini (<0.41.2) / claude (<2.0.0) bails with a structured remediation message naming `csq cli upgrade <name>` instead of the upstream's opaque clap error. (an internal ticket, AC 3)
 - `csq login N --ignore-cli-version` and `csq run N --ignore-cli-version` flag — per-invocation override that downgrades the gate from BAIL to WARN for `Outdated` / `UnrecognizedVersion`. `Missing` and `WrongBinary` remain unconditional bails (no override). The flag is per-invocation only — no persistent state, no env var memory, no config file. WARN line is emitted on every honor.
-- `csq cli install <name>` and `csq cli upgrade <name>` subcommands — installs or upgrades the named CLI via the user's existing package manager (npm / brew). Argv allowlist; range-pinned semver (`@>=<floor> <next-major>` not `@latest`); `[y/N]` consent gate; non-TTY refusal; EACCES non-escalation; chained Node-install when npm is missing. (issue #362, AC 2 + AC 4)
+- `csq cli install <name>` and `csq cli upgrade <name>` subcommands — installs or upgrades the named CLI via the user's existing package manager (npm / brew). Argv allowlist; range-pinned semver (`@>=<floor> <next-major>` not `@latest`); `[y/N]` consent gate; non-TTY refusal; EACCES non-escalation; chained Node-install when npm is missing. (an internal ticket, AC 2 + AC 4)
 - `CSQ_CLI_DEPS_PROBE_DISABLE=1` env-var escape hatch — forces `cli_deps::probe()` to return `Ok(unparsed)` for all surfaces; disclosure WARN emitted at every gate site (login, run, doctor) so a hostile `.envrc` cannot silently disable gates.
 
 ### Changed
@@ -361,9 +361,9 @@ Patch release on v2.7.0. Refreshes the bundled codex model catalog to promote `g
 - M3 closeout: manpage scope retracted. csq does not currently ship a `man/csq.1` file or a `man/` directory. M3's scope item 3 ("Manpage updates") from the original M3 milestone file was based on an incorrect assumption. M9 A16 (Manpage CI lint) is struck — no manpage to lint. If a future cycle adds manpage support to csq, that is a separate workspace.
 
 - New module `csq-core::cli_deps` (probe, install_path, minimum, version, sanitize, dispatch). 2s wall-clock probe budget; 8KB stdout cap; hand-rolled semver parser (no `semver` crate dep); single-canonicalize-per-probe; two-gate WrongBinary defense (prefix gate + install-path gate). [Lands at M1]
-- New stub-binary harness at `coc-eval/bench/stubs/stub-cli` for integration tests across multi-cli-deps milestones. [Lands at M1]
+- New stub-binary harness at `coc-eval/bench/stubs/stub-cli` for integration tests across an internal workspace milestones. [Lands at M1]
 - New spec: `specs/13-multi-cli-detection-contract.md`. [Landed at M0 — staged this draft alongside]
-- R1 M1 redteam convergence (8 HIGH + 10 MEDIUM resolved, issue #362):
+- R1 M1 redteam convergence (8 HIGH + 10 MEDIUM resolved, an internal ticket):
   - H-1: `WrongBinaryReason`-aware remediation text in `csq doctor` text path — per-reason messages for `prefix_mismatch`, `component_too_large`, `install_path_blocklisted`.
   - H-2: PATH-walk bounded at `MAX_PATH_ENTRIES=4096` / `MAX_PATH_ENTRY_BYTES=4096` in `find_in_path` to defend against adversarial PATH.
   - H-3: `child.wait()` called unconditionally after reader thread signals (kill is a no-op for already-exited processes; avoids potential block when cap exceeded before timeout fires).
@@ -402,7 +402,7 @@ Patch release on v2.7.0. Refreshes the bundled codex model catalog to promote `g
 
 - Issue: https://github.com/terrene-foundation/csq/issues/362
 - Spec: `specs/13-multi-cli-detection-contract.md`
-- Workspace: `workspaces/multi-cli-deps/` (analysis + plans + journals; closed at M5)
+- Workspace: `internal-design-docs` (analysis + plans + journals; closed at M5)
 
 ---
 
@@ -454,9 +454,9 @@ See `docs/releases/v2.3.0.md` for the full release notes.
 
 ### Deferred
 
-- **D7 — vault-delete-on-unbind from desktop** (journal 0011 §FD #1, restated in 0013). CLI `csq logout` calls `vault.delete`; desktop "remove Gemini account" flow does not yet. Follow-up PR.
-- **csq-cli orchestration cleanup** (journal 0013). `setkey.rs::handle_gemini` and `models.rs::write_gemini_model_to_binding` carry ~30 LOC of contained duplication that collapses to single-source via `csq-core` helpers.
-- **`launch_gemini` / `exec_gemini` factoring** (journal 0012 §D4). 2 callers today; threshold is 3. Re-evaluate at v2.4 if a third caller appears.
+- **D7 — vault-delete-on-unbind from desktop** (an internal journal entry §FD #1, restated in 0013). CLI `csq logout` calls `vault.delete`; desktop "remove Gemini account" flow does not yet. Follow-up PR.
+- **csq-cli orchestration cleanup** (an internal journal entry). `setkey.rs::handle_gemini` and `models.rs::write_gemini_model_to_binding` carry ~30 LOC of contained duplication that collapses to single-source via `csq-core` helpers.
+- **`launch_gemini` / `exec_gemini` factoring** (an internal journal entry §D4). 2 callers today; threshold is 3. Re-evaluate at v2.4 if a third caller appears.
 
 ---
 
@@ -511,22 +511,22 @@ See `docs/releases/v2.1.0.md` for the full release notes including the surface d
 - Codex surface across `discovery`, `auto_rotate`, `rotation::swap_to`, `daemon::refresher`, and `usage_poller`. `Surface::ClaudeCode` and `Surface::Codex` enums replace the prior implicit Anthropic-only assumption.
 - `csq login N --provider codex` CLI flow + desktop AddAccountModal Codex panels (codex-tos, codex-keychain-prompt, codex-running, codex-picker in ChangeModelModal). Five new Tauri commands: `start_codex_login`, `complete_codex_login`, `list_codex_models`, `acknowledge_codex_tos`, `set_codex_slot_model`. Plus `cancel_codex_login` from the round-1 hardening.
 - Daemon Codex refresher (`broker_codex_check` + `HttpPostFnCodex`), surface-dispatched `tick`, startup reconciler (INV-P08 mode flip + INV-P03 config.toml drift), Windows H2 gate (`require_daemon_healthy` cross-platform + named-pipe surface-dispatch integration test).
-- `usage_poller/codex.rs` parses live `wham/usage` per journal 0010 schema (5h primary + 7d secondary rate-limit windows; `used_percent` is 0–100). Circuit breaker 5-fail → 15min → 80min cap. Raw-body capture to `accounts/codex-wham-raw.json` (0600, redactor-first). STABLE per journal 0010 capture.
+- `usage_poller/codex.rs` parses live `wham/usage` per an internal journal entry schema (5h primary + 7d secondary rate-limit windows; `used_percent` is 0–100). Circuit breaker 5-fail → 15min → 80min cap. Raw-body capture to `accounts/codex-wham-raw.json` (0600, redactor-first). STABLE per an internal journal entry capture.
 - `quota.json` schema_version 2 writer (PR-C6). Nested `CounterState` / `RateLimitState` per spec 07 §7.4.1 + `extras: Option<serde_json::Value>` escape hatch. Idempotent v1 → v2 migration on first daemon tick.
 - `csq swap` cross-surface dispatch (PR-C7). INV-P05 confirm prompt (`--yes` bypasses), INV-P10 rename-source-to-tombstone, then `exec` the target binary. Same-surface Codex routes to the new in-flight `repoint_handle_dir_codex` (M10).
 - `csq models switch <slot> <model>` Codex dispatch — Codex slots route to a `TomlModelKey` writer that updates `config.toml`.
 - New `csq-core/src/platform/test_env.rs` shared cross-module mutex for env-var-mutating tests.
 - Surface badge in AccountList per slot.
-- `repoint_handle_dir_codex` for in-flight same-surface Codex swap (M10 / journal 0023). codex-cli re-stats `auth.json` before each API call so the next request authenticates as the new slot; UNIX open-after-rename keeps in-flight session fds valid until close.
-- `RouteKind` + `route()` pure dispatcher helper in `csq-cli/src/commands/swap.rs` with three-way matrix unit tests (L-CDX-3, journal 0024).
+- `repoint_handle_dir_codex` for in-flight same-surface Codex swap (M10 / an internal journal entry). codex-cli re-stats `auth.json` before each API call so the next request authenticates as the new slot; UNIX open-after-rename keeps in-flight session fds valid until close.
+- `RouteKind` + `route()` pure dispatcher helper in `csq-cli/src/commands/swap.rs` with three-way matrix unit tests (L-CDX-3, an internal journal entry).
 
 ### Changed
 
-- Auto-rotate is **ClaudeCode-only by design** in v2.1 (CRITICAL fix in journal 0021). `find_target` short-circuits when the current account's surface is not ClaudeCode; `repoint_handle_dir` adds a belt-and-suspenders refusal for Codex-shape handle dirs.
+- Auto-rotate is **ClaudeCode-only by design** in v2.1 (CRITICAL fix in an internal journal entry). `find_target` short-circuits when the current account's surface is not ClaudeCode; `repoint_handle_dir` adds a belt-and-suspenders refusal for Codex-shape handle dirs.
 - IPC payload audit flipped from blacklist to per-struct **whitelist** via `assert_ipc_keys_whitelisted` helper (round 1).
 - `app.emit` for `codex-device-code` narrowed to `app.emit_to("main", ...)` so the device code does not broadcast to every window.
 - `csq swap` cross-surface path uses atomic `rename` to a `.sweep-tombstone-swap-<pid>-<nanos>` sibling instead of `remove_dir_all`, closing the Ctrl-C signal-window race and preserving open fds for the running surface process.
-- `repoint_handle_dir_codex` `codex_links` slice rewrites credential (`auth.json`) BEFORE marker (`.csq-account`) so a mid-loop rename failure cannot leave the marker pointing at slot N+1 while the credential still resolves to slot N (M-CDX-1 / journal 0024).
+- `repoint_handle_dir_codex` `codex_links` slice rewrites credential (`auth.json`) BEFORE marker (`.csq-account`) so a mid-loop rename failure cannot leave the marker pointing at slot N+1 while the credential still resolves to slot N (M-CDX-1 / an internal journal entry).
 
 ### Fixed
 
@@ -540,8 +540,8 @@ See `docs/releases/v2.1.0.md` for the full release notes including the surface d
 - `tos::is_acknowledged` distinguishes `NotFound` (silent) from other `io::Error` kinds (logged at WARN with named error_kind tags).
 - `complete_login_scrubs_written_auth_json_when_canonical_save_fails` regression — extracted `scrub_and_remove_written` helper called from BOTH success cleanup AND `save_canonical_for` error branch.
 - `set_codex_slot_model` consults `discover_all` and refuses non-Codex slots with a named error.
-- Codex surface guard in `repoint_handle_dir_codex` requires BOTH `auth.json` AND `config.toml` AND each must be a symlink (L-CDX-1 / journal 0024).
-- `csq swap` Codex→Codex no longer silently `exec`-replaces the running codex process (M10 / journal 0023). Prior behaviour dropped the user's conversation with no warning.
+- Codex surface guard in `repoint_handle_dir_codex` requires BOTH `auth.json` AND `config.toml` AND each must be a symlink (L-CDX-1 / an internal journal entry).
+- `csq swap` Codex→Codex no longer silently `exec`-replaces the running codex process (M10 / an internal journal entry). Prior behaviour dropped the user's conversation with no warning.
 
 ### Platform notes
 
@@ -561,7 +561,7 @@ See `docs/releases/v2.1.0.md` for the full release notes including the surface d
 
 Safety patch on v2.0.0. One CRITICAL credential-handling risk fixed (auto-rotation routing Anthropic OAuth tokens through 3P endpoints under a narrow but reachable mix of OAuth + 3P bindings on the same slot), four HIGH correctness bugs, nine MED/LOW hardening items. Adds READ tolerance for the v2 quota.json schema that v2.1 writes (dual-read; v2.0.1 continues to write v1).
 
-See `docs/releases/v2.0.1.md` for the full red-team finding inventory (journal 0067), structural rotation fix (PR-A1 / journal 0064), credential-sync guards (PR-B7 / journal 0068), and quota schema shakedown (PR-C1.5 / VP-final).
+See `docs/releases/v2.0.1.md` for the full red-team finding inventory (an internal journal entry), structural rotation fix (PR-A1 / an internal journal entry), credential-sync guards (PR-B7 / an internal journal entry), and quota schema shakedown (PR-C1.5 / VP-final).
 
 ## [2.0.0] — 2026-04-22
 
@@ -588,16 +588,16 @@ See `docs/releases/v2.0.0.md` for the full release notes with install instructio
 
 ### Fixed
 
-- Auto-rotation no longer corrupts `config-N/.credentials.json` under the handle-dir model — refuses to run when any `term-*/` dir is present (journal 0064, P0-1).
-- `download_and_apply` updater path guards against placeholder signing key at the core entry, not just the CLI wrapper (journal 0063 H1).
-- `broker::sync::backsync` preserves canonical's `subscription_type` when live carries `None` (journal 0063 P1-1) — prevents silent Max→Sonnet downgrade after re-login.
-- `bind_provider_to_slot` preserves user-edited `permissions`, `plugins`, `effortLevel`, and user-custom env keys when rebinding a 3P provider (journal 0063 P1-2).
+- Auto-rotation no longer corrupts `config-N/.credentials.json` under the handle-dir model — refuses to run when any `term-*/` dir is present (an internal journal entry, P0-1).
+- `download_and_apply` updater path guards against placeholder signing key at the core entry, not just the CLI wrapper (an internal journal entry H1).
+- `broker::sync::backsync` preserves canonical's `subscription_type` when live carries `None` (an internal journal entry P1-1) — prevents silent Max→Sonnet downgrade after re-login.
+- `bind_provider_to_slot` preserves user-edited `permissions`, `plugins`, `effortLevel`, and user-custom env keys when rebinding a 3P provider (an internal journal entry P1-2).
 - `providers::settings::save_settings` propagates `secure_file` chmod errors — 3P API-token files can no longer silently publish at umask default.
-- `ChangeModelModal` loads installed Ollama models on every open edge (journal 0061) — alpha.21 had a `$effect` guard that skipped the first open entirely.
-- `cancel_login` IPC command uses fixed-vocabulary error tags (journal 0063 M1) — future OAuthError widening cannot leak token material.
-- Tauri capabilities narrowed to per-command allowlists (`opener:allow-open-url`, `autostart:allow-*`, `process:allow-restart/exit`) (journal 0063 M2).
-- Resurrection-log JSONL uses `serde_json::to_string` (journal 0063 M3) — paths with backslash or control characters no longer corrupt the forensic trail.
-- Desktop header shows the bundled `tauri.conf.json` version via `getVersion()` instead of a hardcoded literal (journal 0063 P1-5).
+- `ChangeModelModal` loads installed Ollama models on every open edge (an internal journal entry) — alpha.21 had a `$effect` guard that skipped the first open entirely.
+- `cancel_login` IPC command uses fixed-vocabulary error tags (an internal journal entry M1) — future OAuthError widening cannot leak token material.
+- Tauri capabilities narrowed to per-command allowlists (`opener:allow-open-url`, `autostart:allow-*`, `process:allow-restart/exit`) (an internal journal entry M2).
+- Resurrection-log JSONL uses `serde_json::to_string` (an internal journal entry M3) — paths with backslash or control characters no longer corrupt the forensic trail.
+- Desktop header shows the bundled `tauri.conf.json` version via `getVersion()` instead of a hardcoded literal (an internal journal entry P1-5).
 
 ### Platform notes
 

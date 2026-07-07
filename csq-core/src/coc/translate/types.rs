@@ -1,4 +1,4 @@
-//! Per-Surface payload types per Amendment G (M9; csq-as-cli/todos/M9
+//! Per-Surface payload types per Amendment G (M9; an internal workspace/todos/M9
 //! §"Amendment G — Type contract enumeration") + spec 10 §10.3.4.
 //!
 //! Each translator emits a Surface-specific payload. Field shapes are
@@ -231,6 +231,23 @@ impl SpawnPayload {
             SpawnPayload::ClaudeCode(p) => &p.contributing_ids,
             SpawnPayload::Codex(p) => &p.contributing_ids,
             SpawnPayload::Gemini(p) => &p.contributing_ids,
+        }
+    }
+
+    /// The per-Surface system-prompt text field — the single flattened
+    /// `## Rules / ## Agents / ## Skills / ## Commands` prose each Surface
+    /// delivers through its native system-prompt mechanism
+    /// (`system_prompt_append` / `instructions` / `system_instruction`).
+    /// This is the field the capability-layer scaffold stage (CU1b) lifts
+    /// for the live spawn, and the field CU5's byte-parity golden compares.
+    /// Note: the `output_schema_directive` is a SEPARATE field and is NOT
+    /// included here — the live spawn appends it (class-gated) downstream;
+    /// `csq translate --json` exposes it as its own key.
+    pub fn system_text(&self) -> &str {
+        match self {
+            SpawnPayload::ClaudeCode(p) => &p.system_prompt_append,
+            SpawnPayload::Codex(p) => &p.instructions,
+            SpawnPayload::Gemini(p) => &p.system_instruction,
         }
     }
 }

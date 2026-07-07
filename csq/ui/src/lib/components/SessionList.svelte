@@ -139,7 +139,7 @@
 
   async function getBaseDir(): Promise<string> {
     // `join` honors the platform path separator and Tauri 2.10's
-    // `homeDir()` has no trailing separator — see journal 0021.
+    // `homeDir()` has no trailing separator — see an internal journal entry
     const home = await homeDir();
     return await join(home, ".claude", "accounts");
   }
@@ -157,7 +157,7 @@
   }
 
   function formatCwd(cwd: string): string {
-    // Collapse `/Users/esperie` → `~` so long paths fit the row.
+    // Collapse `/Users/example` → `~` so long paths fit the row.
     // We don't have the real home path client-side without another
     // IPC call; use a cheap prefix match on the common macOS/Linux
     // pattern. The full path is still available in the `title=`

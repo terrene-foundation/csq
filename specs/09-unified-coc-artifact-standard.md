@@ -1,6 +1,6 @@
 # 09 Unified `.coc/` Artifact Standard — csq Consumer Contract
 
-Spec version: 2.1.0 | Status: DRAFT | Governs: how csq reads `.coc/` artifacts, the legacy fallback chain, frontmatter contract, version envelope, read-only invariant
+Spec version: 2.2.0 | Status: DRAFT | Governs: how csq reads `.coc/` artifacts, the legacy fallback chain, frontmatter contract, version envelope, read-only invariant
 
 ---
 
@@ -154,10 +154,10 @@ The `CocSet` is the **only** form in which `.coc/` content reaches the downstrea
 
 An artifact (rule, agent, skill, or command) with `applies_to: BTreeSet::new()` (empty set) is **universal** — every consumer MUST include it regardless of the target Surface, **for the artifact families that consumer processes**:
 
-- **Translators** (`csq_core::coc::translate::cc::translate`, `codex::translate`, `gemini::translate`) consume rules + agents + skills + commands. The universal-artifact filter applies to all four artifact-family filter functions in each translator (12 sites total).
-- **Scaffold stage** (`csq_core::capability_layer::scaffold::ScaffoldStage`) consumes rules only. The universal-artifact filter applies to scaffold's `applies_to_surface` helper.
+- **Translators + live scaffold** both flatten via the shared `csq_core::coc::translate::flatten::flatten_artifacts`, which applies the universal-artifact filter (the single `flatten::in_scope` predicate) to all four artifact families (rules + agents + skills + commands). The per-translator filter sites and the live `csq run` scaffold stage (`csq_core::capability_layer::scaffold::ScaffoldStage`) all flatten through this one predicate, so the live scaffold delivers rules + agents + skills + commands.
+- **Citation rule-id set** (`csq_core::capability_layer::driver::extract_rule_ids_in_scope`) applies the SAME `flatten::in_scope` predicate, scoped to rules only.
 
-The filter expression in all 12 translator sites is:
+The shared universal-artifact filter expression (`flatten::in_scope`) is:
 
 ```rust
 .filter(|x| x.applies_to.is_empty() || x.applies_to.contains(&surface))
@@ -413,7 +413,8 @@ The producer DOES write under `.coc/` — that's the emit step. This invariant b
 
 ## 9.12 Revision history
 
-| Rev | Date       | Change                                                                                                                                                                                        |
-| --- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1.0 | 2026-05-01 | Initial draft.                                                                                                                                                                                |
-| 2.1 | 2026-06-11 | Citation accuracy pass: `min_csq_for_coc_major` (`coc/version.rs`); §9.9.3 canonical-test citation to the `#[cfg(test)]` module of `csq-core/src/coc/version.rs`; §9.10 walk-roots `csq/src`. |
+| Rev | Date       | Change                                                                                                                                                                                                                                                                                                      |
+| --- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1.0 | 2026-05-01 | Initial draft.                                                                                                                                                                                                                                                                                              |
+| 2.1 | 2026-06-11 | Citation accuracy pass: `min_csq_for_coc_major` (`coc/version.rs`); §9.9.3 canonical-test citation to the `#[cfg(test)]` module of `csq-core/src/coc/version.rs`; §9.10 walk-roots `csq/src`.                                                                                                               |
+| 2.2 | 2026-06-19 | §9.2.4 rewritten to current truth — the previously per-translator filter functions and the scaffold's rules-only path collapsed onto the single shared flattener (`csq-core/src/coc/translate/flatten.rs`); removed the stale "scaffold consumes rules only" framing and citations to removed filter sites. |

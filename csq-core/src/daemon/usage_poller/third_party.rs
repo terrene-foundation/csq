@@ -18,8 +18,10 @@ use super::{
     set_cooldown_with_backoff, HttpGetFn, HttpPostProbeFn, PollError, CALL_TIMEOUT,
     RATELIMIT_PREFIX,
 };
+use crate::daemon::usage_poller::deepseek::{poll_deepseek_balance, write_deepseek_balance};
 use crate::daemon::usage_poller::minimax::{poll_minimax_quota, write_minimax_quota, MiniMaxQuota};
 use crate::daemon::usage_poller::zai::{poll_zai_quota, write_zai_quota, ZaiQuota};
+use crate::quota::BalanceInfo;
 
 /// Anthropic API version header for 3P probe requests.
 const ANTHROPIC_VERSION_HEADER: &str = "2023-06-01";
@@ -133,12 +135,14 @@ pub(crate) async fn tick_3p(
         };
 
         // Skip providers whose catalog declares no quota signal
-        // (`QuotaKind::Unknown`). Pay-per-token API-key bridges
-        // (DeepSeek, future analogues) have no account-level usage
-        // endpoint AND emit no `anthropic-ratelimit-*` response
-        // headers, so any probe burns a billable request for no
-        // data. Security review MEDIUM-3 surfaced this for DeepSeek
-        // specifically.
+        // (`QuotaKind::Unknown`). Truly keyless providers (e.g. Ollama)
+        // have no account-level usage endpoint AND emit no
+        // `anthropic-ratelimit-*` response headers, so any probe burns a
+        // billable request for no data. Security review MEDIUM-3.
+        //
+        // `QuotaKind::Balance` is intentionally NOT skipped — DeepSeek
+        // exposes a direct `/user/balance` GET endpoint that the
+        // `poll_deepseek_balance` path handles without a probe request.
         if matches!(
             provider_entry.quota_kind,
             crate::providers::catalog::QuotaKind::Unknown
@@ -204,11 +208,12 @@ pub(crate) async fn tick_3p(
         };
 
         // MiniMax and Z.AI return richer structures (both 5h and 7d),
-        // so they get their own result types. Others use RateLimitData.
+        // DeepSeek returns a balance, others use RateLimitData.
         enum PollResult3P {
             RateLimits(RateLimitData),
             MiniMax(MiniMaxQuota),
             Zai(ZaiQuota),
+            DeepSeek(BalanceInfo),
         }
 
         let join_handle = tokio::task::spawn_blocking(move || {
@@ -217,6 +222,8 @@ pub(crate) async fn tick_3p(
                     .map(PollResult3P::MiniMax)
             } else if pid == "zai" {
                 poll_zai_quota(&raw_key, &http_get).map(PollResult3P::Zai)
+            } else if pid == "deepseek" {
+                poll_deepseek_balance(&raw_key, &http_get).map(PollResult3P::DeepSeek)
             } else {
                 poll_3p_usage(&url, &raw_key, &model, &http_probe).map(PollResult3P::RateLimits)
             }
@@ -248,6 +255,19 @@ pub(crate) async fn tick_3p(
                 let base = base_dir.to_path_buf();
                 if let Err(e) = write_zai_quota(&base, info.id, &zai_quota) {
                     warn!(account = info.id, "3P poller: failed to write Z.AI quota");
+                    let _ = e;
+                }
+                clear_cooldown(cooldowns, info.id);
+                clear_backoff(backoffs, info.id);
+                polled += 1;
+            }
+            Ok(Ok(PollResult3P::DeepSeek(balance))) => {
+                let base = base_dir.to_path_buf();
+                if let Err(e) = write_deepseek_balance(&base, info.id, &balance) {
+                    warn!(
+                        account = info.id,
+                        "3P poller: failed to write DeepSeek balance"
+                    );
                     let _ = e;
                 }
                 clear_cooldown(cooldowns, info.id);
@@ -385,7 +405,7 @@ pub(crate) fn load_3p_base_url_for_slot(base_dir: &std::path::Path, slot: u16) -
 ///
 /// ### Why the probe model must match the user's configured model
 ///
-/// Journal 0026 design question 3: the catalog default is
+/// an internal journal entry design question 3: the catalog default is
 /// `MiniMax-M2`, but the user's actual `config-9/settings.json`
 /// says `ANTHROPIC_MODEL=MiniMax-M2.7-highspeed`. If the poller
 /// probes with the catalog default, the probe either:
@@ -403,7 +423,12 @@ pub(crate) fn load_3p_base_url_for_slot(base_dir: &std::path::Path, slot: u16) -
 /// new model in iTerm, the poller follows automatically on the
 /// next tick without a csq code change.
 pub(crate) fn load_3p_model_for_slot(base_dir: &std::path::Path, slot: u16) -> Option<String> {
-    load_3p_env_string_for_slot(base_dir, slot, "ANTHROPIC_MODEL")
+    // Delegates to the shared reader so the poller and the statusline
+    // context-% recompute resolve the slot model from ONE code path (no
+    // drift). `model_id_for_slot` additionally filters an empty-string model
+    // to None — strictly better here, since the caller falls back to the
+    // catalog `default_model` rather than probing with an empty model id.
+    crate::providers::settings::model_id_for_slot(base_dir, slot)
 }
 
 /// Generic helper: reads a single string value from
@@ -679,7 +704,7 @@ mod tests {
                 // bumped to 2100-01-01 so `quota::clear_expired` never
                 // nulls the windows as real time passes. Older literals
                 // (1776*) bit the test suite in 2026-04 when real time
-                // drifted past them — see journal 0036.
+                // drifted past them — see an internal journal entry
                 Ok((200, br#"{"model_remains":[{"model_name":"MiniMax-M2","current_interval_total_count":1000,"current_interval_usage_count":800,"end_time":4102444800000,"current_weekly_total_count":7000,"current_weekly_usage_count":6000,"weekly_end_time":4102444800000}]}"#.to_vec()))
             }
         })

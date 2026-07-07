@@ -2,7 +2,7 @@
 //! slots via the launch log, converts to [`UsageEvent`]s, and is consumed by
 //! the daemon to append to per-account ledgers.
 //!
-//! Per journal 0050 D2 (post-hoc time correlation attribution).
+//! Per an internal journal entry D2 (post-hoc time correlation attribution).
 //!
 //! ## Privacy invariant (D6)
 //!
@@ -102,7 +102,7 @@ pub struct AttributedSession {
 /// Attributes a session to a slot using the launch log. Returns `None` if no
 /// matching launch event is found — those sessions remain unattributed and
 /// are excluded from per-slot ledgers (visible in a future "unattributed"
-/// total in the UI per journal 0050 §FD #1).
+/// total in the UI per an internal journal entry §FD #1).
 ///
 /// Match heuristic: pick the most recent launch event whose `project_path`
 /// equals the session's `project_path` AND whose timestamp is ≤ the session's
@@ -150,7 +150,7 @@ pub fn attribute_session(
 }
 
 /// Converts an attributed session to a [`UsageEvent`] using the slot's
-/// configured model + the cost rates table. Per journal 0050 D3 v1, the
+/// configured model + the cost rates table. Per an internal journal entry D3 v1, the
 /// model is the slot's CURRENT configured model; v2 will source per-turn
 /// model from projects/jsonl.
 ///

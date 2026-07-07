@@ -13,7 +13,7 @@
 //! this function — never inline the routing logic separately. Single source
 //! eliminates the bypass class that manifested as HIGH in M2-7 redteam round 1.
 //!
-//! See `workspaces/account-slot-decoupling/02-plans/03-phase2-readiness.md § M2-7`.
+//! See `internal-design-docs § M2-7`.
 
 use std::path::{Path, PathBuf};
 

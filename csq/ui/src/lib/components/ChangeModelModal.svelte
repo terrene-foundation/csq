@@ -266,7 +266,7 @@
   // reopen. `wasOpen` anchors the edge so we don't re-fetch on
   // every internal modalState transition (pulling → error → etc.).
   //
-  // Regression guard (journal 0061): an earlier version had a guard
+  // Regression guard (an internal journal entry): an earlier version had a guard
   // `modalState.kind !== 'loading'` that skipped the load when the
   // modal was already in its initial 'loading' state — which it
   // always was on first open, so list_ollama_models was never

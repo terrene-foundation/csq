@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "csq — unified CLI + desktop for Claude Code multi-account management"
+# Binary application distributed via GitHub releases / Homebrew, never crates.io.
+# publish = false is also REQUIRED (not just cosmetic) for cargo-deny's
+# `[bans] allow-wildcard-paths = true` to exempt the workspace-internal path
+# deps below: allow-wildcard-paths does NOT apply to publishable crates, because
+# crates.io disallows path deps. Both settings together clear the bans check.
+publish = false
 
 [[bin]]
 name = "csq"
@@ -30,7 +36,7 @@ cli = [
 # Per rules/security.md MUST Rule 1: production binaries MUST NOT respond to
 # CSQ_TEST_BYPASS_TTY; this feature gate enforces that at compile time.
 # Also forwards to csq-core/test-utils so doctor tests can use identity
-# fixtures (M1-8, issue #292 A++ Phase 1).
+# fixtures (M1-8, an internal ticket A++ Phase 1).
 test-utils = ["csq-core/test-utils"]
 # ── M14 sink forwarding (workspace-owner decision §5: opt-in, never default) ──
 # Operators rebuild with --features csq/rekor-sink or csq/csq-ledger-sink to
@@ -38,9 +44,6 @@ test-utils = ["csq-core/test-utils"]
 # or `desktop` feature sets.
 rekor-sink = ["csq-core/rekor-sink"]
 csq-ledger-sink = ["csq-core/csq-ledger-sink"]
-# enterprise: activates Phase-2b direct-API provider client infrastructure.
-# Forwards csq-core/enterprise + the enterprise seam crate/kailash-trust.
-# MUST NOT appear in default, cli, or desktop feature sets (community gate).
 desktop = [
   "dep:tauri",
   "dep:tauri-plugin-log",
@@ -56,9 +59,6 @@ desktop = [
 [dependencies]
 # ── always compiled ──────────────────────────────────────────────────────
 csq-core = { path = "../csq-core" }
-# ── enterprise-only (optional, activated by the enterprise feature) ──────
-# the enterprise seam crate is gated behind kailash-trust; optional = true ensures
-# it compiles into neither the community binary nor unfeaturised CI builds.
 anyhow.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 serde.workspace = true

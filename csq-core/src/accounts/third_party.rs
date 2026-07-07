@@ -144,6 +144,16 @@ pub fn bind_provider_to_slot(
             name: provider_id.to_string(),
         })?;
 
+    // M5: residency gate (enterprise-only) — the PER-SLOT provider-binding write
+    // path's enforcement point (sibling of `providers::settings::save_settings`).
+    // Refuse to bind a provider the operating envelope's residency policy forbids,
+    // BEFORE any filesystem mutation (no profiles lock taken, no settings written).
+    // No policy declared → no-op. Covers every per-slot caller (CLI `setkey --slot`,
+    // desktop `bind_keyed_provider` / `bind_keyless_provider`). Community compiles
+    // it out (the symbol is in the moat-stripped `phase2b` tree).
+    #[cfg(feature = "enterprise")]
+    crate::phase2b::residency::enforce_provider_write(base_dir, provider_id)?;
+
     let base_url = provider
         .default_base_url
         .ok_or_else(|| ConfigError::MergeConflict {
@@ -206,7 +216,7 @@ pub fn bind_provider_to_slot(
     //    ANTHROPIC_*_MODEL) onto whatever env block is already there
     //    and preserve every other top-level field (permissions,
     //    plugins, feedbackSurveyState, user-custom env vars like
-    //    NODE_ENV). Journal 0063 P1-2: earlier revisions built a
+    //    NODE_ENV). an internal journal entry P1-2: earlier revisions built a
     //    minimal settings object from scratch via `Map::new()`, which
     //    silently destroyed any field the user had hand-edited on
     //    the slot. This shape mirrors `unbind_provider_from_slot`
@@ -344,7 +354,7 @@ pub fn bind_provider_to_slot(
         });
     }
 
-    // 2. Profiles.json: M4-9 (release N affordance, issue #292 Phase 4).
+    // 2. Profiles.json: M4-9 (release N affordance, an internal ticket Phase 4).
     //
     // The v1 `profiles.accounts` field is empty-write in production. 3P
     // bindings have NO OAuth identity (no `by_slot` UUID, no `by_email`
@@ -570,6 +580,64 @@ mod tests {
         assert!(env.get("ANTHROPIC_MODEL").is_some());
     }
 
+    /// M5: write an EU-only residency activation gate so the enterprise residency
+    /// hook in `bind_provider_to_slot` has a policy to enforce.
+    #[cfg(feature = "enterprise")]
+    fn write_eu_only_gate(dir: &Path) {
+        let gate = serde_json::json!({
+            "provider": "claude",
+            "schema": { "type": "object" },
+            "max_tokens": 1024,
+            "envelope": {
+                "version": "1.3", "role": "D1-R1",
+                "allowed_operations": [], "denied_operations": [], "require_approval_for": [],
+                "declared_posture": "autonomous", "posture_floor": "supervised",
+                "data_access": { "model_residency": {
+                    "policy_name": "eu-only", "allowed_regions": ["eu", "on-prem"],
+                    "default_action": "deny"
+                }}
+            }
+        })
+        .to_string();
+        std::fs::write(
+            dir.join(crate::daemon::interactive_live::GATE_FILENAME),
+            gate,
+        )
+        .unwrap();
+    }
+
+    /// M5 (T5.2 per-slot write path): with an EU-only residency policy in force,
+    /// binding a China-resident provider (`mm`) is REFUSED before any write — no
+    /// `config-N/settings.json` is created.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_provider_to_slot_blocked_by_residency_policy() {
+        let dir = TempDir::new().unwrap();
+        write_eu_only_gate(dir.path());
+        let slot = AccountNum::try_from(9u16).unwrap();
+        let err =
+            bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None)
+                .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ResidencyDenied { .. }),
+            "expected ResidencyDenied, got {err:?}"
+        );
+        // Fail-closed BEFORE any filesystem mutation: no settings.json written.
+        assert!(!dir.path().join("config-9/settings.json").exists());
+    }
+
+    /// M5: without an activation gate (no residency policy), the per-slot bind
+    /// proceeds unrestricted — enforcement is opt-in.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_provider_to_slot_unrestricted_without_policy() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None)
+            .expect("bind succeeds with no residency policy");
+        assert!(dir.path().join("config-9/settings.json").exists());
+    }
+
     /// `csq setkey claude --slot N --key sk-ant-...` binds the slot
     /// to Claude via direct API key (the dual-mode reality of Claude:
     /// `auth_type = OAuth` AND `key_env_var = "ANTHROPIC_API_KEY"`).
@@ -608,7 +676,7 @@ mod tests {
         assert!(env.get("ANTHROPIC_MODEL").is_some());
     }
 
-    /// Regression for journal 0063 P1-2: bind_provider_to_slot must
+    /// Regression for an internal journal entry P1-2: bind_provider_to_slot must
     /// preserve every user-edited field in config-N/settings.json.
     /// Earlier revisions built a minimal settings from scratch via
     /// `Map::new()`, silently destroying permissions, plugins, and
@@ -868,7 +936,7 @@ mod tests {
         assert_eq!(json.get("permissions").unwrap().get("read").unwrap(), true);
     }
 
-    /// M4-9 (release N affordance, issue #292 Phase 4): the test
+    /// M4-9 (release N affordance, an internal ticket Phase 4): the test
     /// formerly named `bind_creates_profile_entry` is REPLACED here
     /// with the M4-9-compliant assertion. 3P bindings no longer
     /// populate the v1 `profiles.accounts` map; the slot's provider

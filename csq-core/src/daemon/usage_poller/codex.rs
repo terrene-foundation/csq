@@ -2,14 +2,14 @@
 //!
 //! Polls `GET chatgpt.com/backend-api/wham/usage` for each Codex account,
 //! parses the response per the schema pinned in
-//! `workspaces/codex/journal/0010`, and writes quota data to `quota.json`.
+//! `internal-design-docs`, and writes quota data to `quota.json`.
 //!
 //! # Surface dispatch
 //!
 //! Runs on the same 5-minute cadence as the Anthropic poller (see
 //! [`super::POLL_INTERVAL`]) but uses a DIFFERENT transport: Codex sits
 //! behind Cloudflare's JA3/JA4 TLS fingerprint filter which body-strips
-//! reqwest responses (journal 0007). This module accepts the Node
+//! reqwest responses (an internal journal entry). This module accepts the Node
 //! subprocess transport via the `http_get_codex` closure — production
 //! wires `http::get_bearer_node`, tests pass a mock.
 //!

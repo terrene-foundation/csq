@@ -1,4 +1,4 @@
-//! Dual-layout identity fixture surface for M1-7 (issue #292 A++ Phase 1)
+//! Dual-layout identity fixture surface for M1-7 (an internal ticket A++ Phase 1)
 //! and M12 anti-fixture-masking helpers (non-OAuth slot identity workspace).
 //!
 //! # Overview
@@ -27,9 +27,9 @@
 //!
 //! The `daemon_refreshed_only_state` / `legacy_pre_m4_9_state` split
 //! closes the failure mode described in
-//! `workspaces/account-slot-decoupling/journal/0065-DISCOVERY-arm3-fixture-masking-and-3p-codex-slot-identity-gap.md`
+//! `internal-design-docs`
 //! Finding 1 and in
-//! `workspaces/non-oauth-slot-identity/01-analysis/02-failure-modes/01-failure-modes.md`
+//! `internal-design-docs`
 //! FM-1:
 //!
 //! > Synthetic fixtures that construct the recovery channel WITH companion
@@ -513,7 +513,7 @@ pub fn coexisting_fixture(n_accounts: u16) -> TempDir {
 /// (models the race window where the daemon minted the dir but has not yet
 /// seeded the credential files).  All other slots get a full coexisting setup.
 ///
-/// This models the Partial-Pass-0 state defined in journal 0016 (OQ #2): the
+/// This models the Partial-Pass-0 state defined in an internal journal entry (OQ #2): the
 /// daemon has resolved the UUID and created the identity directory but has not
 /// yet written `credentials.json` into it.  The `config-N/.credentials.json`
 /// legacy file DOES exist for the failed slots (it was not deleted — coexisting
@@ -597,8 +597,8 @@ pub fn partial_pass_0_fixture(n_accounts: u16, failed_slots: &[u16]) -> TempDir 
 /// MUST use the separate [`legacy_pre_m4_9_state`] helper (and name itself
 /// `*_legacy_*` for intent visibility).  This split is the structural defence
 /// against the fixture-masking failure mode documented in
-/// `workspaces/account-slot-decoupling/journal/0065` Finding 1 and
-/// `workspaces/non-oauth-slot-identity/01-analysis/02-failure-modes/01-failure-modes.md`
+/// `internal-design-docs` Finding 1 and
+/// `internal-design-docs`
 /// FM-1.
 ///
 /// # What it writes
@@ -632,7 +632,7 @@ pub fn partial_pass_0_fixture(n_accounts: u16, failed_slots: &[u16]) -> TempDir 
 ///
 /// # Origin
 ///
-/// Journal 0065 Finding 1 + FM-1. See module doc-comment for full context.
+/// an internal journal entry Finding 1 + FM-1. See module doc-comment for full context.
 pub fn daemon_refreshed_only_state(base: &Path, slot: u16, kind: NonOauthKind) -> io::Result<()> {
     let config_dir = base.join(format!("config-{slot}"));
     std::fs::create_dir_all(&config_dir)?;
@@ -679,7 +679,7 @@ pub fn daemon_refreshed_only_state(base: &Path, slot: u16, kind: NonOauthKind) -
 /// behaviour on a v2.6.x-upgraded host) MUST name themselves `*_legacy_*`
 /// to make the fixture intent explicit.  Calling this helper in a test that
 /// is supposed to verify modern (post-M4-9) behaviour MASKS the fixture-bug
-/// class described in journal 0065 Finding 1 and FM-1.
+/// class described in an internal journal entry Finding 1 and FM-1.
 ///
 /// Use [`daemon_refreshed_only_state`] for any test that verifies modern
 /// daemon-refreshed-host behaviour.
@@ -769,7 +769,7 @@ impl GeminiFixtureMode {
 /// would make any "slot N no longer OrphanLegacySlot" assertion pass
 /// green REGARDLESS of the G4 predicate fix — the slot was never a
 /// candidate in that fixture. The real maintainer host HAS `config-13/`
-/// (verified in journal 0001 D4). A test asserting the G4 fix MUST pass
+/// (verified in an internal journal entry D4). A test asserting the G4 fix MUST pass
 /// `with_config_dir = true` so the slot is a genuine orphan candidate
 /// that the predicate must actively exclude. This is the structural
 /// defense for the journal-0065-Finding-1 fixture-masking class.
@@ -793,7 +793,7 @@ pub fn gemini_binding_state(
         GeminiFixtureMode::VertexSa => AuthMode::VertexSa {
             // Synthetic absolute path — the fixture does NOT validate or
             // read it (the writer never reads the SA JSON; the identity
-            // literal is mode-class only — journal 0065 Finding 1 class).
+            // literal is mode-class only — an internal journal entry Finding 1 class).
             path: std::path::PathBuf::from(format!("/nonexistent/fixture-sa-{slot}.json")),
         },
         GeminiFixtureMode::CodeAssistOAuth => AuthMode::CodeAssistOAuth,
@@ -1218,7 +1218,7 @@ mod tests {
     /// writes EXACTLY `settings.json` + `.csq-account` and does NOT write
     /// `.credentials.json`, `credentials/`, or `profiles.json::accounts[N]`.
     ///
-    /// Origin: journal 0065 Finding 1 + FM-1.
+    /// Origin: an internal journal entry Finding 1 + FM-1.
     #[test]
     fn daemon_refreshed_only_state_writes_settings_and_marker_only() {
         // Arrange
@@ -1294,7 +1294,7 @@ mod tests {
     /// introduce `oauthAccount.emailAddress` — this test verifies the invariant
     /// at the filesystem level across all five variants.
     ///
-    /// Origin: journal 0065 Finding 1 + FM-1.
+    /// Origin: an internal journal entry Finding 1 + FM-1.
     #[test]
     fn daemon_refreshed_only_state_refuses_to_write_credentials() {
         let all_kinds = [

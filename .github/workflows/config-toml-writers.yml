@@ -1,0 +1,30 @@
+name: config.toml writers
+
+# Enforces spec 07 §7.2.2.1: every writer to `config-<N>/config.toml` MUST use
+# `csq_core::platform::fs::atomic_replace` — no direct `std::fs::write` to a
+# config.toml path in production code. Test fixtures opt in with the
+# `// CI-ALLOW-fs-write-config-toml` same-line marker. Pure grep gate (no
+# toolchain, no build, no secrets) — runs on every Rust-touching PR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "tools/grep-config-toml-writers-use-atomic-replace.sh"
+      - ".github/workflows/config-toml-writers.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "tools/grep-config-toml-writers-use-atomic-replace.sh"
+      - ".github/workflows/config-toml-writers.yml"
+
+jobs:
+  config-toml-writers:
+    name: config.toml writers use atomic_replace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate — no raw std::fs::write to config.toml in production code
+        run: bash tools/grep-config-toml-writers-use-atomic-replace.sh

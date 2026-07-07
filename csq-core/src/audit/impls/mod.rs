@@ -6,12 +6,12 @@
 //! (proprietary) live in the sibling `the enterprise seam crate`
 //! crate, which is NOT a workspace member — maintainers build it
 //! locally with `cargo check --manifest-path the enterprise seam crate/Cargo.toml`.
-//! See `workspaces/csq-pact-eatp-adoption/todos/active/M01-trait-skeleton-csq-core-audit.md`
+//! See `internal-design-docs`
 //! §"Acceptance criteria" amendment for the rationale.
 //!
 //! # Modules
 //!
-//! - [`noop`] — `NoopSink`, a `#[cfg(any(test, feature = "test-utils"))]`
+//! - `noop` — `NoopSink`, a `#[cfg(any(test, feature = "test-utils"))]`
 //!   in-memory sink used by unit tests and the M01 type-check harness.
 //!   Structurally cannot ship in a release binary (see audit-primitive
 //!   grep in `M01-trait-skeleton-csq-core-audit.md`).

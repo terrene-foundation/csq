@@ -1,13 +1,13 @@
 {
   "zai": {
-    "models": ["glm-4.5-air", "glm-4.7", "glm-5.1"],
-    "latest": "glm-5.1",
-    "default": "glm-5.1"
+    "models": ["glm-4.7", "glm-5.2", "glm-5.2[1m]"],
+    "latest": "glm-5.2[1m]",
+    "default": "glm-5.2[1m]"
   },
   "mm": {
-    "models": ["MiniMax-M2.7-highspeed"],
-    "latest": "MiniMax-M2.7-highspeed",
-    "default": "MiniMax-M2.7-highspeed"
+    "models": ["MiniMax-M2.7-highspeed", "MiniMax-M3"],
+    "latest": "MiniMax-M3",
+    "default": "MiniMax-M3"
   },
   "ollama": {
     "models": [],

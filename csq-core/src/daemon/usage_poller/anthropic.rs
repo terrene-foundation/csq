@@ -18,10 +18,10 @@ use super::{
 };
 
 /// Anthropic base URL for OAuth usage.
-const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub(crate) const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 
 /// Beta header value required for the usage endpoint.
-const ANTHROPIC_BETA_HEADER: &str = "oauth-2025-04-20";
+pub(crate) const ANTHROPIC_BETA_HEADER: &str = "oauth-2025-04-20";
 
 /// Runs a single Anthropic usage poller tick.
 ///

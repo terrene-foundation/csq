@@ -1,8 +1,8 @@
 //! Per-account usage ledger — append-only NDJSON of usage events,
-//! identity-keyed (M2-5, issue #292 Phase 2) when `by_slot` is populated
+//! identity-keyed (M2-5, an internal ticket Phase 2) when `by_slot` is populated
 //! in `profiles.json`, slot-keyed otherwise.
 //!
-//! Per journal 0050 D4. Paths:
+//! Per an internal journal entry D4. Paths:
 //! - UUID case  (Phase 2+): `<base_dir>/identities/<UUID>/usage.ndjson`
 //! - Legacy case (no UUID): `<base_dir>/usage-{slot}.ndjson`
 //!
@@ -20,7 +20,7 @@ use crate::types::AccountNum;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Returns the absolute path to the per-account ledger (M2-5, issue #292).
+/// Returns the absolute path to the per-account ledger (M2-5, an internal ticket).
 ///
 /// **UUID case** (Phase 2+, `by_slot` populated in `profiles.json`):
 /// `<base_dir>/identities/<UUID>/usage.ndjson`
@@ -48,7 +48,7 @@ pub enum UsageSource {
     #[serde(rename = "session-meta")]
     SessionMeta,
     /// Sourced from CC's per-cwd `~/.claude/projects/<cwd>/<session-id>.jsonl`
-    /// (per-turn detail). v2 enrichment per journal 0050 D3.
+    /// (per-turn detail). v2 enrichment per an internal journal entry D3.
     #[serde(rename = "projects-jsonl")]
     ProjectsJsonl,
     /// Sourced from the daemon's 3P probe responses. Counts csq's polling
@@ -454,7 +454,7 @@ not-json
     // ── M2-5 acceptance-criteria tests ──────────────────────────────────────
 
     /// Structural guard: the `save_state`/`save_quota` callsite count in
-    /// csq-core/src (excluding `quota/state.rs` itself) MUST stay at 22
+    /// csq-core/src (excluding `quota/state.rs` itself) MUST stay at 23
     /// (cross-phase invariant — `rules/account-terminal-separation.md`
     /// MUST Rule 1). This test enforces that no new callsite was added
     /// accidentally; any intentional change re-runs the Rule 1 channel
@@ -462,10 +462,16 @@ not-json
     ///
     /// Count composition (the line-level scan does NOT exclude `#[cfg(test)]`
     /// modules — the `#[cfg(test)]` check below only skips lines that carry
-    /// the attribute text themselves): 12 genuine production callsites,
+    /// the attribute text themselves): 13 genuine production callsites,
     /// 9 callsites inside test modules, and 1 self-referential match (this
     /// test's own `contains("save_state(")` line). The tripwire value is the
     /// invariant; the per-channel audit lives in the rule's grep primitive.
+    ///
+    /// The 13th production callsite (2026-07-06) is the DeepSeek balance writer
+    /// `usage_poller::deepseek::write_deepseek_balance` — an AUTHORIZED writer
+    /// per Rule 1 channel (a): its slot id comes from `info.id` in the 3P poll
+    /// loop's per-slot iteration state, exactly like MiniMax/Z.AI. NOT a
+    /// terminal-derived slot. See an internal ticket.
     ///
     /// Implementation: a runtime grep against the source tree at
     /// `CARGO_MANIFEST_DIR`. The test only runs when the manifest dir env
@@ -518,10 +524,12 @@ not-json
         walk_and_count(&src_root, &mut count);
 
         assert_eq!(
-            count, 22,
-            "save_state production callsite count changed: expected 22, got {count}. \
-             M2-5 MUST NOT add new quota writers — see \
-             rules/account-terminal-separation.md MUST Rule 1"
+            count, 23,
+            "save_state production callsite count changed: expected 23, got {count}. \
+             A new quota writer MUST source its slot id from an authoritative channel \
+             (per-slot poller state / IPC event / slot-lifecycle param) per \
+             rules/account-terminal-separation.md MUST Rule 1 — classify the channel \
+             before updating this count."
         );
     }
 

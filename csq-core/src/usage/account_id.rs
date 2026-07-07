@@ -1,4 +1,4 @@
-//! `account_id` chokepoint per journal 0050 D4. Today returns the slot number
+//! `account_id` chokepoint per an internal journal entry D4. Today returns the slot number
 //! as a string (`"1"`, `"4"`); post-issue-#292 (Option A++) this returns the
 //! account's permanent UUID. The chokepoint is the SOLE caller-visible function
 //! for "give me a stable identifier for this slot's ledger / config dir / etc."
@@ -11,7 +11,7 @@
 //!     slot.get().to_string()
 //! }
 //!
-//! // Post-A++ (issue #292):
+//! // Post-A++ (an internal ticket):
 //! pub fn resolve_account_id(base: &Path, slot: AccountNum) -> String {
 //!     crate::accounts::profiles::resolve_slot_to_uuid(base, slot.get())
 //!         .map(|id| id.to_string())
@@ -31,7 +31,7 @@ use std::path::Path;
 /// to use as a filename component (alphanumeric + dash; no path separators,
 /// no NUL bytes).
 ///
-/// Post-A++ (issue #292, Phase 2 M2-1): returns the account's permanent UUID
+/// Post-A++ (an internal ticket, Phase 2 M2-1): returns the account's permanent UUID
 /// string when `profiles.json` has a `by_slot` mapping for this slot.
 /// Falls back to the decimal slot number string when UUID is absent (legacy
 /// layout or missing profiles.json).

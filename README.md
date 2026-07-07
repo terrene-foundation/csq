@@ -385,7 +385,7 @@ is not a substitute for upgrading.
 
 - `specs/13-multi-cli-detection-contract.md` — the authoritative contract
   (probe semantics, manager classification, dispatch table, security boundary).
-- `workspaces/multi-cli-deps/` — analysis, plans, and journals for this feature.
+- `internal-design-docs` — analysis, plans, and journals for this feature.
 
 ## Using local models (Ollama)
 
@@ -454,13 +454,13 @@ csq run 9                           # launches CC routed through MiniMax on slot
 | ---------------------- | ---------------------------------- |
 | `ANTHROPIC_BASE_URL`   | `https://api.minimax.io/anthropic` |
 | `ANTHROPIC_AUTH_TOKEN` | your key                           |
-| `ANTHROPIC_MODEL`      | `MiniMax-M2.7-highspeed`           |
+| `ANTHROPIC_MODEL`      | `MiniMax-M3`                       |
 
 It also upserts `profiles.json[9]` with `method: "api_key"` and writes the `.csq-account` marker so the dashboard and `csq run` can identify the slot.
 
 Omitting `--key` prompts for the key with hidden input (paste-safe for long JWTs). Omitting `--slot` falls back to the legacy global `settings-mm.json` store (no slot binding — useful only if you plan to attach it to a slot later).
 
-### Z.AI (GLM-5.1)
+### Z.AI (GLM-5.2)
 
 ```bash
 csq setkey zai --slot 10 --key …
@@ -473,7 +473,7 @@ Writes `config-10/settings.json` with:
 | ---------------------- | -------------------------------- |
 | `ANTHROPIC_BASE_URL`   | `https://api.z.ai/api/anthropic` |
 | `ANTHROPIC_AUTH_TOKEN` | your key                         |
-| `ANTHROPIC_MODEL`      | `glm-5.1`                        |
+| `ANTHROPIC_MODEL`      | `glm-5.2[1m]`                    |
 
 ### Claude direct API key
 
@@ -544,8 +544,8 @@ When a newer model is available, `csq models` shows an update indicator:
 
 ```
 Profile      Model                          Status
-zai          glm-4.7                        (update: glm-5.1)
-mm           MiniMax-M2.7-highspeed         (latest)
+zai          glm-5.2[1m]                    (latest)
+mm           MiniMax-M3                     (latest)
 ```
 
 The model catalog updates automatically -- csq auto-updates from GitHub on every `csq run` (silently, in the background, with a 3s timeout for offline safety).

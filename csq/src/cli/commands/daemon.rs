@@ -136,7 +136,7 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
             // safe to run before `spawn_refresher`.
             let _reconcile_summary = daemon::run_reconciler(&base_dir_for_runtime);
 
-            // M3-7 + M4-5: Phase 4 fail-closed gate (journal 0015 Delta F /
+            // M3-7 + M4-5: Phase 4 fail-closed gate (an internal journal entry Delta F /
             // OQ #7; strengthened in M4-5). Refuse to start if the on-disk
             // store predates Phase 4 layout. Error's `Display` carries
             // operator-actionable next steps per `tauri-commands.md` MUST
@@ -192,6 +192,24 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
                 };
                 let base_for_verify = base_dir_for_runtime.clone();
                 let verify_future = tokio::task::spawn_blocking(move || {
+                    // M3 §10.5 (W2a): reconcile the born-canonical EATP attestation
+                    // chain's own `.chain-broken` sentinel inside the SAME
+                    // spawn_blocking so the startup timeout covers both chains. Side
+                    // pass — the EATP chain does not gate daemon startup (the op-chain
+                    // result below is the authority). Inert until the EATP chain
+                    // exists (`verify_chain_in` returns Ok(default) for absent
+                    // `eatp-runs/`).
+                    let eatp = csq_core::audit::verify_chain_in(
+                        &base_for_verify,
+                        &verify_cfg,
+                        None,
+                        csq_core::audit::ChainKind::Eatp,
+                    );
+                    csq_core::audit::reconcile_chain_sentinel(
+                        &base_for_verify,
+                        csq_core::audit::ChainKind::Eatp.runs_subdir(),
+                        &eatp,
+                    );
                     csq_core::audit::verify_chain(&base_for_verify, &verify_cfg, None)
                 });
                 let health = match tokio::time::timeout(
@@ -350,6 +368,40 @@ Run `csq audit verify --full` for diagnosis."
                 oauth_store: Some(Arc::clone(&oauth_store)),
                 gemini_consumer: gemini_consumer.clone(),
                 audit_health: audit_health.clone(),
+                // #783 — seed the interactive enforcement registry from the
+                // fail-closed §10.5 activation gate (absent → empty/503).
+                // #784 follow-up — inject the cross-SDK kailash projector (the
+                // csq crate owns the seam; csq-core cannot name it).
+                // T-M4.3 — inject the PACT governor factory so a configured
+                // operating envelope wires the first production ActionGovernor
+                // (fail-closed: a present-but-unloadable envelope refuses to open).
+                #[cfg(feature = "enterprise")]
+                interactive: Arc::new({
+                    let reg = daemon::interactive_live::seed_registry(
+                        &base_dir_for_runtime,
+                        Some(crate::kailash_projector::make_kailash_projector()),
+                        Some(crate::kailash_governor::make_governor_factory()),
+                        // T-M4.5 — inject the lifecycle-audit-sink factory so every
+                        // session records a signed Delegate-lifecycle audit trail.
+                        Some(crate::kailash_audit_sink::make_audit_sink_factory()),
+                    );
+                    // M3 §10.5 W2b — inject the EATP born-canonical genesis guard.
+                    // Classifies the genesis record on every session open; non-BornCanonical
+                    // refuses EATP chain appends but the session still proceeds.
+                    // M3 §10.5 W3 — inject the EATP session-close attestation writer.
+                    // Appends a born-canonical session-close attestation on every
+                    // close (fail-closed-NON-FATAL — never blocks teardown).
+                    reg.with_eatp_genesis_guard(
+                        crate::kailash_eatp_genesis::make_eatp_genesis_guard(
+                            &base_dir_for_runtime,
+                        ),
+                    )
+                    .with_eatp_attestor(
+                        crate::kailash_eatp_attest::make_eatp_session_close_attestor(
+                            &base_dir_for_runtime,
+                        ),
+                    )
+                }),
             };
 
             // ── M19: Emit capture-matrix record (sidecar dedup) ───────────────────
@@ -511,7 +563,7 @@ Run `csq audit verify --full` for diagnosis."
                     // Start the handle-dir sweep. Scans term-* dirs
                     // every 60 seconds, preserves each dead dir's
                     // per-session image cache to ~/.claude/image-cache/,
-                    // then removes the orphan. See journal 0035.
+                    // then removes the orphan. See an internal journal entry
                     //
                     // If `claude_home()` cannot resolve `~/.claude`
                     // (malformed $CLAUDE_HOME, missing $HOME), pass
@@ -691,18 +743,18 @@ Run `csq audit verify --full` for diagnosis."
     Ok(())
 }
 
-/// Resolves the active [`LedgerSink`] from `sink_cfg`.
+/// Resolves the active `LedgerSink` from `sink_cfg`.
 ///
 /// Returns `None` when:
 /// - `sink_cfg.sink == "none"` (no external sink configured).
 /// - The requested sink was not compiled into this binary (no matching feature flag).
 ///
 /// Compiled-in sinks (activated by their respective `--features` flag):
-/// - `"rekor"` → [`csq_core::audit::impls::sinks::rekor::RekorSink`] (feature `rekor-sink`).
+/// - `"rekor"` → `csq_core::audit::impls::sinks::rekor::RekorSink` (feature `rekor-sink`).
 ///   **Note:** the M07 ship uses an in-memory mock substrate; a real Sigstore
 ///   Rekor HTTP client is a documented follow-up. A WARN log marks this so
 ///   operators are never silently misled into treating the mock as a durable witness.
-/// - `"csq-ledger"` → [`csq_core::audit::impls::csq_ledger_sink::CsqLedgerSink`]
+/// - `"csq-ledger"` → `csq_core::audit::impls::csq_ledger_sink::CsqLedgerSink`
 ///   (feature `csq-ledger-sink`). `reqwest`-backed; connects to `audit-sink.json`
 ///   default URL `http://127.0.0.1:8080` unless the operator overrides.
 fn resolve_anchor_sink(

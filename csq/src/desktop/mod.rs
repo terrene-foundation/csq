@@ -155,7 +155,7 @@ pub struct AppState {
     /// Running `codex login --device-auth` child. Mirrors
     /// `ollama_pull_child` — see `pull_ollama_model` doc for the
     /// rationale on the `Arc<Mutex<Option<Arc<Mutex<Child>>>>>`
-    /// shape. PR-C9a journal 0021 finding 6: the desktop Codex
+    /// shape. PR-C9a an internal journal entry finding 6: the desktop Codex
     /// UI's modal-close must kill the subprocess so it does not
     /// orphan for the minutes-long codex-cli device-auth window.
     pub codex_login_child: Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
@@ -737,7 +737,7 @@ fn request_update_check_now() {
     }
 }
 
-/// Return value of [`run_update_check_with_outcome`]: did the
+/// Return value of `run_update_check_with_outcome`: did the
 /// network call succeed (up-to-date or new release), or did it
 /// fail (HTTP error, parse error, rate limit)? Drives the
 /// backoff logic in the loop.
@@ -1091,8 +1091,10 @@ pub fn run() {
         // `:default` which would also bundle save / message / ask.
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            commands::get_build_edition,
             commands::get_accounts,
             commands::rename_account,
+            commands::provider_cli_installed,
             commands::remove_account,
             commands::move_account,
             commands::get_account_usage,
@@ -1104,6 +1106,16 @@ pub fn run() {
             commands::get_capability_layer_toggles,
             commands::set_capability_layer_toggles,
             commands::get_daemon_status,
+            // #793 — M-IC interactive per-turn enforcement console. Thin
+            // wrappers driving the daemon's enterprise-only /api/interactive/*
+            // routes; the renderer relays input + displays the redacted verdict,
+            // never deciding enforcement itself (R1-S7).
+            commands::interactive::interactive_open,
+            commands::interactive::interactive_submit,
+            commands::interactive::interactive_override,
+            commands::interactive::interactive_abandon,
+            commands::interactive::interactive_close,
+            commands::interactive::interactive_options,
             commands::list_providers,
             // Phase 2 of #389 — the renderer's Claude OAuth path now
             // shells out to `claude auth login` via
@@ -1189,6 +1201,47 @@ pub fn run() {
                 .with_writer(std::io::stderr)
                 .try_init();
 
+            // ── CLI shim refresh (#1) ──────────────────────────
+            //
+            // The desktop `.app` and the terminal CLI are the same single
+            // binary but are installed by independent channels — a desktop
+            // auto-update never refreshes `~/.local/bin/csq`, so the in-process
+            // daemon (new) and the terminal CLI (old) drift and trip the
+            // version-skew guard on `csq run`/`login`/`status`/`doctor`. Refresh
+            // the CLI to match this bundle on every launch. Best-effort +
+            // NON-FATAL: a failure here must never block the desktop app.
+            // Real-file copy (NOT cp → Gatekeeper SIGKILL; NOT a symlink →
+            // mode::detect canonicalize trap). See csq_core cli_shim.
+            //
+            // Source resolution (an internal ticket): on the enterprise Developer-ID
+            // build the running binary is the bundle's `--deep`-signed MAIN
+            // executable, whose signature is bundle-bound and INVALID when copied
+            // standalone (→ SIGKILL). `resolve_shim_source` prefers the
+            // standalone-signed `Contents/Helpers/csq-cli` helper when present,
+            // falling back to the running exe otherwise.
+            match (
+                std::env::current_exe()
+                    .map(|exe| csq_core::cli_deps::cli_shim::resolve_shim_source(&exe)),
+                csq_core::cli_deps::cli_shim::resolve_shim_target(),
+            ) {
+                (Ok(src), Some(target)) => {
+                    match csq_core::cli_deps::cli_shim::ensure_cli_shim(&src, &target) {
+                        Ok(outcome) => tracing::info!(
+                            ?outcome,
+                            target = %target.display(),
+                            "cli shim refresh"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "cli shim refresh failed (non-fatal)"
+                        ),
+                    }
+                }
+                _ => tracing::warn!(
+                    "cli shim refresh skipped: could not resolve current exe or target"
+                ),
+            }
+
             let log_level = if cfg!(debug_assertions) {
                 log::LevelFilter::Debug
             } else {
@@ -1220,7 +1273,7 @@ pub fn run() {
             // auto-rotate + IPC server) inside the Tauri process so
             // tokens stay refreshed for as long as the desktop app
             // is running. Without this, the user's only option is
-            // `csq daemon start` in a terminal — and journal 0026
+            // `csq daemon start` in a terminal — and an internal journal entry
             // shows what happens when they forget (every OAuth
             // account expired for 6–80 hours).
             //

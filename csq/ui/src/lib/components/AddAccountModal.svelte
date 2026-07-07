@@ -45,7 +45,7 @@
   }
 
   // PR-C8 — Codex device-auth flow types.
-  // Journal 0054 / round-3 redteam HIGH-A — `device_auth_prereq_*` fields
+  // an internal journal entry / round-3 redteam HIGH-A — `device_auth_prereq_*` fields
   // carry the ChatGPT Security Settings prerequisite so the modal can
   // render it BEFORE the device-auth subprocess starts. csq has no way
   // to detect whether the operator's "Device code authorization" toggle
@@ -142,7 +142,7 @@
         kind: 'gemini-provision';
         account: number;
         /// "api-key" | "vertex" | "oauth" — currently active tab.
-        /// Stage 2 of journal 0048 added "oauth" (Code Assist OAuth).
+        /// Stage 2 of an internal journal entry added "oauth" (Code Assist OAuth).
         mode: 'api-key' | 'vertex' | 'oauth';
         /// AI Studio API key paste buffer.
         key: string;
@@ -166,6 +166,17 @@
         /// available). Surfaced verbatim so the user has the
         /// concrete next action.
         message: string;
+      }
+    | {
+        /// The selected provider's CLI binary is not installed. Surfaced as a
+        /// friendly install prompt (with the exact install command + a copy
+        /// button + a Recheck action) BEFORE launching a login that would
+        /// otherwise fail mid-device-auth with a raw error.
+        kind: 'cli-missing';
+        account: number;
+        provider: 'codex' | 'gemini';
+        binary: string;
+        installCmd: string;
       }
     | { kind: 'error'; message: string };
 
@@ -429,7 +440,10 @@
       // now emits stable error-code prefixes (LOCK_HELD, LOCK_FAILED,
       // INVALID_INPUT, BASE_DIR_MISSING, CLAUDE_BIN_MISSING,
       // SPAWN_FAILED, CC_EXITED_NONZERO, NO_CREDENTIALS,
-      // CRED_WRITE_FAILED, MARKER_WRITE_FAILED, FINALIZE_FAILED).
+      // STALE_CREDENTIALS, CRED_WRITE_FAILED, MARKER_WRITE_FAILED,
+      // FINALIZE_FAILED). STALE_CREDENTIALS currently falls through to
+      // the generic error banner (verbatim message); add an explicit
+      // arm here if a distinct 'retry login' hint is ever wanted.
       // The renderer branches on the tag rather than substring-
       // matching prose so a future backend wording tweak cannot
       // silently route a real contention into the generic error
@@ -567,7 +581,7 @@
   // AND show the code so they can type it on the OpenAI page.
   let codexDeviceCodeUnlisten: UnlistenFn | null = null;
 
-  // Journal 0021 finding 14: listener-registration race. If the user
+  // an internal journal entry finding 14: listener-registration race. If the user
   // closes the modal while `await listen()` is still resolving,
   // `codexDeviceCodeUnlisten` is null in `handleClose`, so there is
   // nothing to unregister — and when `listen()` finally resolves,
@@ -576,14 +590,76 @@
   // immediately.
   let codexListenerClosed = false;
 
-  // Round-3 redteam HIGH-A (journal 0054) — populated by `startCodexFlow`
+  // Round-3 redteam HIGH-A (an internal journal entry) — populated by `startCodexFlow`
   // from the `start_codex_login` Tauri response. Rendered in the
   // `codex-tos` and `codex-keychain-prompt` screens so the user sees
   // the ChatGPT Security Settings prerequisite BEFORE the device code
   // is generated. Cleared on modal close / picker reset.
   let codexPrereq = $state<{ message: string; url: string } | null>(null);
 
+  // Copy-to-clipboard helper, shared by the device-auth code and the CLI
+  // install command. `navigator.clipboard` is available in the Tauri WKWebView
+  // under a user gesture (the button click); the copied text is also
+  // user-selectable (CSS) so manual copy is the fallback if the async write is
+  // rejected. `copiedText` holds the most-recently-copied string so each button
+  // shows its own transient "Copied!" affordance without cross-triggering.
+  let copiedText = $state<string | null>(null);
+  async function copyText(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copiedText = text;
+      setTimeout(() => {
+        if (copiedText === text) copiedText = null;
+      }, 1500);
+    } catch {
+      // Clipboard blocked (no gesture / permission) — the text stays
+      // selectable, so the user can still copy it manually.
+    }
+  }
+
+  // Provider CLI install commands, surfaced by the `cli-missing` prompt.
+  const CLI_INSTALL: Record<'codex' | 'gemini', { binary: string; cmd: string }> = {
+    codex: { binary: 'codex', cmd: 'npm install -g @openai/codex' },
+    gemini: { binary: 'gemini', cmd: 'npm install -g @google/gemini-cli' },
+  };
+
+  // Pre-flight: is the provider's CLI installed? Returns true → proceed with the
+  // login; false → the step has been switched to `cli-missing` (a friendly
+  // install prompt) so the caller must abort. Fail-OPEN on the check itself: if
+  // the pre-flight invoke errors, proceed and let the login surface its own
+  // error rather than blocking on a broken probe.
+  async function ensureCliInstalled(
+    account: number,
+    provider: 'codex' | 'gemini',
+  ): Promise<boolean> {
+    const { binary, cmd } = CLI_INSTALL[provider];
+    let installed = true;
+    try {
+      // Fail-OPEN: only an explicit `false` means "missing". Any other value
+      // (a rejected invoke, an unexpected shape) proceeds and lets the login
+      // surface its own error rather than blocking on a broken pre-flight.
+      installed = (await invoke<boolean>('provider_cli_installed', { binary })) !== false;
+    } catch {
+      installed = true;
+    }
+    if (!installed) {
+      step = { kind: 'cli-missing', account, provider, binary, installCmd: cmd };
+      return false;
+    }
+    return true;
+  }
+
+  // Recheck action for the `cli-missing` prompt: re-run the provider flow (which
+  // re-runs the pre-flight) after the user has installed the CLI.
+  async function retryAfterInstall() {
+    if (step.kind !== 'cli-missing') return;
+    const { account, provider } = step;
+    if (provider === 'codex') await startCodexFlow(account);
+    else await startGeminiFlow(account);
+  }
+
   async function startCodexFlow(account: number, tosRetry: boolean = false) {
+    if (!(await ensureCliInstalled(account, 'codex'))) return;
     try {
       const baseDir = await getBaseDir();
       const pre = await invoke<CodexStartLoginView>('start_codex_login', {
@@ -598,7 +674,7 @@
       };
       if (pre.tos_required) {
         if (tosRetry) {
-          // Journal 0021 finding M2: the caller already tried to
+          // an internal journal entry finding M2: the caller already tried to
           // acknowledge once. A second `tos_required` means the
           // marker write didn't stick — probably a disk/permissions
           // problem. Surface an error instead of recursing
@@ -634,7 +710,7 @@
       // even if the user has acknowledged ToS before in a prior
       // session — a new keychain entry may have appeared since.
       //
-      // Journal 0021 finding M2: pass `_tosRetry=true` so if the
+      // an internal journal entry finding M2: pass `_tosRetry=true` so if the
       // backend still reports `tos_required` (stale read / race /
       // broken disk), we surface an error rather than recurse
       // indefinitely. One retry is enough — a second `tos_required`
@@ -679,7 +755,7 @@
       },
     );
 
-    // Journal 0021 finding 14: if the modal was closed while
+    // an internal journal entry finding 14: if the modal was closed while
     // `await listen()` was resolving, `handleClose` has already
     // run but had null to unregister. Check the flag here —
     // if closed, drop the handler immediately so no late event
@@ -723,12 +799,13 @@
   //    OAuth credentials exist on disk — the slot they're about to
   //    bind to API-key mode won't exercise those credentials. Earlier
   //    revisions framed this as ToS enforcement (ADR-G12) — retracted
-  //    in journal 0048.
+  //    in an internal journal entry
   //
   // 2. `gemini-provision` — two-tab panel (AI Studio API key paste /
   //    Vertex service account JSON). Submit invokes the appropriate
   //    Tauri command (`gemini_provision_api_key` / `gemini_provision_vertex_sa`).
   async function startGeminiFlow(account: number) {
+    if (!(await ensureCliInstalled(account, 'gemini'))) return;
     try {
       const baseDir = await getBaseDir();
       // Probe ALWAYS — even if ToS was acknowledged in a prior
@@ -861,7 +938,7 @@
     }
   }
 
-  /// Stage 2 of journal 0048: provisions a Gemini slot in Code Assist
+  /// Stage 2 of an internal journal entry: provisions a Gemini slot in Code Assist
   /// OAuth mode. Invokes `gemini_provision_oauth` which shells out to
   /// `gemini auth login` and waits for the browser-driven OAuth flow
   /// to finish (typically 30-120s). UI stays in `submitting` state for
@@ -889,7 +966,7 @@
 
   // ── Close behavior ────────────────────────────────────────
   async function handleClose() {
-    // Journal 0021 finding 13 + 14: flag the listener as "closed"
+    // an internal journal entry finding 13 + 14: flag the listener as "closed"
     // BEFORE dropping the unlisten handle. If `await listen()` is
     // still in-flight at this moment (race), its post-resolve guard
     // in `runCodexLogin` will see `codexListenerClosed` and drop
@@ -914,7 +991,7 @@
     // before the previous subprocess exits surfaces the
     // login-in-progress recovery UI from the lock acquire path.
 
-    // Journal 0021 finding 6: kill the running codex subprocess so
+    // an internal journal entry finding 6: kill the running codex subprocess so
     // it does not orphan for the minutes-long device-auth window.
     // Best-effort — the backend treats a no-op (no child running)
     // as success. Runs BEFORE the step reset so the invoke is not
@@ -925,7 +1002,7 @@
       /* best-effort — ignore */
     }
 
-    // Journal 0021 finding 13: reset `step` to 'picker' so a late
+    // an internal journal entry finding 13: reset `step` to 'picker' so a late
     // `codex-device-code` delivery (e.g. a Tauri event bus race)
     // does NOT satisfy the `step.kind === 'codex-running'` guard in
     // the listener closure and slam the modal back into the running
@@ -1207,7 +1284,7 @@
             Signing in to Codex account #{step.account}…
           </p>
           <!--
-            Round-4 redteam HIGH-1 (journal 0054) — render the prereq
+            Round-4 redteam HIGH-1 (an internal journal entry) — render the prereq
             in the codex-running screen too. CLI prints the banner
             unconditionally before the device-auth subprocess
             (csq-cli/src/commands/login.rs:580-593); desktop achieves
@@ -1234,7 +1311,17 @@
               Open the verification page and enter the code shown below:
             </p>
             <div class="device-code-panel">
-              <div class="device-code">{step.deviceCode.user_code}</div>
+              <div class="device-code-row">
+                <div class="device-code">{step.deviceCode.user_code}</div>
+                <button
+                  type="button"
+                  class="copy-code-btn"
+                  data-testid="copy-device-code"
+                  title="Copy code to clipboard"
+                  aria-label="Copy code to clipboard"
+                  onclick={() => copyText(step.kind === 'codex-running' && step.deviceCode ? step.deviceCode.user_code : '')}
+                >{step.kind === 'codex-running' && step.deviceCode && copiedText === step.deviceCode.user_code ? '✓ Copied' : '⧉ Copy'}</button>
+              </div>
               <a
                 class="device-code-url"
                 href={step.deviceCode.verification_url}
@@ -1262,7 +1349,7 @@
             gemini-cli, what state csq writes to the slot's
             .gemini/settings.json, and how to switch auth modes.
             Earlier revisions framed this as a ToS-driven warning —
-            that framing was retracted in journal 0048 (the cited
+            that framing was retracted in an internal journal entry (the cited
             ToS targets reimplementations that bypass the official
             CLI; csq just spawns the official gemini binary as a
             subprocess).
@@ -1312,7 +1399,7 @@
               Informational note: the slot is being bound to API-key
               mode, so the OAuth credentials at .gemini/oauth_creds.json
               will not be exercised by this slot. Earlier revisions
-              framed this as ToS enforcement — retracted in journal 0048.
+              framed this as ToS enforcement — retracted in an internal journal entry
             -->
             <div class="hint" data-testid="gemini-residue-warning">
               ℹ <code>{step.residue}</code> was found. This slot will be
@@ -1489,6 +1576,40 @@
               data-testid="login-in-progress-retry"
               onclick={dismissLoginInProgressAndRetry}
             >Retry</button>
+          </div>
+        {:else if step.kind === 'cli-missing'}
+          <div class="cli-missing" data-testid="cli-missing-prompt">
+            <p class="lede">
+              {step.provider === 'codex' ? 'codex-cli' : 'gemini-cli'} is not installed
+            </p>
+            <p class="hint">
+              csq drives the official
+              <code>{step.binary}</code>
+              CLI to sign in to this account. Install it, then click
+              <strong>Recheck</strong>. csq keeps the CLI up to date automatically
+              once it's installed.
+            </p>
+            <div class="install-cmd-row">
+              <code class="install-cmd">{step.installCmd}</code>
+              <button
+                type="button"
+                class="copy-code-btn"
+                data-testid="copy-install-cmd"
+                title="Copy install command"
+                aria-label="Copy install command"
+                onclick={() =>
+                  copyText(step.kind === 'cli-missing' ? step.installCmd : '')}
+              >{step.kind === 'cli-missing' && copiedText === step.installCmd
+                  ? '✓ Copied'
+                  : '⧉ Copy'}</button>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="primary" data-testid="cli-missing-recheck" onclick={retryAfterInstall}
+              >Recheck</button
+            >
+            <button class="secondary" onclick={() => (step = { kind: 'picker' })}>Back</button>
+            <button class="danger" onclick={handleClose}>Close</button>
           </div>
         {:else if step.kind === 'error'}
           <div class="error-banner">{step.message}</div>
@@ -1794,12 +1915,60 @@
     border: 1px solid var(--border);
     border-radius: 6px;
   }
+  .device-code-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
   .device-code {
     font-family: ui-monospace, monospace;
     font-size: 1.4rem;
     font-weight: 600;
     letter-spacing: 0.1em;
     color: var(--accent);
+    /* Selectable so the user can manually copy even if the clipboard
+       API write is rejected (no gesture / permission). */
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
+  }
+  .copy-code-btn {
+    font-size: 0.75rem;
+    padding: 0.2rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary, transparent);
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .copy-code-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .cli-missing {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin: 0.25rem 0 0.75rem 0;
+  }
+  .install-cmd-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.55rem 0.7rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .install-cmd {
+    flex: 1;
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+    color: var(--text-primary, var(--accent));
+    user-select: text;
+    -webkit-user-select: text;
+    word-break: break-all;
   }
   .device-code-url {
     font-size: 0.75rem;

@@ -11,7 +11,7 @@
 //! wants to PROMPT for keychain access, which a non-interactive process cannot
 //! answer → `errSecInteractionNotAllowed` → `keyring::Error::PlatformFailure`.
 //! A present-but-blocked key was then misclassified as absent and bricked the
-//! daemon (journal 0033/0034).
+//! daemon (an internal journal entry/0034).
 //!
 //! A 0o600 file store is read by ANY same-user csq binary identically — no
 //! ACL, no prompt, no signature dependency — so the daemon can always read the

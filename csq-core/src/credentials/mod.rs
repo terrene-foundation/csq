@@ -6,14 +6,17 @@
 //! CLIs; csq preserves every field it sees, including ones it does not
 //! recognise, so that future upstream additions round-trip cleanly.
 
+pub mod claude_json;
 pub mod file;
 pub mod keychain;
 pub mod mutex;
+pub mod post_login;
 pub mod refresh;
 
 pub use file::{load, save, save_canonical_for, save_uuid_settings, write_uuid_settings};
 pub use keychain::service_name;
 pub use mutex::AccountMutexTable;
+pub use post_login::{read_fresh_after_login, FreshLoginError};
 
 use crate::providers::catalog::Surface;
 use crate::types::{AccessToken, RefreshToken};

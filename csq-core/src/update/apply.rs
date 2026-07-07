@@ -56,7 +56,7 @@ pub fn download_and_apply<F>(info: &UpdateInfo, http_get: F) -> Result<()>
 where
     F: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
 {
-    // Structural placeholder-key guard (journal 0063, H1). The CLI
+    // Structural placeholder-key guard (an internal journal entry, H1). The CLI
     // wrapper at `csq-cli/src/commands/update.rs:75` used to be the
     // only caller that enforced this check. Keeping the gate on the
     // public entry point of csq-core ensures every future caller —
@@ -520,7 +520,7 @@ mod tests {
             .contains("failed to download"));
     }
 
-    // ── H1 regression (journal 0063) ──────────────────────────────────────
+    // ── H1 regression (an internal journal entry) ──────────────────────────────────────
 
     #[test]
     fn download_and_apply_refuses_when_placeholder_key_is_compiled_in() {

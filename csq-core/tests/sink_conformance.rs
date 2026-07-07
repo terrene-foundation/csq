@@ -56,6 +56,7 @@ fn test_corpus() -> Vec<SignedRecord> {
             eatp_start_ts: None,
             eatp_end_ts: None,
             op_phase: None,
+            verification_level: None,
         })
         .collect()
 }
@@ -222,4 +223,23 @@ async fn ledger_sink_conformance_csq_ledger() {
     use csq_core::audit::impls::csq_ledger_sink::CsqLedgerSink;
     let sink = CsqLedgerSink::mock_in_memory();
     assert_sink_conforms(&sink, "CsqLedgerSink").await;
+}
+
+// ── CustomerBodyStoreSink (M3 T3.5) ──────────────────────────────────────────
+//
+// Uses the in-memory mock transport (the conformance harness has no live
+// endpoint). The trait contract (append → verify round-trip) is identical to a
+// live operator endpoint; the mock proves the JSON wire encoding + the
+// LedgerSink impl. Requires
+// `--features csq-core/customer-body-store-sink,csq-core/test-utils`.
+
+#[cfg(all(
+    feature = "customer-body-store-sink",
+    any(test, feature = "test-utils")
+))]
+#[tokio::test]
+async fn ledger_sink_conformance_customer_body_store() {
+    use csq_core::audit::impls::sinks::customer_body_store::CustomerBodyStoreSink;
+    let sink = CustomerBodyStoreSink::mock_in_memory();
+    assert_sink_conforms(&sink, "CustomerBodyStoreSink").await;
 }

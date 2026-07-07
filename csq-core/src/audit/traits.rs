@@ -1,5 +1,5 @@
 //! csq-owned trait surface for the audit ledger (M01 + R1 fix-wave,
-//! workspace `csq-pact-eatp-adoption`, Phase A.1).
+//! workspace `an internal workspace`, Phase A.1).
 //!
 //! Four traits define the abstraction boundary between csq's daemon /
 //! CLI surfaces and the underlying canonical-form + signing + storage

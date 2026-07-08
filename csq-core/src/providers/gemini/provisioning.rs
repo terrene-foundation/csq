@@ -525,9 +525,13 @@ pub fn unbind(base_dir: &Path, slot: AccountNum) -> Result<(), ProvisionError> {
 /// `setkey mm` / `setkey codex`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundSurface {
-    /// Anthropic OAuth credentials at `credentials/<N>.json`.
+    /// Anthropic OAuth account — detected via the identity store (`by_slot` →
+    /// `identities/<UUID>/`, provider `anthropic`), with the legacy
+    /// `credentials/<N>.json` mirror as a pre-A++ fallback.
     ClaudeCode,
-    /// Codex OAuth credentials at `credentials/codex-<N>.json`.
+    /// Codex device-auth account — detected via the identity store (`by_slot`
+    /// → `identities/<UUID>/`, provider `codex` / `credentials-codex.json`),
+    /// with the legacy `credentials/codex-<N>.json` marker as a fallback.
     Codex,
 }
 
@@ -545,21 +549,29 @@ impl BoundSurface {
 
 /// Returns `Some(...)` when slot `N` is currently bound to a
 /// non-Gemini surface — the caller MUST refuse rebinding without an
-/// explicit `csq logout N` first. Treats a dangling symlink as
-/// "bound" (same posture as [`is_gemini_bound_slot`]).
+/// explicit `csq logout N` first. This is the shared guard for every
+/// Gemini provisioning entry point: `csq login N --provider gemini`
+/// (via [`super::oauth_login::perform`]) and the desktop
+/// `gemini_provision_*` commands.
 ///
-/// Codex is checked before ClaudeCode because Codex's marker file
-/// (`credentials/codex-<N>.json`) is namespaced and unambiguous,
-/// while the Anthropic path (`credentials/<N>.json`) is the original
-/// shape that pre-dates the multi-surface era — a stale Anthropic
-/// stub may exist on machines that also run Codex.
+/// Identity-store-aware (`account-terminal-separation.md` MUST Rule 4).
+/// M4-12 retired the legacy numeric mirrors (`credentials/<N>.json`,
+/// `credentials/codex-<N>.json`) as write targets, so the previous
+/// `symlink_metadata`-on-the-mirror implementation was blind to every
+/// post-A++ login — a Gemini bind would silently clobber a live
+/// Anthropic/Codex slot and orphan its `by_slot` mapping (the #995 class,
+/// `reconciler-cleanup-parity.md` Rule 6). Detection now delegates to the
+/// identity-aware predicates, which fall back to the legacy mirror
+/// (via `symlink_metadata`, preserving the dangling-link "treat as bound"
+/// posture) only for pre-A++ installs.
+///
+/// Codex is checked before ClaudeCode so a (rare) dual-bound slot reports
+/// Codex; the `csq logout N` remediation is surface-agnostic.
 pub fn detect_other_surface_binding(base_dir: &Path, slot: AccountNum) -> Option<BoundSurface> {
-    let codex_path = canonical_path_for(base_dir, slot, Surface::Codex);
-    if std::fs::symlink_metadata(&codex_path).is_ok() {
+    if crate::accounts::identity_store::is_codex_bound_slot_identity_aware(base_dir, slot) {
         return Some(BoundSurface::Codex);
     }
-    let claude_path = canonical_path_for(base_dir, slot, Surface::ClaudeCode);
-    if std::fs::symlink_metadata(&claude_path).is_ok() {
+    if crate::accounts::identity_store::is_anthropic_bound_slot(base_dir, slot) {
         return Some(BoundSurface::ClaudeCode);
     }
     None
@@ -1037,6 +1049,60 @@ mod tests {
         let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
         write_binding(dir.path(), slot(5), &binding).unwrap();
         assert!(detect_other_surface_binding(dir.path(), slot(5)).is_none());
+    }
+
+    /// Plant the post-M4-12 identity-store shape (by_slot → identity, NO legacy
+    /// mirror) — the state the pre-fix legacy-marker `detect_other_surface_binding`
+    /// was blind to, which would have let a Gemini bind clobber a live login.
+    fn plant_identity_by_slot(base: &Path, s: u16, provider: &str) {
+        use crate::accounts::identity_store::{
+            credentials_codex_path_for, credentials_path_for, identity_path, IdentityId,
+        };
+        use crate::accounts::profiles::{profiles_path, save, ProfilesFile};
+        let uuid = IdentityId::new_v4();
+        let idir = identity_path(base, uuid);
+        std::fs::create_dir_all(&idir).unwrap();
+        std::fs::write(
+            idir.join("identity.json"),
+            format!(r#"{{"email":"x","provider":"{provider}","created_at":"t","key_id":null}}"#),
+        )
+        .unwrap();
+        let cred = if provider == "codex" {
+            credentials_codex_path_for(base, uuid)
+        } else {
+            credentials_path_for(base, uuid)
+        };
+        std::fs::write(cred, b"{}").unwrap();
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert(s.to_string(), uuid);
+        save(&profiles_path(base), &pf).unwrap();
+    }
+
+    #[test]
+    fn detect_other_surface_identity_only_anthropic_no_legacy_mirror() {
+        let dir = TempDir::new().unwrap();
+        plant_identity_by_slot(dir.path(), 6, "anthropic");
+        assert!(
+            !dir.path().join("credentials/6.json").exists(),
+            "precondition: no legacy mirror"
+        );
+        assert_eq!(
+            detect_other_surface_binding(dir.path(), slot(6)),
+            Some(BoundSurface::ClaudeCode),
+            "a Gemini bind must be refused over a post-A++ Anthropic OAuth slot"
+        );
+    }
+
+    #[test]
+    fn detect_other_surface_identity_only_codex_no_legacy_marker() {
+        let dir = TempDir::new().unwrap();
+        plant_identity_by_slot(dir.path(), 7, "codex");
+        assert!(!dir.path().join("credentials/codex-7.json").exists());
+        assert_eq!(
+            detect_other_surface_binding(dir.path(), slot(7)),
+            Some(BoundSurface::Codex),
+            "a Gemini bind must be refused over a post-A++ Codex slot"
+        );
     }
 
     #[test]

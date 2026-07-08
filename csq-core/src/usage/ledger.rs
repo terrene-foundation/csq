@@ -8,10 +8,15 @@
 //!
 //! Mode 0o600. Each line is a [`UsageEvent`].
 //!
-//! The aggregator (in `daemon/usage_aggregator.rs`) is the sole writer in
-//! production. The CLI / Tauri commands READ via [`read_all`] +
-//! [`summarize`]. Per `rules/account-terminal-separation.md` Rule 1
-//! (extended for billing telemetry): only the daemon writes; terminals read.
+//! CURRENT (an internal ticket): the desktop `get_account_usage` command computes the
+//! summary live from CC's transcripts via [`super::aggregator`] (behind a
+//! background-refresh cache) and this NDJSON ledger's [`append`]/[`read_all`]
+//! path is the persistence layer a future daemon writer will use. The intended
+//! end state (follow-up, tracked in #992) is a daemon-written ledger that
+//! terminals READ via [`read_all`] + [`summarize`] — per
+//! `rules/account-terminal-separation.md` Rule 1 (extended for billing
+//! telemetry): only the daemon writes; terminals read. That daemon writer is
+//! not built yet.
 
 use crate::accounts::identity_store::usage_ledger_path_for;
 use crate::accounts::profiles;
@@ -43,8 +48,10 @@ pub fn ledger_path(base_dir: &Path, slot: AccountNum) -> PathBuf {
 /// want to exclude from "my actual spend" totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageSource {
-    /// Sourced from CC's `~/.claude/usage-data/session-meta/*.json`. Per-session
-    /// granularity (one event per session).
+    /// LEGACY (an internal ticket): the `~/.claude/usage-data/session-meta/*.json`
+    /// directory this named was never written by CC. Retained only so old
+    /// ledger lines carrying this tag still deserialize; the aggregator now
+    /// emits [`UsageSource::ProjectsJsonl`].
     #[serde(rename = "session-meta")]
     SessionMeta,
     /// Sourced from CC's per-cwd `~/.claude/projects/<cwd>/<session-id>.jsonl`
@@ -58,27 +65,44 @@ pub enum UsageSource {
 }
 
 /// One usage event. PRIVACY: this struct is the authoritative deserialization
-/// shape for both ledger reads AND session-meta scans. NO content fields. If
-/// a future contributor wants to add a `first_prompt` or `messages` field
-/// here, it MUST be rejected.
+/// shape for ledger reads AND the projects/jsonl transcript scan. NO content
+/// fields. If a future contributor wants to add a `first_prompt` or `messages`
+/// field here, it MUST be rejected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageEvent {
     /// ISO8601 UTC timestamp of the session START.
     pub ts: String,
     /// CC's session ID (UUID string).
     pub session_id: String,
-    /// Model name as configured for the slot at session-attribution time.
-    /// v1: slot's configured model. v2: per-turn model from projects/jsonl.
+    /// Model name (an internal ticket): the real per-turn model observed in the
+    /// transcript when present, else the slot's configured model (caller
+    /// fallback). v1 attributes the whole session to its first model; per-turn
+    /// billing is a follow-up.
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache-write tokens (`cache_creation_input_tokens`) summed across the
+    /// session. Captured from the transcript (an internal ticket) but NOT yet billed
+    /// into `cost_usd_estimate` — per-provider cache rates are a documented
+    /// follow-up. `#[serde(default)]` keeps older ledger lines readable.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// Cache-read tokens (`cache_read_input_tokens`) summed across the session.
+    /// Captured but not yet billed (see `cache_creation_tokens`).
+    #[serde(default)]
+    pub cache_read_tokens: u64,
     /// USD cost estimate computed via [`super::cost_rates`]. `None` if the
     /// model name was unrecognized (table miss → fail-loud rather than guess).
+    /// Bills `input_tokens` + `output_tokens` only (cache tokens excluded —
+    /// follow-up).
     pub cost_usd_estimate: Option<f64>,
     /// Where this event was sourced from.
     pub source: UsageSource,
     /// Optional project path (cwd at session start). Used for attribution
-    /// matching against the launch log; not surfaced in the UI.
+    /// matching against the launch log. Never sent over IPC (`UsageSummaryView`
+    /// carries no path), but IS persisted to the on-disk 0o600 ledger for
+    /// attribution replay — a filesystem path is mild same-user metadata, not a
+    /// credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_path: Option<String>,
 }
@@ -101,6 +125,55 @@ pub fn append(base_dir: &Path, slot: AccountNum, event: &UsageEvent) -> Result<(
 
     let tmp = unique_tmp_path(&path);
     if let Err(e) = std::fs::write(&tmp, &content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LedgerError::Io(e));
+    }
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LedgerError::Platform(e));
+    }
+    if let Err(e) = atomic_replace(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LedgerError::Platform(e));
+    }
+    Ok(())
+}
+
+/// Atomically REPLACES the entire ledger for `slot` with `events` (an internal ticket).
+///
+/// Unlike [`append`], this rewrites the whole file. The daemon usage-ledger
+/// writer ([`crate::daemon::usage_ledger_writer`]) re-derives the COMPLETE
+/// usage history from CC's transcripts on every tick and calls this to publish
+/// it, so a full-replace is idempotent by construction: running it twice with
+/// the same transcript state produces the same file. This is why the writer is
+/// the SOLE producer and terminals only [`read_all`] — per
+/// `rules/account-terminal-separation.md` Rule 1 (extended for billing
+/// telemetry).
+///
+/// Follows the §5a partial-failure cleanup contract (`rules/security.md`): the
+/// tmp file is removed on EVERY failure branch before the error propagates, so
+/// a crash between `write` and `atomic_replace` never leaves a 0o644 artifact
+/// behind. Mode 0o600 via [`secure_file`]. An empty `events` slice writes an
+/// empty (0-byte) ledger — a legitimate "this slot has no usage" state.
+pub fn write_all(
+    base_dir: &Path,
+    slot: AccountNum,
+    events: &[UsageEvent],
+) -> Result<(), LedgerError> {
+    let path = ledger_path(base_dir, slot);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(LedgerError::Io)?;
+    }
+
+    let mut content = String::new();
+    for event in events {
+        let line = serde_json::to_string(event).map_err(LedgerError::Serialize)?;
+        content.push_str(&line);
+        content.push('\n');
+    }
+
+    let tmp = unique_tmp_path(&path);
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(LedgerError::Io(e));
     }
@@ -272,8 +345,10 @@ mod tests {
             model: model.into(),
             input_tokens: input,
             output_tokens: output,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd_estimate: cost,
-            source: UsageSource::SessionMeta,
+            source: UsageSource::ProjectsJsonl,
             project_path: None,
         }
     }
@@ -304,6 +379,104 @@ mod tests {
         let result = read_all(base, s).unwrap();
         assert_eq!(result.events, vec![e1, e2]);
         assert_eq!(result.skipped_malformed, 0);
+    }
+
+    #[test]
+    fn write_all_then_read_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let s = slot(3);
+        let e1 = ev(
+            "2026-05-06T10:00:00Z",
+            "deepseek-chat",
+            10000,
+            5000,
+            Some(0.0083),
+        );
+        let e2 = ev(
+            "2026-05-06T11:00:00Z",
+            "deepseek-coder",
+            20000,
+            10000,
+            Some(0.0164),
+        );
+
+        write_all(base, s, &[e1.clone(), e2.clone()]).unwrap();
+
+        let result = read_all(base, s).unwrap();
+        assert_eq!(result.events, vec![e1, e2]);
+        assert_eq!(result.skipped_malformed, 0);
+    }
+
+    #[test]
+    fn write_all_replaces_prior_content_idempotently() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let s = slot(3);
+        let old = ev(
+            "2026-05-06T10:00:00Z",
+            "deepseek-chat",
+            999,
+            111,
+            Some(0.001),
+        );
+        // Seed the ledger the append way, then a full-replace must DROP the old row.
+        append(base, s, &old).unwrap();
+        let fresh = ev(
+            "2026-05-06T12:00:00Z",
+            "deepseek-coder",
+            20000,
+            10000,
+            Some(0.0164),
+        );
+
+        write_all(base, s, std::slice::from_ref(&fresh)).unwrap();
+        assert_eq!(read_all(base, s).unwrap().events, vec![fresh.clone()]);
+
+        // Running it again with the same input is idempotent (same file).
+        write_all(base, s, std::slice::from_ref(&fresh)).unwrap();
+        assert_eq!(read_all(base, s).unwrap().events, vec![fresh]);
+    }
+
+    #[test]
+    fn write_all_empty_writes_empty_ledger() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let s = slot(3);
+        let seeded = ev(
+            "2026-05-06T10:00:00Z",
+            "deepseek-chat",
+            999,
+            111,
+            Some(0.001),
+        );
+        append(base, s, &seeded).unwrap();
+
+        // A slot whose usage dropped to zero → the writer publishes an empty set.
+        write_all(base, s, &[]).unwrap();
+        let result = read_all(base, s).unwrap();
+        assert!(result.events.is_empty());
+        assert_eq!(result.skipped_malformed, 0);
+        assert!(
+            ledger_path(base, s).exists(),
+            "empty ledger file still present"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_all_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let s = slot(3);
+        let e1 = ev("2026-05-06T10:00:00Z", "deepseek-chat", 10, 5, Some(0.001));
+        write_all(base, s, &[e1]).unwrap();
+        let mode = std::fs::metadata(ledger_path(base, s))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "ledger must be owner-only (0o600)");
     }
 
     #[test]
@@ -625,8 +798,10 @@ not-json
                         model: "claude-3-5-sonnet".into(),
                         input_tokens: 1,
                         output_tokens: 1,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: 0,
                         cost_usd_estimate: Some(0.001),
-                        source: UsageSource::SessionMeta,
+                        source: UsageSource::ProjectsJsonl,
                         project_path: None,
                     };
                     append(&base_clone, s, &event).unwrap();

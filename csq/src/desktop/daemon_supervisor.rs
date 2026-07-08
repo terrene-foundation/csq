@@ -609,12 +609,32 @@ Run `csq audit verify --full` for diagnosis."
         shutdown.clone(),
     );
 
+    // Daemon-written usage-ledger writer (an internal ticket) — mirrors the CLI daemon
+    // wiring. The desktop app IS the daemon (in-process supervisor), so this
+    // task publishes each slot's usage ledger that `get_account_usage` reads
+    // sub-ms instead of running the ~20s live transcript scan on the dashboard
+    // render path. Daemon is the SOLE producer; terminals only read
+    // (account-terminal-separation.md Rule 1, extended for billing telemetry).
+    let claude_home_for_ledger = dirs::home_dir().map(|h| h.join(".claude"));
+    let usage_ledger_writer = daemon::spawn_usage_ledger_writer(
+        base_dir.to_path_buf(),
+        claude_home_for_ledger,
+        shutdown.clone(),
+        chrono::Utc::now,
+    );
+
     // Background update check — same 24-hour-cached behavior as the
     // CLI. Fires a detached OS thread on daemon start so desktop
     // users see the "csq vX.Y.Z available" notice on app launch.
     // Without this, the CLI emits notices on every command but the
     // desktop app silently misses every release.
-    csq_core::update::auto_update_bg(base_dir.to_path_buf());
+    //
+    // Edition independence (rules/independence.md): COMMUNITY channel only —
+    // an enterprise desktop must not query terrene-foundation/csq or surface a
+    // community upgrade notice (mirrors the CLI + desktop update gates).
+    if crate::BUILD_EDITION != "enterprise" {
+        csq_core::update::auto_update_bg(base_dir.to_path_buf());
+    }
 
     // M14 — external anchoring task (mirrors CLI daemon.rs wiring).
     // FIX-2: gate on audit_health.is_operational() so the anchor is not
@@ -646,6 +666,7 @@ Run `csq audit verify --full` for diagnosis."
     let _ = tokio::time::timeout(Duration::from_secs(5), gemini_midnight).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), auto_rotator.join).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), sweep.join).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), usage_ledger_writer.join).await;
     if let Some(handle) = anchor_handle {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
     }

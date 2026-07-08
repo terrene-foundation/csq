@@ -398,9 +398,15 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // On-demand update trigger — bypasses the 30-min timer so the
     // user doesn't have to quit+relaunch after a release cut while
     // the app was running. Calls `request_update_check_now()`
-    // which wakes the background loop via a mpsc channel.
-    let check_updates =
-        MenuItemBuilder::with_id("check_updates", "Check for updates").build(app)?;
+    // which wakes the background loop via a mpsc channel. COMMUNITY
+    // builds only — enterprise has no update channel (edition
+    // independence), so the item is omitted rather than shown as a
+    // dead no-op.
+    let check_updates = if community_auto_update_enabled() {
+        Some(MenuItemBuilder::with_id("check_updates", "Check for updates").build(app)?)
+    } else {
+        None
+    };
 
     // Dock-icon-hide check item (macOS only). Reflects the persisted
     // preference at <base>/desktop-prefs.json. Checked = Dock icon
@@ -445,11 +451,16 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     if let Some(item) = &dock_hidden_item {
         builder = builder.item(item);
     }
+    builder = builder
+        .item(&PredefinedMenuItem::separator(app)?)
+        .item(&capability_submenu);
+    // "Check for updates" only in community builds.
+    if let Some(item) = &check_updates {
+        builder = builder
+            .item(&PredefinedMenuItem::separator(app)?)
+            .item(item);
+    }
     builder
-        .item(&PredefinedMenuItem::separator(app)?)
-        .item(&capability_submenu)
-        .item(&PredefinedMenuItem::separator(app)?)
-        .item(&check_updates)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&quit)
         .build()
@@ -679,6 +690,65 @@ fn compute_tray_status(base: &Path) -> TrayStatus {
     };
 
     TrayStatus { total, health }
+}
+
+/// Whether this build may auto-update from the COMMUNITY release channel.
+///
+/// The updater endpoints + pubkey baked into `tauri.conf.json` point at the
+/// community repo (`terrene-foundation/csq`). Enterprise builds MUST NOT wire
+/// that channel: it would auto-offer/install the community bundle over the
+/// enterprise one when community publishes a newer version — an
+/// edition-independence violation (`rules/independence.md`). Enterprise has no
+/// updater channel yet (an internal journal entry W5), so the entire update surface (plugin
+/// registration, background check loop, tray item) is fail-closed off in
+/// enterprise until that infrastructure lands. Driven by the compile-time
+/// `crate::BUILD_EDITION` const (the `enterprise` Cargo feature).
+pub(crate) fn community_auto_update_enabled() -> bool {
+    crate::BUILD_EDITION != "enterprise"
+}
+
+/// Best-effort: does the CLI already installed at `cli_path` report the
+/// ENTERPRISE edition? Runs `<cli> --version` with a short timeout — the CLI
+/// prints its edition-suffixed version line (`X.Y.Z (enterprise)`) and exits
+/// immediately (a real file at `~/.local/bin/csq` resolves to CLI mode, so this
+/// does NOT launch the desktop app). Returns `false` on ANY ambiguity — missing
+/// binary, spawn error, timeout, non-zero exit, or an unparseable line — so the
+/// shim refresh proceeds by default; only the unambiguous enterprise case is
+/// protected from a community downgrade. The probe thread is detached so a hung
+/// binary can never block launch.
+fn installed_cli_is_enterprise(cli_path: &std::path::Path) -> bool {
+    use std::process::{Command, Stdio};
+    // Reject a SYMLINK target without spawning: `mode::detect` canonicalizes
+    // `current_exe()`, so a symlink at the CLI path pointing into
+    // `…/Contents/MacOS/csq` would resolve back into the bundle and run in
+    // Desktop mode (spawning a GUI subprocess) rather than printing a version
+    // (memory `discovery_csq_symlink_breaks_mode_detect`). A symlink is never a
+    // legitimate standalone enterprise CLI; fail-open so `ensure_cli_shim`
+    // replaces it with a real file.
+    let is_regular_file = cli_path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false);
+    if !is_regular_file {
+        return false;
+    }
+    let cli = cli_path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = Command::new(&cli)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(Ok(output)) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).contains("(enterprise)")
+        }
+        _ => false,
+    }
 }
 
 /// Interval between background update checks (30 minutes).
@@ -1078,12 +1148,16 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
-        // Updater + process plugins for in-app auto-update. The
-        // updater plugin verifies bundle signatures against the
-        // pinned minisign pubkey in tauri.conf.json; the process
-        // plugin exposes `relaunch()` so the frontend can restart
-        // the app after a successful install.
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Process plugin exposes `relaunch()` so the frontend can restart the
+        // app after a successful install. The UPDATER plugin is NOT registered
+        // here — it is registered in `setup` for COMMUNITY builds only (see
+        // `community_auto_update_enabled`). The updater endpoints + pubkey in
+        // tauri.conf.json point at the community repo (terrene-foundation/csq);
+        // registering it in an enterprise build would let the community channel
+        // auto-offer/install the community bundle over the enterprise one — an
+        // edition-independence violation (rules/independence.md). Enterprise has
+        // no release/updater channel yet (an internal journal entry W5), so it is fail-closed
+        // off until that infrastructure lands.
         .plugin(tauri_plugin_process::init())
         // Dialog plugin (PR-G5) — file picker for the Vertex SA JSON
         // path in the AddAccountModal Gemini panel. The capability
@@ -1219,11 +1293,38 @@ pub fn run() {
             // standalone (→ SIGKILL). `resolve_shim_source` prefers the
             // standalone-signed `Contents/Helpers/csq-cli` helper when present,
             // falling back to the running exe otherwise.
+            //
+            // Runs on a DETACHED thread so the `installed_cli_is_enterprise`
+            // probe (a `<cli> --version` subprocess bounded by a 3s timeout)
+            // never blocks the synchronous Tauri setup closure / event-loop
+            // start — otherwise a slow/hung CLI would beachball launch (redteam
+            // an internal ticket M1). The refresh is already best-effort + non-fatal, so
+            // racing the rest of setup is safe.
+            std::thread::spawn(|| {
             match (
                 std::env::current_exe()
                     .map(|exe| csq_core::cli_deps::cli_shim::resolve_shim_source(&exe)),
                 csq_core::cli_deps::cli_shim::resolve_shim_target(),
             ) {
+                // Edition-downgrade guard (edition independence): a COMMUNITY
+                // desktop must never silently overwrite an installed ENTERPRISE
+                // CLI. The shim refresh is unconditional, so without this a
+                // community `.app` launch would replace `~/.local/bin/csq`
+                // (enterprise) with the community binary — the user silently
+                // loses the Phase-2b moat. Enterprise-over-anything and
+                // community-over-community are fine; only community-over-
+                // enterprise is blocked (see `installed_cli_is_enterprise`).
+                (Ok(_), Some(target))
+                    if crate::BUILD_EDITION == "community"
+                        && installed_cli_is_enterprise(&target) =>
+                {
+                    tracing::warn!(
+                        target = %target.display(),
+                        "cli shim refresh SKIPPED: refusing to downgrade an enterprise CLI \
+                         to community. Run the enterprise desktop build, or reinstall the \
+                         enterprise CLI, to keep editions consistent."
+                    );
+                }
                 (Ok(src), Some(target)) => {
                     match csq_core::cli_deps::cli_shim::ensure_cli_shim(&src, &target) {
                         Ok(outcome) => tracing::info!(
@@ -1241,6 +1342,7 @@ pub fn run() {
                     "cli shim refresh skipped: could not resolve current exe or target"
                 ),
             }
+            });
 
             let log_level = if cfg!(debug_assertions) {
                 log::LevelFilter::Debug
@@ -1252,6 +1354,18 @@ pub fn run() {
                     .level(log_level)
                     .build(),
             )?;
+
+            // ── Updater plugin (COMMUNITY builds only) ───────
+            //
+            // The updater endpoints + minisign pubkey in tauri.conf.json point
+            // at terrene-foundation/csq (community). Registering the plugin in
+            // an enterprise build would let the community channel install the
+            // community bundle over the enterprise one. Gate it off for
+            // enterprise until an enterprise updater channel exists (W5).
+            if community_auto_update_enabled() {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+            }
 
             // ── OAuth state store ────────────────────────────
             //
@@ -1408,41 +1522,49 @@ pub fn run() {
             // the local-Receiver channel; the loop wakes early,
             // drains any additional queued messages (coalescing
             // rapid-fire clicks into one check), and runs.
-            let handle_for_update = app.handle().clone();
-            let (update_tx, update_rx) = std::sync::mpsc::channel::<()>();
-            UPDATE_CHECK_TX
-                .set(update_tx)
-                .expect("UPDATE_CHECK_TX set twice — lib::run called more than once?");
-            std::thread::spawn(move || {
-                let mut consecutive_failures: u32 = 0;
-                // Initial settle delay so launch isn't blocked.
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                let outcome = run_update_check(&handle_for_update);
-                consecutive_failures = match outcome {
-                    UpdateCheckOutcome::Success => 0,
-                    UpdateCheckOutcome::Failure => consecutive_failures.saturating_add(1),
-                };
-
-                loop {
-                    let wait = update_check_wait_secs(consecutive_failures);
-                    let awoke_early = update_rx
-                        .recv_timeout(std::time::Duration::from_secs(wait))
-                        .is_ok();
-                    if awoke_early {
-                        // Drain any additional queued messages —
-                        // a rapid-fire clicker shouldn't cause N
-                        // sequential GitHub checks. We want one
-                        // check per observable user intent.
-                        while update_rx.try_recv().is_ok() {}
-                        tracing::debug!("update check: manual request");
-                    }
+            // COMMUNITY builds only: the loop drives the `update-available`
+            // banner off the community `latest.json`. Enterprise builds never
+            // spawn it, so no community update is ever surfaced or installed
+            // (edition independence — see `community_auto_update_enabled`).
+            // `UPDATE_CHECK_TX` stays unset in enterprise, making the tray
+            // "Check for updates" trigger a harmless no-op.
+            if community_auto_update_enabled() {
+                let handle_for_update = app.handle().clone();
+                let (update_tx, update_rx) = std::sync::mpsc::channel::<()>();
+                UPDATE_CHECK_TX
+                    .set(update_tx)
+                    .expect("UPDATE_CHECK_TX set twice — lib::run called more than once?");
+                std::thread::spawn(move || {
+                    let mut consecutive_failures: u32 = 0;
+                    // Initial settle delay so launch isn't blocked.
+                    std::thread::sleep(std::time::Duration::from_secs(10));
                     let outcome = run_update_check(&handle_for_update);
                     consecutive_failures = match outcome {
                         UpdateCheckOutcome::Success => 0,
                         UpdateCheckOutcome::Failure => consecutive_failures.saturating_add(1),
                     };
-                }
-            });
+
+                    loop {
+                        let wait = update_check_wait_secs(consecutive_failures);
+                        let awoke_early = update_rx
+                            .recv_timeout(std::time::Duration::from_secs(wait))
+                            .is_ok();
+                        if awoke_early {
+                            // Drain any additional queued messages —
+                            // a rapid-fire clicker shouldn't cause N
+                            // sequential GitHub checks. We want one
+                            // check per observable user intent.
+                            while update_rx.try_recv().is_ok() {}
+                            tracing::debug!("update check: manual request");
+                        }
+                        let outcome = run_update_check(&handle_for_update);
+                        consecutive_failures = match outcome {
+                            UpdateCheckOutcome::Success => 0,
+                            UpdateCheckOutcome::Failure => consecutive_failures.saturating_add(1),
+                        };
+                    }
+                });
+            }
 
             // ── System tray ──────────────────────────────────
             //
@@ -1536,6 +1658,76 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // ── edition-gated auto-update (edition independence) ─────
+
+    // Concrete per-edition assertions (not a tautology against the definition):
+    // these test the integration between the `enterprise` Cargo feature and the
+    // gate's output. Exactly one compiles per build.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn community_auto_update_disabled_in_enterprise() {
+        assert!(!community_auto_update_enabled());
+        assert_eq!(crate::BUILD_EDITION, "enterprise");
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn community_auto_update_enabled_in_community() {
+        assert!(community_auto_update_enabled());
+        assert_eq!(crate::BUILD_EDITION, "community");
+    }
+
+    #[cfg(unix)]
+    fn write_fake_cli(dir: &std::path::Path, name: &str, version_line: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\necho '{version_line}'\n")).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_cli_is_enterprise_detects_enterprise_suffix() {
+        let dir = TempDir::new().unwrap();
+        let cli = write_fake_cli(dir.path(), "csq-ent", "csq 2.17.0 (enterprise)");
+        assert!(installed_cli_is_enterprise(&cli));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_cli_is_enterprise_rejects_symlink() {
+        // sec-M1: a symlink target (even one pointing at a real enterprise CLI)
+        // must be rejected without spawning — `mode::detect` would canonicalize
+        // it into the .app and launch Desktop mode. Fail-open (false) so
+        // ensure_cli_shim replaces it with a real file.
+        let dir = TempDir::new().unwrap();
+        let real = write_fake_cli(dir.path(), "csq-real", "csq 2.17.0 (enterprise)");
+        let link = dir.path().join("csq-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            !installed_cli_is_enterprise(&link),
+            "a symlink target must be rejected (never probed)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_cli_is_enterprise_false_for_community_and_missing() {
+        let dir = TempDir::new().unwrap();
+        let community = write_fake_cli(dir.path(), "csq-comm", "csq 2.17.0 (community)");
+        assert!(
+            !installed_cli_is_enterprise(&community),
+            "community CLI must not be flagged enterprise"
+        );
+        // Missing binary → false (shim refresh proceeds).
+        assert!(!installed_cli_is_enterprise(
+            &dir.path().join("does-not-exist")
+        ));
+    }
 
     // ── update-check backoff + channel ──────────────────────
 

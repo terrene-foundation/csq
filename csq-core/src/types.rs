@@ -9,7 +9,7 @@ pub const MAX_ACCOUNTS: u16 = 999;
 ///
 /// Prevents path traversal and keychain namespace injection by ensuring
 /// the value is always a valid positive integer in the allowed range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountNum(u16);
 
 impl AccountNum {

@@ -6,12 +6,11 @@
 //! exceed this limit.
 
 use anyhow::{anyhow, Context, Result};
+use csq_core::accounts::identity_store;
 use csq_core::accounts::third_party;
 use csq_core::cli_deps::sanitize::redact_path;
-use csq_core::credentials::file as cred_file;
 use csq_core::platform::secret::{self, SecretError};
 use csq_core::providers::catalog::{AuthType, Surface};
-use csq_core::providers::codex::provisioning::is_codex_bound_slot;
 use csq_core::providers::gemini::provisioning::{self, ProvisionError};
 use csq_core::types::AccountNum;
 use csq_core::{http, providers};
@@ -23,10 +22,16 @@ use std::path::Path;
 /// under 2 KiB; 4096 is generous and bounds interactive input.
 const MAX_KEY_LEN: usize = 4096;
 
-/// FR-CLI-05 exit code: `csq setkey` targets a slot already bound to
-/// Codex (OAuth device-auth). Distinct from the default anyhow-mapped
-/// `1` so scripts can detect the "wrong provider for this slot" case.
-const EXIT_CODE_CODEX_SLOT: i32 = 2;
+/// Exit code when `csq setkey` targets a slot already bound to a non-3P
+/// surface — Codex (OAuth device-auth), Anthropic OAuth, or Gemini. Distinct
+/// from the default anyhow-mapped `1` so scripts can detect the "wrong
+/// provider for this slot — run `csq logout` first" case.
+///
+/// Formerly `EXIT_CODE_CODEX_SLOT` (FR-CLI-05, Codex only). Generalized to the
+/// full OAuth/device-auth surface set once the guard became identity-store-
+/// aware — all three refusals share the "logout-to-rebind" remediation, so
+/// they share one script-detectable code.
+const EXIT_CODE_SLOT_SURFACE_CONFLICT: i32 = 2;
 
 pub fn handle(
     base_dir: &Path,
@@ -37,15 +42,18 @@ pub fn handle(
     let provider = providers::get_provider(provider_id)
         .ok_or_else(|| anyhow!("unknown provider: {provider_id}"))?;
 
-    // FR-CLI-05: refuse if the target slot is already bound to Codex.
-    // `csq setkey` writes an API-key-backed provider into a slot's
-    // settings.json / canonical file; overwriting a Codex-bound slot
-    // would leave `credentials/codex-<N>.json` orphaned AND destroy
-    // a live OAuth session the user probably still wants.
-    if let Some(msg) = check_codex_slot_conflict(base_dir, slot, provider) {
+    // Refuse if the target slot is already bound to a non-3P surface —
+    // Codex (OAuth device-auth), Anthropic OAuth (subscription), or Gemini.
+    // `csq setkey` overlays 3P env keys (ANTHROPIC_BASE_URL / _AUTH_TOKEN) onto
+    // the slot's settings.json; against an OAuth/device-auth slot that silently
+    // overrides a live login and orphans the account's `by_slot` mapping (the
+    // #995 root cause). The user must `csq logout <N>` first. Identity-store-
+    // aware per `account-terminal-separation.md` MUST Rule 4 — keyed on the
+    // identity store, not the M4-12-retired legacy credential mirrors.
+    if let Some(msg) = check_slot_surface_conflict(base_dir, slot, provider) {
         eprintln!("{}", msg.headline);
         eprintln!("{}", msg.hint);
-        std::process::exit(EXIT_CODE_CODEX_SLOT);
+        std::process::exit(EXIT_CODE_SLOT_SURFACE_CONFLICT);
     }
 
     // Keyless providers (Ollama) take no user-supplied key. Writing
@@ -153,14 +161,18 @@ pub fn handle_gemini(
 /// FR-CLI-05 parity for Gemini: refuse to clobber a slot that is
 /// already bound to Codex (OAuth device-auth) or Anthropic OAuth.
 /// The user has to `csq logout <N>` first.
+///
+/// Identity-store-aware (`account-terminal-separation.md` MUST Rule 4). The
+/// prior implementation stat-ed the M4-12-retired legacy mirrors
+/// (`credentials/codex-<N>.json`, `credentials/<N>.json`) which a current login
+/// no longer writes — so it was blind to every post-A++ Codex / Anthropic slot.
 fn refuse_if_slot_bound_to_other_surface(base_dir: &Path, slot: AccountNum) -> Result<()> {
-    if is_codex_bound_slot(base_dir, slot) {
+    if identity_store::is_codex_bound_slot_identity_aware(base_dir, slot) {
         return Err(anyhow!(
             "slot {slot} is bound to Codex — run `csq logout {slot}` to rebind to Gemini"
         ));
     }
-    let anthropic_canonical = cred_file::canonical_path_for(base_dir, slot, Surface::ClaudeCode);
-    if std::fs::symlink_metadata(&anthropic_canonical).is_ok() {
+    if identity_store::is_anthropic_bound_slot(base_dir, slot) {
         return Err(anyhow!(
             "slot {slot} is bound to Claude (Anthropic OAuth) — run `csq logout {slot}` to rebind to Gemini"
         ));
@@ -275,39 +287,68 @@ fn map_provision_error(e: ProvisionError) -> anyhow::Error {
     }
 }
 
-/// Two-line refusal message for the FR-CLI-05 guard. Structured so
-/// tests can assert the wording without having to re-capture stderr,
-/// and so a future desktop-UI consumer can render the two lines in
-/// different type weights.
+/// Two-line refusal message for the slot-surface-conflict guard. Structured so
+/// tests can assert the wording without having to re-capture stderr, and so a
+/// future desktop-UI consumer can render the two lines in different type
+/// weights.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CodexSlotConflict {
+struct SlotSurfaceConflict {
     headline: String,
     hint: String,
 }
 
-/// Returns [`Some`] with the FR-CLI-05 refusal message iff the target
-/// slot is bound to Codex AND the requested provider is not itself
-/// Codex (the only provider that should ever touch a Codex slot).
-/// Returns [`None`] otherwise — the normal write path proceeds.
-fn check_codex_slot_conflict(
+/// Returns [`Some`] refusal iff the target slot is bound to a surface a 3P
+/// API-key write would clobber — Codex, Anthropic OAuth, or Gemini — UNLESS the
+/// requested provider is itself that surface. Returns [`None`] otherwise (the
+/// normal write path proceeds, including 3P→3P rebind).
+///
+/// Identity-store-aware (`account-terminal-separation.md` MUST Rule 4): keyed on
+/// the identity store, NOT the M4-12-retired legacy credential mirrors that the
+/// prior `is_codex_bound_slot`-marker guard stat-ed (blind to every post-A++
+/// login).
+///
+/// A 3P-bound slot carries only a `settings.json` env block — no OAuth /
+/// device-auth binding in the identity store — so none of these predicates
+/// fire and re-keying / switching 3P providers proceeds.
+///
+/// NB the Anthropic branch cannot gate on `provider.surface`: every 3P provider
+/// (mm / deepseek / zai / ollama) AND `claude` share `surface: ClaudeCode`
+/// (they all speak the Anthropic protocol via a base-URL override), so the
+/// presence of an Anthropic OAuth binding is itself the refusal signal — a
+/// direct-API key write would override the live subscription token.
+fn check_slot_surface_conflict(
     base_dir: &Path,
     slot: Option<AccountNum>,
     provider: &providers::Provider,
-) -> Option<CodexSlotConflict> {
+) -> Option<SlotSurfaceConflict> {
     let slot = slot?;
-    if !is_codex_bound_slot(base_dir, slot) {
-        return None;
-    }
-    if provider.surface == Surface::Codex {
-        return None;
-    }
-    Some(CodexSlotConflict {
-        headline: format!(
-            "Codex slots use OAuth device-auth, not API keys — run `csq login {slot} --provider codex`"
-        ),
-        hint: format!(
-            "(slot {slot} is currently bound to Codex; run `csq logout {slot}` first to rebind to another provider)"
-        ),
+    // Delegate the detection to the single source of truth in core (the same
+    // check `bind_provider_to_slot` enforces authoritatively), then dress it in
+    // the CLI's two-line, action-specific messaging.
+    let surface = third_party::conflicting_bound_surface(base_dir, slot, provider)?;
+    Some(match surface {
+        Surface::Codex => SlotSurfaceConflict {
+            headline: format!(
+                "Codex slots use OAuth device-auth, not API keys — run `csq login {slot} --provider codex`"
+            ),
+            hint: format!(
+                "(slot {slot} is currently bound to Codex; run `csq logout {slot}` first to rebind to another provider)"
+            ),
+        },
+        Surface::Gemini => SlotSurfaceConflict {
+            headline: format!("slot {slot} is bound to Gemini — run `csq logout {slot}` to rebind"),
+            hint: format!(
+                "(slot {slot} is currently bound to Gemini; run `csq logout {slot}` first, then re-run `csq setkey`)"
+            ),
+        },
+        Surface::ClaudeCode => SlotSurfaceConflict {
+            headline: format!(
+                "slot {slot} is bound to Claude (Anthropic OAuth) — run `csq logout {slot}` to rebind"
+            ),
+            hint: format!(
+                "(slot {slot} is a Claude subscription/OAuth account; `csq setkey` would override it with an API key — run `csq logout {slot}` first)"
+            ),
+        },
     })
 }
 
@@ -551,55 +592,57 @@ mod tests {
         AccountNum::try_from(n).unwrap()
     }
 
-    #[test]
-    fn is_codex_bound_slot_detects_canonical_file() {
-        let dir = TempDir::new().unwrap();
-        let slot = acc(4);
-        let creds_dir = dir.path().join("credentials");
-        std::fs::create_dir_all(&creds_dir).unwrap();
-
-        // Before any Codex file exists, the slot is not Codex-bound.
-        assert!(!is_codex_bound_slot(dir.path(), slot));
-
-        // `credentials/codex-4.json` → slot is Codex-bound.
-        std::fs::write(creds_dir.join("codex-4.json"), b"{}").unwrap();
-        assert!(is_codex_bound_slot(dir.path(), slot));
-    }
-
-    #[test]
-    fn is_codex_bound_slot_ignores_anthropic_canonical() {
-        let dir = TempDir::new().unwrap();
-        let slot = acc(5);
-        let creds_dir = dir.path().join("credentials");
-        std::fs::create_dir_all(&creds_dir).unwrap();
-
-        // Only `<N>.json` — Anthropic shape — exists. Not Codex-bound.
-        std::fs::write(creds_dir.join("5.json"), b"{}").unwrap();
-        assert!(!is_codex_bound_slot(dir.path(), slot));
-    }
-
-    fn codex_bind(dir: &Path, slot: AccountNum) {
+    /// Legacy pre-A++ Codex marker (`credentials/codex-<N>.json`). Still a valid
+    /// binding signal via the identity-aware predicate's legacy fallback.
+    fn codex_bind_legacy(dir: &Path, slot: AccountNum) {
         let creds_dir = dir.join("credentials");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(creds_dir.join(format!("codex-{}.json", slot)), b"{}").unwrap();
     }
 
+    /// Current post-M4-12 host shape: `by_slot` → `identities/<uuid>/` with the
+    /// given provider + a matching credential file, and NO legacy mirror. This
+    /// is the state a real login leaves; the pre-fix legacy-marker guard was
+    /// blind to it (the bug this shard fixes).
+    fn bind_identity(dir: &Path, slot: u16, provider: &str) {
+        use csq_core::accounts::identity_store::{
+            credentials_codex_path_for, credentials_path_for, identity_path, IdentityId,
+        };
+        use csq_core::accounts::profiles::{profiles_path, save, ProfilesFile};
+        let uuid = IdentityId::new_v4();
+        let idir = identity_path(dir, uuid);
+        std::fs::create_dir_all(&idir).unwrap();
+        std::fs::write(
+            idir.join("identity.json"),
+            format!(r#"{{"email":"x","provider":"{provider}","created_at":"t","key_id":null}}"#),
+        )
+        .unwrap();
+        let cred_path = if provider == "codex" {
+            credentials_codex_path_for(dir, uuid)
+        } else {
+            credentials_path_for(dir, uuid)
+        };
+        std::fs::write(cred_path, b"{}").unwrap();
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), uuid);
+        save(&profiles_path(dir), &pf).unwrap();
+    }
+
     #[test]
-    fn fr_cli_05_refuses_setkey_mm_on_codex_slot() {
+    fn refuses_setkey_mm_on_legacy_codex_slot() {
         let dir = TempDir::new().unwrap();
         let slot = acc(4);
-        codex_bind(dir.path(), slot);
+        codex_bind_legacy(dir.path(), slot);
 
         let mm = providers::get_provider("mm").expect("mm is registered");
-        let conflict = check_codex_slot_conflict(dir.path(), Some(slot), mm).expect(
-            "setkey mm on a Codex-bound slot must return the refusal message per FR-CLI-05",
-        );
+        let conflict = check_slot_surface_conflict(dir.path(), Some(slot), mm)
+            .expect("setkey mm on a Codex-bound slot must return the refusal message");
 
         assert!(
             conflict
                 .headline
                 .contains("OAuth device-auth, not API keys"),
-            "headline must use FR-CLI-05 wording: {}",
+            "headline must name the Codex device-auth surface: {}",
             conflict.headline
         );
         assert!(
@@ -615,49 +658,119 @@ mod tests {
     }
 
     #[test]
-    fn fr_cli_05_allows_setkey_mm_on_anthropic_slot() {
+    fn refuses_setkey_mm_on_identity_only_codex_slot() {
+        // The real-host regression: a current codex slot has NO legacy
+        // `credentials/codex-N.json`; the pre-fix guard let this through.
         let dir = TempDir::new().unwrap();
+        bind_identity(dir.path(), 9, "codex");
+        assert!(
+            !dir.path().join("credentials/codex-9.json").exists(),
+            "precondition: no legacy marker (post-M4-12 shape)"
+        );
         let mm = providers::get_provider("mm").unwrap();
-        assert_eq!(
-            check_codex_slot_conflict(dir.path(), Some(acc(4)), mm),
-            None,
-            "no codex canonical → setkey proceeds"
+        let conflict = check_slot_surface_conflict(dir.path(), Some(acc(9)), mm)
+            .expect("identity-store codex binding must refuse a 3P setkey");
+        assert!(conflict.headline.contains("OAuth device-auth"));
+    }
+
+    #[test]
+    fn refuses_setkey_mm_on_identity_only_anthropic_slot() {
+        // THE #995 origin: a 3P key write over an Anthropic OAuth slot silently
+        // overrode the subscription token and orphaned by_slot. Now refused.
+        let dir = TempDir::new().unwrap();
+        bind_identity(dir.path(), 3, "anthropic");
+        assert!(
+            !dir.path().join("credentials/3.json").exists(),
+            "precondition: no legacy mirror (post-M4-12 shape)"
+        );
+        let mm = providers::get_provider("mm").unwrap();
+        let conflict = check_slot_surface_conflict(dir.path(), Some(acc(3)), mm)
+            .expect("Anthropic OAuth binding must refuse a 3P setkey");
+        assert!(
+            conflict.headline.contains("Claude (Anthropic OAuth)"),
+            "headline must name the Claude OAuth surface: {}",
+            conflict.headline
+        );
+        assert!(conflict.hint.contains("csq logout 3"));
+    }
+
+    #[test]
+    fn refuses_setkey_claude_apikey_on_anthropic_oauth_slot() {
+        // `claude` (direct-API key) shares surface: ClaudeCode with the 3P
+        // providers, so the guard must NOT let it clobber an OAuth slot either —
+        // the binding presence, not provider.surface, is the refusal signal.
+        let dir = TempDir::new().unwrap();
+        bind_identity(dir.path(), 3, "anthropic");
+        let claude = providers::get_provider("claude").unwrap();
+        assert!(
+            check_slot_surface_conflict(dir.path(), Some(acc(3)), claude).is_some(),
+            "setkey claude (API key) must refuse to override an Anthropic OAuth slot"
         );
     }
 
     #[test]
-    fn fr_cli_05_allows_setkey_without_slot() {
-        // Global writes (no --slot) do not touch any canonical
-        // credential file and are therefore unaffected by FR-CLI-05.
+    fn allows_setkey_mm_on_unbound_slot() {
+        // Empty base → no OAuth/device-auth binding of any surface → proceeds.
         let dir = TempDir::new().unwrap();
-        codex_bind(dir.path(), acc(4));
         let mm = providers::get_provider("mm").unwrap();
-        assert_eq!(check_codex_slot_conflict(dir.path(), None, mm), None);
+        assert_eq!(
+            check_slot_surface_conflict(dir.path(), Some(acc(4)), mm),
+            None
+        );
     }
 
     #[test]
-    fn fr_cli_05_allows_codex_provider_on_codex_slot() {
-        // A hypothetical future `setkey codex` for an OAI API-key
-        // (non-subscription) path would itself be a Codex-surface
-        // write — it must not be blocked by FR-CLI-05.
+    fn allows_setkey_mm_on_3p_bound_slot() {
+        // A 3P-bound slot carries only a settings.json env block — none of the
+        // OAuth/device-auth markers — so a 3P→3P rebind must proceed. Model it
+        // by binding an identity with a NON-anthropic, NON-codex provider tag
+        // (a 3P provider id), which leaves no anthropic/codex credential.
+        let dir = TempDir::new().unwrap();
+        // A deepseek-bound slot writes settings.json env only (no identity mint),
+        // so simply: unbound identity store + a settings.json is the real shape.
+        // The guard reads only the identity store / legacy markers → None.
+        std::fs::create_dir_all(dir.path().join("config-5")).unwrap();
+        std::fs::write(
+            dir.path().join("config-5/settings.json"),
+            br#"{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic"}}"#,
+        )
+        .unwrap();
+        let deepseek = providers::get_provider("deepseek").unwrap();
+        assert_eq!(
+            check_slot_surface_conflict(dir.path(), Some(acc(5)), deepseek),
+            None,
+            "3P→3P rebind (settings.json env only, no OAuth binding) must proceed"
+        );
+    }
+
+    #[test]
+    fn allows_setkey_without_slot() {
+        // Global writes (no --slot) touch no per-slot binding → unaffected.
+        let dir = TempDir::new().unwrap();
+        codex_bind_legacy(dir.path(), acc(4));
+        let mm = providers::get_provider("mm").unwrap();
+        assert_eq!(check_slot_surface_conflict(dir.path(), None, mm), None);
+    }
+
+    #[test]
+    fn allows_codex_provider_on_codex_slot() {
+        // A Codex-surface provider is the only thing that may touch a Codex slot.
         let dir = TempDir::new().unwrap();
         let slot = acc(4);
-        codex_bind(dir.path(), slot);
+        codex_bind_legacy(dir.path(), slot);
         let codex = providers::get_provider("codex").unwrap();
         assert_eq!(
-            check_codex_slot_conflict(dir.path(), Some(slot), codex),
+            check_slot_surface_conflict(dir.path(), Some(slot), codex),
             None
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn fr_cli_05_treats_dangling_symlink_as_bound() {
-        // Origin: PR-C3b security review L2. `Path::exists` follows
-        // symlinks; a dangling `credentials/codex-N.json` symlink
-        // would report not-bound and let setkey proceed. The guard
-        // now uses `symlink_metadata` so the dangling-link case
-        // refuses — the user can repair the link and retry.
+    fn treats_dangling_legacy_codex_symlink_as_bound() {
+        // Origin: PR-C3b security review L2. A dangling `credentials/codex-N.json`
+        // symlink must still refuse (fail-toward-refuse); the identity-aware
+        // predicate's legacy fallback uses `symlink_metadata`, not `.exists()`.
         use std::os::unix::fs::symlink;
         let dir = TempDir::new().unwrap();
         let slot = acc(6);
@@ -669,10 +782,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(is_codex_bound_slot(dir.path(), slot));
         let mm = providers::get_provider("mm").unwrap();
         assert!(
-            check_codex_slot_conflict(dir.path(), Some(slot), mm).is_some(),
+            check_slot_surface_conflict(dir.path(), Some(slot), mm).is_some(),
             "dangling Codex symlink must still refuse setkey"
         );
     }

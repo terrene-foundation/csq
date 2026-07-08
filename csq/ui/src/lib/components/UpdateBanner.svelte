@@ -28,7 +28,7 @@
   import { check, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
 
-  // Must match `CachedUpdateInfo` in `csq-desktop/src-tauri/src/lib.rs`.
+  // Must match `CachedUpdateInfo` in `csq/src/desktop/mod.rs`.
   // Kept inline because this component is the only consumer.
   interface UpdateInfo {
     version: string;

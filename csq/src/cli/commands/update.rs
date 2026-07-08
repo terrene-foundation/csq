@@ -25,6 +25,21 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Runs `csq update check`. Prints the result to stdout.
 pub fn check() -> Result<()> {
+    // Edition independence (rules/independence.md): the update channel
+    // (`terrene-foundation/csq`) is the COMMUNITY channel. An enterprise binary
+    // must not check/offer/install from it — that would report (and `install`
+    // would apply) a community "upgrade" that silently downgrades the edition.
+    // Enterprise has no release channel yet (an internal journal entry W5) → disabled.
+    if crate::BUILD_EDITION == "enterprise" {
+        println!(
+            "csq-ee (enterprise) {CURRENT_VERSION}: auto-update is disabled — there is no \
+             enterprise release channel yet. Update by rebuilding/reinstalling the enterprise \
+             binary; the community auto-updater is intentionally not wired to avoid downgrading \
+             the edition."
+        );
+        return Ok(());
+    }
+
     eprintln!("Checking for csq updates…");
 
     let info = csq_core::update::check_for_update().context("failed to check for updates")?;
@@ -69,6 +84,20 @@ pub fn check() -> Result<()> {
 /// Ed25519 signature (against the pinned Foundation release key) pass.
 /// See `csq_core::update::verify` for the verification logic.
 pub fn install() -> Result<()> {
+    // Edition independence (rules/independence.md): `csq update install` on an
+    // enterprise binary would download the COMMUNITY bundle from
+    // `terrene-foundation/csq` and atomically overwrite the running enterprise
+    // binary — silently losing the Phase-2b moat. Refuse in enterprise (no
+    // enterprise release channel yet — an internal journal entry W5). This mirrors the
+    // desktop `community_auto_update_enabled()` gate on the sibling surface.
+    if crate::BUILD_EDITION == "enterprise" {
+        anyhow::bail!(
+            "csq-ee (enterprise) has no auto-update channel yet — `csq update install` is \
+             disabled to prevent downgrading to the community edition. Rebuild or reinstall \
+             the enterprise binary to update."
+        );
+    }
+
     // C1: Refuse to install when the release signing key is still the
     // placeholder test key. Anyone who reads the source can derive
     // the corresponding private key and sign a malicious binary.
@@ -123,3 +152,25 @@ pub fn install() -> Result<()> {
 
 // Version comparison tests live in csq-core/src/update/github.rs alongside
 // the canonical compare_versions implementation.
+
+#[cfg(all(test, feature = "enterprise"))]
+mod enterprise_gate_tests {
+    // Edition independence: the community update channel MUST be disabled in
+    // enterprise builds. Both `check` and `install` return before any network
+    // call when BUILD_EDITION == "enterprise".
+    #[test]
+    fn install_is_disabled_in_enterprise() {
+        let err = super::install().unwrap_err().to_string();
+        assert!(
+            err.contains("no auto-update channel") || err.contains("disabled"),
+            "enterprise install must bail with an edition message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_is_noop_in_enterprise() {
+        // Returns Ok without touching the network (the enterprise guard returns
+        // before `check_for_update`).
+        assert!(super::check().is_ok());
+    }
+}

@@ -50,6 +50,7 @@ pub mod paths;
 pub mod pid;
 pub mod refresher;
 pub mod startup_reconciler;
+pub mod usage_ledger_writer;
 pub mod usage_poller;
 
 // `server` contains the cross-platform router, RouterState, request
@@ -77,6 +78,9 @@ pub use refresher::{
     spawn as spawn_refresher, HttpPostFn, HttpPostFnCodex, RefreshStatus, RefresherHandle,
 };
 pub use startup_reconciler::{run_reconciler, ReconcileSummary};
+pub use usage_ledger_writer::{
+    spawn as spawn_usage_ledger_writer, WriterHandle as UsageLedgerWriterHandle,
+};
 pub use usage_poller::{spawn as spawn_usage_poller, HttpGetFn, HttpPostProbeFn, PollerHandle};
 
 #[cfg(unix)]

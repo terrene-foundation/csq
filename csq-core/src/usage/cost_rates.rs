@@ -73,10 +73,24 @@ const MODEL_RATES: &[(&str, CostRate)] = &[
     ("gemini-2.5-flash", CostRate::new(0.075, 0.30)),
     ("gemini-2.0-flash", CostRate::new(0.075, 0.30)),
     ("gemini-1.5-pro", CostRate::new(1.25, 5.00)),
-    // ── DeepSeek ──────────────────────────────────────────────────────
-    ("deepseek-v4-flash", CostRate::new(0.07, 0.27)),
-    ("deepseek-coder", CostRate::new(0.27, 1.10)),
-    ("deepseek-chat", CostRate::new(0.27, 1.10)),
+    // ── DeepSeek (Anthropic-API-compatible, api.deepseek.com/anthropic) ─
+    // V4 lineup (released 2026-04-24), which is what csq's catalog configures
+    // 3P DeepSeek slots with (`providers::catalog` default_model
+    // `deepseek-v4-pro`, haiku/subagent `deepseek-v4-flash`). Rates are the
+    // cache-MISS input price + output price — the estimator bills
+    // input_tokens + output_tokens only (cache tokens captured-not-billed, see
+    // `attributed_session_to_event`). The former 75%-off promo became the
+    // permanent official price on 2026-05-31. The legacy `deepseek-chat` /
+    // `deepseek-reasoner` aliases route to V4 Flash pricing (both deprecating
+    // 2026-07-24). Verified against DeepSeek pricing docs 2026-07-07.
+    //
+    // `deepseek-coder` was REMOVED: it is not part of the V4 lineup and has no
+    // verifiable current rate, so it correctly renders `n/a` rather than a
+    // guessed price (the fail-loud contract in this module's header).
+    ("deepseek-v4-pro", CostRate::new(0.435, 0.87)),
+    ("deepseek-v4-flash", CostRate::new(0.14, 0.28)),
+    ("deepseek-reasoner", CostRate::new(0.14, 0.28)),
+    ("deepseek-chat", CostRate::new(0.14, 0.28)),
     // ── MiniMax ───────────────────────────────────────────────────────
     ("m2.7-coder", CostRate::new(0.30, 1.20)),
     ("minimax", CostRate::new(0.30, 1.20)),
@@ -86,8 +100,9 @@ const MODEL_RATES: &[(&str, CostRate)] = &[
 ];
 
 /// Date the rates were last verified against public pricing. Update when the
-/// table changes.
-pub const RATES_AS_OF: &str = "2026-05-06";
+/// table changes. The DeepSeek rows were re-verified 2026-07-07 (V4 lineup);
+/// the other providers' rows carry forward from the 2026-05-06 verification.
+pub const RATES_AS_OF: &str = "2026-07-07";
 
 #[cfg(test)]
 mod tests {
@@ -95,8 +110,10 @@ mod tests {
 
     #[test]
     fn rate_for_model_matches_known_families() {
+        assert!(rate_for_model("deepseek-v4-pro").is_some());
+        assert!(rate_for_model("deepseek-v4-flash").is_some());
+        assert!(rate_for_model("deepseek-reasoner").is_some());
         assert!(rate_for_model("deepseek-chat").is_some());
-        assert!(rate_for_model("deepseek-coder").is_some());
         assert!(rate_for_model("claude-opus-4-7").is_some());
         assert!(rate_for_model("claude-sonnet-4-6").is_some());
         assert!(rate_for_model("gpt-5").is_some());
@@ -122,14 +139,25 @@ mod tests {
         assert!(rate_for_model("foobar").is_none());
         assert!(rate_for_model("").is_none());
         assert!(rate_for_model("o3-mini").is_none()); // not in table
+                                                      // deepseek-coder removed (not V4 lineup, no verifiable rate) → n/a.
+        assert!(rate_for_model("deepseek-coder").is_none());
     }
 
     #[test]
     fn estimate_usd_matches_public_pricing() {
-        // 1M input + 1M output deepseek-chat = $0.27 + $1.10 = $1.37
+        // 1M input + 1M output deepseek-v4-pro = $0.435 + $0.87 = $1.305
+        let rate = rate_for_model("deepseek-v4-pro").unwrap();
+        let cost = rate.estimate_usd(1_000_000, 1_000_000);
+        assert!(
+            (cost - 1.305).abs() < 0.001,
+            "expected ~$1.305, got ${cost}"
+        );
+
+        // 1M input + 1M output deepseek-v4-flash = $0.14 + $0.28 = $0.42
+        // (legacy `deepseek-chat`/`deepseek-reasoner` route to this rate).
         let rate = rate_for_model("deepseek-chat").unwrap();
         let cost = rate.estimate_usd(1_000_000, 1_000_000);
-        assert!((cost - 1.37).abs() < 0.001, "expected ~$1.37, got ${cost}");
+        assert!((cost - 0.42).abs() < 0.001, "expected ~$0.42, got ${cost}");
 
         // 100K input + 50K output claude-sonnet = $0.30 + $0.75 = $1.05
         let rate = rate_for_model("claude-sonnet-4-6").unwrap();

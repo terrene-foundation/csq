@@ -343,6 +343,72 @@ pub fn is_codex_only_slot(base: &Path, slot: u16, uuid: IdentityId) -> bool {
     codex_bound && !anthropic_bound
 }
 
+/// True iff `slot` is bound to an **Anthropic OAuth** account, resolving the
+/// binding through the identity store (per `account-terminal-separation.md`
+/// MUST Rule 4) — NOT the M4-12-retired legacy `credentials/<N>.json` mirror
+/// alone.
+///
+/// Post-M4-12 the numeric write path is retired: a slot logged in on a current
+/// build has NO `credentials/<N>.json`; its Anthropic binding lives only in
+/// `profiles.json::by_slot` → `identities/<UUID>/`. A detection site that stats
+/// the legacy mirror alone (the pre-fix `csq setkey` guard) is therefore blind
+/// to every post-A++ Anthropic login — the same detection-site-drift class the
+/// M4-12 mirror retirement introduced (`reconciler-cleanup-parity.md` Rule 6).
+///
+/// Anthropic-bound ⇐ legacy `credentials/<N>.json` exists (pre-A++ fallback) OR
+/// the slot's `by_slot` identity has `provider == "anthropic"` OR an Anthropic
+/// `credentials.json` exists at that identity's path. Fail-toward-unbound only
+/// when there is genuinely no legacy mirror AND no `by_slot` mapping.
+pub fn is_anthropic_bound_slot(base: &Path, slot: crate::types::AccountNum) -> bool {
+    let n = slot.get();
+    // `symlink_metadata` (not `.exists()`): a dangling legacy-mirror symlink is
+    // treated as bound so the guard fails toward refusing the clobber (the
+    // PR-C3b security posture the legacy `is_codex_bound_slot` established).
+    if std::fs::symlink_metadata(base.join("credentials").join(format!("{n}.json"))).is_ok() {
+        return true;
+    }
+    match crate::accounts::profiles::resolve_slot_to_uuid(base, n) {
+        Some(uuid) => {
+            read_identity_provider(base, uuid).as_deref() == Some("anthropic")
+                || credentials_path_for(base, uuid).exists()
+        }
+        None => false,
+    }
+}
+
+/// True iff `slot` is bound to a **Codex** account, resolving through the
+/// identity store — the identity-store-aware sibling of
+/// [`is_anthropic_bound_slot`] and the correct successor to the legacy
+/// [`crate::providers::codex::provisioning::is_codex_bound_slot`] marker
+/// predicate.
+///
+/// `is_codex_bound_slot` stats `credentials/codex-<N>.json`, which M4-12
+/// retired as a WRITE target: a Codex slot logged in on a current build has no
+/// such file (its credentials live at [`credentials_codex_path_for`]), so the
+/// legacy predicate returns `false` for a live Codex slot. This predicate keys
+/// on the identity store instead, with the legacy marker retained only as a
+/// pre-A++ fallback.
+///
+/// Codex-bound ⇐ legacy `credentials/codex-<N>.json` exists (pre-A++ fallback)
+/// OR the slot's `by_slot` identity has `provider == "codex"` OR a Codex
+/// `credentials-codex.json` exists at that identity's path.
+pub fn is_codex_bound_slot_identity_aware(base: &Path, slot: crate::types::AccountNum) -> bool {
+    let n = slot.get();
+    // `symlink_metadata` (not `.exists()`): dangling legacy marker → treated as
+    // bound (fail-toward-refuse), matching the legacy `is_codex_bound_slot`
+    // PR-C3b posture.
+    if std::fs::symlink_metadata(base.join("credentials").join(format!("codex-{n}.json"))).is_ok() {
+        return true;
+    }
+    match crate::accounts::profiles::resolve_slot_to_uuid(base, n) {
+        Some(uuid) => {
+            read_identity_provider(base, uuid).as_deref() == Some("codex")
+                || credentials_codex_path_for(base, uuid).exists()
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +841,108 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let uuid = IdentityId::new_v4();
         assert_eq!(read_identity_email(dir.path(), uuid), None);
+    }
+
+    /// Helper: map `slot` → `uuid` in `profiles.json::by_slot` (the current,
+    /// non-legacy binding channel — the one a real host uses).
+    fn write_by_slot(base: &Path, slot: &str, uuid: IdentityId) {
+        use crate::accounts::profiles::{save, ProfilesFile};
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), uuid);
+        save(&crate::accounts::profiles::profiles_path(base), &pf).unwrap();
+    }
+
+    fn acc(n: u16) -> crate::types::AccountNum {
+        crate::types::AccountNum::try_from(n).unwrap()
+    }
+
+    // ── is_anthropic_bound_slot — the M4-12 detection-site-drift regression ──
+
+    #[test]
+    fn is_anthropic_bound_slot_true_via_identity_store_no_legacy_mirror() {
+        // The real-host shape: by_slot → identity(provider=anthropic) +
+        // identities/<uuid>/credentials.json, and NO legacy credentials/<N>.json.
+        // The pre-fix guard (legacy-mirror stat only) returned false here — the
+        // exact blindness this predicate fixes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        write_identity_provider(dir.path(), uuid, "anthropic");
+        std::fs::write(credentials_path_for(dir.path(), uuid), b"{}").unwrap();
+        write_by_slot(dir.path(), "3", uuid);
+
+        assert!(
+            !dir.path().join("credentials/3.json").exists(),
+            "precondition: no legacy mirror (post-M4-12 host shape)"
+        );
+        assert!(
+            is_anthropic_bound_slot(dir.path(), acc(3)),
+            "identity-store anthropic binding must be detected without a legacy mirror"
+        );
+    }
+
+    #[test]
+    fn is_anthropic_bound_slot_true_via_legacy_mirror_fallback() {
+        // Pre-A++ hosts may still carry the legacy mirror; keep detecting it.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
+        std::fs::write(dir.path().join("credentials/2.json"), b"{}").unwrap();
+        assert!(is_anthropic_bound_slot(dir.path(), acc(2)));
+    }
+
+    #[test]
+    fn is_anthropic_bound_slot_false_for_unbound_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!is_anthropic_bound_slot(dir.path(), acc(5)));
+    }
+
+    #[test]
+    fn is_anthropic_bound_slot_false_for_codex_only_slot() {
+        // A codex slot (by_slot → provider=codex) is NOT anthropic-bound: a 3P
+        // rebind guard must not misclassify it as Claude.
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        write_identity_provider(dir.path(), uuid, "codex");
+        std::fs::write(credentials_codex_path_for(dir.path(), uuid), b"{}").unwrap();
+        write_by_slot(dir.path(), "9", uuid);
+        assert!(!is_anthropic_bound_slot(dir.path(), acc(9)));
+    }
+
+    // ── is_codex_bound_slot_identity_aware — sibling M4-12 drift regression ──
+
+    #[test]
+    fn is_codex_bound_slot_identity_aware_true_without_legacy_marker() {
+        // Real-host slot-9 shape: by_slot → identity(provider=codex) +
+        // credentials-codex.json, NO legacy credentials/codex-9.json. The legacy
+        // `providers::codex::provisioning::is_codex_bound_slot` returns false here.
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        write_identity_provider(dir.path(), uuid, "codex");
+        std::fs::write(credentials_codex_path_for(dir.path(), uuid), b"{}").unwrap();
+        write_by_slot(dir.path(), "9", uuid);
+
+        assert!(
+            !dir.path().join("credentials/codex-9.json").exists(),
+            "precondition: no legacy codex marker (post-M4-12 host shape)"
+        );
+        assert!(is_codex_bound_slot_identity_aware(dir.path(), acc(9)));
+    }
+
+    #[test]
+    fn is_codex_bound_slot_identity_aware_true_via_legacy_marker_fallback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
+        std::fs::write(dir.path().join("credentials/codex-4.json"), b"{}").unwrap();
+        assert!(is_codex_bound_slot_identity_aware(dir.path(), acc(4)));
+    }
+
+    #[test]
+    fn is_codex_bound_slot_identity_aware_false_for_anthropic_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        write_identity_provider(dir.path(), uuid, "anthropic");
+        std::fs::write(credentials_path_for(dir.path(), uuid), b"{}").unwrap();
+        write_by_slot(dir.path(), "3", uuid);
+        assert!(!is_codex_bound_slot_identity_aware(dir.path(), acc(3)));
     }
 
     #[test]

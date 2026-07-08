@@ -22,6 +22,7 @@ use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::error::ConfigError;
 use crate::platform::fs::{atomic_replace, secure_file};
 use crate::providers;
+use crate::providers::catalog::Surface;
 use crate::session::merge::MODEL_KEYS;
 use crate::types::AccountNum;
 use serde_json::{Map, Value};
@@ -105,6 +106,59 @@ fn purge_previous_provider_extras(env: &mut Map<String, Value>) -> bool {
     removed
 }
 
+/// The non-3P OAuth/device-auth surface that slot `slot` is currently bound to
+/// and that a per-slot provider-key write would clobber, or `None` if the slot
+/// is free for a 3P bind (including a 3P→3P re-key).
+///
+/// Identity-store-aware (`account-terminal-separation.md` MUST Rule 4): keyed on
+/// `by_slot` → `identities/<UUID>/` (provider tag + credential presence) with the
+/// M4-12-retired legacy mirrors kept only as a pre-A++ `symlink_metadata`
+/// fallback inside the predicates. The prior surface guards stat-ed the legacy
+/// mirrors directly and were blind to every post-A++ login.
+///
+/// Codex is checked before Anthropic so a (rare) dual-bound slot reports the
+/// Codex surface; the `csq logout <N>` remediation is surface-agnostic, so the
+/// single-surface message stays actionable in either reading.
+///
+/// The Anthropic branch has NO `provider.surface` gate on purpose: every 3P
+/// provider (mm / deepseek / zai / ollama) AND `claude` share
+/// `Surface::ClaudeCode` (they all speak the Anthropic protocol via a base-URL
+/// override), so the presence of an Anthropic OAuth binding — not the provider's
+/// surface — is the refusal signal. A direct-API key write would override the
+/// live subscription token.
+pub fn conflicting_bound_surface(
+    base_dir: &Path,
+    slot: AccountNum,
+    provider: &providers::Provider,
+) -> Option<Surface> {
+    use crate::accounts::identity_store;
+
+    if identity_store::is_codex_bound_slot_identity_aware(base_dir, slot)
+        && provider.surface != Surface::Codex
+    {
+        return Some(Surface::Codex);
+    }
+    if crate::providers::gemini::provisioning::is_gemini_bound_slot(base_dir, slot)
+        && provider.surface != Surface::Gemini
+    {
+        return Some(Surface::Gemini);
+    }
+    if identity_store::is_anthropic_bound_slot(base_dir, slot) {
+        return Some(Surface::ClaudeCode);
+    }
+    None
+}
+
+/// Human-facing label for a conflicting bound surface, used in the
+/// [`ConfigError::SlotSurfaceConflict`] message.
+pub fn bound_surface_label(surface: Surface) -> &'static str {
+    match surface {
+        Surface::ClaudeCode => "Claude (Anthropic OAuth)",
+        Surface::Codex => "Codex",
+        Surface::Gemini => "Gemini",
+    }
+}
+
 /// Binds a provider to a numbered slot.
 ///
 /// `key` is required for keyed providers (MiniMax, Z.AI, Claude api-key)
@@ -131,6 +185,8 @@ fn purge_previous_provider_extras(env: &mut Map<String, Value>) -> bool {
 /// - Keyed provider called with `key = None`, or keyless provider
 ///   called with `key = Some(_)`
 /// - Key is empty or obviously malformed (control chars, too short)
+/// - Slot is bound to a non-3P surface ([`ConfigError::SlotSurfaceConflict`];
+///   see [`conflicting_bound_surface`])
 /// - Any filesystem or JSON error during the write
 pub fn bind_provider_to_slot(
     base_dir: &Path,
@@ -204,6 +260,22 @@ pub fn bind_provider_to_slot(
             path: base_dir.join(".profiles.lock"),
             reason: format!("profiles lock: {e}"),
         })?;
+
+    // Surface-conflict guard (identity-store-aware) — refuse to clobber a slot
+    // bound to Codex / Anthropic OAuth / Gemini. This is the STRUCTURAL backstop
+    // shared by the CLI `setkey` pre-flight AND the desktop
+    // `bind_keyed_provider` / `bind_keyless_provider` commands, so the #995
+    // 3P-clobber (silent OAuth override + orphaned `by_slot`) cannot reach the
+    // write path from any surface. Checked UNDER the profiles lock so a
+    // concurrent `csq logout` cannot open a check→write TOCTOU. The CLI keeps a
+    // pre-flight copy of this check purely for UX (early refusal + exit code 2,
+    // before the interactive key prompt); this is the authoritative one.
+    if let Some(surface) = conflicting_bound_surface(base_dir, slot, provider) {
+        return Err(ConfigError::SlotSurfaceConflict {
+            slot: slot.get(),
+            bound_surface: bound_surface_label(surface).to_string(),
+        });
+    }
 
     let config_dir = base_dir.join(format!("config-{}", slot));
     std::fs::create_dir_all(&config_dir).map_err(|e| ConfigError::InvalidJson {
@@ -555,6 +627,163 @@ mod tests {
     use super::*;
     use crate::accounts::discovery;
     use tempfile::TempDir;
+
+    /// Plant the post-M4-12 host shape: `by_slot` → `identities/<uuid>/` with the
+    /// given provider + matching credential, and NO legacy mirror. This is the
+    /// state a current login leaves; the pre-fix legacy-mirror guards were blind
+    /// to it (the #995 class this shard closes).
+    fn bind_identity_oauth(base: &Path, slot: u16, provider: &str) {
+        use crate::accounts::identity_store::{
+            credentials_codex_path_for, credentials_path_for, identity_path, IdentityId,
+        };
+        use crate::accounts::profiles::{profiles_path, save, ProfilesFile};
+        let uuid = IdentityId::new_v4();
+        let idir = identity_path(base, uuid);
+        std::fs::create_dir_all(&idir).unwrap();
+        std::fs::write(
+            idir.join("identity.json"),
+            format!(r#"{{"email":"x","provider":"{provider}","created_at":"t","key_id":null}}"#),
+        )
+        .unwrap();
+        let cred = if provider == "codex" {
+            credentials_codex_path_for(base, uuid)
+        } else {
+            credentials_path_for(base, uuid)
+        };
+        std::fs::write(cred, b"{}").unwrap();
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), uuid);
+        save(&profiles_path(base), &pf).unwrap();
+    }
+
+    fn prov(id: &str) -> &'static providers::Provider {
+        providers::get_provider(id).unwrap()
+    }
+
+    #[test]
+    fn conflicting_bound_surface_detects_identity_only_anthropic() {
+        let dir = TempDir::new().unwrap();
+        bind_identity_oauth(dir.path(), 3, "anthropic");
+        assert!(
+            !dir.path().join("credentials/3.json").exists(),
+            "precondition: no legacy mirror (post-M4-12 shape)"
+        );
+        let slot = AccountNum::try_from(3u16).unwrap();
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("mm")),
+            Some(crate::providers::catalog::Surface::ClaudeCode),
+        );
+        // `claude` (direct API key) also refused — shares Surface::ClaudeCode,
+        // so the binding presence, not the surface, is the signal.
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("claude")),
+            Some(crate::providers::catalog::Surface::ClaudeCode),
+        );
+    }
+
+    #[test]
+    fn conflicting_bound_surface_detects_identity_only_codex() {
+        let dir = TempDir::new().unwrap();
+        bind_identity_oauth(dir.path(), 9, "codex");
+        assert!(!dir.path().join("credentials/codex-9.json").exists());
+        let slot = AccountNum::try_from(9u16).unwrap();
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("mm")),
+            Some(crate::providers::catalog::Surface::Codex),
+        );
+    }
+
+    #[test]
+    fn conflicting_bound_surface_detects_gemini() {
+        // Gemini's marker (`credentials/gemini-<N>.json`) is NOT M4-12-retired —
+        // it is the live write target — so `is_gemini_bound_slot` remains the
+        // correct signal. Plant it via the production writer and assert a 3P
+        // bind is refused with the Gemini surface.
+        use crate::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(8u16).unwrap();
+        write_binding(
+            dir.path(),
+            slot,
+            &GeminiBinding::new(AuthMode::ApiKey, "auto"),
+        )
+        .unwrap();
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("mm")),
+            Some(Surface::Gemini),
+        );
+        // A Gemini-surface provider is NOT blocked on its own slot.
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("gemini")),
+            None,
+        );
+    }
+
+    #[test]
+    fn conflicting_bound_surface_none_for_unbound_and_3p_slot() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        // Unbound.
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("mm")),
+            None
+        );
+        // 3P-bound: a real bind writes by_slot_identity (synthetic label), NOT
+        // by_slot → resolve_slot_to_uuid → None → no conflict (3P→3P allowed).
+        bind_provider_to_slot(
+            dir.path(),
+            "deepseek",
+            slot,
+            Some("sk-deepseek-xxxxxxxx"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("mm")),
+            None,
+            "3P→3P rebind must not be blocked"
+        );
+    }
+
+    #[test]
+    fn bind_provider_to_slot_refuses_identity_only_anthropic_slot() {
+        // THE #995 origin, now blocked at the core write path (covers CLI setkey
+        // AND desktop bind_keyed/keyless).
+        let dir = TempDir::new().unwrap();
+        bind_identity_oauth(dir.path(), 3, "anthropic");
+        let slot = AccountNum::try_from(3u16).unwrap();
+        let err = bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-123"), None)
+            .expect_err("must refuse a 3P bind over an Anthropic OAuth slot");
+        match err {
+            ConfigError::SlotSurfaceConflict {
+                slot: s,
+                bound_surface,
+            } => {
+                assert_eq!(s, 3);
+                assert!(
+                    bound_surface.contains("Anthropic OAuth"),
+                    "surface label: {bound_surface}"
+                );
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+        // The slot's settings.json must NOT have been written.
+        assert!(!dir.path().join("config-3/settings.json").exists());
+    }
+
+    #[test]
+    fn bind_provider_to_slot_refuses_identity_only_codex_slot() {
+        let dir = TempDir::new().unwrap();
+        bind_identity_oauth(dir.path(), 9, "codex");
+        let slot = AccountNum::try_from(9u16).unwrap();
+        let err =
+            bind_provider_to_slot(dir.path(), "deepseek", slot, Some("sk-deepseek-123"), None)
+                .expect_err("must refuse a 3P bind over a Codex slot");
+        assert!(matches!(
+            err,
+            ConfigError::SlotSurfaceConflict { slot: 9, .. }
+        ));
+    }
 
     #[test]
     fn bind_writes_settings_json_with_env() {

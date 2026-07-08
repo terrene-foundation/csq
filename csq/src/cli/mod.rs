@@ -1220,6 +1220,12 @@ pub fn run() -> Result<()> {
         // surface on every other command (`run`, `swap`, `login`, …) and via
         // the desktop app's own periodic check.
         Command::Statusline => {}
+        // Edition independence (rules/independence.md): the background notice
+        // reads the COMMUNITY latest.json and nudges toward `csq update install`
+        // — itself disabled in enterprise. An enterprise binary must not query
+        // the community channel or advise a community "upgrade" (mirrors the
+        // check()/install() + desktop community_auto_update_enabled gates).
+        _ if crate::BUILD_EDITION == "enterprise" => {}
         _ => csq_core::update::auto_update_bg(base_dir.clone()),
     }
 

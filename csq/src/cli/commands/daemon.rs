@@ -588,6 +588,23 @@ Run `csq audit verify --full` for diagnosis."
                     let coc_cache_sweeper =
                         daemon::spawn_coc_cache_sweeper(roots_seen_path, shutdown.clone());
 
+                    // Start the daemon-written usage-ledger writer (an internal ticket).
+                    // Periodically re-derives each account's usage history from
+                    // CC's transcripts and atomically publishes it to the per-slot
+                    // ledger, so the desktop dashboard reads a sub-ms ledger
+                    // instead of running the ~20s live scan on the render path.
+                    // The daemon is the SOLE producer; terminals only read
+                    // (account-terminal-separation.md Rule 1, extended for
+                    // billing telemetry). `claude_home()` → None (no $HOME) makes
+                    // the writer a no-op, mirroring the sweep/rotator wiring.
+                    let claude_home_for_ledger = super::claude_home().ok();
+                    let usage_ledger_writer = daemon::spawn_usage_ledger_writer(
+                        base_dir_for_runtime.clone(),
+                        claude_home_for_ledger,
+                        shutdown.clone(),
+                        chrono::Utc::now,
+                    );
+
                     // M14 — external anchoring task. Reads `audit-sink.json`;
                     // no-op when sink == "none" (default). When a sink is
                     // configured, periodically anchors the chain HEAD to the
@@ -695,6 +712,18 @@ Run `csq audit verify --full` for diagnosis."
                         Ok(Ok(())) => tracing::info!("coc-cache sweeper stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "coc-cache sweeper panicked"),
                         Err(_) => tracing::warn!("coc-cache sweeper did not stop within 5s"),
+                    }
+
+                    // Await the usage-ledger writer with a 5s deadline.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        usage_ledger_writer.join,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => tracing::info!("usage-ledger writer stopped cleanly"),
+                        Ok(Err(e)) => tracing::warn!(error = %e, "usage-ledger writer panicked"),
+                        Err(_) => tracing::warn!("usage-ledger writer did not stop within 5s"),
                     }
 
                     // Await the M14 anchor task with a 5s deadline (if active).

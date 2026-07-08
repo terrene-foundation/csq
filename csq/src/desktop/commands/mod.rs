@@ -935,48 +935,95 @@ pub struct MoveAccountSummary {
     pub live_pids_bound: Vec<u32>,
 }
 
-/// Phase B' (an internal journal entry) — returns the per-account usage summary for the
-/// pay-per-token ledger view. Runs the aggregator inline (scans CC's
-/// session-meta + reads csq's launch log + attributes via post-hoc time
-/// correlation) and computes rolling time windows.
+// ── Phase B' billing ledger cache (an internal ticket) ────────────────────────────
+//
+// PERF: `aggregator::aggregate` scans CC's transcripts under
+// `~/.claude/projects`. On a heavy host that is tens of GB across thousands of
+// files — a ~20s read that MUST NOT run on the UI's synchronous call path.
+// `BillingLedger.svelte` is mounted once per account card and `AccountList`
+// re-fetches every 5s, so a naive live scan would be ~14 full scans per render
+// and freeze the app.
+//
+// The cache below makes `get_account_usage` return in microseconds: it serves
+// the last computed all-slots aggregate (stale-tolerant) and, when the entry
+// is older than the TTL, kicks ONE guarded background thread to recompute. The
+// existing 5s `AccountList` poll picks up the refreshed numbers with no
+// frontend change. The fully-durable design (daemon-written persistent
+// `usage-{slot}.ndjson` that the command just reads) is tracked in #992.
+
+type UsagePairs = Vec<(AccountNum, csq_core::usage::ledger::UsageEvent)>;
+
+struct UsageCacheEntry {
+    base_dir: String,
+    computed_at: std::time::Instant,
+    pairs: std::sync::Arc<UsagePairs>,
+}
+
+// SINGLE-BASE ASSUMPTION: csq desktop runs with exactly one `~/.claude/accounts`
+// base per process, so a single global cache slot + single in-flight flag are
+// sufficient. If two DIFFERENT `base_dir`s ever alternated through this cache,
+// they would thrash the one slot and the single flag could starve the "losing"
+// base's refresh — acceptable because that configuration does not occur in
+// production. The `base_dir` guard below is also load-bearing for TEST
+// isolation: tests with distinct tempdir bases route a foreign-base cache hit
+// to the "absent" arm, so they never observe each other's cached aggregate.
+static USAGE_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<UsageCacheEntry>>> =
+    std::sync::OnceLock::new();
+static USAGE_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// How long a cached aggregate is served before a background refresh is kicked.
+/// A billing ledger does not need second-fresh numbers; this bounds the ~20s
+/// background scan to at most once per interval while the dashboard is open.
+const USAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn usage_cache() -> &'static std::sync::Mutex<Option<UsageCacheEntry>> {
+    USAGE_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Runs the aggregator for `base` and returns the all-slots (slot, event)
+/// pairs. Synchronous; used by the background refresh thread and by tests.
 ///
-/// PRIVACY: the aggregator's deserialization shape (see
-/// `csq_core::usage::aggregator::SessionMetaRecord`) reads ONLY metadata
-/// fields (model, tokens, timestamps). Conversation content is never read.
-#[tauri::command]
-pub fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryView, String> {
-    use csq_core::usage::{aggregator, ledger};
+/// The real per-turn model is sourced from the transcript (an internal ticket); the
+/// callback below is only a FALLBACK for sessions whose transcript had no
+/// model line (prior to #986 this hardcoded model was applied to EVERY slot,
+/// costing a DeepSeek slot at Sonnet rates).
+fn aggregate_usage_pairs(base: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> UsagePairs {
+    // Resolve $HOME/.claude — `get_base_dir` resolves ~/.claude/accounts, so
+    // claude_home is its parent. Malformed base → empty (no panic).
+    let Some(claude_home) = base.parent().map(|p| p.to_path_buf()) else {
+        return Vec::new();
+    };
+    // Model FALLBACK for the rare model-less transcript line: resolve the
+    // slot's configured model (matching the daemon usage-ledger writer's
+    // fallback) so the cold-start live-scan and the published ledger cost such
+    // lines identically. (#992 redteam R1 MEDIUM-2.)
+    csq_core::usage::aggregator::aggregate(&claude_home, base, now, |slot| {
+        csq_core::providers::settings::model_id_for_slot(base, slot.get())
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+    })
+}
 
-    let base = PathBuf::from(&base_dir);
-    let account_num = AccountNum::try_from(account).map_err(|e| format!("INVALID_INPUT: {e}"))?;
-
-    // Resolve $HOME/.claude. The desktop's `get_base_dir` resolves
-    // ~/.claude/accounts; claude_home is its parent.
-    let claude_home = base
-        .parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| "INVALID_BASE: cannot resolve ~/.claude from base_dir".to_string())?;
-
-    // Aggregate all sessions across all slots, filter to this slot.
-    // For v1 we model resolver returns the slot's catalog default; v2
-    // (per-turn jsonl scan) will source actual model per turn.
-    let pairs = aggregator::aggregate(&claude_home, &base, |_slot| {
-        // Best-effort default: claude-sonnet-4-6 as the workspace baseline.
-        // Replaced in v1.5 by reading the slot's actual configured model
-        // from settings.json when wired through the call site.
-        "claude-sonnet-4-6".to_string()
-    });
-
-    let events: Vec<ledger::UsageEvent> = pairs
-        .into_iter()
+/// Filters the cached pairs to one slot and summarizes into the IPC view.
+fn summarize_slot(
+    pairs: &UsagePairs,
+    account_num: AccountNum,
+    now: chrono::DateTime<chrono::Utc>,
+) -> UsageSummaryView {
+    let events: Vec<csq_core::usage::ledger::UsageEvent> = pairs
+        .iter()
         .filter(|(s, _)| *s == account_num)
-        .map(|(_, ev)| ev)
+        .map(|(_, ev)| ev.clone())
         .collect();
+    let summary = csq_core::usage::ledger::summarize(&events, now);
+    summary_to_view(summary)
+}
 
-    let now = chrono::Utc::now();
-    let summary = ledger::summarize(&events, now);
-
-    Ok(UsageSummaryView {
+/// Maps a core [`csq_core::usage::ledger::UsageSummary`] to the IPC view.
+/// Shared by the live-scan path ([`summarize_slot`]) and the ledger-first path
+/// ([`get_account_usage`], an internal ticket) so both surfaces produce an identical
+/// shape.
+fn summary_to_view(summary: csq_core::usage::ledger::UsageSummary) -> UsageSummaryView {
+    UsageSummaryView {
         total_input_tokens: summary.total_input_tokens,
         total_output_tokens: summary.total_output_tokens,
         total_cost_usd: summary.total_cost_usd,
@@ -994,7 +1041,113 @@ pub fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryV
         today_cost_usd: summary.today_cost_usd,
         event_count: summary.event_count,
         unestimated_cost_count: summary.unestimated_cost_count,
-    })
+    }
+}
+
+/// Returns the cached all-slots pairs (cloning the `Arc`), kicking ONE guarded
+/// background refresh when the entry is stale/absent/for a different base. The
+/// caller gets an immediate answer; refreshed numbers appear on the next poll.
+fn cached_or_refresh_pairs(base_dir: &str) -> std::sync::Arc<UsagePairs> {
+    use std::sync::atomic::Ordering;
+
+    let (pairs, needs_refresh) = {
+        let guard = usage_cache().lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(c) if c.base_dir == base_dir && c.computed_at.elapsed() < USAGE_CACHE_TTL => {
+                (c.pairs.clone(), false)
+            }
+            Some(c) if c.base_dir == base_dir => (c.pairs.clone(), true), // stale → serve + refresh
+            _ => (std::sync::Arc::new(Vec::new()), true),                 // absent / different base
+        }
+    };
+
+    if needs_refresh && !USAGE_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        let base_owned = base_dir.to_string();
+        // `Builder::spawn` returns a `Result` instead of panicking on OS thread
+        // exhaustion, so we can release the flag we just took if the thread
+        // never starts. Without this, a spawn failure after `swap(true)` would
+        // leave the flag stuck `true` and freeze the ledger for the process
+        // lifetime — the same failure class as the panic-in-scan case the RAII
+        // guard below covers (redteam an internal ticket HIGH-1 + R2 MEDIUM).
+        let spawned = std::thread::Builder::new()
+            .name("csq-usage-refresh".into())
+            .spawn(move || {
+                // RAII reset: clears the in-flight flag on EVERY exit of the
+                // running thread, including an unwind out of the scan.
+                struct ResetInFlight;
+                impl Drop for ResetInFlight {
+                    fn drop(&mut self) {
+                        USAGE_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                let _reset = ResetInFlight;
+
+                let now = chrono::Utc::now();
+                let fresh = aggregate_usage_pairs(&PathBuf::from(&base_owned), now);
+                let mut guard = usage_cache().lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(UsageCacheEntry {
+                    base_dir: base_owned,
+                    computed_at: std::time::Instant::now(),
+                    pairs: std::sync::Arc::new(fresh),
+                });
+                // `_reset` drops here (or on unwind), releasing the flag.
+            });
+        if spawned.is_err() {
+            // Thread never started → release the flag so a later call retries.
+            USAGE_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+
+    pairs
+}
+
+/// Phase B' (an internal journal entry) — returns the per-account usage summary for the
+/// pay-per-token ledger view.
+///
+/// Non-blocking: serves a cached all-slots aggregate and kicks a background
+/// refresh when stale (see the cache module above) — the ~20s transcript scan
+/// never runs on this synchronous call path (an internal ticket).
+///
+/// PRIVACY (D6): the aggregator's deserialization shape (see
+/// `csq_core::usage::aggregator::TranscriptLine`) reads ONLY metadata fields
+/// (model, token counts, timestamps, cwd) from CC's transcripts at
+/// `~/.claude/projects/<cwd>/<session-id>.jsonl`, line-streamed so no
+/// transcript is held whole. Conversation content is never retained or
+/// persisted (an internal ticket).
+#[tauri::command]
+pub fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryView, String> {
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("INVALID_INPUT: {e}"))?;
+    let now = chrono::Utc::now();
+
+    // Ledger-first (an internal ticket): when the daemon has published this slot's
+    // ledger, read it directly — a sub-ms read that renders instantly. The
+    // daemon usage-ledger writer is the SOLE producer; this terminal only reads
+    // (account-terminal-separation.md Rule 1, extended for billing telemetry).
+    // The desktop app runs the in-process daemon, so the writer's immediate
+    // first tick populates the ledger within seconds of launch and refreshes it
+    // every 10 min — the read path never pays the ~20s scan.
+    let base = std::path::PathBuf::from(&base_dir);
+    if csq_core::usage::ledger::ledger_path(&base, account_num).exists() {
+        if let Ok(result) = csq_core::usage::ledger::read_all(&base, account_num) {
+            // Treat the ledger as a cache: a NON-EMPTY read is a hit → serve it
+            // fast. An EMPTY read is a miss (rolled-off / never-populated slot)
+            // → fall through to the authoritative live-scan below, which yields
+            // the same zero but defends against a transient empty tick blanking
+            // a populated slot. (#992 redteam R1 MEDIUM-1.)
+            if !result.events.is_empty() {
+                let summary = csq_core::usage::ledger::summarize(&result.events, now);
+                return Ok(summary_to_view(summary));
+            }
+        }
+        // A read error (I/O, not "absent") also falls through to the live scan.
+    }
+
+    // Cold-start fallback: no daemon-written ledger yet (fresh install, or the
+    // first seconds after launch before the writer's first tick completes).
+    // Serve the cached live-scan aggregate and kick a background refresh
+    // (an internal ticket) — non-blocking, never runs the scan on this call.
+    let pairs = cached_or_refresh_pairs(&base_dir);
+    Ok(summarize_slot(&pairs, account_num, now))
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -2655,6 +2808,13 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// banner.
 #[tauri::command]
 pub fn check_for_update(state: State<'_, AppState>) -> Result<Option<CachedUpdateInfo>, String> {
+    // Edition independence (rules/independence.md): the update channel is the
+    // COMMUNITY repo. Enterprise never queries it — the background loop that
+    // drives the banner is already gated off, but this command is registered
+    // for both editions, so short-circuit here too (defense in depth).
+    if crate::BUILD_EDITION == "enterprise" {
+        return Ok(None);
+    }
     let info = match csq_core::update::check_for_update() {
         Ok(v) => v,
         Err(e) => return Err(format!("update check failed: {e}")),
@@ -3979,6 +4139,44 @@ mod tests {
         let err = bind_keyless_provider("/nonexistent/base/dir".into(), "ollama".into(), 5, None)
             .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_keyed_provider_refuses_oauth_slot_twin_parity() {
+        // CLI/desktop twin parity (`discovery_codex_login_cli_desktop_twin_parity`):
+        // the desktop 3P bind inherits the core surface-conflict guard, so the
+        // #995 clobber (silent OAuth override + orphaned by_slot) is unreachable
+        // from the Tauri UI. Plant a post-M4-12 Anthropic OAuth slot (by_slot →
+        // identity, NO legacy mirror) and assert the bind is refused.
+        use csq_core::accounts::identity_store::{credentials_path_for, identity_path, IdentityId};
+        use csq_core::accounts::profiles::{profiles_path, save, ProfilesFile};
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        let idir = identity_path(dir.path(), uuid);
+        std::fs::create_dir_all(&idir).unwrap();
+        std::fs::write(
+            idir.join("identity.json"),
+            br#"{"email":"x","provider":"anthropic","created_at":"t","key_id":null}"#,
+        )
+        .unwrap();
+        std::fs::write(credentials_path_for(dir.path(), uuid), b"{}").unwrap();
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert("3".to_string(), uuid);
+        save(&profiles_path(dir.path()), &pf).unwrap();
+
+        let err = bind_keyed_provider(
+            dir.path().to_string_lossy().into_owned(),
+            "mm".into(),
+            3,
+            "sk-test-minimax-123".into(),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("Anthropic OAuth") && err.contains("csq logout 3"),
+            "desktop bind must surface the surface-conflict refusal: {err}"
+        );
+        assert!(!dir.path().join("config-3/settings.json").exists());
     }
 
     #[test]
@@ -5720,9 +5918,11 @@ mod tests {
         assert_eq!(s.last_7d_cost_usd, 0.0);
     }
 
-    /// End-to-end: plant a session-meta + a launch event, expect the
-    /// command to attribute correctly and return a non-zero summary
-    /// for the matched slot.
+    /// End-to-end (synchronous path): plant a CC transcript + a launch event,
+    /// expect the aggregator to attribute correctly and the per-slot summary
+    /// to be non-zero for the matched slot. Exercises the same helpers the
+    /// Tauri command's background refresh uses (`aggregate_usage_pairs` +
+    /// `summarize_slot`) — deterministic, no cache/thread timing.
     #[test]
     fn get_account_usage_attributes_session_to_correct_slot() {
         let home_dir = tempfile::TempDir::new().unwrap();
@@ -5730,12 +5930,17 @@ mod tests {
         let base = claude_home.join("accounts");
         std::fs::create_dir_all(&base).unwrap();
 
-        // Plant session-meta.
-        let sm_dir = claude_home.join("usage-data").join("session-meta");
-        std::fs::create_dir_all(&sm_dir).unwrap();
+        // Plant a CC transcript for /repo/x with a recent timestamp (so it is
+        // inside the mtime window vs `now`).
+        let now = chrono::Utc::now();
+        let ts = now.to_rfc3339();
+        let proj = claude_home.join("projects").join("-repo-x");
+        std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(
-            sm_dir.join("sess1.json"),
-            r#"{"session_id":"sess1","project_path":"/repo/x","start_time":"2026-05-06T11:30:00Z","input_tokens":10000,"output_tokens":5000}"#,
+            proj.join("sess1.jsonl"),
+            format!(
+                r#"{{"type":"assistant","cwd":"/repo/x","timestamp":"{ts}","sessionId":"sess1","message":{{"model":"deepseek-chat","usage":{{"input_tokens":10000,"output_tokens":5000}}}}}}"#
+            ),
         )
         .unwrap();
 
@@ -5752,15 +5957,160 @@ mod tests {
         )
         .unwrap();
 
-        // Slot 4 sees the event.
-        let result = get_account_usage(base.to_string_lossy().into_owned(), 4).unwrap();
-        assert_eq!(result.event_count, 1);
-        assert_eq!(result.total_input_tokens, 10000);
-        assert_eq!(result.total_output_tokens, 5000);
+        // Mark slot 4 as a DeepSeek (3P) slot via its base-URL binding so
+        // `discover_all` classifies it ThirdParty(DeepSeek) and the aggregator's
+        // provider-consistency gate keeps the deepseek transcript above.
+        let config4 = base.join("config-4");
+        std::fs::create_dir_all(&config4).unwrap();
+        std::fs::write(
+            config4.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","ANTHROPIC_MODEL":"deepseek-v4-pro","ANTHROPIC_AUTH_TOKEN":"sk-test"}}"#,
+        )
+        .unwrap();
+
+        let pairs = aggregate_usage_pairs(&base, now);
+
+        // Slot 4 sees the event with the real transcript model (deepseek).
+        let s4 = summarize_slot(&pairs, AccountNum::try_from(4u16).unwrap(), now);
+        assert_eq!(s4.event_count, 1);
+        assert_eq!(s4.total_input_tokens, 10000);
+        assert_eq!(s4.total_output_tokens, 5000);
 
         // Slot 7 (no launch event) sees nothing.
+        let s7 = summarize_slot(&pairs, AccountNum::try_from(7u16).unwrap(), now);
+        assert_eq!(s7.event_count, 0);
+    }
+
+    /// The Tauri command is non-blocking: it returns a summary immediately
+    /// (from cache — empty on first call) and never errors on a fresh base.
+    /// The ~20s transcript scan happens on a background thread, so the first
+    /// call must NOT block on it.
+    #[test]
+    fn get_account_usage_command_returns_immediately() {
+        let home_dir = tempfile::TempDir::new().unwrap();
+        let base = home_dir.path().join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let result = get_account_usage(base.to_string_lossy().into_owned(), 4);
+        let elapsed = t0.elapsed();
+        assert!(result.is_ok(), "command must not error: {result:?}");
+        // Well under any real scan time — proves the scan is off the call path.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "command should return immediately, took {elapsed:?}"
+        );
+    }
+
+    /// Ledger-first (an internal ticket): when the daemon has published a slot's ledger,
+    /// `get_account_usage` reads it DIRECTLY. Planting a ledger with NO matching
+    /// transcripts on disk proves the numbers came from the published ledger —
+    /// the live-scan fallback would return zero here. A sibling slot with no
+    /// ledger still falls back to the (empty) live scan.
+    #[test]
+    fn get_account_usage_reads_daemon_written_ledger_first() {
+        let home_dir = tempfile::TempDir::new().unwrap();
+        let base = home_dir.path().join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Daemon publishes slot 6's ledger directly (no transcripts exist).
+        let slot = AccountNum::try_from(6u16).unwrap();
+        let now = chrono::Utc::now();
+        let ev = csq_core::usage::ledger::UsageEvent {
+            ts: now.to_rfc3339(),
+            session_id: "sess-led".into(),
+            model: "deepseek-chat".into(),
+            input_tokens: 12_345,
+            output_tokens: 6_789,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd_estimate: Some(0.05),
+            source: csq_core::usage::ledger::UsageSource::ProjectsJsonl,
+            project_path: None,
+        };
+        csq_core::usage::ledger::write_all(&base, slot, std::slice::from_ref(&ev)).unwrap();
+
+        // The command surfaces the ledger's numbers → it read the published
+        // ledger, not the (empty) live scan.
+        let s = get_account_usage(base.to_string_lossy().into_owned(), 6).unwrap();
+        assert_eq!(s.event_count, 1);
+        assert_eq!(s.total_input_tokens, 12_345);
+        assert_eq!(s.total_output_tokens, 6_789);
+        assert!((s.total_cost_usd - 0.05).abs() < 1e-9);
+
+        // A sibling slot with no published ledger falls back to the empty scan.
         let other = get_account_usage(base.to_string_lossy().into_owned(), 7).unwrap();
         assert_eq!(other.event_count, 0);
+    }
+
+    /// An empty-but-present ledger (a rolled-off slot) is treated as a
+    /// cache-miss: `get_account_usage` returns zero and does not short-circuit
+    /// on the empty file. On this cold cache the live-scan fall-through also
+    /// yields zero (no transcripts), so the result is zero either way — this
+    /// guards the empty-present-ledger INPUT, which no other read-path test
+    /// exercises, against a panic/regression. (#992 redteam R2 GAP-2.)
+    #[test]
+    fn get_account_usage_empty_present_ledger_returns_zero() {
+        let home_dir = tempfile::TempDir::new().unwrap();
+        let base = home_dir.path().join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let slot = AccountNum::try_from(5u16).unwrap();
+        csq_core::usage::ledger::write_all(&base, slot, &[]).unwrap();
+        assert!(csq_core::usage::ledger::ledger_path(&base, slot).exists());
+
+        let s = get_account_usage(base.to_string_lossy().into_owned(), 5).unwrap();
+        assert_eq!(s.event_count, 0);
+        assert_eq!(s.total_input_tokens, 0);
+    }
+
+    /// IPC audit (tauri-commands.md MUST Rule 3 / an internal journal entry finding 5):
+    /// `UsageSummaryView` is returned by `get_account_usage` to the renderer.
+    /// Whitelist every key so a future field addition (e.g. a project path or
+    /// session id) fails this test instead of silently shipping to IPC.
+    #[test]
+    fn usage_summary_view_keys_whitelisted() {
+        let v = UsageSummaryView {
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
+            last_30d_input_tokens: 0,
+            last_30d_output_tokens: 0,
+            last_30d_cost_usd: 0.0,
+            last_7d_input_tokens: 0,
+            last_7d_output_tokens: 0,
+            last_7d_cost_usd: 0.0,
+            last_5d_input_tokens: 0,
+            last_5d_output_tokens: 0,
+            last_5d_cost_usd: 0.0,
+            today_input_tokens: 0,
+            today_output_tokens: 0,
+            today_cost_usd: 0.0,
+            event_count: 0,
+            unestimated_cost_count: 0,
+        };
+        assert_ipc_keys_whitelisted(
+            &v,
+            &[
+                "total_input_tokens",
+                "total_output_tokens",
+                "total_cost_usd",
+                "last_30d_input_tokens",
+                "last_30d_output_tokens",
+                "last_30d_cost_usd",
+                "last_7d_input_tokens",
+                "last_7d_output_tokens",
+                "last_7d_cost_usd",
+                "last_5d_input_tokens",
+                "last_5d_output_tokens",
+                "last_5d_cost_usd",
+                "today_input_tokens",
+                "today_output_tokens",
+                "today_cost_usd",
+                "event_count",
+                "unestimated_cost_count",
+            ],
+        );
     }
 
     /// INVALID_INPUT: out-of-range slot # → typed error before

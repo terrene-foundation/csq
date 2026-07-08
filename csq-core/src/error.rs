@@ -423,6 +423,21 @@ pub enum ConfigError {
         policy: String,
         allowed: String,
     },
+
+    /// A per-slot provider-key bind (`csq setkey <3p> --slot N`, desktop
+    /// `bind_keyed_provider` / `bind_keyless_provider`) was refused because slot
+    /// `slot` is already bound to a non-3P OAuth/device-auth surface
+    /// (`bound_surface`: `Claude (Anthropic OAuth)` / `Codex` / `Gemini`).
+    /// Overwriting it would silently override the live login and orphan the
+    /// account's `by_slot` mapping (an internal ticket). The operator must
+    /// `csq logout <N>` first. Constructed by
+    /// [`crate::accounts::third_party::bind_provider_to_slot`] via
+    /// [`crate::accounts::third_party::conflicting_bound_surface`]. Named
+    /// variant → specific UI text (`rules/tauri-commands.md` MUST Rule 6).
+    #[error(
+        "slot {slot} is bound to {bound_surface} — run `csq logout {slot}` before binding a provider key"
+    )]
+    SlotSurfaceConflict { slot: u16, bound_surface: String },
 }
 
 #[cfg(test)]

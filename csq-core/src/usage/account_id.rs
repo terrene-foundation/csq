@@ -1,28 +1,13 @@
-//! `account_id` chokepoint per an internal journal entry D4. Today returns the slot number
-//! as a string (`"1"`, `"4"`); post-issue-#292 (Option A++) this returns the
-//! account's permanent UUID. The chokepoint is the SOLE caller-visible function
-//! for "give me a stable identifier for this slot's ledger / config dir / etc."
-//!
-//! Migration path when A++ ships:
-//!
-//! ```text
-//! // Pre-A++ (today):
-//! pub fn resolve_account_id(_base: &Path, slot: AccountNum) -> String {
-//!     slot.get().to_string()
-//! }
-//!
-//! // Post-A++ (an internal ticket):
-//! pub fn resolve_account_id(base: &Path, slot: AccountNum) -> String {
-//!     crate::accounts::profiles::resolve_slot_to_uuid(base, slot.get())
-//!         .map(|id| id.to_string())
-//!         .unwrap_or_else(|| slot.get().to_string())  // legacy fallback
-//! }
-//! ```
+//! `account_id` chokepoint per an internal journal entry D4. Returns the account's permanent
+//! UUID when `profiles.json` `by_slot` maps the slot (A++ / an internal ticket has
+//! shipped), else the slot number as a string (`"1"`, `"4"`) for legacy layouts
+//! or a missing `profiles.json`. The chokepoint is the SOLE caller-visible
+//! function for "give me a stable identifier for this slot's ledger / config
+//! dir / etc."
 //!
 //! Every call site that needs a stable identifier (for ledger filenames, for
 //! handle-dir symlink targets, for any persisted state keyed by "the account")
-//! goes through this function. Refactoring this single chokepoint is what
-//! Option A++ migration consists of.
+//! goes through this single function.
 
 use crate::types::AccountNum;
 use std::path::Path;

@@ -28,8 +28,8 @@ pub const HOME_ENV_VAR: &str = "CODEX_HOME";
 pub const CODEX_WRITTEN_AUTH_JSON: &str = "auth.json";
 
 /// The config.toml filename inside `config-<N>/` codex reads. Written
-/// by csq pre-login (INV-P03) with `cli_auth_credentials_store` +
-/// `model` keys.
+/// by csq pre-login (INV-P03) with the `cli_auth_credentials_store` key
+/// (csq does NOT write a `model` key at login — CC-parity).
 pub const CONFIG_TOML_FILENAME: &str = "config.toml";
 
 /// Per-account persistent Codex-sessions directory. Symlinked from
@@ -85,8 +85,15 @@ pub fn default_model() -> &'static str {
 /// `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`
 /// in `~/.codex/config.toml`, and the session came up with Codex's
 /// built-in `workspace-write` defaults instead — because the slot's
-/// `config.toml` only had `cli_auth_credentials_store` + `model`.
-const CSQ_CONTROLLED_KEYS: &[&str] = &["cli_auth_credentials_store", "model"];
+/// `config.toml` only had `cli_auth_credentials_store`.
+///
+/// `model` is intentionally NOT in this list. CC-parity: csq must not own
+/// the model key. The user-global `~/.codex/config.toml` `model` key is
+/// propagated verbatim so the user's preference reaches the slot; when it
+/// is absent, codex uses its own built-in default. csq's catalog
+/// `default_model()` is retained as a reference value but MUST NOT be
+/// written into the slot's `config.toml`.
+const CSQ_CONTROLLED_KEYS: &[&str] = &["cli_auth_credentials_store"];
 
 /// csq's curated default for codex's native `tui.status_line` footer — an
 /// ordered array of codex built-in status-line item IDs. Codex renders these
@@ -97,9 +104,9 @@ const CSQ_CONTROLLED_KEYS: &[&str] = &["cli_auth_credentials_store", "model"];
 ///
 /// Applied ONLY when the user has not set `tui.status_line` in
 /// `~/.codex/config.toml` (see [`inject_default_status_line`]): unlike the
-/// csq-controlled auth/model keys (csq-wins), the statusline is a user
-/// preference (user-wins-if-present), so an explicit `/statusline` choice is
-/// never clobbered.
+/// csq-controlled `cli_auth_credentials_store` key (csq-wins), the statusline is
+/// a user preference (user-wins-if-present), so an explicit `/statusline` choice
+/// is never clobbered.
 ///
 /// NOTE — this configures codex's OWN native footer; it does NOT inject a
 /// csq-rendered line the way `csq statusline` does for Claude Code. Codex has no
@@ -166,11 +173,10 @@ fn user_global_config_path() -> Option<PathBuf> {
 }
 
 /// Renders the `config.toml` contents csq writes before the first
-/// `codex login --device-auth`, with no user-global merge. Two keys:
+/// `codex login --device-auth`, with no user-global merge. One key:
 ///
 /// ```toml
 /// cli_auth_credentials_store = "file"
-/// model = "<model>"
 /// ```
 ///
 /// String values are TOML-quoted; trailing newline included.
@@ -181,9 +187,17 @@ fn user_global_config_path() -> Option<PathBuf> {
 /// migrate an existing keychain entry (spec 07 §7.3.3 step 2
 /// rationale).
 ///
+/// csq no longer writes a `model` key. CC-parity: the user-global
+/// `~/.codex/config.toml` `model` propagates verbatim; absent →
+/// codex uses its own built-in default. [`default_model`] is kept
+/// as a catalog-mirror reference but MUST NOT be written here.
+///
 /// This is a thin wrapper around [`render_config_toml_with_global`] for
-/// callers (notably tests) that don't need user-global merging.
-pub fn render_config_toml(model: &str) -> String {
+/// callers (notably tests) that don't need user-global merging. Pass
+/// `Some(model)` to emit an explicit per-slot `model` key (the `csq models
+/// set codex` path); pass `None` to omit it (login / spawn / reconciler
+/// defaults, where csq must not own the model key).
+pub fn render_config_toml(model: Option<&str>) -> String {
     render_config_toml_with_global(model, None)
 }
 
@@ -200,21 +214,42 @@ pub fn render_config_toml(model: &str) -> String {
 /// slots.
 ///
 /// Merge rules:
-/// 1. csq-controlled keys (see [`CSQ_CONTROLLED_KEYS`]) are rendered
-///    from csq's arguments. The user-global file CANNOT override them
-///    (e.g. a user-global `model = "o4-mini"` does NOT replace the
-///    slot's csq-set model).
-/// 2. Every other top-level key in `user_global_toml` is propagated
-///    verbatim (tables, arrays, scalars — TOML round-trip via
-///    `toml::Value`).
-/// 3. On parse error, the user-global is treated as absent and the
-///    2-key fallback is returned (graceful degradation — never break
+/// 1. csq-controlled keys (see [`CSQ_CONTROLLED_KEYS`]) always come from
+///    csq. The sole csq-controlled key is `cli_auth_credentials_store`.
+/// 2. `model` is conditional. When `model` is `Some(m)` — the explicit
+///    `csq models set codex` choice, or a preserved prior explicit choice —
+///    csq writes `model = "m"` and DROPS any `model` propagated from the
+///    user-global (the explicit per-slot choice wins). When `model` is
+///    `None`, csq writes NO model line: the user-global `model` (if any)
+///    propagates verbatim, and when neither is present codex uses its own
+///    built-in default. csq NEVER injects its catalog default (CC-parity:
+///    csq does not own the model key).
+/// 3. Every other top-level key in `user_global_toml` is propagated
+///    verbatim (tables, arrays, scalars — TOML round-trip via `toml::Value`).
+/// 4. On parse error, the user-global is treated as absent and the
+///    1-key fallback is returned (graceful degradation — never break
 ///    the slot operation because the user's global TOML is malformed).
-pub fn render_config_toml_with_global(model: &str, user_global_toml: Option<&str>) -> String {
-    let csq_block = format!(
-        "cli_auth_credentials_store = \"file\"\nmodel = \"{}\"\n",
-        model
-    );
+pub fn render_config_toml_with_global(
+    model: Option<&str>,
+    user_global_toml: Option<&str>,
+) -> String {
+    // csq-controlled block: the mandatory INV-P03 auth-store directive, plus
+    // an explicit per-slot model when one is supplied. Auth-store first keeps
+    // the INV-P03 directive at the top of the file (reviewer-ergonomic).
+    //
+    // The model value is serialized through `toml::Value::String` — NOT raw
+    // string interpolation — so a crafted model id (from `csq models set codex
+    // <id> --force`, or the IPC-reachable desktop picker) cannot break out of the
+    // string literal and inject additional TOML keys (redteam R1 MED: a `"`+`\n`
+    // payload could otherwise append `cli_auth_credentials_store = "keychain"`
+    // — last-wins overrides csq's INV-P03 directive — or an `[mcp_servers.*]`
+    // the operator never set). This mirrors the safe `toml::to_string` treatment
+    // the user-global block already gets below.
+    let mut csq_block = String::from("cli_auth_credentials_store = \"file\"\n");
+    if let Some(m) = model {
+        let quoted = toml::Value::String(m.to_string()).to_string();
+        csq_block.push_str(&format!("model = {quoted}\n"));
+    }
 
     // Build the user-derived table: parse the user-global if present, else start
     // empty. A missing/malformed/non-table user-global degrades to an empty table
@@ -231,7 +266,7 @@ pub fn render_config_toml_with_global(model: &str, user_global_toml: Option<&str
                     error_kind = "codex_user_global_config_unparseable",
                     error = %e,
                     "skipping ~/.codex/config.toml merge — file is not valid TOML; \
-                     slot will receive Codex built-in defaults for any keys outside cli_auth_credentials_store + model"
+                     slot will receive Codex built-in defaults for any keys outside cli_auth_credentials_store"
                 );
                 toml::value::Table::new()
             }
@@ -240,6 +275,13 @@ pub fn render_config_toml_with_global(model: &str, user_global_toml: Option<&str
 
     for key in CSQ_CONTROLLED_KEYS {
         user_table.remove(*key);
+    }
+    // When csq writes an explicit per-slot model, that choice is authoritative —
+    // drop any `model` propagated from the user-global so it is the ONLY model
+    // key. When csq writes none (`model` is None), leave the user-global `model`
+    // in place so it propagates verbatim.
+    if model.is_some() {
+        user_table.remove("model");
     }
 
     // Fill csq's curated codex statusline when the user has not configured one
@@ -383,12 +425,22 @@ pub fn caller_overrides_sandbox(rest: &[String]) -> bool {
 /// Callers that have ALREADY read (and validated) the user-global
 /// content MUST use [`write_config_toml_with_global`] so the validated
 /// snapshot and the written snapshot are the same bytes (closes the
-/// guard-vs-write TOCTOU in [`regenerate_slot_config_preserving_model`]).
-pub fn write_config_toml(base_dir: &Path, account: AccountNum, model: &str) -> io::Result<()> {
+/// guard-vs-write TOCTOU in [`regenerate_slot_config`]).
+///
+/// `model` is `Some(m)` only for the explicit `csq models set codex`
+/// path (and the desktop equivalent); login / spawn / reconciler callers
+/// pass `None` so csq never forces a model — the user-global `model`
+/// propagates and, absent that, codex uses its own built-in default.
+pub fn write_config_toml(
+    base_dir: &Path,
+    account: AccountNum,
+    model: Option<&str>,
+) -> io::Result<()> {
     // Merge user-global ~/.codex/config.toml into the slot config so
     // user preferences (approval_policy, sandbox_mode, mcp_servers, …)
-    // reach Codex via $CODEX_HOME/config.toml. csq-controlled keys
-    // (cli_auth_credentials_store, model) always come from csq.
+    // reach Codex via $CODEX_HOME/config.toml. The sole csq-controlled key
+    // (cli_auth_credentials_store) always comes from csq; `model` is written
+    // only when an explicit choice is supplied.
     let user_global = read_user_global_config_toml();
     write_config_toml_with_global(base_dir, account, model, user_global.as_deref())
 }
@@ -396,13 +448,13 @@ pub fn write_config_toml(base_dir: &Path, account: AccountNum, model: &str) -> i
 /// Like [`write_config_toml`] but writes from the caller-supplied
 /// `user_global` snapshot instead of re-reading `~/.codex/config.toml`.
 /// Lets a caller that already validated the user-global (e.g.
-/// [`regenerate_slot_config_preserving_model`]) render + write from the
+/// [`regenerate_slot_config`]) render + write from the
 /// exact bytes it validated — there is no second read that could observe
 /// a different (e.g. mid-edit malformed) `~/.codex`.
 pub fn write_config_toml_with_global(
     base_dir: &Path,
     account: AccountNum,
-    model: &str,
+    model: Option<&str>,
     user_global: Option<&str>,
 ) -> io::Result<()> {
     let target = config_toml_path(base_dir, account);
@@ -429,7 +481,7 @@ pub fn write_config_toml_with_global(
     Ok(())
 }
 
-/// Outcome of [`regenerate_slot_config_preserving_model`].
+/// Outcome of [`regenerate_slot_config`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegenOutcome {
     /// On-disk `config-<N>/config.toml` already byte-equals the desired
@@ -437,8 +489,11 @@ pub enum RegenOutcome {
     AlreadyCurrent,
     /// The slot config was rewritten from the merge.
     Rewritten {
-        /// The `model` key preserved (or defaulted) into the rewrite.
-        model: String,
+        /// The explicit per-slot `model` preserved into the rewrite, or
+        /// `None` when the slot carries no explicit model (csq wrote none —
+        /// the user-global `model`, if any, propagates and otherwise codex
+        /// uses its built-in default). csq NEVER injects a catalog default.
+        model: Option<String>,
         /// True when the rewrite happened DESPITE a present-but-malformed
         /// `~/.codex` (merge base fell back to the slot's own config; new
         /// global keys could not be pulled). Callers surface the same
@@ -459,8 +514,10 @@ pub enum RegenOutcome {
 
 /// Regenerates `config-<N>/config.toml` by re-merging the CURRENT
 /// user-global `~/.codex/config.toml`, preserving the slot's existing
-/// top-level `model` key (falling back to [`default_model`] when absent
-/// or unparsed). Idempotent — returns [`RegenOutcome::AlreadyCurrent`]
+/// explicit top-level `model` key IF present. When the slot carries no
+/// explicit model, csq writes NONE — the user-global `model` propagates
+/// (or codex's built-in default applies); csq NEVER injects its catalog
+/// default (CC-parity). Idempotent — returns [`RegenOutcome::AlreadyCurrent`]
 /// without writing when the on-disk content already matches.
 ///
 /// This is the single source of the "re-merge `~/.codex` preserving
@@ -481,9 +538,9 @@ pub enum RegenOutcome {
 /// `config.toml` (csq-written, therefore valid TOML). This:
 ///
 /// - preserves the slot's already-merged user keys (they live in the
-///   existing config), AND
-/// - keeps re-asserting the global-INDEPENDENT csq-controlled keys
-///   (`cli_auth_credentials_store`, `model`) — so a malformed global never
+///   existing config) AND the slot's explicit `model` if it has one, AND
+/// - keeps re-asserting the global-INDEPENDENT csq-controlled key
+///   (`cli_auth_credentials_store`) — so a malformed global never
 ///   SUPPRESSES that repair (e.g. an auth-store directive drifted to
 ///   `"keychain"` is still corrected back to `"file"`).
 ///
@@ -499,16 +556,14 @@ pub enum RegenOutcome {
 /// same snapshot passed to [`write_config_toml_with_global`], so no second
 /// read can observe a mid-edit malformed global between the check and the
 /// write.
-pub fn regenerate_slot_config_preserving_model(
-    base_dir: &Path,
-    account: AccountNum,
-) -> io::Result<RegenOutcome> {
+pub fn regenerate_slot_config(base_dir: &Path, account: AccountNum) -> io::Result<RegenOutcome> {
     let toml_path = config_toml_path(base_dir, account);
     let existing = std::fs::read_to_string(&toml_path).ok();
-    let model = existing
-        .as_deref()
-        .and_then(extract_model_key)
-        .unwrap_or_else(|| default_model().to_string());
+    // Preserve the slot's explicit per-slot model IF present; otherwise None.
+    // csq does NOT inject its catalog default (the fix for the stale-default
+    // bug): an absent model means the user-global `model` propagates and, absent
+    // that, codex uses its built-in default.
+    let model = existing.as_deref().and_then(extract_model_key);
 
     let user_global = read_user_global_config_toml();
     let global_malformed = matches!(
@@ -525,7 +580,7 @@ pub fn regenerate_slot_config_preserving_model(
         user_global.as_deref()
     };
 
-    let desired = render_config_toml_with_global(&model, merge_base);
+    let desired = render_config_toml_with_global(model.as_deref(), merge_base);
     if existing.as_deref() == Some(desired.as_str()) {
         // Nothing to write. A malformed global still warrants the operator
         // note (their edits are not propagating), so distinguish it.
@@ -536,7 +591,7 @@ pub fn regenerate_slot_config_preserving_model(
         });
     }
 
-    write_config_toml_with_global(base_dir, account, &model, merge_base)?;
+    write_config_toml_with_global(base_dir, account, model.as_deref(), merge_base)?;
     Ok(RegenOutcome::Rewritten {
         model,
         was_global_malformed: global_malformed,
@@ -545,7 +600,7 @@ pub fn regenerate_slot_config_preserving_model(
 
 /// Extracts the value of the top-level `model = "..."` key, if present.
 /// Returns the unquoted string. Tolerates leading/trailing whitespace
-/// and inline `# comments`. Shared by [`regenerate_slot_config_preserving_model`]
+/// and inline `# comments`. Shared by [`regenerate_slot_config`]
 /// and the daemon startup reconciler.
 pub(crate) fn extract_model_key(toml: &str) -> Option<String> {
     for raw in toml.lines() {
@@ -714,7 +769,7 @@ mod tests {
 
     #[test]
     fn render_config_toml_emits_both_required_keys() {
-        let out = render_config_toml("gpt-test");
+        let out = render_config_toml(Some("gpt-test"));
         assert!(
             out.contains("cli_auth_credentials_store = \"file\""),
             "must pin file-backed auth store per INV-P03; got: {out}"
@@ -727,10 +782,91 @@ mod tests {
     }
 
     #[test]
+    fn render_config_toml_omits_model_key_when_none() {
+        // THE bug fix: with model=None and no user-global, csq writes NO model
+        // key (it never injects its catalog default). Codex uses its built-in
+        // default. This is the login / spawn / reconciler-default path.
+        let out = render_config_toml(None);
+        assert!(
+            out.contains("cli_auth_credentials_store = \"file\""),
+            "must still pin the INV-P03 auth-store directive; got: {out}"
+        );
+        assert!(
+            !out.contains("model ="),
+            "csq must NOT write a model key when model is None; got: {out}"
+        );
+    }
+
+    #[test]
+    fn user_global_model_propagates_when_csq_model_none() {
+        // Core CC-parity fix: with model=None, a user-global `model` propagates
+        // verbatim (it is no longer a csq-controlled key). The user's ~/.codex
+        // model reaches the slot instead of csq's stale catalog default.
+        let out = render_config_toml_with_global(None, Some("model = \"gpt-5.6-sol\"\n"));
+        assert!(out.contains("cli_auth_credentials_store = \"file\""));
+        assert!(
+            out.contains("model = \"gpt-5.6-sol\""),
+            "user-global model must propagate when csq writes none; got: {out}"
+        );
+    }
+
+    #[test]
+    fn explicit_model_overrides_user_global_model() {
+        // An explicit per-slot model (`csq models set codex`) wins over a
+        // user-global `model` — the explicit choice is the ONLY model key.
+        let out =
+            render_config_toml_with_global(Some("gpt-explicit"), Some("model = \"gpt-global\"\n"));
+        assert!(
+            out.contains("model = \"gpt-explicit\""),
+            "explicit per-slot model must win; got: {out}"
+        );
+        assert!(
+            !out.contains("gpt-global"),
+            "user-global model must be dropped when csq sets an explicit one; got: {out}"
+        );
+        assert_eq!(
+            out.matches("model =").count(),
+            1,
+            "exactly one model key; got: {out}"
+        );
+    }
+
+    #[test]
+    fn render_config_toml_model_string_is_toml_escaped_no_injection() {
+        // Redteam R1 MED: a crafted model id (via `csq models set codex --force`
+        // or the IPC desktop picker) must NOT break out of the `model = "..."`
+        // literal to inject TOML keys. A `"`+newline payload attempting to flip
+        // the auth-store back to keychain + register a rogue MCP server must be
+        // neutralized by toml-value escaping, and the rendered file must still
+        // parse with csq's INV-P03 directive intact.
+        let payload = "x\"\ncli_auth_credentials_store = \"keychain\"\n[mcp_servers.evil]\ncommand = \"/tmp/x\"";
+        let out = render_config_toml(Some(payload));
+        let parsed: toml::Value =
+            toml::from_str(&out).expect("rendered config must remain valid TOML after escaping");
+        let table = parsed.as_table().unwrap();
+        // The auth-store directive is still csq's "file" — the injection did NOT
+        // override it (it is escaped inside the model string, not a real key).
+        assert_eq!(
+            table
+                .get("cli_auth_credentials_store")
+                .and_then(|v| v.as_str()),
+            Some("file"),
+            "injected keychain directive must not override INV-P03; got:\n{out}"
+        );
+        // No rogue MCP server was registered.
+        assert!(
+            table.get("mcp_servers").is_none(),
+            "injected [mcp_servers.evil] must not appear as a real table; got:\n{out}"
+        );
+        // The whole payload survives verbatim as the model value.
+        assert_eq!(table.get("model").and_then(|v| v.as_str()), Some(payload));
+    }
+
+    #[test]
     fn render_config_toml_keys_are_ordered_auth_before_model() {
         // Reviewer-ergonomic stability: `cli_auth_credentials_store`
         // first flags the INV-P03 directive at the top of the file.
-        let out = render_config_toml("x");
+        let out = render_config_toml(Some("x"));
         let auth_idx = out.find("cli_auth_credentials_store").unwrap();
         let model_idx = out.find("model =").unwrap();
         assert!(
@@ -746,7 +882,7 @@ mod tests {
         let account = acc(2);
         assert!(!dir.path().join("config-2").exists());
 
-        write_config_toml(dir.path(), account, "gpt-test").unwrap();
+        write_config_toml(dir.path(), account, Some("gpt-test")).unwrap();
 
         assert!(dir.path().join("config-2").is_dir());
         let contents = std::fs::read_to_string(config_toml_path(dir.path(), account)).unwrap();
@@ -759,13 +895,13 @@ mod tests {
         let _env = EnvGuard::new_isolated();
         let dir = TempDir::new().unwrap();
         let account = acc(5);
-        write_config_toml(dir.path(), account, "m1").unwrap();
-        write_config_toml(dir.path(), account, "m1").unwrap();
+        write_config_toml(dir.path(), account, Some("m1")).unwrap();
+        write_config_toml(dir.path(), account, Some("m1")).unwrap();
         let contents = std::fs::read_to_string(config_toml_path(dir.path(), account)).unwrap();
         // EnvGuard::new_isolated points CODEX_USER_CONFIG at a
         // nonexistent path, so read_user_global_config_toml returns None
         // and write_config_toml emits the 2-key fallback exclusively.
-        assert_eq!(contents, render_config_toml("m1"));
+        assert_eq!(contents, render_config_toml(Some("m1")));
     }
 
     #[test]
@@ -776,12 +912,12 @@ mod tests {
         let _env = EnvGuard::new_isolated();
         let dir = TempDir::new().unwrap();
         let account = acc(9);
-        write_config_toml(dir.path(), account, "m1").unwrap();
+        write_config_toml(dir.path(), account, Some("m1")).unwrap();
 
         let tampered = "cli_auth_credentials_store = \"keychain\"\nmodel = \"m1\"\n";
         std::fs::write(config_toml_path(dir.path(), account), tampered).unwrap();
 
-        write_config_toml(dir.path(), account, "m1").unwrap();
+        write_config_toml(dir.path(), account, Some("m1")).unwrap();
 
         let after = std::fs::read_to_string(config_toml_path(dir.path(), account)).unwrap();
         assert!(after.contains("cli_auth_credentials_store = \"file\""));
@@ -795,7 +931,7 @@ mod tests {
         let _env = EnvGuard::new_isolated();
         let dir = TempDir::new().unwrap();
         let account = acc(6);
-        write_config_toml(dir.path(), account, "m1").unwrap();
+        write_config_toml(dir.path(), account, Some("m1")).unwrap();
         let path = config_toml_path(dir.path(), account);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config.toml should be 0o600 after write");
@@ -807,7 +943,7 @@ mod tests {
     fn render_with_global_none_injects_csq_block_plus_default_statusline() {
         // No user-global → csq's 2 controlled keys + the curated default
         // statusline (every codex slot gets a useful footer).
-        let out = render_config_toml_with_global("m1", None);
+        let out = render_config_toml_with_global(Some("m1"), None);
         assert!(out.starts_with("cli_auth_credentials_store = \"file\"\nmodel = \"m1\"\n"));
         assert_default_statusline_present(&out);
     }
@@ -818,7 +954,7 @@ mod tests {
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 "#;
-        let out = render_config_toml_with_global("m1", Some(user_global));
+        let out = render_config_toml_with_global(Some("m1"), Some(user_global));
         // csq-controlled keys appear first.
         assert!(out.starts_with("cli_auth_credentials_store = \"file\"\nmodel = \"m1\"\n"));
         // user-global keys propagated.
@@ -840,7 +976,7 @@ cli_auth_credentials_store = "keychain"
 model = "user-global-model"
 approval_policy = "never"
 "#;
-        let out = render_config_toml_with_global("csq-set-model", Some(user_global));
+        let out = render_config_toml_with_global(Some("csq-set-model"), Some(user_global));
         // csq's values for the controlled keys.
         assert!(
             out.contains("cli_auth_credentials_store = \"file\""),
@@ -876,7 +1012,7 @@ inherit = "core"
 command = "/usr/local/bin/github-mcp"
 args = []
 "#;
-        let out = render_config_toml_with_global("m1", Some(user_global));
+        let out = render_config_toml_with_global(Some("m1"), Some(user_global));
         assert!(out.contains("approval_policy = \"on-failure\""));
         assert!(
             out.contains("[shell_environment_policy]"),
@@ -896,7 +1032,7 @@ args = []
         // § "Fail-Closed on Keychain/Lock Contention"), but csq's controlled keys
         // and the curated statusline still apply.
         let malformed = "approval_policy = \"never\nsandbox_mode = \"unterminated";
-        let out = render_config_toml_with_global("m1", Some(malformed));
+        let out = render_config_toml_with_global(Some("m1"), Some(malformed));
         assert!(out.starts_with("cli_auth_credentials_store = \"file\"\nmodel = \"m1\"\n"));
         assert!(
             !out.contains("approval_policy"),
@@ -909,7 +1045,7 @@ args = []
     fn render_with_global_empty_string_injects_csq_block_plus_default_statusline() {
         // Empty TOML parses to an empty table → csq block + the default
         // statusline (no user prefs to merge).
-        let out = render_config_toml_with_global("m1", Some(""));
+        let out = render_config_toml_with_global(Some("m1"), Some(""));
         assert!(out.starts_with("cli_auth_credentials_store = \"file\"\nmodel = \"m1\"\n"));
         assert_default_statusline_present(&out);
     }
@@ -922,7 +1058,7 @@ args = []
 cli_auth_credentials_store = "keychain"
 model = "user-model"
 "#;
-        let out = render_config_toml_with_global("csq-model", Some(user_global));
+        let out = render_config_toml_with_global(Some("csq-model"), Some(user_global));
         assert!(out.starts_with("cli_auth_credentials_store = \"file\"\nmodel = \"csq-model\"\n"));
         assert!(!out.contains("keychain"), "csq must override; got:\n{out}");
         assert_default_statusline_present(&out);
@@ -1019,7 +1155,7 @@ command = "/usr/bin/foo"
         );
         let tmp_base = TempDir::new().unwrap();
         let account = acc(7);
-        write_config_toml(tmp_base.path(), account, "csq-set-model").unwrap();
+        write_config_toml(tmp_base.path(), account, Some("csq-set-model")).unwrap();
 
         let contents = std::fs::read_to_string(config_toml_path(tmp_base.path(), account)).unwrap();
 
@@ -1035,7 +1171,7 @@ command = "/usr/bin/foo"
         );
     }
 
-    // ── regenerate_slot_config_preserving_model ────────────────────────────
+    // ── regenerate_slot_config ─────────────────────────────────────────────
 
     #[test]
     fn extract_model_key_round_trips() {
@@ -1077,18 +1213,18 @@ command = "/usr/bin/foo"
         write_config_toml_with_global(
             base.path(),
             account,
-            "preserved-model",
+            Some("preserved-model"),
             Some("approval_policy = \"on-request\"\n[mcp_servers.figma]\nurl = \"x\"\n"),
         )
         .unwrap();
 
         // ~/.codex now differs: figma removed, sandbox_mode added.
         let _env = EnvGuard::new_with_fixture("sandbox_mode = \"danger-full-access\"\n");
-        let outcome = regenerate_slot_config_preserving_model(base.path(), account).unwrap();
+        let outcome = regenerate_slot_config(base.path(), account).unwrap();
         assert_eq!(
             outcome,
             RegenOutcome::Rewritten {
-                model: "preserved-model".into(),
+                model: Some("preserved-model".into()),
                 was_global_malformed: false,
             }
         );
@@ -1118,16 +1254,16 @@ command = "/usr/bin/foo"
         let account = acc(6);
         let _env = EnvGuard::new_with_fixture("approval_policy = \"never\"\n");
         // Seed a slot that already matches the current global merge.
-        write_config_toml(base.path(), account, "m").unwrap();
+        write_config_toml(base.path(), account, Some("m")).unwrap();
 
-        let first = regenerate_slot_config_preserving_model(base.path(), account).unwrap();
+        let first = regenerate_slot_config(base.path(), account).unwrap();
         assert_eq!(
             first,
             RegenOutcome::AlreadyCurrent,
             "seeded config already matches the current global"
         );
         let before = std::fs::read_to_string(config_toml_path(base.path(), account)).unwrap();
-        let second = regenerate_slot_config_preserving_model(base.path(), account).unwrap();
+        let second = regenerate_slot_config(base.path(), account).unwrap();
         assert_eq!(second, RegenOutcome::AlreadyCurrent);
         let after = std::fs::read_to_string(config_toml_path(base.path(), account)).unwrap();
         assert_eq!(before, after, "AlreadyCurrent must not rewrite bytes");
@@ -1142,14 +1278,14 @@ command = "/usr/bin/foo"
         write_config_toml_with_global(
             base.path(),
             account,
-            "keep-model",
+            Some("keep-model"),
             Some("approval_policy = \"never\"\n[mcp_servers.linear]\nurl = \"y\"\n"),
         )
         .unwrap();
         let before = std::fs::read_to_string(config_toml_path(base.path(), account)).unwrap();
 
         let _env = EnvGuard::new_with_fixture("approval_policy = \"never\nnot valid toml [[[");
-        let outcome = regenerate_slot_config_preserving_model(base.path(), account).unwrap();
+        let outcome = regenerate_slot_config(base.path(), account).unwrap();
         assert_eq!(outcome, RegenOutcome::SkippedMalformedGlobal);
 
         let after = std::fs::read_to_string(config_toml_path(base.path(), account)).unwrap();
@@ -1179,11 +1315,11 @@ command = "/usr/bin/foo"
         std::fs::write(&p, drifted).unwrap();
 
         let _env = EnvGuard::new_with_fixture("approval_policy = \"never\nnot valid [[[");
-        let outcome = regenerate_slot_config_preserving_model(base.path(), account).unwrap();
+        let outcome = regenerate_slot_config(base.path(), account).unwrap();
         assert_eq!(
             outcome,
             RegenOutcome::Rewritten {
-                model: "keep-model".into(),
+                model: Some("keep-model".into()),
                 was_global_malformed: true,
             },
             "drifted csq key under a malformed global must be repaired, not skipped"
@@ -1208,25 +1344,30 @@ command = "/usr/bin/foo"
         );
     }
 
-    /// An ABSENT `~/.codex` (`None`) is not malformed — defaults apply,
-    /// and a missing slot config is created with the default model.
+    /// An ABSENT `~/.codex` (`None`) is not malformed — a missing slot config
+    /// is created, but csq writes NO model (the stale-default-injection bug is
+    /// fixed): `model` is `None` and the file carries no `model` key, so codex
+    /// falls back to its own built-in default.
     #[test]
-    fn regenerate_absent_global_is_not_malformed() {
+    fn regenerate_absent_global_writes_no_model() {
         let base = TempDir::new().unwrap();
         let account = acc(9);
         let _env = EnvGuard::new_isolated(); // override → nonexistent → None
-        let outcome = regenerate_slot_config_preserving_model(base.path(), account).unwrap();
+        let outcome = regenerate_slot_config(base.path(), account).unwrap();
         assert_eq!(
             outcome,
             RegenOutcome::Rewritten {
-                model: default_model().to_string(),
+                model: None,
                 was_global_malformed: false,
             },
-            "absent global is not malformed; missing slot → created with default model"
+            "absent global + no existing slot model → csq writes NO model (no catalog default)"
         );
         let contents = std::fs::read_to_string(config_toml_path(base.path(), account)).unwrap();
         assert!(contents.contains("cli_auth_credentials_store = \"file\""));
-        assert!(contents.contains(&format!("model = \"{}\"", default_model())));
+        assert!(
+            !contents.contains("model ="),
+            "csq must NOT inject a catalog default model; got:\n{contents}"
+        );
     }
 
     /// `write_config_toml_with_global` writes from the supplied snapshot,
@@ -1240,7 +1381,7 @@ command = "/usr/bin/foo"
         write_config_toml_with_global(
             base.path(),
             account,
-            "m",
+            Some("m"),
             Some("sandbox_mode = \"read-only\"\n"),
         )
         .unwrap();
@@ -1265,7 +1406,7 @@ command = "/usr/bin/foo"
 [tui]
 status_line = ["model", "git-branch"]
 "#;
-        let out = render_config_toml_with_global("m1", Some(user_global));
+        let out = render_config_toml_with_global(Some("m1"), Some(user_global));
         assert!(
             toml::from_str::<toml::Value>(&out).is_ok(),
             "must be valid TOML; got:\n{out}"
@@ -1295,7 +1436,7 @@ status_line = ["model", "git-branch"]
 [tui]
 status_line_use_colors = false
 "#;
-        let out = render_config_toml_with_global("m1", Some(user_global));
+        let out = render_config_toml_with_global(Some("m1"), Some(user_global));
         assert_default_statusline_present(&out);
         assert!(
             out.contains("status_line_use_colors = false"),
@@ -1308,7 +1449,7 @@ status_line_use_colors = false
         // Defensive: user's `tui` is a scalar (malformed for codex) → csq does
         // NOT clobber it and does NOT panic; no status_line is forced in.
         let user_global = "tui = \"oops\"\n";
-        let out = render_config_toml_with_global("m1", Some(user_global));
+        let out = render_config_toml_with_global(Some("m1"), Some(user_global));
         assert!(
             toml::from_str::<toml::Value>(&out).is_ok(),
             "must be valid TOML; got:\n{out}"
@@ -1330,7 +1471,7 @@ status_line_use_colors = false
         let _env = EnvGuard::new_isolated();
         let dir = TempDir::new().unwrap();
         let account = acc(8);
-        write_config_toml(dir.path(), account, "gpt-test").unwrap();
+        write_config_toml(dir.path(), account, Some("gpt-test")).unwrap();
         let contents = std::fs::read_to_string(config_toml_path(dir.path(), account)).unwrap();
         assert_default_statusline_present(&contents);
     }

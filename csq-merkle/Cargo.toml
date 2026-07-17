@@ -1,0 +1,29 @@
+[package]
+name = "csq-merkle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RFC 6962 Merkle tree (Certificate-Transparency) hashing + inclusion/consistency proof verification — a zero-moat, dependency-light leaf crate."
+# publish = false: a workspace-internal leaf, not a crates.io library — same
+# rationale as csq-ledger (server binary). Its SOURCE is genuinely-open
+# (Apache-2.0, pure RFC 6962 crypto, no moat content), so it is listed in
+# `scripts/check-edition-boundary.py::COMMUNITY_SHIPPED_PROPRIETARY` and ships to
+# the community tree. It has ZERO enterprise dependencies, so BOTH csq-ledger
+# (which already depends on csq-core) AND csq-core may depend on it WITHOUT the
+# csq-core↔csq-ledger dependency cycle the extraction of the Merkle verifier from
+# csq-ledger into this leaf breaks (an internal ticket).
+publish = false
+
+[dependencies]
+# The ONLY two dependencies: sha2 for the SHA-256 primitive (the same one
+# csq-core's signing path + csq-ledger's checkpoint path use) and hex, used only
+# by the RFC 6962 test-vector suite to decode canonical hash strings. No
+# workspace crate, no async runtime, no serde — this is a pure computation leaf.
+sha2.workspace = true
+
+[dev-dependencies]
+# hex is needed ONLY by the RFC 6962 canonical-vector test suite (decoding the
+# published CT reference hashes). Keeping it a dev-dependency means the shipped
+# crate graph is `sha2` alone.
+hex.workspace = true

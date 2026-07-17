@@ -49,14 +49,52 @@ pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (ente
 pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (community)");
 
 fn main() {
+    // #1011 headless self-test short-circuit. The self-test lives at the top of
+    // `desktop::run()`, but `mode::detect()` only resolves `Desktop` from the
+    // `.app` bundle sentinel / `--desktop` — so `--self-test` on a raw binary
+    // would otherwise route to CLI and never reach it. Route to `desktop::run()`
+    // directly whenever the self-test is requested, so the flag reliably works on
+    // every desktop-feature build (the bundled binary AND a plain `cargo build`).
+    #[cfg(feature = "desktop")]
+    {
+        // `--self-test` is honored ONLY as the sole argument (not `.any(argv)`,
+        // which would misfire if a future flag or a `csq://` deep-link argv merely
+        // contained the token — R1 LOW-1). The env path stays precise.
+        let argv: Vec<String> = std::env::args().collect();
+        if std::env::var("CSQ_DESKTOP_SELFTEST").as_deref() == Ok("1")
+            || (argv.len() == 2 && argv[1] == "--self-test")
+        {
+            desktop::run(); // runs the self-test block at its top, then exits
+            return;
+        }
+    }
+
     match mode::detect() {
         mode::Mode::Cli => {
             #[cfg(feature = "cli")]
             {
-                if let Err(e) = cli::run() {
-                    eprintln!("Error: {e:?}");
-                    std::process::exit(1);
-                }
+                // clap builds and renders the ENTIRE subcommand tree recursively on
+                // any parse (including `--help`). csq's tree is large; on Windows the
+                // default 1 MiB main-thread stack overflows during that recursion
+                // (`STATUS_STACK_OVERFLOW` on e.g. `csq run --help` — surfaced by
+                // an internal ticket adding roster subcommands), while macOS/Linux (8 MiB
+                // default) are fine. Run the CLI on a thread with a generous stack —
+                // the canonical remedy (rustc/cargo do the same). Applies on every
+                // platform for uniform headroom; the join propagates the exit code.
+                let code = std::thread::Builder::new()
+                    .name("csq-cli".into())
+                    .stack_size(32 * 1024 * 1024)
+                    .spawn(|| match cli::run() {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            eprintln!("Error: {e:?}");
+                            1
+                        }
+                    })
+                    .expect("failed to spawn csq-cli worker thread")
+                    .join()
+                    .unwrap_or(101); // panic hook already printed the message
+                std::process::exit(code);
             }
             #[cfg(not(feature = "cli"))]
             {

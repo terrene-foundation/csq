@@ -823,6 +823,82 @@ pub fn default_cadence_high_impact(sink_name: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/audit/anchor — daemon-side signing entry point (#952 S3)
+// ---------------------------------------------------------------------------
+
+/// Sign a v1 `AuditRecord` and append it to the Op chain, returning the
+/// finalized `SignedRecord` as written to disk.
+///
+/// **DAEMON IS SOLE SIGNER** per `account-terminal-separation.md` MUST Rule 1.
+/// The caller (daemon HTTP handler) MUST NOT compute `canonical_hash`; the
+/// writer ([`write_record_v2_signed`]) assigns it. This function encapsulates:
+///
+/// 1. Loading the active signing key via [`load_signing_key_if_active`].
+/// 2. Building a v2 `SignedRecord` skeleton from the v1 `record` input.
+/// 3. Calling `write_record_v2_signed` to sign, append, and return the
+///    finalized record (daemon-assigned `canonical_hash`, `chain_id`, `seq`).
+///
+/// # Errors
+///
+/// Returns `Err(error_tag)` using a fixed-vocabulary tag:
+/// - `"anchor_no_signing_key"` — chain exists but key is absent/inaccessible.
+/// - `"anchor_write_error"` — chain I/O failed.
+pub(crate) fn sign_audit_record_v1(
+    record: crate::audit::persist::AuditRecord,
+    base_dir: &Path,
+) -> Result<crate::audit::types::SignedRecord, &'static str> {
+    use crate::audit::types::{CsqRunPayload, EventKind, EventPayload};
+
+    // Generate ISO-8601 UTC timestamp without the chrono `clock` feature
+    // (the workspace pins chrono without clock). Mirrors anchor_task::now_iso8601().
+    let now_ts = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let days = (secs / 86_400) as i64;
+        let sod = secs % 86_400;
+        // Euclidean affine from Howard Hinnant's date lib (same as anchor_task).
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        let hh = sod / 3600;
+        let mm = (sod / 60) % 60;
+        let ss = sod % 60;
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    };
+
+    // Require an active signing key — this route is sign-or-fail (no unsigned
+    // fallback). A missing key means either the chain isn't initialized or the
+    // operator needs to run `csq audit migrate-keys`.
+    let signing_key = load_signing_key_if_active(base_dir).ok_or("anchor_no_signing_key")?;
+
+    // Build a CsqRun skeleton wrapping the v1 record's run_id. Writer assigns
+    // seq, prev_hash, canonical_hash, key_id, and signature.
+    let mut skeleton = build_outcome_record(
+        EventKind::CsqRun,
+        EventPayload::CsqRun(CsqRunPayload {
+            run_id: record.run_id,
+        }),
+        &now_ts,
+    );
+
+    // Patch key_id so verify_chain Check 5 identifies it as a signed record
+    // (not placeholder). Mirrors append_outcome_record_signed_inner.
+    skeleton.key_id = signing_key.key_id();
+
+    write_record_v2_signed(skeleton, Some(base_dir), signing_key.as_ref())
+        .map_err(|_| "anchor_write_error")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

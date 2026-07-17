@@ -328,6 +328,38 @@ fn verify_oauth_creds(path: &Path, slot: AccountNum) -> Result<(), OauthLoginErr
     Ok(())
 }
 
+/// Pre-flight for a HEADLESS (`-p` / non-interactive) `csq run` against a
+/// Code Assist OAuth Gemini slot (#965).
+///
+/// gemini-cli v0.41.2+ has NO non-interactive auth surface: when it
+/// auto-discovers a missing or stale `~/.gemini/oauth_creds.json` it prints
+/// `Opening authentication page in your browser. Do you want to continue?
+/// [Y/n]:` and blocks on the TTY. A non-TTY caller (a bundled/one-shot
+/// consumer) then hangs until timeout with no catchable error. The `run`
+/// path calls this BEFORE spawning gemini-cli so a headless caller gets a
+/// typed [`OauthLoginError`] (which names the remediation — `csq login
+/// {slot} --provider gemini`, csq's own OAuth flow) instead of a hang.
+///
+/// Reuses [`verify_oauth_creds`] — the exact `exists + valid + fresh` check
+/// gemini-cli's own auth will apply — so a green pre-flight means gemini-cli
+/// will find usable creds and run non-interactively. `home_dir` is injected
+/// for testability; production passes the process `HOME`. Read-only: no
+/// secret is extracted or copied (`feedback_delegate_to_reference_client`).
+pub fn check_headless_oauth_ready(
+    home_dir: Option<&Path>,
+    slot: AccountNum,
+) -> Result<(), OauthLoginError> {
+    let oauth_creds_path = home_dir
+        .map(|h| h.join(".gemini").join("oauth_creds.json"))
+        .ok_or_else(|| {
+            OauthLoginError::CwdResolveFailed(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HOME env var not set or empty",
+            ))
+        })?;
+    verify_oauth_creds(&oauth_creds_path, slot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +527,48 @@ mod tests {
             OauthLoginError::GeminiOauthCredsStale { slot: 13 } => {}
             other => panic!("expected GeminiOauthCredsStale, got {other:?}"),
         }
+    }
+
+    // #965 headless pre-flight — reuses verify_oauth_creds against
+    // ~/.gemini/oauth_creds.json resolved from an injected HOME.
+    #[test]
+    fn check_headless_oauth_ready_ok_on_fresh() {
+        let home = TempDir::new().unwrap();
+        let gemini = home.path().join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let future_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64)
+            + 3_600_000;
+        std::fs::write(
+            gemini.join("oauth_creds.json"),
+            format!(
+                r#"{{"access_token":"ya29.X","refresh_token":"1//Y","scope":"s","token_type":"Bearer","expiry_date":{future_ms}}}"#
+            ),
+        )
+        .unwrap();
+        check_headless_oauth_ready(Some(home.path()), slot(10)).unwrap();
+    }
+
+    #[test]
+    fn check_headless_oauth_ready_not_found_when_absent() {
+        // Empty HOME with no ~/.gemini/oauth_creds.json → typed NotFound,
+        // NOT a hang. This is the #965 headless contract.
+        let home = TempDir::new().unwrap();
+        let err = check_headless_oauth_ready(Some(home.path()), slot(10)).unwrap_err();
+        match err {
+            OauthLoginError::GeminiOauthCredsNotFound { slot: 10 } => {}
+            other => panic!("expected GeminiOauthCredsNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_headless_oauth_ready_errors_without_home() {
+        let err = check_headless_oauth_ready(None, slot(10)).unwrap_err();
+        matches!(err, OauthLoginError::CwdResolveFailed(_))
+            .then_some(())
+            .expect("expected CwdResolveFailed when HOME is absent");
     }
 
     #[test]

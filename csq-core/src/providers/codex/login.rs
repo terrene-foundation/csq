@@ -8,8 +8,9 @@
 //!    entry (spec step 6). If present, prompt the user; bail on
 //!    decline so we do not proceed with a dual-storage codex-cli
 //!    state that `config.toml` cannot retroactively migrate.
-//! 3. Write `config-<N>/config.toml` with
-//!    `cli_auth_credentials_store = "file"` + `model = "<default>"`.
+//! 3. Write `config-<N>/config.toml` with `cli_auth_credentials_store
+//!    = "file"` (and NO `model` key — CC-parity, csq does not force a
+//!    model; the user-global `~/.codex` model propagates at spawn).
 //!    **MUST happen BEFORE step 4** per INV-P03.
 //! 4. Shell out: `CODEX_HOME=config-<N> codex login --device-auth`.
 //!    codex-cli drives the device-code flow; csq inherits stdio so
@@ -281,7 +282,10 @@ where
     }
 
     // Step 3: pre-seed config.toml BEFORE shelling out. INV-P03.
-    surface::write_config_toml(base_dir, account, surface::default_model())
+    // `model = None`: csq does NOT force a model at login (CC-parity — csq does
+    // not own the model key). The user-global `~/.codex/config.toml` `model`
+    // propagates via the merge; absent that, codex uses its built-in default.
+    surface::write_config_toml(base_dir, account, None)
         .with_context(|| "pre-seed config-<N>/config.toml failed")?;
 
     // Step 4: shell out to `codex login --device-auth`.

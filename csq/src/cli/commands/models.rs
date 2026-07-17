@@ -195,7 +195,11 @@ pub fn handle_switch(
                      config-<slot>/config.toml, there is no global profile"
                 )
             })?;
-            providers::codex::surface::write_config_toml(base_dir, slot_num, &model_id)
+            // Explicit user choice → `Some`: written as the per-slot `model`
+            // key (takes precedence over any user-global `model`, preserved
+            // across launch re-merges). This is the ONLY path that writes a
+            // model; login/spawn/reconciler pass `None`.
+            providers::codex::surface::write_config_toml(base_dir, slot_num, Some(&model_id))
                 .map_err(|e| anyhow!("failed to write config.toml for slot {slot_num}: {e}"))?;
             println!(
                 "Switched {} model on slot {} to {}",

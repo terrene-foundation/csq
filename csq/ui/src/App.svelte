@@ -8,6 +8,7 @@
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import CorruptPrefsBanner from "./lib/components/CorruptPrefsBanner.svelte";
   import InteractiveConsole from "./lib/components/InteractiveConsole.svelte";
+  import PolicyConsole from "./lib/components/PolicyConsole.svelte";
 
   // ── Tab state ────────────────────────────────────────────
   //
@@ -23,7 +24,7 @@
   // console) is enterprise-only: the daemon routes it drives are stripped
   // from the community build, so the tab renders only when the binary
   // reports the enterprise edition.
-  type Tab = "accounts" | "sessions" | "enforcement";
+  type Tab = "accounts" | "sessions" | "enforcement" | "policies";
   let activeTab = $state<Tab>("accounts");
 
   let isEnterprise = $state(false);
@@ -50,7 +51,11 @@
   // read + write are untracked so the effect can't self-invalidate
   // (svelte-patterns Rule 5).
   $effect(() => {
-    if (!isEnterprise && untrack(() => activeTab) === "enforcement") {
+    if (
+      !isEnterprise &&
+      (untrack(() => activeTab) === "enforcement" ||
+        untrack(() => activeTab) === "policies")
+    ) {
       untrack(() => {
         activeTab = "accounts";
       });
@@ -98,6 +103,19 @@
         Enforcement
       </button>
     {/if}
+    {#if isEnterprise}
+      <button
+        id="tab-policies"
+        class="tab"
+        class:active={activeTab === "policies"}
+        role="tab"
+        aria-selected={activeTab === "policies"}
+        aria-controls="policies-panel"
+        onclick={() => (activeTab = "policies")}
+      >
+        Policies
+      </button>
+    {/if}
   </div>
   <main>
     {#if activeTab === "accounts"}
@@ -111,6 +129,10 @@
     {:else if activeTab === "enforcement" && isEnterprise}
       <div id="enforcement-panel" role="tabpanel" aria-labelledby="tab-enforcement">
         <InteractiveConsole />
+      </div>
+    {:else if activeTab === "policies" && isEnterprise}
+      <div id="policies-panel" role="tabpanel" aria-labelledby="tab-policies">
+        <PolicyConsole />
       </div>
     {/if}
   </main>

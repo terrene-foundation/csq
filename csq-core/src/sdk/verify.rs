@@ -31,20 +31,44 @@ use super::{Envelope, VerifyPayload, EDITION, SCHEMA_VERIFY_V1};
 use crate::audit::{to_json_output, LedgerError, VerifyJsonOutput, VerifySummary};
 
 /// Build the `csq.verify.v1` envelope from a `verify_chain` result.
+///
+/// `enterprise_licensed` gates the two enterprise-only fields (`trust_plane_grade`,
+/// `verification_level_summary`): an enterprise binary with no valid license passes `false`,
+/// suppressing them so the wire shape matches community (task #77 gate-coverage — the trust
+/// grade is enterprise-differentiated output the use-only binary must not leak). Community
+/// builds already have these `None` from `to_json_output`, so the flag is a no-op there; the
+/// CLI passes `true` in community and the `enforce`-derived result in enterprise.
+///
+/// `record_verification_level` is the per-record `VerificationLevel` string (community field)
+/// populated when `--record <id>` was supplied; `None` when the flag was absent; `"NOT_FOUND"`
+/// when the id was supplied but not found in the chain.
 #[must_use]
 pub fn build_verify_envelope(
     result: &Result<VerifySummary, LedgerError>,
+    enterprise_licensed: bool,
+    record_verification_level: Option<String>,
 ) -> Envelope<VerifyPayload> {
     let ok = result.is_ok();
     let json_out = to_json_output(result);
-    let payload = payload_from_json_output(json_out, EDITION);
+    let mut payload = payload_from_json_output(json_out, EDITION, record_verification_level);
+    if !enterprise_licensed {
+        // Unlicensed enterprise binary → present the community wire shape.
+        payload.trust_plane_grade = None;
+        payload.verification_level_summary = None;
+    }
     Envelope::verdict(SCHEMA_VERIFY_V1, None, ok, payload)
 }
 
 /// Map csq-core's internal [`VerifyJsonOutput`] onto the public `csq-sdk`
 /// [`VerifyPayload`] DTO, converting the two mirrored sub-DTOs and tagging `edition`.
 /// Consumes the `VerifyJsonOutput` (moves the gap vec + failure detail — no clone).
-fn payload_from_json_output(o: VerifyJsonOutput, edition: &'static str) -> VerifyPayload {
+/// `record_verification_level` is the community-field per-record level string from the
+/// `--record <id>` lookup, or `None` when the flag was absent.
+fn payload_from_json_output(
+    o: VerifyJsonOutput,
+    edition: &'static str,
+    record_verification_level: Option<String>,
+) -> VerifyPayload {
     VerifyPayload {
         status: o.status,
         verified_count: o.verified_count,
@@ -66,6 +90,7 @@ fn payload_from_json_output(o: VerifyJsonOutput, edition: &'static str) -> Verif
         }),
         trust_plane_grade: o.trust_plane_grade,
         verification_level_summary: o.verification_level_summary,
+        record_verification_level,
         edition,
     }
 }
@@ -95,8 +120,9 @@ mod tests {
             verified_count: 7,
             ..VerifySummary::default()
         });
-        let env = build_verify_envelope(&result);
-        let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        let env = build_verify_envelope(&result, true, None);
+        let line = env.to_line().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["schema"], "csq.verify.v1");
         assert_eq!(v["ok"], true, "a clean chain is ok:true");
         assert_eq!(v["status"], "ok");
@@ -108,6 +134,13 @@ mod tests {
         assert!(v.get("failure_detail").is_none(), "ok verdict omits detail");
         // `edition` is always present (the HIGH-1 discriminant).
         assert_eq!(v["edition"], expected_edition());
+        // LOW-2 (AC#2 wire-omission proof): absent `--record` (None) MUST omit the field
+        // from the wire entirely — byte-identical back-compat guarantee.
+        // Mirrors the `community_omits_enterprise_only_fields` guard style.
+        assert!(
+            !line.contains("record_verification_level"),
+            "absent --record must omit the field from wire: {line}"
+        );
     }
 
     #[test]
@@ -124,7 +157,7 @@ mod tests {
             }],
             ..VerifySummary::default()
         });
-        let env = build_verify_envelope(&result);
+        let env = build_verify_envelope(&result, true, None);
         let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
         assert_eq!(v["ok"], true, "degraded-but-linked is ok:true");
         assert_eq!(v["status"], "partial_historical");
@@ -141,7 +174,7 @@ mod tests {
             expected_prev: Sha256Hex::genesis(),
             actual_prev: Sha256Hex::genesis(),
         });
-        let env = build_verify_envelope(&err);
+        let env = build_verify_envelope(&err, true, None);
         let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
         assert_eq!(v["schema"], "csq.verify.v1");
         assert_eq!(v["ok"], false, "an integrity failure is ok:false");
@@ -164,7 +197,7 @@ mod tests {
         let err: Result<VerifySummary, LedgerError> = Err(LedgerError::KeyNotFound {
             key_id: KeyId::try_new(format!("ed25519:{}", "d".repeat(64))).unwrap(),
         });
-        let env = build_verify_envelope(&err);
+        let env = build_verify_envelope(&err, true, None);
         let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["status"], "partial");
@@ -177,7 +210,7 @@ mod tests {
         let err: Result<VerifySummary, LedgerError> = Err(LedgerError::KeyNotFound {
             key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
         });
-        let env = build_verify_envelope(&err);
+        let env = build_verify_envelope(&err, true, None);
         let line = env.to_line().unwrap();
         assert_eq!(
             line.matches('\n').count(),
@@ -192,7 +225,7 @@ mod tests {
     #[test]
     fn community_omits_enterprise_only_fields() {
         let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary::default());
-        let env = build_verify_envelope(&result);
+        let env = build_verify_envelope(&result, true, None);
         let line = env.to_line().unwrap();
         assert!(
             !line.contains("trust_plane_grade"),
@@ -204,5 +237,31 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["edition"], "community");
+    }
+
+    /// Enterprise gate-coverage (task #77): an unlicensed enterprise binary
+    /// (`enterprise_licensed=false`) suppresses the two enterprise-only fields, presenting
+    /// the community wire shape so the use-only binary does not leak the trust-plane grade.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn unlicensed_enterprise_suppresses_trust_plane_fields() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 3,
+            ..VerifySummary::default()
+        });
+        let denied = build_verify_envelope(&result, false, None)
+            .to_line()
+            .unwrap();
+        assert!(
+            !denied.contains("trust_plane_grade"),
+            "unlicensed enterprise wire must omit trust_plane_grade: {denied}"
+        );
+        assert!(
+            !denied.contains("verification_level_summary"),
+            "unlicensed enterprise wire must omit verification_level_summary: {denied}"
+        );
+        // The `edition` discriminant is NOT gated — only the moat-bearing fields are.
+        let v: serde_json::Value = serde_json::from_str(&denied).unwrap();
+        assert_eq!(v["edition"], "enterprise");
     }
 }

@@ -122,8 +122,11 @@ pub enum LayerOutcome {
     /// `mode` to the spawn-step branch (one-shot piped capture vs
     /// interactive inherited-stdio per spec 10 §10.4.2).
     Enabled {
-        /// Pre-spawn state populated by scaffold + mcp_gate.
-        pre_spawn: PreSpawnState,
+        /// Pre-spawn state populated by scaffold + mcp_gate. Boxed to keep the
+        /// `LayerOutcome` enum small (`clippy::large_enum_variant`) — S2 grew
+        /// `PreSpawnState` with `rules_only_scaffold`, tipping the size delta
+        /// against the `Disabled` variant.
+        pre_spawn: Box<PreSpawnState>,
         /// Spawn-mode dispatch decision from the pre-classifier.
         mode: SpawnMode,
         /// Prompt classifier verdict (FR-CL classifier; spec 10 §10.7).
@@ -277,7 +280,7 @@ pub fn run_with_layer_toggled(
     emit_stage_timing(&timing);
 
     Ok(LayerOutcome::Enabled {
-        pre_spawn,
+        pre_spawn: Box::new(pre_spawn),
         mode,
         class,
         rule_ids_in_scope,

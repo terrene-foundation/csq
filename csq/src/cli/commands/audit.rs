@@ -17,6 +17,11 @@ use csq_core::audit::{
     verify_chain, AuditSinkConfig, RotationReason, SigningKey, VerifyConfig,
     AUDIT_SIGNING_SERVICE_NAME,
 };
+// Enterprise-only: consumed solely by the `#[cfg(feature = "enterprise")]`
+// `handle_anchor` path. Ungated, these are dead code under the default/community
+// feature set and fail `cargo clippy -- -D warnings` (test.yml + community build).
+#[cfg(feature = "enterprise")]
+use csq_core::audit::{AuditRecord, Decision, ResultState, Surface};
 use csq_core::cli_deps::sanitize::redact_path;
 use csq_core::error::redact_tokens;
 use std::path::Path;
@@ -192,6 +197,9 @@ pub(crate) fn emit_eatp_genesis(base_dir: &Path, service: &str) -> Result<()> {
             attestation_ts,
             kailash_canonical_hash: Some(kailash_canonical_hash),
             metadata_json: Some(metadata_json),
+            // #980: side-band witnessed-transparency field, terrene#40-gated;
+            // the genesis builder does not populate it.
+            subject_hash: None,
         }),
         ts: "".to_string(),        // patched by writer (chain-write time)
         key_id: eatp_key.key_id(), // real key id from the loaded key
@@ -602,6 +610,40 @@ pub fn handle_compliance_report(base_dir: &Path, html: bool, out: Option<&Path>)
     } else {
         report.render_markdown()
     };
+    // OQ-1 S4: append the unsigned special-category advisory section (enterprise
+    // only), shadow-rebinding `document`. It is rendered SEPARATELY from the signed
+    // chain — it reads the unsigned `csq-advisories/` store, never a `SignedRecord`,
+    // so the advisory signal reaches the DPO/works-council report without ever
+    // touching the signed, immutable chain (INV-1 / INV-2). The community edition
+    // has no producer and no reader; this whole binding is cfg'd out there, so the
+    // base `document` above stays immutable in the community build (no `mut`).
+    #[cfg(feature = "enterprise")]
+    let document = {
+        use csq_core::phase2b::oq1_advisory_store::{
+            load_advisory_notices, render_advisory_section_html, render_advisory_section_markdown,
+        };
+        let load = load_advisory_notices(base_dir);
+        let mut document = document;
+        // For HTML, insert the advisory section BEFORE the closing </body></html>
+        // so it sits inside the document; for Markdown, append after the tables.
+        if html {
+            let section = render_advisory_section_html(&load);
+            // Insert INSIDE the document body: before </body>, or (defensively, if a
+            // future renderer changes its envelope) before </html>, so the section
+            // never lands after the closing tag as malformed markup.
+            if let Some(idx) = document
+                .rfind("</body>")
+                .or_else(|| document.rfind("</html>"))
+            {
+                document.insert_str(idx, &section);
+            } else {
+                document.push_str(&section);
+            }
+        } else {
+            document.push_str(&render_advisory_section_markdown(&load));
+        }
+        document
+    };
     match out {
         Some(path) => {
             std::fs::write(path, document.as_bytes())
@@ -695,6 +737,106 @@ fn count_outbox_json(dir: &Path) -> usize {
         .count()
 }
 
+// ── csq audit anchor (#952 S3, an internal ticket) ───────────────────────────────────
+
+/// Handle `csq audit anchor [--json]` — enterprise-only.
+///
+/// POSTs a minimal `AuditRecord` to the daemon's `POST /api/audit/anchor`
+/// route.  The daemon is the SOLE signer: it signs+appends the record to the
+/// Op chain and returns the `AnchorPayload` projection containing the
+/// daemon-assigned `canonical_hash`, `chain_id`, `seq`, and
+/// `verification_level`.
+///
+/// The CLI NEVER computes `canonical_hash` client-side (DIRECTIVE-1, #1057).
+///
+/// Error handling (#952 S3): daemon-response failures are surfaced with
+/// fixed-vocabulary messages; the untrusted daemon response body is NEVER
+/// interpolated into the error (security.md §2), so no token/path leak is
+/// possible and no redaction step is required.
+#[cfg(feature = "enterprise")]
+pub fn handle_anchor(base_dir: &Path, json: bool) -> Result<()> {
+    use csq_core::audit::gen_run_id;
+    use csq_core::daemon::socket_path;
+    use csq_sdk_enterprise::AnchorPayload;
+
+    // Enterprise governance op — signs + appends a record to the audit chain (via
+    // the daemon). Gate on the license like the sibling audit ops (verify/export at
+    // enforce sites in this file), and unlike the ungated dev-only `oq1-classify`
+    // (mod.rs) which performs NO signed-chain write. Inert during the placeholder-key
+    // window (enforce_enterprise_license is Ok), forward-correct once the real key ships.
+    crate::cli::enforce_enterprise_license(base_dir)?;
+
+    let sock = socket_path(base_dir);
+
+    // Construct a minimal AuditRecord to send as the anchor body.  The daemon
+    // uses the `run_id` as the record identity; other fields carry placeholder
+    // values since the daemon only uses the record to sign+append via
+    // write_record_v2_signed (which overwrites canonical_hash, chain_id, seq).
+    let run_id = gen_run_id();
+    let now_ts = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{secs}")
+    };
+    let record = AuditRecord {
+        schema_version: "1".to_string(),
+        run_id: run_id.clone(),
+        fixture_sha256: String::new(),
+        coc_sha256: String::new(),
+        csq_version: env!("CARGO_PKG_VERSION").to_string(),
+        cli_version: String::new(),
+        surface: Surface::Cc,
+        model: String::new(),
+        start_ts: now_ts.clone(),
+        end_ts: now_ts,
+        result_state: ResultState::Pass,
+        score_delta_vs_baseline: None,
+        rule_ids_cited_original: Vec::new(),
+        rule_ids_cited_after_repair: Vec::new(),
+        rule_ids_dropped_invalid_format: 0,
+        decision: Decision::Accept,
+        spawn_gate: None,
+    };
+
+    let body = serde_json::to_string(&record)
+        .map_err(|e| anyhow::anyhow!("anchor: failed to serialize AuditRecord: {e}"))?;
+
+    // Errors from the daemon are untrusted external messages — wrap the fixed-vocab
+    // tag only; do NOT interpolate the daemon's response body (security.md §2).
+    let response_bytes =
+        crate::cli::audit_emit::post_to_daemon_json(&sock, "/api/audit/anchor", &body).map_err(
+            |()| {
+                anyhow::anyhow!(
+                    "anchor: daemon unreachable or returned a non-200 response \
+                     (chain not initialized or signing key missing)"
+                )
+            },
+        )?;
+
+    let payload: AnchorPayload = serde_json::from_slice(&response_bytes).map_err(|_| {
+        // Redact the response body — it is an untrusted external boundary
+        // (LOW fix: DaemonClientError messages use fixed-vocab, never interpolated).
+        anyhow::anyhow!("anchor: daemon returned malformed AnchorPayload (deserialize_error)")
+    })?;
+
+    if json {
+        let out = serde_json::to_string(&payload)
+            .map_err(|e| anyhow::anyhow!("anchor: JSON serialize error: {e}"))?;
+        println!("{out}");
+    } else {
+        eprintln!(
+            "anchor: signed  chain_id={} seq={} hash={}",
+            payload.chain_id,
+            payload.seq,
+            &payload.canonical_hash[..16.min(payload.canonical_hash.len())],
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod report_tests {
     use super::*;
@@ -748,6 +890,7 @@ mod report_tests {
                 residency_verdict: Some(verdict.to_owned()),
                 residency_policy_name: Some("eu-only".to_owned()),
                 residency_policy_hash: Some("abc123".to_owned()),
+                subject_hash: None,
             }),
             ts: "2100-01-01T00:00:00+00:00".to_owned(),
             key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
@@ -794,6 +937,84 @@ mod report_tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(residency_report_json(dir.path()), "{}");
     }
+
+    /// OQ-1 S4 (enterprise): `csq audit compliance-report` renders the unsigned
+    /// advisory section — distinct from the signed governed table — carrying the
+    /// authoritative attribution + fixed-vocab tags, and NONE of the advisory
+    /// content ever appears in the signed-chain classification.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn compliance_report_renders_unsigned_advisory_section() {
+        use csq_core::phase2b::oq1::{Oq1Category, Oq1Tier};
+        use csq_core::phase2b::oq1_advisory_store::{append_advisory_notice, AdvisoryNotice};
+
+        // A host with NO signed chain (empty) but WITH an advisory notice.
+        let dir = tempfile::tempdir().unwrap();
+        append_advisory_notice(
+            dir.path(),
+            &AdvisoryNotice {
+                ts: "2100-01-01T00:00:00+00:00".to_owned(),
+                session_id: "interactive-live-anon-1-abc".to_owned(),
+                slot: Some(2),
+                categories: vec![Oq1Category::Art9Health, Oq1Category::Art10Conviction],
+                tier: Oq1Tier::PreFilter,
+            },
+        )
+        .unwrap();
+
+        let out = dir.path().join("report.md");
+        handle_compliance_report(dir.path(), false, Some(&out)).unwrap();
+        let doc = std::fs::read_to_string(&out).unwrap();
+
+        // The distinct advisory section + honesty framing is present.
+        assert!(
+            doc.contains("## Advisory Notices (unsigned"),
+            "advisory section heading present: {doc}"
+        );
+        assert!(
+            doc.contains("NOT part of the signed audit chain"),
+            "unsigned framing"
+        );
+        // The authoritative attribution + fixed-vocab tags render.
+        assert!(
+            doc.contains("interactive-live-anon-1-abc"),
+            "session attribution"
+        );
+        assert!(doc.contains("slot 2"), "slot attribution");
+        assert!(doc.contains("art9_health"), "tag renders");
+        assert!(doc.contains("art10_conviction"), "tag renders");
+        // The signed-chain sections are still there and the advisory is NOT
+        // counted among governed decisions (it is unsigned, INV-2).
+        assert!(
+            doc.contains("Governed decisions: 0"),
+            "advisory not tallied as governed"
+        );
+        // R1-F2: the advisory tags appear ONLY in the advisory section, never in
+        // the signed governed portion (the strongest available "not on the signed
+        // surface" assertion — the type system, no EventPayload::Oq1 variant, is
+        // the real guarantee).
+        let (signed_part, _advisory_part) = doc
+            .split_once("## Advisory Notices")
+            .expect("advisory heading splits the report");
+        assert!(
+            !signed_part.contains("art9_health") && !signed_part.contains("art10_conviction"),
+            "advisory tags must not appear in the signed-chain portion of the report"
+        );
+
+        // R1-F1: the HTML render lands the advisory section INSIDE the document
+        // (before </body>), not after the closing tag.
+        let html_out = dir.path().join("report.html");
+        handle_compliance_report(dir.path(), true, Some(&html_out)).unwrap();
+        let html = std::fs::read_to_string(&html_out).unwrap();
+        let sec = html
+            .find("<h2>Advisory Notices")
+            .expect("html advisory section present");
+        let body_close = html.rfind("</body>").expect("body close present");
+        assert!(
+            sec < body_close,
+            "advisory section must render inside <body>"
+        );
+    }
 }
 
 pub fn handle_verify(
@@ -801,6 +1022,7 @@ pub fn handle_verify(
     full: bool,
     since: Option<&str>,
     output_json: bool,
+    record_id: Option<&str>,
 ) -> Result<()> {
     let record_limit = if full { usize::MAX } else { 1_000 };
 
@@ -847,6 +1069,22 @@ pub fn handle_verify(
         csq_core::audit::reconcile_chain_sentinel(base_dir, ChainKind::Eatp.runs_subdir(), &eatp);
     }
 
+    // Enterprise gate-coverage (task #77): the trust-plane grade is enterprise-differentiated
+    // output; an unlicensed enterprise binary suppresses it and behaves like community. The
+    // base `verify` (chain integrity) is a shared community feature and is NOT gated — only
+    // the enterprise grade is. `enforce_enterprise_license` is `Ok` during the inert
+    // placeholder phase, so the grade shows until the real key is baked. Community builds have
+    // no grade to gate, so the flag is `true` there (the fields are already `None`).
+    #[cfg(feature = "enterprise")]
+    let enterprise_licensed = crate::cli::enforce_enterprise_license(base_dir).is_ok();
+    #[cfg(not(feature = "enterprise"))]
+    let enterprise_licensed = true;
+
+    // S4 (#952): look up per-record VerificationLevel when `--record <id>` is supplied.
+    // Delegates to the extracted production fn — NOT an inline duplicate.
+    // Community field — NOT enterprise-gated.
+    let record_verification_level = lookup_record_verification_level(base_dir, record_id);
+
     if output_json {
         // S2 (`csq.verify.v1`): emit the verdict through the shared SDK envelope
         // (`schema` + `ok` + the verdict payload + `edition`). `sdk::emit` is the
@@ -854,7 +1092,11 @@ pub fn handle_verify(
         // 3-valued process exit code (0 clean / 1 integrity / 2 partial) is derived
         // from `result` via `exit_code_for_error`, preserving spec 12 §12.13.5's exit
         // contract.
-        let env = csq_core::sdk::build_verify_envelope(&result);
+        let env = csq_core::sdk::build_verify_envelope(
+            &result,
+            enterprise_licensed,
+            record_verification_level,
+        );
         let emit_result = csq_core::sdk::emit(&env);
         // Redteam R1 (deep-analyst LOW): a `?`-propagated emit failure on an `Err`
         // result would short-circuit BEFORE the exit-code derivation, silently
@@ -890,7 +1132,9 @@ pub fn handle_verify(
                 "audit verify: clean — {} v2 records verified, {} v1 skipped",
                 summary.verified_count, summary.skipped_v1_count
             );
-            print_trust_plane_grade(&result);
+            if enterprise_licensed {
+                print_trust_plane_grade(&result);
+            }
         }
         Ok(summary) => {
             // Degraded: chain-linked end-to-end but signature-verification was
@@ -909,7 +1153,9 @@ pub fn handle_verify(
             eprintln!(
                 "  chain-linking verified end-to-end. Run `csq audit verify --full` for details."
             );
-            print_trust_plane_grade(&result);
+            if enterprise_licensed {
+                print_trust_plane_grade(&result);
+            }
         }
         Err(ref e @ csq_core::audit::LedgerError::ChainBroken { seq, .. }) => {
             eprintln!(
@@ -980,6 +1226,61 @@ Run `csq audit verify --full` for diagnosis.",
         }
     }
     Ok(())
+}
+
+/// Look up the `verification_level` for a specific record id from the chain JSONL.
+///
+/// Returns `Some(level_string)` when `--record <id>` is supplied:
+///
+/// - The record's `verification_level` field value if found.
+/// - `"NOT_FOUND"` if the id is absent from the JSONL, `chain_id` is empty,
+///   or any I/O failure occurs (fail-closed convention matching
+///   `compliance_report.rs:233`'s empty-chain guard).
+///
+/// Returns `None` when `record_id` is `None` — the field is absent from
+/// the envelope (back-compat: callers that omit `--record` see no field).
+///
+/// Community field — NOT enterprise-gated.
+fn lookup_record_verification_level(
+    base_dir: &std::path::Path,
+    record_id: Option<&str>,
+) -> Option<String> {
+    let rid = record_id?;
+    use csq_core::audit::key_custody::ChainState;
+    match ChainState::load_in(base_dir, "csq-runs") {
+        Ok(cs) => {
+            // LOW-3: mirror compliance_report.rs:233's empty-chain guard — skip
+            // building a path from an empty chain_id.
+            if cs.chain_id.is_empty() {
+                return Some("NOT_FOUND".to_string());
+            }
+            let jsonl_path = base_dir
+                .join("csq-runs")
+                .join(format!("{}.jsonl", cs.chain_id));
+            match std::fs::read_to_string(&jsonl_path) {
+                Ok(contents) => {
+                    let mut found: Option<String> = None;
+                    for line in contents.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if v["record_id"].as_str() == Some(rid) {
+                                found = Some(
+                                    v["verification_level"]
+                                        .as_str()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| "NOT_FOUND".to_string()),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    // Supplied id not present in the JSONL → fail-closed NOT_FOUND.
+                    found.or(Some("NOT_FOUND".to_string()))
+                }
+                Err(_) => Some("NOT_FOUND".to_string()),
+            }
+        }
+        Err(_) => Some("NOT_FOUND".to_string()),
+    }
 }
 
 /// Handle `csq audit config-cadence <sink> <key> <value>` (M07).
@@ -1129,5 +1430,99 @@ mod intent_tests {
         std::fs::write(outbox.join("c.tmp.2.json"), b"{}").unwrap();
         std::fs::create_dir_all(outbox.join("sub.json")).unwrap();
         assert_eq!(count_outbox_json(&outbox), 2);
+    }
+}
+
+/// Tests for the S4 `--record <id>` per-record VerificationLevel lookup (#952).
+///
+/// These tests call the PRODUCTION function `lookup_record_verification_level`
+/// directly — no local duplicate. A regression in the production fn fails them.
+#[cfg(test)]
+mod verify_record_lookup_tests {
+    use tempfile::TempDir;
+
+    /// Build a minimal `csq-runs/` tree (chain.json + JSONL) for testing.
+    fn setup_chain(dir: &std::path::Path, chain_id: &str, records: &[(&str, Option<&str>)]) {
+        let runs = dir.join("csq-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        // Write chain.json so ChainState::load_in succeeds.
+        let chain_json = serde_json::json!({ "chain_id": chain_id });
+        std::fs::write(runs.join("chain.json"), chain_json.to_string()).unwrap();
+        // Write the JSONL: one line per record.
+        let mut lines = String::new();
+        for (record_id, level) in records {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "record_id".to_string(),
+                serde_json::Value::String(record_id.to_string()),
+            );
+            if let Some(lvl) = level {
+                obj.insert(
+                    "verification_level".to_string(),
+                    serde_json::Value::String(lvl.to_string()),
+                );
+            }
+            lines.push_str(&serde_json::Value::Object(obj).to_string());
+            lines.push('\n');
+        }
+        std::fs::write(runs.join(format!("{chain_id}.jsonl")), lines).unwrap();
+    }
+
+    /// AC: when `--record <id>` matches a JSONL record that has a
+    /// `verification_level`, `record_verification_level` is that level string.
+    /// Calls the PRODUCTION `lookup_record_verification_level` fn directly.
+    #[test]
+    fn verify_with_record_includes_level() {
+        let dir = TempDir::new().unwrap();
+        setup_chain(
+            dir.path(),
+            "testchain123",
+            &[
+                ("rec-001", Some("AUTO_APPROVED")),
+                ("rec-002", Some("FLAGGED")),
+            ],
+        );
+        let result = super::lookup_record_verification_level(dir.path(), Some("rec-001"));
+        assert_eq!(
+            result.as_deref(),
+            Some("AUTO_APPROVED"),
+            "record found with AUTO_APPROVED level"
+        );
+        let result2 = super::lookup_record_verification_level(dir.path(), Some("rec-002"));
+        assert_eq!(
+            result2.as_deref(),
+            Some("FLAGGED"),
+            "second record found with FLAGGED level"
+        );
+    }
+
+    /// AC: when `--record` is NOT supplied (`record_id = None`), the lookup
+    /// returns `None` — the field is absent from the envelope (back-compat).
+    /// Calls the PRODUCTION `lookup_record_verification_level` fn directly.
+    #[test]
+    fn verify_without_record_unchanged() {
+        let dir = TempDir::new().unwrap();
+        setup_chain(dir.path(), "testchain456", &[("rec-001", Some("HELD"))]);
+        let result = super::lookup_record_verification_level(dir.path(), None);
+        assert!(
+            result.is_none(),
+            "no --record supplied → field MUST be None (omitted from JSON)"
+        );
+    }
+
+    /// AC: when `--record <id>` is supplied but the id is absent from the JSONL,
+    /// the lookup is fail-closed and returns `Some("NOT_FOUND")`.
+    /// Calls the PRODUCTION `lookup_record_verification_level` fn directly.
+    #[test]
+    fn verify_record_unknown_id_returns_not_found() {
+        let dir = TempDir::new().unwrap();
+        setup_chain(dir.path(), "testchain789", &[("rec-001", Some("BLOCKED"))]);
+        let result =
+            super::lookup_record_verification_level(dir.path(), Some("rec-does-not-exist"));
+        assert_eq!(
+            result.as_deref(),
+            Some("NOT_FOUND"),
+            "unknown record id → fail-closed NOT_FOUND"
+        );
     }
 }

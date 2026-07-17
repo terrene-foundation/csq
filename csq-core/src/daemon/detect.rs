@@ -25,6 +25,7 @@
 //! tokio into the hot CLI path where every millisecond matters.
 
 use crate::platform::process;
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -141,6 +142,7 @@ fn is_semver_shaped(s: &str) -> bool {
 /// Health-check read/write timeout per GAP-9. Applied to the socket
 /// after connect via `set_read_timeout`/`set_write_timeout` so the
 /// HTTP/1.1 exchange cannot hang longer than this.
+#[cfg(unix)]
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Runs the 4-step detection protocol.
@@ -769,6 +771,7 @@ mod tests {
             oauth_store: None,
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: std::sync::Arc::new(
                 crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),
@@ -872,6 +875,7 @@ mod tests {
             oauth_store: None,
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: std::sync::Arc::new(
                 crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),

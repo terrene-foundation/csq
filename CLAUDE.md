@@ -56,6 +56,7 @@ src-tauri/                   — Rust backend
 | Zero tolerance             | `rules/zero-tolerance.md`              |
 | Testing                    | `rules/testing.md`                     |
 | User-path verification     | `rules/user-path-verification.md`      |
+| Edition-safe install       | `rules/edition-safe-install.md`        |
 | Sentinel-clearing parity   | `rules/sentinel-clearing-parity.md`    |
 | Reconciler cleanup parity  | `rules/reconciler-cleanup-parity.md`   |
 | Svelte patterns            | `rules/svelte-patterns.md`             |

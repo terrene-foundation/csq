@@ -91,6 +91,7 @@ fn make_router_state(base: &Path) -> RouterState {
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
         audit_health: csq_core::audit::AuditHealth::Verified,
+        anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     }

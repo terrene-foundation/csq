@@ -51,9 +51,9 @@ pub fn status_of(pid_path: &Path) -> DaemonStatus {
 ///    [`DaemonError::NotRunning`].
 /// 2. If PID is dead, cleans up stale files and returns
 ///    [`DaemonError::StalePidFile`].
-/// 3. Sends SIGTERM (Unix) or issues a graceful stop signal
-///    (Windows — deferred to M8.6; currently returns
-///    [`DaemonError::IpcTimeout`] as a placeholder on that platform).
+/// 3. Sends SIGTERM (Unix) or fires the per-user named shutdown event
+///    (Windows — see the `shutdown_windows` module, #786). Both drive the
+///    daemon's shared `CancellationToken` so every subsystem drains.
 /// 4. Polls [`process::is_pid_alive`] every 100ms until the PID
 ///    exits or the 5-second deadline passes.
 /// 5. On clean exit, attempts to remove the PID file (the daemon's
@@ -92,10 +92,10 @@ pub fn stop_daemon(pid_path: &Path) -> Result<u32, DaemonError> {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if !process::is_pid_alive(pid) {
-            // Daemon exited cleanly. Remove the PID file if it's
-            // still there (the daemon's Drop handler should have
-            // done this).
+        if daemon_has_stopped(pid, pid_path) {
+            // Remove the PID file if it's still there (the daemon's Drop
+            // handler usually does this; a dedicated daemon process that
+            // exited without cleanup leaves it behind).
             let _ = std::fs::remove_file(pid_path);
             return Ok(pid);
         }
@@ -103,6 +103,19 @@ pub fn stop_daemon(pid_path: &Path) -> Result<u32, DaemonError> {
     }
 
     Err(DaemonError::IpcTimeout { timeout_ms: 5000 })
+}
+
+/// The daemon has stopped once EITHER its process is gone (a dedicated
+/// `csq daemon start` process exits) OR it has released its PID file (a
+/// desktop-supervised **in-process** daemon: the app process outlives the
+/// daemon task, so PID-liveness never flips — the supervisor's `drop(pid_file)`
+/// after the drain is the authoritative "daemon stopped" signal).
+///
+/// Without the PID-file check, `csq daemon stop` against a desktop daemon would
+/// poll the still-alive app PID for the full 5s deadline and then falsely report
+/// the daemon as "stuck" (#786 redteam HIGH-2).
+fn daemon_has_stopped(pid: u32, pid_path: &Path) -> bool {
+    !process::is_pid_alive(pid) || !pid_path.exists()
 }
 
 #[cfg(unix)]
@@ -128,13 +141,17 @@ fn send_shutdown_signal(pid: u32) -> Result<(), DaemonError> {
 }
 
 #[cfg(windows)]
-fn send_shutdown_signal(_pid: u32) -> Result<(), DaemonError> {
-    // Windows graceful-stop requires either a console control event
-    // sent to the daemon's console, or a quit message posted to its
-    // main thread via an IPC channel. Both are deferred to M8.6
-    // (Windows integration). For now, return a clear error so
-    // callers on Windows can surface the limitation.
-    Err(DaemonError::IpcTimeout { timeout_ms: 0 })
+fn send_shutdown_signal(pid: u32) -> Result<(), DaemonError> {
+    // Windows has no per-process SIGTERM. The daemon creates a per-user
+    // named event at startup and blocks on it; firing that event is the
+    // graceful equivalent of SIGTERM — the daemon's `CancellationToken`
+    // fires and every subsystem drains exactly as on Unix (#786).
+    //
+    // `StalePidFile` is returned when the event does not exist: the PID
+    // is alive per the caller's pre-check but is not a listening csq
+    // daemon (or died in the race window), mirroring the Unix `ESRCH`
+    // arm above.
+    super::shutdown_windows::signal_shutdown(pid)
 }
 
 #[cfg(test)]
@@ -211,8 +228,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn daemon_has_stopped_detects_pid_file_release_of_a_live_host() {
+        // #786 HIGH-2: a desktop-supervised daemon's PID file holds the app's
+        // PID, which stays alive after the daemon task stops. The PID-file
+        // release — not PID death — is the "stopped" signal that lets
+        // `stop_daemon` return Ok instead of falsely reporting "stuck".
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("csq-daemon.pid");
+        let me = std::process::id(); // our own PID: genuinely alive.
+        fs::write(&p, format!("{me}\n")).unwrap();
+
+        // Alive PID + present PID file → still running.
+        assert!(!daemon_has_stopped(me, &p));
+
+        // Alive PID + released PID file → stopped (the in-process desktop case).
+        fs::remove_file(&p).unwrap();
+        assert!(daemon_has_stopped(me, &p));
+    }
+
+    #[test]
+    fn daemon_has_stopped_detects_dead_process() {
+        // The dedicated `csq daemon start` process case: PID death is stop,
+        // regardless of the PID file (which its Drop usually removes).
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("csq-daemon.pid");
+        fs::write(&p, "99999999\n").unwrap();
+        assert!(daemon_has_stopped(99_999_999, &p));
+    }
+
     // We deliberately do not test the live-PID SIGTERM path here
     // because it requires spawning a real child process that blocks
-    // on signal — doable but noisy in unit tests. The integration
-    // test suite (M8.6) exercises the full round trip.
+    // on signal — doable but noisy in unit tests. The Windows
+    // graceful-stop round trip is exercised by the integration test
+    // `tests/daemon_windows_graceful_stop.rs` (#786).
 }

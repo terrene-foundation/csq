@@ -242,6 +242,172 @@ fn provision_vertex(base_dir: &Path, slot: AccountNum, sa_path: &Path) -> Result
     Ok(())
 }
 
+/// `csq setkey azure --resource R [--deployment D] [--api-version V] [--key K]`
+/// (#962)
+///
+/// Azure OpenAI is a direct-API native provider (OpenAI Chat Completions wire,
+/// `api-key` header). Unlike the 3P passthrough providers it does NOT bind a
+/// per-slot `config-<N>/settings.json`; its multi-field endpoint config
+/// (`AZURE_OPENAI_RESOURCE`/`_DEPLOYMENT`/`_API_VERSION`) plus the api-key
+/// (`AZURE_OPENAI_API_KEY`) live in the GLOBAL `settings-azure.json`, which the
+/// native client reads at request time. `save_settings` applies the enterprise
+/// residency gate before persisting.
+///
+/// The key is read from stdin (hidden on a TTY, piped otherwise) when `--key`
+/// is omitted, so it need not enter argv or shell history.
+///
+/// Enterprise-only: the Azure native client lives in the moat-stripped `phase2b`
+/// tree; the community CLI does not expose this handler.
+#[cfg(feature = "enterprise")]
+pub fn handle_azure(
+    base_dir: &Path,
+    resource: &str,
+    deployment: Option<&str>,
+    api_version: Option<&str>,
+    key_arg: Option<&str>,
+) -> Result<()> {
+    // #962 H1: every URL-interpolated component is allowlist-validated before it
+    // can reach `read_native_env_string` → the Azure endpoint `format!`. Guards
+    // against credential-redirection (a doctored `--resource evil.com/` would
+    // otherwise send the live api-key to an attacker host).
+    third_party::validate_endpoint_component(
+        resource,
+        "--resource",
+        third_party::is_dns_label_char,
+        63,
+    )
+    .context("resource rejected")?;
+    if let Some(d) = deployment {
+        third_party::validate_endpoint_component(
+            d,
+            "--deployment",
+            third_party::is_path_segment_char,
+            64,
+        )
+        .context("deployment rejected")?;
+    }
+    if let Some(v) = api_version {
+        third_party::validate_endpoint_component(
+            v,
+            "--api-version",
+            third_party::is_path_segment_char,
+            20,
+        )
+        .context("api-version rejected")?;
+    }
+
+    let key = read_key_arg_or_stdin(key_arg)?;
+    third_party::validate_key_shape(&key).context("key rejected")?;
+
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("AZURE_OPENAI_API_KEY", key.as_str()),
+        ("AZURE_OPENAI_RESOURCE", resource),
+    ];
+    if let Some(d) = deployment {
+        pairs.push(("AZURE_OPENAI_DEPLOYMENT", d));
+    }
+    if let Some(v) = api_version {
+        pairs.push(("AZURE_OPENAI_API_VERSION", v));
+    }
+
+    let mut settings = providers::settings::load_settings(base_dir, "azure")?;
+    settings.set_env_kv(&pairs);
+    providers::settings::save_settings(base_dir, &settings)?;
+
+    println!(
+        "Set Azure OpenAI key: {}",
+        settings.key_fingerprint_for("AZURE_OPENAI_API_KEY")
+    );
+    println!("  Resource: {resource}");
+    if let Some(d) = deployment {
+        println!("  Deployment: {d}");
+    }
+    println!("  Use with: csq eval / csq run against an azure-provider session");
+    Ok(())
+}
+
+/// `csq setkey vertex --project P --region R [--access-token T]` (#962)
+///
+/// GCP Vertex AI is a direct-API native provider (Google generateContent wire,
+/// Bearer access-token). Its endpoint config (`VERTEX_PROJECT`, `VERTEX_REGION`)
+/// plus the access token (`VERTEX_ACCESS_TOKEN`) live in the GLOBAL
+/// `settings-vertex.json`, read by the native client at request time.
+/// `save_settings` applies the enterprise residency gate before persisting.
+///
+/// The access token is read from stdin (hidden on a TTY, piped otherwise) when
+/// `--access-token` is omitted.
+///
+/// NB Vertex access tokens are short-lived (~1h). Refreshing is a
+/// gcloud/service-account concern — the client reads whatever token the settings
+/// currently hold; re-run this command with a fresh token when it expires.
+///
+/// Enterprise-only: the Vertex native client lives in the moat-stripped `phase2b`
+/// tree; the community CLI does not expose this handler.
+#[cfg(feature = "enterprise")]
+pub fn handle_vertex(
+    base_dir: &Path,
+    project: &str,
+    region: &str,
+    token_arg: Option<&str>,
+) -> Result<()> {
+    // #962 H1: allowlist-validate the URL-interpolated Vertex components before
+    // they reach the endpoint `format!` — same credential-redirection defense as
+    // handle_azure (a doctored `--region` / `--project` could otherwise send the
+    // live Bearer service-account token to an attacker host).
+    third_party::validate_endpoint_component(
+        project,
+        "--project",
+        third_party::is_dns_label_char,
+        30,
+    )
+    .context("project rejected")?;
+    third_party::validate_endpoint_component(
+        region,
+        "--region",
+        third_party::is_dns_label_char,
+        40,
+    )
+    .context("region rejected")?;
+
+    let token = read_key_arg_or_stdin(token_arg)?;
+    third_party::validate_key_shape(&token).context("access token rejected")?;
+
+    let pairs: Vec<(&str, &str)> = vec![
+        ("VERTEX_ACCESS_TOKEN", token.as_str()),
+        ("VERTEX_PROJECT", project),
+        ("VERTEX_REGION", region),
+    ];
+
+    let mut settings = providers::settings::load_settings(base_dir, "vertex")?;
+    settings.set_env_kv(&pairs);
+    providers::settings::save_settings(base_dir, &settings)?;
+
+    println!(
+        "Set Vertex AI access token: {}",
+        settings.key_fingerprint_for("VERTEX_ACCESS_TOKEN")
+    );
+    println!("  Project: {project}");
+    println!("  Region: {region}");
+    println!("  Use with: csq eval / csq run against a vertex-provider session");
+    Ok(())
+}
+
+/// Reads a key/token from `--key`/`--access-token` when present, else from stdin
+/// (hidden on a TTY, piped otherwise). Trims whitespace and a trailing `\r`.
+///
+/// Enterprise-only: sole callers are [`handle_azure`] / [`handle_vertex`].
+#[cfg(feature = "enterprise")]
+fn read_key_arg_or_stdin(arg: Option<&str>) -> Result<String> {
+    let key = match arg {
+        Some(k) => k.trim().to_string(),
+        None => read_key_interactive()?,
+    };
+    if key.is_empty() {
+        return Err(anyhow!("key is empty"));
+    }
+    Ok(key.trim_end_matches('\r').to_string())
+}
+
 /// Maps a [`SecretError`] to user-actionable text per
 /// `rules/tauri-commands.md` §6 (no opaque "vault error" tag).
 fn map_vault_error(e: SecretError) -> anyhow::Error {
@@ -832,6 +998,96 @@ mod tests {
     fn ctrl_d_on_empty_cancels() {
         let err = run_bytes(&[0x04]).unwrap_err().to_string();
         assert_eq!(err, "cancelled");
+    }
+
+    // ── #962 H1: endpoint-component allowlist (credential-redirection defense) ──
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_azure_rejects_host_redirection_resource() {
+        // `evil.example.com/` would compose `https://evil.example.com/.openai...`
+        // whose HOST is evil.example.com → the api-key would leak. Must Err
+        // BEFORE any settings write.
+        let dir = TempDir::new().unwrap();
+        let err = handle_azure(
+            dir.path(),
+            "evil.example.com/",
+            None,
+            None,
+            Some("sk-valid-key-1234"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("resource rejected"), "got: {err}");
+        assert!(
+            !dir.path().join("settings-azure.json").exists(),
+            "no settings file may be written when the resource is rejected"
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_azure_rejects_traversal_and_ctrl_bytes() {
+        let dir = TempDir::new().unwrap();
+        for bad in ["a/../b", "a b", "x\r\ny", "has:port", "user@host", "a.b"] {
+            let err = handle_azure(dir.path(), bad, None, None, Some("sk-valid-key-1234"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("resource rejected"), "resource {bad:?}: {err}");
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_azure_rejects_bad_deployment_and_api_version() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_azure(
+            dir.path(),
+            "goodresource",
+            Some("dep/../ment"),
+            None,
+            Some("sk-valid-key-1234"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("deployment rejected"), "got: {err}");
+
+        let err = handle_azure(
+            dir.path(),
+            "goodresource",
+            None,
+            Some("2024-06-01/evil"),
+            Some("sk-valid-key-1234"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("api-version rejected"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_vertex_rejects_host_redirection_project_and_region() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_vertex(
+            dir.path(),
+            "evil.example.com/",
+            "us-central1",
+            Some("ya29.valid-token-abc"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("project rejected"), "got: {err}");
+
+        let err = handle_vertex(
+            dir.path(),
+            "my-gcp-project",
+            "us-central1/../evil",
+            Some("ya29.valid-token-abc"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("region rejected"), "got: {err}");
+        assert!(!dir.path().join("settings-vertex.json").exists());
     }
 
     #[test]

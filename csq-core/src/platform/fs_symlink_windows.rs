@@ -60,10 +60,6 @@ pub fn symlink_exclusive(target: &Path, link: &Path) -> Result<(), PlatformError
     const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
     // FILE_ATTRIBUTE_DIRECTORY
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-    // CreateFileW disposition
-    const OPEN_ALWAYS: u32 = 4;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-
     // Encode a &Path as a null-terminated wide string.
     fn to_wide(p: &Path) -> Vec<u16> {
         p.as_os_str()
@@ -176,8 +172,8 @@ pub fn symlink_exclusive(target: &Path, link: &Path) -> Result<(), PlatformError
     let subst_str = format!("\\??\\{}", target_str);
     let print_str = target_str;
 
-    let mut subst_wide = str_to_wide(&subst_str);
-    let mut print_wide: Vec<u16> = print_str.encode_utf16().collect();
+    let subst_wide = str_to_wide(&subst_str);
+    let print_wide: Vec<u16> = print_str.encode_utf16().collect();
 
     // PathBuffer = subst_wide + NUL + print_wide + NUL
     let mut path_buf: Vec<u16> = Vec::new();

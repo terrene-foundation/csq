@@ -1096,8 +1096,113 @@ fn augment_subprocess_path() {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn augment_subprocess_path() {}
 
+/// Initialise the `tracing` subscriber (stderr, filtered by `CSQ_LOG`).
+///
+/// # Why this is factored out — #1011 / #1010 SIGABRT-on-launch guard
+///
+/// The #1010 crash was a `log`-facade collision: when `tracing-subscriber`'s
+/// `tracing-log` feature is active (pulled in transitively by
+/// `kailash-core → tracing-opentelemetry` on the `native-harness` build),
+/// calling `.try_init()` installs a `LogTracer` as the global `log` logger,
+/// which then collides with `tauri-plugin-log`'s own `set_boxed_logger` and
+/// aborts the process during startup.  The fix (an internal ticket) is `set_global_default`
+/// instead of `try_init()` — that function sets ONLY the tracing dispatcher and
+/// never touches the `log` facade.
+///
+/// Factoring the subscriber init here (instead of inlining it in `.setup()`)
+/// lets the self-test path (`CSQ_DESKTOP_SELFTEST=1`) exercise the EXACT same
+/// code that SIGABRTed in #1010, not a stripped-down copy.  If this function
+/// ever regresses back to `try_init()`, the self-test's `log::set_boxed_logger`
+/// probe (see `run()`) returns `Err` and the self-test exits non-zero — the
+/// build gate then fails closed before the SIGABRT can ship.
+///
+/// Called from two sites:
+/// - `run()` self-test path (before Tauri builder, exits 0 on success)
+/// - `.setup()` closure (real launch, in the same position as before)
+fn init_logging_subscriber() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CSQ_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .finish();
+    // `set_global_default` — NOT `try_init()`.  See doc comment above.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── Headless self-test mode (#1011) ──────────────────────────────────────
+    //
+    // When `CSQ_DESKTOP_SELFTEST=1` is set (or `--self-test` is the sole arg),
+    // exercise the crash-prone startup surface — logging subscriber bind +
+    // `set_global_default` — then exit 0 BEFORE spawning the daemon supervisor,
+    // creating any windows, or entering the Tauri event loop.
+    //
+    // Design choice: we run `init_logging_subscriber()` standalone rather than
+    // driving the full Tauri builder into `.setup()`.  Reasoning:
+    //
+    //   • The SIGABRT in #1010 happened at the `set_global_default` /
+    //     `tauri-plugin-log` registration step — specifically because `try_init()`
+    //     had already claimed the `log` facade before `tauri-plugin-log` tried to.
+    //     `init_logging_subscriber()` exercises that exact call without the GUI.
+    //
+    //   • Driving the full Tauri builder in a headless CI/build environment
+    //     requires a display server (macOS: no issue; Linux CI: needs Xvfb) and
+    //     would spin up windows, sockets, and the daemon supervisor — exactly
+    //     what a self-test must NOT do.
+    //
+    //   • `tauri-plugin-log`'s `build()` is called *inside* `.setup()`.  We
+    //     cannot reach it headlessly (it needs a live `AppHandle` + display).
+    //     Instead the self-test probes the EXACT invariant it depends on: after
+    //     `init_logging_subscriber()`, the global `log` facade must still be free
+    //     (see the regression probe below).
+    //
+    // Regression detection (why this CATCHES the #1010 SIGABRT):
+    //   #1010 aborted at `tauri-plugin-log`'s `set_boxed_logger` because a prior
+    //   `try_init()` had installed `LogTracer` as the global `log` logger.  We
+    //   cannot reach `tauri-plugin-log` registration headlessly, but we can probe
+    //   the precise condition it requires: immediately after
+    //   `init_logging_subscriber()`, the `log` facade MUST be unclaimed.  The
+    //   self-test claims it with a no-op logger; if `set_boxed_logger` returns
+    //   `Err`, a `log` logger is already installed (i.e. a `try_init()`
+    //   regression) — exactly what makes `tauri-plugin-log` SIGABRT.  Failing the
+    //   self-test here makes the build gate fail closed before certification.
+    //   Claiming the facade is harmless — the self-test process exits immediately.
+    // `--self-test` is honored ONLY as the sole argument (not `.any(argv)`, which
+    // would misfire if a future flag / `csq://` deep-link argv merely contained the
+    // token — R1 LOW-1). `main()` applies the same gate before routing here.
+    let argv: Vec<String> = std::env::args().collect();
+    let self_test = std::env::var("CSQ_DESKTOP_SELFTEST").as_deref() == Ok("1")
+        || (argv.len() == 2 && argv[1] == "--self-test");
+    if self_test {
+        // Run the exact logging init path the real launch runs.
+        init_logging_subscriber();
+        // Probe the #1010 invariant: the global `log` facade must still be
+        // claimable after our tracing init. A `try_init()` regression installs a
+        // LogTracer, so this call would return Err — the same condition that
+        // SIGABRTs tauri-plugin-log at startup.
+        struct SelfTestNopLogger;
+        impl log::Log for SelfTestNopLogger {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                false
+            }
+            fn log(&self, _: &log::Record<'_>) {}
+            fn flush(&self) {}
+        }
+        if log::set_boxed_logger(Box::new(SelfTestNopLogger)).is_err() {
+            eprintln!(
+                "csq-desktop self-test FAILED: the global `log` facade is already \
+                 claimed after init_logging_subscriber() — a try_init() regression \
+                 would SIGABRT tauri-plugin-log at startup (#1010/#1011)."
+            );
+            std::process::exit(1);
+        }
+        // Success marker checked by build-enterprise-desktop.sh.
+        println!("csq-desktop self-test OK");
+        std::process::exit(0);
+    }
+
     // Subprocess spawn paths (`codex login --device-auth`, the
     // `which gemini` lookup inside `oauth_flow::run` for OAuth client
     // discovery) require user-installed CLIs to be reachable. macOS
@@ -1243,6 +1348,20 @@ pub fn run() {
             // renderers — fills the gap where setup() emits before
             // the WebView mounts and the Svelte listen() registers.
             commands::consume_prefs_recovery,
+            // #787 AC#3 — policy-bundle admin console. Enterprise-only:
+            // the phase2b seam is moat-stripped in the community edition.
+            // `generate_handler!` preserves the `#[cfg]` attribute on the
+            // match arm, so these entries are absent from the community
+            // build's match statement (the functions themselves are also
+            // `#[cfg(feature = "enterprise")]` in policy.rs).
+            #[cfg(feature = "enterprise")]
+            commands::policy::policy_preview_active,
+            #[cfg(feature = "enterprise")]
+            commands::policy::policy_validate_draft,
+            #[cfg(feature = "enterprise")]
+            commands::policy::policy_create_unsigned,
+            #[cfg(feature = "enterprise")]
+            commands::policy::policy_keygen,
         ])
         .setup(|app| {
             // ── Logging ────────────────────────────────────────
@@ -1259,21 +1378,12 @@ pub fn run() {
             //    lifecycle messages. Output goes to the OS app-
             //    data log dir (Console.app on macOS, etc.).
             //
-            // **Critical**: `tracing-subscriber`'s default
-            // features include `tracing-log`, which would make
-            // `try_init()` silently call `log::set_logger`. That
-            // then collides with `tauri-plugin-log`'s own
-            // `set_boxed_logger` and panics the app at startup.
-            // The workspace `tracing-subscriber` dep is
-            // configured with `default-features = false` +
-            // explicit `fmt`/`env-filter`/`std`/`ansi`/`smallvec`
-            // to avoid this collision. See Cargo.toml.
-            let filter = tracing_subscriber::EnvFilter::try_from_env("CSQ_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::stderr)
-                .try_init();
+            // **Critical (SIGABRT-on-launch guard):** see `init_logging_subscriber()`
+            // for the full explanation of why `set_global_default` is used instead
+            // of `try_init()`. The self-test path (`CSQ_DESKTOP_SELFTEST=1`) calls
+            // the same function so any regression here is caught by the build gate
+            // added in #1011.
+            init_logging_subscriber();
 
             // ── CLI shim refresh (#1) ──────────────────────────
             //

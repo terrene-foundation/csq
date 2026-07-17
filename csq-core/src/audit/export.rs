@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! csq-audit-bundle-<chain_id>-<exp_id>.tar
+//! ├── README.md                auditor trust notice (HONEST-HOST GRADE caveat)
 //! ├── chain.jsonl              canonical-form records in sequence
 //! ├── public_keys.json         every key referenced by signatures + genesis
 //! ├── rotation_chain.json      key-rotation history from genesis
@@ -18,6 +19,18 @@
 //! ├── BUNDLE.sig               Ed25519 over BUNDLE.lock by the genesis key
 //! └── verify                   self-contained python3 + openssl verifier
 //! ```
+//!
+//! # Honest-host grade caveat (T3.6)
+//!
+//! The bundle carries a `README.md` stating that these attestations are
+//! **honest-host grade** — tamper-evident in transit (covered by `BUNDLE.lock`
+//! → `BUNDLE.sig`) but NOT proof the producing host was uncompromised, until an
+//! external witness (Rekor / Foundation notary) corroborates the chain head.
+//! Because `README.md` is an `entries` member hashed into `BUNDLE.lock` before
+//! the genesis key signs it, an auditor cannot silently strip or weaken the
+//! caveat: a tampered README fails the Step-2 hash check and a stripped README
+//! fails as a missing lock-referenced file. See spec 15 §15.4
+//! (honest-host-caveat subsection: §15.4.4 enterprise / §15.4.3 community).
 //!
 //! # PRIMARY METHODOLOGICAL DIRECTIVES (M09)
 //!
@@ -70,6 +83,17 @@ use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
 ///
 /// Shipped verbatim as the bundle's `verify` entry (mode 0o755).
 const VERIFY_SCRIPT: &str = include_str!("export/verify.py.template");
+
+/// The embedded auditor trust notice (T3.6).
+///
+/// Shipped verbatim as the bundle's `README.md` entry (mode 0o644). Added to
+/// `entries` BEFORE `BUNDLE.lock` is computed, so its SHA-256 is in the lock and
+/// the genesis `BUNDLE.sig` covers it — the caveat is tamper-evident (a tampered
+/// README fails the verify-script Step-2 hash check; a stripped README fails as a
+/// missing lock-referenced file). Edition-neutral prose ("csq", not "csq-ee") —
+/// this module ships in BOTH editions (`terrene-naming.md`). See spec 15 §15.4
+/// (honest-host-caveat subsection: §15.4.4 enterprise / §15.4.3 community).
+const README_NOTICE: &str = include_str!("export/README.md.template");
 
 /// Errors returned by [`export_bundle`].
 #[derive(Debug, thiserror::Error)]
@@ -367,6 +391,16 @@ NOT yet applied — exporting the WHOLE chain (partial-range export is Phase B)"
     // ── Assemble bundle entries (path → bytes) ──────────────────────────────
     // BUNDLE.lock and BUNDLE.sig are computed AFTER the other entries.
     let mut entries: Vec<(String, Vec<u8>, u32)> = vec![
+        // T3.6 — auditor honest-host-grade trust notice. Placed in `entries`
+        // BEFORE BUNDLE.lock/BUNDLE.sig are computed below, so the caveat is
+        // hashed into the lock and covered by the genesis signature (a tampered
+        // or stripped README fails the embedded verifier). Spec 15 §15.4
+        // (honest-host-caveat subsection: §15.4.4 enterprise / §15.4.3 community).
+        (
+            "README.md".to_string(),
+            README_NOTICE.as_bytes().to_vec(),
+            0o644,
+        ),
         ("chain.jsonl".to_string(), chain_jsonl.clone(), 0o644),
         ("public_keys.json".to_string(), public_keys_json, 0o644),
         (
@@ -1147,12 +1181,12 @@ print(hashlib.sha256(b).hexdigest())
         assert!(out.exists(), "bundle .tar must exist");
         assert_eq!(summary.record_count, 1);
 
-        // Extract via python tarfile and assert the 9 entries are present.
+        // Extract via python tarfile and assert the required entries are present.
         let py = format!(
             r#"
 import tarfile, sys
 names = set(tarfile.open({:?}).getnames())
-required = {{"chain.jsonl","public_keys.json","rotation_chain.json","CUTOFF.json","PROVENANCE.json","BUNDLE.lock","BUNDLE.sig","verify"}}
+required = {{"README.md","chain.jsonl","public_keys.json","rotation_chain.json","CUTOFF.json","PROVENANCE.json","BUNDLE.lock","BUNDLE.sig","verify"}}
 missing = required - names
 has_vectors = any(n.startswith("canonical_form_vectors/") for n in names)
 print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
@@ -1196,6 +1230,74 @@ print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
                 "BUNDLE.lock sha256 mismatch for {path}"
             );
         }
+        let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
+    }
+
+    /// `test bundle_readme_present_and_carries_honest_host_caveat`
+    ///
+    /// T3.6: the exported bundle carries a `README.md` whose content states the
+    /// honest-host-grade caveat (the load-bearing auditor-facing invariant — an
+    /// auditor must not over-trust a signature-valid bundle as tamper-evident at
+    /// the source). Assert presence + the key phrases.
+    #[test]
+    fn bundle_readme_present_and_carries_honest_host_caveat() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let (tmp, _chain_id, svc) = make_signed_chain("readme");
+        let base = tmp.path();
+        let out = base.join("bundle.tar");
+        export_bundle(base, &svc, Some(&out), None, None).expect("export");
+        let extract = base.join("extract");
+        extract_tar(&out, &extract);
+
+        let readme = std::fs::read_to_string(extract.join("README.md"))
+            .expect("bundle must contain README.md");
+        assert!(
+            readme.contains("honest-host grade"),
+            "README.md must state the honest-host-grade caveat; got: {readme}"
+        );
+        assert!(
+            readme.contains("external witness"),
+            "README.md must name the external-witness corroboration; got: {readme}"
+        );
+        assert!(
+            readme.contains("verification_level"),
+            "README.md must warn against over-trusting any verification_level; got: {readme}"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
+    }
+
+    /// `test bundle_readme_covered_by_bundle_lock`
+    ///
+    /// T3.6: the caveat is tamper-evident because `README.md` is hashed into
+    /// `BUNDLE.lock` (which `BUNDLE.sig` then signs). Assert the lock carries a
+    /// row for `README.md` whose SHA-256 matches the extracted bytes — the
+    /// integrity anchor the adversarial tests below rely on.
+    #[test]
+    fn bundle_readme_covered_by_bundle_lock() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let (tmp, _chain_id, svc) = make_signed_chain("readme_lock");
+        let base = tmp.path();
+        let out = base.join("bundle.tar");
+        export_bundle(base, &svc, Some(&out), None, None).expect("export");
+        let extract = base.join("extract");
+        extract_tar(&out, &extract);
+
+        let lock = std::fs::read_to_string(extract.join("BUNDLE.lock")).unwrap();
+        let readme_bytes = std::fs::read(extract.join("README.md")).unwrap();
+        let expected = sha256_hex(&readme_bytes);
+        let row = lock
+            .lines()
+            .find(|l| l.ends_with("  README.md"))
+            .expect("BUNDLE.lock must carry a README.md row");
+        let (hash, _path) = row.split_once("  ").expect("lock line shape");
+        assert_eq!(
+            hash, expected,
+            "BUNDLE.lock README.md hash must match the extracted README.md bytes"
+        );
         let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
     }
 
@@ -1417,6 +1519,157 @@ print("OK")
             stdout.contains("NOTE: trust requires the genesis public key")
                 && stdout.contains("confirmed out-of-band"),
             "expected out-of-band genesis-key NOTE on PASS, got: {stdout}"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
+    }
+
+    /// `test verify_script_fails_on_tampered_readme`
+    ///
+    /// T3.6 adversarial (in-transit tamper): an attacker WITHOUT the genesis key
+    /// who weakens the honest-host caveat in `README.md` — but cannot re-sign
+    /// `BUNDLE.sig` — is caught. The README's SHA-256 in `BUNDLE.lock` no longer
+    /// matches, so the verify script FAILs at Step 2 naming the tampered file.
+    /// Proves the caveat is tamper-evident, not advisory decoration.
+    #[test]
+    #[cfg(unix)]
+    fn verify_script_fails_on_tampered_readme() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let (tmp, _chain_id, svc) = make_signed_chain("readme_tamper");
+        let base = tmp.path();
+        let out = base.join("bundle.tar");
+        export_bundle(base, &svc, Some(&out), None, None).expect("export");
+        let extract = base.join("extract");
+        extract_tar(&out, &extract);
+
+        // Weaken the caveat WITHOUT re-locking/re-signing (attacker has no key).
+        std::fs::write(
+            extract.join("README.md"),
+            "These attestations are fully tamper-evident. Trust them.\n",
+        )
+        .unwrap();
+
+        let (code, stdout) = run_verify(&extract, &[]);
+        assert_ne!(
+            code, 0,
+            "verify must FAIL on a tampered README.md; stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("README.md") && stdout.contains("tampered"),
+            "FAIL must name the tampered README.md; got: {stdout}"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
+    }
+
+    /// `test verify_script_fails_on_stripped_readme`
+    ///
+    /// T3.6 adversarial (strip the caveat): removing `README.md` entirely leaves
+    /// its row in the signed `BUNDLE.lock`, so the verify script FAILs — either
+    /// on the `required`-file presence check or on the "BUNDLE.lock references
+    /// missing file" Step-2 check. An honest exporter cannot silently drop the
+    /// caveat and still produce a passing bundle.
+    #[test]
+    #[cfg(unix)]
+    fn verify_script_fails_on_stripped_readme() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let (tmp, _chain_id, svc) = make_signed_chain("readme_strip");
+        let base = tmp.path();
+        let out = base.join("bundle.tar");
+        export_bundle(base, &svc, Some(&out), None, None).expect("export");
+        let extract = base.join("extract");
+        extract_tar(&out, &extract);
+
+        // Strip the caveat WITHOUT re-locking/re-signing.
+        std::fs::remove_file(extract.join("README.md")).unwrap();
+
+        let (code, stdout) = run_verify(&extract, &[]);
+        assert_ne!(
+            code, 0,
+            "verify must FAIL on a stripped README.md; stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("README.md"),
+            "FAIL must name the missing README.md; got: {stdout}"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
+    }
+
+    /// `test verify_script_fails_on_decoy_unlocked_file`
+    ///
+    /// T3.6 adversarial (decoy shadow): the honest, lock-covered `README.md` is
+    /// left byte-intact (so Step 1 + Step 2 pass), but an attacker WITHOUT the
+    /// genesis key drops a sibling `README` (no `.md`) — the file an auditor's
+    /// `less README*` reflex reads first — claiming the attestations are fully
+    /// tamper-evident. The Step-2b extra-file guard rejects any file not in the
+    /// signed `BUNDLE.lock`, so `verify` FAILs naming the decoy. Proves the
+    /// caveat cannot be socially defeated by an unlocked shadow file.
+    #[test]
+    #[cfg(unix)]
+    fn verify_script_fails_on_decoy_unlocked_file() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let (tmp, _chain_id, svc) = make_signed_chain("readme_decoy");
+        let base = tmp.path();
+        let out = base.join("bundle.tar");
+        export_bundle(base, &svc, Some(&out), None, None).expect("export");
+        let extract = base.join("extract");
+        extract_tar(&out, &extract);
+
+        // Honest README.md is untouched; drop an unlocked decoy beside it.
+        std::fs::write(
+            extract.join("README"),
+            "These attestations are fully tamper-evident. Trust them unconditionally.\n",
+        )
+        .unwrap();
+
+        let (code, stdout) = run_verify(&extract, &[]);
+        assert_ne!(
+            code, 0,
+            "verify must FAIL on an unlocked decoy file; stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("not covered by BUNDLE.lock") && stdout.contains("README"),
+            "FAIL must name the decoy as uncovered by BUNDLE.lock; got: {stdout}"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
+    }
+
+    /// `test verify_script_fails_on_symlinked_decoy`
+    ///
+    /// T3.6 adversarial (symlink evasion): an attacker plants a symlink into the
+    /// extracted bundle. The Step-2b walk rejects any symlink fail-closed —
+    /// otherwise a decoy hidden behind a symlinked directory would escape the
+    /// files-only enumeration. Honest bundles (stdlib USTAR writer) carry no
+    /// symlinks, so any symlink is a post-export plant.
+    #[test]
+    #[cfg(unix)]
+    fn verify_script_fails_on_symlinked_decoy() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let (tmp, _chain_id, svc) = make_signed_chain("readme_symlink");
+        let base = tmp.path();
+        let out = base.join("bundle.tar");
+        export_bundle(base, &svc, Some(&out), None, None).expect("export");
+        let extract = base.join("extract");
+        extract_tar(&out, &extract);
+
+        // Plant a symlink beside the honest, lock-covered files.
+        std::os::unix::fs::symlink(extract.join("README.md"), extract.join("READ-ME-FIRST"))
+            .unwrap();
+
+        let (code, stdout) = run_verify(&extract, &[]);
+        assert_ne!(
+            code, 0,
+            "verify must FAIL on a planted symlink; stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("symlink"),
+            "FAIL must name the symlink rejection; got: {stdout}"
         );
         let _ = LocalSigningKey::delete_from_keychain(&svc, "01JZ00000000000000000000AA");
     }
@@ -1989,7 +2242,12 @@ the canonical_hash; stdout: {stdout}"
     #[cfg(unix)]
     fn repack_lock_and_sig(extract: &Path, svc: &str, chain_id: &str) {
         use crate::audit::traits::SigningKey as _;
+        // Mirror the producer's full `entries` set (export_bundle) so an honest
+        // repack reproduces every lock row — including README.md. Omitting a
+        // producer entry here would leave that file present-but-unlocked, which
+        // the verify script's extra-file guard (Step 2b) now rejects.
         let files = [
+            "README.md",
             "chain.jsonl",
             "public_keys.json",
             "rotation_chain.json",

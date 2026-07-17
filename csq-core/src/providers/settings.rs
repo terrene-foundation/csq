@@ -109,6 +109,38 @@ impl ProviderSettings {
         }
     }
 
+    /// Overlays `(env_key, value)` pairs into this settings file's `env` block,
+    /// preserving every other key. Used by the Azure OpenAI / Vertex AI native
+    /// direct-API bindings (#962), which persist multi-field endpoint config
+    /// (`AZURE_OPENAI_RESOURCE`/`_DEPLOYMENT`/`_API_VERSION` + the api-key;
+    /// `VERTEX_PROJECT`/`_REGION` + the access token) rather than the single
+    /// `ANTHROPIC_AUTH_TOKEN` the 3P passthrough bind writes.
+    ///
+    /// # Why this is distinct from [`set_api_key`](Self::set_api_key)
+    ///
+    /// `set_api_key` writes a single value keyed on the catalog `key_env_var`,
+    /// which is `None` for azure/vertex (they are native, key read explicitly by
+    /// the client). This method takes the env var names EXPLICITLY, so the
+    /// native-client config keys — which the catalog does not model as a single
+    /// `key_env_var` — can be written in one atomic settings save.
+    pub fn set_env_kv(&mut self, pairs: &[(&str, &str)]) {
+        if !self.settings.is_object() {
+            self.settings = Value::Object(Map::new());
+        }
+        let obj = self.settings.as_object_mut().expect("ensured object above");
+        let env_obj = obj
+            .entry("env".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !env_obj.is_object() {
+            *env_obj = Value::Object(Map::new());
+        }
+        if let Some(env) = env_obj.as_object_mut() {
+            for (k, v) in pairs {
+                env.insert((*k).to_string(), Value::String((*v).to_string()));
+            }
+        }
+    }
+
     /// Sets the active model, updating all MODEL_KEYS.
     pub fn set_model(&mut self, model_id: &str) {
         self.settings = set_model(&self.settings, model_id);
@@ -119,9 +151,53 @@ impl ProviderSettings {
     /// handled as a plain string.
     pub fn key_fingerprint(&self) -> String {
         match self.get_api_key() {
-            None => "(none)".into(),
             Some(k) => k.fingerprint(),
+            // Native direct-API providers (azure/vertex, #962) have catalog
+            // `key_env_var: None`, so `get_api_key()` can't resolve their
+            // credential. Fall back to the known native cred env var so EVERY
+            // fingerprint surface (`csq listkeys`, etc.) shows the real masked
+            // key — not just the setkey handler that calls `key_fingerprint_for`
+            // directly (#962 redteam MED-1: `listkeys` showed `Key: (none)` for a
+            // correctly-configured azure/vertex slot).
+            None => match native_cred_env_var(&self.provider_id) {
+                Some(env_var) => self.key_fingerprint_for(env_var),
+                None => "(none)".into(),
+            },
         }
+    }
+
+    /// Masked fingerprint of the value at an EXPLICIT `env.<env_var>`, for
+    /// native direct-API providers (azure/vertex, #962) whose catalog
+    /// `key_env_var` is `None` so [`key_fingerprint`](Self::key_fingerprint)
+    /// cannot resolve the credential env var. The raw value is wrapped in
+    /// [`ApiKey`] before fingerprinting so it is never handled as a plain string.
+    pub fn key_fingerprint_for(&self, env_var: &str) -> String {
+        match self
+            .settings
+            .get("env")
+            .and_then(|env| env.get(env_var))
+            .and_then(|v| v.as_str())
+        {
+            None => "(none)".into(),
+            Some(s) => ApiKey::new(s.to_string()).fingerprint(),
+        }
+    }
+}
+
+/// Maps a native direct-API provider id (#962) to the `env.<var>` holding its
+/// credential. These providers have catalog `key_env_var: None` (their
+/// credential is multi-field / non-Bearer and read at request time by the
+/// phase2b native client), so the generic `key_env_var` fingerprint path can't
+/// resolve them. Returns `None` for every other provider.
+///
+/// String literals — NOT the `phase2b` client constants — because this module
+/// ships to the community edition where the `phase2b` tree is moat-stripped; the
+/// env-var NAMES are non-secret provider-agnostic data, safe to carry publicly.
+fn native_cred_env_var(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "azure" => Some("AZURE_OPENAI_API_KEY"),
+        "vertex" => Some("VERTEX_ACCESS_TOKEN"),
+        _ => None,
     }
 }
 
@@ -249,6 +325,49 @@ pub fn model_id_for_slot(base_dir: &Path, slot: u16) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Returns `true` when `config-<slot>/settings.json` pins
+/// `env.ANTHROPIC_BASE_URL` — i.e. the slot is a 3P / env-transport slot
+/// (DeepSeek, Z.AI, MiniMax, Ollama) whose base URL and auth token are
+/// injected into Claude Code's **process environment at startup**, not
+/// re-read per request.
+///
+/// This is the single discriminator between the two ClaudeCode auth
+/// transports:
+/// - **OAuth (Anthropic)**: credentials live in `.credentials.json`, which
+///   CC re-stats before every API call — an in-flight symlink repoint (`csq
+///   swap`, daemon auto-rotate) switches accounts without a restart.
+/// - **Env-transport (3P/Ollama)**: `env.ANTHROPIC_BASE_URL` +
+///   `env.ANTHROPIC_AUTH_TOKEN` are baked into the CC process env at launch
+///   and FROZEN for the process lifetime. An in-flight repoint cannot change
+///   them; switching to/from such a slot REQUIRES an exec-replace so a fresh
+///   CC reads the new settings.json env.
+///
+/// Callers use this to refuse an in-flight repoint that would either (a)
+/// silently keep hitting the old endpoint (functional break) or (b) send an
+/// Anthropic OAuth token to a frozen 3P endpoint (token exfiltration — see
+/// `daemon::auto_rotate` VP-F1 and `cli::commands::swap`).
+///
+/// Returns `false` on any I/O or parse error (fail-safe: a missing or
+/// unparseable settings.json means no detectable 3P binding). The check reads
+/// only the slot's on-disk settings, never the process environment.
+pub fn slot_pins_anthropic_base_url(base_dir: &Path, slot: u16) -> bool {
+    let path = base_dir
+        .join(format!("config-{slot}"))
+        .join("settings.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let json: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    json.get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .or_else(|| json.get("ANTHROPIC_BASE_URL"))
+        .is_some()
+}
+
 /// Saves provider settings to disk with atomic write and 0o600 permissions.
 pub fn save_settings(base_dir: &Path, settings: &ProviderSettings) -> Result<(), ConfigError> {
     let provider =
@@ -363,6 +482,82 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// #962: `set_env_kv` overlays the azure config env keys and preserves
+    /// pre-existing unrelated keys; `key_fingerprint_for` reads the explicit
+    /// credential env var (catalog `key_env_var` is `None` for azure).
+    #[test]
+    fn set_env_kv_overlays_azure_config_and_preserves_other_keys() {
+        let mut settings = ProviderSettings {
+            provider_id: "azure".to_string(),
+            settings: serde_json::json!({ "env": { "NODE_ENV": "prod" }, "other": 1 }),
+        };
+        settings.set_env_kv(&[
+            ("AZURE_OPENAI_API_KEY", "azure-key-xyz123"),
+            ("AZURE_OPENAI_RESOURCE", "my-resource"),
+            ("AZURE_OPENAI_DEPLOYMENT", "gpt-5-5"),
+        ]);
+        let env = &settings.settings["env"];
+        assert_eq!(env["AZURE_OPENAI_API_KEY"], "azure-key-xyz123");
+        assert_eq!(env["AZURE_OPENAI_RESOURCE"], "my-resource");
+        assert_eq!(env["AZURE_OPENAI_DEPLOYMENT"], "gpt-5-5");
+        // Unrelated keys preserved.
+        assert_eq!(env["NODE_ENV"], "prod");
+        assert_eq!(settings.settings["other"], 1);
+        // Explicit-env fingerprint masks the key (not "(none)", not the raw value).
+        let fp = settings.key_fingerprint_for("AZURE_OPENAI_API_KEY");
+        assert_ne!(fp, "(none)");
+        assert!(
+            !fp.contains("azure-key-xyz123"),
+            "raw key must not leak: {fp}"
+        );
+        // A missing env var yields "(none)".
+        assert_eq!(
+            settings.key_fingerprint_for("VERTEX_ACCESS_TOKEN"),
+            "(none)"
+        );
+    }
+
+    /// #962: `set_env_kv` initializes `env` when the settings object has none.
+    #[test]
+    fn set_env_kv_creates_env_when_absent() {
+        let mut settings = ProviderSettings {
+            provider_id: "vertex".to_string(),
+            settings: serde_json::json!({}),
+        };
+        settings.set_env_kv(&[
+            ("VERTEX_ACCESS_TOKEN", "ya29.token"),
+            ("VERTEX_PROJECT", "proj"),
+            ("VERTEX_REGION", "us-central1"),
+        ]);
+        assert_eq!(settings.settings["env"]["VERTEX_PROJECT"], "proj");
+        assert_eq!(settings.settings["env"]["VERTEX_REGION"], "us-central1");
+    }
+
+    /// #962: an azure global settings round-trip (set_env_kv → save → load)
+    /// preserves the config, and the native-client read path
+    /// (`read_native_env_string` shape) resolves it. Also exercises that the
+    /// `settings-azure.json` filename is the write target.
+    #[test]
+    fn azure_settings_round_trip_through_save_load() {
+        let dir = TempDir::new().unwrap();
+        let mut settings = load_settings(dir.path(), "azure").unwrap();
+        settings.set_env_kv(&[
+            ("AZURE_OPENAI_API_KEY", "azure-key-roundtrip"),
+            ("AZURE_OPENAI_RESOURCE", "res-rt"),
+        ]);
+        save_settings(dir.path(), &settings).unwrap();
+        assert!(
+            dir.path().join("settings-azure.json").exists(),
+            "azure config must write to settings-azure.json"
+        );
+        let reloaded = load_settings(dir.path(), "azure").unwrap();
+        assert_eq!(reloaded.settings["env"]["AZURE_OPENAI_RESOURCE"], "res-rt");
+        assert_eq!(
+            reloaded.settings["env"]["AZURE_OPENAI_API_KEY"],
+            "azure-key-roundtrip"
+        );
+    }
+
     #[test]
     fn default_settings_for_claude() {
         let p = get_provider("claude").unwrap();
@@ -419,6 +614,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(model_id_for_slot(dir.path(), 5), None);
+    }
+
+    #[test]
+    fn slot_pins_anthropic_base_url_detects_env_transport() {
+        let dir = TempDir::new().unwrap();
+        // 3P slot: env.ANTHROPIC_BASE_URL present → env-transport (needs exec-replace).
+        let cfg = dir.path().join("config-7");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"sk-x"}}"#,
+        )
+        .unwrap();
+        assert!(slot_pins_anthropic_base_url(dir.path(), 7));
+
+        // Top-level fallback location (no nested env).
+        let cfg2 = dir.path().join("config-8");
+        std::fs::create_dir_all(&cfg2).unwrap();
+        std::fs::write(
+            cfg2.join("settings.json"),
+            r#"{"ANTHROPIC_BASE_URL":"http://localhost:11434"}"#,
+        )
+        .unwrap();
+        assert!(slot_pins_anthropic_base_url(dir.path(), 8));
+    }
+
+    #[test]
+    fn slot_pins_anthropic_base_url_false_for_oauth_and_missing() {
+        let dir = TempDir::new().unwrap();
+        // Missing config dir entirely → false (fail-safe).
+        assert!(!slot_pins_anthropic_base_url(dir.path(), 3));
+        // Anthropic OAuth slot: settings.json present but no ANTHROPIC_BASE_URL.
+        let cfg = dir.path().join("config-4");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("settings.json"), r#"{"env":{}}"#).unwrap();
+        assert!(!slot_pins_anthropic_base_url(dir.path(), 4));
+        // Malformed JSON → false (fail-safe).
+        let cfg5 = dir.path().join("config-5");
+        std::fs::create_dir_all(&cfg5).unwrap();
+        std::fs::write(cfg5.join("settings.json"), b"{not json").unwrap();
+        assert!(!slot_pins_anthropic_base_url(dir.path(), 5));
     }
 
     /// M5: write an EU-only residency activation gate so the enterprise residency
@@ -482,6 +718,39 @@ mod tests {
         };
         save_settings(dir.path(), &settings).expect("save succeeds with no residency policy");
         assert!(dir.path().join(p.settings_filename).exists());
+    }
+
+    #[test]
+    fn key_fingerprint_falls_back_to_native_cred_env_var() {
+        // #962 MED-1: azure/vertex have catalog `key_env_var: None`, so
+        // `get_api_key()` returns None; `key_fingerprint()` must fall back to the
+        // native cred env var so `csq listkeys` shows the real masked key, not
+        // "(none)" (which read as "the key didn't save").
+        let azure = ProviderSettings {
+            provider_id: "azure".to_string(),
+            settings: serde_json::json!({
+                "env": { "AZURE_OPENAI_API_KEY": "sk-azure-abcdef123456" }
+            }),
+        };
+        let fp = azure.key_fingerprint();
+        assert_ne!(fp, "(none)", "azure fingerprint must not be (none)");
+        assert!(fp.contains("..."), "expected masked fingerprint, got {fp}");
+
+        let vertex = ProviderSettings {
+            provider_id: "vertex".to_string(),
+            settings: serde_json::json!({
+                "env": { "VERTEX_ACCESS_TOKEN": "ya29.abcdef1234567890" }
+            }),
+        };
+        assert_ne!(vertex.key_fingerprint(), "(none)");
+
+        // An unconfigured azure slot still reports (none) — the fallback resolves
+        // the env var but finds no value.
+        let empty = ProviderSettings {
+            provider_id: "azure".to_string(),
+            settings: serde_json::json!({ "env": {} }),
+        };
+        assert_eq!(empty.key_fingerprint(), "(none)");
     }
 
     /// DeepSeek's published tier asymmetry: opus/sonnet → pro, haiku

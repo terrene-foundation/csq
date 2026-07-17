@@ -614,6 +614,35 @@ pub struct SinkReceipt {
     pub inclusion_proof: Option<String>,
 }
 
+/// Structured Merkle inclusion proof carried in [`SinkReceipt::inclusion_proof`]
+/// by transparency-log sinks that produce one (currently `csq-ledger`).
+///
+/// [`SinkReceipt::inclusion_proof`] is a sink-specific opaque `String`; a sink
+/// MAY populate it with the JSON serialisation of this struct so the daemon
+/// anchor handler (#952 S3 / #1060) can project a structured
+/// `{leaf_index, tree_size, audit_path}` into the `csq.anchor.v1`
+/// `AnchorPayload.inclusion_proof` field instead of an opaque blob. Sinks that
+/// produce no per-entry proof leave the receipt field `None`.
+///
+/// The field names + wire shape match the enterprise SDK's `InclusionProof` DTO
+/// (defined in `the enterprise SDK crate`); csq-core cannot depend on that crate
+/// (edition/moat boundary), so this is the local mirror the daemon serialises.
+///
+/// TRUST NOTE (#1060 redteam F3): when surfaced in an `AnchorPayload`, this proof
+/// is the ledger server's response FORWARDED (after a cheap structural-soundness
+/// check) — it is NOT cryptographically re-verified against the record's
+/// canonical hash by the daemon. Consumers who need an independent guarantee MUST
+/// replay the `audit_path` against the server's signed checkpoint themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerInclusionProof {
+    /// Zero-based index of this leaf in the Merkle tree.
+    pub leaf_index: u64,
+    /// Total number of leaves in the tree at proof-generation time.
+    pub tree_size: u64,
+    /// Ordered sibling node hashes (each a 64-hex string) from leaf to root.
+    pub audit_path: Vec<String>,
+}
+
 /// Error from a [`crate::audit::traits::LedgerSink`] operation.
 ///
 /// `#[non_exhaustive]` so M07/M10 can add variants (`AuthExpired`,
@@ -1046,13 +1075,40 @@ pub enum EventKind {
     /// (community never constructs one). HIGH-1: every field is a `u64`, a hex
     /// key, or a structured timestamp — never free-text prose.
     PolicyBundleInstall,
+    /// M-DEK T-DEK.2 — an org-root key ceremony completed: ≥2 distinct
+    /// participants each contributed a random entropy share, and the org KEK was
+    /// derived from the HKDF of the XOR of all shares. Records the
+    /// `participant_count` (N ≥ 2) and the `ceremony_timestamp`.
+    ///
+    /// The ceremony record is NEVER signed by the org KEK (it is an encryption
+    /// key, not a signer — spec 26 §26.4); it is signed by a designated
+    /// participant/ceremony Ed25519 key. The producer (`csq-ee admin init-org`)
+    /// is enterprise-only and moat-stripped from the community edition; the kind
+    /// lives in the shared taxonomy so both editions compile it (community never
+    /// constructs one). HIGH-1: `participant_count` is a `usize` and
+    /// `ceremony_timestamp` is a structured timestamp — never free-text prose,
+    /// never a raw entropy share (shares are display-once, never persisted).
+    OrgRootCeremony,
+    /// M-DEK T-DEK.4 — a seat DEK succession (reanchor): the outgoing seat
+    /// DEK is superseded by a freshly generated incoming DEK. Carries both
+    /// public keys and the outgoing DEK's succession endorsement signature
+    /// (see [`SeatKeyReanchorPayload`] for the dual-signature design — the
+    /// OUTER record is signed by the audit signing key, never the seat DEK).
+    ///
+    /// The producer (`csq-ee admin rotate-seat`) is enterprise-only and
+    /// moat-stripped from the community edition; the kind lives in the
+    /// shared taxonomy so both editions compile it (community never
+    /// constructs one). HIGH-1: every field is a public key, a signature, or
+    /// a fixed-vocabulary reason tag — never free-text prose, never raw seed
+    /// material.
+    SeatKeyReanchor,
 }
 
 impl EventKind {
-    /// All 24 variants in declaration order. The wildcard-free match
+    /// All 26 variants in declaration order. The wildcard-free match
     /// in `event_payload_kind_matches_variant` is the compile-time
     /// drift catch; this array is for runtime iteration.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 26] = [
         Self::CsqRun,
         Self::OAuthRefresh,
         Self::ArtifactLoad,
@@ -1077,6 +1133,8 @@ impl EventKind {
         Self::EatpAttestation,
         Self::McpGateDecision,
         Self::PolicyBundleInstall,
+        Self::OrgRootCeremony,
+        Self::SeatKeyReanchor,
     ];
 }
 
@@ -1136,6 +1194,10 @@ pub enum EventPayload {
     McpGateDecision(McpGateDecisionPayload),
     /// See [`EventKind::PolicyBundleInstall`].
     PolicyBundleInstall(PolicyBundleInstallPayload),
+    /// See [`EventKind::OrgRootCeremony`].
+    OrgRootCeremony(OrgRootCeremonyPayload),
+    /// See [`EventKind::SeatKeyReanchor`].
+    SeatKeyReanchor(SeatKeyReanchorPayload),
 }
 
 impl EventPayload {
@@ -1169,6 +1231,8 @@ impl EventPayload {
             Self::EatpAttestation(_) => EventKind::EatpAttestation,
             Self::McpGateDecision(_) => EventKind::McpGateDecision,
             Self::PolicyBundleInstall(_) => EventKind::PolicyBundleInstall,
+            Self::OrgRootCeremony(_) => EventKind::OrgRootCeremony,
+            Self::SeatKeyReanchor(_) => EventKind::SeatKeyReanchor,
         }
     }
 }
@@ -1735,6 +1799,19 @@ pub struct GovernanceTurnPayload {
     /// pre-M5 records byte-identical + chain-verifiable.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub residency_policy_hash: Option<String>,
+    /// #980: SHA-256 of the governed subject this decision attests to, lowercase
+    /// hex — an OPTIONAL side-band field for the witnessed-transparency-log tier
+    /// that binds a governed turn to its subject WITHOUT storing the subject
+    /// bytes. Mirrors [`Self::kailash_canonical_hash`]: stored inside the signed
+    /// `CanonicalView` so the Ed25519 signature makes it tamper-evident.
+    ///
+    /// NOT part of any canonical PRE-IMAGE this session — its cross-SDK byte
+    /// position is terrene#40-gated (see `eatp_canonical::EatpAuditAnchor::
+    /// canonical_input`'s TODO(#980/terrene#40)). `skip_serializing_if`/`default`
+    /// keep every record written before this field byte-identical +
+    /// chain-verifiable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subject_hash: Option<Sha256Hex>,
 }
 
 /// Payload for [`EventKind::McpGateDecision`] (M6 T6.2 Shard 4 — the
@@ -1819,6 +1896,89 @@ pub struct PolicyBundleInstallPayload {
     pub installed_at: String,
 }
 
+/// Payload for [`EventKind::OrgRootCeremony`] (M-DEK T-DEK.2 — the org-root key
+/// ceremony that produced the org KEK).
+///
+/// HIGH-1 invariant: no raw untrusted free-text and no key material. The org KEK
+/// is written to the keychain, never to the chain; the participants' entropy
+/// shares are display-once and never persisted. This record carries ONLY the
+/// count of distinct participants and the ceremony timestamp — enough for an
+/// auditor to confirm the ≥2-participant 4-eyes property held, with no secret
+/// entering the signed chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OrgRootCeremonyPayload {
+    /// The org id this ceremony was performed for (non-secret; already public in
+    /// the `csq-ee-org-kek-<org_id>` keychain namespace). Makes the ceremony
+    /// record org-attributable from the chain alone — an auditor can confirm
+    /// WHICH org this ≥2-participant ceremony bound, not just that one occurred.
+    pub org_id: String,
+    /// The number of distinct `person_id` participants that contributed an
+    /// entropy share. MUST be ≥ 2 (a solo org KEK makes M7's 4-eyes gate
+    /// cosmetic); the producer enforces the floor before emitting this record.
+    pub participant_count: usize,
+    /// ISO-8601 UTC timestamp of the ceremony (the producer's own clock, the
+    /// [`GovernanceTurnPayload::governed_at`] analogue for the ceremony).
+    pub ceremony_timestamp: String,
+}
+
+/// Payload for [`EventKind::SeatKeyReanchor`] (M-DEK T-DEK.4 — a seat DEK
+/// succession / rotation).
+///
+/// # Dual-signature design (load-bearing)
+///
+/// The seat DEK signs NOTHING on the audit chain today. So the OUTER
+/// [`SignedRecord::signature`] on a `SeatKeyReanchor` record is the AUDIT
+/// SIGNING KEY — the SAME key that signs every other record kind — which is
+/// why this record verifies via `verify_chain` exactly like
+/// [`EventKind::OrgRootCeremony`] (key resolution is by `record.key_id()`
+/// against the audit-signing custody store, kind-agnostic). An OUTER
+/// signature from the seat DEK would resolve NOWHERE in that store and fail
+/// `verify_chain` with `KeyNotFound`.
+///
+/// Instead, the OUTGOING seat DEK signs an INNER endorsement —
+/// [`Self::seat_endorsement`] — over a domain-separated, chain-bound,
+/// length-prefixed (injective) succession pre-image, produced BEFORE the
+/// outgoing DEK is destroyed by the reanchor's persist step.
+/// `crate::audit::key_hierarchy::verify_seat_reanchor_chain` verifies this
+/// endorsement AND the succession chaining (a record's
+/// `previous_seat_pubkey` must equal the PRIOR reanchor record's
+/// `new_seat_pubkey`) independently of `verify_chain`.
+///
+/// Note: no raw seed / key material rides this payload — only public keys
+/// (safe to publish) and a signature.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SeatKeyReanchorPayload {
+    /// The seat id being reanchored (non-secret; already public in the
+    /// `csq-ee-seat-dek-<seat_id>` keychain namespace).
+    pub seat_id: String,
+    /// The OUTGOING seat's Ed25519 public key — superseded by this reanchor.
+    pub previous_seat_pubkey: Ed25519PublicKey,
+    /// The INCOMING seat's Ed25519 public key.
+    pub new_seat_pubkey: Ed25519PublicKey,
+    /// The OUTGOING seat DEK's signature over the domain-separated,
+    /// chain-bound, injective succession pre-image (v2):
+    /// `b"csq-ee/m-dek/seat-reanchor/v2" || u16be(len(chain_id)) ||
+    /// chain_id || u16be(len(seat_id)) || seat_id || previous_seat_pubkey
+    /// (32B) || new_seat_pubkey (32B) || u16be(len(reason)) ||
+    /// rotation_reason`, produced BEFORE the outgoing DEK is destroyed.
+    /// Every variable-length field is length-prefixed so the encoding is
+    /// injective (no two distinct field tuples collide to the same bytes),
+    /// and `chain_id` binds the endorsement to this specific audit chain
+    /// (SEC-3 parity with `KeyRotatePayload`'s rotation intent-hash).
+    /// Verified by `crate::audit::key_hierarchy::verify_seat_reanchor_chain`,
+    /// NOT by `verify_chain` (which verifies only the OUTER audit-key
+    /// signature).
+    pub seat_endorsement: Ed25519Signature,
+    /// Operator-stated reason for the reanchor.
+    ///
+    /// Defaults to [`RotationReason::Operator`] for consistency with
+    /// [`KeyRotatePayload::rotation_reason`].
+    #[serde(default = "default_rotation_reason")]
+    pub rotation_reason: RotationReason,
+}
+
 /// Payload for [`EventKind::EatpAttestation`] (M3 §10.5 W2b/W3 — born-canonical
 /// EATP genesis record and per-session-close attestations).
 ///
@@ -1876,6 +2036,17 @@ pub struct EatpAttestationPayload {
     /// emission.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub metadata_json: Option<String>,
+    /// #980: SHA-256 of the governed subject this attestation anchors, lowercase
+    /// hex — the OPTIONAL side-band field for the witnessed-transparency-log tier
+    /// (mirrors [`Self::kailash_canonical_hash`]). Stored inside the signed
+    /// `CanonicalView`, so the Ed25519 signature makes it tamper-evident.
+    ///
+    /// NOT part of the kailash canonical PRE-IMAGE this session — its cross-SDK
+    /// byte position is terrene#40-gated (see `eatp_canonical::EatpAuditAnchor::
+    /// canonical_input`'s TODO(#980/terrene#40)). `skip_serializing_if`/`default`
+    /// keep every pre-#980 record byte-identical + chain-verifiable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subject_hash: Option<Sha256Hex>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2602,13 +2773,15 @@ mod tests {
                 EventKind::EatpAttestation => "eatp_attestation",
                 EventKind::McpGateDecision => "mcp_gate_decision",
                 EventKind::PolicyBundleInstall => "policy_bundle_install",
+                EventKind::OrgRootCeremony => "org_root_ceremony",
+                EventKind::SeatKeyReanchor => "seat_key_reanchor",
             };
         }
     }
 
-    // Compile-time variant-count check; if a 25th variant lands, this
+    // Compile-time variant-count check; if a 27th variant lands, this
     // const-assert fails to compile.
-    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 24);
+    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 26);
 
     #[test]
     fn event_payload_kind_matches_variant() {
@@ -2737,6 +2910,7 @@ mod tests {
                     residency_verdict: None,
                     residency_policy_name: None,
                     residency_policy_hash: None,
+                    subject_hash: None,
                 }),
                 EventKind::EatpAttestation => {
                     EventPayload::EatpAttestation(EatpAttestationPayload {
@@ -2754,6 +2928,7 @@ mod tests {
                             "{\"csq_edition\":\"enterprise\",\"genesis_kind\":\"eatp_chain_init\"}"
                                 .to_string(),
                         ),
+                        subject_hash: None,
                     })
                 }
                 EventKind::McpGateDecision => {
@@ -2771,6 +2946,22 @@ mod tests {
                         bundle_version: 7,
                         bundle_pubkey: Ed25519PublicKey::new([0xaa; 32]),
                         installed_at: "2026-07-04T00:00:00+00:00".to_string(),
+                    })
+                }
+                EventKind::OrgRootCeremony => {
+                    EventPayload::OrgRootCeremony(OrgRootCeremonyPayload {
+                        org_id: "acme".to_string(),
+                        participant_count: 2,
+                        ceremony_timestamp: "2026-07-16T00:00:00+00:00".to_string(),
+                    })
+                }
+                EventKind::SeatKeyReanchor => {
+                    EventPayload::SeatKeyReanchor(SeatKeyReanchorPayload {
+                        seat_id: "seat-7".to_string(),
+                        previous_seat_pubkey: Ed25519PublicKey([0u8; 32]),
+                        new_seat_pubkey: Ed25519PublicKey([1u8; 32]),
+                        seat_endorsement: Ed25519Signature::new([0u8; 64]),
+                        rotation_reason: RotationReason::Operator,
                     })
                 }
             };

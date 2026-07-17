@@ -514,6 +514,31 @@ fn lifecycle_label(payload: &EventPayload) -> (String, String) {
                 format!("bundle v{} (pubkey {fp}…)", p.bundle_version),
             )
         }
+        // M-DEK T-DEK.2 — an org-root ceremony (own-op lifecycle record). Cites
+        // only non-secret fields: the org id (already public in the keychain
+        // namespace), the participant count, and the ceremony timestamp. No key
+        // material or entropy share reaches the chain.
+        P::OrgRootCeremony(p) => (
+            "org-root ceremony".into(),
+            format!(
+                "org {} — {} participants at {}",
+                p.org_id, p.participant_count, p.ceremony_timestamp
+            ),
+        ),
+        // M-DEK T-DEK.4 — a seat DEK succession (own-op lifecycle record).
+        // Cites only non-secret fields: the seat id (already public in the
+        // keychain namespace) and both public keys (safe to publish). The
+        // endorsement signature and seed material are never rendered.
+        P::SeatKeyReanchor(p) => (
+            "seat key reanchor".into(),
+            format!(
+                "seat {} — {} → {} ({:?})",
+                p.seat_id,
+                hex::encode(p.previous_seat_pubkey.as_bytes()),
+                hex::encode(p.new_seat_pubkey.as_bytes()),
+                p.rotation_reason
+            ),
+        ),
         // Governance kinds never reach here (classified above); exhaustive
         // match keeps this a compile-time drift catch if a kind is added.
         P::GovernanceTurn(_) | P::EatpAttestation(_) | P::McpGateDecision(_) => {
@@ -890,6 +915,7 @@ mod tests {
             residency_verdict: None,
             residency_policy_name: None,
             residency_policy_hash: None,
+            subject_hash: None,
         };
         mutate(&mut p);
         rec(

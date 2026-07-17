@@ -81,20 +81,50 @@ impl SourceHandle {
 /// `route_*` unit tests pin the matrix.
 #[derive(Debug, PartialEq, Eq)]
 enum RouteKind {
-    /// Source + target both ClaudeCode (Anthropic or 3P). In-flight
-    /// symlink repoint; no exec, no tombstone.
+    /// Source + target both ClaudeCode AND both OAuth/Anthropic (neither
+    /// pins `env.ANTHROPIC_BASE_URL`). In-flight symlink repoint; no exec,
+    /// no tombstone — CC re-stats `.credentials.json` and picks up the new
+    /// account on its next API call.
     SameSurfaceClaudeCode,
     /// Source + target both Codex. In-flight symlink repoint via the
     /// Codex-aware mirror (M10 / an internal journal entry). No exec, no tombstone.
     SameSurfaceCodex,
+    /// Both ClaudeCode, but at least ONE side is an env-transport slot
+    /// (3P / Ollama — `settings.json` pins `env.ANTHROPIC_BASE_URL` +
+    /// `env.ANTHROPIC_AUTH_TOKEN`). A running CC froze those env vars at
+    /// launch and never re-reads them, so an in-flight repoint cannot
+    /// switch the base URL / token — and a 3P→Anthropic repoint would leave
+    /// CC sending the freshly-repointed Anthropic OAuth token to the frozen
+    /// 3P endpoint (token exfiltration; see `daemon::auto_rotate` VP-F1).
+    /// MUST exec-replace so a fresh CC reads the new settings.json env at
+    /// startup. Tombstone + exec; the conversation does not transfer.
+    ClaudeCodeEnvTransportExecReplace,
     /// Source ≠ target surface. INV-P05 confirm + INV-P10 tombstone +
     /// `exec` of the target binary. Conversation does not transfer.
     CrossSurface,
 }
 
-fn route(source: Surface, target: Surface) -> RouteKind {
+/// Pure routing decision.
+///
+/// `source_env_transport` / `target_env_transport` are `true` when the
+/// respective slot pins `env.ANTHROPIC_BASE_URL` in its `config-<N>/settings.json`
+/// (3P / Ollama). They ONLY affect the `(ClaudeCode, ClaudeCode)` cell: an
+/// env-transport slot on either side forces the exec-replace path because a
+/// running CC cannot pick up a base-URL / auth-token change mid-process.
+fn route(
+    source: Surface,
+    target: Surface,
+    source_env_transport: bool,
+    target_env_transport: bool,
+) -> RouteKind {
     match (source, target) {
-        (Surface::ClaudeCode, Surface::ClaudeCode) => RouteKind::SameSurfaceClaudeCode,
+        (Surface::ClaudeCode, Surface::ClaudeCode) => {
+            if source_env_transport || target_env_transport {
+                RouteKind::ClaudeCodeEnvTransportExecReplace
+            } else {
+                RouteKind::SameSurfaceClaudeCode
+            }
+        }
         (Surface::Codex, Surface::Codex) => RouteKind::SameSurfaceCodex,
         _ => RouteKind::CrossSurface,
     }
@@ -130,7 +160,27 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     // from the keychain, not the symlinked `.credentials.json`).
     let handle_dir_path = source.path().to_path_buf();
 
-    let route_kind = route(source.surface(), target_surface);
+    // Env-transport discriminator for the (ClaudeCode, ClaudeCode) cell. A slot
+    // that pins `env.ANTHROPIC_BASE_URL` (3P: DeepSeek/Z.AI/MiniMax, or Ollama)
+    // injects its base URL + auth token into CC's process env at launch — FROZEN
+    // for the process lifetime. An in-flight symlink repoint cannot change them,
+    // so any swap touching such a slot on either side MUST exec-replace (a fresh
+    // CC reads the new settings.json env). The source flag is only knowable when
+    // the source marker resolved (`from_slot`); an absent marker conservatively
+    // reports `false` — the target flag alone still forces exec-replace whenever
+    // the TARGET is env-transport, which covers the Anthropic→3P direction.
+    let source_env_transport = from_slot
+        .map(|s| csq_core::providers::settings::slot_pins_anthropic_base_url(base_dir, s.get()))
+        .unwrap_or(false);
+    let target_env_transport =
+        csq_core::providers::settings::slot_pins_anthropic_base_url(base_dir, target.get());
+
+    let route_kind = route(
+        source.surface(),
+        target_surface,
+        source_env_transport,
+        target_env_transport,
+    );
 
     // A4a — close the daemon-custodian mid-swap race for a same-surface ClaudeCode
     // swap (the only path that repoints an EXISTING dir whose keychain still holds
@@ -164,8 +214,12 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
         RouteKind::SameSurfaceCodex => {
             same_surface_codex_audited(base_dir, source.path(), target, from_slot)
         }
-        RouteKind::CrossSurface => {
-            cross_surface_exec(base_dir, source, target, target_surface, yes, from_slot)
+        // Both env-transport-exec-replace (ClaudeCode 3P/Ollama) and true
+        // cross-surface swaps share the tombstone-then-exec machinery; they
+        // differ only in the confirmation wording, which `exec_replace_swap`
+        // derives from `same_surface` (== source/target surface equality).
+        RouteKind::ClaudeCodeEnvTransportExecReplace | RouteKind::CrossSurface => {
+            exec_replace_swap(base_dir, source, target, target_surface, yes, from_slot)
         }
     };
 
@@ -515,13 +569,19 @@ fn same_surface_codex(base_dir: &Path, source_dir: &Path, target: AccountNum) ->
     Ok(())
 }
 
-// ─── Cross-surface exec-replace path ────────────────────────────────
+// ─── Exec-replace path (cross-surface + ClaudeCode env-transport) ────
 
-/// Cross-surface exec-replace swap.
+/// Exec-replace swap. Handles BOTH true cross-surface swaps (e.g. Codex→Claude)
+/// AND same-surface ClaudeCode swaps that involve a 3P/Ollama env-transport slot
+/// (`RouteKind::ClaudeCodeEnvTransportExecReplace`). Both must tombstone the
+/// source handle dir and `exec` a fresh target binary because the running client
+/// froze its auth (surface binary, or `env.ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`)
+/// at launch and cannot switch it in-flight. The confirmation wording is derived
+/// from whether the SURFACE actually changed (`source_surface != target_surface`).
 ///
 /// ## Append-FIRST ordering (FIX-2, OD-3 corrected)
 ///
-/// The M13b audit contract for cross-surface swaps is:
+/// The M13b audit contract for exec-replace swaps is:
 ///
 /// 1. (optional) Emit INTENT — before any destructive operation.
 ///    If intent-persist fails and from_slot is known, FAIL CLOSED before the
@@ -538,7 +598,7 @@ fn same_surface_codex(base_dir: &Path, source_dir: &Path, target: AccountNum) ->
 ///
 /// exec(2) replaces the process so code after exec is unreachable on success.
 /// OUTCOME therefore MUST precede exec.
-fn cross_surface_exec(
+fn exec_replace_swap(
     base_dir: &Path,
     source: SourceHandle,
     target: AccountNum,
@@ -549,8 +609,31 @@ fn cross_surface_exec(
     let source_surface = source.surface();
     let is_cross_surface = source_surface != target_surface;
 
-    if is_cross_surface && !yes {
-        confirm_cross_surface(source_surface, target_surface)?;
+    // Resume is driven by the TARGET CLI's capability, applied on BOTH exec-replace
+    // routes (env-transport provider swap AND true cross-surface). Each CLI resumes
+    // its OWN most-recent conversation on relaunch:
+    //   - ClaudeCode → `claude --continue`. For an env-transport swap (Anthropic↔3P/
+    //     Ollama) this is the SAME thread: `projects/` is a SHARED_ITEM symlinked into
+    //     `~/.claude/` (see `session::isolation`), so the transcript survives the source
+    //     tombstone. For a cross-surface swap it is the user's most-recent Claude thread.
+    //   - Codex → `codex resume --last` (its `sessions`/`history.jsonl` are likewise
+    //     SHARED_ITEMS, so the most-recent codex session is reachable from the fresh dir).
+    //   - Gemini → no resume flag; gemini-cli starts fresh.
+    // Net effect: swapping surfaces picks up where you last were on the TARGET surface,
+    // and swapping back resumes the source surface's thread — nothing is lost either way.
+    let resume_conversation = matches!(target_surface, Surface::ClaudeCode | Surface::Codex);
+
+    if !is_cross_surface {
+        // Env-transport provider swap: the SAME thread resumes. No y/N prompt —
+        // nothing is lost — just an informational notice.
+        eprintln!(
+            "Switching provider for slot {target} and resuming this conversation \
+             (Claude Code restarts to load the new endpoint)…"
+        );
+    } else if !yes {
+        // True surface change: the current thread stays saved (swap back to resume it);
+        // the target surface's most-recent session resumes (or starts fresh for Gemini).
+        confirm_surface_switch(source_surface, target_surface, resume_conversation)?;
     }
 
     // ── Step 1: emit INTENT (before any destructive operation) ──────────────
@@ -638,8 +721,10 @@ fn cross_surface_exec(
     })?;
 
     match target_surface {
-        Surface::Codex => exec_codex_after_binding(base_dir, target, pid),
-        Surface::ClaudeCode => exec_claude_code_after_binding(base_dir, target, pid),
+        Surface::Codex => exec_codex_after_binding(base_dir, target, pid, resume_conversation),
+        Surface::ClaudeCode => {
+            exec_claude_code_after_binding(base_dir, target, pid, resume_conversation)
+        }
         Surface::Gemini => exec_gemini_after_binding(base_dir, target, pid),
     }
 }
@@ -702,11 +787,21 @@ fn rename_handle_dir_to_sweep_tombstone(source_path: &Path) -> std::io::Result<(
     std::fs::rename(source_path, &tombstone)
 }
 
-fn confirm_cross_surface(source: Surface, target: Surface) -> Result<()> {
+/// Confirmation for a true surface change (e.g. Claude↔Codex). The current
+/// surface's conversation is NOT destroyed — its transcript is a SHARED_ITEM, so
+/// swapping back resumes it. `target_resumes` reflects whether the TARGET CLI
+/// re-attaches to its own most-recent session (`claude --continue` /
+/// `codex resume --last`) or starts fresh (Gemini).
+fn confirm_surface_switch(source: Surface, target: Surface, target_resumes: bool) -> Result<()> {
     use std::io::{BufRead, Write};
+    let target_line = if target_resumes {
+        format!("Your most recent {target} session will resume.")
+    } else {
+        format!("A new {target} session will start.")
+    };
     eprintln!(
-        "Warning: swapping from {source} to {target} — the current \
-         conversation will not transfer across surfaces."
+        "Swapping from {source} to {target}. This {source} conversation stays saved — \
+         swap back to resume it. {target_line}"
     );
     eprint!("Continue? [y/N]: ");
     std::io::stderr().flush().ok();
@@ -720,18 +815,34 @@ fn confirm_cross_surface(source: Surface, target: Surface) -> Result<()> {
 }
 
 /// Exec the Codex binary after the target handle dir has already been created
-/// by `create_target_handle_dir`. The handle dir path is re-derived from the
-/// PID — `create_handle_dir_codex` is idempotent for the same pid.
+/// by `create_target_handle_dir`. The handle dir path is re-derived from the PID.
+///
+/// When `resume` is true (a swap INTO a Codex slot), exec `codex resume --last`
+/// so codex re-attaches to its most-recent session — codex's `sessions` /
+/// `history.jsonl` are SHARED_ITEMS symlinked into the shared codex store, so the
+/// last session is reachable from the fresh handle dir. Otherwise exec bare `codex`.
 #[cfg(unix)]
-fn exec_codex_after_binding(base_dir: &Path, target: AccountNum, pid: u32) -> Result<()> {
+fn exec_codex_after_binding(
+    base_dir: &Path,
+    target: AccountNum,
+    pid: u32,
+    resume: bool,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    // Re-derive the handle dir path (idempotent with create_handle_dir_codex).
-    let handle_dir = csq_core::session::handle_dir::create_handle_dir_codex(base_dir, target, pid)
-        .map_err(|e| anyhow!("failed to access Codex handle dir for slot {target}: {e}"))?;
+    // Re-derive the handle dir path — do NOT call `create_handle_dir_codex` again.
+    // `create_target_handle_dir` (step 3) already created `term-<pid>` and wrote its
+    // live `.live-pid`; a second create with the same pid trips the live-PID guard and
+    // aborts the swap. `create_handle_dir_codex` names the dir `term-<pid>`, so deriving
+    // the path here is exact. Mirrors the ClaudeCode + Gemini exec arms.
+    let handle_dir = base_dir.join(format!("term-{pid}"));
 
     let mut cmd = std::process::Command::new(codex_surface::CLI_BINARY);
     cmd.env(codex_surface::HOME_ENV_VAR, &handle_dir);
     cmd.env_remove("CLAUDE_CONFIG_DIR");
+    if resume {
+        // `codex resume --last`: re-attach to the most-recent recorded codex session.
+        cmd.arg("resume").arg("--last");
+    }
 
     let err = cmd.exec();
     Err(anyhow!(
@@ -743,15 +854,28 @@ fn exec_codex_after_binding(base_dir: &Path, target: AccountNum, pid: u32) -> Re
 
 /// Exec the ClaudeCode binary after the target handle dir has already been
 /// created by `create_target_handle_dir`.
+///
+/// When `resume` is true (any swap INTO a ClaudeCode slot), exec `claude --continue`.
+/// The transcript under `~/.claude/projects/` is a SHARED_ITEM that survives the
+/// source tombstone: for an env-transport provider swap this re-attaches to the SAME
+/// thread (seamless provider switch); for a cross-surface swap it re-attaches to the
+/// user's most-recent Claude thread.
 #[cfg(unix)]
-fn exec_claude_code_after_binding(base_dir: &Path, target: AccountNum, pid: u32) -> Result<()> {
+fn exec_claude_code_after_binding(
+    base_dir: &Path,
+    target: AccountNum,
+    pid: u32,
+    resume: bool,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let claude_home = super::claude_home()?;
-    let handle_dir =
-        csq_core::session::handle_dir::create_handle_dir(base_dir, &claude_home, target, pid)
-            .map_err(|e| {
-                anyhow!("failed to access ClaudeCode handle dir for slot {target}: {e}")
-            })?;
+    // Re-derive the handle dir path — do NOT call `create_handle_dir` again.
+    // `create_target_handle_dir` (step 3) already created `term-<pid>` and wrote
+    // its `.live-pid = <pid>`; a second `create_handle_dir` with the same pid sees
+    // that live marker and refuses ("in use by live PID … Refusing to remove"),
+    // which would abort every ClaudeCode-target exec-replace swap. `create_handle_dir`
+    // names the dir `term-<pid>` (see its impl), so deriving the path here is exact.
+    // Mirrors `exec_gemini_after_binding`, which already re-derives rather than recreates.
+    let handle_dir = base_dir.join(format!("term-{pid}"));
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
 
@@ -766,6 +890,12 @@ fn exec_claude_code_after_binding(base_dir: &Path, target: AccountNum, pid: u32)
     let mut cmd = std::process::Command::new("claude");
     cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
     cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    if resume {
+        // `-c/--continue`: re-attach to the most recent conversation in the CWD.
+        // The transcript is shared across handle dirs (SHARED_ITEMS `projects`),
+        // so the provider swap resumes the same session seamlessly.
+        cmd.arg("--continue");
+    }
 
     let err = cmd.exec();
     Err(anyhow!(
@@ -775,7 +905,12 @@ fn exec_claude_code_after_binding(base_dir: &Path, target: AccountNum, pid: u32)
 }
 
 #[cfg(not(unix))]
-fn exec_codex_after_binding(_base_dir: &Path, _target: AccountNum, _pid: u32) -> Result<()> {
+fn exec_codex_after_binding(
+    _base_dir: &Path,
+    _target: AccountNum,
+    _pid: u32,
+    _resume: bool,
+) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
          On Windows, exit the current surface and run `csq run <N>`."
@@ -783,7 +918,12 @@ fn exec_codex_after_binding(_base_dir: &Path, _target: AccountNum, _pid: u32) ->
 }
 
 #[cfg(not(unix))]
-fn exec_claude_code_after_binding(_base_dir: &Path, _target: AccountNum, _pid: u32) -> Result<()> {
+fn exec_claude_code_after_binding(
+    _base_dir: &Path,
+    _target: AccountNum,
+    _pid: u32,
+    _resume: bool,
+) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
          On Windows, exit the current surface and run `csq run <N>`."
@@ -952,13 +1092,53 @@ mod tests {
 
     // ── PR-C9b L-CDX-3 — dispatcher routing matrix ────────────────────
 
-    /// Pinning: ClaudeCode→ClaudeCode MUST stay on the same-surface
+    /// Pinning: ClaudeCode→ClaudeCode with BOTH sides OAuth/Anthropic
+    /// (neither pins env.ANTHROPIC_BASE_URL) MUST stay on the same-surface
     /// in-flight repoint path.
     #[test]
     fn route_claudecode_to_claudecode_is_same_surface_claudecode() {
         assert_eq!(
-            route(Surface::ClaudeCode, Surface::ClaudeCode),
+            route(Surface::ClaudeCode, Surface::ClaudeCode, false, false),
             RouteKind::SameSurfaceClaudeCode
+        );
+    }
+
+    /// Regression guard for the Anthropic↔3P swap bug: a ClaudeCode→ClaudeCode
+    /// swap where EITHER side is an env-transport slot (3P/Ollama pinning
+    /// env.ANTHROPIC_BASE_URL) MUST take the exec-replace path — a running CC
+    /// froze its base URL + token at launch and cannot switch in-flight, and a
+    /// 3P→Anthropic in-flight repoint would exfiltrate the Anthropic OAuth token
+    /// to the frozen 3P endpoint.
+    #[test]
+    fn route_claudecode_env_transport_forces_exec_replace() {
+        // target is 3P (Anthropic → DeepSeek/Z.AI/MiniMax/Ollama).
+        assert_eq!(
+            route(Surface::ClaudeCode, Surface::ClaudeCode, false, true),
+            RouteKind::ClaudeCodeEnvTransportExecReplace
+        );
+        // source is 3P (3P → Anthropic) — the exfiltration-risk direction.
+        assert_eq!(
+            route(Surface::ClaudeCode, Surface::ClaudeCode, true, false),
+            RouteKind::ClaudeCodeEnvTransportExecReplace
+        );
+        // both 3P (3P → different 3P).
+        assert_eq!(
+            route(Surface::ClaudeCode, Surface::ClaudeCode, true, true),
+            RouteKind::ClaudeCodeEnvTransportExecReplace
+        );
+    }
+
+    /// The env-transport flags ONLY affect the (ClaudeCode, ClaudeCode) cell;
+    /// a true surface change always routes CrossSurface regardless of them.
+    #[test]
+    fn route_env_transport_flags_do_not_affect_cross_surface() {
+        assert_eq!(
+            route(Surface::ClaudeCode, Surface::Codex, true, true),
+            RouteKind::CrossSurface
+        );
+        assert_eq!(
+            route(Surface::Codex, Surface::ClaudeCode, true, true),
+            RouteKind::CrossSurface
         );
     }
 
@@ -969,7 +1149,7 @@ mod tests {
     #[test]
     fn route_codex_to_codex_is_same_surface_codex() {
         assert_eq!(
-            route(Surface::Codex, Surface::Codex),
+            route(Surface::Codex, Surface::Codex, false, false),
             RouteKind::SameSurfaceCodex
         );
     }
@@ -979,11 +1159,11 @@ mod tests {
     #[test]
     fn route_cross_surface_is_cross_surface() {
         assert_eq!(
-            route(Surface::ClaudeCode, Surface::Codex),
+            route(Surface::ClaudeCode, Surface::Codex, false, false),
             RouteKind::CrossSurface
         );
         assert_eq!(
-            route(Surface::Codex, Surface::ClaudeCode),
+            route(Surface::Codex, Surface::ClaudeCode, false, false),
             RouteKind::CrossSurface
         );
     }
@@ -992,7 +1172,7 @@ mod tests {
     #[test]
     fn route_gemini_to_claudecode_is_cross_surface() {
         assert_eq!(
-            route(Surface::Gemini, Surface::ClaudeCode),
+            route(Surface::Gemini, Surface::ClaudeCode, false, false),
             RouteKind::CrossSurface
         );
     }
@@ -1001,7 +1181,7 @@ mod tests {
     #[test]
     fn route_claudecode_to_gemini_is_cross_surface() {
         assert_eq!(
-            route(Surface::ClaudeCode, Surface::Gemini),
+            route(Surface::ClaudeCode, Surface::Gemini, false, false),
             RouteKind::CrossSurface
         );
     }
@@ -1010,7 +1190,7 @@ mod tests {
     #[test]
     fn route_codex_to_gemini_is_cross_surface() {
         assert_eq!(
-            route(Surface::Codex, Surface::Gemini),
+            route(Surface::Codex, Surface::Gemini, false, false),
             RouteKind::CrossSurface
         );
     }
@@ -1019,7 +1199,7 @@ mod tests {
     #[test]
     fn route_gemini_to_codex_is_cross_surface() {
         assert_eq!(
-            route(Surface::Gemini, Surface::Codex),
+            route(Surface::Gemini, Surface::Codex, false, false),
             RouteKind::CrossSurface
         );
     }
@@ -1032,7 +1212,7 @@ mod tests {
     #[test]
     fn route_gemini_to_gemini_is_cross_surface_path() {
         assert_eq!(
-            route(Surface::Gemini, Surface::Gemini),
+            route(Surface::Gemini, Surface::Gemini, false, false),
             RouteKind::CrossSurface
         );
     }
@@ -1244,7 +1424,7 @@ mod tests {
         // in-flight `handle_dir::repoint_handle_dir` path (M4-8's only
         // ClaudeCode swap entry).
         assert_eq!(
-            route(Surface::ClaudeCode, Surface::ClaudeCode),
+            route(Surface::ClaudeCode, Surface::ClaudeCode, false, false),
             RouteKind::SameSurfaceClaudeCode,
         );
     }
@@ -1400,6 +1580,41 @@ mod tests {
         assert!(
             src.contains("Step 4: emit OUTCOME"),
             "swap.rs must contain the Step 4 OUTCOME-before-exec sentinel"
+        );
+    }
+
+    /// Regression guard for the double-create bug: the step-5 exec helpers MUST
+    /// re-derive the target handle dir path (`term-<pid>`), NOT call the create fn
+    /// a second time. `create_target_handle_dir` (step 3) already created the dir
+    /// and wrote its live `.live-pid`; a second `create_handle_dir[_codex]` with the
+    /// same pid trips the live-PID guard ("in use by live PID … Refusing to remove")
+    /// and aborts every exec-replace swap to a ClaudeCode/Codex target.
+    #[test]
+    fn exec_helpers_rederive_handle_dir_not_recreate() {
+        let src = include_str!("swap.rs");
+        // Split off the test module so we only inspect production code.
+        let prod = src
+            .split("mod tests")
+            .next()
+            .expect("swap.rs must have production code before the test module");
+        // All three step-5 exec arms (ClaudeCode, Codex, Gemini) MUST re-derive the
+        // target handle dir by path rather than calling the create fn a second time.
+        // `create_target_handle_dir` (step 3) is the SINGLE creator; a second create
+        // with the same pid trips the live-PID guard and aborts the swap.
+        assert!(
+            prod.matches("base_dir.join(format!(\"term-{pid}\"))")
+                .count()
+                >= 3,
+            "all three exec arms must re-derive term-<pid> by path (double-create trips \
+             the live-PID guard — see exec_*_after_binding)"
+        );
+        // create_handle_dir must appear EXACTLY once in production (step 3's creator);
+        // create_handle_dir_codex likewise. A second occurrence means an exec arm
+        // regressed to re-creating.
+        assert_eq!(
+            prod.matches("handle_dir::create_handle_dir(").count(),
+            1,
+            "create_handle_dir must be called exactly once (step 3 creator only)"
         );
     }
 

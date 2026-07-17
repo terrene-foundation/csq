@@ -194,11 +194,6 @@ async fn accept_loop(
     app: std::sync::Arc<axum::Router>,
     shutdown: CancellationToken,
 ) {
-    use hyper::service::service_fn;
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use hyper_util::server::conn::auto;
-    use tower::ServiceExt;
-
     loop {
         // Wait for either shutdown or a client connecting.
         tokio::select! {
@@ -318,6 +313,7 @@ mod tests {
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(
                 crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),

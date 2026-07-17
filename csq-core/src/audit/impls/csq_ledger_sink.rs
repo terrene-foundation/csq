@@ -11,8 +11,11 @@
 //!
 //! - `append(record)` → `POST <url>/v1/log/entries` with the `SignedRecord`
 //!   JSON body; parses `{ inclusion_proof, log_index, checkpoint_at_submit }`
-//!   and returns a [`SinkReceipt`] carrying the log index as `sink_id` and the
-//!   checkpoint root as the inclusion-proof summary.
+//!   and returns a [`SinkReceipt`](crate::audit::types::SinkReceipt) carrying the log index as `sink_id` and a
+//!   structured [`crate::audit::types::LedgerInclusionProof`] JSON
+//!   (`{leaf_index, tree_size, audit_path}`) as the `inclusion_proof` — or
+//!   `None` when the server returned no checkpoint (honest-null, #1060 redteam).
+//!   The blocking `reqwest` transport is invoked inside `spawn_blocking`.
 //! - `verify_at(id)` → `GET <url>/v1/log/entries/{id}`; parses the returned
 //!   record and returns it (the daemon compares against its local canonical
 //!   hash — a mismatch is `SinkError::Drift`).
@@ -28,10 +31,11 @@
 //! # Server-key pinning (M10 limitation — rust-R5)
 //!
 //! This sink does NOT consume `GET /v1/checkpoint` and does NOT pin the
-//! csq-ledger server's checkpoint signing key. `append` decodes only
-//! `{inclusion_proof, log_index}` from the submit response (the embedded
-//! `checkpoint_at_submit` is discarded), and `verify_at` decodes only the
-//! returned record. There is no configured expected `signed_by_key_id` to
+//! csq-ledger server's checkpoint signing key. `append` decodes
+//! `{inclusion_proof, log_index}` plus `checkpoint_at_submit.tree_size` from the
+//! submit response (only to SIZE the structured inclusion proof — #1060; the
+//! checkpoint root + signature are NOT verified), and `verify_at` decodes only
+//! the returned record. There is no configured expected `signed_by_key_id` to
 //! compare against in M10. CONSEQUENCE: a man-in-the-middle (or a swapped server
 //! behind the configured URL) that returns a validly-shaped response is NOT
 //! detected by this sink. Operators MUST pin the server out-of-band — terminate
@@ -39,7 +43,7 @@
 //! the server with a reverse proxy / mTLS per spec 17 §17.9), and/or verify the
 //! `GET /v1/checkpoint` `signed_by_key_id` against the expected server key id
 //! through a separate trusted channel. Configurable in-sink key pinning is
-//! Phase B (would add an `expected_key_id` field to [`CsqLedgerConfig`] and a
+//! Phase B (would add an `expected_key_id` field to [`CsqLedgerConfig`](crate::audit::impls::csq_ledger_sink::CsqLedgerConfig) and a
 //! checkpoint-signature check on each `append`).
 
 // `HashMap` and `Mutex` are only used in the mock_in_memory helper, which is
@@ -84,7 +88,11 @@ impl Default for CsqLedgerConfig {
 /// server (spec 15 §15.4.2 mock-substrate policy).
 ///
 /// Returns `(status_code, body_bytes)` or a transport error string.
-type Transport = Box<
+///
+/// `Arc` (not `Box`) so `append`/`verify_at` can clone it into
+/// `tokio::task::spawn_blocking` — the production transport is the BLOCKING
+/// `reqwest` client and must not run on a tokio worker thread (#1060 redteam B1).
+type Transport = std::sync::Arc<
     dyn Fn(HttpMethod, String, Option<Vec<u8>>) -> Result<(u16, Vec<u8>), String> + Send + Sync,
 >;
 
@@ -124,7 +132,7 @@ impl CsqLedgerSink {
     pub fn new(config: CsqLedgerConfig) -> Result<Self, IdError> {
         let base = config.url.clone();
         let transport: Transport =
-            Box::new(move |method, path, body| live_request(&base, method, &path, body));
+            std::sync::Arc::new(move |method, path, body| live_request(&base, method, &path, body));
         Ok(Self {
             name: SinkName::try_new("csq-ledger")?,
             config,
@@ -159,7 +167,7 @@ impl CsqLedgerSink {
         let store: std::sync::Arc<Mutex<HashMap<String, SignedRecord>>> =
             std::sync::Arc::new(Mutex::new(HashMap::new()));
         let counter = std::sync::Arc::new(Mutex::new(0u64));
-        let transport: Transport = Box::new(move |method, path, body| match method {
+        let transport: Transport = std::sync::Arc::new(move |method, path, body| match method {
             HttpMethod::Post => {
                 let body = body.ok_or_else(|| "missing POST body".to_string())?;
                 let record: SignedRecord =
@@ -227,11 +235,21 @@ impl LedgerSink for CsqLedgerSink {
             message: RedactedString::from_untrusted(e.to_string()),
         })?;
         let path = "/v1/log/entries".to_string();
-        let (status, resp) = (self.transport)(HttpMethod::Post, path, Some(body)).map_err(|e| {
-            SinkError::Unreachable {
-                message: RedactedString::from_untrusted(e),
-            }
-        })?;
+        // #1060 redteam B1 — the production transport is a BLOCKING `reqwest`
+        // client; run it on a blocking pool so it never stalls a tokio worker
+        // thread (the daemon serves every IPC route on that pool).
+        let transport = std::sync::Arc::clone(&self.transport);
+        let (status, resp) =
+            tokio::task::spawn_blocking(move || transport(HttpMethod::Post, path, Some(body)))
+                .await
+                .map_err(|_join| SinkError::Internal {
+                    message: RedactedString::from_trusted(
+                        "csq-ledger transport task failed".to_string(),
+                    ),
+                })?
+                .map_err(|e| SinkError::Unreachable {
+                    message: RedactedString::from_untrusted(e),
+                })?;
         if status != 200 {
             return Err(SinkError::Rejected {
                 message: RedactedString::from_trusted(format!("csq-ledger returned HTTP {status}")),
@@ -246,22 +264,57 @@ impl LedgerSink for CsqLedgerSink {
                 message: RedactedString::from_trusted(e.to_string()),
             }
         })?;
+        // #1060 — project the wire response into a STRUCTURED
+        // `{leaf_index, tree_size, audit_path}` proof so the daemon anchor
+        // handler surfaces a real `AnchorPayload.inclusion_proof` instead of a
+        // bare hash array. `leaf_index` = the log index; `tree_size` comes from
+        // the checkpoint-at-submit summary; `audit_path` = the sibling hashes.
+        //
+        // #1060 redteam F1 — HONEST-NULL, never fabricate: when the server
+        // returned no checkpoint (`tree_size` 0/absent) there is no verifiable
+        // tree to prove inclusion in. Emit `None` so the daemon boundary
+        // surfaces `inclusion_proof: null` rather than a structurally-impossible
+        // `{leaf_index: N, tree_size: 0}` proof (0 is a concrete, wrong claim —
+        // "empty tree containing leaf N" — not "absent"). The daemon's
+        // structural-soundness gate (`project_inclusion_proof`) is the backstop.
+        let tree_size = parsed
+            .checkpoint_at_submit
+            .as_ref()
+            .map(|c| c.tree_size)
+            .unwrap_or(0);
+        let inclusion_proof = if tree_size == 0 {
+            None
+        } else {
+            let proof = crate::audit::types::LedgerInclusionProof {
+                leaf_index: parsed.log_index,
+                tree_size,
+                audit_path: parsed.inclusion_proof,
+            };
+            Some(serde_json::to_string(&proof).unwrap_or_default())
+        };
         Ok(SinkReceipt {
             sink: self.name.clone(),
             sink_id,
             anchored_at: record.ts.clone(),
-            inclusion_proof: Some(
-                serde_json::to_string(&parsed.inclusion_proof).unwrap_or_default(),
-            ),
+            inclusion_proof,
         })
     }
 
     async fn verify_at(&self, id: &RecordId) -> Result<SignedRecord, SinkError> {
         let path = format!("/v1/log/entries/{}", id.as_str());
+        // #1060 redteam B1 — blocking transport off the tokio worker pool.
+        let transport = std::sync::Arc::clone(&self.transport);
         let (status, resp) =
-            (self.transport)(HttpMethod::Get, path, None).map_err(|e| SinkError::Unreachable {
-                message: RedactedString::from_untrusted(e),
-            })?;
+            tokio::task::spawn_blocking(move || transport(HttpMethod::Get, path, None))
+                .await
+                .map_err(|_join| SinkError::Internal {
+                    message: RedactedString::from_trusted(
+                        "csq-ledger transport task failed".to_string(),
+                    ),
+                })?
+                .map_err(|e| SinkError::Unreachable {
+                    message: RedactedString::from_untrusted(e),
+                })?;
         if status == 404 {
             return Err(SinkError::NotFound {
                 record_id: id.clone(),
@@ -286,6 +339,21 @@ impl LedgerSink for CsqLedgerSink {
 struct SubmitResponse {
     inclusion_proof: Vec<String>,
     log_index: u64,
+    /// The checkpoint the server had at submit time. Optional: the daemon does
+    /// NOT pin the checkpoint signing key (M10 limitation, see module note), and
+    /// only `tree_size` is consumed — to size the structured inclusion proof
+    /// (#1060). Absent → `tree_size` defaults to 0 (honest, never fabricated).
+    #[serde(default)]
+    checkpoint_at_submit: Option<CheckpointSummary>,
+}
+
+/// Minimal checkpoint summary — only the field the structured inclusion proof
+/// needs. The full checkpoint (root hash, signature, key id) is intentionally
+/// not decoded here (M10 does not pin the server key; see module note).
+#[derive(serde::Deserialize)]
+struct CheckpointSummary {
+    #[serde(default)]
+    tree_size: u64,
 }
 
 /// Entry response shape (mirror of `csq-ledger`'s `EntryResponse`).
@@ -294,10 +362,12 @@ struct EntryResponse {
     record: SignedRecord,
 }
 
-/// Live `reqwest` transport used in production. Uses the blocking client inside
-/// `spawn_blocking` to keep the async trait body non-blocking.
+/// Live `reqwest` transport used in production. This is a BLOCKING call; the
+/// `LedgerSink` impls (`append` / `verify_at`) invoke it inside
+/// `tokio::task::spawn_blocking` so it never runs on a tokio worker thread
+/// (#1060 redteam B1).
 ///
-/// The `_config` URL is the base; `path` is appended.
+/// The `base` URL is the base; `path` is appended.
 fn live_request(
     base: &str,
     method: HttpMethod,
@@ -371,6 +441,56 @@ mod tests {
         assert!(receipt.sink_id.as_str().starts_with("csq-ledger-"));
         let fetched = sink.verify_at(&record.record_id).await.expect("verify");
         assert_eq!(fetched, record);
+    }
+
+    /// `test csq_ledger_sink_append_returns_structured_inclusion_proof`
+    ///
+    /// #1060 — the receipt's `inclusion_proof` string MUST parse as a structured
+    /// [`crate::audit::types::LedgerInclusionProof`] with `leaf_index` = the log
+    /// index, `tree_size` from the checkpoint summary, and `audit_path` = the
+    /// returned sibling hashes. The in-memory mock's first POST returns
+    /// `log_index=0`, `checkpoint_at_submit.tree_size=1`, empty proof.
+    #[tokio::test]
+    async fn csq_ledger_sink_append_returns_structured_inclusion_proof() {
+        let sink = CsqLedgerSink::mock_in_memory();
+        let record = sample("01JZ00000000000000000000Z2");
+        let receipt = sink.append(&record).await.expect("append");
+        let proof_str = receipt
+            .inclusion_proof
+            .expect("csq-ledger receipt carries a structured inclusion_proof");
+        let proof: crate::audit::types::LedgerInclusionProof =
+            serde_json::from_str(&proof_str).expect("parses as LedgerInclusionProof");
+        assert_eq!(proof.leaf_index, 0, "first mock append → leaf_index 0");
+        assert_eq!(
+            proof.tree_size, 1,
+            "checkpoint_at_submit.tree_size = log_index + 1 = 1"
+        );
+        assert!(
+            proof.audit_path.is_empty(),
+            "mock returns an empty audit_path"
+        );
+    }
+
+    /// `test csq_ledger_sink_append_honest_null_when_no_checkpoint`
+    ///
+    /// #1060 redteam F1 — when the server response omits `checkpoint_at_submit`
+    /// (no `tree_size`), the sink MUST emit `inclusion_proof: None` rather than a
+    /// structurally-impossible `{leaf_index: N, tree_size: 0}` proof.
+    #[tokio::test]
+    async fn csq_ledger_sink_append_honest_null_when_no_checkpoint() {
+        let transport: Transport = std::sync::Arc::new(|_method, _path, _body| {
+            Ok((200, br#"{"inclusion_proof":[],"log_index":5}"#.to_vec()))
+        });
+        let sink =
+            CsqLedgerSink::with_mock_transport(CsqLedgerConfig::default(), transport).unwrap();
+        let record = sample("01JZ00000000000000000000Z3");
+        let receipt = sink.append(&record).await.expect("append");
+        assert!(
+            receipt.inclusion_proof.is_none(),
+            "no checkpoint → honest null, not a tree_size:0 proof"
+        );
+        // sink_id still carries the log index.
+        assert_eq!(receipt.sink_id.as_str(), "csq-ledger-5");
     }
 
     /// `test csq_ledger_sink_verify_missing_returns_not_found`

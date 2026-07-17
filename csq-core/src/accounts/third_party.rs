@@ -72,6 +72,82 @@ pub fn validate_key_shape(key: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validates an operator-supplied endpoint component that is interpolated into
+/// a native provider's request URL — Azure `resource`/`deployment`/`api-version`
+/// and Vertex `project`/`region` (#962).
+///
+/// # Why this exists (security review #962 H1 — credential-redirection defense)
+///
+/// These values are interpolated into
+/// `https://{resource}.openai.azure.com/openai/deployments/{deployment}/…` and
+/// `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/…`. A
+/// doctored component such as `resource = "evil.example.com/"` yields a URL
+/// whose HOST is `evil.example.com`, redirecting the live paid `api-key` /
+/// Bearer service-account token to an attacker-chosen host (an SSRF-class
+/// credential leak). `validate_key_shape` guards the KEY; this guards every
+/// non-key field that reaches the URL.
+///
+/// The allowlist model (only `allowed` chars pass) structurally forecloses the
+/// redirection primitives — `/` (host termination / path injection), `:`
+/// (scheme/port), `@` (userinfo), `?`/`#` (query/fragment), whitespace, and
+/// control bytes are all outside every caller's allowed set. `..` is rejected
+/// explicitly regardless of `allowed`, closing path-traversal in the segment
+/// fields. The native client applies a second, independent host-suffix assert
+/// before the POST (defense-in-depth).
+///
+/// # Errors
+///
+/// [`ConfigError::MergeConflict`] with a field-named, actionable message when
+/// the value is empty, over `max_len`, contains `..`, or contains any character
+/// outside `allowed`.
+pub fn validate_endpoint_component(
+    value: &str,
+    field: &str,
+    allowed: fn(char) -> bool,
+    max_len: usize,
+) -> Result<(), ConfigError> {
+    if value.is_empty() {
+        return Err(ConfigError::MergeConflict {
+            key: format!("{field} must not be empty"),
+        });
+    }
+    if value.len() > max_len {
+        return Err(ConfigError::MergeConflict {
+            key: format!(
+                "{field} too long (max {max_len} chars, got {})",
+                value.len()
+            ),
+        });
+    }
+    if value.contains("..") {
+        return Err(ConfigError::MergeConflict {
+            key: format!("{field} must not contain '..'"),
+        });
+    }
+    if let Some(bad) = value.chars().find(|c| !allowed(*c)) {
+        return Err(ConfigError::MergeConflict {
+            key: format!(
+                "{field} contains an invalid character {bad:?} — only unreserved endpoint characters are allowed"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// `true` for the Azure resource-name / Vertex project / Vertex region charset:
+/// lowercase ASCII alphanumerics and hyphen. Excludes `.`, `/`, `:`, `@`, and
+/// all other URL-structural bytes. Used by [`validate_endpoint_component`].
+pub fn is_dns_label_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
+}
+
+/// `true` for the Azure deployment-name / api-version charset: ASCII
+/// alphanumerics plus `.`, `_`, `-` (valid path-segment bytes, no host- or
+/// segment-redirection primitives). Used by [`validate_endpoint_component`].
+pub fn is_path_segment_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+}
+
 /// Removes the catalog-declared `extra_env` keys belonging to whatever
 /// provider currently owns this slot's `env` block, identified via
 /// `ANTHROPIC_BASE_URL` → host classification → catalog id → provider
@@ -627,6 +703,60 @@ mod tests {
     use super::*;
     use crate::accounts::discovery;
     use tempfile::TempDir;
+
+    // ── #962 H1: endpoint-component allowlist validator ──────────────────────
+
+    #[test]
+    fn validate_endpoint_component_accepts_valid_values() {
+        assert!(
+            validate_endpoint_component("myresource", "resource", is_dns_label_char, 63).is_ok()
+        );
+        assert!(
+            validate_endpoint_component("us-central1", "region", is_dns_label_char, 40).is_ok()
+        );
+        assert!(
+            validate_endpoint_component("my-gcp-project", "project", is_dns_label_char, 30).is_ok()
+        );
+        assert!(
+            validate_endpoint_component("gpt-5.5_v2", "deployment", is_path_segment_char, 64)
+                .is_ok()
+        );
+        assert!(validate_endpoint_component(
+            "2024-06-01-preview",
+            "api-version",
+            is_path_segment_char,
+            20
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_endpoint_component_rejects_redirection_and_injection() {
+        // Host-termination / path-injection / userinfo / scheme / query / fragment.
+        for bad in [
+            "evil.com/",
+            "a:1",
+            "u@h",
+            "a?b",
+            "a#b",
+            "a b",
+            "a\tb",
+            "a\rb",
+            "a\nb",
+        ] {
+            assert!(
+                validate_endpoint_component(bad, "f", is_dns_label_char, 63).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        // Path traversal, rejected regardless of the allowed charset.
+        assert!(validate_endpoint_component("a..b", "f", is_path_segment_char, 64).is_err());
+        // Dot is not a DNS-label char (host-boundary hardening for resource/project/region).
+        assert!(validate_endpoint_component("a.b", "f", is_dns_label_char, 63).is_err());
+        // Empty + overlong.
+        assert!(validate_endpoint_component("", "f", is_dns_label_char, 63).is_err());
+        assert!(validate_endpoint_component(&"a".repeat(64), "f", is_dns_label_char, 63).is_err());
+    }
 
     /// Plant the post-M4-12 host shape: `by_slot` → `identities/<uuid>/` with the
     /// given provider + matching credential, and NO legacy mirror. This is the

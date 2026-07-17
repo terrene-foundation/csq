@@ -123,17 +123,38 @@ fn stage_anthropic_identity_slot(base: &std::path::Path, n: u16) {
 }
 
 /// (M06-1) `--no-audit` appears in `csq run --help` output.
+///
+/// MUST spawn through the hermetic `clean_cmd()` (env_clear + whitelist), NOT a
+/// raw `Command::new(csq_bin())`. The raw form inherited the CI runner's full
+/// parent environment and emitted empty stdout on `windows-latest` while passing
+/// on macOS/Linux (an internal ticket) — the exact `rules/testing.md` Rule 4a /
+/// `rules/test-hermeticity.md` MUST-2 bug class: an inherited parent-env var
+/// perturbs the spawned binary's output on Windows only. Every sibling subprocess
+/// test in this file already uses `clean_cmd()` and is green on Windows; this was
+/// the lone raw-spawn outlier. Exit status + combined stdout/stderr are asserted
+/// so a genuine empty-output regression still fails loudly (it cannot be masked
+/// as a capture artifact).
 #[test]
 fn no_audit_flag_in_run_help() {
-    let out = Command::new(csq_bin())
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let out = clean_cmd(None)
         .args(["run", "--help"])
         .output()
         .expect("failed to spawn csq run --help");
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        stdout.contains("no-audit"),
-        "`csq run --help` must mention '--no-audit'; got:\n{stdout}"
+        out.status.success(),
+        "`csq run --help` must exit 0; status={:?}\noutput:\n{combined}",
+        out.status
+    );
+    assert!(
+        combined.contains("no-audit"),
+        "`csq run --help` must mention '--no-audit'; got (stdout+stderr):\n{combined}"
     );
 }
 

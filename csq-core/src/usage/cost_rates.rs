@@ -9,28 +9,112 @@
 //! Rates are USD per 1M tokens. `Unknown` is used when no rate exists for a
 //! model name — caller renders cost as `n/a` rather than guessing.
 
-/// Cost rate for one model. Both fields are USD per 1,000,000 tokens.
+/// Cost rate for one model. `input`/`output` fields are USD per 1,000,000
+/// tokens. `cache_eligible` marks whether this model's prompt-cache tokens
+/// should be billed with the Anthropic multipliers ([`CACHE_WRITE_INPUT_MULTIPLIER`]
+/// / [`CACHE_READ_INPUT_MULTIPLIER`]) — true ONLY for the Anthropic Claude
+/// family, where those prices are exact. Deriving cache-eligibility from the
+/// matched rate ROW (not a separate model-name check) keeps a single source of
+/// truth: a model that matches no rate row is billed nothing (rate + cache),
+/// and a non-Claude row can never be cache-billed. #992.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostRate {
     pub input_per_1m_usd: f64,
     pub output_per_1m_usd: f64,
+    /// See the struct doc. `true` only for Anthropic Claude rows.
+    pub cache_eligible: bool,
 }
 
 impl CostRate {
+    /// A non-cache-eligible rate (every provider except Anthropic Claude).
     pub const fn new(input: f64, output: f64) -> Self {
         Self {
             input_per_1m_usd: input,
             output_per_1m_usd: output,
+            cache_eligible: false,
+        }
+    }
+
+    /// A cache-eligible rate — `cache_eligible = true` so prompt-cache tokens
+    /// are billed at [`CACHE_WRITE_INPUT_MULTIPLIER`] /
+    /// [`CACHE_READ_INPUT_MULTIPLIER`] of the base input rate. Used for models
+    /// whose cache pricing is verified — currently all Anthropic Claude models
+    /// (mirrors `Vec::with_capacity`: names the behavior, not the provider, so a
+    /// future cache-eligible provider reuses it without a new constructor).
+    pub const fn with_cache(input: f64, output: f64) -> Self {
+        Self {
+            input_per_1m_usd: input,
+            output_per_1m_usd: output,
+            cache_eligible: true,
         }
     }
 
     /// Estimate the cost in USD for a session with the given token counts.
+    ///
+    /// Bills `input_tokens` + `output_tokens` only. For a cache-aware estimate
+    /// use [`Self::estimate_usd_with_cache`]; this method is retained as the
+    /// zero-cache case (`estimate_usd_with_cache(i, o, 0, 0) == estimate_usd(i, o)`).
     pub fn estimate_usd(&self, input_tokens: u64, output_tokens: u64) -> f64 {
         let i = (input_tokens as f64) * self.input_per_1m_usd / 1_000_000.0;
         let o = (output_tokens as f64) * self.output_per_1m_usd / 1_000_000.0;
         i + o
     }
+
+    /// Estimate the cost in USD including prompt-cache tokens (#992).
+    ///
+    /// Cache-write (`cache_creation_input_tokens`) and cache-read
+    /// (`cache_read_input_tokens`) are billed as multiples of the base input
+    /// rate per [`CACHE_WRITE_INPUT_MULTIPLIER`] / [`CACHE_READ_INPUT_MULTIPLIER`].
+    /// With zero cache tokens this returns exactly [`Self::estimate_usd`] — so
+    /// existing cost numbers do not regress for sessions with no cache activity.
+    pub fn estimate_usd_with_cache(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> f64 {
+        let base = self.estimate_usd(input_tokens, output_tokens);
+        let write =
+            (cache_creation_tokens as f64) * self.input_per_1m_usd * CACHE_WRITE_INPUT_MULTIPLIER
+                / 1_000_000.0;
+        let read = (cache_read_tokens as f64) * self.input_per_1m_usd * CACHE_READ_INPUT_MULTIPLIER
+            / 1_000_000.0;
+        base + write + read
+    }
 }
+
+/// Prompt-cache cost multipliers relative to the base input rate (#992).
+///
+/// These are Anthropic's published prompt-caching multipliers (5-minute TTL):
+/// a cache WRITE costs 1.25× the base input rate; a cache READ (hit) costs
+/// 0.10× the base input rate. They are billed relative to each model's already
+/// verified input rate rather than stored as separate per-model columns.
+///
+/// **Application:** these multipliers are applied ONLY to rates whose
+/// [`CostRate::cache_eligible`] is `true` — the Anthropic Claude family, where
+/// they are exact. Every other provider ([`CostRate::cache_eligible`] `== false`)
+/// bills cache at $0 (unchanged) — their cache pricing differs materially
+/// (OpenAI charges no cache-write surcharge; Gemini's context caching is
+/// duration-based; DeepSeek's Anthropic-compatible cache-hit is only in the
+/// same ballpark), so applying Claude's rates would emit directionally wrong
+/// dollar figures, and csq does not guess (the module's fail-loud contract).
+/// Per-provider cache rates are the #992 follow-up. For a Claude slot, billing
+/// cache at these multipliers is far closer to true cost than the prior
+/// "cache = $0" model, since cache-read volume routinely dwarfs fresh input on
+/// long coding sessions (a session commonly reads millions of cached tokens
+/// against a few thousand fresh input tokens).
+///
+/// NOTE (known pre-existing limitation, not #992): cache-eligibility is keyed on
+/// the matched rate ROW, and [`rate_for_model`] itself is provider-blind — a
+/// locally-run model whose name coincidentally contains a Claude rate pattern
+/// (e.g. an Ollama pull literally named `claude-sonnet-local`) would match a
+/// Claude row and be billed at Claude base+cache rates. That mis-attribution
+/// predates #992 (it already applied to base input/output billing) and is a
+/// `rate_for_model` provider-awareness gap, tracked separately.
+pub const CACHE_WRITE_INPUT_MULTIPLIER: f64 = 1.25;
+/// See [`CACHE_WRITE_INPUT_MULTIPLIER`]. Cache-read (hit) multiplier.
+pub const CACHE_READ_INPUT_MULTIPLIER: f64 = 0.10;
 
 /// Looks up the cost rate for a model name. Returns `None` if the name is
 /// unrecognized — caller renders `n/a` rather than guessing a rate.
@@ -57,14 +141,14 @@ pub fn rate_for_model(model: &str) -> Option<CostRate> {
 const MODEL_RATES: &[(&str, CostRate)] = &[
     // ── Anthropic Claude (pay-per-token API) ───────────────────────────
     // Subscription users see no cost; this fires for direct-API-key slots.
-    ("claude-opus-4-7", CostRate::new(15.00, 75.00)),
-    ("claude-opus-4-6", CostRate::new(15.00, 75.00)),
-    ("claude-opus", CostRate::new(15.00, 75.00)),
-    ("claude-sonnet-4-7", CostRate::new(3.00, 15.00)),
-    ("claude-sonnet-4-6", CostRate::new(3.00, 15.00)),
-    ("claude-sonnet", CostRate::new(3.00, 15.00)),
-    ("claude-haiku-4-5", CostRate::new(1.00, 5.00)),
-    ("claude-haiku", CostRate::new(1.00, 5.00)),
+    ("claude-opus-4-7", CostRate::with_cache(15.00, 75.00)),
+    ("claude-opus-4-6", CostRate::with_cache(15.00, 75.00)),
+    ("claude-opus", CostRate::with_cache(15.00, 75.00)),
+    ("claude-sonnet-4-7", CostRate::with_cache(3.00, 15.00)),
+    ("claude-sonnet-4-6", CostRate::with_cache(3.00, 15.00)),
+    ("claude-sonnet", CostRate::with_cache(3.00, 15.00)),
+    ("claude-haiku-4-5", CostRate::with_cache(1.00, 5.00)),
+    ("claude-haiku", CostRate::with_cache(1.00, 5.00)),
     // ── OpenAI / Codex (pay-per-token API) ─────────────────────────────
     ("gpt-5-codex", CostRate::new(1.25, 10.00)),
     ("gpt-5", CostRate::new(1.25, 10.00)),
@@ -77,9 +161,9 @@ const MODEL_RATES: &[(&str, CostRate)] = &[
     // V4 lineup (released 2026-04-24), which is what csq's catalog configures
     // 3P DeepSeek slots with (`providers::catalog` default_model
     // `deepseek-v4-pro`, haiku/subagent `deepseek-v4-flash`). Rates are the
-    // cache-MISS input price + output price — the estimator bills
-    // input_tokens + output_tokens only (cache tokens captured-not-billed, see
-    // `attributed_session_to_event`). The former 75%-off promo became the
+    // cache-MISS input price + output price. DeepSeek is non-Anthropic, so
+    // its rate row is `cache_eligible == false` and its cache tokens are billed at $0
+    // (its cache-hit pricing is not yet verified — #992). The former 75%-off promo became the
     // permanent official price on 2026-05-31. The legacy `deepseek-chat` /
     // `deepseek-reasoner` aliases route to V4 Flash pricing (both deprecating
     // 2026-07-24). Verified against DeepSeek pricing docs 2026-07-07.
@@ -173,5 +257,72 @@ mod tests {
     fn rates_table_is_non_empty() {
         // Smoke — guards against accidental wholesale deletion.
         assert!(MODEL_RATES.len() >= 10);
+    }
+
+    #[test]
+    fn estimate_usd_with_cache_bills_cache_tokens() {
+        // claude-sonnet: input 3.00, output 15.00 per 1M.
+        //   base  = 100K in ×3/1M   + 50K out ×15/1M = 0.30 + 0.75 = 1.05
+        //   write = 200K ×3 ×1.25/1M                  = 0.75
+        //   read  = 1M   ×3 ×0.10/1M                  = 0.30
+        //   total = 2.10
+        let rate = rate_for_model("claude-sonnet-4-6").unwrap();
+        let cost = rate.estimate_usd_with_cache(100_000, 50_000, 200_000, 1_000_000);
+        assert!((cost - 2.10).abs() < 0.001, "expected ~$2.10, got ${cost}");
+    }
+
+    #[test]
+    fn estimate_usd_with_cache_zero_cache_equals_base() {
+        // No cache activity must bill exactly the same as the input+output-only
+        // estimate — the no-regression guarantee for #992.
+        for model in ["claude-opus-4-7", "gpt-5", "deepseek-v4-pro", "glm-4.6"] {
+            let rate = rate_for_model(model).unwrap();
+            let base = rate.estimate_usd(123_456, 65_432);
+            let with_zero_cache = rate.estimate_usd_with_cache(123_456, 65_432, 0, 0);
+            assert_eq!(
+                base, with_zero_cache,
+                "{model}: zero-cache estimate must equal the base estimate"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_eligible_is_true_only_for_claude_rows() {
+        // Anthropic Claude rows → cache_eligible (exact multipliers).
+        for m in ["claude-opus-4-7", "claude-sonnet-4-6", "CLAUDE-HAIKU-4-5"] {
+            assert!(
+                rate_for_model(m).unwrap().cache_eligible,
+                "{m} should be cache_eligible"
+            );
+        }
+        // Every other provider row → NOT cache_eligible ($0 cache, fail-loud).
+        for m in [
+            "gpt-5-codex",
+            "gemini-2.5-pro",
+            "deepseek-v4-pro",
+            "glm-4.6",
+            "minimax",
+        ] {
+            assert!(
+                !rate_for_model(m).unwrap().cache_eligible,
+                "{m} must not be cache_eligible"
+            );
+        }
+        // A locally-named model that matches NO rate row bills nothing at all —
+        // cache-eligibility is moot because rate_for_model returns None.
+        assert!(rate_for_model("claude3-local-gguf").is_none());
+    }
+
+    #[test]
+    fn cache_read_is_cheaper_than_cache_write() {
+        // Structural: at equal token counts a cache READ (hit) must cost less
+        // than a cache WRITE, per the 0.10× vs 1.25× multipliers.
+        let rate = rate_for_model("claude-opus-4-7").unwrap();
+        let write_only = rate.estimate_usd_with_cache(0, 0, 1_000_000, 0);
+        let read_only = rate.estimate_usd_with_cache(0, 0, 0, 1_000_000);
+        assert!(
+            read_only < write_only,
+            "cache read (${read_only}) must be cheaper than cache write (${write_only})"
+        );
     }
 }

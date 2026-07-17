@@ -3609,6 +3609,17 @@ pub fn set_codex_slot_model(
     if model.is_empty() {
         return Err("model must not be empty".into());
     }
+    // Bound the renderer-supplied model id at the IPC boundary (tauri-commands.md
+    // MUST Rule 2 — validate all string args; assume the renderer is adversarial).
+    // Codex model ids are short; a value this long is malformed. The value is
+    // TOML-escaped downstream (no injection), but the cap rejects a bloated id
+    // early. Mirrors the CLI's catalog gate on the desktop path (R3 finding).
+    if model.len() > 256 {
+        return Err(format!(
+            "model id too long: {} chars (max 256)",
+            model.len()
+        ));
+    }
     let base = PathBuf::from(&base_dir);
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
@@ -3639,7 +3650,10 @@ pub fn set_codex_slot_model(
         }
     }
 
-    csq_core::providers::codex::surface::write_config_toml(&base, slot_num, &model)
+    // Explicit user choice → `Some`: the desktop model picker sets the per-slot
+    // `model` key (mirrors the `csq models set codex` CLI path). login/spawn
+    // callers pass `None`.
+    csq_core::providers::codex::surface::write_config_toml(&base, slot_num, Some(&model))
         .map_err(|e| format!("write codex config.toml: {e}"))?;
     let _ = app.emit(
         "slot-model-changed",

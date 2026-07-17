@@ -59,6 +59,9 @@ desktop = [
 [dependencies]
 # ── always compiled ──────────────────────────────────────────────────────
 csq-core = { path = "../csq-core" }
+# the enterprise SDK crate — enterprise wire DTOs (AnchorPayload, EvalPayload, Verdict, etc.).
+# Optional; activated by the `enterprise` feature. publish=false (PROPRIETARY),
+# so the dep is valid: PROPRIETARY (csq) → PROPRIETARY (the enterprise SDK crate).
 anyhow.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 serde.workspace = true
@@ -78,6 +81,10 @@ base64.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 libc.workspace = true
+# Defense-in-depth scrub of transient secret buffers in the `admin` M-DEK CLI
+# (pasted entropy shares / recovery-key file contents) — the library scrubs its
+# own key material; this scrubs the CLI-side parse/read copies.
+zeroize.workspace = true
 
 # ── cli-only (optional) ──────────────────────────────────────────────────
 clap = { workspace = true, optional = true }
@@ -96,6 +103,7 @@ tauri-plugin-dialog = { version = "2", optional = true }
 log = { version = "0.4", optional = true }
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 csq-core = { path = "../csq-core", features = ["secret-in-memory", "test-utils"] }
 ed25519-dalek.workspace = true

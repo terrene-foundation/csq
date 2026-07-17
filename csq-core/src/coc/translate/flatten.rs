@@ -44,6 +44,15 @@ pub struct FlatArtifact {
     pub id: String,
     pub precedence: i32,
     pub body: String,
+    /// Glob path-scope from the artifact's `paths` frontmatter (spec 09
+    /// §9.2.2), preserved so CU3's native rule materialization (an internal ticket S2b)
+    /// can reconstruct a Claude Code `.claude/rules/<id>.md` with `paths:`
+    /// frontmatter — the ONLY channel that honors per-file rule scoping (CC's
+    /// native rules loader activates a path-scoped rule when Claude reads a
+    /// matching file). Populated for RULES only (from `RuleDef.paths`); always
+    /// empty for agents/skills/commands (they have no `paths` semantics). Empty
+    /// for a rule means "unscoped / always-on".
+    pub paths: Vec<String>,
 }
 
 /// Per-kind flattened artifacts in scope for a Surface. Each `Vec` is
@@ -79,6 +88,17 @@ impl SurfaceArtifacts {
 /// (the rules-only citation ID set) both call it, so the rules that appear in
 /// the delivered scaffold are exactly the rules required for citation — they
 /// cannot drift (redteam R1 DA-2). `pub(crate)` so the driver can reach it.
+///
+/// Filters on `applies_to` (Surface) ONLY — NOT on `RuleDef.paths` (spec 09
+/// §9.2.2). Surface-scope (`applies_to`) and file-scope (`paths`) are orthogonal:
+/// `in_scope` decides whether a rule reaches THIS surface at all; `paths` (now
+/// carried on [`FlatArtifact`]) decides WHEN CC activates it once delivered.
+/// On CC, `paths` IS honored — S2b (an internal ticket) materializes each rule into a
+/// native `$CLAUDE_CONFIG_DIR/rules/coc-<ID>.md` so CC's own rules loader
+/// activates a path-scoped rule on matching file reads (resolving the
+/// `coc-native-materialization` an internal journal entry gap where `paths` was consumed by
+/// no surface). codex/gemini have no per-file rule-scoping mechanism, so on
+/// those surfaces `paths` is still delivered but not file-scoped.
 pub(crate) fn in_scope(applies_to: &BTreeSet<Surface>, surface: Surface) -> bool {
     applies_to.is_empty() || applies_to.contains(&surface)
 }
@@ -121,6 +141,8 @@ pub fn flatten_artifacts(coc_set: &CocSet, surface: Surface) -> SurfaceArtifacts
             id: r.id.0.clone(),
             precedence: r.precedence,
             body: r.body.clone(),
+            // Rules carry their glob path-scope (S2b native materialization).
+            paths: r.paths.clone(),
         })
         .collect();
     sort_flat(&mut rules);
@@ -133,6 +155,8 @@ pub fn flatten_artifacts(coc_set: &CocSet, surface: Surface) -> SurfaceArtifacts
             id: a.id.0.clone(),
             precedence: a.precedence,
             body: a.body.clone(),
+            // Non-rule kinds have no path-scope.
+            paths: Vec::new(),
         })
         .collect();
     sort_flat(&mut agents);
@@ -145,6 +169,8 @@ pub fn flatten_artifacts(coc_set: &CocSet, surface: Surface) -> SurfaceArtifacts
             id: s.id.0.clone(),
             precedence: s.precedence,
             body: s.body.clone(),
+            // Non-rule kinds have no path-scope.
+            paths: Vec::new(),
         })
         .collect();
     sort_flat(&mut skills);
@@ -157,6 +183,8 @@ pub fn flatten_artifacts(coc_set: &CocSet, surface: Surface) -> SurfaceArtifacts
             id: c.id.0.clone(),
             precedence: c.precedence,
             body: c.body.clone(),
+            // Non-rule kinds have no path-scope.
+            paths: Vec::new(),
         })
         .collect();
     sort_flat(&mut commands);

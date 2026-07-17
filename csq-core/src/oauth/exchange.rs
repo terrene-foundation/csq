@@ -61,7 +61,11 @@ use std::collections::HashMap;
 /// Fallback `expires_in` used if Anthropic's response omits the
 /// field. 18000 seconds (5 hours) matches the observed Anthropic
 /// default and is also what v1.x hardcodes.
-const DEFAULT_EXPIRES_IN_SECS: u64 = 18000;
+///
+/// `pub(crate)` so that `credentials::post_login` can derive its
+/// `CC_ACCESS_TOKEN_TTL_MS` from this single source of truth, ensuring
+/// the exchange default and the login-fresh detection window never diverge.
+pub(crate) const DEFAULT_EXPIRES_IN_SECS: u64 = 18000;
 
 /// Extracts a human-readable error from a token endpoint error
 /// response.

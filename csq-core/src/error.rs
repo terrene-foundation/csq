@@ -396,6 +396,17 @@ pub enum DaemonError {
 
     #[error("stale PID file (PID {pid} not alive)")]
     StalePidFile { pid: u32 },
+
+    /// A Win32 kernel call on the Windows graceful-stop path failed
+    /// (`CreateEventW` / `OpenEventW` / `SetEvent`). Distinct from
+    /// [`IpcTimeout`](DaemonError::IpcTimeout) so the message names the real
+    /// cause instead of a misleading "0ms" timeout (#786 redteam LOW; the event
+    /// path is name-addressed, never SIGTERM/timeout). `context` names the
+    /// failing syscall for operator diagnostics.
+    #[error(
+        "Windows kernel error {code} during {context} — retry `csq daemon stop` or restart the daemon"
+    )]
+    Win32 { code: u32, context: &'static str },
 }
 
 #[derive(Error, Debug)]

@@ -61,6 +61,11 @@ pub mod usage_poller;
 pub mod server;
 #[cfg(windows)]
 pub mod server_windows;
+/// Windows graceful-stop channel (#786) — a named kernel event object the
+/// daemon awaits and `csq daemon stop` fires. The Windows equivalent of the
+/// Unix `SIGTERM` path; keeps the drain semantics identical across platforms.
+#[cfg(windows)]
+pub mod shutdown_windows;
 
 pub use anchor_task::{spawn as spawn_anchor_task, AnchorTaskHandle};
 pub use auto_rotate::{spawn as spawn_auto_rotate, AutoRotateHandle};
@@ -103,3 +108,8 @@ pub use client_windows::{
 };
 #[cfg(windows)]
 pub use server_windows::{serve as serve_windows, WindowsServerHandle};
+#[cfg(windows)]
+pub use shutdown_windows::{
+    create_shutdown_event, create_shutdown_event_scoped, signal_shutdown, signal_shutdown_scoped,
+    ShutdownEvent,
+};

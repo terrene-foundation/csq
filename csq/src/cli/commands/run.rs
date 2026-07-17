@@ -139,6 +139,15 @@ pub fn handle(
     no_audit: bool,
     rest: &[String],
 ) -> Result<()> {
+    // Enterprise license gate (task #77 shard 3). `csq run` is the primary surface of
+    // the enterprise binary; gating it here is what makes the pre-built use-only binary
+    // "useless without a key" (see `csq_core::license` module docs). Full per-op
+    // `enforce` (liveness-checked) — an offline-beyond-grace licensee is told to
+    // reconnect; the daemon's own startup uses the deadlock-free `enforce_startup`.
+    // Inert while the placeholder key is baked. Community builds carry no gate.
+    #[cfg(feature = "enterprise")]
+    super::super::enforce_enterprise_license(base_dir)?;
+
     // M7: convert user intent → the `enabled` bool every downstream
     // helper already takes. `.coc/` detection stays in ONE place (the
     // spec-09 fallback walk inside `run_capability_layer_preflight`);
@@ -570,6 +579,16 @@ pub fn handle_native(
     bench_json: bool,
     rest: &[String],
 ) -> Result<()> {
+    // Enterprise license gate (task #77 gate-coverage remediation). The native governed
+    // loop is an enterprise-only moat op (`native-harness` ⇒ `enterprise`, csq/Cargo.toml),
+    // but it is dispatched via an early `return commands::run::handle_native(...)` in
+    // `cli::run` BEFORE `run::handle` — so it never reaches the gate at `handle`'s top and
+    // ran ungated. Without this line a keyless use-only binary runs the full native LLM
+    // loop for free at go-live. Full per-op `enforce` (liveness-checked), matching
+    // `run::handle`. `native-harness` guarantees `enterprise`, so the wrapper is always
+    // compiled in here. Inert while the placeholder key is baked.
+    super::super::enforce_enterprise_license(base_dir)?;
+
     let account =
         account.ok_or_else(|| anyhow!("--native requires a slot: `csq run N --native`"))?;
 
@@ -710,6 +729,83 @@ fn launch_third_party(
     exec_or_spawn(cmd, &handle_dir, audit_emitter)
 }
 
+/// True when the target `surface`'s NATIVE artifacts exist at `cwd` or any
+/// ancestor up to the project root.
+///
+/// When they do, the native CLI (`claude` / `codex` / `gemini`) loads them with
+/// its OWN harness, so csq must inject NOTHING (Model 2 — csq translates
+/// `.coc/`→native artifacts and gets out of the way; see memory
+/// `project_coc_two_model_architecture_and_native_delegation`). The
+/// capability-layer scaffold flattens the ENTIRE `.coc/` (all rules/agents/
+/// skills/commands, full bodies) into ONE system prompt; injecting that ON TOP
+/// of native artifacts the CLI already loads duplicated + overflowed codex's
+/// context window (the `csq run 9` "Context 0% left" bug on a 2.1 MB `.coc/`).
+fn native_artifacts_present(surface: Surface, cwd: &Path) -> bool {
+    let (dir_marker, file_marker) = match surface {
+        Surface::ClaudeCode => (".claude", "CLAUDE.md"),
+        Surface::Codex => (".codex", "AGENTS.md"),
+        Surface::Gemini => (".gemini", "GEMINI.md"),
+    };
+    // Walk cwd → ancestors, mirroring how BOTH (a) the `.coc/` loader discovers
+    // its scaffold source (`coc::loader::discover`, walk-from-CWD-upward, spec 09
+    // §9.1.1) AND (b) the native CLI itself discovers its artifacts (claude/codex/
+    // gemini all walk up for `.claude/`/`AGENTS.md`/etc). A native artifact at ANY
+    // ancestor means the native CLI WILL load it, so csq must not also inject —
+    // otherwise running `csq run N` from a SUBDIRECTORY of a project whose `.coc/`
+    // + native artifacts both live at the root re-opens the duplication+overflow
+    // bug the leaf-only check missed (redteam R1 HIGH).
+    //
+    // The walk STOPS at the project root (the dir containing `.coc/`): the
+    // competing native artifacts live at or below it, and this bound keeps a
+    // user-global `~/.codex` / `~/.claude` from being mistaken for a project
+    // artifact. The bound is always reached before $HOME in practice because this
+    // gate runs only on the WithLayer path, which the preflight enters only when a
+    // `.coc/` was found up-tree — so a `.coc/` sits at or above `cwd` within the
+    // MAX_WALK_DEPTH (64) the loader itself uses.
+    let mut current = cwd;
+    for _ in 0..=64 {
+        if current.join(dir_marker).is_dir() || current.join(file_marker).is_file() {
+            return true;
+        }
+        // Project-root boundary: stop AFTER checking this level's native markers.
+        if current.join(".coc").is_dir() {
+            break;
+        }
+        match current.parent() {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    false
+}
+
+/// Whether csq should inject the flattened `.coc/` scaffold for `surface` given
+/// `cwd`.
+///
+/// The scaffold injection is a TRANSITION / parity-testing mechanism, not the
+/// steady state: it MUST default OFF when the surface's native artifacts are
+/// present (the native CLI loads its own — see [`native_artifacts_present`]).
+/// `CSQ_COC_PARITY_TEST=1` forces injection regardless, the escape hatch for
+/// verifying `.coc/`→native parity via csq's sub-process path.
+fn should_inject_scaffold(surface: Surface, cwd: &Path) -> bool {
+    std::env::var_os("CSQ_COC_PARITY_TEST").is_some() || !native_artifacts_present(surface, cwd)
+}
+
+/// Emits the operator note explaining that a `.coc/` scaffold was suppressed
+/// because the surface's native artifacts are present. Call ONLY when a
+/// non-empty scaffold is actually being dropped (not on every WithLayer spawn).
+fn note_scaffold_deferred(surface: Surface) {
+    let name = match surface {
+        Surface::ClaudeCode => "claude",
+        Surface::Codex => "codex",
+        Surface::Gemini => "gemini",
+    };
+    eprintln!(
+        "csq: native {name} artifacts detected — deferring to the native CLI harness \
+         (.coc/ scaffold not injected). Set CSQ_COC_PARITY_TEST=1 to inject for parity testing."
+    );
+}
+
 /// Launches CC for an Anthropic OAuth slot. Assumes credentials have
 /// already been copied into `config-<N>` by the caller.
 #[allow(clippy::too_many_arguments)]
@@ -807,7 +903,14 @@ fn launch_anthropic(
     let mut cmd = Command::new("claude");
     cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
     strip_sensitive_env(&mut cmd);
-    cmd.args(rest);
+    // NB: the user's `rest` args are appended LAST in each arm below — AFTER any
+    // csq-injected top-level flags (`--plugin-dir`, `--append-system-prompt-file`).
+    // Those flags MUST precede a `claude` SUBCOMMAND (e.g. `csq run N -- plugin
+    // details`): commander parses top-level options before dispatching a
+    // subcommand, so a flag appended after the subcommand is rejected
+    // ("unknown option '--plugin-dir'"). Placing them before `rest` keeps every
+    // usage working — interactive (`rest` empty), print (`-p "…"`), AND
+    // subcommand — instead of only the no-subcommand cases.
 
     match layer_control {
         LayerControl::Inherit => {
@@ -817,6 +920,8 @@ fn launch_anthropic(
             // child.wait() so the record reflects true session duration).
             use csq_core::audit::{Decision, ResultState};
             audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+            // Inherit adds no csq flags; append rest and go (byte-identical argv).
+            cmd.args(rest);
             exec_or_spawn(cmd, &handle_dir, audit_emitter)
         }
         LayerControl::WithLayer {
@@ -824,22 +929,128 @@ fn launch_anthropic(
             class,
             rule_ids_in_scope,
             scaffold,
+            rules_only_scaffold,
+            artifacts,
         } => {
-            // PR-CA7c: deliver the scaffold (rules + structured-output
-            // directive when applicable) to CC via the same env var
-            // CC reads from `settings.json::env`. This is what makes
-            // FR-CL-02 (rule citation) and FR-CL-01 (structured output)
-            // actually reach the model — without this injection, the
-            // pipeline computes the scaffold but drops it.
+            // PR-CA7c / E2BIG fix: deliver the scaffold (rules + structured-
+            // output directive when applicable) to CC via
+            // `--append-system-prompt-file <path>`.
             //
-            // Empty/missing scaffold is a no-op: the env var is set
-            // only when there's something to deliver. CC tolerates
-            // either presence or absence of the var.
-            if let Some(s) = scaffold.as_deref() {
-                if !s.is_empty() {
-                    cmd.env("CLAUDE_SYSTEM_PROMPT_APPEND", s);
+            // Prior approach used `CLAUDE_SYSTEM_PROMPT_APPEND` env var.
+            // Large `.coc/` artifact flattens can exceed ARG_MAX (macOS:
+            // 1 MiB, shared by argv + envp) causing `cmd.spawn()` to fail
+            // with `E2BIG / os error 7`. The file-based carrier matches what
+            // the codex and gemini surfaces already do (config.toml
+            // instructions / settings.json system_instruction), and CC's
+            // `--append-system-prompt-file` flag makes the content path
+            // argv — never exceeding ARG_MAX regardless of artifact size.
+            //
+            // `attach_scaffold` writes the text to a temp file, appends the
+            // flag+path to `cmd`, and returns the path so we can clean it up
+            // after spawn completes. Falls back to the env var if the write
+            // fails so small scaffolds still work.
+            // Fix A (native-delegation gate): suppress the flattened `.coc/`
+            // scaffold when the target's native `.claude/` / `CLAUDE.md` are
+            // present — CC loads its own artifacts, so injecting on top
+            // duplicates + overflows context. `CSQ_COC_PARITY_TEST=1` forces it.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // S2/S2b (an internal ticket): deliver each `.coc/` artifact kind through its
+            // NATIVE Claude Code channel; keep prose to the minimum.
+            //
+            // When the `.coc/` would be injected (no competing native `.claude/`
+            // at cwd, OR `CSQ_COC_PARITY_TEST=1`):
+            //   - agents/skills/commands → a session-scoped plugin at
+            //     `term-<pid>/coc-plugin/` reached via `claude --plugin-dir` (S2).
+            //   - rules → native `term-<pid>/rules/coc-<ID>.md`, so CC's own rules
+            //     loader honors each rule's `paths:` scoping (S2b — a path-scoped
+            //     rule activates only when Claude reads a matching file; resolves
+            //     the journal-0002 gap where `paths` was parsed but honored
+            //     nowhere). Unscoped rules load always-on, same effect as prose.
+            //   - prose (`--append-system-prompt-file`) then carries ONLY the
+            //     FR-CL-01 structured-output directive (Compliance prompts).
+            // Each native channel falls back to prose INDEPENDENTLY on failure,
+            // so the prose selected below is exactly the artifact set NOT
+            // delivered natively — nothing is ever dropped. When the project
+            // carries its own native `.claude/`, the scaffold is deferred
+            // entirely (Level-1 behavior byte-unchanged).
+            let inject = should_inject_scaffold(Surface::ClaudeCode, &cwd);
+            let has_materializable = !artifacts.agents.is_empty()
+                || !artifacts.skills.is_empty()
+                || !artifacts.commands.is_empty();
+
+            let mut plugin_ok = false;
+            let mut native_rules_ok = false;
+            if inject {
+                if has_materializable {
+                    match materialize_cc_coc_plugin(&handle_dir_abs, &artifacts) {
+                        Ok(plugin_dir) => {
+                            cmd.arg("--plugin-dir").arg(&plugin_dir);
+                            plugin_ok = true;
+                        }
+                        Err(e) => {
+                            // Fail-safe: tear down the partial tree; a/s/c fall
+                            // back to prose.
+                            let _ = std::fs::remove_dir_all(handle_dir_abs.join("coc-plugin"));
+                            tracing::warn!(
+                                error_kind = "coc_plugin_materialize_failed",
+                                "CC plugin materialization failed; falling back to prose: {}",
+                                csq_core::error::redact_tokens(&e.to_string())
+                            );
+                        }
+                    }
+                }
+                // Attempt native rules ONLY when the plugin leg did not FAIL
+                // (plugin succeeded, or there was nothing to plug in). If the
+                // plugin failed, everything falls back to full prose (`scaffold`),
+                // so materializing rules natively too would double-deliver them
+                // (redteam R1 correctness MED) AND defeat path-scoping. Thus
+                // `native_rules_ok` implies `(plugin_ok || !has_materializable)`.
+                if !artifacts.rules.is_empty() && (plugin_ok || !has_materializable) {
+                    match materialize_native_rules(&handle_dir_abs, &artifacts.rules) {
+                        Ok(()) => native_rules_ok = true,
+                        Err(e) => {
+                            // Path-scoped rules were never honored before S2b, so
+                            // a failure is NO regression: fall back to rules-prose.
+                            tracing::warn!(
+                                error_kind = "coc_native_rules_failed",
+                                "native rule materialization failed; falling back to rules-as-prose: {}",
+                                csq_core::error::redact_tokens(&e.to_string())
+                            );
+                        }
+                    }
                 }
             }
+
+            // Prose = exactly the artifacts NOT delivered natively (+ the FR-CL-01
+            // directive on Compliance prompts). `scaffold` (all kinds) and
+            // `rules_only_scaffold` (rules + directive) already embed the
+            // directive; the directive-only case is built inline.
+            let prose_owned: Option<String> = if !inject {
+                if scaffold.as_deref().is_some_and(|s| !s.is_empty()) {
+                    note_scaffold_deferred(Surface::ClaudeCode);
+                }
+                None
+            } else if native_rules_ok && (plugin_ok || !has_materializable) {
+                // Rules native; agents/skills/commands native-or-absent → prose
+                // is just the structured-output directive (Compliance only).
+                if class.class == csq_core::capability_layer::PromptClassKind::Compliance {
+                    Some(csq_core::coc::translate::build_output_schema_directive())
+                } else {
+                    None
+                }
+            } else if plugin_ok {
+                // a/s/c native; rules NOT native (none, or native failed) →
+                // rules as prose.
+                rules_only_scaffold
+            } else {
+                // No plugin (or it failed) → full prose fallback (all kinds).
+                scaffold
+            };
+            let scaffold_tmp = attach_scaffold(&mut cmd, prose_owned.as_deref());
+            // Append the user's args LAST — after --plugin-dir + the scaffold
+            // flag — so a `claude` subcommand in `rest` still sees those as
+            // top-level options (see the note at cmd construction above).
+            cmd.args(rest);
             let result = spawn_with_layer(
                 cmd,
                 &handle_dir,
@@ -850,6 +1061,12 @@ fn launch_anthropic(
                 debug,
                 audit_emitter,
             );
+            // Clean up the scaffold temp file now that CC has exited.
+            // WithLayer always spawns+waits, so csq is still alive here.
+            // Non-secret content (COC rule text), but we clean up regardless.
+            if let Some(ref p) = scaffold_tmp {
+                let _ = std::fs::remove_file(p);
+            }
             // WithLayer path: spawn+wait, so Drop fires normally. We still
             // populate the emitter fields so the record reflects the actual
             // post-spawn state rather than the construction-time defaults.
@@ -934,7 +1151,7 @@ fn launch_codex(
     // - write failure → `atomic_replace` leaves the prior `config.toml`
     //   intact; warn and continue with the existing (possibly stale)
     //   config rather than block a launch on a transient FS error.
-    match codex_surface::regenerate_slot_config_preserving_model(base_dir, account) {
+    match codex_surface::regenerate_slot_config(base_dir, account) {
         Ok(codex_surface::RegenOutcome::AlreadyCurrent)
         | Ok(codex_surface::RegenOutcome::Rewritten {
             was_global_malformed: false,
@@ -1164,6 +1381,11 @@ fn launch_codex(
             class,
             rule_ids_in_scope,
             scaffold,
+            // S3 (an internal ticket): codex materializes SKILLS natively; the rest is
+            // prose. `rules_only_scaffold` is a CC-only field (rebuilt inline
+            // here via `reduced_surface_prose` instead).
+            artifacts,
+            ..
         } => {
             // PR-CA8 commit 2: materialize per-spawn config.toml in the
             // handle dir with the layer's `instructions` block merged
@@ -1178,7 +1400,60 @@ fn launch_codex(
             // and `daemon::startup_reconciler::pass2_codex_config_toml`
             // touch the canonical), (c) toml::from_str parse-as-
             // defense-in-depth on the merge path.
-            let instructions = scaffold.as_deref().filter(|s| !s.is_empty());
+            // Fix A (native-delegation gate): suppress the flattened `.coc/`
+            // scaffold when the target's native `.codex/` / `AGENTS.md` are
+            // present — codex loads its own artifacts, so injecting the full
+            // `.coc/` flatten into `config.toml instructions` duplicated + blew
+            // past codex's context window (the `csq run 9` bug). An MCP-policy
+            // rewrite (`mcp_wrap`) is orthogonal and still materializes.
+            // `CSQ_COC_PARITY_TEST=1` forces injection for parity testing.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let inject = should_inject_scaffold(Surface::Codex, &cwd);
+            // S3 (an internal ticket): deliver codex-native SKILLS through
+            // `$CODEX_HOME/skills/` (native progressive disclosure instead of a
+            // flattened prose blob). agents/commands/rules have no native codex
+            // primitive, so they stay prose. The materialization falls back to
+            // prose INDEPENDENTLY on failure — nothing is ever dropped.
+            let mut skills_native = false;
+            if inject && !artifacts.skills.is_empty() {
+                match materialize_codex_native(&handle_dir_abs, &artifacts) {
+                    Ok(()) => skills_native = true,
+                    Err(e) => {
+                        // Fail-safe: tear down the partial tree; skills fall back
+                        // to prose alongside the other kinds.
+                        let _ = std::fs::remove_dir_all(handle_dir_abs.join("skills"));
+                        tracing::warn!(
+                            error_kind = "coc_codex_native_failed",
+                            "codex-native skills materialization failed; falling back to prose: {}",
+                            csq_core::error::redact_tokens(&e.to_string())
+                        );
+                    }
+                }
+            }
+            // Prose (config.toml `instructions`) = exactly the kinds NOT delivered
+            // natively. When !inject (project carries its own native `.codex/`),
+            // defer entirely — Level-1 behavior byte-unchanged.
+            let prose_owned: Option<String> = if !inject {
+                if scaffold.as_deref().is_some_and(|s| !s.is_empty()) {
+                    note_scaffold_deferred(Surface::Codex);
+                }
+                None
+            } else if skills_native {
+                // Skills native → prose is every OTHER kind (rules/agents/commands).
+                let remaining = csq_core::coc::translate::SurfaceArtifacts {
+                    skills: Vec::new(),
+                    ..artifacts.clone()
+                };
+                reduced_surface_prose(
+                    Surface::Codex,
+                    &remaining,
+                    class.class == csq_core::capability_layer::PromptClassKind::Compliance,
+                )
+            } else {
+                // No skills, or materialization failed → full prose (all kinds).
+                scaffold
+            };
+            let instructions = prose_owned.as_deref().filter(|s| !s.is_empty());
             if instructions.is_some() || mcp_wrap.is_some() {
                 let skipped = materialize_handle_config_toml(
                     base_dir,
@@ -1436,6 +1711,397 @@ fn verify_codex_handle_config_toml_is_regular_file(handle_dir: &Path) -> Result<
     Ok(())
 }
 
+/// S2 (an internal ticket): materialize the CC Level-2 native plugin tree into the
+/// ephemeral handle dir and return the absolute plugin-root path for
+/// `claude --plugin-dir`.
+///
+/// Creates a FRESH `term-<pid>/coc-plugin/` (removing any stale residue first so
+/// the pure [`emit_cc_plugin`](csq_core::coc::translate::emit_cc_plugin) writer
+/// receives the clean, csq-owned, non-symlink `dest` its caller-contract
+/// requires), renders agents/skills/commands into a CC plugin tree, then
+/// re-stats that the plugin root is a real (non-symlink) directory immediately
+/// before the caller adds `--plugin-dir` — the TOCTOU close mirroring
+/// [`verify_codex_handle_config_toml_is_regular_file`]. On ANY error the partial
+/// tree is torn down and the error propagated so the caller falls back to
+/// Level-1 prose (materialize.rs caller-contract: "partial failure leaves a
+/// partial tree the caller must tear down").
+///
+/// **Rules are NOT materialized** — they have no native CC plugin analogue and
+/// stay Level-1 prose (see `emit_cc_plugin` + spec 07 §7.2.1.1).
+///
+/// Spec 07 §7.2.1.1 grants the ephemeral `coc-plugin/` subtree its carve-out to
+/// spec 02 INV-02 ("settings.json only" in a CC handle dir); it is torn down by
+/// the same wrapper-on-exit + daemon-sweep teardown as the rest of `term-<pid>`.
+fn materialize_cc_coc_plugin(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+) -> Result<PathBuf> {
+    use csq_core::coc::translate::emit_cc_plugin;
+
+    let plugin_dir = handle_dir_abs.join("coc-plugin");
+    // Fresh dir: `term-<pid>` is per-process so `coc-plugin` should not pre-exist,
+    // but remove any residue (incl. a pre-planted symlink) defensively so the
+    // emitter writes into a clean, csq-owned tree.
+    if plugin_dir.exists() || plugin_dir.symlink_metadata().is_ok() {
+        std::fs::remove_dir_all(&plugin_dir)
+            .with_context(|| format!("clearing stale {}", redact_path(&plugin_dir)))?;
+    }
+    std::fs::create_dir(&plugin_dir)
+        .with_context(|| format!("creating {}", redact_path(&plugin_dir)))?;
+
+    emit_cc_plugin(artifacts, &plugin_dir)
+        .map_err(|e| anyhow!("materializing CC coc-plugin: {e}"))?;
+
+    verify_coc_plugin_dir_is_real(&plugin_dir)?;
+    Ok(plugin_dir)
+}
+
+/// S2 TOCTOU close for the materialized plugin dir. Refuses a symlinked (or
+/// non-directory) plugin root immediately before `--plugin-dir` is added to the
+/// spawn — same fail-closed posture as
+/// [`verify_codex_handle_config_toml_is_regular_file`]. A same-user attacker who
+/// unlinked our real dir and replaced it with a symlink to attacker-controlled
+/// plugin content would otherwise inject Task-invocable agents into the CC
+/// session.
+fn verify_coc_plugin_dir_is_real(plugin_dir: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(plugin_dir).with_context(|| {
+        format!(
+            "stat {} — coc-plugin missing post-materialization",
+            redact_path(plugin_dir)
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing claude spawn: {} became a symlink between materialization and spawn (TOCTOU). \
+             Re-run `csq run`.",
+            redact_path(plugin_dir)
+        ));
+    }
+    if !ft.is_dir() {
+        return Err(anyhow!(
+            "refusing claude spawn: {} is not a directory (type: {:?})",
+            redact_path(plugin_dir),
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// S2b (an internal ticket): materialize `.coc/` rules into the session handle dir's
+/// native Claude Code rules location so CC's own rules loader honors each rule's
+/// `paths:` scoping (a path-scoped rule activates only when Claude reads a
+/// matching file).
+///
+/// CC reads rules from `$CLAUDE_CONFIG_DIR/rules/` — which in a handle dir is a
+/// `SHARED_ITEMS` symlink to the user-global `~/.claude/rules`. To add the
+/// `.coc/` rules WITHOUT polluting that global dir (and without losing the
+/// user's own global rules), this replaces the symlink with a REAL dir that
+/// MERGES the user's global rules (copied in, by value) with the materialized
+/// rules under a `csq-coc/` subdir. The whole `rules/` dir is torn down with the
+/// ephemeral handle dir on session exit (spec 07 §7.2.1.1 lifetime), so the
+/// user's global rules are never touched. If there is no `rules` entry, a fresh
+/// real dir is created. On any error the caller falls back to delivering rules
+/// as prose.
+///
+/// **Atomic replacement (redteam R1 failure-mode MED).** When replacing the
+/// symlink, the merged dir is built in a sibling temp dir FIRST and swapped in
+/// only after every copy/emit succeeds — so a mid-copy failure NEVER destroys
+/// the symlink and the session keeps the complete user-global rule set. On the
+/// rare `rename` failure after the symlink is unlinked, the symlink is restored
+/// best-effort.
+///
+/// **`csq-coc/` subdir (redteam R1 failure-mode MED).** The materialized rules
+/// live under `rules/csq-coc/coc-<ID>.md` (CC discovers rules recursively), so
+/// they cannot collide with — or silently overwrite — a user-global rule file
+/// copied into `rules/` at the top level.
+fn materialize_native_rules(
+    handle_dir_abs: &Path,
+    rules: &[csq_core::coc::translate::FlatArtifact],
+) -> Result<()> {
+    materialize_native_rules_inner(
+        handle_dir_abs,
+        rules,
+        |p| std::fs::remove_file(p),
+        |from, to| std::fs::rename(from, to),
+    )
+}
+
+/// Closure-injectable core of [`materialize_native_rules`] (an internal journal entry
+/// For-Discussion #2). The two failure branches of the atomic symlink→dir swap —
+/// the `unlink` of the old symlink and the `rename` of the staged dir into place
+/// — are the only paths the natural test setup cannot exercise (both fs ops are
+/// near-infallible within one directory on a healthy filesystem). Injecting them
+/// as closures lets the tests deterministically fault EITHER op and assert the
+/// invariant each branch upholds:
+///
+/// - **`unlink` fails** (symlink removal denied): the symlink is left intact (the
+///   session keeps its complete user-global rule set) AND the staging dir is torn
+///   down (redteam R2 MED — no residue on any failure branch).
+/// - **`rename` fails** (post-unlink move denied): the symlink is RESTORED
+///   best-effort (so the session still resolves its user-global rules) AND the
+///   staging dir is torn down.
+///
+/// Production passes the real `std::fs::remove_file` / `std::fs::rename`; only the
+/// tests inject failing closures. The closures take/return the same shapes as the
+/// std fns so the injection is transparent (redteam-discipline Rule 5: closure
+/// injection over chmod-parent tricks, which can only reach ONE branch and
+/// misrepresent coverage).
+fn materialize_native_rules_inner<U, R>(
+    handle_dir_abs: &Path,
+    rules: &[csq_core::coc::translate::FlatArtifact],
+    mut unlink: U,
+    mut rename: R,
+) -> Result<()>
+where
+    U: FnMut(&Path) -> std::io::Result<()>,
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    use csq_core::coc::translate::emit_coc_rules;
+
+    let rules_dir = handle_dir_abs.join("rules");
+    // Emit the materialized rules under a namespaced subdir so they never collide
+    // with a top-level user-global rule file.
+    let emit_into = |dir: &Path| -> Result<()> {
+        let coc_sub = dir.join("csq-coc");
+        std::fs::create_dir_all(&coc_sub)
+            .with_context(|| format!("creating {}", redact_path(&coc_sub)))?;
+        emit_coc_rules(rules, &coc_sub).map_err(|e| anyhow!("materializing native rules: {e}"))?;
+        Ok(())
+    };
+
+    match std::fs::symlink_metadata(&rules_dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            // Build the replacement in a sibling temp dir; swap in only on full
+            // success so the symlink (→ complete user-global rules) survives any
+            // partial failure.
+            let target = std::fs::read_link(&rules_dir).ok();
+            let tmp = handle_dir_abs.join("rules.coc-staging");
+            let _ = std::fs::remove_dir_all(&tmp); // clear any stale residue
+            std::fs::create_dir(&tmp).with_context(|| format!("creating {}", redact_path(&tmp)))?;
+            let build = (|| -> Result<()> {
+                if let Some(t) = &target {
+                    if t.is_dir() {
+                        copy_dir_into(t, &tmp).with_context(|| {
+                            format!("preserving user-global rules from {}", redact_path(t))
+                        })?;
+                    }
+                }
+                emit_into(&tmp)
+            })();
+            if let Err(e) = build {
+                let _ = std::fs::remove_dir_all(&tmp); // leave the symlink intact
+                return Err(e);
+            }
+            // Swap: unlink the symlink, move the staged dir into place.
+            if let Err(e) = unlink(&rules_dir) {
+                // Symlink removal failed → symlink still intact; clean the staged
+                // dir so no residue survives (redteam R2 MED — every failure
+                // branch of the atomic swap must tear down the staging dir).
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(anyhow!(
+                    "removing rules symlink {}: {e}",
+                    redact_path(&rules_dir)
+                ));
+            }
+            if let Err(e) = rename(&tmp, &rules_dir) {
+                // Restore the symlink so the session keeps its user-global rules.
+                if let Some(t) = &target {
+                    let _ = csq_core::session::isolation::create_symlink_pub(t, &rules_dir);
+                }
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(anyhow!(
+                    "swapping staged rules into {}: {e}",
+                    redact_path(&rules_dir)
+                ));
+            }
+        }
+        // Already a real dir (unexpected for a fresh handle dir) — emit into it.
+        Ok(_) => emit_into(&rules_dir)?,
+        // No `rules` entry (the user has no ~/.claude/rules) — create fresh.
+        Err(_) => {
+            std::fs::create_dir_all(&rules_dir)
+                .with_context(|| format!("creating {}", redact_path(&rules_dir)))?;
+            emit_into(&rules_dir)?;
+        }
+    }
+
+    // TOCTOU close: refuse a symlinked rules dir before spawn (same posture as
+    // the coc-plugin guard).
+    verify_coc_plugin_dir_is_real(&rules_dir)?;
+    Ok(())
+}
+
+/// Build the Level-1 prose for exactly the artifact kinds NOT delivered natively
+/// on this surface (an internal ticket S3/S4). `remaining` is the `.coc/` artifacts with
+/// the natively-materialized kinds cleared (codex: skills removed; gemini: both
+/// skills and commands removed). Mirrors the CC launch arm's prose selection
+/// precisely so no kind is ever double-delivered or dropped:
+///
+/// - remaining kinds present → render them through the SAME
+///   `render_sections(surface_header(..), ..)` the full scaffold uses (so a full
+///   `remaining` is byte-identical to the pre-built `scaffold` — no drift), plus
+///   the FR-CL-01 structured-output directive on Compliance prompts.
+/// - nothing remains (every kind delivered natively) → deliver ONLY the directive
+///   (Compliance) or nothing at all (free-form).
+///
+/// Returns `None` when there is nothing to say (no remaining kinds AND not a
+/// Compliance prompt), so the caller omits the prose carrier entirely.
+fn reduced_surface_prose(
+    surface: Surface,
+    remaining: &csq_core::coc::translate::SurfaceArtifacts,
+    compliance: bool,
+) -> Option<String> {
+    use csq_core::coc::translate::{
+        build_output_schema_directive, render_sections, surface_header,
+    };
+    let has_content = !remaining.rules.is_empty()
+        || !remaining.agents.is_empty()
+        || !remaining.skills.is_empty()
+        || !remaining.commands.is_empty();
+    if has_content {
+        let (mut prose, _) = render_sections(surface_header(surface), remaining);
+        if compliance {
+            prose.push_str(&build_output_schema_directive());
+        }
+        Some(prose)
+    } else if compliance {
+        Some(build_output_schema_directive())
+    } else {
+        None
+    }
+}
+
+/// TOCTOU close for a materialized native subdir (codex `skills/`, gemini
+/// `skills/`/`commands/`). Refuses a symlinked (or non-directory) path
+/// immediately before the CLI is spawned against it — same fail-closed posture
+/// as [`verify_coc_plugin_dir_is_real`], but surface-neutral in its message. A
+/// same-user attacker who unlinked our real dir and replaced it with a symlink to
+/// attacker-controlled skill/command content would otherwise inject native
+/// artifacts into the spawned session.
+fn verify_materialized_dir_is_real(dir: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(dir).with_context(|| {
+        format!(
+            "stat {} — materialized native dir missing post-materialization",
+            redact_path(dir)
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing spawn: {} became a symlink between materialization and spawn (TOCTOU). \
+             Re-run `csq run`.",
+            redact_path(dir)
+        ));
+    }
+    if !ft.is_dir() {
+        return Err(anyhow!(
+            "refusing spawn: {} is not a directory (type: {:?})",
+            redact_path(dir),
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// S3 (an internal ticket): materialize codex-native SKILLS into `$CODEX_HOME/skills/`
+/// (the handle dir IS `$CODEX_HOME`, spec 07 §7.2.2). codex has native skill
+/// discovery only — agents (no registry), commands (`prompts/` is TUI-only), and
+/// rules (no native primitive) stay Level-1 prose, so ONLY `skills/` is written.
+///
+/// Creates a FRESH `<handle_dir>/skills/` (removing any residue first so the pure
+/// [`emit_codex_native`](csq_core::coc::translate::emit_codex_native) writer gets
+/// the clean, csq-owned, non-symlink `dest` its caller-contract requires — the
+/// codex handle-dir symlink set never includes `skills`, so it should not
+/// pre-exist), emits, then re-stats the dir is real before the caller spawns. On
+/// ANY error the partial tree is torn down and the error propagated so the caller
+/// falls back to Level-1 prose for skills too.
+fn materialize_codex_native(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+) -> Result<()> {
+    use csq_core::coc::translate::emit_codex_native;
+
+    let skills_dir = handle_dir_abs.join("skills");
+    if skills_dir.exists() || skills_dir.symlink_metadata().is_ok() {
+        std::fs::remove_dir_all(&skills_dir)
+            .with_context(|| format!("clearing stale {}", redact_path(&skills_dir)))?;
+    }
+    // The emitter joins `skills/<id>/SKILL.md` under `handle_dir_abs`, so pass the
+    // handle dir as `dest`. On any error, tear down the partial skills/ tree.
+    if let Err(e) = emit_codex_native(artifacts, handle_dir_abs) {
+        let _ = std::fs::remove_dir_all(&skills_dir);
+        return Err(anyhow!("materializing codex-native skills: {e}"));
+    }
+    verify_materialized_dir_is_real(&skills_dir)?;
+    Ok(())
+}
+
+/// S4 (an internal ticket): materialize gemini-native SKILLS + COMMANDS into the handle
+/// dir's `.gemini/` config root (where csq already writes `settings.json`).
+/// gemini has native skill AND command discovery — agents (no registry) and
+/// rules (no native primitive) stay Level-1 prose, so `skills/` + `commands/` are
+/// written.
+///
+/// Creates FRESH `.gemini/skills/` + `.gemini/commands/` (removing any residue
+/// first), emits, then re-stats each written dir is real before spawn. Runs
+/// BEFORE `build_spawn_plan_with_system_instruction` writes `settings.json` —
+/// safe because that path uses idempotent `create_dir_all` on `.gemini/` and
+/// never wipes it. On ANY error the partial trees are torn down and the error
+/// propagated so the caller falls back to Level-1 prose.
+fn materialize_gemini_native(
+    gemini_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+) -> Result<()> {
+    use csq_core::coc::translate::emit_gemini_native;
+
+    let skills_dir = gemini_dir_abs.join("skills");
+    let commands_dir = gemini_dir_abs.join("commands");
+    for d in [&skills_dir, &commands_dir] {
+        if d.exists() || d.symlink_metadata().is_ok() {
+            std::fs::remove_dir_all(d)
+                .with_context(|| format!("clearing stale {}", redact_path(d)))?;
+        }
+    }
+    std::fs::create_dir_all(gemini_dir_abs)
+        .with_context(|| format!("creating {}", redact_path(gemini_dir_abs)))?;
+    if let Err(e) = emit_gemini_native(artifacts, gemini_dir_abs) {
+        let _ = std::fs::remove_dir_all(&skills_dir);
+        let _ = std::fs::remove_dir_all(&commands_dir);
+        return Err(anyhow!("materializing gemini-native skills/commands: {e}"));
+    }
+    // Only the dirs the emitter actually wrote (a kind may be empty) need the
+    // TOCTOU re-stat.
+    if !artifacts.skills.is_empty() {
+        verify_materialized_dir_is_real(&skills_dir)?;
+    }
+    if !artifacts.commands.is_empty() {
+        verify_materialized_dir_is_real(&commands_dir)?;
+    }
+    Ok(())
+}
+
+/// Recursively copy the CONTENTS of `src` into `dst` (both must be dirs).
+/// Regular files and subdirectories are copied by value; symlinks are SKIPPED
+/// (never followed) so a hostile symlink in the user-global rules dir cannot
+/// redirect a copy out of the handle dir.
+fn copy_dir_into(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_into(&from, &to)?;
+        } else if ft.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+        // symlinks intentionally skipped
+    }
+    Ok(())
+}
+
 /// JWT-exp pre-flight check on auth.json.
 ///
 /// Reads `tokens.access_token` from the JSON at `auth_json_path`, decodes the
@@ -1569,6 +2235,21 @@ fn verify_codex_canonical_is_regular_file(base_dir: &Path, account: AccountNum) 
     Ok(())
 }
 
+/// Detect a headless (non-interactive) Gemini invocation — a `-p` / `--prompt`
+/// one-shot. gemini-cli's `-i` / `--prompt-interactive` seeds an INTERACTIVE
+/// session and is NOT headless. #965: a headless run must not reach gemini-cli's
+/// interactive browser-auth prompt, so this gates the pre-spawn OAuth check.
+fn gemini_invocation_is_headless(rest: &[String]) -> bool {
+    let interactive = rest.iter().any(|a| {
+        a == "-i" || a == "--prompt-interactive" || a.starts_with("--prompt-interactive=")
+    });
+    if interactive {
+        return false;
+    }
+    rest.iter()
+        .any(|a| a == "-p" || a == "--prompt" || a.starts_with("--prompt="))
+}
+
 /// Verifies `config-<N>/config.toml` exists before a Codex spawn.
 /// Extracted from [`launch_codex`] so the precondition can be
 /// unit-tested without shelling out to `codex` or exit(2)-ing on the
@@ -1627,7 +2308,12 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
 /// module + typed error enum. When a 3rd caller surfaces (most
 /// likely the desktop spawn path landing inside csq-cli, or a
 /// future Bedrock launcher reusing the same shape), factor both
-/// bodies into csq-core. Both sites must be edited together.
+/// bodies into csq-core. Both sites must be edited together — AND the
+/// factored spawn path MUST carry the #965 headless-OAuth guard
+/// (`gemini_invocation_is_headless` → `oauth_login::check_headless_oauth_ready`)
+/// so a future desktop/Bedrock caller cannot silently regress the "no
+/// interactive prompt on a headless run" contract. The guard is structurally
+/// required, not caller-optional.
 #[allow(clippy::too_many_arguments)]
 fn launch_gemini(
     base_dir: &Path,
@@ -1754,6 +2440,50 @@ fn launch_gemini(
         ));
     }
 
+    // #965: a headless (`-p`/`--prompt`) run against a Code Assist OAuth Gemini
+    // slot whose `~/.gemini/oauth_creds.json` is missing or stale would trip
+    // gemini-cli's interactive browser-auth prompt ("Opening authentication
+    // page ... [Y/n]"), which hangs any non-TTY caller with no catchable error.
+    // Pre-check the cached creds here and return a typed error instead of
+    // spawning. API-key and Vertex-SA slots never prompt, so they skip this.
+    //
+    // Detection is `-p`/`--prompt`-ONLY, NOT `!stdin().is_terminal()`: a bare
+    // non-TTY check fires for EVERY piped/redirected/CI invocation — including
+    // stub-driven integration harnesses (`cu2_gemini_one_shot_integration`) and
+    // any non-OAuth spawn — and would reject a legitimate one-shot whose creds
+    // gemini-cli would resolve differently. The reported failure (#965) is the
+    // `-p` case; the piped-stdin-without-`-p` variant is a documented, accepted
+    // limitation (zero-tolerance Rule 5: the specific blocker is that non-TTY
+    // detection breaks stub/test spawns + non-OAuth gemini paths).
+    if gemini_invocation_is_headless(rest) {
+        use csq_core::providers::gemini::provisioning::{self, AuthMode};
+        let binding = provisioning::read_binding(base_dir, account)
+            .with_context(|| format!("read Gemini binding for slot {account}"))?;
+        if matches!(binding.auth, AuthMode::CodeAssistOAuth) {
+            let home = std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(std::path::PathBuf::from);
+            // Path-redaction: two OauthLoginError variants (Malformed/Unreadable)
+            // embed the absolute `~/.gemini/oauth_creds.json` path in their
+            // Display, which would leak $HOME/username to operator stderr — and
+            // `csq run` is NOT operator-surface-exempt (operator-surface-verification.md
+            // Rule 5). All four failure variants share one remediation, so emit a
+            // fixed, path-free message instead of interpolating the raw error.
+            csq_core::providers::gemini::oauth_login::check_headless_oauth_ready(
+                home.as_deref(),
+                account,
+            )
+            .map_err(|_e| {
+                anyhow!(
+                    "headless Gemini run for slot {account} cannot proceed: cached \
+                     Google OAuth credentials are missing, expired, or unreadable. \
+                     Run `csq login {account} --provider gemini` to re-authenticate, \
+                     then retry."
+                )
+            })?;
+        }
+    }
+
     // Ensure ~/.claude/accounts exists. We do NOT create config-N/
     // for Gemini — the binding marker lives in
     // ~/.claude/accounts/credentials/, and the per-spawn settings
@@ -1846,6 +2576,10 @@ fn launch_gemini(
             class,
             rule_ids_in_scope,
             scaffold,
+            // S4 (an internal ticket): gemini materializes SKILLS + COMMANDS natively; the
+            // rest is prose (`rules_only_scaffold` is a CC-only field).
+            artifacts,
+            ..
         } => {
             // PR-CA8b commit 4: emit the host-isolation warning per
             // spec 08 MED-03 if production-shaped secrets were
@@ -1862,7 +2596,83 @@ fn launch_gemini(
             let parent_env: std::collections::HashMap<String, String> = std::env::vars().collect();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            let system_instruction = scaffold.as_deref().filter(|s| !s.is_empty());
+            // Fix A (native-delegation gate): suppress the flattened `.coc/`
+            // scaffold when the target's native `.gemini/` / `GEMINI.md` are
+            // present — gemini-cli loads its own artifacts, so injecting the
+            // full `.coc/` flatten into `settings.json system_instruction`
+            // duplicates + overflows context. `CSQ_COC_PARITY_TEST=1` forces it.
+            let inject = should_inject_scaffold(Surface::Gemini, &cwd);
+            // S4 (an internal ticket): deliver gemini-native SKILLS + COMMANDS through
+            // `.gemini/skills/` + `.gemini/commands/` (native progressive
+            // disclosure + `/commands`). Runs BEFORE the settings.json write below
+            // (that path uses idempotent `create_dir_all` on `.gemini/` and never
+            // wipes it). agents/rules have no native gemini primitive → prose.
+            // Native materialization is JOINT (all-or-nothing): a single
+            // `materialize_gemini_native` call emits both kinds, and any error
+            // tears BOTH down and routes BOTH to prose. This is deliberate and
+            // safe — `emit_gemini_native` only errors on an id-validation reject
+            // (unreachable for spec-conformant `.coc/` ids) or a filesystem write
+            // failure on the fresh handle dir (near-infallible), so the joint
+            // fallback never fires in practice; and on the fallback, prose is the
+            // full `scaffold` (every kind delivered exactly once — no
+            // double-delivery, no drop). Per-kind independence (CC-arm style) would
+            // add surface for a path that cannot be reached.
+            let gemini_dir = handle_dir_abs.join(".gemini");
+            let mut skills_native = false;
+            let mut commands_native = false;
+            if inject && (!artifacts.skills.is_empty() || !artifacts.commands.is_empty()) {
+                match materialize_gemini_native(&gemini_dir, &artifacts) {
+                    Ok(()) => {
+                        skills_native = !artifacts.skills.is_empty();
+                        commands_native = !artifacts.commands.is_empty();
+                    }
+                    Err(e) => {
+                        // Fail-safe: tear down the partial trees; both kinds fall
+                        // back to prose.
+                        let _ = std::fs::remove_dir_all(gemini_dir.join("skills"));
+                        let _ = std::fs::remove_dir_all(gemini_dir.join("commands"));
+                        tracing::warn!(
+                            error_kind = "coc_gemini_native_failed",
+                            "gemini-native skills/commands materialization failed; falling back to prose: {}",
+                            csq_core::error::redact_tokens(&e.to_string())
+                        );
+                    }
+                }
+            }
+            // Prose (settings.json `system_instruction`) = exactly the kinds NOT
+            // delivered natively. When !inject (project carries its own native
+            // `.gemini/`), defer entirely — Level-1 behavior byte-unchanged.
+            let prose_owned: Option<String> = if !inject {
+                if scaffold.as_deref().is_some_and(|s| !s.is_empty()) {
+                    note_scaffold_deferred(Surface::Gemini);
+                }
+                None
+            } else if skills_native || commands_native {
+                // Some kind native → prose is every kind NOT materialized. A kind
+                // whose materialization was skipped/failed stays in `remaining`.
+                let remaining = csq_core::coc::translate::SurfaceArtifacts {
+                    skills: if skills_native {
+                        Vec::new()
+                    } else {
+                        artifacts.skills.clone()
+                    },
+                    commands: if commands_native {
+                        Vec::new()
+                    } else {
+                        artifacts.commands.clone()
+                    },
+                    ..artifacts.clone()
+                };
+                reduced_surface_prose(
+                    Surface::Gemini,
+                    &remaining,
+                    class.class == csq_core::capability_layer::PromptClassKind::Compliance,
+                )
+            } else {
+                // Nothing native → full prose (all kinds).
+                scaffold
+            };
+            let system_instruction = prose_owned.as_deref().filter(|s| !s.is_empty());
 
             let plan = match build_spawn_plan_with_system_instruction(
                 base_dir,
@@ -2357,15 +3167,24 @@ enum LayerControl {
     /// `scaffold` is the system-prompt-append text built by
     /// `ScaffoldStage`, including the FR-CL-01 structured-output
     /// directive when `class == Compliance` (PR-CA7c). The caller
-    /// injects this into CC's environment via
-    /// `CLAUDE_SYSTEM_PROMPT_APPEND` (the same name CC reads from
-    /// `settings.json::env`); spec 10 §10.4.6 records the delivery
+    /// delivers this to CC via `--append-system-prompt-file <path>`
+    /// (file-based carrier — avoids E2BIG when the flattened `.coc/`
+    /// artifacts exceed ARG_MAX); spec 10 §10.4.6 records the delivery
     /// mechanism.
     WithLayer {
         mode: SpawnMode,
         class: PromptClass,
         rule_ids_in_scope: BTreeSet<String>,
         scaffold: Option<String>,
+        /// Rules-ONLY scaffold for the CC Level-2 native-materialization
+        /// branch (an internal ticket S2). Same value shape for all surfaces; only the
+        /// CC launch path consumes it today (codex/gemini deliver full prose).
+        rules_only_scaffold: Option<String>,
+        /// Per-kind flattened artifacts (rules/agents/skills/commands) with full
+        /// bodies. The CC launch path materializes agents/skills/commands into a
+        /// native session-scoped plugin (Level-2, an internal ticket S2); the codex/gemini
+        /// launch paths ignore this field today.
+        artifacts: csq_core::coc::translate::SurfaceArtifacts,
     },
 }
 
@@ -2564,11 +3383,16 @@ fn run_capability_layer_preflight(
                      or durably via the desktop tray toggle."
                 );
             }
+            // `pre_spawn` is boxed in `LayerOutcome::Enabled`
+            // (clippy::large_enum_variant); deref to move its fields out.
+            let pre_spawn = *pre_spawn;
             Ok(LayerControl::WithLayer {
                 mode,
                 class,
                 rule_ids_in_scope,
                 scaffold: pre_spawn.scaffold,
+                rules_only_scaffold: pre_spawn.rules_only_scaffold,
+                artifacts: pre_spawn.artifacts,
             })
         }
     }
@@ -2704,6 +3528,52 @@ mod debug_record_tests {
             v.get("rule_ids_cited").is_none(),
             "ok=false must omit rule_ids_cited"
         );
+    }
+}
+
+/// Delivers the capability-layer scaffold text to a CC `Command` via
+/// `--append-system-prompt-file <path>`.
+///
+/// Writes `scaffold_text` to a unique temp file under the system temp dir
+/// and appends `--append-system-prompt-file <path>` to `cmd`.  Returns the
+/// temp-file path so the caller can clean it up after `spawn_with_layer`
+/// returns (WithLayer always spawns+waits, so the parent is still alive).
+///
+/// Falls back to `CLAUDE_SYSTEM_PROMPT_APPEND` env var on write failure so
+/// small scaffolds (< ARG_MAX) are still delivered on permission-restricted
+/// temp dirs.  Returns `None` when `scaffold_text` is `None` or empty.
+///
+/// **E2BIG rationale**: env vars count toward the execve argv+envp limit
+/// (macOS ARG_MAX = 1 MiB).  Large `.coc/` artifact flattens can exceed
+/// that limit, causing `cmd.spawn()` to return `os error 7`.  Writing the
+/// content to a file keeps argv small regardless of scaffold size.
+fn attach_scaffold(cmd: &mut Command, scaffold_text: Option<&str>) -> Option<PathBuf> {
+    use csq_core::platform::fs::unique_tmp_path;
+
+    let text = match scaffold_text {
+        Some(s) if !s.is_empty() => s,
+        _ => return None,
+    };
+
+    let base = std::env::temp_dir().join("csq-coc-scaffold.md");
+    let tmp = unique_tmp_path(&base);
+
+    match std::fs::write(&tmp, text.as_bytes()) {
+        Ok(()) => {
+            cmd.arg("--append-system-prompt-file").arg(&tmp);
+            Some(tmp)
+        }
+        Err(e) => {
+            // Best-effort fallback: small scaffolds still reach CC via the
+            // env var; large ones will hit E2BIG on spawn (the original bug)
+            // but that is better than silently dropping the scaffold.
+            tracing::warn!(
+                error_kind = "scaffold_tmp_write_failed",
+                "could not write scaffold temp file, falling back to env var: {e}"
+            );
+            cmd.env("CLAUDE_SYSTEM_PROMPT_APPEND", text);
+            None
+        }
     }
 }
 
@@ -3468,6 +4338,622 @@ mod tests {
         AccountNum::try_from(n).unwrap()
     }
 
+    // ── S2 (an internal ticket): CC native-materialization helpers ────────────────
+
+    fn flat(id: &str, body: &str) -> csq_core::coc::translate::FlatArtifact {
+        csq_core::coc::translate::FlatArtifact {
+            id: id.to_string(),
+            precedence: 0,
+            body: body.to_string(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// Full path: materialize a plugin tree from agents/skills/commands into a
+    /// fresh `coc-plugin/`, return its absolute path, and confirm the CC plugin
+    /// shape + 0o600 perms. Rules are NOT materialized.
+    #[test]
+    fn materialize_cc_coc_plugin_writes_expected_tree() {
+        let handle = TempDir::new().unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            rules: vec![flat("RULE-X", "rule must NOT be materialized")],
+            agents: vec![flat("AGENT-Y", "you are a reviewer")],
+            skills: vec![flat("SKILL-Z", "progressive disclosure")],
+            commands: vec![flat("COMMAND-W", "run the thing")],
+        };
+        let plugin_dir = materialize_cc_coc_plugin(handle.path(), &arts).unwrap();
+
+        assert_eq!(plugin_dir, handle.path().join("coc-plugin"));
+        assert!(plugin_dir.join(".claude-plugin/plugin.json").is_file());
+        assert!(plugin_dir.join("agents/AGENT-Y.md").is_file());
+        assert!(plugin_dir.join("skills/SKILL-Z/SKILL.md").is_file());
+        assert!(plugin_dir.join("commands/COMMAND-W.md").is_file());
+        // Rules are Level-1 prose — never materialized.
+        assert!(!plugin_dir.join("rules").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(plugin_dir.join("agents/AGENT-Y.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "materialized files must be 0o600");
+        }
+    }
+
+    /// Caller-contract "fresh dest": a pre-existing `coc-plugin/` with stale
+    /// residue is cleared before the emitter writes, so no orphan survives.
+    #[test]
+    fn materialize_cc_coc_plugin_clears_stale_residue() {
+        let handle = TempDir::new().unwrap();
+        let stale = handle.path().join("coc-plugin").join("agents");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("ORPHAN.md"), b"stale from a prior emit").unwrap();
+
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            agents: vec![flat("AGENT-FRESH", "fresh")],
+            ..Default::default()
+        };
+        let plugin_dir = materialize_cc_coc_plugin(handle.path(), &arts).unwrap();
+
+        assert!(plugin_dir.join("agents/AGENT-FRESH.md").is_file());
+        assert!(
+            !plugin_dir.join("agents/ORPHAN.md").exists(),
+            "stale residue must be cleared before emit (fresh-dest contract)"
+        );
+    }
+
+    /// TOCTOU close: a symlink planted at the plugin root is refused fail-closed.
+    #[cfg(unix)]
+    #[test]
+    fn verify_coc_plugin_dir_is_real_rejects_symlink() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real-target");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("coc-plugin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = verify_coc_plugin_dir_is_real(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "symlinked plugin root must be refused: {err}"
+        );
+    }
+
+    /// A real directory passes the TOCTOU re-stat.
+    #[test]
+    fn verify_coc_plugin_dir_is_real_accepts_directory() {
+        let dir = TempDir::new().unwrap();
+        let plugin = dir.path().join("coc-plugin");
+        std::fs::create_dir(&plugin).unwrap();
+        assert!(verify_coc_plugin_dir_is_real(&plugin).is_ok());
+    }
+
+    // ── S2b (an internal ticket): native rule materialization ─────────────────────
+
+    fn rule(id: &str, body: &str, paths: &[&str]) -> csq_core::coc::translate::FlatArtifact {
+        csq_core::coc::translate::FlatArtifact {
+            id: id.to_string(),
+            precedence: 0,
+            body: body.to_string(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// The handle dir's `rules` symlink → user-global rules is replaced by a real
+    /// dir that MERGES the preserved user-global rules with the materialized
+    /// `coc-<ID>.md`; the user-global dir itself is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_replaces_symlink_and_merges() {
+        let dir = TempDir::new().unwrap();
+        // User-global rules dir (the symlink target).
+        let user_rules = dir.path().join("user-claude-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("user-global.md"), b"user rule").unwrap();
+        // Handle dir with a `rules` symlink → user-global rules.
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        let rules = vec![
+            rule("RULE-SCOPED", "# RULE-SCOPED\nbody", &["src/**/*.rs"]),
+            rule("RULE-UNSCOPED", "always on", &[]),
+        ];
+        materialize_native_rules(&handle, &rules).unwrap();
+
+        let rd = handle.join("rules");
+        // Now a REAL dir, not a symlink.
+        assert!(!std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // User-global rule preserved (copied in).
+        assert_eq!(
+            std::fs::read_to_string(rd.join("user-global.md")).unwrap(),
+            "user rule"
+        );
+        // coc rules materialized under the namespaced `csq-coc/` subdir.
+        assert!(
+            std::fs::read_to_string(rd.join("csq-coc/coc-RULE-SCOPED.md"))
+                .unwrap()
+                .contains("paths:\n  - \"src/**/*.rs\"")
+        );
+        assert_eq!(
+            std::fs::read_to_string(rd.join("csq-coc/coc-RULE-UNSCOPED.md")).unwrap(),
+            "always on\n"
+        );
+        // The user-global source dir is UNTOUCHED (no coc files leaked into it).
+        assert!(!user_rules.join("csq-coc").exists());
+        assert_eq!(
+            std::fs::read_dir(&user_rules).unwrap().count(),
+            1,
+            "user-global rules dir must be untouched"
+        );
+    }
+
+    /// When the handle dir has no `rules` entry (user has no ~/.claude/rules), a
+    /// fresh real dir is created with just the coc rules.
+    #[test]
+    fn materialize_native_rules_creates_fresh_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-2");
+        std::fs::create_dir(&handle).unwrap();
+        materialize_native_rules(&handle, &[rule("RULE-X", "body", &[])]).unwrap();
+        assert!(handle.join("rules/csq-coc/coc-RULE-X.md").is_file());
+    }
+
+    /// Redteam R1 (failure-mode): a user-global rule that happens to be named
+    /// `coc-<ID>.md` is PRESERVED, not silently overwritten — the materialized
+    /// rules live under the `csq-coc/` subdir, so top-level names never collide.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_preserves_colliding_user_filename() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        // A user rule whose filename collides with the emitted prefix.
+        std::fs::write(user_rules.join("coc-RULE-SCOPED.md"), b"USER OWNED").unwrap();
+        let handle = dir.path().join("term-3");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        materialize_native_rules(&handle, &[rule("RULE-SCOPED", "coc body", &["x"])]).unwrap();
+
+        let rd = handle.join("rules");
+        // User's top-level file preserved verbatim.
+        assert_eq!(
+            std::fs::read_to_string(rd.join("coc-RULE-SCOPED.md")).unwrap(),
+            "USER OWNED"
+        );
+        // csq's rule lives in the subdir, distinct.
+        assert!(rd.join("csq-coc/coc-RULE-SCOPED.md").is_file());
+    }
+
+    /// Redteam R1 (failure-mode): a mid-build failure must NOT destroy the
+    /// symlink — the session keeps the complete user-global rule set. Force a
+    /// failure by making the coc rule id invalid (rejected by `validate_id`).
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_leaves_symlink_intact_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-4");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        // An id with a path separator is rejected by emit_coc_rules::validate_id.
+        let err = materialize_native_rules(&handle, &[rule("bad/id", "b", &[])]);
+        assert!(err.is_err(), "invalid id must fail materialization");
+
+        // The symlink is untouched → the session still sees the complete user rules.
+        let rd = handle.join("rules");
+        assert!(std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        // No staging residue left behind.
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    /// FD2 (an internal journal entry): the swap's `unlink` failure branch — the symlink
+    /// removal is denied. Injected via closure (redteam-discipline Rule 5: closure
+    /// injection reaches THIS branch exactly, where a chmod-parent trick could
+    /// not). Invariant: the symlink is left intact (session keeps its complete
+    /// user-global rules) AND the staging dir is torn down.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_swap_unlink_failure_preserves_symlink() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-fd2a");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        let err = materialize_native_rules_inner(
+            &handle,
+            &[rule("RULE-X", "body", &["x"])],
+            // unlink denied — the symlink is never removed.
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "boom",
+                ))
+            },
+            |from, to| std::fs::rename(from, to),
+        );
+        assert!(err.is_err(), "unlink failure must propagate");
+
+        let rd = handle.join("rules");
+        // Symlink intact → the session still resolves the complete user rules.
+        assert!(std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        // Staging dir torn down — no residue on the failure branch.
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    /// FD2 (an internal journal entry): the swap's `rename` failure branch — the staged dir
+    /// move is denied AFTER the symlink was already unlinked. Injected via closure.
+    /// Invariant: the symlink is RESTORED best-effort (session still resolves its
+    /// user-global rules) AND the staging dir is torn down.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_swap_rename_failure_restores_symlink() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-fd2b");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        let err = materialize_native_rules_inner(
+            &handle,
+            &[rule("RULE-X", "body", &["x"])],
+            // Real unlink — the symlink IS removed, so the rename branch is reached.
+            |p| std::fs::remove_file(p),
+            // rename denied — restore path must fire.
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "boom",
+                ))
+            },
+        );
+        assert!(err.is_err(), "rename failure must propagate");
+
+        let rd = handle.join("rules");
+        // Symlink RESTORED → still a symlink, still resolving to the user rules.
+        let meta = std::fs::symlink_metadata(&rd).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "symlink restored after rename failure"
+        );
+        assert_eq!(std::fs::read_link(&rd).unwrap(), user_rules);
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        // Staging dir torn down — no residue on the failure branch.
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    /// FD2 (an internal journal entry): the inner, driven with the REAL `std::fs` ops, is
+    /// behavior-identical to the public `materialize_native_rules` — the swap
+    /// succeeds and the merged dir replaces the symlink. Guards against the
+    /// injection refactor changing the happy path.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_inner_real_ops_swaps_successfully() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-fd2c");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        materialize_native_rules_inner(
+            &handle,
+            &[rule("RULE-X", "body", &["x"])],
+            |p| std::fs::remove_file(p),
+            |from, to| std::fs::rename(from, to),
+        )
+        .unwrap();
+
+        let rd = handle.join("rules");
+        // Now a real dir (symlink swapped out), user rules preserved, coc rule emitted.
+        assert!(!std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        assert!(rd.join("csq-coc/coc-RULE-X.md").is_file());
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    // ── S3 (an internal ticket): codex-native wiring ───────────────────────────────
+
+    /// S3: `materialize_codex_native` writes ONLY skills into `$CODEX_HOME/skills/`
+    /// (the handle dir), leaving no other native kind on disk.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_writes_skills_dir() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-codex");
+        std::fs::create_dir(&handle).unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            rules: vec![rule("RULE-A", "r", &[])],
+            agents: vec![rule("AGENT-A", "persona", &[])],
+            skills: vec![rule("SKILL-A", "# skill\nbody", &[])],
+            commands: vec![rule("CMD-A", "do it", &[])],
+        };
+        materialize_codex_native(&handle, &arts).unwrap();
+        assert!(handle.join("skills/SKILL-A/SKILL.md").is_file());
+        // No agents/commands/rules dirs — those stay prose.
+        assert!(!handle.join("agents").exists());
+        assert!(!handle.join("commands").exists());
+        assert!(!handle.join("rules").exists());
+    }
+
+    // ── S4 (an internal ticket): gemini-native wiring ──────────────────────────────
+
+    /// S4: `materialize_gemini_native` writes skills + commands into `.gemini/`,
+    /// leaving agents/rules for prose.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_gemini_native_writes_skills_and_commands() {
+        let dir = TempDir::new().unwrap();
+        let gemini_dir = dir.path().join("term-gemini").join(".gemini");
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            rules: vec![rule("RULE-A", "r", &[])],
+            agents: vec![rule("AGENT-A", "persona", &[])],
+            skills: vec![rule("SKILL-A", "# skill\nbody", &[])],
+            commands: vec![rule("CMD-A", "do it", &[])],
+        };
+        materialize_gemini_native(&gemini_dir, &arts).unwrap();
+        assert!(gemini_dir.join("skills/SKILL-A/SKILL.md").is_file());
+        assert!(gemini_dir.join("commands/CMD-A.toml").is_file());
+        assert!(!gemini_dir.join("agents").exists());
+        assert!(!gemini_dir.join("rules").exists());
+    }
+
+    // ── S3/S4: reduced prose selection ─────────────────────────────────────
+
+    /// `reduced_surface_prose` returns None when nothing remains and the prompt
+    /// is free-form; the directive only when nothing remains but Compliance;
+    /// and rendered sections when kinds remain.
+    #[test]
+    fn reduced_surface_prose_selection_matrix() {
+        use csq_core::coc::translate::SurfaceArtifacts;
+        // Empty + free-form → nothing to say.
+        assert_eq!(
+            reduced_surface_prose(Surface::Codex, &SurfaceArtifacts::default(), false),
+            None
+        );
+        // Empty + Compliance → directive only.
+        let directive = reduced_surface_prose(Surface::Codex, &SurfaceArtifacts::default(), true)
+            .expect("compliance directive");
+        assert_eq!(
+            directive,
+            csq_core::coc::translate::build_output_schema_directive()
+        );
+        // Remaining rules → rendered prose that contains the rule body.
+        let remaining = SurfaceArtifacts {
+            rules: vec![rule("RULE-KEEP", "rule stays prose", &[])],
+            ..Default::default()
+        };
+        let prose =
+            reduced_surface_prose(Surface::Gemini, &remaining, false).expect("prose for remaining");
+        assert!(
+            prose.contains("rule stays prose"),
+            "remaining rule body must be in prose: {prose:?}"
+        );
+    }
+
+    /// `copy_dir_into` does not follow a symlink in the source (never redirects
+    /// a copy out of the handle dir).
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_into_skips_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"x").unwrap();
+        std::fs::write(src.join("real.md"), b"r").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("escape")).unwrap();
+        copy_dir_into(&src, &dst).unwrap();
+        assert!(dst.join("real.md").is_file());
+        assert!(!dst.join("escape").exists(), "symlink must be skipped");
+    }
+
+    // ── Fix A: native-artifact scaffold gate (native-delegation) ──────────
+
+    #[test]
+    fn native_artifacts_present_detects_each_surface() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        // Bound the upward walk to this dir (deterministic regardless of the
+        // tempdir's real ancestors) by planting the project-root `.coc/` marker.
+        std::fs::create_dir(cwd.join(".coc")).unwrap();
+        // Empty (of native artifacts) dir → no native artifacts for any surface.
+        assert!(!native_artifacts_present(Surface::ClaudeCode, cwd));
+        assert!(!native_artifacts_present(Surface::Codex, cwd));
+        assert!(!native_artifacts_present(Surface::Gemini, cwd));
+
+        // cc: `.claude/` dir OR `CLAUDE.md` file.
+        std::fs::create_dir(cwd.join(".claude")).unwrap();
+        assert!(native_artifacts_present(Surface::ClaudeCode, cwd));
+        assert!(
+            !native_artifacts_present(Surface::Codex, cwd),
+            ".claude/ must not count as a codex native artifact"
+        );
+
+        // codex: `.codex/` dir OR `AGENTS.md` file.
+        std::fs::write(cwd.join("AGENTS.md"), "x").unwrap();
+        assert!(native_artifacts_present(Surface::Codex, cwd));
+
+        // gemini: `.gemini/` dir OR `GEMINI.md` file.
+        assert!(!native_artifacts_present(Surface::Gemini, cwd));
+        std::fs::create_dir(cwd.join(".gemini")).unwrap();
+        assert!(native_artifacts_present(Surface::Gemini, cwd));
+    }
+
+    #[test]
+    fn native_artifacts_present_detects_marker_files_without_dirs() {
+        // A bare CLAUDE.md / GEMINI.md (no dir) still counts as native.
+        let dir = TempDir::new().unwrap();
+        // Bound the walk to this dir so the negative assertion below cannot
+        // false-positive on a real ancestor `AGENTS.md` (R2 finding 1).
+        std::fs::create_dir(dir.path().join(".coc")).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "x").unwrap();
+        std::fs::write(dir.path().join("GEMINI.md"), "x").unwrap();
+        assert!(native_artifacts_present(Surface::ClaudeCode, dir.path()));
+        assert!(native_artifacts_present(Surface::Gemini, dir.path()));
+        // Codex has no marker here → not falsely detected (walk stops at `.coc/`).
+        assert!(!native_artifacts_present(Surface::Codex, dir.path()));
+    }
+
+    #[test]
+    fn native_artifacts_present_detects_intermediate_ancestor_marker() {
+        // R2 finding 2: a native artifact at an INTERMEDIATE dir between cwd and
+        // the `.coc/` root must be detected (the walk checks every level).
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".coc")).unwrap(); // project root
+        let mid = root.path().join("a");
+        std::fs::create_dir(&mid).unwrap();
+        std::fs::write(mid.join("AGENTS.md"), "x").unwrap(); // codex native at intermediate level
+        let cwd = mid.join("b");
+        std::fs::create_dir(&cwd).unwrap();
+        assert!(native_artifacts_present(Surface::Codex, &cwd));
+    }
+
+    #[test]
+    fn native_artifacts_present_walks_up_to_project_root() {
+        // Redteam R1 HIGH: running `csq run N` from a SUBDIR of a project whose
+        // native artifacts + `.coc/` live at the root must still detect them
+        // (mirrors the `.coc/` loader's upward walk + the native CLI's own
+        // artifact discovery). The leaf-only check missed this, re-opening the
+        // overflow bug for every non-root invocation.
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".coc")).unwrap(); // project-root marker
+        std::fs::write(root.path().join("AGENTS.md"), "x").unwrap(); // codex native at root
+        let subdir = root.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&subdir).unwrap();
+        // From the deep subdir, the root-level AGENTS.md is still found.
+        assert!(native_artifacts_present(Surface::Codex, &subdir));
+        // A surface with NO native artifact at any level is not falsely
+        // suppressed; the walk stops at the `.coc/` project root → false.
+        assert!(!native_artifacts_present(Surface::Gemini, &subdir));
+    }
+
+    #[test]
+    fn native_artifacts_present_walk_stops_at_coc_root() {
+        // The walk must NOT climb past the `.coc/` project root into a parent
+        // that happens to hold a native marker (e.g. a user-global `~/.codex`
+        // above the project) — the `.coc/` boundary bounds it.
+        let outer = TempDir::new().unwrap();
+        std::fs::create_dir(outer.path().join(".codex")).unwrap(); // "user-global"-shaped, ABOVE project
+        let project = outer.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(project.join(".coc")).unwrap(); // project root
+                                                            // codex native artifact is NOT in the project → false despite the
+                                                            // ancestor `.codex` (walk stops at the project's `.coc/`).
+        assert!(!native_artifacts_present(Surface::Codex, &project));
+    }
+
+    #[test]
+    fn should_inject_scaffold_defers_when_native_present() {
+        // Env override (CSQ_COC_PARITY_TEST) is process-global → serialize.
+        let _lock = csq_core::platform::test_env::lock();
+        let had = std::env::var_os("CSQ_COC_PARITY_TEST");
+        // SAFETY: test_env::lock serializes env mutation per rules/testing.md.
+        unsafe {
+            std::env::remove_var("CSQ_COC_PARITY_TEST");
+        }
+
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        // Bound the upward walk to this dir with a project-root `.coc/` marker.
+        std::fs::create_dir(cwd.join(".coc")).unwrap();
+        // No native artifacts → inject (transition behavior preserved).
+        assert!(should_inject_scaffold(Surface::Codex, cwd));
+        // Native present → defer (do NOT inject) — THE fix.
+        std::fs::create_dir(cwd.join(".codex")).unwrap();
+        assert!(!should_inject_scaffold(Surface::Codex, cwd));
+
+        // Parity override forces injection even when native present.
+        // SAFETY: still under test_env::lock.
+        unsafe {
+            std::env::set_var("CSQ_COC_PARITY_TEST", "1");
+        }
+        assert!(should_inject_scaffold(Surface::Codex, cwd));
+
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match had {
+                Some(v) => std::env::set_var("CSQ_COC_PARITY_TEST", v),
+                None => std::env::remove_var("CSQ_COC_PARITY_TEST"),
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_invocation_is_headless_detects_print_flags() {
+        // #965: `-p` / `--prompt` / `--prompt=x` are headless one-shots.
+        assert!(gemini_invocation_is_headless(&["-p".into(), "hi".into()]));
+        assert!(gemini_invocation_is_headless(&[
+            "--prompt".into(),
+            "hi".into()
+        ]));
+        assert!(gemini_invocation_is_headless(&["--prompt=hi".into()]));
+    }
+
+    #[test]
+    fn gemini_invocation_is_headless_false_for_interactive() {
+        // Bare launch and interactive-prompt seeds are NOT headless — they may
+        // legitimately complete the browser-auth flow on the TTY.
+        assert!(!gemini_invocation_is_headless(&[]));
+        assert!(!gemini_invocation_is_headless(&[
+            "--model".into(),
+            "gemini-2.5-pro".into()
+        ]));
+        assert!(!gemini_invocation_is_headless(&["-i".into(), "hi".into()]));
+        assert!(!gemini_invocation_is_headless(&[
+            "--prompt-interactive".into(),
+            "hi".into()
+        ]));
+        // `-i` alongside `-p` stays interactive (interactive wins).
+        assert!(!gemini_invocation_is_headless(&[
+            "-p".into(),
+            "hi".into(),
+            "-i".into()
+        ]));
+    }
+
     /// PR-C3c regression: `verify_codex_config_toml` errors with an
     /// actionable message when the pre-seed is missing.
     #[test]
@@ -3492,7 +4978,7 @@ mod tests {
     fn codex_precondition_succeeds_when_config_toml_present() {
         let dir = TempDir::new().unwrap();
         let slot = acc(5);
-        codex_surface::write_config_toml(dir.path(), slot, "gpt-5.4").unwrap();
+        codex_surface::write_config_toml(dir.path(), slot, Some("gpt-5.4")).unwrap();
         verify_codex_config_toml(dir.path(), slot).expect("precondition should pass");
     }
 
@@ -4687,5 +6173,103 @@ mod tests {
         symlink(dir.path().join("nowhere"), &path).unwrap();
         check_codex_token_freshness(&path, acc(8), 9999)
             .expect("dangling symlink auth.json must be non-fatal");
+    }
+
+    // ── attach_scaffold tests ────────────────────────────────────────────
+
+    /// Non-empty scaffold: --append-system-prompt-file + path arg must be
+    /// appended to the command; the temp file must exist with the scaffold
+    /// content; CLAUDE_SYSTEM_PROMPT_APPEND must NOT be set.
+    #[test]
+    fn attach_scaffold_nonempty_uses_file_carrier() {
+        let scaffold = "## Compliance rules\n\nCite RULE_IDs.\n";
+        let mut cmd = Command::new("echo"); // dummy executable
+        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold))
+            .expect("non-empty scaffold must return Some(path)");
+
+        // The temp file must exist and contain the exact scaffold text.
+        assert!(
+            tmp_path.exists(),
+            "scaffold temp file must exist after attach"
+        );
+        let on_disk = std::fs::read_to_string(&tmp_path).expect("must be readable");
+        assert_eq!(
+            on_disk, scaffold,
+            "on-disk content must be byte-identical to scaffold"
+        );
+
+        // The command args must include --append-system-prompt-file <path>.
+        // Inspect args directly via `Command::get_args` (stable since 1.57) —
+        // OsStr equality avoids the `Debug`-format backslash-escaping that
+        // breaks a string `contains` check on Windows temp paths.
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert!(
+            args.iter()
+                .any(|a| *a == std::ffi::OsStr::new("--append-system-prompt-file")),
+            "command args must include --append-system-prompt-file: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| *a == tmp_path.as_os_str()),
+            "command args must include the temp path: {args:?}"
+        );
+
+        // Env var must NOT be set (file carrier replaces it). `get_envs` is
+        // stable since 1.57 — check it directly rather than via the debug repr.
+        assert!(
+            !cmd.get_envs()
+                .any(|(k, _)| k == std::ffi::OsStr::new("CLAUDE_SYSTEM_PROMPT_APPEND")),
+            "env var must be absent when file carrier succeeds"
+        );
+
+        // Cleanup the temp file (mirrors what the WithLayer arm does).
+        let _ = std::fs::remove_file(&tmp_path);
+        assert!(
+            !tmp_path.exists(),
+            "cleanup: temp file must be gone after remove_file"
+        );
+    }
+
+    /// Empty scaffold: no flag, no file, no env var.
+    #[test]
+    fn attach_scaffold_empty_is_noop() {
+        let mut cmd = Command::new("echo");
+        let result = attach_scaffold(&mut cmd, Some(""));
+        assert!(result.is_none(), "empty scaffold must return None");
+        let dbg = format!("{cmd:?}");
+        assert!(
+            !dbg.contains("--append-system-prompt-file"),
+            "empty scaffold must not append flag: {dbg}"
+        );
+        assert!(
+            !dbg.contains("CLAUDE_SYSTEM_PROMPT_APPEND"),
+            "empty scaffold must not set env var: {dbg}"
+        );
+    }
+
+    /// None scaffold: same no-op as empty.
+    #[test]
+    fn attach_scaffold_none_is_noop() {
+        let mut cmd = Command::new("echo");
+        let result = attach_scaffold(&mut cmd, None);
+        assert!(result.is_none(), "None scaffold must return None");
+        let dbg = format!("{cmd:?}");
+        assert!(
+            !dbg.contains("--append-system-prompt-file"),
+            "None scaffold must not append flag: {dbg}"
+        );
+    }
+
+    /// Cleanup contract: after remove_file on the returned path, the file
+    /// is gone.  (Tests that the returned path is the actual file path, not
+    /// a copy or a directory.)
+    #[test]
+    fn attach_scaffold_cleanup_removes_temp_file() {
+        let scaffold = "rule-1: cite IDs\n";
+        let mut cmd = Command::new("echo");
+        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold))
+            .expect("non-empty scaffold must return Some(path)");
+        assert!(tmp_path.exists(), "file must exist before cleanup");
+        let _ = std::fs::remove_file(&tmp_path);
+        assert!(!tmp_path.exists(), "file must not exist after cleanup");
     }
 }

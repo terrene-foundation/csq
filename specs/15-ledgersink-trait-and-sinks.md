@@ -99,6 +99,28 @@ and the cfg-gating discipline in CI without cloud credentials. Operators harden
 for production by replacing the mock with the SDK client as documented in
 `docs/audit-sinks/<sink>.md`.
 
+### §15.4.3 Honest-host grade & the zero-install export bundle caveat
+
+A `csq audit export` bundle is self-verifying for **integrity in transit**: the
+embedded `verify` script reproduces csq's canonical form, checks every signature
+under the genesis key, and confirms `BUNDLE.sig` (Ed25519 over `BUNDLE.lock`)
+covers every file. A PASS proves the records form an unbroken, signature-valid
+chain and that nothing was altered after export.
+
+A PASS does NOT, on its own, prove the host that produced the chain was
+uncompromised. Without corroboration by an **external witness** — an independent
+transparency log (`RekorSink`) or a Foundation notary co-signing the chain head —
+the records are **honest-host grade**: an auditor can verify csq governed the
+session as recorded, but cannot prove csq was not compromised at production time.
+Integrity is tamper-evident **in transit** (the bundle), not at the **source**,
+until an external witness corroborates the chain head.
+
+The bundle carries this caveat to auditors in a `README.md` entry hashed into
+`BUNDLE.lock` **before** the genesis key signs it, so the notice is itself
+tamper-evident: the `verify` script fails on a tampered README (hash mismatch)
+and on a stripped README (a missing lock-referenced file). An honest exporter
+cannot silently drop or weaken the notice.
+
 ---
 
 ## §15.5 cfg-Gating Discipline

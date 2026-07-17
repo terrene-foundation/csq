@@ -32,6 +32,7 @@ use crate::capability_layer::errors::StageError;
 use crate::capability_layer::pipeline::PipelineStage;
 use crate::capability_layer::state::{PreSpawnState, PromptClass, PromptClassKind, UserPrompt};
 use crate::coc::translate as translate_root;
+use crate::coc::translate::SurfaceArtifacts;
 use crate::coc::types::CocSet;
 use crate::providers::catalog::Surface;
 
@@ -98,6 +99,27 @@ impl PipelineStage for ScaffoldStage {
         }
 
         output.scaffold = Some(scaffold);
+
+        // CU3/S2 (an internal ticket): rules-ONLY prose for the CC Level-2 native
+        // materialization branch. In Level-2 the CC launch path delivers
+        // agents/skills/commands as a native plugin (`--plugin-dir`), so only
+        // rules remain prose — delivering the other three as prose too would
+        // double-deliver them (redteam R1 MED-1). Rendered from the SAME `arts`
+        // (single flatten) so it can never drift from `scaffold`/`artifacts`,
+        // through the SAME `render_sections` + `surface_header`, with the SAME
+        // FR-CL-01 directive gate below — one source of truth for the directive.
+        let rules_only_arts = SurfaceArtifacts {
+            rules: arts.rules.clone(),
+            ..Default::default()
+        };
+        let (mut rules_only_scaffold, _) = translate_root::render_sections(
+            translate_root::surface_header(input.surface),
+            &rules_only_arts,
+        );
+        if input.class.class == PromptClassKind::Compliance {
+            rules_only_scaffold.push_str(&translate_root::build_output_schema_directive());
+        }
+        output.rules_only_scaffold = Some(rules_only_scaffold);
 
         // CU1b WB1/AC4 — per-kind channel: record the per-kind breakdown the
         // delivered prose was built from (full artifact bodies, sorted
@@ -215,6 +237,144 @@ mod tests {
         let codex_scaffold = codex_state.scaffold.unwrap();
         assert!(codex_scaffold.contains("RULE-CODEX-ONLY"));
         assert!(!codex_scaffold.contains("RULE-CC-ONLY"));
+    }
+
+    /// S2 (an internal ticket): `rules_only_scaffold` carries RULES but NOT
+    /// agents/skills/commands (they go native via `--plugin-dir` in Level-2),
+    /// while the full `scaffold` carries all four kinds. Both are built from the
+    /// same flatten, so the rules text is byte-identical between them.
+    #[test]
+    fn rules_only_scaffold_excludes_agents_skills_commands() {
+        use crate::coc::types::{AgentDef, AgentId, CommandDef, CommandId, SkillDef, SkillId};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut set = CocSet::empty();
+        set.rules.insert(
+            RuleId("RULE-KEEP".into()),
+            rule_with_applies_to("RULE-KEEP", "rule stays prose", &[]).1,
+        );
+        set.agents.insert(
+            AgentId("AGENT-NATIVE".into()),
+            AgentDef {
+                id: AgentId("AGENT-NATIVE".into()),
+                applies_to: BTreeSet::new(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "agent goes native".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        set.skills.insert(
+            SkillId("SKILL-NATIVE".into()),
+            SkillDef {
+                id: SkillId("SKILL-NATIVE".into()),
+                applies_to: BTreeSet::new(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "skill goes native".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        set.commands.insert(
+            CommandId("COMMAND-NATIVE".into()),
+            CommandDef {
+                id: CommandId("COMMAND-NATIVE".into()),
+                applies_to: BTreeSet::new(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "command goes native".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+
+        let mut out = PreSpawnState::default();
+        ScaffoldStage::run(
+            ScaffoldInputs {
+                coc_set: set,
+                prompt: UserPrompt { text: "x".into() },
+                class: PromptClass::PR_CA4_DEFAULT,
+                surface: Surface::ClaudeCode,
+            },
+            &mut out,
+        )
+        .unwrap();
+
+        let full = out.scaffold.expect("full scaffold set");
+        let rules_only = out.rules_only_scaffold.expect("rules-only scaffold set");
+
+        // Full prose carries all four kinds.
+        for id in [
+            "RULE-KEEP",
+            "AGENT-NATIVE",
+            "SKILL-NATIVE",
+            "COMMAND-NATIVE",
+        ] {
+            assert!(full.contains(id), "full scaffold missing {id}");
+        }
+        // Rules-only carries the rule but NONE of the native-materialized kinds.
+        assert!(
+            rules_only.contains("RULE-KEEP"),
+            "rules-only missing the rule"
+        );
+        assert!(rules_only.contains("rule stays prose"));
+        for id in ["AGENT-NATIVE", "SKILL-NATIVE", "COMMAND-NATIVE"] {
+            assert!(
+                !rules_only.contains(id),
+                "rules-only scaffold must NOT carry {id} (delivered natively)"
+            );
+        }
+        // The rules-only prose has no `## Agents/Skills/Commands` section headers.
+        assert!(!rules_only.contains("## Agents"));
+        assert!(!rules_only.contains("## Skills"));
+        assert!(!rules_only.contains("## Commands"));
+    }
+
+    /// S2: the FR-CL-01 structured-output directive is appended to BOTH the full
+    /// scaffold and the rules-only scaffold when the prompt is `Compliance`, and
+    /// to NEITHER when `FreeForm` — the single directive gate lives in one place.
+    #[test]
+    fn rules_only_scaffold_directive_tracks_compliance_class() {
+        let set = coc_set_with_rules(vec![rule_with_applies_to("RULE-X", "body", &[])]);
+        let directive = crate::coc::translate::build_output_schema_directive();
+        // Non-empty directive is a precondition for a meaningful presence check.
+        assert!(!directive.trim().is_empty());
+
+        let compliance = PromptClass {
+            class: PromptClassKind::Compliance,
+            conf: 1.0,
+        };
+        let freeform = PromptClass {
+            class: PromptClassKind::FreeForm,
+            conf: 1.0,
+        };
+
+        let mut c = PreSpawnState::default();
+        ScaffoldStage::run(
+            ScaffoldInputs {
+                coc_set: set.clone(),
+                prompt: UserPrompt { text: "x".into() },
+                class: compliance,
+                surface: Surface::ClaudeCode,
+            },
+            &mut c,
+        )
+        .unwrap();
+        assert!(c.scaffold.as_ref().unwrap().contains(&directive));
+        assert!(c.rules_only_scaffold.as_ref().unwrap().contains(&directive));
+
+        let mut f = PreSpawnState::default();
+        ScaffoldStage::run(
+            ScaffoldInputs {
+                coc_set: set,
+                prompt: UserPrompt { text: "x".into() },
+                class: freeform,
+                surface: Surface::ClaudeCode,
+            },
+            &mut f,
+        )
+        .unwrap();
+        assert!(!f.scaffold.as_ref().unwrap().contains(&directive));
+        assert!(!f.rules_only_scaffold.as_ref().unwrap().contains(&directive));
     }
 
     #[test]

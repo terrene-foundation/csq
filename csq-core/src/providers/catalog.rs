@@ -408,6 +408,85 @@ pub const PROVIDERS: &[Provider] = &[
         default_auth_token: Some("ollama"),
         extra_env: &[],
     },
+    // Azure OpenAI (#962) — OpenAI Chat Completions wire, but NOT
+    // Anthropic-API-compatible, so it CANNOT use the `ANTHROPIC_BASE_URL`
+    // claude-spawn passthrough the 3P providers use. It routes exclusively
+    // through the enterprise Phase-2b direct-API client, enterprise-only.
+    //
+    // Endpoint is per-slot (`https://{resource}.openai.azure.com/openai/
+    // deployments/{deployment}/chat/completions?api-version={ver}`), so there
+    // is NO catalog `default_base_url` — the resource / deployment / api-version
+    // live in the slot `settings.json` `env` block (`AZURE_OPENAI_RESOURCE`,
+    // `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`) and are read at
+    // request time by the native client, alongside the key.
+    //
+    // Auth is the `api-key: {key}` header (NOT `Authorization: Bearer`); the key
+    // is `env.AZURE_OPENAI_API_KEY`. `key_env_var` is `None` (like `codex`/
+    // `gemini`) because the native client reads the key env var explicitly —
+    // `providers_with_keys()` therefore excludes it, and the setkey path writes
+    // the key into `env.AZURE_OPENAI_API_KEY` via a dedicated arm rather than
+    // the generic `ANTHROPIC_AUTH_TOKEN` fan-out.
+    Provider {
+        id: "azure",
+        name: "Azure OpenAI",
+        surface: Surface::ClaudeCode,
+        model_config: ModelConfigTarget::EnvInSettingsJson,
+        // Azure OpenAI exposes no Anthropic-style utilization endpoint; quota is
+        // Azure-subscription-managed out of band. Unknown (no poller).
+        quota_kind: QuotaKind::Unknown,
+        auth_type: AuthType::Bearer,
+        // Read explicitly by the enterprise direct-API client (like `codex`/`gemini`).
+        key_env_var: None,
+        // No `ANTHROPIC_BASE_URL` passthrough — endpoint is per-slot and resolved
+        // by the native client from `env.AZURE_OPENAI_RESOURCE` etc.
+        base_url_env_var: None,
+        default_base_url: None,
+        default_model: "gpt-5.5",
+        // No Anthropic-compatible `/v1/messages` probe surface.
+        validation_endpoint: None,
+        settings_filename: "settings-azure.json",
+        system_primer: None,
+        timeout_secs: 60,
+        default_auth_token: None,
+        extra_env: &[],
+    },
+    // GCP Vertex AI (#962) — Google `generateContent` wire (same as native
+    // Gemini), but NOT Anthropic-API-compatible. Routes through the Phase-2b
+    // enterprise direct-API client, enterprise-only.
+    //
+    // Endpoint is per-slot (`https://{region}-aiplatform.googleapis.com/v1/
+    // projects/{project}/locations/{region}/publishers/google/models/{model}:
+    // generateContent`), so NO catalog `default_base_url` — project / region
+    // live in `env.VERTEX_PROJECT` / `env.VERTEX_REGION` and are read at request
+    // time by the native client.
+    //
+    // Auth is `Authorization: Bearer {access_token}` where the token is a GCP
+    // service-account / gcloud ADC access token in `env.VERTEX_ACCESS_TOKEN`.
+    // (For VERTEX-hosted Claude, Claude Code uses the `CLAUDE_CODE_USE_VERTEX`
+    // claude-spawn path — that is a distinct, subprocess-spawned route and is NOT
+    // this native Google-wire client.) `key_env_var` is `None` (native client
+    // reads the token env var explicitly).
+    Provider {
+        id: "vertex",
+        name: "Vertex AI",
+        surface: Surface::ClaudeCode,
+        model_config: ModelConfigTarget::EnvInSettingsJson,
+        // Vertex quota is GCP-project-managed out of band; no Anthropic-style
+        // utilization endpoint. Unknown (no poller).
+        quota_kind: QuotaKind::Unknown,
+        auth_type: AuthType::Bearer,
+        // Read explicitly by the enterprise direct-API client (like `codex`/`gemini`).
+        key_env_var: None,
+        base_url_env_var: None,
+        default_base_url: None,
+        default_model: "gemini-2.5-pro",
+        validation_endpoint: None,
+        settings_filename: "settings-vertex.json",
+        system_primer: None,
+        timeout_secs: 60,
+        default_auth_token: None,
+        extra_env: &[],
+    },
 ];
 
 /// Looks up a provider by ID.
@@ -480,7 +559,16 @@ mod tests {
     #[test]
     fn bearer_providers_have_primers() {
         for p in PROVIDERS {
-            if p.auth_type == AuthType::Bearer {
+            // The `system_primer` exists ONLY for the claude-spawn passthrough
+            // path: a Bearer 3P provider (mm/zai/deepseek) reroutes CC through
+            // `ANTHROPIC_BASE_URL`, and the primer is injected to enable tool use
+            // on that non-Claude model. A Bearer provider with NO base-URL
+            // override (azure/vertex, #962) never spawns CC — it routes through a
+            // Phase-2b native direct-API client that supplies its own request
+            // shape — so a primer is structurally meaningless for it. Scope the
+            // requirement to the passthrough Bearer providers (those declaring a
+            // `base_url_env_var`).
+            if p.auth_type == AuthType::Bearer && p.base_url_env_var.is_some() {
                 assert!(
                     p.system_primer.is_some(),
                     "{} should have a system primer",
@@ -507,7 +595,7 @@ mod tests {
         let ids: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
         assert_eq!(
             ids,
-            vec!["claude", "codex", "gemini", "deepseek", "zai", "mm", "ollama"]
+            vec!["claude", "codex", "gemini", "deepseek", "zai", "mm", "ollama", "azure", "vertex"]
         );
     }
 

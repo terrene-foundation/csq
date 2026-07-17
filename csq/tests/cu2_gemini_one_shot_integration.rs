@@ -88,6 +88,12 @@ fn clean_cmd(path_override: &str) -> Command {
     }
     cmd.env("HOME", sandbox_home());
     cmd.env("CLAUDE_HOME", sandbox_home());
+    // #965: launch_gemini now pre-checks `~/.gemini/oauth_creds.json` before a
+    // headless CodeAssistOAuth spawn (to avoid gemini-cli's interactive
+    // browser-auth prompt hanging non-TTY callers). The stub gemini needs no
+    // real creds, but the csq-side guard verifies the file exists + is unexpired,
+    // so seed a fresh fixture under the sandbox HOME to satisfy the precondition.
+    seed_gemini_oauth_creds(&sandbox_home());
     cmd.env("PATH", path_override);
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {
@@ -144,6 +150,17 @@ fn write_gemini_canonical(base: &std::path::Path, n: u16) {
     std::fs::create_dir_all(&dir).unwrap();
     let json = r#"{"v":1,"auth":{"mode":"code_assist_oauth"},"model_name":"auto","created_unix_secs":1714000000}"#;
     std::fs::write(dir.join(format!("gemini-{n}.json")), json).unwrap();
+}
+
+/// #965: seed a fresh `~/.gemini/oauth_creds.json` under the sandbox HOME so the
+/// headless CodeAssistOAuth pre-check in `launch_gemini` passes. Far-future
+/// `expiry_date` (2100-01-01 in ms) per `rules/testing.md` Rule 1 — no
+/// wall-clock time-bomb. Idempotent (same content every call).
+fn seed_gemini_oauth_creds(home: &std::path::Path) {
+    let gemini = home.join(".gemini");
+    std::fs::create_dir_all(&gemini).unwrap();
+    let creds = r#"{"access_token":"ya29.fixture","refresh_token":"1//fixture","scope":"s","token_type":"Bearer","expiry_date":4102444800000}"#;
+    std::fs::write(gemini.join("oauth_creds.json"), creds).unwrap();
 }
 
 /// Write a minimal `.coc/` fixture that defines RULE-NO-PII so the

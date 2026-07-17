@@ -183,21 +183,10 @@ fn same_surface_as_active(active_surface: Surface, candidate_surface: Surface) -
 /// Returns `false` on any I/O or parse error (fail-safe: a missing or unparseable
 /// settings.json means no 3P binding — allow the rotation check to proceed).
 fn handle_dir_is_3p(base_dir: &Path, current_account: AccountNum) -> bool {
-    let config_dir = base_dir.join(format!("config-{}", current_account));
-    let settings_path = config_dir.join("settings.json");
-    let content = match std::fs::read_to_string(&settings_path) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let json: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    // Check env.ANTHROPIC_BASE_URL (canonical location) and top-level fallback.
-    json.get("env")
-        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
-        .or_else(|| json.get("ANTHROPIC_BASE_URL"))
-        .is_some()
+    // Single source of truth for the env-transport discriminator: shared with
+    // `cli::commands::swap`'s routing guard so the daemon rotator and the manual
+    // `csq swap` path never disagree on which slots are in-flight-repoint-unsafe.
+    crate::providers::settings::slot_pins_anthropic_base_url(base_dir, current_account.get())
 }
 
 /// Runs a single auto-rotation tick.

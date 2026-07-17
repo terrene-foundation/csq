@@ -1032,10 +1032,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: sign `raw_bytes` with `sk`, return lowercase hex of the sig.
+    ///
+    /// Routes through the shared production seam (`super::super::sign::sign_raw_bytes`)
+    /// so the test signer and the CLI signer are byte-identical (an internal ticket).
     fn sign_raw(sk: &DalekSigningKey, raw_bytes: &[u8]) -> String {
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(raw_bytes);
-        hex::encode(sig.to_bytes())
+        super::super::sign::sign_raw_bytes(sk, raw_bytes)
     }
 
     /// Helper: build an `UnsignedRosterFile` and serialize it to bytes.

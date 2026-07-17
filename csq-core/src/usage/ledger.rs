@@ -82,19 +82,22 @@ pub struct UsageEvent {
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cache-write tokens (`cache_creation_input_tokens`) summed across the
-    /// session. Captured from the transcript (an internal ticket) but NOT yet billed
-    /// into `cost_usd_estimate` — per-provider cache rates are a documented
-    /// follow-up. `#[serde(default)]` keeps older ledger lines readable.
+    /// session. Captured from the transcript (an internal ticket). For Anthropic Claude
+    /// models these are billed into `cost_usd_estimate` at 1.25× the base input
+    /// rate (#992); non-Anthropic providers bill cache at $0 pending verified
+    /// per-provider rates. `#[serde(default)]` keeps older ledger lines readable.
     #[serde(default)]
     pub cache_creation_tokens: u64,
     /// Cache-read tokens (`cache_read_input_tokens`) summed across the session.
-    /// Captured but not yet billed (see `cache_creation_tokens`).
+    /// Billed at 0.10× the base input rate for Claude models only (#992; see
+    /// `cache_creation_tokens`).
     #[serde(default)]
     pub cache_read_tokens: u64,
     /// USD cost estimate computed via [`super::cost_rates`]. `None` if the
     /// model name was unrecognized (table miss → fail-loud rather than guess).
-    /// Bills `input_tokens` + `output_tokens` only (cache tokens excluded —
-    /// follow-up).
+    /// Bills `input_tokens` + `output_tokens`, plus cache tokens for Anthropic
+    /// Claude models (#992; other providers bill cache at $0 — see
+    /// `cache_creation_tokens`).
     pub cost_usd_estimate: Option<f64>,
     /// Where this event was sourced from.
     pub source: UsageSource,

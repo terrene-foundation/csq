@@ -6,9 +6,10 @@
 //!
 //! # Platform scope
 //!
-//! This module is Unix-only (`cfg(unix)`). Windows named-pipe
-//! support is deferred to M8.6 — see
-//! `internal-design-docs` task M8-03.
+//! The Unix-socket bind/accept loop in this module is `cfg(unix)`; the
+//! router, `RouterState`, and handlers are cross-platform and shared with
+//! the Windows named-pipe listener (`server_windows.rs`), which is wired
+//! end to end as of #786.
 //!
 //! # Security model
 //!
@@ -64,7 +65,9 @@ use super::refresher::RefreshStatus;
 use super::usage_poller::gemini::GeminiConsumerState;
 use crate::accounts::{discovery, AccountInfo};
 use crate::credentials;
-use crate::error::{DaemonError, OAuthError};
+#[cfg(unix)]
+use crate::error::DaemonError;
+use crate::error::OAuthError;
 use crate::oauth::{
     exchange_code, start_login, LoginRequest, OAuthStateStore, PASTE_CODE_REDIRECT_URI,
 };
@@ -154,6 +157,22 @@ pub struct RouterState {
     /// §10.5.1) — the activation signal is operator-owned go-live authorization.
     #[cfg(feature = "enterprise")]
     pub interactive: Arc<InteractiveSessionRegistry>,
+    /// Active transparency-log sink for `POST /api/audit/anchor` (#952 S3 /
+    /// #1060). `None` in the default local-only build — either no external sink
+    /// is configured (`audit-sink.json` `sink = "none"`) or the requested sink's
+    /// feature was not compiled in, in which case `resolve_anchor_sink` returns
+    /// `None`. When `Some`, the anchor handler appends the freshly-signed record
+    /// and projects the returned
+    /// [`crate::audit::types::LedgerInclusionProof`] into the `AnchorPayload`
+    /// `inclusion_proof` field. Append is best-effort / fail-open: a sink error
+    /// yields a `null` proof (the local chain append already succeeded and is
+    /// authoritative), never a 5xx. DAEMON IS SOLE SIGNER is preserved — the
+    /// proof is READ from the receipt, never computed client-side.
+    ///
+    /// Resolved UNCONDITIONALLY at daemon startup (independent of `audit_health`);
+    /// the operative protection when the chain is not operational is the anchor
+    /// handler's own 503 gate, not the absence of a resolved sink (#1060 redteam).
+    pub anchor_sink: Option<Arc<dyn crate::audit::LedgerSink>>,
 }
 
 /// Maximum staleness for the discovery cache: 5 seconds.
@@ -230,6 +249,7 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/slot-swap", post(slot_swap_handler))
         .route("/api/gemini/event", post(gemini_event_handler))
         .route("/api/audit/record", post(audit_record_handler))
+        .route("/api/audit/anchor", post(audit_anchor_handler))
         .route("/api/provenance/anchor", post(provenance_anchor_handler));
 
     // #783/#794 — interactive per-turn enforcement routes (enterprise-only,
@@ -1817,6 +1837,297 @@ async fn provenance_anchor_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// POST /api/audit/anchor
+// ---------------------------------------------------------------------------
+
+/// Error body for `POST /api/audit/anchor`.
+///
+/// Fixed-vocabulary tags — the handler never echoes upstream request content
+/// per `rules/security.md` §2 and `rules/tauri-commands.md` MUST-6.
+///
+/// Tags:
+/// - `"audit_chain_broken"` — chain not operational (503).
+/// - `"anchor_deserialize_error"` — body is not valid anchor request JSON (422).
+/// - `"anchor_no_signing_key"` — chain is initialised but signing key is absent;
+///   operator must run `csq audit migrate-keys` (503).
+/// - `"anchor_write_error"` — chain I/O failed (503).
+#[derive(Debug, Clone, Serialize)]
+struct AuditAnchorError {
+    error: &'static str,
+}
+
+/// Minimal request body for `POST /api/audit/anchor` (#952 S3).
+///
+/// Only `run_id` is required — all other fields are metadata that the daemon
+/// reconstructs into a `CsqRun` audit record before signing.  Unknown fields
+/// are silently ignored (additive schema: future clients may send extra metadata
+/// without breaking older daemons).
+#[derive(Debug, Deserialize)]
+struct AuditAnchorRequest {
+    /// The run identifier — the daemon uses this as the signed record's identity.
+    run_id: String,
+}
+
+/// Handler for `POST /api/audit/anchor` (#952 S3, an internal ticket).
+///
+/// **DAEMON IS SOLE SIGNER** per `account-terminal-separation.md` MUST Rule 1:
+/// the CLI MUST NOT compute `canonical_hash` client-side. This handler accepts
+/// an [`AuditAnchorRequest`] body (minimal: only `run_id` required), signs+appends
+/// it to the Op chain via
+/// [`crate::audit::anchor::sign_audit_record_v1`], and returns the on-chain
+/// projection as `AnchorPayload` JSON:
+///
+/// ```json
+/// {
+///   "canonical_hash": "<64-hex>",
+///   "chain_id":       "<26-char ULID>",
+///   "seq":            42,
+///   "verification_level": "AUTO_APPROVED",
+///   "inclusion_proof": null
+/// }
+/// ```
+///
+/// The `inclusion_proof` field is `null` when no external transparency-log sink
+/// is active ([`RouterState::anchor_sink`] is `None` — the default local-only
+/// build). When a `csq-ledger` sink IS configured (#1060), the handler appends
+/// the freshly-signed record to it and projects the returned structured
+/// [`crate::audit::types::LedgerInclusionProof`] (`leaf_index`/`tree_size`/
+/// `audit_path`) into this field. Append is best-effort / fail-open: a sink
+/// error yields `null` (the local chain append is authoritative), never a 5xx.
+///
+/// **Audit-subsystem fail-closed gate**: returns 503 when `audit_health` is not
+/// operational (mirrors `audit_record_handler`).
+///
+/// **Signing-key gate**: returns 503 when the chain is initialised but the key is
+/// absent (keychain inaccessible, key not yet migrated). Callers should retry
+/// after `csq audit migrate-keys`.
+///
+/// Returns 200 + JSON `AnchorPayload` on success, never 204 (the payload IS the
+/// response; dropping it would require the CLI to re-compute it, violating DAEMON
+/// IS SOLE SIGNER).
+async fn audit_anchor_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<AuditAnchorError>)> {
+    // Fail-closed: reject when the chain is not operational. Health check
+    // runs BEFORE body deserialization so a broken chain returns 503 even
+    // for a malformed body (mirrors audit_record_handler).
+    if !state.audit_health.is_operational() {
+        tracing::warn!(
+            error_kind = "audit_chain_broken",
+            "audit anchor rejected — chain is not operational (audit_health={:?})",
+            state.audit_health
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuditAnchorError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    // Deserialize the minimal anchor request — only `run_id` is required.
+    // All other fields (ts, surface, decision, reason, result) are metadata that
+    // the daemon ignores when building the signed record; unknown fields are
+    // silently dropped (additive schema per the AuditAnchorRequest doc).
+    // Fixed-vocabulary tag only — no `{e}` interpolation per security.md §2.
+    let req: AuditAnchorRequest = serde_json::from_slice(&body).map_err(|_| {
+        tracing::warn!(
+            error_kind = "anchor_deserialize_error",
+            "audit anchor: request deserialize failed"
+        );
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(AuditAnchorError {
+                error: "anchor_deserialize_error",
+            }),
+        )
+    })?;
+
+    // Build a minimal AuditRecord from the request for sign_audit_record_v1.
+    // The daemon uses only the `run_id`; the signing function generates all
+    // chain-assigned fields (canonical_hash, chain_id, seq) internally.
+    let record = crate::audit::AuditRecord {
+        schema_version: "1".to_string(),
+        run_id: req.run_id,
+        fixture_sha256: String::new(),
+        coc_sha256: String::new(),
+        csq_version: String::new(),
+        cli_version: String::new(),
+        surface: crate::audit::Surface::Cc,
+        model: String::new(),
+        start_ts: String::new(),
+        end_ts: String::new(),
+        result_state: crate::audit::ResultState::Pass,
+        score_delta_vs_baseline: None,
+        rule_ids_cited_original: Vec::new(),
+        rule_ids_cited_after_repair: Vec::new(),
+        rule_ids_dropped_invalid_format: 0,
+        decision: crate::audit::Decision::Accept,
+        spawn_gate: None,
+    };
+
+    // Sign + append via the daemon-sole-signer path. This encapsulates key
+    // loading, skeleton building, and write_record_v2_signed. Offloaded to a
+    // blocking thread because write_record_v2_signed acquires a POSIX flock.
+    let base = state.base_dir.clone();
+    let signed = tokio::task::spawn_blocking(move || {
+        crate::audit::anchor::sign_audit_record_v1(record, &base)
+    })
+    .await
+    .map_err(|e| {
+        // spawn_blocking JoinError — treat as internal server error.
+        let _ = e;
+        tracing::warn!(
+            error_kind = "anchor_spawn_error",
+            "audit anchor: spawn_blocking panicked"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuditAnchorError {
+                error: "anchor_write_error",
+            }),
+        )
+    })?
+    .map_err(|tag| {
+        tracing::warn!(
+            error_kind = tag,
+            "audit anchor: sign_audit_record_v1 failed"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuditAnchorError { error: tag }),
+        )
+    })?;
+
+    // Project the finalized SignedRecord → AnchorPayload JSON.
+    // DAEMON IS SOLE SIGNER: canonical_hash comes from the returned signed record,
+    // never computed by the CLI.
+    let vl = signed
+        .verification_level
+        .map(|v| v.as_canonical_str().to_string())
+        .unwrap_or_else(|| "AUTO_APPROVED".to_string());
+
+    // #1060 — when an external transparency-log sink is active, append the
+    // freshly-signed record and project its structured Merkle inclusion proof
+    // into the AnchorPayload. Best-effort / fail-open: the local chain append
+    // (sign_audit_record_v1 above) already succeeded and is authoritative, so a
+    // sink error/miss yields a null proof rather than failing the op. DAEMON IS
+    // SOLE SIGNER is preserved — the proof is READ from the sink receipt.
+    let inclusion_proof = match state.anchor_sink.as_ref() {
+        Some(sink) => project_inclusion_proof(sink.as_ref(), &signed).await,
+        None => serde_json::Value::Null,
+    };
+
+    let payload = serde_json::json!({
+        "canonical_hash": signed.canonical_hash.as_str(),
+        "chain_id":       signed.chain_id.as_str(),
+        "seq":            signed.seq,
+        "verification_level": vl,
+        "inclusion_proof": inclusion_proof,
+    });
+
+    Ok(Json(payload))
+}
+
+/// Appends `signed` to `sink` and projects the receipt's structured Merkle proof
+/// into a JSON value for the `AnchorPayload.inclusion_proof` field (#1060).
+///
+/// Fail-open: any sink error, a receipt with no proof, a proof string that does
+/// not parse as [`crate::audit::types::LedgerInclusionProof`], OR a proof that is
+/// not structurally sound (#1060 redteam F1/F2 — see
+/// [`inclusion_proof_is_structurally_sound`]) yields [`serde_json::Value::Null`]
+/// (the local chain append is authoritative — the external witness is additive,
+/// not load-bearing for the op's success). Fixed-vocabulary WARN tags only — no
+/// `{e}` interpolation per `security.md` §2 (a sink error body could echo a
+/// request field).
+///
+/// NOTE (#1060 redteam F3): the projected proof is the sink's returned proof
+/// FORWARDED VERBATIM after a structural-soundness check — it is NOT re-verified
+/// against `signed.canonical_hash` (no Merkle-root recomputation). The trust
+/// model is out-of-band server pinning (see `csq_ledger_sink` module note);
+/// `DAEMON IS SOLE SIGNER` holds for the RECORD (the local chain append is
+/// authoritative), and the proof is a best-effort external witness. Independent
+/// verification against the server's signed checkpoint is a Phase-B follow-up.
+async fn project_inclusion_proof(
+    sink: &dyn crate::audit::LedgerSink,
+    signed: &crate::audit::types::SignedRecord,
+) -> serde_json::Value {
+    let receipt = match sink.append(signed).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(
+                error_kind = "anchor_sink_append_failed",
+                "audit anchor: sink append failed — returning null inclusion_proof"
+            );
+            return serde_json::Value::Null;
+        }
+    };
+    let Some(proof_str) = receipt.inclusion_proof else {
+        // Sink acknowledged the append but returns no per-entry proof — honest null.
+        return serde_json::Value::Null;
+    };
+    match serde_json::from_str::<crate::audit::types::LedgerInclusionProof>(&proof_str) {
+        Ok(proof) if inclusion_proof_is_structurally_sound(&proof) => {
+            serde_json::to_value(proof).unwrap_or(serde_json::Value::Null)
+        }
+        Ok(_) => {
+            // Parsed but structurally impossible (leaf outside tree, empty path
+            // for a multi-leaf tree, non-hex sibling, absurd length). Emitting it
+            // would present a fabricated-looking proof to an auditor — honest null.
+            tracing::warn!(
+                error_kind = "anchor_proof_inconsistent",
+                "audit anchor: sink inclusion_proof failed the structural-soundness check — returning null"
+            );
+            serde_json::Value::Null
+        }
+        Err(_) => {
+            tracing::warn!(
+                error_kind = "anchor_proof_parse_failed",
+                "audit anchor: sink receipt inclusion_proof did not parse as a structured proof"
+            );
+            serde_json::Value::Null
+        }
+    }
+}
+
+/// Structural-soundness gate for a ledger [`crate::audit::types::LedgerInclusionProof`]
+/// before it is surfaced in an `AnchorPayload` (#1060 redteam F1/F2 + security-LOW).
+///
+/// This is a CHEAP, conservative RFC6962 shape check — NOT a cryptographic
+/// verification (the audit path is not replayed against a root). It rejects the
+/// structurally-impossible shapes a buggy or hostile ledger server could return:
+///
+/// - `leaf_index >= tree_size` — a leaf cannot sit at/after the end of the tree
+///   (also catches the `tree_size == 0` "empty tree containing a leaf" case).
+/// - single-leaf tree (`tree_size == 1`) ⟺ empty `audit_path`; any other tree
+///   size REQUIRES a non-empty path (RFC6962), and a single-leaf tree forbids one.
+/// - `audit_path.len() > 64` — a tree of 2^64 leaves is the ceiling; also bounds
+///   the relayed-data size (security-LOW: unvalidated ledger response amplification).
+/// - every sibling hash is a 64-char lowercase-hex string (a Merkle node hash).
+///
+/// The bounds are deliberately loose (`len <= 64`, not the exact
+/// `ceil(log2(tree_size))`) so a genuinely valid proof is never rejected; the
+/// goal is to null out the *impossible* shapes, not to re-verify the tree.
+fn inclusion_proof_is_structurally_sound(p: &crate::audit::types::LedgerInclusionProof) -> bool {
+    if p.leaf_index >= p.tree_size {
+        return false;
+    }
+    let single_leaf = p.tree_size == 1;
+    if single_leaf != p.audit_path.is_empty() {
+        return false;
+    }
+    if p.audit_path.len() > 64 {
+        return false;
+    }
+    p.audit_path.iter().all(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Response body for `GET /api/accounts`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountsResponse {
@@ -2165,6 +2476,7 @@ mod tests {
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
@@ -2180,6 +2492,7 @@ mod tests {
             oauth_store: None,
             gemini_consumer: GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
@@ -2199,6 +2512,7 @@ mod tests {
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: GeminiConsumerState::default(),
             audit_health: crate::audit::AuditHealth::Verified,
+            anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
@@ -3745,6 +4059,473 @@ mod tests {
         assert!(
             status.contains("202"),
             "provenance/anchor with malformed body must return 202 (quarantined); got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── POST /api/audit/anchor tests (#952 S3, an internal ticket) ─────────────────
+
+    /// Helper: initialise a chain in `base_dir` via the file-store path (no
+    /// OS keychain prompt). Mirrors `seed_chain` from anchor tests but also
+    /// sets the signing cutoff so `sign_audit_record_v1` finds an active key.
+    ///
+    /// Uses `init_mock_keyring()` to redirect keychain I/O to the in-process
+    /// shared store (per `audit/key_custody/mod.rs::test_helpers`).
+    fn init_signed_chain(base_dir: &std::path::Path) {
+        use crate::audit::anchor::test_helpers::sample_signed_record;
+        use crate::audit::key_custody::init_mock_keyring;
+        use crate::audit::persist::write_record_v2;
+
+        // Redirect keychain I/O away from the OS keychain.
+        init_mock_keyring();
+
+        // Seed the chain with a genesis record so csq-runs/ + chain.json exist.
+        let csq_runs = base_dir.join("csq-runs");
+        std::fs::create_dir_all(&csq_runs).unwrap();
+        let genesis = sample_signed_record(0, "01JZ00000000000000000000A0");
+        write_record_v2(genesis, Some(base_dir)).expect("seed genesis record");
+
+        // Run audit_init to mint + store the signing key and set the cutoff.
+        crate::audit::audit_init(base_dir, crate::audit::AUDIT_SIGNING_SERVICE_NAME)
+            .expect("audit_init must succeed with mock keyring");
+    }
+
+    // T1: success path — 200 + AnchorPayload JSON on valid AuditRecord with
+    // initialised chain and active signing key.
+    #[tokio::test]
+    async fn audit_anchor_returns_200_and_anchor_payload_on_signed_chain() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-200.sock");
+        init_signed_chain(dir.path());
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t1","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+
+        assert!(
+            status.contains("200"),
+            "audit anchor signed chain must return 200; got: {status}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&resp_body).expect("response must be valid JSON");
+        assert!(
+            v.get("canonical_hash").is_some(),
+            "response must contain canonical_hash; got: {resp_body}"
+        );
+        assert!(
+            v.get("chain_id").is_some(),
+            "response must contain chain_id; got: {resp_body}"
+        );
+        assert!(
+            v.get("seq").is_some(),
+            "response must contain seq; got: {resp_body}"
+        );
+        assert_eq!(
+            v.get("inclusion_proof"),
+            Some(&serde_json::Value::Null),
+            "inclusion_proof must be null (no ledger sink wired); got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// A test `LedgerSink` whose `append` returns a receipt carrying a fixed
+    /// structured [`crate::audit::types::LedgerInclusionProof`] — the substrate
+    /// for `anchor_proof_present_with_sink` (#1060). It exercises the handler's
+    /// receipt→AnchorPayload projection without needing the `csq-ledger-sink`
+    /// feature or a live ledger server.
+    struct StructuredProofSink;
+
+    #[async_trait::async_trait]
+    impl crate::audit::LedgerSink for StructuredProofSink {
+        fn name(&self) -> &str {
+            "structured-proof-test"
+        }
+
+        async fn append(
+            &self,
+            record: &crate::audit::types::SignedRecord,
+        ) -> Result<crate::audit::types::SinkReceipt, crate::audit::types::SinkError> {
+            let proof = crate::audit::types::LedgerInclusionProof {
+                leaf_index: 3,
+                tree_size: 8,
+                audit_path: vec!["a".repeat(64), "b".repeat(64)],
+            };
+            Ok(crate::audit::types::SinkReceipt {
+                sink: crate::audit::types::SinkName::try_new("structured-proof-test").unwrap(),
+                sink_id: crate::audit::types::SinkId::try_new("structured-proof-1").unwrap(),
+                anchored_at: record.ts.clone(),
+                inclusion_proof: Some(serde_json::to_string(&proof).unwrap()),
+            })
+        }
+
+        async fn verify_at(
+            &self,
+            id: &crate::audit::types::RecordId,
+        ) -> Result<crate::audit::types::SignedRecord, crate::audit::types::SinkError> {
+            Err(crate::audit::types::SinkError::NotFound {
+                record_id: id.clone(),
+            })
+        }
+    }
+
+    // T1b (#1060): success path WITH an active sink — the AnchorPayload's
+    // `inclusion_proof` is the structured `{leaf_index, tree_size, audit_path}`
+    // read back from the sink receipt (NOT null, NOT client-computed).
+    #[tokio::test]
+    async fn anchor_proof_present_with_sink() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-proof.sock");
+        init_signed_chain(dir.path());
+        let mut state = test_state(dir.path());
+        state.anchor_sink = Some(std::sync::Arc::new(StructuredProofSink));
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-proof-t1b"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("200"),
+            "anchor with active sink must return 200; got: {status}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&resp_body).expect("response must be valid JSON");
+        let ip = v
+            .get("inclusion_proof")
+            .expect("inclusion_proof field must be present");
+        assert!(
+            !ip.is_null(),
+            "inclusion_proof must be populated when a sink is active; got: {resp_body}"
+        );
+        assert_eq!(
+            ip.get("leaf_index").and_then(|x| x.as_u64()),
+            Some(3),
+            "leaf_index projected from receipt; got: {resp_body}"
+        );
+        assert_eq!(
+            ip.get("tree_size").and_then(|x| x.as_u64()),
+            Some(8),
+            "tree_size projected from receipt; got: {resp_body}"
+        );
+        assert_eq!(
+            ip.get("audit_path")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len()),
+            Some(2),
+            "audit_path projected from receipt; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T1c (#1060): a sink that errors on append MUST fail open — the op still
+    // returns 200 with a null proof (the local chain append is authoritative).
+    #[tokio::test]
+    async fn anchor_proof_null_when_sink_append_fails() {
+        struct FailingSink;
+        #[async_trait::async_trait]
+        impl crate::audit::LedgerSink for FailingSink {
+            fn name(&self) -> &str {
+                "failing-sink-test"
+            }
+            async fn append(
+                &self,
+                _record: &crate::audit::types::SignedRecord,
+            ) -> Result<crate::audit::types::SinkReceipt, crate::audit::types::SinkError>
+            {
+                Err(crate::audit::types::SinkError::Unreachable {
+                    message: crate::audit::types::RedactedString::from_trusted(
+                        "test sink unreachable".to_string(),
+                    ),
+                })
+            }
+            async fn verify_at(
+                &self,
+                id: &crate::audit::types::RecordId,
+            ) -> Result<crate::audit::types::SignedRecord, crate::audit::types::SinkError>
+            {
+                Err(crate::audit::types::SinkError::NotFound {
+                    record_id: id.clone(),
+                })
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-failopen.sock");
+        init_signed_chain(dir.path());
+        let mut state = test_state(dir.path());
+        state.anchor_sink = Some(std::sync::Arc::new(FailingSink));
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-failopen"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("200"),
+            "sink append failure must fail OPEN (200), not 5xx; got: {status}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&resp_body).expect("response must be valid JSON");
+        assert_eq!(
+            v.get("inclusion_proof"),
+            Some(&serde_json::Value::Null),
+            "inclusion_proof must be null on sink error; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T1d (#1060 redteam F1/F2): a sink returning a PARSEABLE but structurally
+    // impossible proof (leaf_index >= tree_size, empty path for a multi-leaf
+    // tree) must be nulled at the daemon boundary, not surfaced as valid.
+    #[tokio::test]
+    async fn anchor_proof_null_when_proof_structurally_unsound() {
+        struct UnsoundProofSink;
+        #[async_trait::async_trait]
+        impl crate::audit::LedgerSink for UnsoundProofSink {
+            fn name(&self) -> &str {
+                "unsound-proof-test"
+            }
+            async fn append(
+                &self,
+                record: &crate::audit::types::SignedRecord,
+            ) -> Result<crate::audit::types::SinkReceipt, crate::audit::types::SinkError>
+            {
+                // leaf_index 5 >= tree_size 2, and empty path for a 2-leaf tree.
+                let bad = r#"{"leaf_index":5,"tree_size":2,"audit_path":[]}"#;
+                Ok(crate::audit::types::SinkReceipt {
+                    sink: crate::audit::types::SinkName::try_new("unsound-proof-test").unwrap(),
+                    sink_id: crate::audit::types::SinkId::try_new("unsound-1").unwrap(),
+                    anchored_at: record.ts.clone(),
+                    inclusion_proof: Some(bad.to_string()),
+                })
+            }
+            async fn verify_at(
+                &self,
+                id: &crate::audit::types::RecordId,
+            ) -> Result<crate::audit::types::SignedRecord, crate::audit::types::SinkError>
+            {
+                Err(crate::audit::types::SinkError::NotFound {
+                    record_id: id.clone(),
+                })
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-unsound.sock");
+        init_signed_chain(dir.path());
+        let mut state = test_state(dir.path());
+        state.anchor_sink = Some(std::sync::Arc::new(UnsoundProofSink));
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, resp_body) =
+            http_post_json(&sock, "/api/audit/anchor", r#"{"run_id":"anchor-unsound"}"#).await;
+        assert!(status.contains("200"), "got: {status}");
+        let v: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(
+            v.get("inclusion_proof"),
+            Some(&serde_json::Value::Null),
+            "structurally-impossible proof must be nulled; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // Unit coverage for the structural-soundness gate (#1060 redteam F1/F2).
+    #[test]
+    fn inclusion_proof_soundness_accepts_valid_and_rejects_impossible() {
+        use crate::audit::types::LedgerInclusionProof;
+        let hex = "a".repeat(64);
+        // Valid: single-leaf tree, empty path.
+        assert!(inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 1,
+                audit_path: vec![],
+            }
+        ));
+        // Valid: multi-leaf tree, non-empty 64-hex path, leaf in range.
+        assert!(inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 3,
+                tree_size: 8,
+                audit_path: vec![hex.clone(), hex.clone()],
+            }
+        ));
+        // Reject: empty tree containing a leaf (the tree_size:0 fabrication).
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 0,
+                audit_path: vec![],
+            }
+        ));
+        // Reject: leaf_index >= tree_size.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 5,
+                tree_size: 2,
+                audit_path: vec![hex.clone()],
+            }
+        ));
+        // Reject: multi-leaf tree with an empty path.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 1,
+                tree_size: 4,
+                audit_path: vec![],
+            }
+        ));
+        // Reject: single-leaf tree with a non-empty path.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 1,
+                audit_path: vec![hex.clone()],
+            }
+        ));
+        // Reject: non-hex sibling (uppercase is not lowercase-hex).
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 2,
+                audit_path: vec!["A".repeat(64)],
+            }
+        ));
+        // Reject: wrong-length sibling.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 2,
+                audit_path: vec!["ab".to_string()],
+            }
+        ));
+        // Reject: absurd path length (> 64).
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 2,
+                audit_path: vec![hex.clone(); 65],
+            }
+        ));
+    }
+
+    // T2: 422 on malformed body — body is not a valid AuditRecord JSON.
+    #[tokio::test]
+    async fn audit_anchor_returns_422_on_malformed_body() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-422.sock");
+        let state = test_state(dir.path()); // Verified by default
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, resp_body) =
+            http_post_json(&sock, "/api/audit/anchor", "not-json-at-all").await;
+        assert!(
+            status.contains("422"),
+            "malformed body must return 422; got: {status}"
+        );
+        assert!(
+            resp_body.contains("anchor_deserialize_error"),
+            "422 body must contain anchor_deserialize_error tag; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T3: 503 when audit_health is Broken — fail-closed gate fires before signing.
+    #[tokio::test]
+    async fn audit_anchor_returns_503_when_chain_health_broken() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-503-broken.sock");
+        let mut state = test_state(dir.path());
+        state.audit_health = crate::audit::AuditHealth::Broken {
+            error_kind: "anchor_chain_broken_test".to_string(),
+            reason: "injected broken health for T3".to_string(),
+        };
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t3","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("503"),
+            "broken chain health must return 503; got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "503 body must contain audit_chain_broken tag; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T4: 503 when no signing key is active — chain exists but signing cutoff
+    // not set (pre-`csq audit init` state).
+    #[tokio::test]
+    async fn audit_anchor_returns_503_when_no_signing_key() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-503-nokey.sock");
+        // Seed a chain WITHOUT calling audit_init — no signing cutoff set.
+        {
+            use crate::audit::anchor::test_helpers::sample_signed_record;
+            use crate::audit::persist::write_record_v2;
+            std::fs::create_dir_all(dir.path().join("csq-runs")).unwrap();
+            let genesis = sample_signed_record(0, "01JZ00000000000000000000B0");
+            write_record_v2(genesis, Some(dir.path())).expect("seed genesis");
+        }
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t4","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("503"),
+            "no signing key must return 503; got: {status}"
+        );
+        assert!(
+            resp_body.contains("anchor_no_signing_key"),
+            "503 body must contain anchor_no_signing_key tag; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T5: DAEMON IS SOLE SIGNER — canonical_hash in the response is a
+    // non-empty hex string assigned by the daemon, not the CLI.
+    #[tokio::test]
+    async fn audit_anchor_canonical_hash_is_nonempty_hex_from_daemon() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("csq-anchor-hash.sock");
+        init_signed_chain(dir.path());
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t5","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(status.contains("200"), "T5 expected 200; got: {status}");
+
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("response must be JSON");
+        let hash = v["canonical_hash"]
+            .as_str()
+            .expect("canonical_hash must be a string");
+
+        // DAEMON IS SOLE SIGNER: canonical_hash must be a non-empty hex string
+        // (64 hex chars for SHA-256). The CLI never computes this — it reads
+        // it verbatim from this response.
+        assert!(
+            !hash.is_empty(),
+            "canonical_hash must not be empty; got: {resp_body}"
+        );
+        assert!(
+            hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "canonical_hash must be a 64-char hex string; got: {hash}"
         );
 
         handle.shutdown();

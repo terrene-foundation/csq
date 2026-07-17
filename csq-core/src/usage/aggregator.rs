@@ -459,19 +459,39 @@ where
 /// If the resolved model is unknown to the rate table, `cost_usd_estimate` is
 /// `None` and the UI shows "n/a" for the cost column.
 ///
-/// COST NOTE (tracked in #992): the estimate bills `input_tokens` +
-/// `output_tokens` only. Cache tokens (`cache_creation_tokens`,
-/// `cache_read_tokens`) are CAPTURED on the event but not yet billed —
-/// per-provider cache rates need offline-unverifiable pricing (#992). Capturing
-/// them here means that follow-up is pure rate-table work with no re-scan.
+/// COST NOTE (#992): for Anthropic Claude models the estimate now bills cache
+/// tokens in addition to `input_tokens` + `output_tokens` — cache-write
+/// (`cache_creation_tokens`) and cache-read (`cache_read_tokens`) via
+/// [`super::cost_rates::CostRate::estimate_usd_with_cache`] at Anthropic's
+/// published prompt-caching multipliers (1.25× / 0.10× of the base input rate).
+/// Non-Anthropic providers (rate rows with `cache_eligible == false`) bill cache
+/// at $0 — their cache pricing is not yet verified and csq does not guess (#992
+/// follow-up). Sessions with zero cache tokens bill identically to before on
+/// every provider (no cost regression).
 pub fn attributed_session_to_event(
     attributed: &AttributedSession,
     fallback_model: &str,
 ) -> UsageEvent {
     let session = &attributed.session;
     let model = session.model.as_deref().unwrap_or(fallback_model);
-    let cost = super::cost_rates::rate_for_model(model)
-        .map(|r| r.estimate_usd(session.input_tokens, session.output_tokens));
+    let cost = super::cost_rates::rate_for_model(model).map(|r| {
+        if r.cache_eligible {
+            // Anthropic Claude rows only: bill cache-write at 1.25× and
+            // cache-read at 0.10× of the base input rate (Anthropic's published
+            // prices). Non-Claude rows are `cache_eligible == false` and fall to
+            // the input+output-only estimate below — their cache pricing differs
+            // materially and is not yet verified, so csq does not guess (the
+            // fail-loud contract). #992 follow-up for per-provider cache rates.
+            r.estimate_usd_with_cache(
+                session.input_tokens,
+                session.output_tokens,
+                session.cache_creation_tokens,
+                session.cache_read_tokens,
+            )
+        } else {
+            r.estimate_usd(session.input_tokens, session.output_tokens)
+        }
+    });
     UsageEvent {
         ts: session.start_time.clone(),
         session_id: session.session_id.clone(),
@@ -840,13 +860,44 @@ mod tests {
             session,
         };
         let event = attributed_session_to_event(&attr, "claude-opus-4-8");
-        // Cache tokens are captured on the event (for the follow-up costing).
+        // Cache tokens are captured on the event.
         assert_eq!(event.cache_creation_tokens, 930_906);
         assert_eq!(event.cache_read_tokens, 8_839_479);
-        // v1 cost bills input+output only (cache excluded).
+        // #992: cost now bills input + output + cache-write(1.25×) + cache-read(0.10×)
+        // at claude-opus input rate ($15/1M).
         let cost = event.cost_usd_estimate.unwrap();
-        let expected = 100.0 * 15.0 / 1e6 + 50.0 * 75.0 / 1e6;
-        assert!((cost - expected).abs() < 1e-9);
+        let expected = 100.0 * 15.0 / 1e6            // input
+            + 50.0 * 75.0 / 1e6                       // output
+            + 930_906.0 * 15.0 * 1.25 / 1e6           // cache write
+            + 8_839_479.0 * 15.0 * 0.10 / 1e6; // cache read
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "expected cache-inclusive ${expected}, got ${cost}"
+        );
+    }
+
+    #[test]
+    fn attributed_session_to_event_non_anthropic_excludes_cache_from_cost() {
+        // #992: a non-Anthropic model (deepseek) with cache tokens present bills
+        // cache at $0 — cost is input+output only. The tokens are still captured.
+        let mut session = scanned("2026-05-06T11:30:00Z", "/repo/a", 1_000, 500);
+        session.model = Some("deepseek-v4-pro".into());
+        session.cache_creation_tokens = 5_000_000;
+        session.cache_read_tokens = 20_000_000;
+        let attr = AttributedSession {
+            slot: slot(7),
+            session,
+        };
+        let event = attributed_session_to_event(&attr, "claude-sonnet-4-6");
+        assert_eq!(event.cache_creation_tokens, 5_000_000);
+        assert_eq!(event.cache_read_tokens, 20_000_000);
+        // deepseek-v4-pro: $0.435/1M input, $0.87/1M output; cache NOT billed.
+        let cost = event.cost_usd_estimate.unwrap();
+        let expected = 1_000.0 * 0.435 / 1e6 + 500.0 * 0.87 / 1e6;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "non-Anthropic cache must be $0: expected ${expected}, got ${cost}"
+        );
     }
 
     #[test]

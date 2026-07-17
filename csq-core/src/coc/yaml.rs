@@ -15,13 +15,18 @@
 //!
 //! - Frontmatter is delimited by `---` lines (open + close).
 //! - Each non-empty, non-comment line is `key: value` at column 0.
-//! - Values are scalars (strings, optionally quoted) OR inline-flow arrays
-//!   (`[a, b, c]`).
-//! - No block scalars, no anchors, no multi-line continuations, no nesting.
+//! - Values are scalars (strings, optionally quoted), inline-flow arrays
+//!   (`[a, b, c]`), OR a following block sequence (`key:` then indented
+//!   `- item` lines) — the block form maps to the same [`YamlValue::Array`].
+//! - No anchors. Block-scalar / nested-mapping continuation lines under a key
+//!   are TOLERATED (consumed, never a parse failure) per spec 09 §9.2.3, but
+//!   only block SEQUENCES are captured as a list value.
 //!
-//! That subset covers everything csq's contract uses. Loom MUST emit
-//! frontmatter in this subset; richer YAML in the artifact body (after
-//! the `---`) is NOT csq's concern (csq treats it as opaque text).
+//! Loom's emit uses this subset; the block-sequence tolerance (an internal ticket)
+//! exists because §9.2.3 requires csq to accept unknown/forward-compat
+//! frontmatter fields — including block-list-valued ones — WITHOUT a parse
+//! failure. Richer YAML in the artifact body (after the `---`) is NOT csq's
+//! concern (csq treats it as opaque text).
 
 use std::collections::BTreeMap;
 
@@ -81,7 +86,7 @@ pub enum YamlError {
 /// and `body` will be the whole input. This matches loom's expected emit
 /// where `COC.md` MAY have a frontmatter block.
 pub fn parse(input: &str) -> Result<Frontmatter, YamlError> {
-    let mut lines = input.lines().enumerate();
+    let mut lines = input.lines().enumerate().peekable();
 
     // Look for the opening `---` line.
     let first = lines.next();
@@ -96,7 +101,7 @@ pub fn parse(input: &str) -> Result<Frontmatter, YamlError> {
     let mut fields: BTreeMap<String, YamlValue> = BTreeMap::new();
     let mut body_start: Option<usize> = None;
 
-    for (idx, line) in &mut lines {
+    while let Some((idx, line)) = lines.next() {
         if line == "---" {
             // Closer; body starts on the NEXT line.
             body_start = Some(idx + 1);
@@ -106,7 +111,54 @@ pub fn parse(input: &str) -> Result<Frontmatter, YamlError> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let (key, value) = parse_kv_line(line, idx)?;
+        // Indented continuation lines (block-sequence items `- x`, nested
+        // mappings) belong to the PREVIOUS top-level key — a bare one at
+        // column 0 with no owning key is unexpected. If we reach one here it
+        // means a top-level key had a non-empty inline value AND an indented
+        // block followed; skip the orphan continuation (tolerated per §9.2.3,
+        // never a parse failure). See the block-collection below for the
+        // normal `key:`-then-block path.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let (key, mut value) = parse_kv_line(line, idx)?;
+        // Block sequence (#58, spec 09 §9.2.3): a top-level `key:` with an empty
+        // inline value MAY be followed by indented `- item` lines — csq's known
+        // list fields (`paths`/`coc.disable`/`applies_to`) and unknown fields
+        // alike. Collect them into an Array so csq TOLERATES the shape instead of
+        // mis-parsing `- item` as a new key (`invalid key character in - item`).
+        // Scalar items are unquoted; mapping items (`- matcher: X`) are captured
+        // as raw strings (csq reads no such field semantically).
+        if matches!(&value, YamlValue::Scalar(s) if s.is_empty()) {
+            let mut items: Vec<String> = Vec::new();
+            while let Some((_, next)) = lines.peek() {
+                if !next.starts_with(char::is_whitespace) && !next.is_empty() {
+                    break; // next top-level key or the `---` closer
+                }
+                let t = next.trim();
+                if t.is_empty() {
+                    lines.next(); // blank line inside the block
+                    continue;
+                }
+                if let Some(item) = t.strip_prefix("- ") {
+                    let it = item.trim();
+                    let it = it
+                        .strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .or_else(|| it.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                        .unwrap_or(it);
+                    items.push(it.to_string());
+                    lines.next();
+                } else {
+                    // Indented non-sequence continuation (nested mapping / block
+                    // scalar) — tolerated, consumed, not captured as a list item.
+                    lines.next();
+                }
+            }
+            if !items.is_empty() {
+                value = YamlValue::Array(items);
+            }
+        }
         if fields.contains_key(&key) {
             return Err(YamlError::DuplicateKey { key, line: idx });
         }
@@ -212,6 +264,55 @@ mod tests {
         let fm = parse(input).unwrap();
         let paths = fm.fields.get("paths").unwrap().as_array().unwrap();
         assert_eq!(paths, &["src/**", "lib/**"]);
+    }
+
+    // #58: a known list field emitted as a YAML BLOCK sequence (not inline flow)
+    // must parse to the same Array, not crash.
+    #[test]
+    fn parses_block_sequence_for_known_list_field() {
+        let input = "---\nid: RULE-X\npaths:\n  - src/**\n  - \"lib/**\"\n---\nbody";
+        let fm = parse(input).unwrap();
+        let paths = fm.fields.get("paths").unwrap().as_array().unwrap();
+        assert_eq!(paths, &["src/**", "lib/**"]);
+        assert_eq!(fm.fields.get("id").unwrap().as_scalar(), Some("RULE-X"));
+        assert_eq!(fm.body, "body");
+    }
+
+    // #58 (the reported case): a block sequence of MAPPINGS (`- matcher: X`) under
+    // an unknown field must be TOLERATED (§9.2.3 — no parse failure, captured), not
+    // yield `invalid key character in \`- matcher\``.
+    #[test]
+    fn tolerates_block_sequence_of_mappings_unknown_field() {
+        let input = "---\nid: RULE-X\nhooks:\n  - matcher: Bash\n  - matcher: Edit\n---\nbody";
+        let fm = parse(input).expect("block-sequence-of-mappings must not fail to parse");
+        // Known scalar field still read.
+        assert_eq!(fm.fields.get("id").unwrap().as_scalar(), Some("RULE-X"));
+        // Unknown field captured (surfaced via --show-unknowns), not dropped.
+        let hooks = fm.fields.get("hooks").unwrap().as_array().unwrap();
+        assert_eq!(hooks, &["matcher: Bash", "matcher: Edit"]);
+    }
+
+    // #58 edge: a bare `key:` immediately before the `---` closer (no block, no
+    // value) is a legal empty-scalar field; block collection breaks on `---`.
+    #[test]
+    fn bare_key_before_closer_is_empty_scalar() {
+        let input = "---\nid: RULE-X\nfuture:\n---\nbody";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.fields.get("future").unwrap().as_scalar(), Some(""));
+        assert_eq!(fm.fields.get("id").unwrap().as_scalar(), Some("RULE-X"));
+        assert_eq!(fm.body, "body");
+    }
+
+    // A `key:` followed by a nested mapping (not a sequence) is tolerated: the key
+    // is captured with an empty value, the indented lines are consumed, no crash.
+    #[test]
+    fn tolerates_nested_mapping_continuation() {
+        let input = "---\nid: RULE-X\nmeta:\n  author: jack\n  team: core\ndesc: ok\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.fields.get("id").unwrap().as_scalar(), Some("RULE-X"));
+        assert_eq!(fm.fields.get("desc").unwrap().as_scalar(), Some("ok"));
+        // `meta` captured (empty scalar — nested map not a list), never a failure.
+        assert!(fm.fields.contains_key("meta"));
     }
 
     #[test]

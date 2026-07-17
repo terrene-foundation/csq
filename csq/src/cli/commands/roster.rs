@@ -14,17 +14,22 @@
 
 use anyhow::{bail, Result};
 use csq_core::audit::authority::{
-    resolve_registry, roster_path, save_detached_roster, verify_detached_roster,
-    verify_signed_roster, OpClass, SignedRoster, UnsignedRosterFile,
+    generate_keypair, public_key_of_seed, resolve_registry, roster_path, roster_sig_path,
+    save_detached_roster, sign_raw_bytes_with_seed, verify_detached_roster, verify_hex_signature,
+    verify_signed_roster, EnrolledKey, OpClass, Roster, RosterEntry, SignedRoster,
+    UnsignedRosterFile,
 };
 use csq_core::audit::multi_sig::edition::resolve_edition;
 use csq_core::audit::multi_sig::edition::Edition;
 use csq_core::audit::persist::acquire_chain_lock;
+use csq_core::audit::types::{Ed25519PublicKey, Ed25519Signature};
 use csq_core::audit::verify::{verify_chain, VerifyConfig};
 use csq_core::audit::ChainState;
 use csq_core::daemon::detect::{detect_daemon, DetectResult};
 use csq_core::error::redact_tokens;
-use std::path::Path;
+use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Handle `csq audit roster install <file>`.
 ///
@@ -505,14 +510,654 @@ pub fn handle_roster_show(base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ===========================================================================
+// an internal ticket — roster authoring / signing / rotation verbs.
+//
+// These verbs let an operator AUTHOR and SIGN a roster offline, and PROVISION
+// the org-root trust anchor, without hand-editing JSON or shelling out to
+// external Ed25519 tooling. They complement the existing install/show/verify
+// enforcement surface.
+//
+// Secret custody (security.md §1, §5a): the org-root SECRET key
+// (roster-root.sec) is written 0o600 via secure_file + atomic_replace with
+// cleanup-on-failure, and is NEVER printed. Only the PUBLIC key hex is echoed.
+// ===========================================================================
+
+/// Default authoring directory: `<base>/audit/`.
+///
+/// The keygen/create/sign verbs default their `--out` to this directory so a
+/// bare `csq audit roster-keygen` provisions the canonical trust anchor
+/// (`resolve_root_pubkey` reads `<base>/audit/roster-root.pub`).
+fn default_audit_dir(base_dir: &Path) -> PathBuf {
+    roster_path(base_dir)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| base_dir.join("audit"))
+}
+
+/// Write `bytes` to `path` via the §5a write path (unique tmp → write →
+/// secure_file(0o600) → atomic_replace) with cleanup-on-every-failure.
+///
+/// Used for BOTH the secret and the public key: `resolve_root_pubkey` requires
+/// `roster-root.pub` to be 0o600-or-stricter on Unix, so the public file gets
+/// the same treatment as the secret.
+fn write_secure_bytes(path: &Path, bytes: &[u8], what: &'static str) -> Result<()> {
+    let tmp = unique_tmp_path(path);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("failed to write {what}: {}", redact_tokens(&e.to_string()));
+    }
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        bail!(
+            "failed to secure {what} permissions: {}",
+            redact_tokens(&e.to_string())
+        );
+    }
+    if let Err(e) = atomic_replace(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        bail!(
+            "failed to finalize {what}: {}",
+            redact_tokens(&e.to_string())
+        );
+    }
+    Ok(())
+}
+
+/// Handle `csq audit roster-keygen [--out <dir>] [--force]`.
+///
+/// Generates a fresh Ed25519 org-root keypair (CSPRNG via `getrandom`), writes
+/// the 32-byte SECRET seed to `<dir>/roster-root.sec` (mode 0o600) and the
+/// 32-byte PUBLIC key to `<dir>/roster-root.pub` (mode 0o600), and prints the
+/// public key as lowercase hex.
+///
+/// # Secret custody
+///
+/// The secret seed is NEVER printed or logged. It lives only in the 0o600
+/// `roster-root.sec` file. The operator uses it with `roster-sign` and keeps it
+/// offline (see `license-administration.md` for the crown-jewel-key discipline).
+///
+/// # Overwrite protection
+///
+/// If either output file already exists and `--force` is not set, the command
+/// refuses (a keypair overwrite would invalidate every roster already signed
+/// with the old key). `--force` overwrites both.
+pub fn handle_roster_keygen(base_dir: &Path, out: Option<&Path>, force: bool) -> Result<()> {
+    let dir = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_audit_dir(base_dir));
+
+    // Create the output dir (0o700 on Unix — it holds the secret seed).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create output directory: {}",
+                    redact_tokens(&e.to_string())
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create output directory: {}",
+                redact_tokens(&e.to_string())
+            )
+        })?;
+    }
+
+    let sec_path = dir.join("roster-root.sec");
+    let pub_path = dir.join("roster-root.pub");
+
+    if !force && (sec_path.exists() || pub_path.exists()) {
+        bail!(
+            "a roster root keypair already exists in the output directory — \
+             re-run with --force to overwrite (this invalidates every roster \
+             already signed with the existing key)"
+        );
+    }
+
+    // CSPRNG keypair via the shared crypto seam. The seed is the SECRET; it
+    // also lands in the 0o600 file, which is the durable custody surface.
+    let (mut seed, pk) =
+        generate_keypair().map_err(|_| anyhow::anyhow!("failed to gather entropy"))?;
+    let pk_bytes = pk.0;
+
+    // Write the SECRET seed first (0o600), then the PUBLIC key (0o600).
+    write_secure_bytes(&sec_path, &seed, "roster-root.sec")?;
+    // Best-effort scrub of the in-memory seed copy now that it is persisted.
+    seed.iter_mut().for_each(|b| *b = 0);
+    write_secure_bytes(&pub_path, &pk_bytes, "roster-root.pub")?;
+
+    // Public key is safe to print (public material). Secret is NEVER printed.
+    println!("{}", hex::encode(pk_bytes));
+    eprintln!("audit roster: org-root keypair generated");
+    eprintln!("  secret key: roster-root.sec (mode 0600 — keep offline, never commit)");
+    eprintln!("  public key: roster-root.pub (mode 0600 — the trust anchor)");
+    eprintln!(
+        "  set CSQ_AUDIT_ROSTER_ROOT_PUBKEY to the printed hex, or rely on the roster-root.pub file"
+    );
+    Ok(())
+}
+
+/// Parse an `OpClass` from the CLI `--op-class` value.
+fn parse_op_class(s: &str) -> Result<OpClass> {
+    match s {
+        "key_rotate" => Ok(OpClass::KeyRotate),
+        "identity_mint" => Ok(OpClass::IdentityMint),
+        "release_auth" => Ok(OpClass::ReleaseAuth),
+        other => bail!(
+            "invalid op-class '{other}' — expected one of: key_rotate, identity_mint, release_auth"
+        ),
+    }
+}
+
+/// Parse a 64-char hex Ed25519 pubkey.
+fn parse_pubkey_hex(hex_str: &str) -> Result<Ed25519PublicKey> {
+    let bytes = hex::decode(hex_str.trim()).map_err(|_| {
+        anyhow::anyhow!("pubkey is not valid hex (expected 64 hex chars / 32 bytes)")
+    })?;
+    if bytes.len() != 32 {
+        bail!(
+            "pubkey must be 32 bytes (64 hex chars), got {} bytes",
+            bytes.len()
+        );
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(Ed25519PublicKey(arr))
+}
+
+/// Current UTC timestamp as an RFC-3339 string for `generated_at`.
+///
+/// This value is descriptive metadata inside the roster; it is covered by the
+/// signature (so it is byte-stable once signed) but is not security-load-bearing
+/// — the verify path treats `generated_at` as opaque.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Handle `csq audit roster-create`.
+///
+/// Builds an `UnsignedRosterFile` with a single principal enrolled for one
+/// op-class with one key, and writes it as pretty JSON. The `roster_pubkey`
+/// field is set from the resolved org-root pubkey (env `CSQ_AUDIT_ROSTER_ROOT_PUBKEY`
+/// preferred, else the `--pubkey` argument is used as the org-root anchor).
+///
+/// The output is the UNSIGNED form (no `signature` field, no `.sig`) — it is the
+/// input to `roster-sign`. `entries` is a `BTreeMap`, so serialization is
+/// canonical/deterministic (byte-stable for the eventual signature).
+#[allow(clippy::too_many_arguments)]
+pub fn handle_roster_create(
+    base_dir: &Path,
+    principal: &str,
+    op_class: &str,
+    pubkey_hex: &str,
+    roster_version: Option<u64>,
+    out: Option<&Path>,
+) -> Result<()> {
+    if principal.trim().is_empty() {
+        bail!("principal must not be empty");
+    }
+    let op = parse_op_class(op_class)?;
+    let member_pk = parse_pubkey_hex(pubkey_hex)?;
+
+    // The org-root pubkey embedded in the file's `roster_pubkey` field.
+    // Prefer the env var (the recommended production source); the member key
+    // (--pubkey) is the ENROLLED key, distinct from the org-root anchor.
+    let root_pk = if let Ok(env_hex) = std::env::var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY") {
+        parse_pubkey_hex(&env_hex)
+            .map_err(|e| anyhow::anyhow!("CSQ_AUDIT_ROSTER_ROOT_PUBKEY invalid: {e}"))?
+    } else {
+        // Fall back to the roster-root.pub file if present.
+        let pub_path = default_audit_dir(base_dir).join("roster-root.pub");
+        if pub_path.exists() {
+            let raw = std::fs::read(&pub_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read roster-root.pub: {}",
+                    redact_tokens(&e.to_string())
+                )
+            })?;
+            if raw.len() != 32 {
+                bail!("roster-root.pub is not 32 bytes");
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&raw);
+            Ed25519PublicKey(arr)
+        } else {
+            bail!(
+                "no org-root pubkey available — set CSQ_AUDIT_ROSTER_ROOT_PUBKEY or run \
+                 `csq audit roster-keygen` first to provision roster-root.pub"
+            );
+        }
+    };
+
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        principal.to_string(),
+        RosterEntry {
+            keys: vec![EnrolledKey {
+                pubkey: member_pk,
+                active_from_seq: 0,
+                retired_at_seq: None,
+            }],
+            op_classes: vec![op],
+        },
+    );
+
+    let roster = Roster {
+        format_version: 1,
+        roster_version: roster_version.unwrap_or(1),
+        generated_at: now_rfc3339(),
+        entries,
+    };
+
+    let unsigned = UnsignedRosterFile {
+        roster,
+        roster_pubkey: root_pk,
+    };
+
+    let json = serde_json::to_string_pretty(&unsigned)
+        .map_err(|_| anyhow::anyhow!("failed to serialize roster"))?;
+
+    let out_path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_audit_dir(base_dir).join("authority-roster.unsigned.json"));
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create output directory: {}",
+                redact_tokens(&e.to_string())
+            )
+        })?;
+    }
+    std::fs::write(&out_path, json.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to write roster file: {}",
+            redact_tokens(&e.to_string())
+        )
+    })?;
+
+    eprintln!(
+        "audit roster: unsigned roster v{} written — principal '{}', op-class {:?}",
+        unsigned.roster.roster_version, principal, op
+    );
+    eprintln!("  next: sign it with `csq audit roster-sign <file> --secret-key roster-root.sec`");
+    Ok(())
+}
+
+/// Read the org-root secret seed from `--secret-key <path>` (0o600-enforced) or
+/// `--secret-key-hex <hex>`, returning the raw 32-byte seed.
+///
+/// The secret seed is NEVER echoed. On Unix the file MUST be 0o600-or-stricter
+/// (rejects group/other bits) — the same posture `resolve_root_pubkey` enforces
+/// on `roster-root.pub`.
+fn load_secret_seed(sk_path: Option<&Path>, sk_hex: Option<&str>) -> Result<[u8; 32]> {
+    let seed: [u8; 32] = match (sk_path, sk_hex) {
+        (Some(_), Some(_)) => {
+            bail!("provide either --secret-key or --secret-key-hex, not both")
+        }
+        (None, None) => {
+            bail!("a secret key is required: pass --secret-key <path> or --secret-key-hex <hex>")
+        }
+        (Some(p), None) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::metadata(p).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to stat secret key file: {}",
+                        redact_tokens(&e.to_string())
+                    )
+                })?;
+                if meta.mode() & 0o077 != 0 {
+                    bail!(
+                        "secret key file has insecure permissions (expected 0600 or stricter) — \
+                         run `chmod 600` on it before signing"
+                    );
+                }
+            }
+            let raw = std::fs::read(p).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read secret key file: {}",
+                    redact_tokens(&e.to_string())
+                )
+            })?;
+            if raw.len() != 32 {
+                bail!("secret key file must be a raw 32-byte Ed25519 seed");
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&raw);
+            arr
+        }
+        (None, Some(h)) => {
+            let bytes = hex::decode(h.trim())
+                .map_err(|_| anyhow::anyhow!("secret key hex is not valid hex"))?;
+            if bytes.len() != 32 {
+                bail!("secret key hex must be 32 bytes (64 hex chars)");
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+    };
+    Ok(seed)
+}
+
+/// Handle `csq audit roster-sign <unsigned.json> --secret-key <path>|--secret-key-hex <hex> [--detached]`.
+///
+/// Reads the unsigned roster as RAW bytes, signs, THEN writes — byte-preserving
+/// (the file is never re-serialized after signing, so the detached signature
+/// covers exactly the stored bytes).
+///
+/// - Embedded (default): parses the unsigned bytes into a `Roster`, signs the
+///   CANONICAL `serde_json::to_vec(&roster)` (matching `verify_signed_roster`),
+///   and writes a `SignedRoster` (roster + roster_pubkey + signature).
+/// - Detached (`--detached`): signs the RAW unsigned-file bytes and writes them
+///   verbatim to the roster path plus a `.sig` sidecar (matching
+///   `verify_detached_roster`).
+///
+/// The output verifies with the corresponding verify path. The signer's public
+/// key MUST equal the file's `roster_pubkey` (else install would reject a
+/// pubkey mismatch) — this is checked before writing.
+pub fn handle_roster_sign(
+    base_dir: &Path,
+    unsigned_file: &Path,
+    secret_key_path: Option<&Path>,
+    secret_key_hex: Option<&str>,
+    detached: bool,
+    out: Option<&Path>,
+) -> Result<()> {
+    let raw_bytes = std::fs::read(unsigned_file).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read unsigned roster: {}",
+            redact_tokens(&e.to_string())
+        )
+    })?;
+    let raw_str = std::str::from_utf8(&raw_bytes)
+        .map_err(|_| anyhow::anyhow!("unsigned roster is not valid UTF-8"))?;
+    let unsigned: UnsignedRosterFile = serde_json::from_str(raw_str)
+        .map_err(|_| anyhow::anyhow!("unsigned roster is not valid JSON or has unknown fields"))?;
+
+    let mut seed = load_secret_seed(secret_key_path, secret_key_hex)?;
+    let signer_pk = public_key_of_seed(&seed).0;
+
+    // The signer MUST be the org-root anchor named in the file; otherwise the
+    // signed output would fail the pubkey-match check at install time.
+    if signer_pk != unsigned.roster_pubkey.0 {
+        bail!(
+            "the secret key does not match the roster_pubkey field in the unsigned file — \
+             sign with the org-root key that authored this roster"
+        );
+    }
+
+    if detached {
+        // Detached: sign the RAW bytes; write them verbatim + a .sig sidecar.
+        let sig_hex = sign_raw_bytes_with_seed(&seed, &raw_bytes);
+        // Best-effort scrub of the in-memory seed once signing is done (mirrors the
+        // keygen path; closes the sign-path zeroization asymmetry — redteam R2 LOW).
+        seed.iter_mut().for_each(|b| *b = 0);
+        // Sanity: confirm the produced signature verifies before persisting.
+        if !verify_hex_signature(&signer_pk, &raw_bytes, &sig_hex).unwrap_or(false) {
+            bail!("internal: produced detached signature failed self-verification");
+        }
+
+        if let Some(out_path) = out {
+            // Explicit out: write roster verbatim + <out>.sig sidecar.
+            let sig_path = sidecar_for(out_path);
+            write_bytes_plain(out_path, &raw_bytes, "roster")?;
+            write_bytes_plain(&sig_path, sig_hex.as_bytes(), "sidecar")?;
+            eprintln!("audit roster: detached-signed roster written (+ .sig sidecar)");
+        } else {
+            // Default: install-shaped canonical location (base/audit/…).
+            save_detached_roster(base_dir, &raw_bytes, &sig_hex).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to save detached roster: {}",
+                    redact_tokens(&e.to_string())
+                )
+            })?;
+            let _ = roster_sig_path(base_dir); // canonical sidecar path (informational)
+            eprintln!("audit roster: detached-signed roster written to the audit directory");
+        }
+    } else {
+        // Embedded: sign the CANONICAL roster bytes (matching verify_signed_roster).
+        let canonical = serde_json::to_vec(&unsigned.roster)
+            .map_err(|_| anyhow::anyhow!("failed to canonicalize roster"))?;
+        let sig_hex = sign_raw_bytes_with_seed(&seed, &canonical);
+        // Best-effort scrub of the in-memory seed once signing is done (mirrors the
+        // keygen path; closes the sign-path zeroization asymmetry — redteam R2 LOW).
+        seed.iter_mut().for_each(|b| *b = 0);
+        let sig_bytes = hex::decode(&sig_hex)
+            .map_err(|_| anyhow::anyhow!("internal: produced signature is not hex"))?;
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+
+        let signed = SignedRoster {
+            roster: unsigned.roster,
+            roster_pubkey: unsigned.roster_pubkey,
+            signature: Ed25519Signature::new(sig_arr),
+        };
+
+        let json = serde_json::to_string_pretty(&signed)
+            .map_err(|_| anyhow::anyhow!("failed to serialize signed roster"))?;
+
+        let out_path = out
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| roster_path(base_dir));
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create output directory: {}",
+                    redact_tokens(&e.to_string())
+                )
+            })?;
+        }
+        write_bytes_plain(&out_path, json.as_bytes(), "signed roster")?;
+        eprintln!(
+            "audit roster: embedded-signed roster v{} written",
+            signed.roster.roster_version
+        );
+    }
+    eprintln!("  next: install it with `csq audit roster-install <file>`");
+    Ok(())
+}
+
+/// Derive the `.sig` sidecar path for an explicit output roster path.
+fn sidecar_for(roster: &Path) -> PathBuf {
+    let mut p = roster.to_path_buf();
+    let ext = p
+        .extension()
+        .map(|e| {
+            let mut s = e.to_os_string();
+            s.push(".sig");
+            s
+        })
+        .unwrap_or_else(|| std::ffi::OsString::from("sig"));
+    p.set_extension(ext);
+    p
+}
+
+/// Plain (non-secret) write via the atomic tmp→write→replace path.
+///
+/// Rosters and sidecars are PUBLIC material (no secret custody needed), but the
+/// atomic replace still prevents a torn write from leaving a half-file that
+/// fails verification.
+fn write_bytes_plain(path: &Path, bytes: &[u8], what: &'static str) -> Result<()> {
+    let tmp = unique_tmp_path(path);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("failed to write {what}: {}", redact_tokens(&e.to_string()));
+    }
+    if let Err(e) = atomic_replace(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        bail!(
+            "failed to finalize {what}: {}",
+            redact_tokens(&e.to_string())
+        );
+    }
+    Ok(())
+}
+
+/// Parse an `<email>:<hex>` key spec for `roster-rotate`.
+fn parse_key_spec(spec: &str) -> Result<(String, Ed25519PublicKey)> {
+    let (email, hex_part) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("key spec must be '<email>:<pubkey-hex>', got '{spec}'"))?;
+    if email.trim().is_empty() {
+        bail!("key spec email must not be empty");
+    }
+    let pk = parse_pubkey_hex(hex_part)?;
+    Ok((email.to_string(), pk))
+}
+
+/// Handle `csq audit roster-rotate --from <roster.json> --add-key <email>:<hex> [--retire-key <email>:<hex>] [--bump-version]`.
+///
+/// Reads an existing roster (signed OR unsigned), mutates the entry set, and
+/// emits a new UNSIGNED roster. `roster_version` is monotonic: `--bump-version`
+/// increments it by 1 (the operator re-signs the output afterward).
+///
+/// - `--add-key <email>:<hex>`: adds the key to the named principal's entry
+///   (creating the principal with the same op-classes as the roster's first
+///   entry if new), active from seq 0.
+/// - `--retire-key <email>:<hex>`: sets `retired_at_seq` on the matching key to
+///   the current max-seq + 1 (a monotonic retirement point). Retired keys are
+///   retained in the roster (records signed before retirement still verify).
+pub fn handle_roster_rotate(
+    base_dir: &Path,
+    from: &Path,
+    add_key: Option<&str>,
+    retire_key: Option<&str>,
+    bump_version: bool,
+    out: Option<&Path>,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(from).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read source roster: {}",
+            redact_tokens(&e.to_string())
+        )
+    })?;
+
+    // Accept both the signed (embedded) and unsigned forms as the source.
+    let (mut roster, roster_pubkey) = if let Ok(signed) = serde_json::from_str::<SignedRoster>(&raw)
+    {
+        (signed.roster, signed.roster_pubkey)
+    } else if let Ok(unsigned) = serde_json::from_str::<UnsignedRosterFile>(&raw) {
+        (unsigned.roster, unsigned.roster_pubkey)
+    } else {
+        bail!("source roster is not a valid signed or unsigned roster file");
+    };
+
+    if add_key.is_none() && retire_key.is_none() {
+        bail!("nothing to do — pass --add-key and/or --retire-key");
+    }
+
+    // Retirement point: strictly-monotonic seq above every active_from_seq seen.
+    let retire_at = roster
+        .entries
+        .values()
+        .flat_map(|e| e.keys.iter())
+        .map(|k| k.active_from_seq)
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    if let Some(spec) = add_key {
+        let (email, pk) = parse_key_spec(spec)?;
+        // Template op-classes from the first existing entry (or KeyRotate if empty).
+        let default_ops = roster
+            .entries
+            .values()
+            .next()
+            .map(|e| e.op_classes.clone())
+            .unwrap_or_else(|| vec![OpClass::KeyRotate]);
+        let entry = roster.entries.entry(email).or_insert_with(|| RosterEntry {
+            keys: Vec::new(),
+            op_classes: default_ops,
+        });
+        // Idempotence guard: refuse a duplicate active pubkey.
+        if entry
+            .keys
+            .iter()
+            .any(|k| k.pubkey.0 == pk.0 && k.retired_at_seq.is_none())
+        {
+            bail!("that pubkey is already active for the named principal");
+        }
+        entry.keys.push(EnrolledKey {
+            pubkey: pk,
+            active_from_seq: 0,
+            retired_at_seq: None,
+        });
+    }
+
+    if let Some(spec) = retire_key {
+        let (email, pk) = parse_key_spec(spec)?;
+        let entry = roster
+            .entries
+            .get_mut(&email)
+            .ok_or_else(|| anyhow::anyhow!("principal '{email}' not found in the roster"))?;
+        let key = entry
+            .keys
+            .iter_mut()
+            .find(|k| k.pubkey.0 == pk.0 && k.retired_at_seq.is_none())
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active key matching that pubkey for principal '{email}'")
+            })?;
+        key.retired_at_seq = Some(retire_at);
+    }
+
+    if bump_version {
+        roster.roster_version = roster
+            .roster_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("roster_version overflow"))?;
+    }
+    roster.generated_at = now_rfc3339();
+
+    let unsigned = UnsignedRosterFile {
+        roster,
+        roster_pubkey,
+    };
+    let json = serde_json::to_string_pretty(&unsigned)
+        .map_err(|_| anyhow::anyhow!("failed to serialize rotated roster"))?;
+
+    let out_path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_audit_dir(base_dir).join("authority-roster.rotated.json"));
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create output directory: {}",
+                redact_tokens(&e.to_string())
+            )
+        })?;
+    }
+    std::fs::write(&out_path, json.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to write rotated roster: {}",
+            redact_tokens(&e.to_string())
+        )
+    })?;
+
+    eprintln!(
+        "audit roster: rotated roster v{} written (UNSIGNED)",
+        unsigned.roster.roster_version
+    );
+    eprintln!("  next: sign it with `csq audit roster-sign <file> --secret-key roster-root.sec`");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csq_core::audit::authority::{save_roster, EnrolledKey, Roster, RosterEntry, SignedRoster};
-    use csq_core::audit::types::{Ed25519PublicKey, Ed25519Signature};
+    use csq_core::audit::authority::save_roster;
     use csq_core::audit::ChainState;
     use ed25519_dalek::SigningKey as DalekSigningKey;
-    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     fn tmp() -> TempDir {
@@ -1374,5 +2019,251 @@ mod tests {
         // different path.  Verify the chain.json the ChainState writes.
         // ChainState::save writes to base/csq-runs/chain.json per chain_state.rs.
         assert!(chain_json.exists(), "chain.json must be written on success");
+    }
+
+    // -----------------------------------------------------------------------
+    // an internal ticket — authoring/signing/rotation round-trip tests.
+    // -----------------------------------------------------------------------
+
+    /// keygen writes 0600 sec+pub, prints the pubkey hex, and NEVER writes the
+    /// secret to the public file. --force is required to overwrite.
+    #[test]
+    fn keygen_writes_secure_files_and_refuses_overwrite() {
+        let _g = csq_core::platform::test_env::lock();
+        let dir = tmp();
+        let out = dir.path().join("keys");
+
+        handle_roster_keygen(dir.path(), Some(&out), false).expect("keygen");
+
+        let sec = out.join("roster-root.sec");
+        let pubf = out.join("roster-root.pub");
+        assert!(sec.exists(), "secret key file must exist");
+        assert!(pubf.exists(), "public key file must exist");
+
+        let sec_bytes = std::fs::read(&sec).unwrap();
+        let pub_bytes = std::fs::read(&pubf).unwrap();
+        assert_eq!(sec_bytes.len(), 32, "secret seed is 32 bytes");
+        assert_eq!(pub_bytes.len(), 32, "public key is 32 bytes");
+        assert_ne!(
+            sec_bytes, pub_bytes,
+            "public file must NOT contain the secret"
+        );
+
+        // The public key file must match the seed's verifying key.
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&sec_bytes);
+        let sk = DalekSigningKey::from_bytes(&seed);
+        assert_eq!(
+            sk.verifying_key().to_bytes().as_slice(),
+            pub_bytes.as_slice(),
+            "roster-root.pub must be the seed's verifying key"
+        );
+
+        // 0600 on Unix (resolve_root_pubkey enforces 0600-or-stricter on .pub).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&sec).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(&pubf).unwrap().mode() & 0o777, 0o600);
+        }
+
+        // Refuse overwrite without --force.
+        let again = handle_roster_keygen(dir.path(), Some(&out), false);
+        assert!(again.is_err(), "second keygen without --force must fail");
+        // --force overwrites.
+        handle_roster_keygen(dir.path(), Some(&out), true).expect("force keygen");
+    }
+
+    /// Full round-trip (embedded): keygen → create → sign → RosterFileRegistry::load PASSES.
+    #[test]
+    fn round_trip_embedded_sign_verifies() {
+        let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = tmp();
+        let base = dir.path();
+        let keys = base.join("keys");
+
+        // keygen — capture the printed pubkey by re-reading roster-root.pub.
+        handle_roster_keygen(base, Some(&keys), false).expect("keygen");
+        let pub_bytes = std::fs::read(keys.join("roster-root.pub")).unwrap();
+        let root_hex = hex::encode(&pub_bytes);
+        let sec_path = keys.join("roster-root.sec");
+
+        // create — enroll a member for KeyRotate. Anchor via env root pubkey.
+        std::env::set_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY", &root_hex);
+        let (_, member_pk) = gen_keypair();
+        let unsigned_out = base.join("roster.unsigned.json");
+        handle_roster_create(
+            base,
+            "alice@example.com",
+            "key_rotate",
+            &hex::encode(member_pk.0),
+            Some(3),
+            Some(&unsigned_out),
+        )
+        .expect("create");
+        assert!(unsigned_out.exists(), "unsigned roster written");
+
+        // sign (embedded) into the canonical roster path.
+        handle_roster_sign(base, &unsigned_out, Some(&sec_path), None, false, None).expect("sign");
+
+        // Load via RosterFileRegistry — must verify.
+        let reg = csq_core::audit::authority::RosterFileRegistry::load(base, 0);
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        assert!(
+            reg.is_ok(),
+            "embedded round-trip must load: {:?}",
+            reg.err()
+        );
+        assert_eq!(reg.unwrap().roster().roster_version, 3);
+    }
+
+    /// Full round-trip (detached): keygen → create → sign --detached → load PASSES;
+    /// tampering one byte of the roster file → load FAILS.
+    #[test]
+    fn round_trip_detached_sign_verifies_and_tamper_fails() {
+        let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = tmp();
+        let base = dir.path();
+        let keys = base.join("keys");
+
+        handle_roster_keygen(base, Some(&keys), false).expect("keygen");
+        let root_hex = hex::encode(std::fs::read(keys.join("roster-root.pub")).unwrap());
+        let sec_path = keys.join("roster-root.sec");
+
+        std::env::set_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY", &root_hex);
+        let (_, member_pk) = gen_keypair();
+        let unsigned_out = base.join("roster.unsigned.json");
+        handle_roster_create(
+            base,
+            "bob@example.com",
+            "release_auth",
+            &hex::encode(member_pk.0),
+            Some(1),
+            Some(&unsigned_out),
+        )
+        .expect("create");
+
+        handle_roster_sign(base, &unsigned_out, Some(&sec_path), None, true, None)
+            .expect("detached sign");
+
+        // Load (detached path) — must verify.
+        let reg = csq_core::audit::authority::RosterFileRegistry::load(base, 0);
+        assert!(
+            reg.is_ok(),
+            "detached round-trip must load: {:?}",
+            reg.err()
+        );
+
+        // Tamper: append a byte to the roster file → signature no longer covers it.
+        let roster_p = csq_core::audit::authority::roster_path(base);
+        let mut contents = std::fs::read(&roster_p).unwrap();
+        contents.push(b' ');
+        std::fs::write(&roster_p, &contents).unwrap();
+
+        let reg2 = csq_core::audit::authority::RosterFileRegistry::load(base, 0);
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        assert!(reg2.is_err(), "tampered detached roster must fail to load");
+    }
+
+    /// sign refuses when the secret key does not match the roster_pubkey anchor.
+    #[test]
+    fn sign_refuses_wrong_secret_key() {
+        let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = tmp();
+        let base = dir.path();
+        let keys = base.join("keys");
+        handle_roster_keygen(base, Some(&keys), false).expect("keygen");
+        let root_hex = hex::encode(std::fs::read(keys.join("roster-root.pub")).unwrap());
+
+        std::env::set_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY", &root_hex);
+        let (_, member_pk) = gen_keypair();
+        let unsigned_out = base.join("roster.unsigned.json");
+        handle_roster_create(
+            base,
+            "alice@example.com",
+            "key_rotate",
+            &hex::encode(member_pk.0),
+            None,
+            Some(&unsigned_out),
+        )
+        .expect("create");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
+        // A DIFFERENT secret key (not the org-root anchor) → refusal.
+        let (wrong_sk, _) = gen_keypair();
+        let wrong_hex = hex::encode(wrong_sk.to_bytes());
+        let result = handle_roster_sign(base, &unsigned_out, None, Some(&wrong_hex), false, None);
+        assert!(result.is_err(), "sign with wrong key must fail");
+    }
+
+    /// rotate adds and retires keys, bumps version monotonically, retains
+    /// retired keys with retired_at_seq, and emits a re-signable unsigned roster.
+    #[test]
+    fn rotate_add_retire_bump_version() {
+        let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = tmp();
+        let base = dir.path();
+        let keys = base.join("keys");
+        handle_roster_keygen(base, Some(&keys), false).expect("keygen");
+        let root_hex = hex::encode(std::fs::read(keys.join("roster-root.pub")).unwrap());
+        let sec_path = keys.join("roster-root.sec");
+
+        std::env::set_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY", &root_hex);
+        let (_, member1) = gen_keypair();
+        let unsigned_out = base.join("roster.unsigned.json");
+        handle_roster_create(
+            base,
+            "alice@example.com",
+            "key_rotate",
+            &hex::encode(member1.0),
+            Some(5),
+            Some(&unsigned_out),
+        )
+        .expect("create");
+
+        // Rotate: add a new key for bob, retire alice's key, bump version.
+        let (_, member2) = gen_keypair();
+        let rotated_out = base.join("roster.rotated.json");
+        handle_roster_rotate(
+            base,
+            &unsigned_out,
+            Some(&format!("bob@example.com:{}", hex::encode(member2.0))),
+            Some(&format!("alice@example.com:{}", hex::encode(member1.0))),
+            true,
+            Some(&rotated_out),
+        )
+        .expect("rotate");
+
+        let raw = std::fs::read_to_string(&rotated_out).unwrap();
+        let parsed: UnsignedRosterFile = serde_json::from_str(&raw).expect("parse rotated");
+        assert_eq!(parsed.roster.roster_version, 6, "version bumped 5 -> 6");
+        // alice's key must be retired (retired_at_seq set).
+        let alice = parsed.roster.entries.get("alice@example.com").unwrap();
+        assert!(
+            alice.keys.iter().any(|k| k.retired_at_seq.is_some()),
+            "alice's key must be retired"
+        );
+        // bob's new key must be present and active.
+        let bob = parsed.roster.entries.get("bob@example.com").unwrap();
+        assert!(
+            bob.keys.iter().any(|k| k.retired_at_seq.is_none()),
+            "bob's new key must be active"
+        );
+
+        // The rotated roster must still be signable + verifiable.
+        handle_roster_sign(base, &rotated_out, Some(&sec_path), None, false, None)
+            .expect("sign rotated");
+        let reg = csq_core::audit::authority::RosterFileRegistry::load(base, 0);
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        assert!(
+            reg.is_ok(),
+            "rotated+signed roster must load: {:?}",
+            reg.err()
+        );
+        assert_eq!(reg.unwrap().roster().roster_version, 6);
     }
 }

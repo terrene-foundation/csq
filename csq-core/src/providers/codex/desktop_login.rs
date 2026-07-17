@@ -200,7 +200,10 @@ where
     }
 
     // Step 3: pre-seed config.toml BEFORE shelling out. INV-P03.
-    surface::write_config_toml(base_dir, account, surface::default_model())
+    // `model = None`: csq does NOT force a model at login (CC-parity). The
+    // user-global `~/.codex/config.toml` `model` propagates; absent → codex
+    // built-in default. Mirrors `login.rs` (twin-parity).
+    surface::write_config_toml(base_dir, account, None)
         .with_context(|| "pre-seed config-<N>/config.toml failed")?;
 
     // Step 4: shell out via the caller-supplied spawn closure. The

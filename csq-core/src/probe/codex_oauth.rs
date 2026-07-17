@@ -91,7 +91,11 @@ fn evaluate(slot: AccountNum, snapshot: codex_http::WhamSnapshot, elapsed_ms: u6
     // structural assertions (rate_limit.{primary,secondary}_window
     // present, used_percent + reset_at fields).
     let primary = &snapshot.rate_limit.primary_window;
-    let secondary = &snapshot.rate_limit.secondary_window;
+    // `secondary_window` is nullable since 2026-07 (pro plans send a single
+    // 7-day `primary_window` + `secondary_window: null`). A null secondary is
+    // VALID, not a probe failure — the A2/A3/A4 secondary checks only run when
+    // it is present.
+    let secondary = snapshot.rate_limit.secondary_window.as_ref();
 
     // A2: used_percent in [0, 100] for both windows.
     if !(0.0..=100.0).contains(&primary.used_percent) {
@@ -104,15 +108,17 @@ fn evaluate(slot: AccountNum, snapshot: codex_http::WhamSnapshot, elapsed_ms: u6
             "spec 05 §5.7: used_percent is already a percentage (0-100), not a fraction. Out-of-range value is upstream schema drift.",
         );
     }
-    if !(0.0..=100.0).contains(&secondary.used_percent) {
-        return fail(
-            slot,
-            elapsed_ms,
-            2,
-            "A2: 0.0 <= secondary_window.used_percent <= 100.0",
-            &format!("secondary.used_percent = {}", secondary.used_percent),
-            "spec 05 §5.7: used_percent is a percentage (0-100). Out-of-range = drift.",
-        );
+    if let Some(secondary) = secondary {
+        if !(0.0..=100.0).contains(&secondary.used_percent) {
+            return fail(
+                slot,
+                elapsed_ms,
+                2,
+                "A2: 0.0 <= secondary_window.used_percent <= 100.0",
+                &format!("secondary.used_percent = {}", secondary.used_percent),
+                "spec 05 §5.7: used_percent is a percentage (0-100). Out-of-range = drift.",
+            );
+        }
     }
 
     // A3: reset_at is in the future for both windows.
@@ -130,15 +136,17 @@ fn evaluate(slot: AccountNum, snapshot: codex_http::WhamSnapshot, elapsed_ms: u6
             "reset time is in the past; possible clock skew or stale upstream response.",
         );
     }
-    if secondary.reset_at <= now {
-        return fail(
-            slot,
-            elapsed_ms,
-            4,
-            "A3: secondary_window.reset_at > now()",
-            &format!("secondary.reset_at = {}, now = {}", secondary.reset_at, now),
-            "reset time is in the past; possible clock skew or stale upstream response.",
-        );
+    if let Some(secondary) = secondary {
+        if secondary.reset_at <= now {
+            return fail(
+                slot,
+                elapsed_ms,
+                4,
+                "A3: secondary_window.reset_at > now()",
+                &format!("secondary.reset_at = {}, now = {}", secondary.reset_at, now),
+                "reset time is in the past; possible clock skew or stale upstream response.",
+            );
+        }
     }
 
     // A4: clock-skew sanity for both windows per spec 05 §5.7
@@ -157,16 +165,18 @@ fn evaluate(slot: AccountNum, snapshot: codex_http::WhamSnapshot, elapsed_ms: u6
             "spec 05 §5.7: reset_at vs (now + reset_after_seconds) must agree within 5s. Operator clock or upstream out of sync.",
         );
     }
-    let secondary_skew = clock_skew(secondary.reset_at, now, secondary.reset_after_seconds);
-    if secondary_skew.abs() > CLOCK_SKEW_TOLERANCE_S {
-        return fail(
-            slot,
-            elapsed_ms,
-            5,
-            "A4: |secondary_window clock_skew| <= 5s",
-            &format!("secondary_skew = {secondary_skew}s"),
-            "spec 05 §5.7: reset_at vs (now + reset_after_seconds) must agree within 5s. Operator clock or upstream out of sync.",
-        );
+    if let Some(secondary) = secondary {
+        let secondary_skew = clock_skew(secondary.reset_at, now, secondary.reset_after_seconds);
+        if secondary_skew.abs() > CLOCK_SKEW_TOLERANCE_S {
+            return fail(
+                slot,
+                elapsed_ms,
+                5,
+                "A4: |secondary_window clock_skew| <= 5s",
+                &format!("secondary_skew = {secondary_skew}s"),
+                "spec 05 §5.7: reset_at vs (now + reset_after_seconds) must agree within 5s. Operator clock or upstream out of sync.",
+            );
+        }
     }
 
     // A5: plan_type is non-empty.
@@ -300,7 +310,7 @@ mod tests {
                 allowed: true,
                 limit_reached: false,
                 primary_window: future_window(42.0),
-                secondary_window: future_window(15.0),
+                secondary_window: Some(future_window(15.0)),
             },
         }
     }

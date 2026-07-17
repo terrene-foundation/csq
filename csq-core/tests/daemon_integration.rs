@@ -50,6 +50,7 @@ fn make_router_state(base: &Path) -> RouterState {
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
         audit_health: csq_core::audit::AuditHealth::Verified,
+        anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     }
@@ -343,6 +344,7 @@ async fn gemini_event_live_ipc_then_ndjson_drain_does_not_double_count() {
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: gemini_consumer::GeminiConsumerState::default(),
         audit_health: csq_core::audit::AuditHealth::Verified,
+        anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     };

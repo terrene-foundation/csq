@@ -72,12 +72,12 @@ Every artifact under `.coc/rules/`, `.coc/agents/`, `.coc/skills/`, `.coc/comman
 
 ### 9.2.2 Optional fields
 
-| Field         | Type          | Default   | Notes                                                                                                                |
-| ------------- | ------------- | --------- | -------------------------------------------------------------------------------------------------------------------- |
-| `paths`       | `Vec<string>` | `["**"]`  | Path-scope filter. Glob; first non-empty match wins.                                                                 |
-| `coc.disable` | `Vec<string>` | `[]`      | Per-artifact technique opt-out array. Allowed values: `"scaffold"`, `"mcp-gate"`, `"post-validate"`, `"struct-out"`. |
-| `applies_to`  | `Vec<string>` | `["all"]` | Surface allowlist. Allowed: `"all"` / `"claude-code"` / `"codex"` / `"gemini"`. Filtering is OR-of-listed.           |
-| `precedence`  | `i32`         | `0`       | Tie-break for collision resolution within `.coc/`. Higher wins. Default 0.                                           |
+| Field         | Type          | Default   | Notes                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------- | ------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `paths`       | `Vec<string>` | `["**"]`  | Parsed into the typed `RuleDef.paths` field but **not consumed by spawn-time artifact selection**: `flatten::in_scope` filters on `applies_to` only. The capability layer flattens the whole `.coc/` into one system prompt at session start — there is no current-file context — so CC's per-file rule path scoping has no spawn analogue; codex/gemini have no per-file rule-scoping mechanism. Rules-only field. |
+| `coc.disable` | `Vec<string>` | `[]`      | Per-artifact technique opt-out array. Allowed values: `"scaffold"`, `"mcp-gate"`, `"post-validate"`, `"struct-out"`.                                                                                                                                                                                                                                                                                                |
+| `applies_to`  | `Vec<string>` | `["all"]` | Surface allowlist. Allowed: `"all"` / `"claude-code"` / `"codex"` / `"gemini"`. Filtering is OR-of-listed.                                                                                                                                                                                                                                                                                                          |
+| `precedence`  | `i32`         | `0`       | Tie-break for collision resolution within `.coc/`. Higher wins. Default 0.                                                                                                                                                                                                                                                                                                                                          |
 
 ### 9.2.3 Unknown-field tolerance (forward-compat)
 
@@ -125,7 +125,7 @@ pub struct CommandId(pub String);
 
 pub struct RuleDef {
     pub id: RuleId,
-    pub paths: Vec<String>,
+    pub paths: Vec<String>, // rules-only; parsed but NOT consumed by `flatten::in_scope` (§9.2.2 — no spawn analogue)
     pub applies_to: BTreeSet<Surface>,
     pub precedence: i32,
     pub disable: BTreeSet<TechniqueOptOut>,

@@ -162,6 +162,7 @@ async fn windows_named_pipe_surface_dispatch_refresher_cycle() {
         oauth_store: None,
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
         audit_health: csq_core::audit::AuditHealth::Verified,
+        anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     };

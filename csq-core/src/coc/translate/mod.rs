@@ -20,10 +20,15 @@ pub mod codex;
 pub mod codex_merge;
 pub mod flatten;
 pub mod gemini;
+pub mod materialize;
 pub mod types;
 
 pub use flatten::{
     flatten_artifacts, render_sections, surface_header, FlatArtifact, SurfaceArtifacts,
+};
+pub use materialize::{
+    emit_cc_plugin, emit_coc_rules, emit_codex_native, emit_gemini_native, MaterializedKind,
+    MaterializedManifest,
 };
 pub use types::{
     ApprovalMode, ClaudeSpawnPayload, CodexSpawnPayload, GeminiSpawnPayload, HostContext,

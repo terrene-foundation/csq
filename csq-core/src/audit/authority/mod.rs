@@ -96,6 +96,7 @@ pub mod grant;
 pub mod op_class;
 pub mod registry;
 pub mod roster;
+pub mod sign;
 
 #[cfg(test)]
 mod tests_m12;
@@ -109,4 +110,8 @@ pub use roster::{
     roster_path, roster_sig_path, save_detached_roster, save_roster, verify_detached_roster,
     verify_signed_roster, Roster, RosterEntry, RosterFileRegistry, SignedRoster,
     UnsignedRosterFile, SUPPORTED_ROSTER_FORMAT_VERSION,
+};
+pub use sign::{
+    generate_keypair, public_key_of, public_key_of_seed, sign_raw_bytes, sign_raw_bytes_with_seed,
+    signing_key_from_seed, verify_hex_signature,
 };

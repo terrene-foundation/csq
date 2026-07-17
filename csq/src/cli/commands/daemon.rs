@@ -29,10 +29,11 @@
 //! # Not in scope here
 //!
 //! The Tauri-tray *in-process* daemon (the tray app hosting these
-//! subsystems without a separate process) is M8.6 and lives in
-//! `csq::desktop::daemon_supervisor`. Windows named-pipe IPC is
-//! M8-03. Neither affects the three standalone run modes above —
-//! standalone backgrounding (modes 2 and 3) is shipped.
+//! subsystems without a separate process) lives in
+//! `csq::desktop::daemon_supervisor`. Both the standalone `csq daemon
+//! start` here and the in-process supervisor now run over a Windows
+//! named pipe (`daemon::serve_windows`) as well as a Unix socket, with a
+//! per-user named-event graceful stop (#786).
 
 use anyhow::{Context, Result};
 use csq_core::daemon::{self, DaemonStatus, PidFile};
@@ -49,6 +50,17 @@ use std::sync::Arc;
 /// is stopped (socket removed) and the PID file is removed via
 /// `PidFile`'s Drop impl.
 pub fn handle_start(base_dir: &Path) -> Result<()> {
+    // Enterprise license gate for the daemon-hosted governance / audit / EATP stack
+    // (task #77 shard 3). Uses the STARTUP variant (structural validity + definitive
+    // revocation, no liveness deny) so a licensed-but-offline-beyond-grace customer can
+    // still start the daemon whose CRL refresher recovers their cache — the full
+    // per-op `enforce` would be a fail-closed deadlock here. Inert while the placeholder
+    // key is baked; community builds carry no gate. The re-exec'd child of
+    // `handle_start_background` runs this same path, so both foreground and background
+    // starts are covered.
+    #[cfg(feature = "enterprise")]
+    super::super::enforce_enterprise_license_startup(base_dir)?;
+
     let pid_path = daemon::pid_file_path(base_dir);
 
     // Acquire PID file; errors if another daemon is already running.
@@ -79,8 +91,10 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
 
     let base_dir_for_runtime = base_dir.to_path_buf();
     rt.block_on(async move {
-        // Bind the Unix socket + axum router.
-        #[cfg(unix)]
+        // Bind the IPC transport (Unix socket / Windows named pipe) +
+        // axum router, then wire the subsystems. The whole body is
+        // cross-platform — only the `serve` bind call and the
+        // shutdown-wait are `#[cfg]`-gated per transport (#786).
         {
             // Create the shared refresh-status cache at the daemon
             // level so both the refresher (writer) and the HTTP
@@ -361,6 +375,18 @@ Run `csq audit verify --full` for diagnosis."
                 health
             };
 
+            // #1060 — resolve the active transparency-log sink ONCE so both the
+            // anchor HTTP handler (RouterState.anchor_sink, for synchronous
+            // inclusion-proof projection on `POST /api/audit/anchor`) and the
+            // cadence-driven drain task below share the same Arc + config. In the
+            // default local-only build `sink = "none"` (or the requested sink's
+            // feature is not compiled in) → `resolve_anchor_sink` returns `None`
+            // and the handler surfaces `inclusion_proof: null` (honest).
+            let anchor_sink_cfg =
+                csq_core::audit::AuditSinkConfig::load(&base_dir_for_runtime).unwrap_or_default();
+            let anchor_sink: Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> =
+                resolve_anchor_sink(&anchor_sink_cfg);
+
             let router_state = daemon::server::RouterState {
                 cache: Arc::clone(&refresh_cache),
                 discovery_cache: Arc::clone(&discovery_cache),
@@ -368,6 +394,7 @@ Run `csq audit verify --full` for diagnosis."
                 oauth_store: Some(Arc::clone(&oauth_store)),
                 gemini_consumer: gemini_consumer.clone(),
                 audit_health: audit_health.clone(),
+                anchor_sink: anchor_sink.clone(),
                 // #783 — seed the interactive enforcement registry from the
                 // fail-closed §10.5 activation gate (absent → empty/503).
                 // #784 follow-up — inject the cross-SDK kailash projector (the
@@ -485,7 +512,21 @@ Run `csq audit verify --full` for diagnosis."
                 );
             }
 
-            match daemon::serve(&sock_path, router_state).await {
+            // Bind the transport. Unix binds a domain socket
+            // (`daemon::serve`); Windows binds a named pipe
+            // (`daemon::serve_windows`). Both return a handle exposing
+            // `.shutdown()` + a `JoinHandle<()>`, so the entire tail
+            // below is shared. `sock_path` already resolves to the
+            // named-pipe path on Windows (`daemon::socket_path`).
+            #[cfg(unix)]
+            let serve_result = daemon::serve(&sock_path, router_state).await;
+            #[cfg(windows)]
+            let serve_result = daemon::serve_windows(
+                &sock_path.to_string_lossy().into_owned(),
+                router_state,
+            )
+            .await;
+            match serve_result {
                 Ok((server, server_join)) => {
                     tracing::info!("IPC server bound at {}", sock_path.display());
 
@@ -508,6 +549,17 @@ Run `csq audit verify --full` for diagnosis."
                         Arc::clone(&refresh_cache),
                         http_post,
                         http_post_codex,
+                        shutdown.clone(),
+                    );
+
+                    // License CRL refresher (task #77 shard 2): keeps the signed
+                    // revocation list fresh so the enterprise license gate can fail
+                    // closed on a revoked/stale license without bricking a paying
+                    // customer on a network blip. Enterprise-only; inert while the
+                    // placeholder key is baked.
+                    #[cfg(feature = "enterprise")]
+                    let crl_refresher = daemon::spawn_crl_refresher(
+                        base_dir_for_runtime.clone(),
                         shutdown.clone(),
                     );
 
@@ -626,22 +678,22 @@ Run `csq audit verify --full` for diagnosis."
                         );
                         None
                     } else {
-                        let sink_cfg =
-                            csq_core::audit::AuditSinkConfig::load(&base_dir_for_runtime)
-                                .unwrap_or_default();
-                        let sink: Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> =
-                            resolve_anchor_sink(&sink_cfg);
-                        sink.and_then(|s| {
+                        // #1060 — reuse the sink + config resolved once above for
+                        // RouterState.anchor_sink (no second config read / resolve).
+                        anchor_sink.clone().and_then(|s| {
                             daemon::spawn_anchor_task(
                                 base_dir_for_runtime.clone(),
-                                sink_cfg,
+                                anchor_sink_cfg.clone(),
                                 s,
                                 shutdown.clone(),
                             )
                         })
                     };
 
-                    // Block until SIGTERM/SIGINT arrives.
+                    // Block until a graceful-stop signal arrives.
+                    // Unix: SIGTERM/SIGINT. Windows: the per-user named
+                    // shutdown event fired by `csq daemon stop`, OR Ctrl-C
+                    // in the foreground (#786).
                     wait_for_shutdown().await;
 
                     eprintln!("csq daemon stopping...");
@@ -669,6 +721,23 @@ Run `csq audit verify --full` for diagnosis."
                         Ok(Ok(())) => tracing::info!("usage poller stopped cleanly"),
                         Ok(Err(e)) => tracing::warn!(error = %e, "usage poller task panicked"),
                         Err(_) => tracing::warn!("usage poller did not stop within 5s deadline"),
+                    }
+
+                    // Await the license CRL refresher with a 5s deadline.
+                    #[cfg(feature = "enterprise")]
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        crl_refresher.join,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => tracing::info!("license CRL refresher stopped cleanly"),
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "license CRL refresher task panicked")
+                        }
+                        Err(_) => {
+                            tracing::warn!("license CRL refresher did not stop within 5s deadline")
+                        }
                     }
 
                     // Await the Gemini midnight-LA reset task with a
@@ -751,15 +820,6 @@ Run `csq audit verify --full` for diagnosis."
                     return Err::<(), anyhow::Error>(anyhow::anyhow!("socket bind failed: {e}"));
                 }
             }
-        }
-        #[cfg(not(unix))]
-        {
-            eprintln!(
-                "warning: Unix-socket IPC server not available on this platform — \
-                 Windows named-pipe support lands in M8.6"
-            );
-            let _ = base_dir_for_runtime;
-            wait_for_shutdown().await;
         }
         Ok::<(), anyhow::Error>(())
     })?;
@@ -865,7 +925,18 @@ pub fn handle_stop(base_dir: &Path) -> Result<()> {
             Ok(())
         }
         Err(csq_core::error::DaemonError::StalePidFile { pid }) => {
-            eprintln!("csq daemon stale PID file (PID {pid} not alive) — cleaned up");
+            // Two paths reach here and the old wording ("not alive — cleaned up")
+            // lied on the second: (a) Unix/dead-PID pre-check — the PID is
+            // genuinely gone and its stale file was removed; (b) Windows — the
+            // daemon's shutdown event is absent (an exceptional startup failure)
+            // even though the PID is ALIVE, so the file is intentionally NOT
+            // removed (a live daemon keeps its lock). Word it truthfully for both
+            // (#786 redteam R3 LOW).
+            eprintln!(
+                "csq daemon not reachable for a graceful stop (PID {pid} — already \
+                 stopped, or its shutdown channel is unavailable). If a daemon is \
+                 still running, restart it to restore a working shutdown channel."
+            );
             Ok(())
         }
         Err(csq_core::error::DaemonError::IpcTimeout { timeout_ms }) => {
@@ -1263,10 +1334,39 @@ async fn wait_for_shutdown() {
     }
     #[cfg(windows)]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
-        tracing::info!("Ctrl-C received");
+        // Windows has no SIGTERM. `csq daemon stop` fires a per-user
+        // named event; the daemon waits on it here (via a blocking
+        // thread) alongside Ctrl-C for the foreground case (#786). If
+        // the event cannot be created (an exceptional kernel condition),
+        // fall back to Ctrl-C only so the daemon still runs.
+        match csq_core::daemon::create_shutdown_event() {
+            Ok(event) => {
+                // WaitForSingleObject blocks a thread; run it off the
+                // async runtime so the select! below stays responsive.
+                let event_wait = tokio::task::spawn_blocking(move || {
+                    event.wait_blocking();
+                });
+                tokio::select! {
+                    _ = event_wait => tracing::info!("shutdown event received"),
+                    r = tokio::signal::ctrl_c() => {
+                        r.expect("failed to install Ctrl-C handler");
+                        tracing::info!("Ctrl-C received");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not create Windows shutdown event; \
+                     `csq daemon stop` will not signal this daemon — \
+                     Ctrl-C only"
+                );
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to install Ctrl-C handler");
+                tracing::info!("Ctrl-C received");
+            }
+        }
     }
 }
 

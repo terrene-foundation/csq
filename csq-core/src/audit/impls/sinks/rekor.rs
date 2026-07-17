@@ -25,6 +25,19 @@
 //!
 //! `#[non_exhaustive]` on `RekorConfig` allows adding fields (e.g. TLS cert,
 //! auth token path) without breaking existing callers.
+//!
+//! # Honest-host grade (T3.6)
+//!
+//! Until an operational Rekor instance (or a Foundation notary) corroborates the
+//! anchor, csq attestation is **honest-host grade**: an auditor can verify csq
+//! governed the session as recorded, but cannot prove the producing host was not
+//! compromised. Rekor IS that external witness — submitting the hash-only anchor
+//! here is what upgrades the chain from honest-host grade to tamper-evident +
+//! independently verifiable. The external-witness operator is a portfolio-level
+//! dependency (see `internal-design-docs`
+//! portfolio-dependencies); the zero-install export bundle's `README.md` states
+//! the honest-host-grade caveat to auditors (spec 15 §15.4, honest-host-caveat
+//! subsection: §15.4.4 enterprise / §15.4.3 community).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

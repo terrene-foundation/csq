@@ -108,7 +108,7 @@ fn xdg_runtime_dir() -> Option<PathBuf> {
 /// a same-session process from poisoning the pipe name by mutating the
 /// environment variable before the daemon starts.
 #[cfg(target_os = "windows")]
-fn windows_username() -> String {
+pub(crate) fn windows_username() -> String {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 

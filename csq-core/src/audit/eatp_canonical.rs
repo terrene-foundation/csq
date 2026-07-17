@@ -310,6 +310,18 @@ pub struct EatpAuditAnchor {
     /// the metadata segment. MUST be string/integer/boolean/null/nested values
     /// only — see the module-level number-formatting constraint.
     pub metadata: Option<Map<String, Value>>,
+    /// #980: SHA-256 of the governed subject (e.g. the decision subject / body
+    /// the anchor attests to), lowercase hex. An OPTIONAL side-band field for
+    /// the witnessed-transparency-log tier — it lets a witness bind an anchor to
+    /// its subject WITHOUT the subject's bytes.
+    ///
+    /// **NOT part of the SHA-256 canonical pre-image** (`canonical_input`) this
+    /// session — its byte-position in the cross-SDK canonical string is defined
+    /// by external protocol (terrene#40) and is not yet aligned. Inserting it
+    /// into the pre-image before that alignment would permanently break cross-SDK
+    /// hash verification + existing chain-hash parity. It is carried as a plain
+    /// serialized field only (see `canonical_input`'s TODO(#980/terrene#40)).
+    pub subject_hash: Option<Sha256Hex>,
 }
 
 impl std::fmt::Debug for EatpAuditAnchor {
@@ -333,6 +345,7 @@ impl std::fmt::Debug for EatpAuditAnchor {
                     .as_ref()
                     .map(|m| format!("<redacted {} keys>", m.len())),
             )
+            .field("subject_hash", &self.subject_hash)
             .finish()
     }
 }
@@ -392,6 +405,15 @@ impl EatpAuditAnchor {
                 canonicalize_object(meta, &mut content);
             }
         }
+        // TODO(#980/terrene#40): subject_hash NOT yet in canonical pre-image —
+        // awaiting protocol alignment on byte-position + preimage version bump.
+        // `self.subject_hash` is deliberately NOT appended to `content` here:
+        // its position in the colon-delimited cross-SDK canonical string is
+        // defined by external protocol (terrene#40) and is not yet aligned.
+        // Appending it before alignment would permanently break cross-SDK hash
+        // verification + existing chain-hash parity. subject_hash is carried as
+        // a plain side-band field only until the protocol lands + the pre-image
+        // spec version is bumped in lockstep across every SDK.
         Ok(content)
     }
 
@@ -567,6 +589,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T11:00:00+00:00".into(),
             metadata: Some(obj(json!({"role": "café", "中文": "value"}))),
+            subject_hash: None,
         };
         assert_eq!(
             anchor.canonical_input().unwrap(),
@@ -594,6 +617,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T12:00:00+00:00".into(),
             metadata: Some(obj(json!({"celebration": "🎉🚀"}))),
+            subject_hash: None,
         };
         assert_eq!(
             anchor.canonical_input().unwrap(),
@@ -621,6 +645,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T10:00:00+00:00".into(),
             metadata: None,
+            subject_hash: None,
         };
         let input = anchor.canonical_input().unwrap();
         assert!(input.ends_with(":success:2026-01-15T10:00:00+00:00"));
@@ -647,6 +672,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T10:00:00+00:00".into(),
             metadata: Some(Map::new()),
+            subject_hash: None,
         };
         let input = anchor.canonical_input().unwrap();
         assert!(
@@ -676,6 +702,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T10:00:00+00:00".into(),
             metadata: Some(Map::new()),
+            subject_hash: None,
         };
         let input = anchor.canonical_input_kailash_rs().unwrap();
         assert!(
@@ -715,6 +742,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T13:00:00+00:00".into(),
             metadata: None,
+            subject_hash: None,
         };
         let input = anchor.canonical_input().unwrap();
         assert!(input.starts_with(
@@ -771,6 +799,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T10:00:00+00:00".into(),
             metadata: Some(obj(meta)),
+            subject_hash: None,
         };
         // Top-level float.
         assert_eq!(
@@ -791,6 +820,55 @@ mod tests {
         assert!(mk(json!({"count": 42, "neg": -7})).compute_hash().is_ok());
     }
 
+    /// #980 / terrene#40 gate: `subject_hash` is NOT part of the SHA-256
+    /// canonical pre-image this session. Two anchors identical except for
+    /// `subject_hash` (one `None`, one `Some(...)`) MUST produce the SAME
+    /// `canonical_input` AND the SAME `compute_hash` — the parity proof that
+    /// carrying the field does not perturb the cross-SDK hash before the
+    /// terrene#40 protocol aligns its pre-image byte-position.
+    #[test]
+    fn subject_hash_is_not_in_canonical_preimage() {
+        let base = EatpAuditAnchor {
+            anchor_id: "anc-980".into(),
+            sequence: 0,
+            previous_hash: None,
+            agent_id: "agent-980".into(),
+            action: "envelope_created".into(),
+            verification_level: VerificationLevel::AutoApproved,
+            envelope_id: Some("env-980".into()),
+            result: "success".into(),
+            timestamp: "2026-01-15T10:00:00+00:00".into(),
+            metadata: Some(obj(json!({"role": "reviewer"}))),
+            subject_hash: None,
+        };
+        let with_subject = EatpAuditAnchor {
+            subject_hash: Some(
+                Sha256Hex::try_new(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .unwrap(),
+            ),
+            ..base.clone()
+        };
+        assert_eq!(
+            base.canonical_input().unwrap(),
+            with_subject.canonical_input().unwrap(),
+            "subject_hash must NOT change the canonical pre-image (terrene#40-gated)"
+        );
+        assert_eq!(
+            base.compute_hash().unwrap().as_str(),
+            with_subject.compute_hash().unwrap().as_str(),
+            "subject_hash must NOT change the content hash (terrene#40-gated)"
+        );
+        // The enterprise dialect must also be unaffected.
+        #[cfg(feature = "enterprise")]
+        assert_eq!(
+            base.compute_hash_kailash_rs().unwrap().as_str(),
+            with_subject.compute_hash_kailash_rs().unwrap().as_str(),
+            "subject_hash must NOT change the enterprise-dialect hash either"
+        );
+    }
+
     /// `Debug` MUST NOT print metadata values (PII forward-guard). It prints the
     /// key count only.
     #[test]
@@ -806,6 +884,7 @@ mod tests {
             result: "success".into(),
             timestamp: "2026-01-15T10:00:00+00:00".into(),
             metadata: Some(obj(json!({"ssn": "123-45-6789", "name": "secret"}))),
+            subject_hash: None,
         };
         let dbg = format!("{anchor:?}");
         assert!(dbg.contains("<redacted 2 keys>"), "got: {dbg}");

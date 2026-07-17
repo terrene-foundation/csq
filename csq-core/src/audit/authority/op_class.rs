@@ -83,7 +83,22 @@ impl OpClass {
             // out-of-band --pubkey) IS its authority, so the record is
             // single-sig chain-signed, not an M12 multi-sig-roster decision
             // (same rationale as GovernanceTurn).
-            | EventKind::PolicyBundleInstall => None,
+            | EventKind::PolicyBundleInstall
+            // M-DEK T-DEK.2 org-root ceremony is a passive custody observation:
+            // the ceremony record is signed by a designated ceremony key and the
+            // ≥2-participant 4-eyes property is enforced structurally in the
+            // ceremony logic (`key_hierarchy::ceremony`), not by the M12 op-class
+            // multi-sig roster (same rationale as GovernanceTurn/PolicyBundleInstall).
+            | EventKind::OrgRootCeremony
+            // M-DEK T-DEK.4 seat-key reanchor already runs the M11 authorize_op
+            // threshold gate (over the audit signing key, mirroring KeyRotate's
+            // own ordering) and the OUTGOING seat DEK's succession endorsement is
+            // verified independently by `verify_seat_reanchor_chain` — the M12
+            // op-class ROSTER-MEMBERSHIP check is a distinct, later-milestone
+            // enforcement layer with no seat-hierarchy integration yet. Unguarded
+            // for op-class purposes today; a future milestone MAY promote this to
+            // a guarded class once seat ids participate in the M12 roster.
+            | EventKind::SeatKeyReanchor => None,
         }
     }
 }
@@ -136,6 +151,8 @@ mod tests {
             EventKind::EatpAttestation,
             EventKind::McpGateDecision,
             EventKind::PolicyBundleInstall,
+            EventKind::OrgRootCeremony,
+            EventKind::SeatKeyReanchor,
         ] {
             assert!(
                 OpClass::from_event_kind(&kind).is_none(),

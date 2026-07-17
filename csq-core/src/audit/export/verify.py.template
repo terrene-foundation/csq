@@ -278,6 +278,11 @@ def main():
 
     # --- Step 0: required files present -------------------------------------
     required = [
+        # README.md carries the honest-host-grade auditor caveat (T3.6). It is
+        # covered by BUNDLE.lock/BUNDLE.sig, so Step 2 below also detects a
+        # tampered README; the presence check here gives a clearer error and
+        # asserts an honest exporter did not silently drop the caveat.
+        "README.md",
         "chain.jsonl",
         "public_keys.json",
         "rotation_chain.json",
@@ -364,6 +369,47 @@ def main():
                 + relpath
                 + " tampered after BUNDLE.sig was created"
             )
+
+    # --- Step 2b: reject any bundle file NOT covered by BUNDLE.lock -----------
+    # Step 2 proves every LOCK-LISTED file is intact, but on its own does NOT
+    # detect an EXTRA file that was added after export. Because BUNDLE.sig covers
+    # only BUNDLE.lock's bytes, an attacker without the genesis key cannot strip
+    # or alter a locked file (Step 1+2 catch it) — but they COULD DROP an
+    # unlocked decoy alongside the honest, lock-covered README.md (e.g. a
+    # `README` or `INSTRUCTIONS.md` that an auditor's `less README*` reflex reads
+    # first) to socially defeat the honest-host caveat while `verify` still PASSes.
+    # Enumerate every regular file under the bundle root and reject any not in
+    # BUNDLE.lock. BUNDLE.lock and BUNDLE.sig are the self-describing integrity
+    # pair (the sig signs the lock; the lock covers every OTHER file) and are
+    # intentionally NOT lock rows, so they are the only permitted exclusions.
+    integrity_pair = {"BUNDLE.lock", "BUNDLE.sig"}
+    on_disk = set()
+    for root, dirs, files in os.walk(here):
+        # Reject symlinks (files AND directories) fail-closed: os.walk does not
+        # follow a symlinked dir (followlinks=False) and lists only regular
+        # files, so a decoy hidden behind a symlinked dir would otherwise escape
+        # enumeration entirely. The honest bundle (stdlib USTAR writer) emits
+        # zero symlinks, so any symlink present is a post-export plant.
+        for d in dirs:
+            if os.path.islink(os.path.join(root, d)):
+                fail(
+                    "bundle contains a symlinked directory (not permitted): "
+                    + os.path.relpath(os.path.join(root, d), here)
+                )
+        for fn in files:
+            fpath = os.path.join(root, fn)
+            if os.path.islink(fpath):
+                fail(
+                    "bundle contains a symlink (not permitted): "
+                    + os.path.relpath(fpath, here)
+                )
+            on_disk.add(os.path.relpath(fpath, here))
+    extra = sorted(on_disk - set(recorded.keys()) - integrity_pair)
+    if extra:
+        fail(
+            "bundle contains file(s) not covered by BUNDLE.lock (possible decoy): "
+            + ", ".join(extra)
+        )
 
     # --- Step 2.5: CUTOFF.json signed-cutoff self-check (M16, spec 16 §16.14) ─
     # The cutoff is signed by the genesis-anchored export key over the 32 raw

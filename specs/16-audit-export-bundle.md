@@ -1,8 +1,8 @@
 # 16 — Audit Export Bundle
 
-**Spec version:** 1.4.0
+**Spec version:** 1.5.0
 **Status:** Normative
-**Governs:** `csq audit export` — the self-contained, cross-org-verifiable audit-bundle producer, the signed export cutoff (`CUTOFF.json`, §16.14), and the embedded `verify` script contract.
+**Governs:** `csq audit export` — the self-contained, cross-org-verifiable audit-bundle producer, the signed export cutoff (`CUTOFF.json`, §16.14), the governance provenance lane (`PROVENANCE.json`, §16.15), the auditor trust notice (`README.md`, §16.2), and the embedded `verify` script contract.
 
 ## 16.0 Scope
 
@@ -33,6 +33,7 @@ spec 12 §12.10) for the mandatory pre-flight and the `LocalSigningKey` (spec 12
 
 ```text
 csq-audit-bundle-<chain_id>-<exp_id>.tar
+├── README.md                auditor trust notice — honest-host-grade caveat (see honest-grade note below)
 ├── chain.jsonl              verbatim on-disk chain records, in sequence
 ├── public_keys.json         { genesis, keys: { key_id -> raw_pubkey_hex } }
 ├── rotation_chain.json      { anchor_key_id, entries: [ {previous_key_id, new_key_id, rotation_reason} ] }
@@ -40,6 +41,7 @@ csq-audit-bundle-<chain_id>-<exp_id>.tar
 │   ├── VERSION              the canonical-form version (== AUDIT_SCHEMA_VERSION)
 │   └── vectors.json         golden (record_json -> canonical_hash) self-check vectors
 ├── CUTOFF.json              signed export cutoff (head snapshot + anchor ref) — §16.14
+├── PROVENANCE.json          governance provenance lane (decision projection) — §16.15
 ├── BUNDLE.lock              sorted-by-path "<sha256>  <relpath>" of every other file
 ├── BUNDLE.sig               Ed25519 signature over BUNDLE.lock by the genesis-anchored key
 └── verify                   self-contained python3-stdlib verifier (mode 0o755)
@@ -55,6 +57,17 @@ csq-audit-bundle-<chain_id>-<exp_id>.tar
   output path: `csq-audit-bundle-<chain_id>-<exp_id>.tar` in the current
   working directory; the produced path is printed on stdout and echoed on
   stderr for discoverability.
+- **`README.md` (honest-grade note).** An auditor-facing trust notice stating
+  that a `verify` PASS proves integrity **in transit** (the records are a
+  signature-valid chain and no file was added/removed/altered after export) but
+  NOT that the producing host was uncompromised: without corroboration by an
+  external witness (Rekor / Foundation notary), the attestations are
+  **honest-host grade**. Sourced from `export/README.md.template`
+  (`export.rs::README_NOTICE`), it is a `BUNDLE.lock`-covered entry, so the
+  caveat is itself tamper-evident (a tampered README fails step 3; a stripped
+  README fails the required-files check; an unlocked decoy fails the step-3b
+  extra-file guard). The full honest-host-grade rationale + external-witness
+  contract live in spec 15 §15.4.3.
 
 ## 16.3 `BUNDLE.lock` and `BUNDLE.sig` discipline
 
@@ -201,7 +214,8 @@ tests run on every platform.
 
 The script, run from the extracted bundle directory, performs in order:
 
-1. **Required-files check** — all 8 entries present.
+1. **Required-files check** — all 10 entries present (`CUTOFF.json`,
+   `PROVENANCE.json`, and `README.md` are part of the stabilized shape — §16.2).
 2. **`BUNDLE.sig` over `BUNDLE.lock`** via `public_keys.json[genesis]` — FAILs
    first (before any chain check) with
    `"BUNDLE.sig verification failed: bundle tamper detected at export-time
@@ -209,6 +223,13 @@ anchor key"` so a tampered `BUNDLE.lock` surfaces as a signature failure.
 3. **Per-file SHA-256** vs `BUNDLE.lock` — FAILs with
    `"file <path> SHA-256 mismatch: bundle file <path> tampered after BUNDLE.sig
 was created"`.
+   3b. **Extra-file guard** — every regular file under the bundle root MUST be a
+   `BUNDLE.lock` row (except the self-describing `BUNDLE.lock` / `BUNDLE.sig`
+   pair). Any file NOT covered by the signed lock FAILs with
+   `"bundle contains file(s) not covered by BUNDLE.lock (possible decoy): <names>"`.
+   Closes the shadow-decoy gap where an attacker without the genesis key drops an
+   unlocked `README` beside the honest, lock-covered `README.md` (§16.2) to
+   socially defeat the honest-grade caveat while `verify` still PASSes.
 4. **`CUTOFF.json` signed-cutoff self-check** (§16.14) — `cutoff_version`
    is `1`; `key_id` equals `public_keys.json[genesis]`; the recomputed canonical
    cutoff hash equals the stored `cutoff_hash`; and the `signature` verifies
@@ -228,12 +249,25 @@ was created"`.
    (explicit tail-truncation / head-tamper detection); and when
    `latest_anchor_ref` is present, `chain.jsonl[ack_seq]` MUST be a
    `replication_ack` carrying the same `sink` + `sink_id`.
-8. **`--rekor <url>` (optional)** — best-effort entry-existence check, §16.7.
-9. **Verdict** — `PASS: chain verified end-to-end (N records, M key rotations, K
-signed records; signed cutoff confirms head seq S)` (exit 0) followed by a
-   `NOTE:` line restating the auditor obligation to confirm the genesis key
-   out-of-band (§16.3.1); or `FAIL: <specific>` (exit 1). Environment errors
-   (bad args) exit 2.
+8. **`PROVENANCE.json` lane-faithfulness check** (§16.15) — the lane's
+   `provenance_version` is `1`; its `records` seq-set EXACTLY equals the chain's
+   `provenance_anchored` seq-set (a record is "provenance" iff BOTH its top-level
+   `kind` AND its tagged payload discriminant are `provenance_anchored`, mirroring
+   the producer's dual filter — no dropped or injected record); every projected
+   field (`record_id`, `decision_id`, `surface`, `claimed_decision_ts`,
+   `received_bytes_hash`, `f101_schema_version`, `words_hash`, `backing`,
+   `principal`, `trust_level`, `authority`, `ordering_basis`,
+   `predecessor_missing`, `prev_link`, `kind`, `session`, `operator_ref`) matches
+   the signed chain record; no record carries a verbatim `human_words` / `words`
+   key; and `record_count` / `unbacked_count` match the actual lane content. A
+   chain with no `provenance_anchored` records has an empty lane (`records: []`,
+   `record_count: 0`) — still present and still checked.
+9. **`--rekor <url>` (optional)** — best-effort entry-existence check, §16.7.
+10. **Verdict** — `PASS: chain verified end-to-end (N records, M key rotations, K
+signed records; signed cutoff confirms head seq S; provenance lane: P
+decision(s), U unbacked)` (exit 0) followed by a `NOTE:` line restating the
+    auditor obligation to confirm the genesis key out-of-band (§16.3.1); or
+    `FAIL: <specific>` (exit 1). Environment errors (bad args) exit 2.
 
 The next record's `prev_hash` is checked against the SHA-256 of the previous
 record's canonical bytes computed WITH its real (stored) `canonical_hash` in
@@ -422,8 +456,124 @@ reproducibly verifiable independent of the file manifest). The verifier checks
 both: Step 4 (self-consistency: hash + signature) and Step 7 (HEAD cross-check +
 anchor-ref cross-check) — see §16.6.
 
+## 16.15 `PROVENANCE.json` — governance provenance lane
+
+`csq audit export` embeds a `PROVENANCE.json` carrying a seq-ordered,
+auditor-consumable projection of every `ProvenanceAnchored` chain record — the
+anchored provenance-decision records. It is the governance-export deliverable: the artifact
+that makes "every co-authored decision in window W, with the authorizing
+principal and whether it was backed" reconstructable from the bundle ALONE —
+without the auditor needing csq's internal record schema to filter `chain.jsonl`
+and hand-join the `actor` attestation blobs.
+
+**When the lane is empty vs populated.** The lane projects every
+`ProvenanceAnchored` chain record. A chain that has anchored no
+governance-provenance decisions carries a well-formed but empty lane
+(`record_count: 0`, `records: []`); a chain that HAS ingested provenance events —
+via the daemon's `/api/provenance/anchor` seam (`server.rs`, unconditionally
+registered) — carries one entry per anchored decision. The entry is present and
+checked by `verify` (Step 8) in both cases — the bundle shape is stable
+regardless, and the manifest shape below is documented so an auditor can read the
+lane the same way on any chain.
+
+### 16.15.1 Manifest shape
+
+```json
+{
+  "provenance_version": "1",
+  "chain_id": "<chain_id>",
+  "record_count": <N>,
+  "unbacked_count": <K>,
+  "records": [
+    {
+      "seq": <chain seq — the AUTHORITATIVE order>,
+      "record_id": "<record_id>",
+      "decision_id": "<sha256(exact received bytes) for v1 events>",
+      "surface": "cc|codex|gemini|...",
+      "claimed_decision_ts": "<ISO-8601 — EVIDENCE ONLY, not chain order>",
+      "principal": "<actor.principal — redacted at ingest>",
+      "backing": "verified|unbacked",
+      "trust_level": "<trust.level>",
+      "authority": <authority object, or null>,
+      "f101_schema_version": "<frozen schema version this decision was decoded against>",
+      "words_hash": "<sha256 commitment, or null — NEVER the verbatim words>",
+      "received_bytes_hash": "<sha256 of the exact received bytes>",
+      "ordering_basis": "<wallclock_skew_bounded, or null>",
+      "predecessor_missing": <bool, or null>,
+      "prev_link": "<sha256 of predecessor event bytes, or null — genesis events carry null>",
+      "kind": "<v1 event kind: Decision|Delegation|Action|HumanInput, or null for non-v1>",
+      "session": "<v1 wire session field, or null for non-v1>",
+      "operator_ref": { "verified_id": "<hex>", "person_id": "<id>", "display_id": "<id>" } | null
+    }
+  ]
+}
+```
+
+- Records are sorted by `seq` (the chain-authoritative order).
+  `claimed_decision_ts` is an EVIDENCE-ONLY timestamp; an auditor windows on it
+  but the `seq` is what orders the decisions.
+- `backing` is the per-developer authorship attestation status. A record whose
+  `actor.backing` is not exactly `"verified"` (including a missing actor or
+  missing `backing` field) counts as **unbacked** and is tallied in
+  `unbacked_count`. Unbacked claims are visibly flagged both here and on the
+  `./verify` PASS line.
+- `authority` projects the record's authority slot verbatim, or `null`. The slot
+  is projected as-is so a record that DOES carry authority is surfaced faithfully.
+- A chain with no anchored provenance decisions yields a well-formed lane with
+  `record_count: 0` and `records: []`. The bundle shape is stable regardless.
+
+### 16.15.2 Redact-then-hash (load-bearing)
+
+The verbatim human `words` are NEVER present in the bundle. The chain record
+itself only carries `words_hash = sha256(canonical(words))` — the verbatim words
+are discarded at ingest — so the lane structurally cannot leak them: the producer
+copies only the explicitly-named scalar fields, never a free-text body. The
+bundle proves "these specific words were said" (the hash-commitment) without
+exposing the words to every auditor who opens the bundle or to any untrusted
+channel it transits. The `verify` script asserts no lane record carries a
+`human_words` / `words` key, so a tampered lane that injected verbatim text FAILs.
+
+### 16.15.3 Lane-faithfulness — a VERIFIED projection, not a hint
+
+`PROVENANCE.json` is covered by `BUNDLE.lock` (so `BUNDLE.sig` detects a
+post-export swap, the same defense as every other bundle file). On top of that,
+the `verify` script's lane-faithfulness step (§16.6 Step 8) cross-checks that the
+lane is a FAITHFUL + COMPLETE projection of the SIGNED chain: the lane's seq-set
+exactly equals the chain's `provenance_anchored` seq-set (no record dropped from
+the lane while present in the chain, none injected), and every projected field
+matches the chain record. This turns `PROVENANCE.json` from an unverified
+convenience file into a trustworthy derived view — an auditor acts on the lane
+knowing the verifier confirmed it against the signed chain. This parallels
+`CUTOFF.json`'s defense layering (§16.14.3): covered by the lock AND independently
+cross-checked.
+
+This faithfulness check does NOT defend against a malicious exporter holding the
+genesis key (who could equally drop the record from `chain.jsonl` itself and
+re-sign — the §16.3.1 self-attestation boundary applies identically). Its purpose
+is to make the lane TRUSTWORTHY for an auditor who has confirmed the genesis key
+out-of-band: it guarantees the human-readable lane and the cryptographically
+verified chain agree.
+
 ## Revisions
 
+- 1.5.0 — Bundle shape reaches 10 entries. (a) `PROVENANCE.json` — governance
+  provenance lane (§16.15): a seq-ordered, auditor-consumable projection of every
+  `ProvenanceAnchored` chain record (`record_id`, `decision_id`, `surface`,
+  `principal`, `backing`, `trust_level`, `authority`, `words_hash` commitment —
+  never the verbatim words, `operator_ref`, …). Empty on a chain that has
+  anchored no provenance decisions; populated when provenance events have been
+  ingested via the daemon's `/api/provenance/anchor` seam. The bundle shape is
+  documented and `verify` checks the lane (Step 8) regardless. (b) `README.md` — auditor trust notice stating a `verify`
+  PASS proves integrity **in transit** but not that the producing host was
+  uncompromised; without external-witness corroboration the attestations are
+  **honest-host grade** (§16.2; full rationale in spec 15 §15.4.3). `README.md`
+  is a `BUNDLE.lock` entry, so the caveat is tamper-evident. `verify` gains
+  **Step 3b** (extra-file guard): any regular file under the bundle root not
+  covered by `BUNDLE.lock` — except the self-describing `BUNDLE.lock` /
+  `BUNDLE.sig` pair — FAILs, closing the shadow-decoy gap (an unlocked `README`
+  beside the honest `README.md`). Required files 8 → 10; the `verify` step list
+  gains the `PROVENANCE.json` lane-faithfulness check (Step 8) and the PASS line
+  reports the provenance-lane decision / unbacked counts.
 - 1.4.0 — Bundle shape stabilized at 8 entries (`chain.jsonl`,
   `public_keys.json`, `rotation_chain.json`, `canonical_form_vectors/`,
   `CUTOFF.json`, `BUNDLE.lock`, `BUNDLE.sig`, `verify`). Canonical-form vectors

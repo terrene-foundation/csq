@@ -1392,6 +1392,26 @@ fn doctor_trust_plane_grade(
     None
 }
 
+/// Gate the enterprise-differentiated trust-plane grade behind the license (task #77
+/// gate-coverage). The grade is computed from ANY local audit chain, so an unlicensed
+/// enterprise binary would otherwise emit it via `csq doctor --json` — the SAME
+/// enterprise-only value the `audit verify` gate suppresses (its third emission path). When
+/// `enterprise_licensed` is false the grade is suppressed so the doctor wire matches
+/// community. Pure over the flag so it is unit-tested without a live license. Community always
+/// returns `None` here (the underlying `doctor_trust_plane_grade` is `None` in that edition),
+/// so the CLI passes `true` there — a no-op.
+fn gated_doctor_trust_plane_grade(
+    enterprise_licensed: bool,
+    health: &csq_core::audit::AuditHealth,
+    verification_levels_populated: bool,
+) -> Option<&'static str> {
+    if enterprise_licensed {
+        doctor_trust_plane_grade(health, verification_levels_populated)
+    } else {
+        None
+    }
+}
+
 /// #787 b2b — project the policy-bundle floor keychain-anchor cross-check into
 /// the doctor report. DETECTOR posture: reports the anchor status but never
 /// changes the enforced (file) floor. Returns `None` (field omitted) until a
@@ -1480,12 +1500,24 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         audit_level_summary_raw,
     ) = check_audit_chain(base_dir);
 
+    // Enterprise gate-coverage (task #77): the trust-plane grade is enterprise-differentiated
+    // output; an unlicensed enterprise binary suppresses it so `csq doctor --json` matches the
+    // community wire shape (the third emission path alongside `audit verify`). Inert while the
+    // placeholder key is baked (enforce → Ok → licensed). Community has no grade, so `true`.
+    #[cfg(feature = "enterprise")]
+    let enterprise_licensed = crate::cli::enforce_enterprise_license(base_dir).is_ok();
+    #[cfg(not(feature = "enterprise"))]
+    let enterprise_licensed = true;
+
     // M3a: compute the trust-plane grade once, then attach the per-level
     // disclosure ONLY when the grade is surfaced — a CONFORMANT grade must never
     // appear bare (honest-host boundary; redteam R1 HIGH, 2026-06-17). In the
     // community build the grade is always None, so the summary is omitted too.
-    let audit_trust_plane_grade =
-        doctor_trust_plane_grade(&audit_chain_state, audit_verification_levels_populated);
+    let audit_trust_plane_grade = gated_doctor_trust_plane_grade(
+        enterprise_licensed,
+        &audit_chain_state,
+        audit_verification_levels_populated,
+    );
     let audit_verification_level_summary = audit_trust_plane_grade.and(audit_level_summary_raw);
 
     DoctorReport {
@@ -4483,6 +4515,31 @@ fn info() -> &'static str {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn gated_doctor_trust_grade_suppressed_when_unlicensed() {
+        // Task #77 gate-coverage: an unlicensed enterprise binary suppresses the doctor
+        // trust-plane grade (its third emission path, alongside `audit verify`), regardless of
+        // chain health, so `csq doctor --json` matches the community wire. Holds in both
+        // editions.
+        assert!(
+            gated_doctor_trust_plane_grade(false, &csq_core::audit::AuditHealth::Verified, true)
+                .is_none(),
+            "unlicensed enterprise doctor must suppress the trust-plane grade"
+        );
+    }
+
+    /// Licensed enterprise → the gate is a pure pass-through (it only suppresses, never
+    /// alters), proving the unlicensed-None above is a genuine suppression and not vacuous.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn gated_doctor_trust_grade_passes_through_when_licensed() {
+        let h = csq_core::audit::AuditHealth::Verified;
+        assert_eq!(
+            gated_doctor_trust_plane_grade(true, &h, true),
+            doctor_trust_plane_grade(&h, true)
+        );
+    }
 
     #[test]
     fn build_token_owner_report_partitions_verdicts() {

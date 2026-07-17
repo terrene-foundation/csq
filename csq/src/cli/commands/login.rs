@@ -114,7 +114,39 @@ pub fn handle(
 /// credentials file, so the function returned `true` for every
 /// healthy slot, making `csq login N --reset-handle-dir
 /// --non-interactive` unusable as a T22a pre-flight gate.
-fn credentials_expired_for_recording(path: &Path) -> bool {
+/// Whether slot `account`'s Anthropic OAuth tokens are expired, for the
+/// `--reset-handle-dir --non-interactive` recording pre-flight.
+///
+/// Reads the DAEMON'S CANONICAL credential channel —
+/// `identities/<UUID>/credentials.json` resolved via
+/// [`resolve_slot_to_uuid`](csq_core::accounts::profiles::resolve_slot_to_uuid)
+/// (`account-terminal-separation.md` MUST Rule 4: a diagnostic surface MUST read
+/// the same channel the daemon's production paths write) — NOT the retired legacy
+/// `config-<N>/.credentials.json` mirror. Spec 02 INV-05: the daemon stopped
+/// writing that mirror in the M3-7 identity-store migration, so a post-migration
+/// install has NO legacy file; the prior check (`Err(_) => true`) therefore
+/// reported EVERY slot expired — including the active one — and made the §10.5
+/// recording bench structurally unrunnable. The legacy mirror is consulted ONLY as
+/// a pre-A++ fallback (when no identity mapping exists, `by_slot` empty).
+fn credentials_expired_for_recording(base_dir: &Path, account: AccountNum) -> bool {
+    // Canonical channel first (what the daemon actually refreshes).
+    let canonical = csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get())
+        .map(|uuid| csq_core::accounts::identity_store::credentials_path_for(base_dir, uuid));
+    let legacy = base_dir
+        .join(format!("config-{}", account))
+        .join(".credentials.json");
+    let path = match canonical {
+        Some(p) if p.exists() => p,
+        // No identity mapping (pre-A++), or the identity file is absent → fall back
+        // to the legacy mirror (which itself may be absent → treated as expired).
+        _ => legacy,
+    };
+    credential_file_expired(&path)
+}
+
+/// Pure token-expiry check over one Anthropic `.credentials.json`-shaped file.
+/// Missing / unparseable / `claudeAiOauth.expiresAt` absent or `<= now` → expired.
+fn credential_file_expired(path: &Path) -> bool {
     let body = match std::fs::read_to_string(path) {
         Err(_) => return true, // missing → treat as expired
         Ok(b) => b,
@@ -177,10 +209,10 @@ fn handle_reset_handle_dir(
     }
 
     if non_interactive {
-        let cred_path = base_dir
-            .join(format!("config-{}", account))
-            .join(".credentials.json");
-        if credentials_expired_for_recording(&cred_path) {
+        // Check the daemon's canonical identity-store credential (not the retired
+        // legacy `config-<N>/.credentials.json` mirror — account-terminal-separation
+        // MUST Rule 4 / spec 02 INV-05).
+        if credentials_expired_for_recording(base_dir, account) {
             eprintln!(
                 "error: slot {account} has expired tokens; \
                  refresh interactively before recording"
@@ -1549,7 +1581,7 @@ mod tests {
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist.json");
-        assert!(credentials_expired_for_recording(&path));
+        assert!(credential_file_expired(&path));
     }
 
     #[test]
@@ -1571,7 +1603,7 @@ mod tests {
             }
         });
         std::fs::write(&path, body.to_string()).unwrap();
-        assert!(!credentials_expired_for_recording(&path));
+        assert!(!credential_file_expired(&path));
     }
 
     #[test]
@@ -1587,7 +1619,7 @@ mod tests {
             }
         });
         std::fs::write(&path, body.to_string()).unwrap();
-        assert!(credentials_expired_for_recording(&path));
+        assert!(credential_file_expired(&path));
     }
 
     #[test]
@@ -1602,7 +1634,7 @@ mod tests {
             "expires_at": 9_999_999_999u64,
         });
         std::fs::write(&path, body.to_string()).unwrap();
-        assert!(credentials_expired_for_recording(&path));
+        assert!(credential_file_expired(&path));
     }
 
     #[test]
@@ -1611,7 +1643,44 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".credentials.json");
         std::fs::write(&path, b"not valid json {{{").unwrap();
-        assert!(credentials_expired_for_recording(&path));
+        assert!(credential_file_expired(&path));
+    }
+
+    /// Regression for the §10.5-bench-blocker: with NO identity mapping (pre-A++
+    /// fallback) the slot-based check reads the legacy `config-<N>/.credentials.json`
+    /// mirror. A FRESH legacy mirror → NOT expired. Proves the new slot-based
+    /// signature falls back correctly.
+    #[test]
+    fn credentials_expired_for_recording_slot_uses_fresh_legacy_mirror_when_no_identity() {
+        use tempfile::TempDir;
+        let base = TempDir::new().unwrap();
+        let acct = AccountNum::try_from(3u16).unwrap();
+        let cfg = base.path().join("config-3");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let future_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 86_400_000) as u64;
+        std::fs::write(
+            cfg.join(".credentials.json"),
+            serde_json::json!({ "claudeAiOauth": { "expiresAt": future_ms } }).to_string(),
+        )
+        .unwrap();
+        assert!(!credentials_expired_for_recording(base.path(), acct));
+    }
+
+    /// With neither an identity mapping NOR a legacy mirror (a post-M3-7 install —
+    /// the exact on-disk state that made the bench report every slot expired) the
+    /// check returns expired. The FIX is that a real install DOES have the canonical
+    /// `identities/<UUID>/credentials.json`, which this slot-based signature now
+    /// reads first (verified end-to-end by the live bench pre-flight).
+    #[test]
+    fn credentials_expired_for_recording_slot_expired_when_nothing_on_disk() {
+        use tempfile::TempDir;
+        let base = TempDir::new().unwrap();
+        let acct = AccountNum::try_from(3u16).unwrap();
+        assert!(credentials_expired_for_recording(base.path(), acct));
     }
 
     // Tests for `extract_device_auth_url` + `strip_ansi_escapes` live with

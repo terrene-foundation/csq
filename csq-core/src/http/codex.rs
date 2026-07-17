@@ -110,7 +110,15 @@ pub struct WhamRateLimit {
     pub allowed: bool,
     pub limit_reached: bool,
     pub primary_window: WhamWindow,
-    pub secondary_window: WhamWindow,
+    /// Nullable since 2026-07: for `pro` plans OpenAI collapsed the two
+    /// windows to a single (7-day) `primary_window` and sends
+    /// `secondary_window: null`. Previously always present (the 7-day window
+    /// while `primary_window` was the 5-hour one). `#[serde(default)]` makes a
+    /// missing key parse too. The window→quota-field mapping keys off
+    /// `limit_window_seconds` (NOT position), so it is correct under both
+    /// shapes — see `daemon::usage_poller::codex::write_wham_to_quota`.
+    #[serde(default)]
+    pub secondary_window: Option<WhamWindow>,
 }
 
 /// Typed Codex HTTP error variants. Distinguished from generic
@@ -638,7 +646,40 @@ mod tests {
         assert_eq!(s.rate_limit.primary_window.used_percent, 42.5);
         assert_eq!(s.rate_limit.primary_window.limit_window_seconds, 18000);
         assert_eq!(s.rate_limit.primary_window.reset_at, 4_102_444_800);
-        assert_eq!(s.rate_limit.secondary_window.limit_window_seconds, 604_800);
+        assert_eq!(
+            s.rate_limit
+                .secondary_window
+                .as_ref()
+                .expect("legacy shape carries a secondary_window")
+                .limit_window_seconds,
+            604_800
+        );
+    }
+
+    /// 2026-07 drift shape: `pro` plan sends a single 7-day `primary_window`
+    /// and `secondary_window: null`. MUST parse cleanly (previously the
+    /// non-optional `secondary_window: WhamWindow` rejected the null → the
+    /// poller degraded to `kind: "unknown"` with null quota windows).
+    #[test]
+    fn parse_wham_accepts_null_secondary_window() {
+        let body = br#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 37,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 555089,
+                    "reset_at": 1784682780
+                },
+                "secondary_window": null
+            }
+        }"#;
+        let s = super::parse_wham_response(200, body).expect("null secondary_window must parse");
+        assert_eq!(s.plan_type, "pro");
+        assert_eq!(s.rate_limit.primary_window.limit_window_seconds, 604_800);
+        assert!(s.rate_limit.secondary_window.is_none());
     }
 
     /// PII fields MUST be discarded at deserialize time (the struct

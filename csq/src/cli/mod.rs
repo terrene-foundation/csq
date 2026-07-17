@@ -262,6 +262,43 @@ enum Command {
         timeout: u64,
     },
 
+    /// Run a single governed completion and print one JSON envelope
+    /// (`csq.eval.v1`). Validates the response against a JSON Schema, retries
+    /// on governance failures, and emits `ok=true` (Passed) or `ok=false`
+    /// (MaxRetriesExceeded) — both as DATA envelopes; hard errors emit
+    /// `ok=null` failure envelopes. Enterprise-only.
+    #[cfg(feature = "enterprise")]
+    Eval {
+        /// The prompt to send (positional). Mutually exclusive with `--stdin`.
+        prompt: Option<String>,
+        /// Read the prompt from stdin instead of the positional argument.
+        #[arg(long)]
+        stdin: bool,
+        /// Target a specific slot (1-999). Mutually exclusive with `--provider`.
+        #[arg(long)]
+        slot: Option<u16>,
+        /// Target a provider by name (`claude`); resolves to a healthy slot.
+        /// Mutually exclusive with `--slot`.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model alias or id to request.
+        #[arg(long)]
+        model: Option<String>,
+        /// A system prompt to inject before the user message.
+        #[arg(long)]
+        system: Option<String>,
+        /// Correlation id echoed back verbatim on the envelope's `id` field.
+        #[arg(long)]
+        id: Option<String>,
+        /// Path to the JSON Schema file the response must conform to, or `-`
+        /// to read from stdin (mutually exclusive with `--stdin` prompt read).
+        #[arg(long = "schema-file")]
+        schema_file: String,
+        /// Seconds to wait before aborting the governed turn (default 120).
+        #[arg(long = "timeout", default_value_t = 120)]
+        timeout: u64,
+    },
+
     /// SDK surface introspection (`csq.capabilities.v1`).
     Sdk {
         #[command(subcommand)]
@@ -556,6 +593,38 @@ enum Command {
         keywords: Option<String>,
     },
 
+    /// Run the OQ-1 Tier-0 content pre-filter against a prompt (OQ1-S5,
+    /// enterprise-only).
+    ///
+    /// Pure classifier path — runs the production
+    /// `csq_core::phase2b::oq1::prefilter_advisory` deterministic keyword
+    /// pre-filter and emits a JSON record `{ok, categories, tier, is_finding}`
+    /// where `categories` is the fixed GDPR Art.9/Art.10 vocabulary. No CC /
+    /// codex / gemini spawn, no API call, no signed-chain write. The prompt is
+    /// classified and dropped — never echoed (INV-1). Used by the
+    /// `coc-eval/suites/oq1_special_category.py` harness to score recall/FPR of
+    /// special-category detection against synthetic labelled fixtures.
+    #[cfg(feature = "enterprise")]
+    #[command(name = "oq1-classify")]
+    Oq1Classify {
+        /// Prompt text to classify (required). Read, classified, and dropped;
+        /// never echoed to stdout (INV-1 — no special-category content leaves
+        /// the classifier).
+        #[arg(long)]
+        prompt: String,
+    },
+
+    /// M-DEK org-root key-hierarchy administration (enterprise-only).
+    ///
+    /// Establishes the per-seat key hierarchy M7's 4-eyes gate depends on: an
+    /// org KEK (from a ≥2-participant ceremony) wraps independently-generated
+    /// seat DEKs for recovery. See `specs/26-per-seat-key-hierarchy.md`.
+    #[cfg(feature = "enterprise")]
+    Admin {
+        #[command(subcommand)]
+        command: AdminCmd,
+    },
+
     /// Gate an MCP server's stdio JSON-RPC through the PACT `mcp_verdict`
     /// allow-path (M6 T6.2 Shard 2, enterprise-only).
     ///
@@ -622,6 +691,116 @@ enum CliCommand {
         /// CLI name to upgrade. Allowed: claude, codex, gemini.
         #[arg(value_parser = ["claude", "codex", "gemini"])]
         name: String,
+    },
+}
+
+/// Subcommands for `csq admin` — M-DEK org-root key-hierarchy operations
+/// (enterprise-only; the whole surface + its `admin` module are moat-stripped).
+#[cfg(feature = "enterprise")]
+#[derive(Subcommand, Debug)]
+enum AdminCmd {
+    /// Run the org-root ceremony: derive the org KEK from ≥2 distinct
+    /// participants' entropy shares and emit a signed `OrgRootCeremony` record.
+    ///
+    /// For each `--participant`, paste their own 64-hex entropy share when
+    /// prompted, or press Enter to generate one (displayed ONCE — record it
+    /// offline; the org KEK is re-derivable only from all recorded shares).
+    /// Requires `csq audit init` first (so the ceremony record is signed).
+    #[command(name = "init-org")]
+    InitOrg {
+        /// The org id (path-safe: `[A-Za-z0-9._-]`, ≤64 chars).
+        #[arg(long, value_name = "ORG_ID")]
+        org_id: String,
+        /// A participant's `person_id`. Repeat for each contributor; ≥2 DISTINCT
+        /// participants are required (a solo org KEK makes M7's 4-eyes gate
+        /// cosmetic).
+        #[arg(long = "participant", value_name = "PERSON_ID", required = true)]
+        participants: Vec<String>,
+        /// Intentionally rotate an EXISTING org's KEK. Without this, init-org
+        /// refuses to overwrite an existing org KEK (doing so would orphan every
+        /// provisioned seat's recovery envelope).
+        #[arg(long)]
+        rotate: bool,
+    },
+
+    /// Provision a seat: mint its independent DEK, wrap it under the org KEK
+    /// (recovery envelope on disk), and store the unwrapped seed in the seat
+    /// keychain. Requires the org KEK (`init-org`) to exist first.
+    #[command(name = "provision-seat")]
+    ProvisionSeat {
+        /// The org whose KEK wraps this seat's recovery envelope.
+        #[arg(long, value_name = "ORG_ID")]
+        org_id: String,
+        /// The seat id (path-safe: `[A-Za-z0-9._-]`, ≤64 chars).
+        #[arg(long, value_name = "SEAT_ID")]
+        seat_id: String,
+        /// Intentionally re-provision an EXISTING seat (mints a NEW signing
+        /// identity). Without this, provision-seat refuses to overwrite.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Export a seat's recovery package: re-encrypt its org-KEK-wrapped envelope
+    /// under a recovery authority's key for out-of-band custody.
+    #[command(name = "export-seat-recovery")]
+    ExportSeatRecovery {
+        /// The seat whose recovery envelope to export.
+        #[arg(long, value_name = "SEAT_ID")]
+        seat_id: String,
+        /// Path to the recovery authority's 32-byte key as 64-hex (0o600-enforced).
+        #[arg(long, value_name = "PATH")]
+        recovery_key: std::path::PathBuf,
+        /// Where to write the encrypted recovery package.
+        #[arg(long, value_name = "PATH")]
+        out: std::path::PathBuf,
+    },
+
+    /// Rotate (reanchor) a seat's DEK: supersede its current signing
+    /// identity with a freshly generated one, recording the succession
+    /// endorsement on the audit chain (M-DEK T-DEK.4). Requires the seat to
+    /// already be provisioned (`provision-seat`) and the org KEK to exist
+    /// (`init-org`). Refuses when a prior rotation attempt left an
+    /// unresolved retry hazard (`csq admin doctor-seat` diagnoses it).
+    #[command(name = "rotate-seat")]
+    RotateSeat {
+        /// The org whose KEK wraps this seat's recovery envelope.
+        #[arg(long, value_name = "ORG_ID")]
+        org_id: String,
+        /// The seat id to rotate (path-safe: `[A-Za-z0-9._-]`, ≤64 chars).
+        #[arg(long, value_name = "SEAT_ID")]
+        seat_id: String,
+        /// Reason for the rotation. Defaults to `operator`.
+        /// Valid values: `operator`, `policy`, `compromised`, `scheduled`.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
+
+    /// Report a seat's `.persist-broken` sentinel state — set when a prior
+    /// rotation's rollback could not restore the outgoing envelope
+    /// byte-identical after a keychain-write failure. Read-only diagnostic;
+    /// a SET sentinel does not brick the seat — a normal retry of
+    /// `provision-seat --force` / `rotate-seat` resolves it and clears the
+    /// sentinel automatically.
+    #[command(name = "doctor-seat")]
+    DoctorSeat {
+        /// The seat id to inspect.
+        #[arg(long, value_name = "SEAT_ID")]
+        seat_id: String,
+    },
+
+    /// Resume an interrupted seat rotation: resolve the orphan `SeatKeyReanchor`
+    /// audit INTENT a prior `rotate-seat` left when its OUTCOME record was lost
+    /// to a crash / kill (the retry hazard `doctor-seat` diagnoses and
+    /// `rotate-seat` refuses over). Reads the seat's LIVE keychain key to PROVE
+    /// what happened, then writes the completing OUTCOME — `Ok` when the
+    /// rotation had committed, `Failed` (freeing the seat to rotate again) when
+    /// it had not. Idempotent; refuses (fail-closed) when it cannot prove the
+    /// outcome. Requires `csq audit init`.
+    #[command(name = "resume-seat-rotation")]
+    ResumeSeatRotation {
+        /// The seat id whose interrupted rotation to resume.
+        #[arg(long, value_name = "SEAT_ID")]
+        seat_id: String,
     },
 }
 
@@ -700,6 +879,12 @@ enum AuditCmd {
         /// Shape: `{status, verified_count, skipped_v1_count, failure_detail?}`.
         #[arg(long)]
         json: bool,
+
+        /// Look up a specific record by its record-id and include its
+        /// `VerificationLevel` as `record_verification_level` in the JSON output.
+        /// Only meaningful with `--json`. Returns `"NOT_FOUND"` when the id is absent.
+        #[arg(long, value_name = "RECORD_ID")]
+        record: Option<String>,
     },
 
     /// Migrate audit signing keys from the OS keychain into the file store.
@@ -868,6 +1053,95 @@ enum AuditCmd {
     /// and enterprise (roster required) editions.
     RosterShow,
 
+    /// Generate an Ed25519 org-root keypair for roster signing (an internal ticket).
+    ///
+    /// Writes `roster-root.sec` (the SECRET seed, mode 0600 — keep offline,
+    /// never commit) and `roster-root.pub` (the PUBLIC trust anchor, mode 0600)
+    /// and prints the public key as hex. The public key is the value for
+    /// `CSQ_AUDIT_ROSTER_ROOT_PUBKEY`. The secret is NEVER printed.
+    RosterKeygen {
+        /// Output directory. Defaults to `<base>/audit/`.
+        #[arg(long, value_name = "DIR")]
+        out: Option<std::path::PathBuf>,
+        /// Overwrite an existing keypair (invalidates rosters signed with the old key).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Author an UNSIGNED authority roster (an internal ticket).
+    ///
+    /// Builds a roster enrolling one principal for one op-class with one key
+    /// and writes it as unsigned JSON (the input to `roster-sign`). The
+    /// `roster_pubkey` anchor is taken from `CSQ_AUDIT_ROSTER_ROOT_PUBKEY` or
+    /// the `roster-root.pub` file.
+    RosterCreate {
+        /// Principal (email/identity) to enroll.
+        #[arg(long, value_name = "EMAIL")]
+        principal: String,
+        /// Op-class: `key_rotate`, `identity_mint`, or `release_auth`.
+        #[arg(long, value_name = "OP_CLASS")]
+        op_class: String,
+        /// The enrolled member's Ed25519 public key (64 hex chars).
+        #[arg(long, value_name = "HEX")]
+        pubkey: String,
+        /// Roster version (monotonic; defaults to 1).
+        #[arg(long, value_name = "N")]
+        roster_version: Option<u64>,
+        /// Output file. Defaults to `<base>/audit/authority-roster.unsigned.json`.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
+
+    /// Sign an unsigned roster with the org-root secret key (an internal ticket).
+    ///
+    /// Reads the unsigned roster as raw bytes, signs, THEN writes
+    /// (byte-preserving). Default emits the embedded `SignedRoster` form;
+    /// `--detached` emits the roster verbatim plus a `.sig` sidecar. The output
+    /// verifies with `roster-install`.
+    RosterSign {
+        /// Path to the unsigned roster JSON file.
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// Path to the org-root secret key file (raw 32-byte seed, mode 0600).
+        #[arg(long, value_name = "PATH")]
+        secret_key: Option<std::path::PathBuf>,
+        /// The org-root secret key as 64 hex chars (alternative to --secret-key).
+        /// WARNING: a hex value passed on the command line enters process argv
+        /// (`/proc/<pid>/cmdline`) and shell history — high-security operators should
+        /// prefer `--secret-key <file>` (0600-checked, never in argv).
+        #[arg(long, value_name = "HEX")]
+        secret_key_hex: Option<String>,
+        /// Emit the detached-signature form (roster + `.sig` sidecar).
+        #[arg(long)]
+        detached: bool,
+        /// Output file. Defaults to the canonical audit-dir roster path.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
+
+    /// Rotate keys in a roster, emitting a new UNSIGNED roster (an internal ticket).
+    ///
+    /// Reads an existing roster (signed or unsigned), adds and/or retires keys,
+    /// and writes a new unsigned roster to re-sign. `--bump-version` increments
+    /// `roster_version` (monotonic); retired keys keep a `retired_at_seq`.
+    RosterRotate {
+        /// Source roster (signed or unsigned).
+        #[arg(long, value_name = "FILE")]
+        from: std::path::PathBuf,
+        /// Add a key: `<email>:<pubkey-hex>`.
+        #[arg(long, value_name = "EMAIL:HEX")]
+        add_key: Option<String>,
+        /// Retire a key: `<email>:<pubkey-hex>`.
+        #[arg(long, value_name = "EMAIL:HEX")]
+        retire_key: Option<String>,
+        /// Increment `roster_version` by 1.
+        #[arg(long)]
+        bump_version: bool,
+        /// Output file. Defaults to `<base>/audit/authority-roster.rotated.json`.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
+
     /// Install a signed governance policy bundle (Phase-2b, b2a — enterprise-only).
     ///
     /// Loads the policy bundle from a JSON file, verifies its Ed25519 detached
@@ -891,6 +1165,88 @@ enum AuditCmd {
         file: std::path::PathBuf,
         /// The customer org-admin Ed25519 public key (32 bytes, 64 lowercase hex chars).
         /// This is the out-of-band root of trust for the bundle signature.
+        #[arg(long, value_name = "PUBKEY_HEX")]
+        pubkey: String,
+    },
+
+    /// Generate an Ed25519 org-admin keypair for policy-bundle signing (an internal ticket, FR-GOV).
+    ///
+    /// Writes `bundle-signing.sec` (the SECRET seed, mode 0600 — keep offline,
+    /// never commit) and `bundle-signing.pub` (the PUBLIC out-of-band trust anchor,
+    /// mode 0600) and prints the public key as hex. The public key is the value for
+    /// `csq audit bundle-install --pubkey <hex>`. The secret is NEVER printed.
+    #[cfg(feature = "enterprise")]
+    BundleKeygen {
+        /// Output directory. Defaults to `<base>/phase2b/`.
+        #[arg(long, value_name = "DIR")]
+        out: Option<std::path::PathBuf>,
+        /// Overwrite an existing keypair (invalidates bundles signed with the old key).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Author an UNSIGNED policy bundle from a schemas file (an internal ticket, FR-GOV).
+    ///
+    /// Builds a policy bundle carrying the supplied `response_format` schemas and
+    /// the `GovernanceConfig` (from `--config <file>`, or the public-law safe default),
+    /// anchored to the org-admin `--pubkey`, and writes it as unsigned JSON (the input
+    /// to `bundle-sign`).
+    #[cfg(feature = "enterprise")]
+    BundleCreate {
+        /// JSON object mapping schema-name → JSON-Schema value (the enforced schemas).
+        #[arg(long, value_name = "FILE")]
+        schemas: std::path::PathBuf,
+        /// GovernanceConfig JSON file. If omitted, the public-law safe default is used.
+        #[arg(long, value_name = "FILE")]
+        config: Option<std::path::PathBuf>,
+        /// The customer org-admin Ed25519 public key (64 hex chars) — the trust anchor.
+        #[arg(long, value_name = "PUBKEY_HEX")]
+        pubkey: String,
+        /// Monotonic bundle version (rollback floor; defaults to 1).
+        #[arg(long, value_name = "N")]
+        bundle_version: Option<u64>,
+        /// Output file. Defaults to `<base>/phase2b/policy-bundle.unsigned.json`.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
+
+    /// Sign an unsigned policy bundle with the org-admin secret key (an internal ticket, FR-GOV).
+    ///
+    /// Reads the unsigned bundle as raw bytes, signs the RAW bytes (byte-preserving),
+    /// and writes the bundle verbatim plus a `.sig` sidecar (the detached form
+    /// `bundle-install` accepts). The signer's public key must equal the file's
+    /// `bundle_pubkey` anchor.
+    #[cfg(feature = "enterprise")]
+    BundleSign {
+        /// Path to the unsigned policy bundle JSON file.
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// Path to the org-admin secret key file (raw 32-byte seed, mode 0600).
+        #[arg(long, value_name = "PATH")]
+        secret_key: Option<std::path::PathBuf>,
+        /// The org-admin secret key as 64 hex chars (alternative to --secret-key).
+        /// WARNING: a hex value passed on the command line enters process argv
+        /// (`/proc/<pid>/cmdline`) and shell history — high-security operators should
+        /// prefer `--secret-key <file>` (0600-checked, never in argv).
+        #[arg(long, value_name = "HEX")]
+        secret_key_hex: Option<String>,
+        /// Output file. Defaults to the canonical live bundle path (+ `.sig` sidecar).
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
+
+    /// Validate a signed policy bundle against a pubkey (an internal ticket, FR-GOV).
+    ///
+    /// Read-only round-trip check: verifies the detached Ed25519 signature against
+    /// the supplied `--pubkey` and runs the non-configurable governance floor.
+    /// Answers "would `bundle-install --pubkey <hex>` accept this?" without any
+    /// install, write, or daemon interaction.
+    #[cfg(feature = "enterprise")]
+    BundleValidate {
+        /// Path to the signed policy bundle JSON file (with a sibling `.sig` sidecar).
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// The customer org-admin Ed25519 public key (32 bytes, 64 lowercase hex chars).
         #[arg(long, value_name = "PUBKEY_HEX")]
         pubkey: String,
     },
@@ -927,6 +1283,25 @@ enum AuditCmd {
         /// Write the report to this file instead of stdout.
         #[arg(long, value_name = "PATH")]
         out: Option<std::path::PathBuf>,
+    },
+
+    /// Submit an audit anchor request to the daemon and print the
+    /// `AnchorPayload` projection as JSON (enterprise-only, #952 S3).
+    ///
+    /// POSTs the current audit record to the daemon's
+    /// `POST /api/audit/anchor` route.  The daemon signs the record
+    /// using the chain's Ed25519 key and returns the signed
+    /// `AnchorPayload` projection — containing the daemon-assigned
+    /// `canonical_hash`, `chain_id`, `seq`, and `verification_level`.
+    ///
+    /// The CLI NEVER computes `canonical_hash` client-side; the daemon
+    /// is the sole signer (DIRECTIVE-1 from #1057).
+    #[cfg(feature = "enterprise")]
+    Anchor {
+        /// Output the anchor result as machine-parseable JSON.
+        /// Shape: `{canonical_hash, chain_id, seq, verification_level}`.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1068,6 +1443,56 @@ enum SetkeyCmd {
         #[arg(long)]
         vertex_sa_json: Option<std::path::PathBuf>,
     },
+    /// Azure OpenAI (#962) — direct-API native client (OpenAI Chat
+    /// Completions wire, `api-key` header). Config lives in the global
+    /// `settings-azure.json`; the key is read from stdin (hidden/piped)
+    /// so it never enters argv or shell history.
+    ///
+    /// Enterprise-only: the native client lives in the moat-stripped
+    /// `phase2b` tree, so this variant is `#[cfg(feature = "enterprise")]` —
+    /// the community CLI does not expose (or accept) it.
+    #[cfg(feature = "enterprise")]
+    Azure {
+        /// Azure resource name — the `{resource}` in
+        /// `https://{resource}.openai.azure.com`. Required.
+        #[arg(long)]
+        resource: String,
+        /// Deployment name — the `{deployment}` path segment. Optional;
+        /// when omitted the per-request model override (or the catalog
+        /// default) is used.
+        #[arg(long)]
+        deployment: Option<String>,
+        /// `api-version` query parameter. Optional; a stable GA default
+        /// is written when omitted.
+        #[arg(long)]
+        api_version: Option<String>,
+        /// The Azure OpenAI api-key. If omitted, read from stdin
+        /// (hidden on a TTY, piped otherwise).
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// GCP Vertex AI (#962) — direct-API native client (Google
+    /// generateContent wire, Bearer access-token). Config lives in the
+    /// global `settings-vertex.json`; the access token is read from stdin
+    /// (hidden/piped) so it never enters argv or shell history.
+    ///
+    /// Enterprise-only: the native client lives in the moat-stripped
+    /// `phase2b` tree, so this variant is `#[cfg(feature = "enterprise")]` —
+    /// the community CLI does not expose (or accept) it.
+    #[cfg(feature = "enterprise")]
+    Vertex {
+        /// GCP project id — the `{project}` path segment. Required.
+        #[arg(long)]
+        project: String,
+        /// GCP region — the host prefix AND `locations/{region}` path
+        /// segment (e.g. `us-central1`). Required.
+        #[arg(long)]
+        region: String,
+        /// The Vertex access token (gcloud ADC / service-account). If
+        /// omitted, read from stdin (hidden on a TTY, piped otherwise).
+        #[arg(long)]
+        access_token: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1113,24 +1538,76 @@ enum ModelsCmd {
 /// is baked, a missing / invalid / expired license surfaces here as a
 /// `license_required` error instead of running the op.
 ///
-/// Call sites (W4): the enterprise CLI admin arms (`mcp-proxy`, `audit
-/// bundle-install`) AND the enterprise CLI moat entrypoints (`emit_eatp_genesis`
-/// for `audit init`, `report_residency` for `audit report`) — gating at the moat
-/// entrypoint covers the op regardless of the caller.
+/// Call sites: the enterprise CLI admin arms (`mcp-proxy`, `audit bundle-install`) AND
+/// the enterprise CLI moat entrypoints (`emit_eatp_genesis` for `audit init`,
+/// `report_residency` for `audit report`) — gating at the moat entrypoint covers the op
+/// regardless of the caller. As of task #77 shard 3, **`csq run`
+/// (`commands::run::handle`) is ALSO gated** with this full per-op `enforce`. The task #77
+/// gate-coverage remediation extends the same gate to the remaining LLM-execution surfaces
+/// that had slipped it — **`csq run --native`** (`commands::run::handle_native`, dispatched
+/// via an early `return` before `handle`) and **`csq exec`**
+/// (`commands::exec::run_exec`, via an enveloped `SdkError`) — plus the enterprise-only
+/// **`audit verify` trust-plane grade** (suppressed when unlicensed so the wire matches
+/// community). Shared read-only surfaces (`audit compliance-report`, `audit export`) are
+/// deliberately left ungated: they render the already-local signed chain, leak no
+/// enterprise-only value, and are a maintainer moat-policy choice, not a fail-open.
 ///
-/// **NOT yet gated (W5, paired with the real key + use-only distribution):** the
-/// daemon-hosted governance / audit / EATP stack brought up by `csq daemon start`
-/// (`commands::daemon::handle_start` → `kailash_governor::make_governor_factory`
-/// etc.), the enterprise `csq run` surfaces, and the desktop enterprise surface.
-/// The gate is inert today, so no enterprise op runs differently; W5 wires these
-/// remaining surfaces when the real key lands and enforcement actually bites.
+/// The daemon-hosted governance / audit / EATP stack — brought up by `csq daemon start`
+/// (`commands::daemon::handle_start`) and the desktop supervisor
+/// (`desktop::daemon_supervisor::run_daemon`) — is gated with the sibling
+/// [`enforce_enterprise_license_startup`] (validity + definitive revocation, but NO
+/// liveness deny, so a licensed-but-offline daemon can still start to run the CRL
+/// refresher that recovers its cache — see that fn's docs).
+///
+/// The gate is INERT today (seed-2 placeholder key), so no enterprise op runs differently
+/// until the real key is baked at go-live.
 #[cfg(feature = "enterprise")]
 pub(crate) fn enforce_enterprise_license(base_dir: &std::path::Path) -> anyhow::Result<()> {
-    let now = std::time::SystemTime::now()
+    let now = license_now_fail_closed()?;
+    // Soft enforcement (#968): the gate verdict is unchanged (fail-closed on any
+    // missing/invalid/expired/revoked license); on success we additionally surface an
+    // approaching-expiry renewal nudge to STDERR — never stdout, so JSON envelopes on
+    // the per-op surfaces stay clean.
+    let advisory = csq_core::license::enforce_returning_advisory(base_dir, now)
+        .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message.as_str()))?;
+    if let Some(a) = advisory {
+        eprintln!("csq: license notice — {}", a.message);
+    }
+    Ok(())
+}
+
+/// Read the wall clock as unix seconds, failing CLOSED on a broken clock. If the clock
+/// is before the UNIX epoch (dead RTC, VM snapshot reset), `duration_since` errors — the
+/// old `unwrap_or(0)` substituted `now = 0`, which is fail-OPEN for a security gate:
+/// expiry (`0 > exp` is never true) and grace (`0.saturating_sub(..) == 0 <= grace`) both
+/// pass unconditionally, so a revoked/expired licensee could evade the gate by setting
+/// their clock to before 1970. A gate that cannot trust the clock cannot validate the
+/// license, so it MUST deny. (Redteam R1 — security + deep-analyst.)
+#[cfg(feature = "enterprise")]
+fn license_now_fail_closed() -> anyhow::Result<u64> {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    csq_core::license::enforce(base_dir, now)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "license_required: system clock is invalid (before the UNIX epoch) — \
+                 cannot validate the enterprise license"
+            )
+        })
+}
+
+/// Startup variant of [`enforce_enterprise_license`] for DAEMON bring-up (task #77 shard
+/// 3). Verifies the license is present, signature-valid, unexpired, and not DEFINITIVELY
+/// revoked — but skips the CRL liveness/staleness deny, because the daemon HOSTS the CRL
+/// refresher: a stale-beyond-grace cache is exactly the state it must start in to
+/// re-fetch and recover. Using the full [`enforce_enterprise_license`] here would brick a
+/// licensed customer offline longer than the grace window in a fail-closed deadlock (they
+/// could never start the daemon that would refresh their CRL). See
+/// [`csq_core::license::enforce_startup`]. Inert while the placeholder key is baked.
+#[cfg(feature = "enterprise")]
+pub(crate) fn enforce_enterprise_license_startup(base_dir: &std::path::Path) -> anyhow::Result<()> {
+    let now = license_now_fail_closed()?;
+    csq_core::license::enforce_startup(base_dir, now)
         .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message.as_str()))
 }
 
@@ -1326,6 +1803,31 @@ pub fn run() -> Result<()> {
                 },
             )
         }
+        #[cfg(feature = "enterprise")]
+        Command::Eval {
+            prompt,
+            stdin,
+            slot,
+            provider,
+            model,
+            system,
+            id,
+            schema_file,
+            timeout,
+        } => commands::eval::handle(
+            &base_dir,
+            commands::eval::EvalArgs {
+                prompt,
+                stdin,
+                slot,
+                provider,
+                model,
+                system,
+                id,
+                schema_file,
+                timeout_secs: timeout,
+            },
+        ),
         Command::Sdk { command } => match command {
             SdkCommands::Capabilities => commands::exec::handle_capabilities(),
         },
@@ -1382,6 +1884,43 @@ pub fn run() -> Result<()> {
                     vertex_sa_json.as_deref(),
                 );
             }
+            // Azure OpenAI / Vertex AI (#962) — multi-field direct-API config
+            // (endpoint coordinates + credential) that does not fit the single
+            // `{key, slot}` shape. They persist to the GLOBAL settings file
+            // (`settings-azure.json` / `settings-vertex.json`), which the native
+            // client reads at request time; there is no per-slot ANTHROPIC_*
+            // passthrough bind. Enterprise-only (the native client is in the
+            // moat-stripped `phase2b` tree).
+            #[cfg(feature = "enterprise")]
+            if let SetkeyCmd::Azure {
+                resource,
+                deployment,
+                api_version,
+                key,
+            } = &sk
+            {
+                return commands::setkey::handle_azure(
+                    &base_dir,
+                    resource,
+                    deployment.as_deref(),
+                    api_version.as_deref(),
+                    key.as_deref(),
+                );
+            }
+            #[cfg(feature = "enterprise")]
+            if let SetkeyCmd::Vertex {
+                project,
+                region,
+                access_token,
+            } = &sk
+            {
+                return commands::setkey::handle_vertex(
+                    &base_dir,
+                    project,
+                    region,
+                    access_token.as_deref(),
+                );
+            }
             let (provider, key, slot) = match sk {
                 SetkeyCmd::Mm { key, slot } => ("mm", key, slot),
                 SetkeyCmd::Zai { key, slot } => ("zai", key, slot),
@@ -1389,6 +1928,10 @@ pub fn run() -> Result<()> {
                 SetkeyCmd::Claude { key, slot } => ("claude", key, slot),
                 SetkeyCmd::Ollama { slot } => ("ollama", None, slot),
                 SetkeyCmd::Gemini { .. } => unreachable!("handled above"),
+                #[cfg(feature = "enterprise")]
+                SetkeyCmd::Azure { .. } | SetkeyCmd::Vertex { .. } => {
+                    unreachable!("handled above")
+                }
             };
             let slot = match slot {
                 Some(n) => Some(
@@ -1502,6 +2045,50 @@ pub fn run() -> Result<()> {
             },
         ),
         #[cfg(feature = "enterprise")]
+        Command::Oq1Classify { prompt } => {
+            // Dev/bench measurement surface — NOT license-gated (no production
+            // side effect, no credential access, no signed-chain write). The
+            // `enterprise` compile-gate keeps it out of the community binary;
+            // license-gating would break the coc-eval harness in CI/dev.
+            commands::oq1_classify::handle(commands::oq1_classify::Oq1ClassifyOptions { prompt })
+        }
+        #[cfg(feature = "enterprise")]
+        Command::Admin { command } => match command {
+            AdminCmd::InitOrg {
+                org_id,
+                participants,
+                rotate,
+            } => commands::admin::handle_init_org(&base_dir, &org_id, &participants, rotate),
+            AdminCmd::ProvisionSeat {
+                org_id,
+                seat_id,
+                force,
+            } => commands::admin::handle_provision_seat(&base_dir, &org_id, &seat_id, force),
+            AdminCmd::ExportSeatRecovery {
+                seat_id,
+                recovery_key,
+                out,
+            } => commands::admin::handle_export_seat_recovery(
+                &base_dir,
+                &seat_id,
+                &recovery_key,
+                &out,
+            ),
+            AdminCmd::RotateSeat {
+                org_id,
+                seat_id,
+                reason,
+            } => {
+                commands::admin::handle_rotate_seat(&base_dir, &org_id, &seat_id, reason.as_deref())
+            }
+            AdminCmd::DoctorSeat { seat_id } => {
+                commands::admin::handle_doctor_seat(&base_dir, &seat_id)
+            }
+            AdminCmd::ResumeSeatRotation { seat_id } => {
+                commands::admin::handle_resume_seat_rotation(&base_dir, &seat_id)
+            }
+        },
+        #[cfg(feature = "enterprise")]
         Command::McpProxy {
             envelope,
             cli,
@@ -1566,9 +2153,18 @@ pub fn run() -> Result<()> {
             AuditCmd::ConfigCadence { sink, key, value } => {
                 commands::audit::handle_config_cadence(&base_dir, &sink, &key, &value)
             }
-            AuditCmd::Verify { full, since, json } => {
-                commands::audit::handle_verify(&base_dir, full, since.as_deref(), json)
-            }
+            AuditCmd::Verify {
+                full,
+                since,
+                json,
+                record,
+            } => commands::audit::handle_verify(
+                &base_dir,
+                full,
+                since.as_deref(),
+                json,
+                record.as_deref(),
+            ),
             AuditCmd::MigrateKeys => commands::audit::handle_migrate_keys(&base_dir),
             AuditCmd::Repair { apply } => commands::audit::handle_repair(&base_dir, apply),
             AuditCmd::Intent { state } => {
@@ -1596,12 +2192,103 @@ pub fn run() -> Result<()> {
                 activation_seq,
             } => commands::roster::handle_roster_install(&base_dir, &file, activation_seq),
             AuditCmd::RosterShow => commands::roster::handle_roster_show(&base_dir),
+            AuditCmd::RosterKeygen { out, force } => {
+                commands::roster::handle_roster_keygen(&base_dir, out.as_deref(), force)
+            }
+            AuditCmd::RosterCreate {
+                principal,
+                op_class,
+                pubkey,
+                roster_version,
+                out,
+            } => commands::roster::handle_roster_create(
+                &base_dir,
+                &principal,
+                &op_class,
+                &pubkey,
+                roster_version,
+                out.as_deref(),
+            ),
+            AuditCmd::RosterSign {
+                file,
+                secret_key,
+                secret_key_hex,
+                detached,
+                out,
+            } => commands::roster::handle_roster_sign(
+                &base_dir,
+                &file,
+                secret_key.as_deref(),
+                secret_key_hex.as_deref(),
+                detached,
+                out.as_deref(),
+            ),
+            AuditCmd::RosterRotate {
+                from,
+                add_key,
+                retire_key,
+                bump_version,
+                out,
+            } => commands::roster::handle_roster_rotate(
+                &base_dir,
+                &from,
+                add_key.as_deref(),
+                retire_key.as_deref(),
+                bump_version,
+                out.as_deref(),
+            ),
             #[cfg(feature = "enterprise")]
             AuditCmd::BundleInstall { file, pubkey } => {
                 // Enterprise op — gate on the license before installing the bundle (W4).
                 enforce_enterprise_license(&base_dir)?;
                 commands::bundle::handle_bundle_install(&base_dir, &file, &pubkey)
             }
+            #[cfg(feature = "enterprise")]
+            AuditCmd::BundleKeygen { out, force } => {
+                enforce_enterprise_license(&base_dir)?;
+                commands::bundle::handle_bundle_keygen(&base_dir, out.as_deref(), force)
+            }
+            #[cfg(feature = "enterprise")]
+            AuditCmd::BundleCreate {
+                schemas,
+                config,
+                pubkey,
+                bundle_version,
+                out,
+            } => {
+                enforce_enterprise_license(&base_dir)?;
+                commands::bundle::handle_bundle_create(
+                    &base_dir,
+                    &schemas,
+                    config.as_deref(),
+                    &pubkey,
+                    bundle_version,
+                    out.as_deref(),
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            AuditCmd::BundleSign {
+                file,
+                secret_key,
+                secret_key_hex,
+                out,
+            } => {
+                enforce_enterprise_license(&base_dir)?;
+                commands::bundle::handle_bundle_sign(
+                    &base_dir,
+                    &file,
+                    secret_key.as_deref(),
+                    secret_key_hex.as_deref(),
+                    out.as_deref(),
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            AuditCmd::BundleValidate { file, pubkey } => {
+                enforce_enterprise_license(&base_dir)?;
+                commands::bundle::handle_bundle_validate(&base_dir, &file, &pubkey)
+            }
+            #[cfg(feature = "enterprise")]
+            AuditCmd::Anchor { json } => commands::audit::handle_anchor(&base_dir, json),
             AuditCmd::Report { json } => commands::audit::handle_report(&base_dir, json),
             AuditCmd::ComplianceReport { format, out } => {
                 commands::audit::handle_compliance_report(
@@ -1797,6 +2484,19 @@ mod tests {
                 assert!(keywords.is_none(), "--keywords defaults to None");
             }
             other => panic!("expected Classify subcommand, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn oq1_classify_subcommand_parses_with_required_prompt() {
+        let cli = Cli::try_parse_from(["csq", "oq1-classify", "--prompt", "SYNTHETIC: diagnosis"])
+            .expect("parse oq1-classify");
+        match cli.command {
+            Some(Command::Oq1Classify { prompt }) => {
+                assert_eq!(prompt, "SYNTHETIC: diagnosis");
+            }
+            other => panic!("expected Oq1Classify subcommand, got {other:?}"),
         }
     }
 

@@ -378,8 +378,29 @@ pub(crate) fn write_wham_to_quota(
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
-    let primary = &snapshot.rate_limit.primary_window;
-    let secondary = &snapshot.rate_limit.secondary_window;
+    // Classify each PRESENT window by its `limit_window_seconds`, NOT by its
+    // position. OpenAI moved the 7-day window from `secondary_window` into
+    // `primary_window` (with `secondary_window: null`) for `pro` plans in
+    // 2026-07, so the old positional map (primary→5h, secondary→7d) both
+    // panicked on the null AND mislabeled 7-day usage as 5-hour. A window
+    // ≤ 1 day is the short ("5-hour") window; anything longer is the
+    // long ("7-day") window. Whichever is absent stays `None`.
+    const SHORT_WINDOW_MAX_SECS: u64 = 86_400; // 1 day divides short vs long
+    let mut five_hour: Option<UsageWindow> = None;
+    let mut seven_day: Option<UsageWindow> = None;
+    for w in std::iter::once(&snapshot.rate_limit.primary_window)
+        .chain(snapshot.rate_limit.secondary_window.iter())
+    {
+        let slot = if w.limit_window_seconds <= SHORT_WINDOW_MAX_SECS {
+            &mut five_hour
+        } else {
+            &mut seven_day
+        };
+        *slot = Some(UsageWindow {
+            used_percentage: w.used_percent,
+            resets_at: w.reset_at,
+        });
+    }
 
     let extras = serde_json::json!({
         "plan_type": snapshot.plan_type,
@@ -392,14 +413,8 @@ pub(crate) fn write_wham_to_quota(
         AccountQuota {
             surface: "codex".into(),
             kind: "utilization".into(),
-            five_hour: Some(UsageWindow {
-                used_percentage: primary.used_percent,
-                resets_at: primary.reset_at,
-            }),
-            seven_day: Some(UsageWindow {
-                used_percentage: secondary.used_percent,
-                resets_at: secondary.reset_at,
-            }),
+            five_hour,
+            seven_day,
             updated_at: now,
             extras: Some(extras),
             ..Default::default()
@@ -689,7 +704,11 @@ mod tests {
         assert!(snap.rate_limit.allowed);
         assert_eq!(snap.rate_limit.primary_window.used_percent, 42.5);
         assert_eq!(
-            snap.rate_limit.secondary_window.limit_window_seconds,
+            snap.rate_limit
+                .secondary_window
+                .as_ref()
+                .expect("golden carries a secondary_window")
+                .limit_window_seconds,
             604_800
         );
     }
@@ -714,6 +733,43 @@ mod tests {
         assert_eq!(
             extras.get("plan_type").and_then(|v| v.as_str()),
             Some("plus")
+        );
+    }
+
+    #[test]
+    fn write_wham_to_quota_maps_7day_only_pro_shape() {
+        // 2026-07 `pro` drift shape: single 7-day primary_window,
+        // secondary_window null. The mapping keys off limit_window_seconds,
+        // so the 7-day window lands in seven_day (NOT five_hour) and
+        // five_hour is correctly absent — the regression this fix closes.
+        let body = br#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 37,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 555089,
+                    "reset_at": 1784682780
+                },
+                "secondary_window": null
+            }
+        }"#;
+        let snap = parse_wham_response(200, body).expect("pro drift shape parses");
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(9u16).unwrap();
+        write_wham_to_quota(dir.path(), account, &snap).unwrap();
+
+        let state = quota_state::load_state(dir.path()).unwrap();
+        let q = state.get(9).expect("account present");
+        assert_eq!(q.kind, "utilization"); // NOT "unknown"
+        assert!(q.five_hour.is_none(), "no 5-hour window on the pro shape");
+        assert!((q.seven_day_pct() - 37.0).abs() < 0.01, "7-day = 37%");
+        assert_eq!(
+            q.seven_day.as_ref().unwrap().resets_at,
+            1_784_682_780,
+            "7-day reset carried through"
         );
     }
 

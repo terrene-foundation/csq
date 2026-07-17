@@ -60,9 +60,19 @@ impl PromptClass {
 /// translator stages BEFORE the downstream CLI is spawned.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PreSpawnState {
-    /// System-prompt scaffold built from the `CocSet`. `None` until
+    /// System-prompt scaffold built from the `CocSet` (ALL kinds — rules +
+    /// agents + skills + commands). `None` until
     /// [`crate::capability_layer::scaffold::ScaffoldStage`] runs.
     pub scaffold: Option<String>,
+    /// Rules-ONLY system-prompt scaffold for the CC Level-2 native
+    /// materialization branch (an internal ticket S2). In Level-2, agents/skills/
+    /// commands are delivered as a native CC plugin (`--plugin-dir`), so only
+    /// rules remain prose. Built from the SAME flatten as `scaffold`/`artifacts`
+    /// (single flatten → no drift) with the same FR-CL-01 structured-output
+    /// directive appended when the prompt classifies as `Compliance`. `None`
+    /// until [`crate::capability_layer::scaffold::ScaffoldStage`] runs. Consumed
+    /// only by the CC launch path today (codex/gemini stay full-prose).
+    pub rules_only_scaffold: Option<String>,
     /// MCP tool-name denylist intersection (`.coc/` policy ∩ user
     /// policy per spec 10 §10.8.2).
     pub mcp_filter: McpFilter,

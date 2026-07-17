@@ -10,13 +10,16 @@ use super::{CapabilitiesPayload, Envelope, EDITION, SCHEMA_CAPABILITIES_V1};
 
 /// The ops actually IMPLEMENTED in this build.
 ///
-/// Per `rules/spec-accuracy.md`, this advertises only what ships today. Later shards
-/// append their op as they land (`anchor.v1`, and `eval.v1` under
-/// `#[cfg(feature = "enterprise")]`).
+/// Per `rules/spec-accuracy.md`, this advertises only what ships today. `eval.v1`
+/// is enterprise-only (an internal ticket S2); community builds do not advertise it.
 #[must_use]
 pub fn implemented_ops() -> Vec<&'static str> {
-    // S1: exec + capabilities. S2: verify. All community, edition-uniform shape.
-    vec!["exec.v1", "capabilities.v1", "verify.v1"]
+    // S1: exec + capabilities. S2: verify. Community ops; enterprise extends below.
+    #[allow(unused_mut)]
+    let mut ops = vec!["exec.v1", "capabilities.v1", "verify.v1"];
+    #[cfg(feature = "enterprise")]
+    ops.push("eval.v1");
+    ops
 }
 
 /// Build the `csq.capabilities.v1` success envelope for this build.
@@ -54,8 +57,17 @@ mod tests {
         );
         assert!(ops.contains(&"capabilities.v1"));
         assert!(ops.contains(&"verify.v1"), "verify.v1 is implemented in S2");
-        // eval is not implemented yet; it must not be advertised.
-        assert!(!ops.contains(&"eval.v1"), "eval.v1 not coded yet");
+        // eval.v1 ships in S2, enterprise-only.
+        #[cfg(feature = "enterprise")]
+        assert!(
+            ops.contains(&"eval.v1"),
+            "eval.v1 must be advertised in enterprise builds"
+        );
+        #[cfg(not(feature = "enterprise"))]
+        assert!(
+            !ops.contains(&"eval.v1"),
+            "eval.v1 must NOT be advertised in community builds"
+        );
     }
 
     #[test]

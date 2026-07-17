@@ -147,10 +147,11 @@ pub async fn http_get_pipe_with_timeout(
 ///
 /// Currently has NO production callers: the non-unix
 /// `notify_daemon_cache_invalidation` paths in `swap`/`logout`/`login` are
-/// explicit no-ops (M8-03 — there is no production Windows daemon yet), so
-/// `csq swap` never calls this on any platform. Re-exported from
-/// `daemon::mod` as the client primitive for when the Windows named-pipe
-/// daemon ships.
+/// still explicit no-ops, so `csq swap` never calls this on any platform.
+/// The Windows named-pipe daemon itself IS wired end to end (#786 — start /
+/// stop / status round-trip); wiring these cache-invalidation notify
+/// callers onto `http_post_pipe` is a separate follow-up. Re-exported from
+/// `daemon::mod` as the client primitive for that work.
 pub async fn http_post_pipe(
     pipe_path: &Path,
     path_and_query: &str,

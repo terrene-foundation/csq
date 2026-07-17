@@ -414,12 +414,12 @@ pub(crate) fn post_to_daemon(_socket_path: &Path, _route: &str, _body: &str) -> 
 #[cfg(unix)]
 pub(crate) fn post_to_daemon(socket_path: &Path, route: &str, body: &str) -> Result<(), ()> {
     // `route` is interpolated into the HTTP request line below. All current callers
-    // pass static string literals, but guard the CRLF-injection invariant explicitly
-    // (security.md §9) so a future dynamic-route caller cannot smuggle headers.
-    debug_assert!(
-        !route.contains('\r') && !route.contains('\n'),
-        "post_to_daemon route must not contain CR/LF (CRLF injection guard)"
-    );
+    // pass static string literals, but enforce the CRLF-injection invariant at RUNTIME
+    // (security.md §9 — MUST be a runtime check, not debug_assert!, which is compiled
+    // out in release) so a future dynamic-route caller cannot smuggle headers.
+    if route.contains('\r') || route.contains('\n') {
+        return Err(());
+    }
     let io_timeout = Duration::from_millis(IPC_TOTAL_DEADLINE_MS);
 
     // `UnixStream::connect` is synchronous; the socket is either present or not.
@@ -472,6 +472,93 @@ pub(crate) fn post_to_daemon(socket_path: &Path, route: &str, body: &str) -> Res
     } else {
         Err(())
     }
+}
+
+/// Issues a `POST <route>` to the daemon socket and returns the response body
+/// on HTTP 200.
+///
+/// Returns `Ok(body_bytes)` when the daemon replies HTTP 200; returns `Err(())`
+/// on any timeout, connection failure, or non-200 response.
+///
+/// CRLF injection guard (security.md §9): `route` MUST NOT contain `\r` or
+/// `\n`.  All current callers pass static string literals; the runtime guard
+/// makes a future dynamic-route caller fail loudly.
+///
+/// Windows: the daemon transport (Unix domain socket) is not available; this
+/// always returns `Err(())`.  A named-pipe transport for Windows is tracked
+/// separately.
+#[cfg(all(not(unix), feature = "enterprise"))]
+pub(crate) fn post_to_daemon_json(
+    _socket_path: &Path,
+    _route: &str,
+    _body: &str,
+) -> Result<Vec<u8>, ()> {
+    Err(())
+}
+
+#[cfg(all(unix, feature = "enterprise"))]
+pub(crate) fn post_to_daemon_json(
+    socket_path: &Path,
+    route: &str,
+    body: &str,
+) -> Result<Vec<u8>, ()> {
+    // CRLF injection guard (security.md §9 — runtime check, not debug_assert!, which
+    // is compiled out in release). Every current caller passes a static literal, but a
+    // future dynamic-route caller must fail closed even in a release build.
+    if route.contains('\r') || route.contains('\n') {
+        return Err(());
+    }
+    let io_timeout = Duration::from_millis(IPC_TOTAL_DEADLINE_MS);
+
+    let mut stream = UnixStream::connect(socket_path).map_err(|_| ())?;
+    stream.set_read_timeout(Some(io_timeout)).map_err(|_| ())?;
+    stream.set_write_timeout(Some(io_timeout)).map_err(|_| ())?;
+
+    let request = format!(
+        "POST {route} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+
+    stream.write_all(request.as_bytes()).map_err(|_| ())?;
+
+    // Read the full response (headers + body); cap at 64 KiB to bound
+    // allocation for an unexpectedly large reply.
+    let mut response = Vec::with_capacity(1024);
+    let mut buf = [0u8; 512];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if response.len() > 65_536 {
+                    break;
+                }
+            }
+            Err(_) => return Err(()),
+        }
+    }
+
+    // Check for HTTP 200.
+    if !response.starts_with(b"HTTP/1.1 200") && !response.starts_with(b"HTTP/1.0 200") {
+        return Err(());
+    }
+
+    // Find the header/body separator and return the body bytes.
+    let sep = b"\r\n\r\n";
+    let body_start = response
+        .windows(sep.len())
+        .position(|w| w == sep)
+        .ok_or(())?
+        + sep.len();
+
+    Ok(response[body_start..].to_vec())
 }
 
 // ── .pending/ fallback writer ──────────────────────────────────────────────────

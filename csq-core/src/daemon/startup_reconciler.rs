@@ -76,7 +76,7 @@ pub struct ReconcileSummary {
     /// Number of `config.toml` files left UNTOUCHED because the
     /// user-global `~/.codex/config.toml` is present but not valid TOML.
     /// The slot config is KEPT rather than wiped to the degraded 2-key
-    /// fallback (see `surface::regenerate_slot_config_preserving_model`).
+    /// fallback (see `surface::regenerate_slot_config`).
     pub config_tomls_skipped_malformed_global: usize,
     /// PR-C6: whether a v1→v2 `quota.json` migration ran this start.
     /// `None` means no file existed (fresh install); `Some(false)` means
@@ -1989,7 +1989,7 @@ fn pass2_codex_config_toml(base_dir: &Path, summary: &mut ReconcileSummary) {
         let toml_path = codex_surface::config_toml_path(base_dir, account);
         let existing = std::fs::read_to_string(&toml_path).ok();
 
-        match codex_surface::regenerate_slot_config_preserving_model(base_dir, account) {
+        match codex_surface::regenerate_slot_config(base_dir, account) {
             Ok(codex_surface::RegenOutcome::AlreadyCurrent) => {
                 summary.config_tomls_already_ok += 1;
             }
@@ -2006,10 +2006,14 @@ fn pass2_codex_config_toml(base_dir: &Path, summary: &mut ReconcileSummary) {
                 } else {
                     "user_global_merge_outdated"
                 };
+                // `model` is the preserved explicit per-slot model, or None when
+                // the slot defers to the user-global / codex built-in default.
                 info!(
                     account = id,
                     surface = "codex",
-                    model = %model,
+                    model = model
+                        .as_deref()
+                        .unwrap_or("(deferred-to-global-or-default)"),
                     drift_reason = drift_reason,
                     "reconciler rewrote config.toml"
                 );
@@ -2079,8 +2083,8 @@ fn has_file_backed_directive(toml: &str) -> bool {
 }
 
 // `extract_model_key` moved to `providers::codex::surface` (shared with
-// `regenerate_slot_config_preserving_model`); the reconciler now reaches
-// the re-merge through that helper.
+// `regenerate_slot_config`); the reconciler now reaches the re-merge
+// through that helper.
 
 // ─── RN1-D5b label relocation pass ───────────────────────────────────────────
 
@@ -3897,8 +3901,10 @@ mod tests {
         assert_eq!(s.codex_credentials_repaired, 0);
     }
 
-    /// Pass 2: missing config.toml is created with the default model
-    /// + the file-backed directive.
+    /// Pass 2: missing config.toml is created with the file-backed directive
+    /// but NO model key — csq no longer injects its catalog default (CC-parity;
+    /// the user-global is isolated/absent here, so nothing propagates and codex
+    /// falls back to its own built-in default).
     #[test]
     fn pass2_creates_missing_config_toml_with_directive() {
         let _env_guard = codex_user_config_isolated();
@@ -3917,8 +3923,8 @@ mod tests {
             "rewritten config.toml must carry the directive: {contents}"
         );
         assert!(
-            contents.contains("model = "),
-            "rewritten config.toml must carry a model key: {contents}"
+            !contents.contains("model ="),
+            "csq must NOT inject a catalog-default model into a fresh config.toml: {contents}"
         );
     }
 
@@ -3960,11 +3966,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         install_codex_canonical(dir.path(), 11);
 
-        // Write a correct config.toml.
+        // Write a correct config.toml with an explicit per-slot model.
         codex_surface::write_config_toml(
             dir.path(),
             AccountNum::try_from(11u16).unwrap(),
-            "gpt-keep",
+            Some("gpt-keep"),
         )
         .unwrap();
         let toml_path =
@@ -4096,7 +4102,7 @@ mod tests {
         codex_surface::write_config_toml_with_global(
             dir.path(),
             AccountNum::try_from(12u16).unwrap(),
-            "gpt-existing",
+            Some("gpt-existing"),
             Some("sandbox_mode = \"read-only\"\n"),
         )
         .unwrap();

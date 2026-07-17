@@ -112,6 +112,12 @@ pub struct VerifyPayload {
     /// Disambiguate community-absent from empty via [`VerifyPayload::edition`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification_level_summary: Option<BTreeMap<String, u64>>,
+    /// Per-record `VerificationLevel` for the record identified by `--record <id>`.
+    /// `None` (omitted) when `--record` was not supplied; `"NOT_FOUND"` when the id
+    /// was supplied but the record is absent in the chain. Community field — not
+    /// enterprise-gated. Back-compat: omitted from wire when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_verification_level: Option<String>,
     /// The build edition (`"community"` | `"enterprise"`) — the discriminant that lets
     /// a consumer interpret an omitted enterprise-only field. Supplied by the app.
     pub edition: &'static str,
@@ -137,6 +143,7 @@ mod tests {
                 failure_detail: None,
                 trust_plane_grade: None,
                 verification_level_summary: None,
+                record_verification_level: None,
                 edition: "community",
             },
         );
@@ -179,6 +186,7 @@ mod tests {
                 }),
                 trust_plane_grade: None,
                 verification_level_summary: None,
+                record_verification_level: None,
                 edition: "community",
             },
         );

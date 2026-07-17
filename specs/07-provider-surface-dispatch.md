@@ -64,7 +64,40 @@ Base layout (spec 02 §2.1) is unchanged. The following amendments describe what
 
 ### 7.2.1 `Surface::ClaudeCode`
 
-Unchanged from spec 02. `config-<N>` holds `.credentials.json`, `.csq-account`, `settings.json`, `.claude.json`. Handle dir holds symlinks + materialized `settings.json`.
+Unchanged from spec 02. `config-<N>` holds `.credentials.json`, `.csq-account`, `settings.json`, `.claude.json`. Handle dir holds symlinks + materialized `settings.json`. The one addition is the capability-layer Level-2 deviation in §7.2.1.1 below, which materializes an ephemeral `coc-plugin/` subtree under the handle dir for a single spawn (the CC carve-out to spec 02 INV-02, INV-P04).
+
+#### 7.2.1.1 Capability-layer with-layer deviation (CC native materialization)
+
+When `csq run --capability-layer` engages on a `Surface::ClaudeCode` slot, the pre-spawn pipeline returns `LayerControl::WithLayer` (`.coc/` resolved + non-empty), the `.coc/` would be injected (`should_inject_scaffold` — no competing native `.claude/`/`CLAUDE.md` at the cwd/ancestors, OR `CSQ_COC_PARITY_TEST=1`), AND at least one native-materializable artifact (agent / skill / command) is in scope, csq **materializes a session-scoped Claude Code plugin** into `term-<pid>/coc-plugin/` and points the spawned CLI at it via `claude --plugin-dir <abs>`:
+
+```
+term-<pid>/coc-plugin/                (ephemeral; one per spawn; the CC INV-02 carve-out)
+├── .claude-plugin/plugin.json        minimal fixed-field manifest {name:"csq-coc", version, description}
+├── agents/<ID>.md                    one file per in-scope agent (full body) — Task-invocable subagents
+├── skills/<ID>/SKILL.md              one dir per in-scope skill (full body) — progressive disclosure
+└── commands/<ID>.md                  one file per in-scope command (full body) — /commands
+```
+
+This is **Level-2** delivery: agents become Task-invocable subagents, skills regain progressive disclosure, and commands become `/commands` — the native CC affordances that a flattened prose blob (Level-1) cannot express. It replaces the pre-S2 behavior where the whole `.coc/` was flattened into a single `--append-system-prompt-file` blob.
+
+**Rules are materialized NATIVELY, not into the plugin.** A Claude Code plugin has no `rules/` component (verified empirically), so rules do NOT ride the `--plugin-dir` tree. Instead csq materializes each in-scope rule into the handle dir's native rules location `$CLAUDE_CONFIG_DIR/rules/coc-<ID>.md` via `csq_core::coc::translate::emit_coc_rules` (S2b) — CC reads `$CLAUDE_CONFIG_DIR/rules/` natively, so its own rules loader honors each rule's `paths:` glob file-scoping (a path-scoped rule activates only when Claude reads a matching file; an unscoped rule loads always-on). This is the ONLY channel that honors `.coc/` rule `paths:` (spec 09 §9.2.2), which was previously parsed but honored nowhere. Because the handle dir's `rules` is a `SHARED_ITEMS` symlink to the user-global `~/.claude/rules`, `csq/src/cli/commands/run.rs::materialize_native_rules` replaces it with a REAL dir that MERGES the user's global rules (copied in) with the `coc-<ID>.md` files, then re-stats the dir before spawn (TOCTOU close). On any failure it falls back to delivering rules as Level-1 prose (`rules_only_scaffold`, `csq-core/src/capability_layer/scaffold.rs`) — path-scoped rules were honored nowhere before S2b, so a failure is no regression. When rules are delivered natively, the `--append-system-prompt-file` prose carries ONLY the FR-CL-01 structured-output directive (Compliance prompts). Agents/skills/commands are delivered natively via the plugin, NOT also as prose — delivering any kind twice would double the artifact set and re-inflate the context native materialization exists to avoid.
+
+**Level-2 XOR Level-1 (mutual exclusion).** The Level-2 native path and the Level-1 full-prose path are an `if/else`, never both, so `CSQ_COC_PARITY_TEST=1` (which forces `should_inject_scaffold` true regardless of native-presence) never fires both. When there is nothing native to materialize (a rules-only `.coc/`), or a materialization error occurs, csq falls back to full Level-1 prose; when the project carries its own native `.claude/`, the scaffold is suppressed entirely (deferred to CC's own harness), byte-unchanged from pre-S2.
+
+**Emit mechanism.** `csq/src/cli/commands/run.rs::materialize_cc_coc_plugin` creates a fresh `coc-plugin/` dir (clearing any residue first) and calls the pure, deterministic `csq_core::coc::translate::emit_cc_plugin` emitter, which renders the per-kind flattened artifacts (`PreSpawnState::artifacts`, sorted `(precedence DESC, id ASC)`) into the plugin tree. The emitter validates each artifact id against a conservative filesystem-safe charset (no path separators / `.`/`..` / control bytes → no traversal outside `dest`), rejects case-insensitive filename collisions, chmods every file `0o600`, and embeds NO timestamp/env/randomness (pinned `plugin.json` version) so the tree is byte-identical cross-process (spec 10 §10.3.5). On ANY emit error the partial tree is torn down and the launch falls back to Level-1 prose (the emitter's caller-contract: partial failure leaves a partial tree the caller MUST tear down).
+
+**Post-materialization re-stat (TOCTOU close).** Immediately before `--plugin-dir` is added to the spawn, `csq/src/cli/commands/run.rs::verify_coc_plugin_dir_is_real` re-stats `term-<pid>/coc-plugin/` and refuses to spawn if it became a symlink (or is not a directory) between materialization and spawn — the same fail-closed posture as `verify_codex_handle_config_toml_is_regular_file` (§7.2.2.1). Closes the same-user-attacker window where an unlink + symlink-replace would otherwise inject attacker-controlled Task-invocable agents into the CC session.
+
+**No SHARED_ITEMS collision.** `plugins` (no hyphen) is a `SHARED_ITEMS` symlink (`csq-core/src/session/isolation.rs`: `term-<pid>/plugins` → `~/.claude/plugins`); `coc-plugin` (hyphenated) is NOT in `SHARED_ITEMS`, so the materialized path never collides with the global plugins symlink. The plugin's own name (`csq-coc`) is unique, so `--plugin-dir` loads it session-scoped alongside any globally-enabled plugins without a plugin-name clash.
+
+**Lifetime (spec 02 INV-02 carve-out — see INV-P04).** The `coc-plugin/` subtree is ephemeral: it is torn down with the rest of `term-<pid>` by the launch wrapper on process exit, with the PID-gated daemon sweep (`csq-core/src/session/handle_dir.rs::sweep_dead_handles`, spec 02 §2.5) as the crash/kill backstop — the sweeper renames to a tombstone and `remove_dir_all`s the whole handle dir, so the non-empty `coc-plugin/` subtree tears down recursively with no new teardown logic. It leaves zero durable residue and is never written into the repo tree, `.claude/`, or under `.coc/`.
+
+**Cross-references.**
+
+- `csq_core::coc::translate::emit_cc_plugin` (`csq-core/src/coc/translate/materialize.rs`) — pure emitter.
+- `csq/src/cli/commands/run.rs::materialize_cc_coc_plugin` + `verify_coc_plugin_dir_is_real` — spawn wiring + TOCTOU close.
+- `csq-core/src/capability_layer/scaffold.rs` `rules_only_scaffold` + `csq-core/src/capability_layer/state.rs` `PreSpawnState::{artifacts, rules_only_scaffold}` — the Level-2 rules-prose + per-kind channels.
+- spec 02 INV-02 + §2.5 — handle-dir ephemerality + sweep (the carve-out this deviation is granted against).
 
 ### 7.2.2 `Surface::Codex`
 
@@ -264,7 +297,7 @@ status_line = ["model-with-reasoning", "context-remaining", "git-branch", "curre
 
 Contract (`csq-core/src/providers/codex/surface.rs::inject_default_status_line`):
 
-- **Categories.** Three classes of `config.toml` keys: (1) **csq-controlled** (`cli_auth_credentials_store`, `model`) — csq always wins; (2) **user-propagated** — every other user-global top-level key passes through verbatim; (3) **csq-default-if-absent** — `tui.status_line` is filled ONLY when the user has not set it.
+- **Categories.** Three classes of `config.toml` keys: (1) **csq-controlled** (`cli_auth_credentials_store` only) — csq always wins; (2) **user-propagated** — every other user-global top-level key passes through verbatim, INCLUDING `model` (CC-parity — csq does not own the model key; a user-global `model` reaches the slot directly, and absent that codex uses its own built-in default). An explicit per-slot model set via `csq models set codex <id> --slot N` is written by csq and overrides the propagated user-global `model`; (3) **csq-default-if-absent** — `tui.status_line` is filled ONLY when the user has not set it.
 - **User-wins-if-present.** A user's own `tui.status_line` (set via codex `/statusline` or by hand) is never overwritten — unlike categories (1). The item array mirrors what csq surfaces for `Surface::ClaudeCode` (model, context, git, dir).
 - **Table-aware merge.** Injection resolves or creates the `[tui]` table and adds `status_line` only when absent, preserving sibling `[tui]` keys (e.g. `status_line_use_colors`). A non-table `tui` value (malformed user config) is left untouched (no clobber, no panic). Output is always valid TOML.
 - **All write paths.** Applies on every `write_config_toml` call (login §7.3.3, daemon startup reconciler, model-switch), so every codex slot — including one with no `~/.codex/config.toml` — gets the footer.
@@ -315,12 +348,11 @@ Unchanged: API-key capture into `config-<N>/settings.json` under `env.ANTHROPIC_
 Ordered sequence (any deviation is a spec violation):
 
 1. `mkdir -p config-<N>/` and `mkdir -p config-<N>/codex-sessions/`.
-2. Write `config-<N>/config.toml` via `codex::surface::render_config_toml_with_global`. The csq-controlled head is always:
+2. Write `config-<N>/config.toml` via `codex::surface::render_config_toml_with_global` (login passes `model = None`). The csq-controlled head is always:
    ```toml
    cli_auth_credentials_store = "file"
-   model = "<default-model>"
    ```
-   plus (a) every non-csq-controlled top-level key propagated verbatim from `~/.codex/config.toml`, and (b) csq's curated default `tui.status_line` (see §7.2.2.2). This MUST happen BEFORE step 3. Rationale: without this file, `codex login` uses the keychain default and writes a credential entry under `com.openai.codex` keychain service; a later csq rewrite of `config.toml` does not retroactively move the token to a file.
+   (NO `model` key at login — CC-parity; csq does not force a model) plus (a) every non-csq-controlled top-level key propagated verbatim from `~/.codex/config.toml` — INCLUDING `model` — and (b) csq's curated default `tui.status_line` (see §7.2.2.2). This MUST happen BEFORE step 3. Rationale: without this file, `codex login` uses the keychain default and writes a credential entry under `com.openai.codex` keychain service; a later csq rewrite of `config.toml` does not retroactively move the token to a file.
 3. Shell out: `CODEX_HOME=config-<N> codex login --device-auth`. User completes device code in browser.
 4. On success, codex writes `config-<N>/auth.json`. Daemon moves it to `credentials/codex-<N>.json` (atomic rename), then replaces `config-<N>/auth.json` with `codex-auth.json → ../credentials/codex-<N>.json` symlink.
 5. Flip `credentials/codex-<N>.json` mode to `0400` outside refresh windows.
@@ -572,7 +604,7 @@ On the v2.1 release that flips write path, daemon startup: (a) reads quota.json,
 
 **INV-P04: Handle dir persistence carveouts are surface-dispatched.**
 
-- `Surface::ClaudeCode`: no per-terminal persistent state; `history/`, `sessions/` etc. symlink to `~/.claude` (spec 02 §2.1.3).
+- `Surface::ClaudeCode`: no per-terminal persistent state; `history/`, `sessions/` etc. symlink to `~/.claude` (spec 02 §2.1.3). **Ephemeral carve-out (S2):** under the capability-layer Level-2 with-layer deviation (§7.2.1.1), a single spawn materializes a real (non-symlink) `coc-plugin/` subtree in the handle dir — the ONE non-`settings.json` real-content exception to spec 02 INV-02's "settings.json only" base invariant, held for exactly the life of the spawn. It carries NO persistent state (it is re-derived from `.coc/` on every launch) and is swept whole by daemon sweep / wrapper-on-exit with the rest of `term-<pid>`.
 - `Surface::Codex`: `sessions/` and `history.jsonl` symlink to `config-<N>/codex-sessions/` and `config-<N>/codex-history.jsonl`. Daemon sweep of handle dir MUST NOT dereference these symlinks.
 - `Surface::Gemini`: `shell_history` and `tmp/` symlink to `config-<N>/gemini-state/`. Same sweep guarantee.
 
@@ -696,3 +728,4 @@ These are items that MUST be resolved (verified or decided) before the first Cod
 - 1.5.0 — Spec-accuracy wave: §7.2.3.1 socket-path helper citation corrected to `csq_core::daemon::paths::socket_path(base_dir)` (daemon/paths.rs). §7.2.3.2 bench-reset citation corrected to the shipped inline removal at `csq/src/cli/commands/login.rs::reset_handle_dir_gemini`. All `csq-cli/src/commands/` paths migrated to `csq/src/cli/commands/` (crate merge). No contract change.
 - 1.5.1 — Split-state purge: INV-P01 contingency bullet rewritten present-state — the interposition design is recorded as a conditional contingency, not a tracked follow-up. No shipped behavior changed.
 - 1.6.0 — Codex statusline configuration. New §7.2.2.2: `render_config_toml_with_global` injects a curated default `[tui] status_line` (`model-with-reasoning` / `context-remaining` / `git-branch` / `current-dir`) into the slot `config.toml` when the user has not set one — codex renders its native footer from it (openai/codex an internal ticket; no external-command hook exists, so a csq-rendered codex line awaits the unshipped openai/codex #17827). §7.3.3 step 2 references the full render. User-wins-if-present; table-aware merge preserves sibling `[tui]` keys; non-table `tui` left untouched. Verified against codex-cli 0.142.3.
+- 1.7.0 — Codex model de-pin (CC-parity). `model` REMOVED from the csq-controlled key set (§7.2.2 categories + §7.3.3 step 2): csq no longer forces a model at login; a user-global `~/.codex` `model` propagates and, absent that, codex uses its built-in default. `render_config_toml_with_global` / `write_config_toml` / `regenerate_slot_config` take `model: Option<&str>`; login/spawn/reconciler pass `None`, explicit `csq models set codex <id> --slot N` passes `Some(m)` (durable per-slot override). The model value is toml-serialized to prevent injection. Also: `csq run` no longer injects the flattened `.coc/` scaffold into a native CLI when that surface's native artifacts (`.claude/`/`.codex/`/`.gemini/` or `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`) are present at cwd-or-ancestor — the native CLI loads its own; `CSQ_COC_PARITY_TEST=1` forces injection.

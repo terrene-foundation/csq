@@ -121,6 +121,7 @@ pub mod export;
 /// committed chain for INTENT records with no matching OUTCOME.
 pub mod intent_scan;
 pub mod key_custody;
+
 /// Shared, edition-neutral on-disk subdir NAMES for the durable outboxes —
 /// read by the community `doctor`, written by the (gated) producers. Non-gated
 /// so the community build can reference the directory names it must scan.
@@ -221,10 +222,10 @@ pub use types::{
     ChainContinuationPayload, ChainReGenesisPayload, CsqRunPayload, EatpActor,
     EatpAttestationPayload, EatpAuthority, EatpTrust, Ed25519PublicKey, Ed25519Signature,
     EventKind, EventPayload, IdError, IdentityMintPayload, KeyId, KeyRotatePayload, LedgerError,
-    ModelInvokePayload, OAuthRefreshPayload, OpOutcome, OpPhase, OutputCapturePayload, RecordId,
-    RedactedString, ReleaseAuthPayload, ReplicationAckPayload, ReplicationFailedPayload,
-    RotationReason, Sha256Hex, SignedRecord, SigningError, SinkDriftDetectedPayload, SinkError,
-    SinkId, SinkName, SinkReceipt,
+    ModelInvokePayload, OAuthRefreshPayload, OpOutcome, OpPhase, OrgRootCeremonyPayload,
+    OutputCapturePayload, RecordId, RedactedString, ReleaseAuthPayload, ReplicationAckPayload,
+    ReplicationFailedPayload, RotationReason, SeatKeyReanchorPayload, Sha256Hex, SignedRecord,
+    SigningError, SinkDriftDetectedPayload, SinkError, SinkId, SinkName, SinkReceipt,
 };
 // M04 public surface — key custody operations.
 pub use key_custody::{

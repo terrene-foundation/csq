@@ -3,13 +3,14 @@ resolver = "2"
 members = [
   "csq-core",
   "csq",                      # Single-binary csq (an internal ticket).
+  "csq-merkle",              # #980 RFC 6962 Merkle verifier leaf (dep of BOTH csq-ledger AND csq-core; breaks the csq-core↔csq-ledger cycle).
   "csq-redact",              # W1 community leaf: token redaction + RedactedString (dep of csq-sdk).
   "csq-sdk",                 # W2 public wire contract: SDK envelope/error/adapter + payload DTOs.
   "csq-ledger",              # M10 Foundation-owned transparency-log server.
 ]
 
 [workspace.package]
-version = "2.17.1"
+version = "2.18.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/terrene-foundation/csq"
@@ -26,13 +27,20 @@ repository = "https://github.com/terrene-foundation/csq"
 # NOT these dep literals (nor the enterprise SDK crate's `=X.Y.Z` pin), so the
 # `version_pins_match_workspace` test in the enterprise SDK crate fails closed on drift
 # until W5 automates the bump — do NOT trust the /release flow to keep these in sync.
-csq-redact = { path = "csq-redact", version = "2.17.1" }
+csq-redact = { path = "csq-redact", version = "2.18.0" }
 # csq-sdk — public (Apache-2.0) SDK wire contract (W2): envelope/error/adapter +
 # payload DTOs. csq-core depends on it and re-exports it (crate::sdk::*); the
 # builders (EDITION + audit->DTO mapping) live app-side in csq-core. `version`
 # alongside `path` for the same publishability reason as csq-redact above; the same
 # `version_pins_match_workspace` guard covers this literal.
-csq-sdk = { path = "csq-sdk", version = "2.17.1" }
+csq-sdk = { path = "csq-sdk", version = "2.18.0" }
+# csq-merkle — #980 RFC 6962 Merkle verifier leaf crate (publish=false). Both
+# csq-ledger AND csq-core depend on it; no `version` alongside `path` is needed
+# because it is not published and no publishable (OPEN) crate depends on it — it
+# is PROPRIETARY (publish=false) reached only by PROPRIETARY crates, the allowed
+# edition-boundary direction. Zero enterprise deps, so csq-core → csq-merkle is
+# not a moat edge; ships to community (COMMUNITY_SHIPPED_PROPRIETARY).
+csq-merkle = { path = "csq-merkle" }
 serde = { version = "1", features = ["derive"] }
 # `raw_value` enables `serde_json::value::RawValue` — verbatim JSON capture used
 # by the audit-chain forward-compat path (`csq-core/src/audit/opaque.rs`) to
@@ -61,6 +69,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "registry", "std", "ansi", "smallvec"] }
 hex = "0.4"
 sha2 = "0.10"
+# HKDF (RFC 5869) over SHA-256 — RustCrypto family, consistent with the existing
+# aes-gcm / sha2 / ed25519-dalek set (no FFI, audited pure Rust). Used by M-DEK's
+# enterprise-only org-root ceremony to derive the org KEK from the XOR of the
+# participants' entropy shares. Already present transitively (Cargo.lock); promoting
+# to a direct workspace dep gives a stable public API surface and one version pin.
+hkdf = "0.12"
 unicode-normalization = "0.1"
 secrecy = { version = "0.10", features = ["serde"] }
 libc = "0.2"
@@ -90,7 +104,11 @@ tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
 getrandom = "0.2"
 security-framework = "3"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+# `zeroize` pins the SigningKey seed-scrub-on-drop guarantee that M-DEK's seat
+# DEK custody (`audit::key_hierarchy`) and every other Ed25519 seed holder rely
+# on — declared here rather than left to cross-crate feature unification, so the
+# property cannot silently vanish if another crate drops the feature.
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 # Gemini PR-G2a — encryption-at-rest primitives for the platform::secret
 # fallback path (Linux without Secret Service / explicit opt-in). RustCrypto
 # audited pure Rust; no FFI. argon2 is OWASP 2023 KDF; aes-gcm is the AEAD.
@@ -149,6 +167,27 @@ keyring = { version = "3", features = ["apple-native", "windows-native"] }
 # Optional — compiled only in enterprise builds (csq-core `enterprise` feature).
 # Pure-Rust; no C FFI added to the build graph.
 jsonschema = { version = "0.46", default-features = false }
+
+# ── Build-cache hygiene: bounded sccache instead of unbounded incremental ──────
+# Cargo's per-crate incremental cache grows WITHOUT BOUND across this workspace's
+# many build configurations (check / clippy / nextest / doc / feature matrices /
+# --no-default-features), because Cargo's built-in cleanup barely prunes it — a
+# single machine accumulated 16k+ incremental dirs (100s of GB) in days.
+#
+# Crucially, incremental compilation DISABLES sccache: sccache bails on incremental
+# builds, so with incremental ON the (already-wired) `rustc-wrapper = sccache` in
+# `~/.cargo/config.toml` never caches anything — the same bounded, content-addressed
+# cache CI uses is left idle while the unbounded incremental path balloons.
+#
+# Turning incremental OFF for dev/test lets sccache actually cache, capping the
+# on-disk cache to tens of GB (CI builds this workspace in ~7 GB via sccache).
+# Trade-off: a warm single-crate rebuild is slightly slower, offset by sccache +
+# the targeted `cargo <cmd> -p <crate>` builds this repo already mandates.
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false
 
 [workspace.lints.rust]
 unexpected_cfgs = "allow"

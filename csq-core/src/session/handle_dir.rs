@@ -3511,6 +3511,78 @@ mod tests {
         assert!(removed >= 1);
     }
 
+    /// S2 (an internal ticket): a dead handle dir carrying a non-empty ephemeral
+    /// `coc-plugin/` subtree (the CC Level-2 native-materialization surface) is
+    /// swept whole — `sweep_dead_handles` renames to a tombstone + recursive
+    /// `remove_dir_all`, so the plugin tree tears down with the rest of
+    /// `term-<pid>` (spec 07 §7.2.1.1 lifetime guarantee; no new teardown logic).
+    #[test]
+    fn sweep_removes_dead_handle_with_coc_plugin_subtree() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let dead = base.join("term-999999999");
+        // Populate a realistic coc-plugin/ tree: manifest + one agent/skill/command.
+        std::fs::create_dir_all(dead.join("coc-plugin").join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(dead.join("coc-plugin").join("agents")).unwrap();
+        std::fs::create_dir_all(dead.join("coc-plugin").join("skills").join("SKILL-Z")).unwrap();
+        std::fs::create_dir_all(dead.join("coc-plugin").join("commands")).unwrap();
+        std::fs::write(
+            dead.join("coc-plugin")
+                .join(".claude-plugin")
+                .join("plugin.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(
+            dead.join("coc-plugin").join("agents").join("AGENT-Y.md"),
+            b"a",
+        )
+        .unwrap();
+        std::fs::write(
+            dead.join("coc-plugin")
+                .join("skills")
+                .join("SKILL-Z")
+                .join("SKILL.md"),
+            b"s",
+        )
+        .unwrap();
+        std::fs::write(
+            dead.join("coc-plugin").join("commands").join("CMD-W.md"),
+            b"c",
+        )
+        .unwrap();
+        std::fs::write(dead.join(".live-pid"), "999999999").unwrap();
+
+        // Red-team R1 (deep-analyst): a symlink planted INSIDE coc-plugin must be
+        // removed as a LINK, not followed out of the tree — the recursive
+        // teardown the CC carve-out (spec 07 §7.2.1.1) depends on must not
+        // dereference an interior symlink and delete external content.
+        #[cfg(unix)]
+        let external = {
+            let ext = base.join("external-keep");
+            std::fs::create_dir(&ext).unwrap();
+            std::fs::write(ext.join("precious.txt"), b"do not delete").unwrap();
+            std::os::unix::fs::symlink(&ext, dead.join("coc-plugin").join("escape-link")).unwrap();
+            ext
+        };
+
+        let removed = sweep_dead_handles(base, Some(&claude_home));
+
+        assert!(
+            !dead.exists(),
+            "dead handle dir with a non-empty coc-plugin/ subtree must be swept whole"
+        );
+        #[cfg(unix)]
+        assert!(
+            external.join("precious.txt").exists(),
+            "sweep must NOT follow an interior coc-plugin symlink and delete external content"
+        );
+        assert!(removed >= 1);
+    }
+
     #[test]
     fn sweep_ignores_config_dirs() {
         let dir = TempDir::new().unwrap();
@@ -4849,7 +4921,7 @@ mod tests {
         std::fs::write(config_dir.join(".csq-account"), account_num.to_string()).unwrap();
         std::fs::create_dir_all(config_dir.join("codex-sessions")).unwrap();
         std::fs::write(config_dir.join("codex-history.jsonl"), "").unwrap();
-        codex_surface::write_config_toml(base, account, "gpt-test-model").unwrap();
+        codex_surface::write_config_toml(base, account, Some("gpt-test-model")).unwrap();
 
         // Build the handle dir with the codex symlink set.
         let handle = create_handle_dir_codex(base, account, 88891).unwrap();

@@ -175,7 +175,7 @@ fn home_dir() -> Option<std::path::PathBuf> {
     }
     #[cfg(windows)]
     {
-        return std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
     }
     #[cfg(not(windows))]
     {

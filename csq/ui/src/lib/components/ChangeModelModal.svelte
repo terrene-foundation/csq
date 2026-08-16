@@ -23,7 +23,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { homeDir, join } from '@tauri-apps/api/path';
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
 
   interface Props {
     isOpen: boolean;
@@ -296,6 +296,80 @@
     }
   });
 
+  // ── F4 (i-audit/i-harden) — Escape, focus trap, initial focus ──
+  // Same dead-Escape mechanism an internal ticket fixed in AddAccountModal: the
+  // backdrop's onkeydown handled Escape, but `.modal`'s own onkeydown
+  // called `e.stopPropagation()` — keydown bubbles from the focused
+  // element upward, so any focus inside the modal (every real
+  // interaction) never reached the backdrop handler. Fixed the same
+  // way — a document-level keydown effect mirroring
+  // SettingsPopover.svelte's established pattern, extended with a Tab
+  // focus trap + initial-focus move. This is a SEPARATE effect from
+  // the `wasOpen` load-on-open effect above: it only reads `isOpen`
+  // (never `wasOpen`/`modalState`), so it can't self-invalidate the
+  // way an internal journal entry's bug did (svelte-patterns.md Rule 5).
+  let modalEl: HTMLDivElement | undefined = $state();
+  let previouslyFocusedEl: HTMLElement | null = null;
+
+  function focusableElements(container: HTMLElement): HTMLElement[] {
+    // No visibility filter needed: every modalState.kind branch below
+    // is a Svelte `{#if}` block, which removes inactive-state markup
+    // from the DOM rather than hiding it via CSS.
+    return Array.from(
+      container.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea:not([disabled]), ' +
+          'input:not([disabled]), select:not([disabled]), ' +
+          '[tabindex]:not([tabindex="-1"])',
+      ),
+    );
+  }
+
+  $effect(() => {
+    if (!isOpen) return;
+
+    previouslyFocusedEl = document.activeElement as HTMLElement | null;
+    // Move focus into the dialog once it has rendered. `modalEl`
+    // carries `tabindex="-1"` so it accepts programmatic focus even
+    // while modalState is still 'loading' (no focusable descendant).
+    void tick().then(() => modalEl?.focus());
+
+    function handleKeydown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        close();
+        return;
+      }
+      if (e.key !== 'Tab' || !modalEl) return;
+      const focusables = focusableElements(modalEl);
+      if (focusables.length === 0) {
+        // Nothing to cycle through — keep focus pinned on the dialog
+        // itself rather than letting Tab escape to the page behind it.
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      const outsideTrap = !active || !modalEl.contains(active);
+      if (e.shiftKey) {
+        if (active === first || outsideTrap) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || outsideTrap) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener('keydown', handleKeydown);
+    return () => {
+      document.removeEventListener('keydown', handleKeydown);
+      // Restore focus to whatever had it before the dialog opened.
+      previouslyFocusedEl?.focus();
+      previouslyFocusedEl = null;
+    };
+  });
+
   async function submit() {
     // H1 guard: reject the second click of a rapid double-submit.
     // The first click flips `submitting = true`; subsequent clicks
@@ -408,8 +482,40 @@
 </script>
 
 {#if isOpen}
-  <div class="backdrop" onclick={close} onkeydown={(e) => { if (e.key === 'Escape') close(); }} role="button" tabindex="-1">
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="change-model-title" tabindex="-1">
+  <div
+    class="backdrop"
+    onclick={close}
+    onkeydown={(e) => {
+      // svelte a11y_click_events_have_key_events wants keyboard parity
+      // for the click-to-dismiss behavior — Enter/Space mirror the
+      // click. Escape is intentionally NOT handled here (see the
+      // document-level effect above): a bubble-phase handler on an
+      // ancestor of the focused element is exactly the pattern that
+      // made Escape dead before this fix, so dismissal-by-Escape must
+      // not depend on where focus happens to be.
+      if (e.key === 'Enter' || e.key === ' ') close();
+    }}
+    role="button"
+    tabindex="-1"
+  >
+    <div
+      class="modal"
+      bind:this={modalEl}
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={() => {
+        // Intentional no-op — present only to satisfy
+        // a11y_click_events_have_key_events for the sibling onclick
+        // (which stops a click INSIDE the modal from bubbling to the
+        // backdrop's dismiss-on-click). Must NOT call
+        // stopPropagation: that was the F4 bug — it silently killed
+        // Escape (and would kill this Tab-trap effect's own listener)
+        // for any focus inside the modal, which is every real use.
+      }}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="change-model-title"
+      tabindex="-1"
+    >
       <header>
         <h2 id="change-model-title">
           {#if surface === 'codex'}

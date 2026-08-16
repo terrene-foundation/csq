@@ -79,6 +79,24 @@ pub struct SweeperSnapshot {
     /// Number of files currently blocked by Windows `ERROR_SHARING_VIOLATION`
     /// for `>= SHARING_VIOLATION_RETRY_LIMIT` consecutive ticks.
     pub cache_sweep_blocked: u64,
+    /// `true` when the roots-seen FIFO did not exist at the last tick, i.e. the
+    /// sweeper had NO input rather than nothing to do.
+    ///
+    /// This distinction is the diagnostic that was missing. `read_roots_seen`
+    /// returns `Ok(vec![])` for an absent file, so a sweeper pointed at the
+    /// WRONG path reported exactly the same healthy snapshot as a correctly
+    /// wired one with no work to do: `files_swept_last_run: 0`, no error, a
+    /// fresh `last_sweep_at`. That is precisely how a sweeper reading a path
+    /// nothing writes stayed invisible from the day it shipped — `csq doctor`
+    /// said `ok` the whole time. When this is `true` the doctor reports
+    /// `degraded` so the next path drift surfaces immediately instead of
+    /// hiding behind a green block.
+    ///
+    /// `#[serde(default)]` keeps older on-disk snapshots readable (they parse
+    /// as `false`, the honest answer for a snapshot written before this
+    /// existed).
+    #[serde(default)]
+    pub roots_source_missing: bool,
 }
 
 /// Mutable state shared between the spawned tick task and the doctor
@@ -104,18 +122,97 @@ pub struct SweeperHandle {
     pub state: Arc<Mutex<SweeperState>>,
 }
 
+/// The canonical roots-seen FIFO path: `~/.csq/coc-roots-seen.jsonl`.
+///
+/// **This is the ONE resolver for both sides of the contract** — the `csq run`
+/// WRITER (`record_root_seen`) and the daemon-side sweeper READER. Returns
+/// `None` only when the home directory cannot be resolved.
+///
+/// It exists because the two sides drifted: the writer resolved
+/// `~/.csq/coc-roots-seen.jsonl` (spec 04 §4.2.6 / spec 10 §10.9.3 — "the sole
+/// roots authority") while both daemon twins read
+/// `<base_dir>/coc-roots-seen.jsonl` (i.e. `~/.claude/accounts/`). Those paths
+/// never coincide in production, so the sweeper read a file nothing writes and
+/// swept nothing, for every user, since it shipped. The defect was invisible
+/// because a missing roots file is indistinguishable from "no roots yet": the
+/// tick still ran, still wrote a state file, and still reported success with
+/// `files_swept_last_run: 0`.
+///
+/// Route BOTH sides through here. A hardcoded join on either side re-opens the
+/// drift — and because the two sides are now the SAME function, they cannot
+/// disagree even if the home-resolution strategy changes later.
+///
+/// Home resolution follows the `csq-core` convention (`$HOME`, then
+/// `%USERPROFILE%`), which also makes the path redirectable in a sandboxed
+/// `HOME=$(mktemp -d)` smoke test.
+pub fn default_roots_seen_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())?;
+    Some(
+        PathBuf::from(home)
+            .join(".csq")
+            .join("coc-roots-seen.jsonl"),
+    )
+}
+
+/// [`default_roots_seen_path`] with a loud, inert fallback for the daemon spawn
+/// sites — the ONE place the fallback is decided, so the two twins cannot pick
+/// different ones.
+///
+/// When the home directory cannot be resolved there is no correct roots path:
+/// the `csq run` writer also gives up in that case (it logs and returns without
+/// writing), so no file exists to read under any path. We still return a path
+/// so the subsystem is spawned and the twin sets stay identical, but we WARN —
+/// the previous behavior silently used `<base_dir>/coc-roots-seen.jsonl`, which
+/// is precisely the wrong path this fix removed, and a future reader grepping
+/// for that string would be led straight back to the bug.
+pub fn roots_seen_path_or_inert(base_dir: &Path) -> PathBuf {
+    match default_roots_seen_path() {
+        Some(p) => p,
+        None => {
+            warn!(
+                error_kind = "coc_roots_seen_home_unresolved",
+                "coc-cache-sweep: home directory unresolved; the sweeper will find no \
+                 roots this session (the `csq run` writer cannot record any either)"
+            );
+            base_dir.join("coc-roots-seen.jsonl")
+        }
+    }
+}
+
 /// Spawns the daemon-side parse-cache sweeper.
 ///
-/// `roots_seen_path` points at `~/.csq/coc-roots-seen.jsonl`; pass an
-/// explicit override path during testing. The sweeper runs immediately
-/// (one tick at startup) and then every `TICK_INTERVAL` until cancelled.
-pub fn spawn(roots_seen_path: PathBuf, shutdown: CancellationToken) -> SweeperHandle {
-    spawn_with_config(roots_seen_path, shutdown, TICK_INTERVAL, PER_TICK_BUDGET)
+/// `roots_seen_path` points at [`default_roots_seen_path`] in production; pass
+/// an explicit override path during testing.
+///
+/// `state_dir` is where the doctor-visible `coc-cache-sweeper-state.json`
+/// snapshot is written — it is the daemon `base_dir`, NOT the roots file's
+/// parent. The two are deliberately decoupled: `csq doctor` reads the snapshot
+/// via `state_file_path(base_dir)`, so deriving it from the roots path (which
+/// lives under `~/.csq/`) would silently move the snapshot out from under the
+/// doctor and make `cache_sweeper` report `never_run` forever.
+///
+/// The sweeper skips the immediate tick and then runs every `TICK_INTERVAL`
+/// until cancelled.
+pub fn spawn(
+    roots_seen_path: PathBuf,
+    state_dir: PathBuf,
+    shutdown: CancellationToken,
+) -> SweeperHandle {
+    spawn_with_config(
+        roots_seen_path,
+        state_dir,
+        shutdown,
+        TICK_INTERVAL,
+        PER_TICK_BUDGET,
+    )
 }
 
 /// Like [`spawn`] but with explicit timing for tests.
 pub fn spawn_with_config(
     roots_seen_path: PathBuf,
+    state_dir: PathBuf,
     shutdown: CancellationToken,
     interval: Duration,
     per_tick_budget: Duration,
@@ -123,19 +220,28 @@ pub fn spawn_with_config(
     let state = Arc::new(Mutex::new(SweeperState::default()));
     let task_state = Arc::clone(&state);
 
-    // Persist the snapshot to a sibling file so `csq doctor --json` can
-    // read it without an IPC round-trip. The base_dir for the state file
-    // is the parent of `roots_seen_path` (typically `~/.csq/`).
-    let state_path = roots_seen_path
-        .parent()
-        .map(state_file_path)
-        .unwrap_or_else(|| PathBuf::from("coc-cache-sweeper-state.json"));
+    // Persist the snapshot so `csq doctor --json` can read it without an IPC
+    // round-trip. It goes under `state_dir` (the daemon base_dir) because that
+    // is where `csq doctor` looks — `state_file_path(base_dir)`. Deriving it
+    // from `roots_seen_path.parent()` (the old behavior) coupled the snapshot's
+    // location to the roots file's location, so correcting the roots path would
+    // have moved the snapshot to `~/.csq/` and left the doctor reporting
+    // `never_run` indefinitely.
+    let state_path = state_file_path(&state_dir);
 
     let join = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // First tick fires immediately by default. Skip the immediate
-        // tick and then run on cadence so a freshly-started daemon does
-        // not pay the sweep cost during startup-critical operations.
+        // `interval_at(now + interval, ...)` is what actually defers the first
+        // tick. `tokio::time::interval` ALWAYS completes its first tick
+        // immediately, and `set_missed_tick_behavior` governs only what happens
+        // after a MISSED deadline — `Delay` is already the default and skips
+        // nothing. The old code set it and claimed in a comment that the
+        // startup tick was skipped; it never was. That was free while the
+        // sweeper was inert (it found no roots and did no work), but with the
+        // roots path fixed the first tick is a real multi-root walk that would
+        // otherwise run milliseconds after daemon start, concurrently with
+        // credential refresh — the exact startup contention this daemon
+        // workstream exists to avoid.
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -144,7 +250,27 @@ pub fn spawn_with_config(
                     return;
                 }
                 _ = ticker.tick() => {
-                    let _ = run_once(&roots_seen_path, &task_state, per_tick_budget);
+                    // `run_once` is synchronous filesystem I/O with a 30s
+                    // wall-clock budget. Running it inline would occupy a
+                    // runtime worker for that budget — one of only two on the
+                    // daemon runtime — starving the refresher. The module
+                    // header's "never on the daemon main loop" claim is only
+                    // true with this `spawn_blocking`; `tokio::spawn` alone
+                    // puts it on the shared worker pool. Raced against
+                    // shutdown so a slow sweep cannot delay teardown
+                    // (mirrors `usage_ledger_writer`).
+                    let roots = roots_seen_path.clone();
+                    let st = Arc::clone(&task_state);
+                    let sweep = tokio::task::spawn_blocking(move || {
+                        let _ = run_once(&roots, &st, per_tick_budget);
+                    });
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            debug!("coc-cache-sweep: shutdown during sweep, exiting");
+                            return;
+                        }
+                        _ = sweep => {}
+                    }
                     let snap = task_state
                         .lock()
                         .map(|s| s.snapshot())
@@ -219,6 +345,18 @@ pub fn run_once(
         s.partial_cursor.unwrap_or(0)
     };
 
+    // Distinguish "no input" from "nothing to do" — see `roots_source_missing`.
+    // A sweeper wired to the wrong path is indistinguishable from an idle one
+    // without this, which is how the wrong path survived undetected.
+    let roots_source_missing = !roots_seen_path.exists();
+    if roots_source_missing {
+        warn!(
+            error_kind = "coc_roots_seen_absent",
+            "coc-cache-sweep: roots file {} does not exist — the sweeper has NO input \
+             (this is not the same as having nothing to sweep); csq doctor reports degraded",
+            roots_seen_path.display()
+        );
+    }
     let entries = read_roots_seen(roots_seen_path)?;
     let mut swept: u64 = 0;
     let mut skipped: u64 = 0;
@@ -270,6 +408,7 @@ pub fn run_once(
             files_swept_last_run: swept,
             files_skipped_last_run: skipped,
             cache_sweep_blocked: blocked,
+            roots_source_missing,
         };
     }
 
@@ -311,15 +450,63 @@ pub fn is_parsed_cache_filename(s: &str) -> bool {
 }
 
 fn sweep_root(coc_root: &Path, state: &Arc<Mutex<SweeperState>>) -> std::io::Result<(u64, u64)> {
-    let cache_dir = coc_root.join(".cache");
-    if !cache_dir.exists() {
-        return Ok((0, 0));
-    }
+    // Dead-root pruning MUST precede the `.cache` existence check: a root whose
+    // directory is gone also has no `.cache`, so the old ordering returned
+    // early and the retry-map entries for that root were never reclaimed.
     if !coc_root.is_dir() {
         // Root no longer exists; clear sharing-violation entries that point at it.
         let mut s = state.lock().expect("sweeper state poisoned");
         s.sharing_violation_retries
             .retain(|p, _| !p.starts_with(coc_root));
+        return Ok((0, 0));
+    }
+
+    // Containment guards. `coc_root` comes from a JSON file on disk and is used
+    // unnormalized, and `exists()`/`read_dir()` both FOLLOW symlinks — so a
+    // symlinked root or `.cache` would redirect the delete walk into the link's
+    // target. The filename predicate still bounds what can be removed, but the
+    // sibling handle-dir sweep already refuses symlinked sources for exactly
+    // this reason ("prevents a poisoned handle dir from redirecting us
+    // elsewhere via a symlink"); this deleter deserves the same treatment now
+    // that it actually runs.
+    //
+    // Requiring a real `.coc/` directory is the strongest of the three: it
+    // narrows the sweep from "any recorded directory" to "directories that are
+    // genuinely COC roots". That matters because the `.coc/` resolver walks
+    // upward, so a user with a global `~/.coc/` legitimately records `$HOME` as
+    // a root — which would otherwise put `~/.cache/` (the shared XDG cache dir
+    // on Linux) in scope.
+    if !coc_root.is_absolute() {
+        return Ok((0, 0));
+    }
+    let is_symlink = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+    };
+    if is_symlink(coc_root) {
+        warn!(
+            error_kind = "coc_cache_sweep_symlinked_root",
+            "coc-cache-sweep: refusing symlinked root {}",
+            coc_root.display()
+        );
+        return Ok((0, 0));
+    }
+    if !coc_root.join(".coc").is_dir() {
+        // Not a COC root (or its .coc/ was removed) — nothing here is ours.
+        return Ok((0, 0));
+    }
+
+    let cache_dir = coc_root.join(".cache");
+    if !cache_dir.exists() {
+        return Ok((0, 0));
+    }
+    if is_symlink(&cache_dir) {
+        warn!(
+            error_kind = "coc_cache_sweep_symlinked_cache_dir",
+            "coc-cache-sweep: refusing symlinked .cache under {}",
+            coc_root.display()
+        );
         return Ok((0, 0));
     }
 
@@ -834,5 +1021,203 @@ mod tests {
         // than appending a duplicate.
         assert_eq!(entries.len(), 1);
         assert!(entries[0].last_seen > 0);
+    }
+
+    // ── Writer/reader path agreement ────────────────────────────────────────
+    //
+    // The sweeper was inert for every user from the day it shipped: `csq run`'s
+    // `record_root_seen` wrote `~/.csq/coc-roots-seen.jsonl` (spec 04 §4.2.6 —
+    // "the sole roots authority") while both daemon twins read
+    // `<base_dir>/coc-roots-seen.jsonl`. Nothing failed: a missing roots file
+    // is indistinguishable from "no roots recorded yet", so every tick reported
+    // success with `files_swept_last_run: 0`. Both sides now route through
+    // `default_roots_seen_path`.
+
+    /// The canonical roots path is under `~/.csq/`, NOT the daemon `base_dir`
+    /// (`~/.claude/accounts/`). A change back to base_dir re-breaks the writer
+    /// agreement and re-renders the sweeper inert.
+    #[test]
+    fn default_roots_seen_path_is_dot_csq_not_base_dir() {
+        let p = default_roots_seen_path().expect("HOME must resolve in the test env");
+        assert!(
+            p.ends_with(".csq/coc-roots-seen.jsonl"),
+            "canonical roots path must be <home>/.csq/coc-roots-seen.jsonl, got {}",
+            p.display()
+        );
+        assert!(
+            !p.to_string_lossy().contains(".claude"),
+            "roots path must NOT live under the daemon base_dir (~/.claude/accounts) — \
+             that is the drift that made the sweeper inert; got {}",
+            p.display()
+        );
+    }
+
+    /// What the writer produces at the canonical path is what the reader parses.
+    /// Exercises the real `append_root_seen` → `read_roots_seen` contract at the
+    /// canonical FILE NAME, so a rename on either side is caught.
+    #[test]
+    fn writer_output_at_canonical_filename_is_readable_by_the_sweeper_reader() {
+        let tmp = TempDir::new().unwrap();
+        let canonical_name = default_roots_seen_path()
+            .expect("HOME must resolve")
+            .file_name()
+            .expect("canonical path must have a file name")
+            .to_owned();
+        let path = tmp.path().join(canonical_name);
+
+        append_root_seen(&path, Path::new("/repo-agreement")).unwrap();
+
+        let entries = read_roots_seen(&path).expect("reader must parse the writer's output");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].coc_root, "/repo-agreement");
+    }
+
+    /// The doctor-visible state snapshot lands under `state_dir` (the daemon
+    /// base_dir), NOT next to the roots file. These were coupled
+    /// (`roots_seen_path.parent()`), so moving the roots file to `~/.csq/`
+    /// would have moved the snapshot with it and left
+    /// `csq doctor --json::cache_sweeper` reporting `never_run` forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_file_lands_in_state_dir_not_beside_the_roots_file() {
+        let roots_home = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+
+        let root = fresh_root(&roots_home, "repo-state", b"lock-contents");
+        let roots_path = roots_home.path().join("coc-roots-seen.jsonl");
+        write_roots_seen_jsonl(&roots_path, &[&root]);
+
+        let shutdown = CancellationToken::new();
+        // Tiny interval so the first tick fires promptly; MissedTickBehavior
+        // skips the immediate tick, so we must wait out one interval.
+        let handle = spawn_with_config(
+            roots_path,
+            state_dir.path().to_path_buf(),
+            shutdown.clone(),
+            Duration::from_millis(50),
+            PER_TICK_BUDGET,
+        );
+
+        let expected = state_file_path(state_dir.path());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !expected.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        shutdown.cancel();
+        let _ = handle.join.await;
+
+        assert!(
+            expected.exists(),
+            "state snapshot must be written under state_dir at {}",
+            expected.display()
+        );
+        assert!(
+            !state_file_path(roots_home.path()).exists(),
+            "state snapshot must NOT be written beside the roots file — that coupling \
+             is what would hide the sweeper from `csq doctor`"
+        );
+    }
+
+    // ── Containment guards on the delete walk ────────────────────────────────
+    //
+    // These became load-bearing the moment the roots-path fix made the sweeper
+    // actually delete. Each asserts a refusal, so each fails loudly if a future
+    // edit drops the guard.
+
+    /// A symlinked `.cache` must not be followed — `read_dir` would otherwise
+    /// enumerate (and delete inside) the link's target directory.
+    #[test]
+    #[cfg(unix)]
+    fn sweeper_refuses_symlinked_cache_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo-symcache");
+        let coc = root.join(".coc");
+        std::fs::create_dir_all(&coc).unwrap();
+        std::fs::write(coc.join("COC.lock"), b"lock").unwrap();
+
+        // A real directory elsewhere holding a victim file with the exact
+        // sweepable shape, reachable only through the symlink.
+        let victim_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join(format!("parsed-{}.bin", "ab".repeat(32)));
+        std::fs::write(&victim, b"x").unwrap();
+
+        std::os::unix::fs::symlink(&victim_dir, root.join(".cache")).unwrap();
+
+        let state = Arc::new(Mutex::new(SweeperState::default()));
+        let (swept, _skipped) = sweep_root(&root, &state).unwrap();
+
+        assert_eq!(swept, 0, "a symlinked .cache must not be swept");
+        assert!(
+            victim.exists(),
+            "the symlink target's contents must be untouched"
+        );
+    }
+
+    /// A recorded root without a real `.coc/` directory is not a COC root and
+    /// must not be swept. This keeps `$HOME` out of scope for users without a
+    /// `~/.coc/` — the upward-walking resolver can otherwise record it.
+    #[test]
+    fn sweeper_refuses_root_without_coc_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("not-a-coc-root");
+        let cache = root.join(".cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let file = cache.join(format!("parsed-{}.bin", "cd".repeat(32)));
+        std::fs::write(&file, b"x").unwrap();
+
+        let state = Arc::new(Mutex::new(SweeperState::default()));
+        let (swept, _) = sweep_root(&root, &state).unwrap();
+
+        assert_eq!(swept, 0, "a directory without .coc/ must not be swept");
+        assert!(file.exists(), "its files must be untouched");
+    }
+
+    /// A relative root is rejected: `.cache` would otherwise resolve against
+    /// the daemon's CWD, which differs between a Finder-launched app (`/`) and
+    /// a shell-launched daemon — nondeterministic targets for a delete walk.
+    #[test]
+    fn sweeper_refuses_relative_root() {
+        let state = Arc::new(Mutex::new(SweeperState::default()));
+        let (swept, skipped) = sweep_root(Path::new("relative/path"), &state).unwrap();
+        assert_eq!((swept, skipped), (0, 0), "relative roots must be refused");
+    }
+
+    /// An absent roots FIFO is "no input", NOT "nothing to do" — the snapshot
+    /// must say so, because a sweeper pointed at the wrong path is otherwise
+    /// indistinguishable from a healthy idle one. This is the diagnostic whose
+    /// absence hid the wrong-path defect.
+    #[test]
+    fn absent_roots_file_marks_snapshot_roots_source_missing() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist.jsonl");
+        let state = Arc::new(Mutex::new(SweeperState::default()));
+
+        run_once(&missing, &state, PER_TICK_BUDGET).unwrap();
+
+        let snap = state.lock().unwrap().snapshot();
+        assert!(
+            snap.roots_source_missing,
+            "an absent roots file must set roots_source_missing"
+        );
+        assert_eq!(snap.files_swept_last_run, 0);
+    }
+
+    /// A roots file that EXISTS but is empty is a healthy idle sweeper — the
+    /// flag must stay false, or a correctly-wired host that simply has not run
+    /// `csq run` yet would report degraded forever.
+    #[test]
+    fn present_but_empty_roots_file_does_not_mark_missing() {
+        let tmp = TempDir::new().unwrap();
+        let empty = tmp.path().join("coc-roots-seen.jsonl");
+        std::fs::write(&empty, b"").unwrap();
+        let state = Arc::new(Mutex::new(SweeperState::default()));
+
+        run_once(&empty, &state, PER_TICK_BUDGET).unwrap();
+
+        let snap = state.lock().unwrap().snapshot();
+        assert!(
+            !snap.roots_source_missing,
+            "an existing-but-empty roots file is 'nothing to do', not 'no input'"
+        );
     }
 }

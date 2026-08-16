@@ -3,7 +3,15 @@
 //! These tests exercise cross-process locking, atomic writes under
 //! contention, and process lifecycle detection.
 
-use csq_core::platform::fs::{atomic_replace, secure_file};
+use csq_core::platform::fs::atomic_replace;
+// `secure_file` is exercised only by `secure_file_integration`, a
+// `#[cfg(unix)]` test (it asserts on unix `PermissionsExt` mode bits).
+#[cfg(unix)]
+use csq_core::platform::fs::secure_file;
+// `lock_file`/`try_lock_file` are exercised only by the cross-process flock
+// tests below, all of which are `#[cfg(unix)]` (they shell out to `perl`
+// for a second-process flock, a POSIX-only test technique here).
+#[cfg(unix)]
 use csq_core::platform::lock::{lock_file, try_lock_file};
 use csq_core::platform::process::{is_cc_command, is_pid_alive};
 use std::fs;

@@ -146,6 +146,40 @@ pub fn read_csq_account_uuid(config_dir: &Path) -> Option<IdentityId> {
     read_identity_marker(config_dir).and_then(|m| m.uuid)
 }
 
+/// Resolves the account-number slot bound to a config/handle directory's
+/// `.csq-account` marker, accepting BOTH the M4-7 UUID content and the
+/// legacy numeric content.
+///
+/// - Numeric marker (`"3"`) → returned directly, no further resolution.
+/// - UUID marker → reverse-resolved to a slot via
+///   [`crate::accounts::profiles::resolve_uuid_to_slot`]. Returns `None`
+///   if the UUID has no `by_slot` entry (e.g. `profiles.json` missing or
+///   stale) — this function never invents a slot.
+/// - Marker absent or unparseable → `None`.
+///
+/// This is the marker-READER half of the M4-7 writer flip: `write_csq_account`
+/// writes UUID content for any slot with a `by_slot` mapping, but
+/// [`read_csq_account`] stayed numeric-only by contract, so every caller that
+/// used `read_csq_account` purely to recover "which slot is this dir bound
+/// to" silently went blind on modern installs (`guard-reader-writer-parity.md`).
+/// Callers with that need should call this function instead of
+/// `read_csq_account`. `read_csq_account` remains correct for callers that
+/// specifically want numeric-only semantics (e.g. rejecting a UUID marker as
+/// invalid input).
+///
+/// **No-silent-fallback** (`account-terminal-separation.md` MUST NOT Rule 3):
+/// never invents a slot from directory names, `CLAUDE_CONFIG_DIR`, or any
+/// other terminal-derived channel — the marker (and its UUID→slot reverse
+/// resolution through `profiles.json`) is the SOLE authority.
+pub fn resolve_marker_to_slot(base_dir: &Path, config_dir: &Path) -> Option<AccountNum> {
+    let marker = read_identity_marker(config_dir)?;
+    if let Some(numeric) = marker.numeric {
+        return Some(numeric);
+    }
+    let uuid = marker.uuid?;
+    crate::accounts::profiles::resolve_uuid_to_slot(base_dir, uuid)
+}
+
 /// Writes the `.csq-account` marker as the canonical UUID string of
 /// the given [`IdentityId`].
 ///
@@ -707,6 +741,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── resolve_marker_to_slot (guard-reader-writer-parity.md) ─────────────
+
+    /// Sets up `profiles.json::by_slot[slot] = uuid` under `base`.
+    fn provision_by_slot(base: &Path, slot: u16, uuid: IdentityId) {
+        let path = crate::accounts::profiles::profiles_path(base);
+        let mut pf = crate::accounts::profiles::ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), uuid);
+        crate::accounts::profiles::save(&path, &pf).unwrap();
+    }
+
+    #[test]
+    fn resolve_marker_to_slot_numeric_marker_returns_directly() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-3");
+        std::fs::create_dir_all(&config).unwrap();
+        write_csq_account_legacy(&config, AccountNum::try_from(3u16).unwrap()).unwrap();
+
+        assert_eq!(
+            resolve_marker_to_slot(dir.path(), &config),
+            Some(AccountNum::try_from(3u16).unwrap())
+        );
+    }
+
+    #[test]
+    fn resolve_marker_to_slot_uuid_marker_reverse_resolves_via_by_slot() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-5");
+        std::fs::create_dir_all(&config).unwrap();
+        let uuid = IdentityId::new_v4();
+        provision_by_slot(dir.path(), 5, uuid);
+        write_csq_account(&config, uuid).unwrap();
+
+        assert_eq!(
+            resolve_marker_to_slot(dir.path(), &config),
+            Some(AccountNum::try_from(5u16).unwrap()),
+            "UUID marker must reverse-resolve to its by_slot slot"
+        );
+    }
+
+    #[test]
+    fn resolve_marker_to_slot_uuid_with_no_by_slot_entry_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-6");
+        std::fs::create_dir_all(&config).unwrap();
+        let uuid = IdentityId::new_v4();
+        // No provision_by_slot call — profiles.json has no entry for this UUID.
+        write_csq_account(&config, uuid).unwrap();
+
+        assert_eq!(
+            resolve_marker_to_slot(dir.path(), &config),
+            None,
+            "UUID with no by_slot entry must return None, never invent a slot"
+        );
+    }
+
+    #[test]
+    fn resolve_marker_to_slot_missing_marker_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-7");
+        std::fs::create_dir_all(&config).unwrap();
+
+        assert_eq!(resolve_marker_to_slot(dir.path(), &config), None);
     }
 
     /// Verify read_current_account backward-compat: UUID in .current-account

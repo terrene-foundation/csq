@@ -31,15 +31,15 @@ use tracing::{debug, warn};
 /// Default tick interval. The read path is instant regardless of cadence (it
 /// reads the published ledger), so this only bounds staleness — 10 minutes is
 /// imperceptible for a billing view and halves the always-on daemon's
-/// background transcript-scan load versus the 5-minute cache TTL that #986
+/// background transcript-scan load versus the 5-minute cache TTL that an internal ticket
 /// shipped.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Fallback model used ONLY for transcript sessions whose lines carried no
-/// model (rare post-#986; the per-turn model is normally read from the
+/// model (rare post-an internal ticket; the per-turn model is normally read from the
 /// transcript). Matches the desktop command's historical fallback; the writer
 /// improves on it per-slot via [`crate::providers::settings::model_id_for_slot`].
-const DEFAULT_FALLBACK_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_FALLBACK_MODEL: &str = "claude-sonnet-5";
 
 /// Outcome of one writer tick. Returned by [`run_once`] for logging and tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,7 +117,7 @@ pub fn run_once(
     // last non-empty tick while a fresh live-scan — which the ledger is a cache
     // of — would attribute it zero events. Skip slots already empty so the
     // roll-off quiesces after one tick instead of rewriting every cycle.
-    // (#992 redteam R1 HIGH-1.)
+    // (an internal ticket redteam R1 HIGH-1.)
     for slot in existing_ledger_slots(base_dir) {
         if by_slot.contains_key(&slot) {
             continue;
@@ -126,7 +126,7 @@ pub fn run_once(
         // file. If an ACTIVE slot just wrote to the file this inactive slot
         // resolves to, rolling it off would wipe the active slot's events. Skip
         // any slot whose ledger path an active slot already published to.
-        // (#992 redteam R3 LOW-1.)
+        // (an internal ticket redteam R3 LOW-1.)
         if written_paths.contains(&ledger::ledger_path(base_dir, slot)) {
             continue;
         }
@@ -180,7 +180,7 @@ fn existing_ledger_slots(base_dir: &Path) -> std::collections::BTreeSet<AccountN
     // UUID-keyed ledgers: <base>/identities/<UUID>/usage.ndjson. Load profiles
     // ONCE and reverse-map each UUID inline — `resolve_uuid_to_slot` re-reads
     // profiles.json per directory entry, which is O(N²) across identities.
-    // (#992 redteam R2 LOW-2.) No profiles → no UUID→slot mapping possible, so
+    // (an internal ticket redteam R2 LOW-2.) No profiles → no UUID→slot mapping possible, so
     // the branch is skipped (matching the read path, which also needs profiles
     // to resolve a UUID-keyed ledger).
     let identities = crate::accounts::identity_store::identities_dir(base_dir);
@@ -218,9 +218,11 @@ fn existing_ledger_slots(base_dir: &Path) -> std::collections::BTreeSet<AccountN
 /// Spawns the daemon-side usage-ledger writer.
 ///
 /// `claude_home` is `~/.claude`; pass `None` when it cannot be resolved (no
-/// `$HOME`) — the writer then becomes a no-op (it cannot scan transcripts).
-/// The task runs one tick immediately and then every [`TICK_INTERVAL`] until
-/// `shutdown` is cancelled.
+/// `$HOME`) — the writer then does no work (it cannot scan transcripts) but
+/// still idles until `shutdown` rather than returning early, because the daemon
+/// supervisor treats any subsystem exit while `shutdown` is unfired as a fault
+/// and restarts the session (an internal ticket). The task runs one tick immediately and
+/// then every [`TICK_INTERVAL`] until `shutdown` is cancelled.
 ///
 /// `now_fn` supplies the current time per tick. csq-core builds chrono WITHOUT
 /// the `clock` feature (deliberate — see `crate::usage::aggregator`, so tests
@@ -251,7 +253,15 @@ where
 {
     let join = tokio::spawn(async move {
         let Some(claude_home) = claude_home else {
-            debug!("usage-ledger-writer: no claude_home — writer disabled");
+            // CONTRACT (daemon `supervise::await_session_stop`, an internal ticket): a daemon
+            // subsystem MUST NOT return while `shutdown` is unfired — a clean
+            // early return is treated as a fault that restarts the whole daemon
+            // session. On a host with no resolvable `$HOME` an early return here
+            // would restart-storm (re-bind socket + re-run audit verify + re-spawn
+            // every subsystem, every backoff cycle). So idle until shutdown rather
+            // than exiting — mirrors `auto_rotate`'s disabled path.
+            debug!("usage-ledger-writer: no claude_home — writer disabled, idling until shutdown");
+            shutdown.cancelled().await;
             return;
         };
         let mut ticker = tokio::time::interval(interval);
@@ -279,7 +289,7 @@ where
                     // runs to completion regardless (a blocking task cannot be
                     // cancelled), so the detached task finishes its atomic write
                     // harmlessly — we just stop waiting on it. No ledger is torn
-                    // (atomic_replace). (#992 redteam R1 MEDIUM-3.)
+                    // (atomic_replace). (an internal ticket redteam R1 MEDIUM-3.)
                     let report = tokio::select! {
                         _ = shutdown.cancelled() => {
                             debug!("usage-ledger-writer: shutdown during scan, exiting");
@@ -445,7 +455,7 @@ mod tests {
         // A slot whose transcripts aged out of the scan window (here: simply no
         // transcripts) but which has an EXISTING ledger from a prior tick must
         // converge to empty, so the read path matches a fresh live-scan.
-        // (#992 redteam R1 HIGH-1.)
+        // (an internal ticket redteam R1 HIGH-1.)
         let home = TempDir::new().unwrap();
         let claude_home = home.path().join(".claude");
         let base_dir = claude_home.join("accounts");
@@ -491,7 +501,7 @@ mod tests {
         // The PRIMARY production shape (post-A++): a UUID-keyed ledger at
         // identities/<UUID>/usage.ndjson must be discovered by
         // existing_ledger_slots (via resolve_uuid_to_slot) and rolled off.
-        // (#992 redteam R2 GAP-1.)
+        // (an internal ticket redteam R2 GAP-1.)
         let home = TempDir::new().unwrap();
         let claude_home = home.path().join(".claude");
         let base_dir = claude_home.join("accounts");
@@ -547,7 +557,7 @@ mod tests {
     #[test]
     fn existing_ledger_slots_ignores_non_ledger_files() {
         // A stray file must not be misidentified as a ledger slot and trigger a
-        // spurious roll-off. (#992 redteam R2 GAP-3.)
+        // spurious roll-off. (an internal ticket redteam R2 GAP-3.)
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         for name in &[
@@ -574,7 +584,7 @@ mod tests {
     fn run_once_writes_active_slot_and_rolls_off_stale_slot_together() {
         // Mixed tick: an active slot (has transcripts) must be WRITTEN while a
         // stale slot (ledger only) is rolled off — guards the
-        // by_slot.contains_key gate against inversion. (#992 redteam R2 GAP-4.)
+        // by_slot.contains_key gate against inversion. (an internal ticket redteam R2 GAP-4.)
         let home = TempDir::new().unwrap();
         let claude_home = home.path().join(".claude");
         let base_dir = claude_home.join("accounts");
@@ -630,7 +640,7 @@ mod tests {
 
     #[test]
     fn run_once_shared_uuid_rolloff_does_not_wipe_active_slot() {
-        // Anomaly guard (#992 redteam R3 LOW-1): two slots mapped to ONE UUID
+        // Anomaly guard (an internal ticket redteam R3 LOW-1): two slots mapped to ONE UUID
         // share one ledger file. When slot 7 is active and slot 5 is not, the
         // roll-off (which resolves the shared UUID to min slot = 5) must NOT
         // wipe the file slot 7 just wrote.
@@ -673,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_none_claude_home_is_noop_and_exits() {
+    async fn spawn_none_claude_home_idles_until_shutdown() {
         let dir = TempDir::new().unwrap();
         let shutdown = CancellationToken::new();
         let handle = spawn_with_config(
@@ -683,10 +693,21 @@ mod tests {
             Duration::from_millis(10),
             now,
         );
-        // With no claude_home the task returns immediately without ticking.
+        // CONTRACT (an internal ticket): a disabled subsystem MUST idle until shutdown, NOT
+        // return early — a clean early return is treated as a fault by the daemon
+        // supervisor (`await_session_stop`) and restarts the session, which on a
+        // no-$HOME host would restart-storm. Assert the task is still alive well
+        // after it would otherwise have ticked...
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.join.is_finished(),
+            "disabled writer must idle until shutdown, not exit early"
+        );
+        // ...and exits promptly once shutdown fires.
+        shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(2), handle.join)
             .await
-            .expect("no-op writer must exit promptly")
+            .expect("disabled writer must exit promptly on shutdown")
             .unwrap();
     }
 

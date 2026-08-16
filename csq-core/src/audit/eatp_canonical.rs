@@ -310,7 +310,7 @@ pub struct EatpAuditAnchor {
     /// the metadata segment. MUST be string/integer/boolean/null/nested values
     /// only — see the module-level number-formatting constraint.
     pub metadata: Option<Map<String, Value>>,
-    /// #980: SHA-256 of the governed subject (e.g. the decision subject / body
+    /// an internal ticket: SHA-256 of the governed subject (e.g. the decision subject / body
     /// the anchor attests to), lowercase hex. An OPTIONAL side-band field for
     /// the witnessed-transparency-log tier — it lets a witness bind an anchor to
     /// its subject WITHOUT the subject's bytes.
@@ -320,7 +320,8 @@ pub struct EatpAuditAnchor {
     /// by external protocol (terrene#40) and is not yet aligned. Inserting it
     /// into the pre-image before that alignment would permanently break cross-SDK
     /// hash verification + existing chain-hash parity. It is carried as a plain
-    /// serialized field only (see `canonical_input`'s TODO(#980/terrene#40)).
+    /// serialized field only (see `canonical_input`'s TODO — tracked by an internal ticket
+    /// and `terrene-foundation/terrene#40`).
     pub subject_hash: Option<Sha256Hex>,
 }
 
@@ -405,8 +406,16 @@ impl EatpAuditAnchor {
                 canonicalize_object(meta, &mut content);
             }
         }
-        // TODO(#980/terrene#40): subject_hash NOT yet in canonical pre-image —
-        // awaiting protocol alignment on byte-position + preimage version bump.
+        // TODO(an internal ticket / terrene-foundation/terrene#40): subject_hash NOT yet in
+        // the canonical pre-image — awaiting protocol alignment on byte-position
+        // + preimage version bump.
+        //
+        // Was `TODO(an internal ticket/…)`. csq an internal ticket is CLOSED, so it could never have been
+        // revisited; an internal ticket is its live csq-side successor. The Foundation-side
+        // tracker `terrene-foundation/terrene#40` was verified OPEN on
+        // 2026-08-08 — that half was always live, only csq's citation was dead.
+        // The bare `terrene#40` form is spelled out here because a bare name
+        // does not resolve to an owner (`repo-scope-discipline.md` condition 6).
         // `self.subject_hash` is deliberately NOT appended to `content` here:
         // its position in the colon-delimited cross-SDK canonical string is
         // defined by external protocol (terrene#40) and is not yet aligned.
@@ -820,7 +829,7 @@ mod tests {
         assert!(mk(json!({"count": 42, "neg": -7})).compute_hash().is_ok());
     }
 
-    /// #980 / terrene#40 gate: `subject_hash` is NOT part of the SHA-256
+    /// an internal ticket / terrene#40 gate: `subject_hash` is NOT part of the SHA-256
     /// canonical pre-image this session. Two anchors identical except for
     /// `subject_hash` (one `None`, one `Some(...)`) MUST produce the SAME
     /// `canonical_input` AND the SAME `compute_hash` — the parity proof that

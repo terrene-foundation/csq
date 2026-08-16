@@ -91,12 +91,32 @@ pub struct RaceConfig {
 }
 
 /// Which path won the race.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written, NOT derived (`credential-type-hygiene.md`
+/// Rule 1). `code` is the OAuth **authorization code** — exchangeable for
+/// a token pair, and per `security.md` Rule 8 it has no stable prefix, so
+/// `redact_tokens` cannot catch it downstream. Structural redaction here
+/// is the only defence. The variant name and `redirect_uri` stay legible:
+/// which leg won and where it redirected is the entire diagnostic value.
+#[derive(Clone, PartialEq, Eq)]
 pub enum RaceWinner {
     /// The browser hit the loopback listener.
     Loopback { code: String, redirect_uri: String },
     /// The user pasted the code from Anthropic's hosted page.
     Paste { code: String, redirect_uri: String },
+}
+
+impl std::fmt::Debug for RaceWinner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (variant, redirect_uri) = match self {
+            RaceWinner::Loopback { redirect_uri, .. } => ("Loopback", redirect_uri),
+            RaceWinner::Paste { redirect_uri, .. } => ("Paste", redirect_uri),
+        };
+        f.debug_struct(variant)
+            .field("code", &"[REDACTED]")
+            .field("redirect_uri", redirect_uri)
+            .finish()
+    }
 }
 
 impl RaceWinner {
@@ -392,6 +412,74 @@ mod tests {
 
     fn acct(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
+    }
+
+    // ── Debug redaction (credential-type-hygiene Rule 1) ─────────
+
+    #[test]
+    fn race_winner_debug_redacts_the_authorization_code() {
+        for w in [
+            RaceWinner::Loopback {
+                code: "AUTHCODE-SECRET-VALUE".into(),
+                redirect_uri: "http://127.0.0.1:1455/callback/xyz".into(),
+            },
+            RaceWinner::Paste {
+                code: "AUTHCODE-SECRET-VALUE".into(),
+                redirect_uri: "https://console.anthropic.com/oauth/code/callback".into(),
+            },
+        ] {
+            // Non-vacuity: the value really is in the type.
+            assert_eq!(w.code(), "AUTHCODE-SECRET-VALUE");
+
+            let rendered = format!("{w:?}");
+            assert!(
+                !rendered.contains("AUTHCODE-SECRET-VALUE"),
+                "Debug leaked the authorization code: {rendered}"
+            );
+            assert!(
+                rendered.contains("[REDACTED]"),
+                "no redaction placeholder: {rendered}"
+            );
+            // The diagnostic half must survive: which leg won, and where.
+            assert!(
+                rendered.contains(w.redirect_uri()),
+                "redirect_uri was masked, leaving the line useless: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn race_result_debug_does_not_leak_the_code_through_winner() {
+        // The regression this whole change exists for: `RaceResult`'s
+        // hand-written Debug redacts `verifier` but forwards `winner`,
+        // so a DERIVED Debug on RaceWinner leaked the authorization code
+        // through the very impl written to prevent leaks.
+        let r = RaceResult {
+            winner: RaceWinner::Loopback {
+                code: "AUTHCODE-SECRET-VALUE".into(),
+                redirect_uri: "http://127.0.0.1:1455/callback/xyz".into(),
+            },
+            auto_url: "https://claude.ai/oauth/authorize?x=1".into(),
+            manual_url: "https://console.anthropic.com/oauth/authorize?x=1".into(),
+            state: "state-nonce-abc".into(),
+            verifier: CodeVerifier::new("VERIFIER-SECRET-VALUE".into()),
+        };
+
+        let rendered = format!("{r:?}");
+        assert!(
+            !rendered.contains("AUTHCODE-SECRET-VALUE"),
+            "RaceResult Debug leaked the authorization code via winner: {rendered}"
+        );
+        assert!(
+            !rendered.contains("VERIFIER-SECRET-VALUE"),
+            "RaceResult Debug leaked the PKCE verifier: {rendered}"
+        );
+        // `state` is a single-use anti-CSRF nonce and stays legible by
+        // design — it is what an operator needs on a StateMismatch.
+        assert!(
+            rendered.contains("state-nonce-abc"),
+            "state should stay legible: {rendered}"
+        );
     }
 
     /// Mock paste resolver that never resolves. Used to force the

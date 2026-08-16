@@ -79,7 +79,7 @@ pub mod op_emit;
 /// The daemon tokio loop lives in [`crate::daemon::anchor_task`]; this module
 /// contains the pure, dependency-injected logic testable without a live daemon.
 pub mod anchor;
-/// FR-GOV #788 — plain-language compliance-report generator. Renders the signed
+/// FR-GOV an internal ticket — plain-language compliance-report generator. Renders the signed
 /// EATP chain into an auditor-readable Markdown/HTML document (governed
 /// decisions vs lifecycle ops), grounded in the verified canonical records.
 pub mod compliance_report;
@@ -127,7 +127,7 @@ pub mod key_custody;
 /// so the community build can reference the directory names it must scan.
 pub mod outbox_paths;
 
-/// GH #910 — forward-compat opaque record: an older reader treats a record whose
+/// GH an internal ticket — forward-compat opaque record: an older reader treats a record whose
 /// `EventKind` a newer writer added as opaque-but-intact (signature + hash-chain
 /// still verified) rather than `IntegrityBroken`. See the module doc.
 pub(crate) mod opaque;

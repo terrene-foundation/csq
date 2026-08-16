@@ -110,7 +110,7 @@ const CSQ_CONTROLLED_KEYS: &[&str] = &["cli_auth_credentials_store"];
 ///
 /// NOTE — this configures codex's OWN native footer; it does NOT inject a
 /// csq-rendered line the way `csq statusline` does for Claude Code. Codex has no
-/// external-command statusline hook (openai/codex #17827, unshipped) — so a
+/// external-command statusline hook (openai/codex an internal ticket, unshipped) — so a
 /// csq-rendered codex footer is tracked-upstream, not buildable today.
 const CSQ_DEFAULT_STATUS_LINE: &[&str] = &[
     "model-with-reasoning",
@@ -383,7 +383,7 @@ pub fn derive_spawn_flags(user_global_toml: Option<&str>) -> Vec<String> {
 /// full-bypass flag (`--dangerously-bypass-approvals-and-sandbox`) is a terminal
 /// override that a later `-s read-only` cannot undo (it is not a `-s` value, so
 /// codex's last-wins argparse does not apply), so injecting it silently defeats
-/// the caller's explicit downscope (GH #978).
+/// the caller's explicit downscope (GH an internal ticket).
 const CALLER_SANDBOX_FLAGS: &[&str] = &[
     "-s",
     "--sandbox",
@@ -401,7 +401,7 @@ const CALLER_SANDBOX_FLAGS: &[&str] = &[
 /// codex sandbox themselves. In that case the account-snapshot-derived spawn
 /// flags MUST be suppressed so the caller's explicit policy is the ONLY one codex
 /// sees — otherwise csq's injected full-bypass flag wins and the caller cannot
-/// enforce a read-only one-shot (GH #978). Matches both the bare flag (`-s
+/// enforce a read-only one-shot (GH an internal ticket). Matches both the bare flag (`-s
 /// read-only`) and the `=value` form (`--sandbox=read-only`).
 pub fn caller_overrides_sandbox(rest: &[String]) -> bool {
     rest.iter().any(|tok| {
@@ -1482,7 +1482,7 @@ status_line_use_colors = false
 
     #[test]
     fn caller_overrides_sandbox_detects_passthrough_policy_flags() {
-        // GH #978: a caller downscoping a one-shot must suppress the derived flags.
+        // GH an internal ticket: a caller downscoping a one-shot must suppress the derived flags.
         assert!(caller_overrides_sandbox(&v(&["exec", "-s", "read-only"])));
         assert!(caller_overrides_sandbox(&v(&[
             "exec",

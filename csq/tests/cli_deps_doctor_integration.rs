@@ -5,8 +5,9 @@
 //! - Slot-suppression: surface row appears only when authenticated slots exist.
 //! - Stale-slot variant: `Missing | WrongBinary` with slots configured.
 //! - Empty-state row: no slots on any surface.
-//! - `schema_version` in JSON output — edition-specific (community 19 /
-//!   enterprise 22); asserted against the build-active value, not a literal.
+//! - `schema_version` in JSON output — both editions report 23 as of v23
+//!   (`stale_quota_slots`, cross-edition); asserted against the
+//!   build-active value, not a literal.
 //! - Absent-key test: `codex_cli` omitted when no codex slots (R1-L2).
 //! - Probe-disabled disclosure via env var.
 //! - Half-migrated handle dir does not trigger surface row.
@@ -95,6 +96,7 @@ fn clean_cmd(path_override: Option<&str>) -> Command {
 // ── Fixture builders ─────────────────────────────────────────────────────────
 
 /// Write a minimal Anthropic credential file at `credentials/<n>.json`.
+#[cfg(unix)]
 fn write_anthropic_cred(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -111,6 +113,7 @@ fn write_codex_cred(base: &std::path::Path, n: u16) {
 }
 
 /// Write a minimal Gemini binding file at `credentials/gemini-<n>.json`.
+#[cfg(unix)]
 fn write_gemini_cred(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -153,6 +156,7 @@ fn write_hang_stub(stub_dir: &std::path::Path, name: &str, hang_secs: u64) -> Pa
     path
 }
 
+#[cfg(unix)]
 fn find_bin(name: &str) -> Option<String> {
     std::process::Command::new("which")
         .arg(name)
@@ -167,6 +171,7 @@ fn find_bin(name: &str) -> Option<String> {
 
 /// Run `csq doctor --json` with the given base dir and PATH override.
 /// Returns the parsed JSON `Value`.
+#[cfg(unix)]
 fn run_doctor_json(base: &std::path::Path, path_override: &str) -> Value {
     let out = clean_cmd(Some(path_override))
         .env("CSQ_BASE_DIR", base)
@@ -191,6 +196,7 @@ fn run_doctor_json_probe_disabled(base: &std::path::Path) -> Value {
 }
 
 /// Run `csq doctor` (text output) with the given base dir and PATH override.
+#[cfg(unix)]
 fn run_doctor_text(base: &std::path::Path, path_override: &str) -> String {
     let out = clean_cmd(Some(path_override))
         .env("CSQ_BASE_DIR", base)
@@ -225,20 +231,21 @@ fn test_1_all_surfaces_with_stubs_render_three_rows() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version: edition-specific — community 19, enterprise 22. The shared
-    // monotonic counter is the highest field-version an edition emits; v19's
-    // `mcp_partial_coverage` ships cross-edition (community rose 16→19), but the
-    // enterprise-only `mcp_gate_outbox_backlog` (v20 #914 + v21 M6 #909 shard-D
-    // daemon-aware `state`) and `audit_bundle_floor_anchor` (v22 #787 b2b) raise
-    // only the enterprise ceiling 19→22. The spawned binary carries this crate's
-    // feature set. Keep in lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
+    // schema_version: BOTH editions report 23. v23's `stale_quota_slots` is
+    // NOT cfg-gated (the community build computes+emits it too), so per the
+    // shared-monotonic-counter "highest field-version an edition emits"
+    // contract the community ceiling jumps straight from 19 to 23 — past
+    // the intervening enterprise-only v20/v21/v22 — exactly as v19
+    // (`mcp_partial_coverage`) jumped it from 16 to 19 past v17/v18. The
+    // spawned binary carries this crate's feature set. Keep in lockstep
+    // with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema = 22;
+    let expected_schema = 23;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema = 19;
+    let expected_schema = 23;
     assert_eq!(
         json["schema_version"], expected_schema,
-        "schema_version must equal the edition-active value (community 19 / enterprise 22)"
+        "schema_version must equal the edition-active value (both editions: 23)"
     );
     assert_eq!(json["claude_code"]["status"], "ok");
     assert_eq!(json["codex_cli"]["status"], "ok");
@@ -526,20 +533,22 @@ fn test_10_json_schema_version_2() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version: edition-specific — community 19, enterprise 22. The
-    // enterprise-only `mcp_gate_outbox_backlog` (v20 #914 + v21 M6 #909 shard-D
-    // daemon-aware `state`) and `audit_bundle_floor_anchor` (v22 #787 b2b) raise
-    // only the enterprise ceiling 19→22; v19 (`mcp_partial_coverage`) was the last
-    // cross-edition bump. The spawned binary carries this crate's feature set. Keep
-    // in lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
+    // schema_version: BOTH editions report 23. v23 (`stale_quota_slots`) is
+    // NOT cfg-gated (always-computed, `skip_serializing_if` empty — a
+    // RUNTIME-state omission, not an edition capability), so the community
+    // ceiling jumps straight from 19 to 23, past the intervening
+    // enterprise-only v20/v21/v22 — the same "highest field-version an
+    // edition emits" jump v19 (`mcp_partial_coverage`) made from 16 to 19.
+    // The spawned binary carries this crate's feature set. Keep in
+    // lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema: u64 = 22;
+    let expected_schema: u64 = 23;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema: u64 = 19;
+    let expected_schema: u64 = 23;
     assert_eq!(
         json["schema_version"],
         Value::Number(serde_json::Number::from(expected_schema)),
-        "schema_version must equal the edition-active value (community 19 / enterprise 22)"
+        "schema_version must equal the edition-active value (both editions: 23)"
     );
 }
 
@@ -594,6 +603,7 @@ fn test_12_json_codex_key_present_when_codex_slots_exist() {
 ///
 /// Covers 6 variants × 3 surfaces using a parameterized helper.
 /// Uses hand-written expected `Value` per `M9 A3` (no snapshot crate).
+#[cfg(unix)]
 #[derive(Debug)]
 struct ParamCase {
     surface_key: &'static str,
@@ -608,6 +618,7 @@ struct ParamCase {
 }
 
 /// Build 18 test cases across (surface × status).
+#[cfg(unix)]
 fn param_cases() -> Vec<ParamCase> {
     vec![
         // ── Claude ───────────────────────────────────────────────────────

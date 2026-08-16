@@ -316,7 +316,7 @@ where
         KeySlot::Active,
         &incoming_seed,
         cutoff_for_incoming,
-        // #694 item 2: the roster floor rides the same payload — rotation
+        // an internal ticket item 2: the roster floor rides the same payload — rotation
         // preserves it (a 3-field write here would silently drop the anchor).
         floor_for_incoming,
     ) {

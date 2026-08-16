@@ -1,14 +1,8 @@
-//! Per-slot lifecycle sentinels: config-dir scanning + broker-failed
-//! flag persistence.
+//! Per-slot lifecycle sentinels: broker-failed flag persistence.
 //!
 //! Phase 4 M4-6 (an internal ticket): migrated from `broker::fanout` to
 //! `refresh::sentinel`. The module's surviving responsibility is the
-//! per-slot failure marker (`credentials/{N}.broker-failed`) plus the
-//! `scan_config_dirs` helper used by the desktop swap command to find
-//! the live config-N for an account.
-//!
-//! `scan_config_dirs` enumerates `config-*` directories whose
-//! `.csq-account` marker matches the given account.
+//! per-slot failure marker (`credentials/{N}.broker-failed`).
 //!
 //! `broker_failed` helpers manage the `credentials/{N}.broker-failed`
 //! flag file used to surface LOGIN-NEEDED state on the dashboard.
@@ -18,49 +12,21 @@
 //! (M3-3/M3-4), so the daemon's `save_canonical_for` write IS the only
 //! credential write needed. `config-N/.credentials.json` is no longer
 //! materialised. The retired symbol is gone with the M4-6 rename.
+//!
+//! **`scan_config_dirs` removed (`guard-reader-writer-parity.md` sweep):**
+//! this module's docstring previously claimed a `scan_config_dirs` helper
+//! was "used by the desktop swap command to find the live config-N for an
+//! account". That was false — a repo-wide grep found zero production
+//! callers (only its own `#[cfg(test)]` module referenced it), and it
+//! carried the SAME narrow-marker-reader defect as the three live sites
+//! this sweep fixed (`markers::read_csq_account`, numeric-only, silently
+//! dropping every UUID-marker `config-*` dir from its scan). Genuinely dead
+//! code with the class-defining bug pre-baked is deleted rather than fixed,
+//! so it cannot be re-wired blind by a future caller.
 
-use crate::accounts::markers;
 use crate::error::CredentialError;
 use crate::types::AccountNum;
 use std::path::{Path, PathBuf};
-
-/// Scans `config-*` directories for those belonging to the given account.
-///
-/// Returns paths to config directories whose `.csq-account` marker
-/// matches the given account number.
-pub fn scan_config_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
-    let mut matches = Vec::new();
-
-    let entries = match std::fs::read_dir(base_dir) {
-        Ok(e) => e,
-        Err(_) => return matches,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-
-        if !name.starts_with("config-") {
-            continue;
-        }
-
-        // Check if this config dir belongs to the target account
-        if let Some(marker_account) = markers::read_csq_account(&path) {
-            if marker_account == account {
-                matches.push(path);
-            }
-        }
-    }
-
-    matches
-}
 
 // `fan_out_credentials` retired in M3-7 and the symbol is gone in
 // M4-6. Handle dirs symlink `.credentials.json` to
@@ -180,6 +146,14 @@ pub fn read_broker_failed_reason(base_dir: &Path, account: AccountNum) -> Option
 ///     cross-account-contaminated store token (an internal ticket heal); the flag
 ///     from that dead token is now obsolete. `sentinel-clearing-parity.md`
 ///     Rule 1 names `csq repair --apply` as a resolution boundary.
+/// 12. `accounts::logout::logout_account` post-credential-sweep
+///     (`csq-core/src/accounts/logout.rs`) — the account is GONE, which
+///     resolves the condition permanently rather than transiently: there
+///     is no longer a slot to re-login. Without this the sentinel
+///     outlives its slot and `csq doctor` reports a hard
+///     `✗ LOGIN-NEEDED — run `csq login N`` for a slot with no profiles
+///     entry, no quota row, no config dir and no credentials. Observed
+///     live 2026-08-07 on a removed slot 7.
 ///
 /// **Audit primitive (per `sentinel-clearing-parity.md` Rule 1):**
 ///
@@ -188,7 +162,7 @@ pub fn read_broker_failed_reason(base_dir: &Path, account: AccountNum) -> Option
 ///   | grep -v test | grep -v '/sentinel.rs'
 /// ```
 ///
-/// Should return exactly 11 callsites matching the enumeration above. A
+/// Should return exactly 12 callsites matching the enumeration above. A
 /// match outside the enumeration is either a new caller that MUST be
 /// added to this docstring (paired-update discipline) or an unauthorized
 /// site to investigate.
@@ -206,6 +180,7 @@ pub fn clear_broker_failed(base_dir: &Path, account: AccountNum) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::markers;
     use crate::credentials;
     use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
@@ -233,39 +208,6 @@ mod tests {
         let account = AccountNum::try_from(n).unwrap();
         markers::write_csq_account_legacy(&dir, account).unwrap();
         dir
-    }
-
-    #[test]
-    fn scan_finds_matching_dirs() {
-        let dir = TempDir::new().unwrap();
-        setup_config_dir(dir.path(), 3);
-        setup_config_dir(dir.path(), 3); // same account, different dir won't happen in practice
-        let other = dir.path().join("config-5");
-        std::fs::create_dir_all(&other).unwrap();
-        markers::write_csq_account_legacy(&other, AccountNum::try_from(5u16).unwrap()).unwrap();
-
-        let account = AccountNum::try_from(3u16).unwrap();
-        let matches = scan_config_dirs(dir.path(), account);
-        assert_eq!(matches.len(), 1);
-    }
-
-    #[test]
-    fn scan_ignores_dirs_without_marker() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("config-1")).unwrap();
-        // No .csq-account marker
-
-        let account = AccountNum::try_from(1u16).unwrap();
-        let matches = scan_config_dirs(dir.path(), account);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn scan_empty_base_dir() {
-        let dir = TempDir::new().unwrap();
-        let account = AccountNum::try_from(1u16).unwrap();
-        let matches = scan_config_dirs(dir.path(), account);
-        assert!(matches.is_empty());
     }
 
     /// M3-7 acceptance test #9 (WBS line 266), preserved across the

@@ -822,7 +822,7 @@ No VS Code extension or plugin is needed. Install csq once via the regular insta
 - **macOS (with Homebrew)**: `brew install node`
 - **Windows**: `winget install OpenJS.NodeJS` or download from <https://nodejs.org>
 
-If node is installed and you still see `loader:1143`, the hook script in your project (commonly `scripts/hooks/session-start.js`) has a `require("./lib/...")` whose target is missing. Restore the full `scripts/hooks/` tree from the project template, or remove the `hooks` block from the offending `settings.json`.
+If node is installed and you still see `loader:1143`, the hook script in your project (commonly `.claude/hooks/session-start.js`) has a `require("./lib/...")` whose target is missing. Restore the full `.claude/hooks/` tree from the project template, or remove the `hooks` block from the offending `settings.json`.
 
 ## Uninstall
 

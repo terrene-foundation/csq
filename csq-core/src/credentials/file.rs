@@ -662,9 +662,11 @@ pub fn save_canonical_for(
             Some(uuid) => save_codex_canonical_for_uuid(base_dir, uuid, creds)?,
             None => return Err(CredentialError::NoCredentials(account.get())),
         },
-        Surface::Gemini => {
-            // Gemini has no canonical credential file — key flows via
-            // `platform::secret::Vault`. No UUID check required here.
+        Surface::Gemini | Surface::Kimi | Surface::Grok => {
+            // Gemini + native-CLI surfaces (Kimi/Grok) store NO csq credential
+            // file — Gemini keys flow via `platform::secret::Vault`; native
+            // CLIs self-authenticate (creds under `~/.kimi-code/`,
+            // `~/.grok/auth.json`). No UUID write path.
         }
     }
     // ── End UUID write (M4-12: numeric write fully retired) ───────────────────
@@ -773,6 +775,9 @@ pub fn canonical_path_for(base_dir: &Path, account: AccountNum, surface: Surface
         Surface::ClaudeCode => format!("{}.json", account),
         Surface::Codex => format!("codex-{}.json", account),
         Surface::Gemini => format!("gemini-{}.json", account),
+        // Native-CLI binding markers (credential-less; see `providers::native`).
+        Surface::Kimi => format!("kimi-{}.json", account),
+        Surface::Grok => format!("grok-{}.json", account),
     };
     base_dir.join("credentials").join(filename)
 }
@@ -803,6 +808,10 @@ pub fn live_path_for(base_dir: &Path, account: AccountNum, surface: Surface) -> 
         Surface::ClaudeCode => ".credentials.json",
         Surface::Codex => "codex-auth.json",
         Surface::Gemini => ".gemini-creds.json",
+        // Native-CLI surfaces have no live mirror (the vendor CLI owns its
+        // creds); returned for API symmetry only — never written.
+        Surface::Kimi => ".kimi-creds.json",
+        Surface::Grok => ".grok-creds.json",
     };
     base_dir.join(format!("config-{}", account)).join(filename)
 }

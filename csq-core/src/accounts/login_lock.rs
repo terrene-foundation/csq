@@ -71,6 +71,37 @@ impl std::fmt::Debug for AcquireOutcome {
     }
 }
 
+/// Who currently holds an `.login-N.lock`, for operator recovery
+/// (`csq unlock N`). Returned by [`inspect_lock`].
+#[derive(Debug, Clone)]
+pub struct LockHolder {
+    /// PID read from the `.login-N.lock.pid` sidecar, if present and
+    /// parseable. `None` means the lock file exists but the sidecar is
+    /// missing/unreadable (a microsecond acquire race, or a manual
+    /// leftover).
+    pub pid: Option<u32>,
+    /// Whether that PID is currently alive. `None` when there is no PID.
+    /// A live holder means the lock is genuinely in use (or hung); a dead
+    /// holder means the lock files are stale residue.
+    pub alive: Option<bool>,
+    /// The holder's process command line (`ps -o command=`), for the
+    /// operator to confirm it is a stuck `csq login` before terminating
+    /// it. `None` on Windows or when the process cannot be inspected.
+    pub command: Option<String>,
+}
+
+/// Outcome of a [`force_release`] operation.
+#[derive(Debug, Clone)]
+pub struct ForceReleaseReport {
+    /// Whether a lock file (or sidecar) was present to begin with.
+    pub had_lock: bool,
+    /// The PID that was terminated, if `kill` was requested and a live,
+    /// verified-as-login holder existed.
+    pub killed_pid: Option<u32>,
+    /// The lock files that were removed.
+    pub removed_files: Vec<PathBuf>,
+}
+
 /// Exclusive per-account lock around the `csq login N` flow.
 ///
 /// Acquired via [`AccountLoginLock::acquire`]; released on `Drop`.
@@ -396,6 +427,184 @@ fn pid_is_alive(pid: u32) -> bool {
     exit_code == STILL_ACTIVE
 }
 
+/// Read the holder PID from the sidecar, if present + parseable.
+fn read_holder_pid(pid_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// The holder process's command line, for operator confirmation.
+/// Unix: `ps -o command= -p <pid>` (array args, no shell — `security.md`
+/// MUST-NOT-1). Windows: not resolved (returns `None`); the kill still works.
+#[cfg(unix)]
+fn holder_command(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let cmd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
+#[cfg(not(unix))]
+fn holder_command(_pid: u32) -> Option<String> {
+    None
+}
+
+/// TOCTOU / recycled-PID guard: the holder must still look like a `csq login`
+/// process before we terminate it. Unix inspects the live command line; on
+/// platforms without command inspection we conservatively require only that
+/// the PID is still alive (the caller already re-read the sidecar PID).
+#[cfg(unix)]
+fn holder_looks_like_login(pid: u32) -> bool {
+    match holder_command(pid) {
+        // A csq login holder's argv contains the binary ("csq") and the
+        // "login" subcommand. Match loosely (path prefixes vary) but require
+        // both tokens so an unrelated recycled PID is not terminated.
+        Some(cmd) => {
+            let lc = cmd.to_ascii_lowercase();
+            lc.contains("csq") && lc.contains("login")
+        }
+        // Could not read the command (process vanished, or ps unavailable) —
+        // fail closed: do NOT kill a PID we cannot confirm.
+        None => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn holder_looks_like_login(pid: u32) -> bool {
+    pid_is_alive(pid)
+}
+
+/// Terminate `pid`: SIGTERM, then SIGKILL after a short grace if still alive.
+#[cfg(unix)]
+fn terminate_pid(pid: u32) {
+    let pid_signed = match i32::try_from(pid) {
+        Ok(p) if p > 0 => p,
+        _ => return,
+    };
+    // SAFETY: `kill` is a documented syscall; sending SIGTERM to a PID the
+    // kernel validates. No memory is touched.
+    unsafe {
+        libc::kill(pid_signed, libc::SIGTERM);
+    }
+    // Grace: poll for exit up to ~2s, then escalate.
+    for _ in 0..20 {
+        if !pid_is_alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // SAFETY: as above; SIGKILL is unblockable.
+    unsafe {
+        libc::kill(pid_signed, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: OpenProcess is a documented Win32 API; a 0 handle means failure.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: handle is non-null and owned; TerminateProcess does not retain it.
+    unsafe {
+        TerminateProcess(handle, 1);
+        CloseHandle(handle);
+    }
+}
+
+/// Inspect the login lock for `account` without acquiring it.
+///
+/// Returns `Ok(None)` when no lock file (or sidecar) exists, and
+/// `Ok(Some(holder))` describing the current holder otherwise — whether or not
+/// a live process holds it. Read-only; safe to call while another process holds
+/// the lock. Powers `csq unlock N`'s "here is what is holding it" display.
+pub fn inspect_lock(base_dir: &Path, account: AccountNum) -> std::io::Result<Option<LockHolder>> {
+    let lock_path = AccountLoginLock::lock_path(base_dir, account);
+    let pid_path = AccountLoginLock::pid_path(base_dir, account);
+    if !lock_path.exists() && !pid_path.exists() {
+        return Ok(None);
+    }
+    let pid = read_holder_pid(&pid_path);
+    let alive = pid.map(pid_is_alive);
+    let command = pid.and_then(holder_command);
+    Ok(Some(LockHolder {
+        pid,
+        alive,
+        command,
+    }))
+}
+
+/// Force-release the login lock for `account`.
+///
+/// When `kill` is true and a LIVE holder exists, terminates it (SIGTERM →
+/// SIGKILL) then removes the lock files. TOCTOU-guarded: the sidecar PID is
+/// re-read immediately before killing AND the holder is re-confirmed to look
+/// like a `csq login` process (Unix), so a PID recycled between inspect and
+/// kill is never terminated. Ordering is kill → wait-for-exit → unlink, so a
+/// new acquirer cannot pin a fresh lock file behind a still-dying holder's
+/// flock.
+///
+/// Callers (`csq unlock`, the desktop force-release command) MUST gate this
+/// behind an operator confirmation showing [`inspect_lock`]'s holder — this
+/// function does not prompt.
+pub fn force_release(
+    base_dir: &Path,
+    account: AccountNum,
+    kill: bool,
+) -> std::io::Result<ForceReleaseReport> {
+    let lock_path = AccountLoginLock::lock_path(base_dir, account);
+    let pid_path = AccountLoginLock::pid_path(base_dir, account);
+    let mut report = ForceReleaseReport {
+        had_lock: false,
+        killed_pid: None,
+        removed_files: Vec::new(),
+    };
+    if !lock_path.exists() && !pid_path.exists() {
+        return Ok(report);
+    }
+    report.had_lock = true;
+
+    if kill {
+        // Re-read the PID at the last moment (TOCTOU): the holder may have
+        // exited between an earlier inspect_lock and now, and its PID may have
+        // been recycled. Only terminate a PID that is (a) not us, (b) still
+        // alive, AND (c) still looks like a csq login process.
+        if let Some(pid) = read_holder_pid(&pid_path) {
+            if pid != std::process::id() && pid_is_alive(pid) && holder_looks_like_login(pid) {
+                terminate_pid(pid);
+                report.killed_pid = Some(pid);
+            }
+        }
+    }
+
+    // Remove the lock files AFTER the holder is dead. Sidecar first, then the
+    // lock file itself. NotFound is fine (concurrent Drop cleanup may race us).
+    for p in [&pid_path, &lock_path] {
+        match std::fs::remove_file(p) {
+            Ok(()) => report.removed_files.push(p.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(windows)]
 fn try_lock_exclusive(file: &File) -> std::io::Result<LockResult> {
     use std::os::windows::io::AsRawHandle;
@@ -441,6 +650,153 @@ mod tests {
         AccountNum::try_from(n).unwrap()
     }
 
+    // ── Cross-process contention (an internal ticket) ───────────────────────────────
+    //
+    // The property that matters is CROSS-PROCESS mutual exclusion: two
+    // `csq login 7` invocations racing. A same-process second acquire is the
+    // wrong instrument — it exercises handle semantics, not the user-facing
+    // guarantee — and it is why the Windows path had no coverage at all: the
+    // same-process test is `#[cfg(unix)]` because POSIX `flock` and Windows
+    // `LockFileEx` differ on same-process reacquire, a difference that has no
+    // bearing on whether two SEPARATE logins exclude each other.
+    //
+    // These two tests run on BOTH platforms from one code path, so the
+    // guarantee is stated once and each CI target proves it. NOTE the
+    // `windows-latest` job is NOT a required check in the `main — required CI
+    // (no bypass)` ruleset, so a green merge does not imply this passed there —
+    // read the run.
+
+    /// Env var naming the lock directory the helper below should hold.
+    const HOLD_DIR_ENV: &str = "CSQ_TEST_LOGIN_LOCK_HOLD_DIR";
+
+    /// Child-process role: acquire the lock, announce readiness by writing our
+    /// PID to `ready`, then hold it until `stop` appears.
+    ///
+    /// This is a `#[test]` so the parent can re-invoke this same test binary
+    /// with `--exact` and reach it — the standard way to get a second PROCESS
+    /// without shipping a helper binary. With `HOLD_DIR_ENV` unset it returns
+    /// immediately, so it is a no-op in an ordinary suite run and cannot
+    /// recurse (the child runs only this test, which never spawns).
+    #[test]
+    fn cross_process_lock_holder_helper() {
+        let Ok(dir) = std::env::var(HOLD_DIR_ENV) else {
+            return; // not the child — nothing to do
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let guard = match AccountLoginLock::acquire(&dir, account(7)) {
+            Ok(AcquireOutcome::Acquired(g)) => g,
+            other => panic!("helper must acquire the lock, got {other:?}"),
+        };
+        std::fs::write(dir.join("ready"), format!("{}\n", std::process::id()))
+            .expect("helper writes ready");
+
+        // Bounded hold: if the parent dies without writing `stop`, exit rather
+        // than wedge a CI job forever.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !dir.join("stop").exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn cross_process_acquire_reports_the_live_holder_pid() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        // `env_clear` + whitelist per testing.md Rule 4a. The Windows-essential
+        // vars are listed unconditionally — absent on Unix, so the `if let Ok`
+        // simply skips them there, and REQUIRED on windows-latest for the child
+        // to start at all.
+        cmd.env_clear();
+        for k in [
+            "HOME",
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "USER",
+            "TMPDIR",
+            "SYSTEMROOT",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "WINDIR",
+            "ComSpec",
+            "PATHEXT",
+            "NUMBER_OF_PROCESSORS",
+        ] {
+            if let Ok(v) = std::env::var(k) {
+                cmd.env(k, v);
+            }
+        }
+        let mut child = cmd
+            .env(HOLD_DIR_ENV, &dir)
+            .args([
+                "--exact",
+                "accounts::login_lock::tests::cross_process_lock_holder_helper",
+                "--nocapture",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the holder child");
+
+        // Wait for the child to actually hold the lock. Bounded, and a timeout
+        // is a FAILURE rather than a skip — a skip keyed on what the system
+        // returned would turn a real regression green (test-skip-discipline).
+        let ready = dir.join("ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let holder_pid: u32 = if ready.exists() {
+            std::fs::read_to_string(&ready)
+                .expect("read ready")
+                .trim()
+                .parse()
+                .expect("ready holds a pid")
+        } else {
+            let _ = child.kill();
+            panic!("holder child never acquired the lock within 20s");
+        };
+        assert_eq!(
+            holder_pid,
+            child.id(),
+            "the announced holder pid must be the child we spawned"
+        );
+
+        // THE ASSERTION. A second process must be refused, and must be told who
+        // holds it and that the holder is alive.
+        let outcome = AccountLoginLock::acquire(&dir, account(7)).expect("acquire returns");
+        let result = match outcome {
+            AcquireOutcome::Held { pid, pid_alive } => Ok((pid, pid_alive)),
+            AcquireOutcome::Acquired(_) => Err("second PROCESS acquired a held lock"),
+        };
+
+        // Release the child before asserting, so a failure cannot leave it
+        // holding the lock for its full 30s and slow the rest of the suite.
+        std::fs::write(dir.join("stop"), b"1").ok();
+        let _ = child.wait();
+
+        let (pid, pid_alive) = result.expect("mutual exclusion across processes");
+        assert_eq!(
+            pid,
+            Some(holder_pid),
+            "the refusal must name the holding process"
+        );
+        assert_eq!(
+            pid_alive,
+            Some(true),
+            "a live cross-process holder must be reported alive"
+        );
+    }
+
     #[test]
     fn handle_race_acquires_exclusive_lock_for_account() {
         // Successful acquire returns Acquired with a guard that
@@ -460,6 +816,86 @@ mod tests {
     }
 
     #[test]
+    fn inspect_lock_none_when_no_lock_file() {
+        let dir = TempDir::new().unwrap();
+        assert!(inspect_lock(dir.path(), account(3)).unwrap().is_none());
+    }
+
+    #[test]
+    fn inspect_lock_reports_live_current_holder() {
+        let dir = TempDir::new().unwrap();
+        let _guard = match AccountLoginLock::acquire(dir.path(), account(3)).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("fresh acquire must succeed"),
+        };
+        let holder = inspect_lock(dir.path(), account(3))
+            .unwrap()
+            .expect("lock is held → Some");
+        assert_eq!(holder.pid, Some(std::process::id()));
+        assert_eq!(holder.alive, Some(true));
+    }
+
+    #[test]
+    fn force_release_reports_no_lock_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let report = force_release(dir.path(), account(3), true).unwrap();
+        assert!(!report.had_lock);
+        assert!(report.killed_pid.is_none());
+        assert!(report.removed_files.is_empty());
+    }
+
+    #[test]
+    fn force_release_removes_files_without_kill() {
+        let dir = TempDir::new().unwrap();
+        let guard = match AccountLoginLock::acquire(dir.path(), account(3)).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("fresh acquire must succeed"),
+        };
+        // Hold the guard (this process owns the flock); force_release(kill=false)
+        // must still unlink the on-disk files without touching us.
+        let report = force_release(dir.path(), account(3), false).unwrap();
+        assert!(report.had_lock);
+        assert!(report.killed_pid.is_none(), "kill=false must not terminate");
+        assert_eq!(report.removed_files.len(), 2, "sidecar + lock file removed");
+        assert!(!AccountLoginLock::lock_path(dir.path(), account(3)).exists());
+        drop(guard);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn force_release_kill_skips_dead_holder() {
+        // A sidecar naming a guaranteed-dead PID must NOT be killed (the process
+        // is gone / recycled-unknown); the stale files are still cleared.
+        let dir = TempDir::new().unwrap();
+        // A PID guaranteed never to name a live process: i32::MAX exceeds the
+        // kernel PID ceiling (`/proc/sys/kernel/pid_max` ≤ 2^22 on Linux; macOS
+        // similar), so `pid_is_alive` (kill(pid,0) → ESRCH) always reads it as
+        // dead — the exact code path this test exercises. Deterministic and
+        // hermetic: the prior `Command::new("true").spawn()` depended on $PATH
+        // and hit `ENOENT` on a CI runner whose PATH lacked coreutils (a
+        // non-hermetic bare-name spawn; see feedback_find_claude_binary +
+        // test-hermeticity). No external binary, no fork, no reap-recycle race.
+        let dead_pid: u32 = i32::MAX as u32;
+
+        // Fabricate the on-disk lock state pointing at the dead PID.
+        std::fs::write(AccountLoginLock::lock_path(dir.path(), account(7)), b"").unwrap();
+        std::fs::write(
+            AccountLoginLock::pid_path(dir.path(), account(7)),
+            format!("{dead_pid}\n"),
+        )
+        .unwrap();
+
+        let report = force_release(dir.path(), account(7), true).unwrap();
+        assert!(report.had_lock);
+        assert!(
+            report.killed_pid.is_none(),
+            "a dead holder PID must not be reported as killed"
+        );
+        assert_eq!(report.removed_files.len(), 2);
+        assert!(!AccountLoginLock::pid_path(dir.path(), account(7)).exists());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn handle_race_returns_clear_error_when_lock_held() {
         // Hold the lock in a separate thread; second acquire must
@@ -472,8 +908,29 @@ mod tests {
         // both acquires from the same process — so the second
         // acquire reads back its OWN write rather than the first
         // holder's PID, and `pid` is None at line 454. The Windows
-        // path is exercised via the Job-Object integration test
-        // tracked under M8-03 (Windows port follow-up).
+        // reacquire semantics differ, which is why this test is Unix-only.
+        //
+        // That difference does NOT matter to the user-facing guarantee, and
+        // the coverage question it used to stand in for is now answered
+        // properly by `cross_process_acquire_reports_the_live_holder_pid`
+        // below, which runs on BOTH platforms and asserts what actually
+        // matters: a second PROCESS is refused and told who holds the lock.
+        //
+        // History, because the previous note was wrong twice over (an internal ticket): it
+        // claimed a Job-Object integration test covered this path, and cited
+        // milestone id M8-03 as where that work lived. No such test existed
+        // anywhere in the tree, and that id resolves only to a COMPLETED
+        // an internal workspace todo. It also reasoned that on Windows both same-process
+        // acquires succeed AND the second returns `Held` with `pid: None` —
+        // which cannot both hold, since a successful `try_lock_exclusive`
+        // takes the `Acquired` branch and never reaches a `Held` arm at all.
+        // Do not restore either claim.
+        //
+        // The retracted sentence is PARAPHRASED above, deliberately not quoted.
+        // `scripts/verify/milestone-refs.sh` fires when deferral vocabulary and
+        // a milestone id co-occur on one line, so quoting the false claim
+        // verbatim makes this retraction flag ITSELF. The fix is to paraphrase;
+        // teaching the gate an exception would blind it to the real thing.
         let dir = TempDir::new().unwrap();
         let dir_path = dir.path().to_path_buf();
 

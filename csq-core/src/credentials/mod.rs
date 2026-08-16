@@ -137,7 +137,7 @@ impl CredentialFile {
     }
 
     /// Returns a fixed-vocabulary `&'static str` naming which variant
-    /// the parser recognised. For #520's wrong-variant detection: a
+    /// the parser recognised. For an internal ticket's wrong-variant detection: a
     /// `codex-<N>.json` whose `Ok(cf)` has `cf.codex().is_none()` is
     /// structurally guaranteed to be `cf == Anthropic(_)` (parser is
     /// 2-variant untagged at `csq-core/src/credentials/mod.rs:38-48`),
@@ -330,7 +330,7 @@ pub struct CodexTokensFile {
     pub access_token: String,
 
     /// Single-use refresh token. Rotated on every successful refresh
-    /// (OpenAI's `#10332` single-use semantics).
+    /// (OpenAI's `an internal ticket` single-use semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
 

@@ -205,6 +205,121 @@ impl ProvisionError {
             ProvisionError::ProfilesIdentity { .. } => "gemini_provision_profiles_identity",
         }
     }
+
+    /// User-actionable message with filesystem paths redacted via
+    /// [`crate::cli_deps::sanitize::redact_path`]. Canonical mapper
+    /// shared by the CLI (`csq setkey gemini ...` — see
+    /// `csq/src/cli/commands/setkey.rs::map_provision_error`) and the
+    /// desktop Tauri IPC boundary (`gemini_provision_api_key`,
+    /// `gemini_provision_vertex_sa`, `gemini_provision_oauth` via
+    /// `OauthLoginError::BindingWriteFailed`) so both editions stay in
+    /// sync and neither duplicates the redaction logic —
+    /// `rules/tauri-commands.md` MUST-3, an internal ticket.
+    ///
+    /// `Vault` is rendered via its own `Display` (no path fields —
+    /// see [`crate::platform::secret::SecretError`]'s doc comment);
+    /// callers that want the richer per-variant vault remediation text
+    /// (e.g. the CLI's `map_vault_error`) should match on `Vault`
+    /// themselves before falling back to this method.
+    pub fn redacted_message(&self) -> String {
+        use crate::cli_deps::sanitize::redact_path;
+        match self {
+            ProvisionError::Vault(v) => v.to_string(),
+            // Wording mirrors the CLI's `--vertex-sa-json` flag name even
+            // though the desktop UI has no such flag (it has a "Vertex SA
+            // tab" — see `gemini_provision_api_key`'s doc comment). Kept
+            // byte-identical to the CLI's reference implementation
+            // (`csq/src/cli/commands/setkey.rs::map_provision_error`) so
+            // both editions share one canonical mapper rather than two
+            // texts that can silently drift.
+            ProvisionError::VertexSaInvalid { path, reason } => {
+                format!("--vertex-sa-json {} rejected: {reason}", redact_path(path))
+            }
+            ProvisionError::Malformed { path, reason } => {
+                format!("binding marker {} is corrupt: {reason}", redact_path(path))
+            }
+            ProvisionError::Io { path, source } => {
+                format!("provisioning I/O at {}: {source}", redact_path(path))
+            }
+            ProvisionError::AtomicReplace { path, reason } => {
+                format!("atomic write at {}: {reason}", redact_path(path))
+            }
+            ProvisionError::ProfilesIdentity { reason } => format!(
+                "by_slot_identity write failed (slot usable; backfill will repair): {reason}"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod redacted_message_tests {
+    use super::*;
+
+    fn with_home<R>(home: &str, f: impl FnOnce() -> R) -> R {
+        let _g = crate::platform::test_env::lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        let out = f();
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        out
+    }
+
+    #[test]
+    fn redacted_message_strips_path_on_io_variant() {
+        with_home("/Users/jack", || {
+            let err = ProvisionError::Io {
+                path: std::path::PathBuf::from(
+                    "/Users/jack/.claude/accounts/credentials/gemini-2.json",
+                ),
+                source: std::io::Error::other("disk full"),
+            };
+            let msg = err.redacted_message();
+            assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+            assert!(msg.contains("~/.claude/accounts/credentials/gemini-2.json"));
+            assert!(msg.contains("disk full"));
+        });
+    }
+
+    #[test]
+    fn redacted_message_strips_path_on_vertex_sa_invalid_variant() {
+        with_home("/Users/jack", || {
+            let err = ProvisionError::VertexSaInvalid {
+                path: std::path::PathBuf::from("/Users/jack/secrets/sa.json"),
+                reason: "not a regular file".to_string(),
+            };
+            let msg = err.redacted_message();
+            assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+            assert!(msg.contains("~/secrets/sa.json"));
+        });
+    }
+
+    #[test]
+    fn redacted_message_strips_path_on_malformed_variant() {
+        with_home("/Users/jack", || {
+            let err = ProvisionError::Malformed {
+                path: std::path::PathBuf::from(
+                    "/Users/jack/.claude/accounts/credentials/gemini-6.json",
+                ),
+                reason: "invalid schema version".to_string(),
+            };
+            let msg = err.redacted_message();
+            assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+            assert!(msg.contains("~/.claude/accounts/credentials/gemini-6.json"));
+        });
+    }
+
+    #[test]
+    fn redacted_message_profiles_identity_has_no_path_and_is_reassuring() {
+        let err = ProvisionError::ProfilesIdentity {
+            reason: "identity write timed out".to_string(),
+        };
+        let msg = err.redacted_message();
+        assert!(msg.contains("slot usable"));
+        assert!(msg.contains("identity write timed out"));
+    }
 }
 
 /// Identity-class segment for a Gemini auth mode.
@@ -312,7 +427,7 @@ pub fn is_gemini_bound_slot(base_dir: &Path, slot: AccountNum) -> bool {
 /// True iff slot has a spawn-admissible Gemini marker
 /// (`is_gemini_bound_slot`) whose binding does NOT parse (corrupt JSON
 /// / newer schema / unreadable). Single definition shared by
-/// `csq doctor` and `csq probe --all` (#514 / #513). NOT called from
+/// `csq doctor` and `csq probe --all` (an internal ticket / an internal ticket). NOT called from
 /// `probe_slot` — that path reads the binding once and matches the
 /// Result directly.
 pub fn is_gemini_corrupt_bound(base_dir: &Path, slot: AccountNum) -> bool {
@@ -346,22 +461,116 @@ pub fn read_binding(base_dir: &Path, slot: AccountNum) -> Result<GeminiBinding, 
     Ok(binding)
 }
 
+/// Names the POLLING regime an auth mode implies, which is what the
+/// quota row's shape depends on — not the auth mode itself.
+///
+/// `CodeAssistOAuth` slots are polled on a cadence by
+/// `daemon::usage_poller::gemini_oauth` (which enumerates slots by
+/// reading each binding's auth mode) and get `kind: "utilization"`
+/// rows. `ApiKey` / `VertexSa` slots are never polled — their rows are
+/// written only when the operator's own gemini-cli traffic produces an
+/// event, and carry `kind: "counter"` / `"unknown"`.
+///
+/// Compared at the DISCRIMINANT level on purpose: re-pointing
+/// `VertexSa` at a different SA JSON, or re-running an OAuth login, is
+/// not a regime change and must not discard a valid row (the
+/// same-provider half of the third-party precedent below).
+fn polls_on_a_cadence(auth: &AuthMode) -> bool {
+    matches!(auth, AuthMode::CodeAssistOAuth)
+}
+
 /// Writes the binding marker atomically with 0o600 permissions.
 /// Caller is responsible for vault writes (API-key mode) or path
-/// validation (Vertex SA mode); this helper is purely the marker
-/// write.
+/// validation (Vertex SA mode); this helper is otherwise purely the
+/// marker write — with ONE deliberate side effect, below.
+///
+/// # Clears the slot's quota row when the polling regime changes
+///
+/// Rebinding a slot from `CodeAssistOAuth` to `ApiKey`/`VertexSa` (or
+/// back) leaves a row written by the OLD regime in `quota.json`.
+/// Nothing else ever rewrites it: `enumerate_oauth_mode_slots` stops
+/// returning the slot the moment its binding is no longer OAuth, so
+/// the cadence poller goes silent, and the event path only writes when
+/// the operator's own gemini-cli traffic produces an event — which on
+/// an idle-but-healthy slot may be hours or days away.
+///
+/// The frozen row keeps `kind: "utilization"`, so
+/// `quota::status::is_event_driven_row` (`surface == "gemini" &&
+/// kind != "utilization"`) reads FALSE and the staleness classifier
+/// runs the row's `updated_at` through the poll-cadence path. One hour
+/// after the REBIND — not after any real loss of health — a perfectly
+/// healthy idle ApiKey slot renders `stale <age>`. That is the same
+/// false-positive class the staleness feature was written to
+/// eliminate, reached through a rebind instead of a fresh slot.
+///
+/// Clearing here makes the slot show the honest "not yet polled"
+/// state until its new regime writes a real row. This mirrors the
+/// third-party precedent in `accounts::third_party::bind_provider_to_slot`
+/// (a rebind to a DIFFERENT provider calls the same
+/// `logout::remove_quota_entry`; a same-provider re-key preserves the
+/// row) and lives HERE rather than in each caller because every
+/// production provisioning path funnels through this one function —
+/// per-caller enumeration is the drift this repo has been bitten by
+/// repeatedly. Those callers are FOUR, not the three an earlier revision
+/// of this comment claimed: `provision_api_key_via_vault`,
+/// `provision_code_assist_oauth`, `provision_vertex_sa` and
+/// `set_model_name`. The fourth only rewrites `model_name` on a binding it
+/// has just read, so its regime is unchanged by construction and the clear
+/// below is a guaranteed no-op there — which is exactly why routing it
+/// through the same chokepoint costs nothing and keeps the invariant in
+/// one place.
+///
+/// Best-effort and non-fatal: an unreadable or absent prior binding
+/// means there is no established regime to have changed, so nothing is
+/// cleared. The clear runs only AFTER the marker write succeeds, so a
+/// failed write leaves both the marker and the quota row untouched.
 pub fn write_binding(
     base_dir: &Path,
     slot: AccountNum,
     binding: &GeminiBinding,
 ) -> Result<(), ProvisionError> {
     let path = binding_path(base_dir, slot);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ProvisionError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
     }
+
+    // Per-slot lock held across read-prior -> write -> clear.
+    //
+    // Without it the prior-regime read is unsynchronised, so two concurrent
+    // provisioning calls for the SAME slot (a desktop double-submit, or CLI
+    // and desktop racing) can both read the pre-race marker. The loser then
+    // computes its regime change against a marker the winner has already
+    // replaced, concludes nothing changed, and skips a clear that the REAL
+    // transition required — leaving the stale row this function exists to
+    // remove.
+    //
+    // Lock ORDER is binding -> quota, and only ever that way:
+    // `remove_quota_entry` acquires the quota lock inside the region guarded
+    // here and releases it before returning, and no path takes the quota lock
+    // and then a binding lock (the OAuth poller reads this marker without
+    // locking it — safe, because the marker is published by atomic rename, so
+    // a reader sees the old or the new file, never a torn one). A `.lock`
+    // suffix is also invisible to `enumerate_oauth_mode_slots`, which matches
+    // only `gemini-<N>.json`.
+    let lock_path = path.with_extension("lock");
+    let _binding_guard = crate::platform::lock::lock_file(&lock_path).map_err(|e| {
+        ProvisionError::AtomicReplace {
+            path: lock_path.clone(),
+            reason: format!("binding lock: {e}"),
+        }
+    })?;
+
+    // Read the PRIOR regime before the marker is overwritten — after
+    // the write there is no way to tell what it used to be. An absent
+    // or unreadable prior binding yields None: no established regime,
+    // so nothing to have changed.
+    let previous_polls_on_a_cadence = read_binding(base_dir, slot)
+        .ok()
+        .map(|b| polls_on_a_cadence(&b.auth));
 
     let json =
         serde_json::to_string_pretty(binding).map_err(|e| ProvisionError::AtomicReplace {
@@ -391,6 +600,13 @@ pub fn write_binding(
             reason: format!("atomic replace: {e}"),
         });
     }
+
+    // Only after the marker is durably in place: see the
+    // regime-change rationale on this function.
+    if previous_polls_on_a_cadence.is_some_and(|prev| prev != polls_on_a_cadence(&binding.auth)) {
+        crate::accounts::logout::remove_quota_entry(base_dir, slot);
+    }
+
     Ok(())
 }
 
@@ -508,6 +724,18 @@ pub fn delete_api_key_from_vault(
 /// Removes the binding marker. Does NOT touch the vault entry —
 /// callers that want a full unbind invoke `Vault::delete` separately
 /// so the audit log emits both events distinctly.
+///
+/// # Callers (enumerate on every addition — `sentinel-clearing-parity.md` MUST-1)
+///
+/// - [`crate::accounts::binding_guard::clear_detected_marker_binding`] — an
+///   Anthropic or Codex OAuth login onto a Gemini-marked slot REPLACES the
+///   binding; this clears the stale Gemini marker (captured pre-mint by
+///   [`crate::accounts::binding_guard::detect_stale_marker_binding`], applied
+///   only once the login has succeeded) so the slot does not carry two
+///   bindings (GH an internal ticket).
+/// - `csq logout <N>` sweeps this marker too, but via the surface-neutral
+///   `ALL_SURFACES` loop in `accounts::logout::logout_account` (direct
+///   `remove_file` on `canonical_path_for`), not through this function.
 pub fn unbind(base_dir: &Path, slot: AccountNum) -> Result<(), ProvisionError> {
     let path = binding_path(base_dir, slot);
     match std::fs::remove_file(&path) {
@@ -517,65 +745,15 @@ pub fn unbind(base_dir: &Path, slot: AccountNum) -> Result<(), ProvisionError> {
     }
 }
 
-/// Surface a slot is currently bound to, when that surface is
-/// something other than Gemini. Returned by
-/// [`detect_other_surface_binding`] so a `setkey gemini` flow can
-/// refuse to silently overwrite an existing binding without an
-/// explicit `csq logout`. Mirrors FR-CLI-05 posture for parity with
-/// `setkey mm` / `setkey codex`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BoundSurface {
-    /// Anthropic OAuth account — detected via the identity store (`by_slot` →
-    /// `identities/<UUID>/`, provider `anthropic`), with the legacy
-    /// `credentials/<N>.json` mirror as a pre-A++ fallback.
-    ClaudeCode,
-    /// Codex device-auth account — detected via the identity store (`by_slot`
-    /// → `identities/<UUID>/`, provider `codex` / `credentials-codex.json`),
-    /// with the legacy `credentials/codex-<N>.json` marker as a fallback.
-    Codex,
-}
-
-impl BoundSurface {
-    /// Stable lower-case tag for logs and UI labels (`"claude_code"`,
-    /// `"codex"`). The desktop renders this in the slot-conflict
-    /// refusal message.
-    pub fn as_tag(&self) -> &'static str {
-        match self {
-            BoundSurface::ClaudeCode => "claude_code",
-            BoundSurface::Codex => "codex",
-        }
-    }
-}
-
-/// Returns `Some(...)` when slot `N` is currently bound to a
-/// non-Gemini surface — the caller MUST refuse rebinding without an
-/// explicit `csq logout N` first. This is the shared guard for every
-/// Gemini provisioning entry point: `csq login N --provider gemini`
-/// (via [`super::oauth_login::perform`]) and the desktop
-/// `gemini_provision_*` commands.
-///
-/// Identity-store-aware (`account-terminal-separation.md` MUST Rule 4).
-/// M4-12 retired the legacy numeric mirrors (`credentials/<N>.json`,
-/// `credentials/codex-<N>.json`) as write targets, so the previous
-/// `symlink_metadata`-on-the-mirror implementation was blind to every
-/// post-A++ login — a Gemini bind would silently clobber a live
-/// Anthropic/Codex slot and orphan its `by_slot` mapping (the #995 class,
-/// `reconciler-cleanup-parity.md` Rule 6). Detection now delegates to the
-/// identity-aware predicates, which fall back to the legacy mirror
-/// (via `symlink_metadata`, preserving the dangling-link "treat as bound"
-/// posture) only for pre-A++ installs.
-///
-/// Codex is checked before ClaudeCode so a (rare) dual-bound slot reports
-/// Codex; the `csq logout N` remediation is surface-agnostic.
-pub fn detect_other_surface_binding(base_dir: &Path, slot: AccountNum) -> Option<BoundSurface> {
-    if crate::accounts::identity_store::is_codex_bound_slot_identity_aware(base_dir, slot) {
-        return Some(BoundSurface::Codex);
-    }
-    if crate::accounts::identity_store::is_anthropic_bound_slot(base_dir, slot) {
-        return Some(BoundSurface::ClaudeCode);
-    }
-    None
-}
+/// The taxonomy of what a slot is bound to. Moved to the surface-neutral
+/// [`crate::accounts::binding_guard`] module (an internal journal entry For-Discussion #1)
+/// and re-exported here for the callers that historically imported
+/// `provisioning::BoundSurface`. The unified detector is
+/// [`crate::accounts::binding_guard::detect_bound_surface`]; the Gemini
+/// entry points refuse conflicts via
+/// [`crate::accounts::binding_guard::refuse_if_slot_conflicts`] with
+/// [`Surface::Gemini`] as the target.
+pub use crate::accounts::binding_guard::BoundSurface;
 
 /// Orchestrates AI Studio API-key provisioning from a desktop or CLI
 /// caller. Sequence:
@@ -590,9 +768,9 @@ pub fn detect_other_surface_binding(base_dir: &Path, slot: AccountNum) -> Option
 ///
 /// The caller is responsible for shape validation on `key` (e.g.
 /// `AIza` prefix, length bounds) and for refusing cross-surface
-/// conflicts via [`detect_other_surface_binding`] BEFORE invoking —
-/// this fn deliberately does NOT re-check those so it stays unit
-/// testable in isolation.
+/// conflicts via [`crate::accounts::binding_guard::refuse_if_slot_conflicts`]
+/// (with [`Surface::Gemini`]) BEFORE invoking — this fn deliberately does NOT
+/// re-check those so it stays unit testable in isolation.
 pub fn provision_api_key_via_vault(
     base_dir: &Path,
     slot: AccountNum,
@@ -713,6 +891,171 @@ mod tests {
 
     fn slot(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
+    }
+
+    /// Seeds a `quota.json` row for `n` shaped the way the
+    /// cadence poller writes one for an OAuth slot: `surface:
+    /// "gemini"`, `kind: "utilization"`. `updated_at` is the caller's,
+    /// so a test can make the row arbitrarily old without a
+    /// wall-clock literal that decays into a time-bomb.
+    fn seed_oauth_shaped_quota_row(base: &Path, n: u16, updated_at: f64) {
+        use crate::quota::{state as quota_state, AccountQuota};
+
+        let row = AccountQuota {
+            surface: "gemini".to_string(),
+            kind: "utilization".to_string(),
+            updated_at,
+            ..AccountQuota::default()
+        };
+        let mut quota = quota_state::load_state_salvage(base);
+        quota.set(n, row);
+        quota_state::save_state(base, &quota).unwrap();
+    }
+
+    fn quota_row_present(base: &Path, n: u16) -> bool {
+        crate::quota::state::load_state(base)
+            .unwrap()
+            .accounts
+            .contains_key(&n.to_string())
+    }
+
+    /// The regime change the staleness classifier cannot see. An
+    /// OAuth row is `kind: "utilization"`, so
+    /// `status::is_event_driven_row` reads FALSE and the row is judged
+    /// on poll cadence — but nothing polls the slot any more once its
+    /// binding is no longer OAuth, so it renders `stale` one hour
+    /// after the REBIND while being perfectly healthy and merely idle.
+    #[test]
+    fn rebind_from_oauth_to_api_key_clears_the_stale_quota_row() {
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            slot(13),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "gemini-2.5-pro"),
+        )
+        .unwrap();
+        seed_oauth_shaped_quota_row(dir.path(), 13, 1_000.0);
+        assert!(
+            quota_row_present(dir.path(), 13),
+            "precondition: the seeded row must exist, or this test proves nothing"
+        );
+
+        write_binding(
+            dir.path(),
+            slot(13),
+            &GeminiBinding::new(AuthMode::ApiKey, "gemini-2.5-pro"),
+        )
+        .unwrap();
+
+        assert!(
+            !quota_row_present(dir.path(), 13),
+            "the OAuth-written row outlived its writer: nothing polls an ApiKey slot, \
+             so it stays frozen at kind=utilization and renders a false `stale`"
+        );
+    }
+
+    /// The reverse direction: an event-driven slot rebound to OAuth
+    /// must not keep a counter row that the cadence poller would then
+    /// be judged against.
+    #[test]
+    fn rebind_from_api_key_to_oauth_clears_the_stale_quota_row() {
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            slot(4),
+            &GeminiBinding::new(AuthMode::ApiKey, "gemini-2.5-pro"),
+        )
+        .unwrap();
+        seed_oauth_shaped_quota_row(dir.path(), 4, 1_000.0);
+
+        write_binding(
+            dir.path(),
+            slot(4),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "gemini-2.5-pro"),
+        )
+        .unwrap();
+
+        assert!(!quota_row_present(dir.path(), 4));
+    }
+
+    /// The other half of the precedent: a re-login / re-key inside the
+    /// SAME regime is not a regime change, and discarding a valid row
+    /// there would throw away real data for nothing.
+    #[test]
+    fn rewriting_the_same_regime_preserves_the_quota_row() {
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            slot(5),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "gemini-2.5-pro"),
+        )
+        .unwrap();
+        seed_oauth_shaped_quota_row(dir.path(), 5, 1_000.0);
+
+        // Same regime, different model — an OAuth re-login or a
+        // `csq models switch` rewrite.
+        write_binding(
+            dir.path(),
+            slot(5),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "gemini-2.5-flash"),
+        )
+        .unwrap();
+
+        assert!(
+            quota_row_present(dir.path(), 5),
+            "a same-regime rewrite discarded a valid row"
+        );
+    }
+
+    /// Discriminant-level comparison: re-pointing Vertex SA at a
+    /// different JSON changes the binding but not the polling regime.
+    #[test]
+    fn repointing_vertex_sa_preserves_the_quota_row() {
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            slot(6),
+            &GeminiBinding::new(
+                AuthMode::VertexSa {
+                    path: PathBuf::from("/tmp/sa-one.json"),
+                },
+                "gemini-2.5-pro",
+            ),
+        )
+        .unwrap();
+        seed_oauth_shaped_quota_row(dir.path(), 6, 1_000.0);
+
+        write_binding(
+            dir.path(),
+            slot(6),
+            &GeminiBinding::new(
+                AuthMode::VertexSa {
+                    path: PathBuf::from("/tmp/sa-two.json"),
+                },
+                "gemini-2.5-pro",
+            ),
+        )
+        .unwrap();
+
+        assert!(quota_row_present(dir.path(), 6));
+    }
+
+    /// A first-ever binding has no prior regime, so there is nothing
+    /// to have changed — and a row seeded by any other surface must
+    /// not be collateral damage.
+    #[test]
+    fn first_binding_with_no_prior_marker_preserves_the_quota_row() {
+        let dir = TempDir::new().unwrap();
+        seed_oauth_shaped_quota_row(dir.path(), 8, 1_000.0);
+
+        write_binding(
+            dir.path(),
+            slot(8),
+            &GeminiBinding::new(AuthMode::ApiKey, "gemini-2.5-pro"),
+        )
+        .unwrap();
+
+        assert!(quota_row_present(dir.path(), 8));
     }
 
     #[test]
@@ -1001,7 +1344,12 @@ mod tests {
     #[test]
     fn detect_other_surface_returns_none_when_no_bindings() {
         let dir = TempDir::new().unwrap();
-        assert!(detect_other_surface_binding(dir.path(), slot(1)).is_none());
+        assert!(crate::accounts::binding_guard::conflicting_bound_surface(
+            dir.path(),
+            slot(1),
+            Surface::Gemini
+        )
+        .is_none());
     }
 
     #[test]
@@ -1009,7 +1357,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_marker_file(dir.path(), Surface::Codex, 2, "{}");
         assert_eq!(
-            detect_other_surface_binding(dir.path(), slot(2)),
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(2),
+                Surface::Gemini
+            ),
             Some(BoundSurface::Codex)
         );
     }
@@ -1019,7 +1371,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_marker_file(dir.path(), Surface::ClaudeCode, 3, "{}");
         assert_eq!(
-            detect_other_surface_binding(dir.path(), slot(3)),
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(3),
+                Surface::Gemini
+            ),
             Some(BoundSurface::ClaudeCode)
         );
     }
@@ -1035,7 +1391,61 @@ mod tests {
         write_marker_file(dir.path(), Surface::Codex, 4, "{}");
         write_marker_file(dir.path(), Surface::ClaudeCode, 4, "{}");
         assert_eq!(
-            detect_other_surface_binding(dir.path(), slot(4)),
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(4),
+                Surface::Gemini
+            ),
+            Some(BoundSurface::Codex)
+        );
+    }
+
+    #[test]
+    fn detect_other_surface_returns_native_when_kimi_marker_present() {
+        // redteam R2 MED-2: `detect_other_surface_binding` was blind to
+        // native (Kimi/Grok) bindings — a Gemini bind onto a native-bound
+        // slot silently dual-bound it. Now checked (last, after Codex +
+        // ClaudeCode) via the shared `native::native_surface_for_slot`
+        // primitive.
+        let dir = TempDir::new().unwrap();
+        write_marker_file(dir.path(), Surface::Kimi, 8, "{}");
+        assert_eq!(
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(8),
+                Surface::Gemini
+            ),
+            Some(BoundSurface::Native(Surface::Kimi))
+        );
+    }
+
+    #[test]
+    fn detect_other_surface_returns_native_when_grok_marker_present() {
+        let dir = TempDir::new().unwrap();
+        write_marker_file(dir.path(), Surface::Grok, 9, "{}");
+        assert_eq!(
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(9),
+                Surface::Gemini
+            ),
+            Some(BoundSurface::Native(Surface::Grok))
+        );
+    }
+
+    #[test]
+    fn detect_other_surface_prefers_codex_over_native_when_both_present() {
+        // Check order: Codex, ClaudeCode, then native — an inconsistent
+        // dual-marker state still resolves deterministically.
+        let dir = TempDir::new().unwrap();
+        write_marker_file(dir.path(), Surface::Codex, 10, "{}");
+        write_marker_file(dir.path(), Surface::Kimi, 10, "{}");
+        assert_eq!(
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(10),
+                Surface::Gemini
+            ),
             Some(BoundSurface::Codex)
         );
     }
@@ -1048,7 +1458,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
         write_binding(dir.path(), slot(5), &binding).unwrap();
-        assert!(detect_other_surface_binding(dir.path(), slot(5)).is_none());
+        assert!(crate::accounts::binding_guard::conflicting_bound_surface(
+            dir.path(),
+            slot(5),
+            Surface::Gemini
+        )
+        .is_none());
     }
 
     /// Plant the post-M4-12 identity-store shape (by_slot → identity, NO legacy
@@ -1087,7 +1502,11 @@ mod tests {
             "precondition: no legacy mirror"
         );
         assert_eq!(
-            detect_other_surface_binding(dir.path(), slot(6)),
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(6),
+                Surface::Gemini
+            ),
             Some(BoundSurface::ClaudeCode),
             "a Gemini bind must be refused over a post-A++ Anthropic OAuth slot"
         );
@@ -1099,7 +1518,11 @@ mod tests {
         plant_identity_by_slot(dir.path(), 7, "codex");
         assert!(!dir.path().join("credentials/codex-7.json").exists());
         assert_eq!(
-            detect_other_surface_binding(dir.path(), slot(7)),
+            crate::accounts::binding_guard::conflicting_bound_surface(
+                dir.path(),
+                slot(7),
+                Surface::Gemini
+            ),
             Some(BoundSurface::Codex),
             "a Gemini bind must be refused over a post-A++ Codex slot"
         );
@@ -1370,6 +1793,8 @@ mod tests {
     fn bound_surface_as_tag_is_stable() {
         assert_eq!(BoundSurface::ClaudeCode.as_tag(), "claude_code");
         assert_eq!(BoundSurface::Codex.as_tag(), "codex");
+        assert_eq!(BoundSurface::Native(Surface::Kimi).as_tag(), "kimi");
+        assert_eq!(BoundSurface::Native(Surface::Grok).as_tag(), "grok");
     }
 
     // ── delete_api_key_from_vault ────────────────────────────────────────────

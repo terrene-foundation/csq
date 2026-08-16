@@ -8,15 +8,20 @@ use std::path::{Path, PathBuf};
 
 use super::InstallManager;
 
-/// Walk `PATH` and return the first entry that contains an executable
-/// named `name`.
+/// Resolve an executable named `name` from `PATH`, then from the
+/// self-managed CLIs' known install dirs.
 ///
 /// Unix: splits on `:`, checks `<entry>/<name>` existence + executable bit.
 /// Windows: splits on `;`, tries `<entry>/<name>`, `<entry>/<name>.exe`,
 /// `<entry>/<name>.cmd`, `<entry>/<name>.bat`.
 ///
-/// Returns the first match (NOT canonicalized). Returns `None` if the
-/// binary is not found in any PATH entry.
+/// If the PATH walk finds nothing (or `PATH` is unset), a known-location
+/// fallback is consulted for the self-managed CLIs (`known_install_dirs`:
+/// `~/.kimi-code/bin` for `kimi`, `~/.grok/bin` for `grok`) — see spec/13 §5.
+/// For every other `name` the fallback is empty, so behaviour is unchanged.
+///
+/// Returns the first match (NOT canonicalized). Returns `None` if the binary
+/// is found in neither `PATH` nor the known-location fallback.
 /// Maximum number of PATH entries to inspect before giving up.
 /// Defends against adversarially-crafted 100k-entry PATH values.
 const MAX_PATH_ENTRIES: usize = 4096;
@@ -26,39 +31,68 @@ const MAX_PATH_ENTRIES: usize = 4096;
 const MAX_PATH_ENTRY_BYTES: usize = 4096;
 
 pub fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    let separator = if cfg!(windows) { ';' } else { ':' };
+    if let Some(path_var) = std::env::var_os("PATH") {
+        let separator = if cfg!(windows) { ';' } else { ':' };
 
-    for (count, dir) in std::env::split_paths(&path_var).enumerate() {
-        if count >= MAX_PATH_ENTRIES {
-            break;
-        }
-        // Skip entries that are longer than PATH_MAX — they can't be real.
-        // Use as_os_str().len() which returns the byte length of the
-        // underlying OS string representation.
-        if dir.as_os_str().len() > MAX_PATH_ENTRY_BYTES {
-            continue;
-        }
+        for (count, dir) in std::env::split_paths(&path_var).enumerate() {
+            if count >= MAX_PATH_ENTRIES {
+                break;
+            }
+            // Skip entries that are longer than PATH_MAX — they can't be real.
+            // Use as_os_str().len() which returns the byte length of the
+            // underlying OS string representation.
+            if dir.as_os_str().len() > MAX_PATH_ENTRY_BYTES {
+                continue;
+            }
 
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+
+            // On Windows also try with common PATHEXT extensions.
+            #[cfg(windows)]
+            for ext in &[".exe", ".cmd", ".bat"] {
+                let with_ext = dir.join(format!("{name}{ext}"));
+                if is_executable(&with_ext) {
+                    return Some(with_ext);
+                }
+            }
+
+            // Suppress unused warning on non-Windows.
+            let _ = separator;
+        }
+    }
+
+    // Known-location fallback for self-managed CLIs (spec/13 §5).
+    //
+    // Kimi/Grok install to a fixed per-user dir (`~/.kimi-code/bin`,
+    // `~/.grok/bin`) and add it to the interactive-shell PATH via a profile
+    // edit. csq subprocesses can run under a minimal PATH that omits it (cf.
+    // the `find_claude_binary`-on-minimal-PATH precedent), so probe + the
+    // `csq cli upgrade` spawn would otherwise see the binary as Missing.
+    for dir in known_install_dirs(name) {
         let candidate = dir.join(name);
         if is_executable(&candidate) {
             return Some(candidate);
         }
-
-        // On Windows also try with common PATHEXT extensions.
-        #[cfg(windows)]
-        for ext in &[".exe", ".cmd", ".bat"] {
-            let with_ext = dir.join(format!("{name}{ext}"));
-            if is_executable(&with_ext) {
-                return Some(with_ext);
-            }
-        }
-
-        // Suppress unused warning on non-Windows.
-        let _ = separator;
     }
 
     None
+}
+
+/// Fixed per-user install directories for self-managed CLIs, checked after
+/// the PATH walk fails. Empty for everything except `kimi` / `grok`.
+fn known_install_dirs(name: &str) -> Vec<PathBuf> {
+    let home = match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h),
+        _ => return Vec::new(),
+    };
+    match name {
+        "kimi" => vec![home.join(".kimi-code").join("bin")],
+        "grok" => vec![home.join(".grok").join("bin")],
+        _ => Vec::new(),
+    }
 }
 
 /// Returns `true` if `path` exists and is executable by the current process.
@@ -135,6 +169,12 @@ pub fn classify_install_manager(canonical_path: &Path) -> InstallManager {
     if s.contains("/Cellar/gemini-cli/") {
         return InstallManager::BrewFormula;
     }
+    // Self-managed vendor install dirs (Kimi/Grok update via own subcommand).
+    // Grok's `bin/grok` is a symlink into `~/.grok/downloads/`, so match the
+    // `/.grok/` ancestor rather than the `bin/` leaf; likewise `/.kimi-code/`.
+    if s.contains("/.kimi-code/") || s.contains("/.grok/") {
+        return InstallManager::SelfManaged;
+    }
 
     InstallManager::Unknown
 }
@@ -195,6 +235,90 @@ mod tests {
     fn classify_unknown_for_home_bin() {
         let p = PathBuf::from("/home/user/bin/claude");
         assert_eq!(classify_install_manager(&p), InstallManager::Unknown);
+    }
+
+    #[test]
+    fn classify_self_managed_kimi() {
+        let p = PathBuf::from("/Users/u/.kimi-code/bin/kimi");
+        assert_eq!(classify_install_manager(&p), InstallManager::SelfManaged);
+    }
+
+    #[test]
+    fn classify_self_managed_grok_via_downloads_symlink_target() {
+        // grok's bin/grok symlinks into ~/.grok/downloads/; canonicalize lands
+        // there, so we match the `/.grok/` ancestor, not the `bin/` leaf.
+        let p = PathBuf::from("/Users/u/.grok/downloads/grok-macos-aarch64");
+        assert_eq!(classify_install_manager(&p), InstallManager::SelfManaged);
+    }
+
+    // ── known_install_dirs fallback ──────────────────────────────────
+
+    #[test]
+    fn known_install_dirs_maps_kimi_and_grok_only() {
+        let _env_guard = crate::platform::test_env::lock();
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: env lock held; restored below.
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+
+        let kimi = known_install_dirs("kimi");
+        assert_eq!(kimi, vec![PathBuf::from("/home/tester/.kimi-code/bin")]);
+        let grok = known_install_dirs("grok");
+        assert_eq!(grok, vec![PathBuf::from("/home/tester/.grok/bin")]);
+        // No fallback for the session surfaces.
+        assert!(known_install_dirs("claude").is_empty());
+        assert!(known_install_dirs("codex").is_empty());
+
+        // Restore.
+        unsafe {
+            match old_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn find_in_path_falls_back_to_known_kimi_dir() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _env_guard = crate::platform::test_env::lock();
+
+        // Build a fake HOME with ~/.kimi-code/bin/kimi and an empty PATH so the
+        // walk misses and the known-location fallback must find it.
+        let home = TempDir::new().unwrap();
+        let bin_dir = home.path().join(".kimi-code").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let kimi = bin_dir.join("kimi");
+        fs::write(&kimi, b"#!/bin/sh\necho 0.27.0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&kimi, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let old_home = std::env::var_os("HOME");
+        let old_path = std::env::var_os("PATH");
+        // SAFETY: env lock held; both restored below.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("PATH", ""); // empty PATH → walk finds nothing
+        }
+
+        let found = find_in_path("kimi");
+
+        unsafe {
+            match old_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(found.as_deref(), Some(kimi.as_path()));
     }
 
     // ── find_in_path ─────────────────────────────────────────────────

@@ -111,7 +111,7 @@ impl ProviderSettings {
 
     /// Overlays `(env_key, value)` pairs into this settings file's `env` block,
     /// preserving every other key. Used by the Azure OpenAI / Vertex AI native
-    /// direct-API bindings (#962), which persist multi-field endpoint config
+    /// direct-API bindings (an internal ticket), which persist multi-field endpoint config
     /// (`AZURE_OPENAI_RESOURCE`/`_DEPLOYMENT`/`_API_VERSION` + the api-key;
     /// `VERTEX_PROJECT`/`_REGION` + the access token) rather than the single
     /// `ANTHROPIC_AUTH_TOKEN` the 3P passthrough bind writes.
@@ -152,12 +152,12 @@ impl ProviderSettings {
     pub fn key_fingerprint(&self) -> String {
         match self.get_api_key() {
             Some(k) => k.fingerprint(),
-            // Native direct-API providers (azure/vertex, #962) have catalog
+            // Native direct-API providers (azure/vertex, an internal ticket) have catalog
             // `key_env_var: None`, so `get_api_key()` can't resolve their
             // credential. Fall back to the known native cred env var so EVERY
             // fingerprint surface (`csq listkeys`, etc.) shows the real masked
             // key — not just the setkey handler that calls `key_fingerprint_for`
-            // directly (#962 redteam MED-1: `listkeys` showed `Key: (none)` for a
+            // directly (an internal ticket redteam MED-1: `listkeys` showed `Key: (none)` for a
             // correctly-configured azure/vertex slot).
             None => match native_cred_env_var(&self.provider_id) {
                 Some(env_var) => self.key_fingerprint_for(env_var),
@@ -167,7 +167,7 @@ impl ProviderSettings {
     }
 
     /// Masked fingerprint of the value at an EXPLICIT `env.<env_var>`, for
-    /// native direct-API providers (azure/vertex, #962) whose catalog
+    /// native direct-API providers (azure/vertex, an internal ticket) whose catalog
     /// `key_env_var` is `None` so [`key_fingerprint`](Self::key_fingerprint)
     /// cannot resolve the credential env var. The raw value is wrapped in
     /// [`ApiKey`] before fingerprinting so it is never handled as a plain string.
@@ -184,7 +184,7 @@ impl ProviderSettings {
     }
 }
 
-/// Maps a native direct-API provider id (#962) to the `env.<var>` holding its
+/// Maps a native direct-API provider id (an internal ticket) to the `env.<var>` holding its
 /// credential. These providers have catalog `key_env_var: None` (their
 /// credential is multi-field / non-Bearer and read at request time by the
 /// phase2b native client), so the generic `key_env_var` fingerprint path can't
@@ -368,6 +368,62 @@ pub fn slot_pins_anthropic_base_url(base_dir: &Path, slot: u16) -> bool {
         .is_some()
 }
 
+/// Derives the cloud-Claude [`Backend`](crate::accounts::Backend) of a slot
+/// from its `config-<slot>/settings.json` env block (an internal ticket).
+///
+/// The env block is the SOLE source of truth for what the spawned `claude`
+/// actually does — CC reads `CLAUDE_CODE_USE_VERTEX` / `CLAUDE_CODE_USE_BEDROCK`
+/// from the config dir at startup. csq therefore DERIVES the backend here
+/// rather than persisting a duplicate `AccountInfo.backend` field that could
+/// drift from the env block (e.g. an operator hand-edits settings.json). This
+/// mirrors [`slot_pins_anthropic_base_url`]: it reads only the slot's on-disk
+/// settings, never the process environment, and is fail-safe.
+///
+/// A flag is treated as enabled when the key is present with a truthy value
+/// (anything other than empty / `0` / `false`, case-insensitive) — matching
+/// how CC interprets these boolean env flags. Returns [`crate::accounts::Backend::Direct`] on
+/// any I/O or parse error, when neither flag is present, or when a flag is
+/// present but falsy. If both flags are (incorrectly) enabled, Vertex wins —
+/// but fail-closed provisioning never writes both.
+pub fn backend_for_slot(base_dir: &Path, slot: u16) -> crate::accounts::Backend {
+    use crate::accounts::Backend;
+
+    let path = base_dir
+        .join(format!("config-{slot}"))
+        .join("settings.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Backend::Direct,
+    };
+    let json: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Backend::Direct,
+    };
+
+    // Read a boolean CC env flag from the `env` block (or a bare top-level
+    // key, matching the `model_id_for_slot` fallback shape). Truthy = present
+    // and not empty / "0" / "false".
+    let flag_enabled = |key: &str| -> bool {
+        json.get("env")
+            .and_then(|e| e.get(key))
+            .or_else(|| json.get(key))
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                let t = s.trim().to_ascii_lowercase();
+                !t.is_empty() && t != "0" && t != "false"
+            })
+            .unwrap_or(false)
+    };
+
+    if flag_enabled("CLAUDE_CODE_USE_VERTEX") {
+        Backend::Vertex
+    } else if flag_enabled("CLAUDE_CODE_USE_BEDROCK") {
+        Backend::Bedrock
+    } else {
+        Backend::Direct
+    }
+}
+
 /// Saves provider settings to disk with atomic write and 0o600 permissions.
 pub fn save_settings(base_dir: &Path, settings: &ProviderSettings) -> Result<(), ConfigError> {
     let provider =
@@ -482,7 +538,48 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// #962: `set_env_kv` overlays the azure config env keys and preserves
+    /// an internal ticket: `backend_for_slot` derives the cloud-Claude backend from the
+    /// slot's `settings.json` env block, treating the CC flag as truthy only
+    /// when present and not empty/`0`/`false`, and fail-safe (`Direct`) on a
+    /// missing/unparseable file.
+    #[test]
+    fn backend_for_slot_derives_from_settings_env() {
+        use crate::accounts::Backend;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let mk = |slot: u16, json: &str| {
+            let cfg = base.join(format!("config-{slot}"));
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(cfg.join("settings.json"), json).unwrap();
+        };
+        mk(1, r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1"}}"#);
+        mk(2, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#);
+        mk(3, r#"{"env":{}}"#); // ordinary Anthropic/OAuth slot
+        mk(4, r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"0"}}"#); // falsy → Direct
+        mk(5, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"false"}}"#); // falsy → Direct
+                                                                 // Both flags set (never written by csq) → Vertex wins deterministically.
+        mk(
+            6,
+            r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1","CLAUDE_CODE_USE_BEDROCK":"1"}}"#,
+        );
+
+        assert_eq!(backend_for_slot(base, 1), Backend::Vertex);
+        assert_eq!(backend_for_slot(base, 2), Backend::Bedrock);
+        assert_eq!(backend_for_slot(base, 3), Backend::Direct);
+        assert_eq!(backend_for_slot(base, 4), Backend::Direct);
+        assert_eq!(backend_for_slot(base, 5), Backend::Direct);
+        assert_eq!(backend_for_slot(base, 6), Backend::Vertex);
+        // Missing file → Direct (fail-safe).
+        assert_eq!(backend_for_slot(base, 99), Backend::Direct);
+
+        // Unparseable settings.json → Direct (fail-safe).
+        let cfg8 = base.join("config-8");
+        std::fs::create_dir_all(&cfg8).unwrap();
+        std::fs::write(cfg8.join("settings.json"), b"{not json").unwrap();
+        assert_eq!(backend_for_slot(base, 8), Backend::Direct);
+    }
+
+    /// an internal ticket: `set_env_kv` overlays the azure config env keys and preserves
     /// pre-existing unrelated keys; `key_fingerprint_for` reads the explicit
     /// credential env var (catalog `key_env_var` is `None` for azure).
     #[test]
@@ -517,7 +614,7 @@ mod tests {
         );
     }
 
-    /// #962: `set_env_kv` initializes `env` when the settings object has none.
+    /// an internal ticket: `set_env_kv` initializes `env` when the settings object has none.
     #[test]
     fn set_env_kv_creates_env_when_absent() {
         let mut settings = ProviderSettings {
@@ -533,7 +630,7 @@ mod tests {
         assert_eq!(settings.settings["env"]["VERTEX_REGION"], "us-central1");
     }
 
-    /// #962: an azure global settings round-trip (set_env_kv → save → load)
+    /// an internal ticket: an azure global settings round-trip (set_env_kv → save → load)
     /// preserves the config, and the native-client read path
     /// (`read_native_env_string` shape) resolves it. Also exercises that the
     /// `settings-azure.json` filename is the write target.
@@ -579,7 +676,7 @@ mod tests {
 
     #[test]
     fn model_id_for_slot_reads_env_anthropic_model() {
-        // #984: the statusline resolves the true context window from this
+        // an internal ticket: the statusline resolves the true context window from this
         // on-disk source, NOT the process env.
         let dir = TempDir::new().unwrap();
         let cfg = dir.path().join("config-11");
@@ -722,7 +819,7 @@ mod tests {
 
     #[test]
     fn key_fingerprint_falls_back_to_native_cred_env_var() {
-        // #962 MED-1: azure/vertex have catalog `key_env_var: None`, so
+        // an internal ticket MED-1: azure/vertex have catalog `key_env_var: None`, so
         // `get_api_key()` returns None; `key_fingerprint()` must fall back to the
         // native cred env var so `csq listkeys` shows the real masked key, not
         // "(none)" (which read as "the key didn't save").
@@ -787,6 +884,48 @@ mod tests {
         assert_eq!(
             env.get("CLAUDE_CODE_EFFORT_LEVEL").unwrap().as_str(),
             Some("max")
+        );
+    }
+
+    /// Kimi's official Claude Code docs require a fixed env set: all model
+    /// tiers → `kimi-k3[1m]` (uniform fan-out onto the 1M-context variant; no
+    /// tier asymmetry like DeepSeek), plus `ENABLE_TOOL_SEARCH=false` (the
+    /// Moonshot endpoint doesn't support tool-search yet), a 1M
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, and
+    /// `CLAUDE_CODE_SUBAGENT_MODEL=kimi-k3[1m]`. Effort is a csq-chosen
+    /// default of `high` (not docs-mandated). This locks that the
+    /// `extra_env` contract actually reaches the generated settings.json.
+    #[test]
+    fn default_settings_kimi_applies_docs_env() {
+        let p = get_provider("kimi").unwrap();
+        let s = default_settings(p);
+        let env = s.get("env").unwrap();
+
+        // All three model tiers stay uniform at kimi-k3[1m] (no flash-tier split).
+        for key in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        ] {
+            assert_eq!(env.get(key).unwrap().as_str(), Some("kimi-k3[1m]"), "{key}");
+        }
+
+        // Docs-mandated extra_env keys reach settings.json verbatim.
+        assert_eq!(
+            env.get("ENABLE_TOOL_SEARCH").unwrap().as_str(),
+            Some("false")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").unwrap().as_str(),
+            Some("1048576")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_EFFORT_LEVEL").unwrap().as_str(),
+            Some("high")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_SUBAGENT_MODEL").unwrap().as_str(),
+            Some("kimi-k3[1m]")
         );
     }
 

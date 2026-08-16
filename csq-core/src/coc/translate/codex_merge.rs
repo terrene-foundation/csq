@@ -123,9 +123,16 @@ pub fn merge_instructions_via_toml_value(
     // scalar (no multi-line tables, no trailing comments).
     for (k, raw_value) in overlay {
         let synthetic = format!("__x = {raw_value}");
-        let parsed: toml::Value = toml::from_str(&synthetic).with_context(|| {
-            format!("config_toml_overlay key {k}: invalid TOML scalar expression")
-        })?;
+        // Discard the parser's error body — same token-leak discipline as
+        // the canonical-parse `map_err(|_| ...)` above (LOW-I / round-2
+        // H2). `with_context` would otherwise wrap the raw
+        // `toml::de::Error` as the anyhow chain's source, and
+        // `toml::de::Error::Display` echoes a snippet of the OFFENDING
+        // INPUT (the raw scalar expression, which could carry fragmented
+        // credential material) — visible to any `{err:?}`/`{err:#}`
+        // formatting even though the top-level `{err}` Display looks safe.
+        let parsed: toml::Value = toml::from_str(&synthetic)
+            .map_err(|_| anyhow!("config_toml_overlay key {k}: invalid TOML scalar expression"))?;
         let parsed_table = parsed.as_table().ok_or_else(|| {
             anyhow!("config_toml_overlay key {k}: expected scalar, got non-table")
         })?;
@@ -136,6 +143,51 @@ pub fn merge_instructions_via_toml_value(
             ));
         }
         let scalar = parsed_table["__x"].clone();
+        // MED-K: `parsed_table.len() != 1` above catches EXTRA keys, not a
+        // COMPOSITE `__x` value — `raw_value = "{ }"` parses to exactly one
+        // key (`__x`) holding an inline TABLE, which passes that check.
+        // Inserting a table/array wholesale REPLACES the existing top-level
+        // key of the same name (e.g. `overlay["cli_auth_credentials_store"]
+        // = "{ }"` would silently clobber it). Reject composites
+        // explicitly; only true scalars may reach the `insert` below — this
+        // guards the VALUE side (mirrors the identical fix in
+        // kimi_merge.rs — zero-tolerance Rule 1a). The TARGET side (a
+        // scalar overlay at a key whose EXISTING canonical value is a
+        // table/array) is a SEPARATE clobber class, guarded immediately
+        // below — round-11 MED-1 ported kimi_merge.rs's target-aware guard
+        // to close it here too (see that guard's comment for why a
+        // composite-value-only check is insufficient).
+        if matches!(scalar, toml::Value::Table(_) | toml::Value::Array(_)) {
+            let kind = if scalar.is_table() { "table" } else { "array" };
+            return Err(anyhow!(
+                "config_toml_overlay key {k}: raw_value must be a scalar (string, \
+                 integer, float, boolean, or datetime), got a TOML {kind} — a composite \
+                 value would silently REPLACE the existing top-level `{k}` key wholesale \
+                 instead of merging into it"
+            ));
+        }
+        // Round-11 MED-1: the composite check above guards the VALUE side
+        // only. `insert` REPLACES whatever lives at `k` — so a SCALAR
+        // overlay at a key whose EXISTING canonical value is a table/array
+        // wholesale-deletes that subtree. Codex's `config.toml` carries
+        // table keys too — e.g. `mcp_servers`, which
+        // `daemon::mcp_rewrite::rewrite_codex_config_mcp_servers` maintains
+        // (`run.rs`'s own doc: "The overlay is reserved for future
+        // MCP-filter parameters") — so a future overlay entry named
+        // `mcp_servers` carrying a rendered scalar would silently
+        // wholesale-delete the operator's MCP server table. Refuse
+        // target-aware, mirroring kimi_merge.rs's identical guard.
+        if let Some(existing) = table_mut.get(k) {
+            if matches!(existing, toml::Value::Table(_) | toml::Value::Array(_)) {
+                return Err(anyhow!(
+                    "config_toml_overlay key {k}: the canonical config already has a \
+                     table/array at `{k}` — a scalar overlay would REPLACE it wholesale, \
+                     silently deleting its contents (e.g. the `mcp_servers` table). csq \
+                     does not overlay composite keys; edit config.toml directly to \
+                     restructure `{k}`"
+                ));
+            }
+        }
         table_mut.insert(k.clone(), scalar);
     }
 
@@ -349,24 +401,104 @@ instructions = "[csq:layer-scaffold-begin] preseeded literal"
 
     #[test]
     fn merge_overlay_rejects_value_with_extra_keys_in_synthetic_table() {
-        // Crafted to make the parsed table have len() > 1 OR not
-        // contain `__x` — any ill-formed scalar expression should
-        // be rejected.
+        // A multi-line raw_value that injects a second top-level
+        // assignment produces a parsed table with TWO keys (`__x` and
+        // `extra`) — the `len() != 1` branch this test targets.
         let mut overlay = BTreeMap::new();
-        // A table-shaped value would be parsed as `__x = { … }` and
-        // then we'd see a single key __x with table value — that's
-        // accepted (table is a valid scalar in TOML 1.0). Actual
-        // rejection: a value that produces a non-table parse like
-        // "[broken" — but that fails parse outright. Test the
-        // contract: a value that produces multiple top-level keys
-        // is rejected.
-        overlay.insert("k".to_string(), "{ a = 1, b = 2 }".to_string());
-        let result = merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay);
-        // Inline table is a valid scalar; this should succeed with
-        // a typed inline-table value.
+        overlay.insert("k".to_string(), "1\nextra = 2".to_string());
+        let err =
+            merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay).unwrap_err();
         assert!(
-            result.is_ok(),
-            "inline tables are valid scalars: {result:?}"
+            format!("{err}").contains("scalar"),
+            "error must flag the extra-key defect"
+        );
+    }
+
+    /// MED-K non-vacuity: an inline TABLE parses to exactly one key
+    /// (`__x`) — the `len() != 1` check above does NOT catch it — but a
+    /// table is a COMPOSITE, not a scalar. Was PREVIOUSLY accepted
+    /// (`merge_overlay_rejects_value_with_extra_keys_in_synthetic_table`'s
+    /// prior body asserted `result.is_ok()` for exactly this input,
+    /// pinning the bug). MUST now be rejected — see the clobber
+    /// regression test below for why.
+    #[test]
+    fn merge_rejects_table_shaped_overlay_value() {
+        let mut overlay = BTreeMap::new();
+        overlay.insert("k".to_string(), "{ a = 1, b = 2 }".to_string());
+        let err =
+            merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("composite") || msg.contains("table"),
+            "error must name the defect: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_array_shaped_overlay_value() {
+        let mut overlay = BTreeMap::new();
+        overlay.insert("k".to_string(), "[1, 2, 3]".to_string());
+        let err =
+            merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("array"), "error must name the defect: {msg}");
+    }
+
+    /// MED-K regression, the exact clobber the finding demonstrated:
+    /// BEFORE the fix, `overlay["cli_auth_credentials_store"] = "{ }"`
+    /// validated and would have silently wiped the credential-store field
+    /// this canonical carries. Proves the guard fires on the credential
+    /// field specifically, not just some generic key.
+    #[test]
+    fn merge_rejects_overlay_value_that_would_clobber_credential_field() {
+        let mut overlay = BTreeMap::new();
+        overlay.insert("cli_auth_credentials_store".to_string(), "{ }".to_string());
+        let err =
+            merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay).unwrap_err();
+        assert!(format!("{err}").contains("cli_auth_credentials_store"));
+    }
+
+    /// LOW-I non-vacuity: an overlay value that fails the initial
+    /// `toml::from_str` parse (as opposed to the later "multiple keys"
+    /// semantic check exercised above) is rejected with the sanitized
+    /// message.
+    #[test]
+    fn merge_rejects_invalid_overlay_scalar_expression() {
+        let mut overlay = BTreeMap::new();
+        overlay.insert("bad".to_string(), "not valid toml {{{".to_string());
+        let err =
+            merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid TOML scalar expression"),
+            "error must name the defect: {msg}"
+        );
+    }
+
+    /// LOW-I regression: `{err:?}` (anyhow's Debug chain, which — unlike
+    /// the top-level `{err}` Display — walks the FULL source chain) must
+    /// NOT echo a JWT-like fragment embedded in a malformed overlay scalar
+    /// expression. Before the fix, `.with_context(...)` wrapped the raw
+    /// `toml::de::Error` as the anyhow chain's source, and
+    /// `toml::de::Error`'s own Display quotes the offending source line
+    /// verbatim (confirmed empirically) — this test pins that the
+    /// `map_err(|_| ...)` fix discards it, mirroring
+    /// `merge_corrupt_canonical_does_not_echo_parse_error_body` above for
+    /// the canonical-parse leg.
+    #[test]
+    fn merge_overlay_parse_error_does_not_echo_scalar_value_via_debug_chain() {
+        let mut overlay = BTreeMap::new();
+        overlay.insert(
+            "bad".to_string(),
+            "eyJhbGciOi.fake_jwt_fragment.x not-a-scalar {{{".to_string(),
+        );
+        let err =
+            merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay).unwrap_err();
+        let debug_text = format!("{err:?}");
+        assert!(
+            !debug_text.contains("eyJhbGciOi"),
+            "error Debug chain must not echo JWT-like fragments from a malformed \
+             overlay value: {debug_text}"
         );
     }
 
@@ -382,5 +514,71 @@ instructions = "[csq:layer-scaffold-begin] preseeded literal"
         assert!(table.contains_key("instructions"));
         // No extras.
         assert_eq!(table.len(), 3, "no extra keys: {merged}");
+    }
+
+    // ── Round-11 MED-1: scalar overlay at a table/array key (ported from
+    // kimi_merge.rs's identical D4-1/R4-1 guard) ────────────────────────
+
+    /// `overlay["mcp_servers"] = "\"x\""` would wholesale-replace the
+    /// `[mcp_servers]` table `daemon::mcp_rewrite::
+    /// rewrite_codex_config_mcp_servers` maintains — refused target-aware.
+    #[test]
+    fn merge_rejects_scalar_overlay_at_mcp_servers_table_key() {
+        let canonical = r#"cli_auth_credentials_store = "file"
+model = "gpt-5"
+
+[mcp_servers.filesystem]
+command = "npx"
+"#;
+        let mut overlay = BTreeMap::new();
+        overlay.insert("mcp_servers".to_string(), "\"x\"".to_string());
+        let err = merge_instructions_via_toml_value(canonical, "body", &overlay).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mcp_servers") && msg.contains("REPLACE"),
+            "error must name the key and the clobber: {msg}"
+        );
+    }
+
+    /// Array variant: a scalar overlay at a key whose existing canonical
+    /// value is an ARRAY is refused the same way as a table — the clobber
+    /// class is table/array symmetric (mirrors kimi_merge.rs's
+    /// `merge_rejects_scalar_overlay_at_hooks_array_key`).
+    #[test]
+    fn merge_rejects_scalar_overlay_at_existing_array_key() {
+        let canonical = r#"cli_auth_credentials_store = "file"
+model = "gpt-5"
+some_array = [1, 2, 3]
+"#;
+        let mut overlay = BTreeMap::new();
+        overlay.insert("some_array".to_string(), "\"x\"".to_string());
+        let err = merge_instructions_via_toml_value(canonical, "body", &overlay).unwrap_err();
+        assert!(format!("{err}").contains("some_array"));
+    }
+
+    /// Positive control: a scalar overlay at an ABSENT key still inserts
+    /// fine even when the canonical carries an unrelated table
+    /// (`mcp_servers`) — the target-aware guard is per-key, not "any table
+    /// exists anywhere → refuse everything".
+    #[test]
+    fn merge_allows_scalar_overlay_at_absent_key_alongside_existing_table() {
+        let canonical = r#"cli_auth_credentials_store = "file"
+model = "gpt-5"
+
+[mcp_servers.filesystem]
+command = "npx"
+"#;
+        let mut overlay = BTreeMap::new();
+        overlay.insert("max_tokens".to_string(), "4096".to_string());
+        let merged = merge_instructions_via_toml_value(canonical, "body", &overlay).unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(parsed["max_tokens"].as_integer(), Some(4096));
+        assert_eq!(
+            parsed["mcp_servers"]["filesystem"]["command"]
+                .as_str()
+                .unwrap(),
+            "npx",
+            "the unrelated mcp_servers table must survive untouched: {merged}"
+        );
     }
 }

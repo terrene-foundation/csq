@@ -45,8 +45,17 @@ pub fn backsync(config_dir: &Path, base_dir: &Path) -> Result<bool, crate::error
     };
 
     // Resolve account via the marker — the SOLE authority per
-    // `account-terminal-separation.md` MUST NOT Rule 3.
-    let account = match markers::read_csq_account(config_dir) {
+    // `account-terminal-separation.md` MUST NOT Rule 3. M4-7 (an internal ticket
+    // Phase 4): the marker's CONTENT is a UUID whenever a `by_slot` mapping
+    // exists, so `resolve_marker_to_slot` (numeric-or-UUID) is used rather
+    // than the numeric-only `read_csq_account` — the latter silently
+    // returned `None` on every modern slot, meaning backsync never ran
+    // (`guard-reader-writer-parity.md`). `account: AccountNum` stays the
+    // resolved type below because `save_canonical_for` and every log/trace
+    // field in this function are keyed on the slot number, not the UUID —
+    // a UUID-only shortcut (`read_csq_account_uuid`) would still need to
+    // re-derive the slot for those, so it buys nothing here.
+    let account = match markers::resolve_marker_to_slot(base_dir, config_dir) {
         Some(a) => a,
         None => {
             debug!(dir = %config_dir.display(), "backsync: cannot determine account");
@@ -246,6 +255,48 @@ mod tests {
         credentials::save(&config.join(".credentials.json"), &live).unwrap();
 
         config
+    }
+
+    /// M4-7 regression (`guard-reader-writer-parity.md`): `.csq-account`
+    /// markers are UUID content whenever a `by_slot` mapping exists
+    /// (`markers::write_csq_account`, written by `csq run` /
+    /// `finalize_login`). `backsync` only wants the slot NUMBER to key its
+    /// canonical write — the marker it failed to parse already contains
+    /// that number's identity, one hop away via `by_slot`. Before the fix,
+    /// `markers::read_csq_account` returned `None` on a UUID marker and
+    /// `backsync` silently no-op'd (`return Ok(false)`), which meant a token
+    /// CC refreshed in place was NEVER promoted to canonical on any host
+    /// with a modern (UUID-marker) slot.
+    #[test]
+    fn backsync_resolves_uuid_marker() {
+        let dir = TempDir::new().unwrap();
+
+        let config = dir.path().join("config-21");
+        std::fs::create_dir_all(&config).unwrap();
+        // UUID-content marker (M4-7 writer shape) instead of
+        // `write_csq_account_legacy`'s decimal content — also provisions
+        // `profiles.json::by_slot[21]`, which save_canonical_for needs to
+        // locate the identity-keyed write path.
+        crate::testing::identity_fixtures::write_uuid_account_marker(dir.path(), &config, 21);
+
+        let live = make_creds("at-live-21", "rt-21", 5000);
+        credentials::save(&config.join(".credentials.json"), &live).unwrap();
+
+        // Act: no canonical exists yet — backsync should write it.
+        let synced = backsync(&config, dir.path()).unwrap();
+        assert!(
+            synced,
+            "backsync must resolve the UUID marker and promote live -> canonical"
+        );
+
+        let uuid21 = crate::testing::identity_fixtures::fixture_uuid_for_slot(21);
+        let uuid_path = crate::accounts::identity_store::credentials_path_for(dir.path(), uuid21);
+        let written = credentials::load(&uuid_path).unwrap();
+        assert_eq!(
+            written.expect_anthropic().claude_ai_oauth.expires_at,
+            5000,
+            "canonical must be written from live under the UUID-resolved slot"
+        );
     }
 
     #[test]

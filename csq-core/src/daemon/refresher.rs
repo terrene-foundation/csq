@@ -369,7 +369,7 @@ async fn run_loop(
             );
         }
 
-        // M6 #909 shard B: periodic backstop drain of both durable audit outboxes
+        // M6 an internal ticket shard B: periodic backstop drain of both durable audit outboxes
         // onto the signed chain. Rides the same 5-min refresher cadence as the
         // held-sweep above; synchronous chain I/O → spawn_blocking so it never
         // stalls the runtime. A panic surfaces as a JoinError and is logged
@@ -416,7 +416,7 @@ async fn run_loop(
     }
 }
 
-/// M6 #909 shard B: periodic backstop drain of BOTH durable audit outboxes.
+/// M6 an internal ticket shard B: periodic backstop drain of BOTH durable audit outboxes.
 ///
 /// Runs on every refresher tick (the daemon's existing periodic cadence). Drains
 /// the `csq run` audit floor (`csq-runs/.pending/`, community) and — enterprise
@@ -2289,7 +2289,7 @@ mod tests {
         );
     }
 
-    /// AC-16 (#515 M3) — daemon-spawn-admissibility invariant pin.
+    /// AC-16 (an internal ticket M3) — daemon-spawn-admissibility invariant pin.
     ///
     /// A Codex `AccountInfo` with `has_credentials: false` MUST NOT proceed
     /// past the daemon's Codex-branch filter in `tick`. The filter is the
@@ -2366,7 +2366,7 @@ mod tests {
         );
     }
 
-    // ── M6 #909 shard B: periodic outbox-drain backstop tick ──────────────────
+    // ── M6 an internal ticket shard B: periodic outbox-drain backstop tick ──────────────────
 
     /// The tick stamps the drain cycle when `csq-runs/` exists (drain-liveness
     /// signal for shard D), even when there is nothing to drain.

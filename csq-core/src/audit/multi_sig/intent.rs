@@ -108,7 +108,7 @@ pub(crate) fn intent_hash(chain_id: &str, kind: &EventKind, payload: &EventPaylo
 }
 
 /// The intent-hash pre-image view for a record whose `EventKind` is UNKNOWN to
-/// this binary (GH #910). `kind` is the raw tag string and `payload` is the
+/// this binary (GH an internal ticket). `kind` is the raw tag string and `payload` is the
 /// verbatim payload bytes — see [`intent_hash_raw`].
 #[derive(Serialize)]
 struct IntentViewRaw<'a> {
@@ -117,7 +117,7 @@ struct IntentViewRaw<'a> {
     payload: &'a serde_json::value::RawValue,
 }
 
-/// Forward-compat (GH #910): the 32-byte intent hash for a record whose
+/// Forward-compat (GH an internal ticket): the 32-byte intent hash for a record whose
 /// `EventKind` is unknown to this binary, computed from the raw kind string and
 /// the verbatim payload bytes.
 ///
@@ -164,7 +164,7 @@ mod tests {
         RotationReason, Sha256Hex,
     };
 
-    /// GH #910 — `intent_hash_raw` (unknown-kind path) reproduces `intent_hash`
+    /// GH an internal ticket — `intent_hash_raw` (unknown-kind path) reproduces `intent_hash`
     /// (typed path) byte-for-byte for a KNOWN record, so a newer writer's inner
     /// multi-sig authorization signatures verify against an older reader's
     /// re-derived hash. This is the pin that keeps the two views in lockstep.

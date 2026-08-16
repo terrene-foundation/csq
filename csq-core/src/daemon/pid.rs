@@ -1,13 +1,23 @@
 //! PID file primitives with single-instance guard.
 //!
-//! Writes are atomic (temp file + rename) to prevent partial reads
-//! on crash. Single-instance guard re-reads the file inside the
-//! atomic-write path so two concurrent `csq daemon start` calls
-//! cannot both "win" — whichever rename lands last overwrites the
-//! other, and the loser's `acquire` detects the mismatch on its own
-//! PID verification and errors out.
+//! Single-instance exclusion is **kernel-atomic**: `acquire` holds an
+//! exclusive OS lock (`flock` on Unix, a named kernel mutex via
+//! `CreateMutexW` on Windows — see `platform::lock`) tied to a sibling
+//! `<pidfile>.lock` for the daemon's whole lifetime. Two
+//! concurrent `acquire` calls cannot both win — the kernel grants the
+//! lock to exactly one; the other gets `AlreadyRunning`. The lock is
+//! released automatically on process death, so a crashed daemon never
+//! leaves a stuck lock. The PID file itself is written atomically (temp
+//! file + rename) for partial-read safety and carries the owner PID for
+//! `stop`/`status` and stale-file cleanup.
+//!
+//! Before the flock (daemon-auth-resilience Wave B), exclusion rested on
+//! a write-then-re-read heuristic that admitted a TOCTOU double-win under
+//! near-simultaneous starts — two live daemons, two refreshers, an OAuth
+//! refresh-token war. The flock closes that class structurally.
 
 use crate::error::DaemonError;
+use crate::platform::lock::{try_lock_file, FileLockGuard};
 use crate::platform::{fs as platform_fs, process};
 use std::fs;
 use std::io::Write;
@@ -22,6 +32,21 @@ use std::path::{Path, PathBuf};
 pub struct PidFile {
     path: PathBuf,
     owned_pid: u32,
+    /// Exclusive advisory lock on `<path>.lock`, held for the daemon's
+    /// lifetime. Dropped AFTER the `Drop` body removes the PID file (Rust
+    /// drops fields after the enclosing value's `Drop::drop`), so the PID
+    /// file is removed while the lock is still held — no window where a
+    /// contender sees both the lock free and the PID file gone.
+    _lock: FileLockGuard,
+}
+
+/// The sibling lock-file path for a PID file: `<path>.lock`. Never
+/// renamed (unlike the atomically-replaced PID file), so the flock on it
+/// is stable across PID-file rewrites.
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
 }
 
 impl PidFile {
@@ -30,20 +55,25 @@ impl PidFile {
     ///
     /// # Single-instance algorithm
     ///
+    /// 0. Acquire an exclusive OS lock tied to `<path>.lock` (`flock` on
+    ///    Unix, a named kernel mutex on Windows; non-blocking). If another
+    ///    process holds it, error [`DaemonError::AlreadyRunning`]. This is
+    ///    the kernel-atomic exclusion — steps 1-5 run under it, race-free.
     /// 1. Read existing PID file if any.
-    /// 2. If it exists and its PID is alive, error
-    ///    [`DaemonError::AlreadyRunning`].
-    /// 3. If it exists but PID is dead, delete the stale file.
+    /// 2. If it exists and its PID is alive AND that PID is a csq process,
+    ///    error [`DaemonError::AlreadyRunning`] (defers to a daemon started
+    ///    by an older binary that predates the flock).
+    /// 3. If it exists but the PID is dead — or alive yet positively
+    ///    identified as some OTHER program, i.e. the kernel recycled a dead
+    ///    daemon's PID ([`process::is_pid_foreign`]) — delete the stale file.
     /// 4. Write our PID atomically (temp file + rename).
-    /// 5. Re-read to verify we "own" the file — if a concurrent
-    ///    `acquire` won the rename race, our PID won't match and we
-    ///    error out (the other process owns the daemon).
+    /// 5. Re-read as a cheap sanity check (belt-and-suspenders under the
+    ///    lock).
     ///
-    /// The re-read-after-write check catches the TOCTOU window
-    /// between step 1-2 (existing-alive check) and step 4 (our
-    /// rename). Without it, two `csq daemon start` calls racing
-    /// simultaneously could both pass step 2, both write, and the
-    /// loser would incorrectly believe it owned the daemon.
+    /// The flock (step 0) is the primary guarantee: it is granted to
+    /// exactly one process and released automatically on death. Steps 1-2
+    /// remain for upgrade-transition safety (an old-binary daemon holds
+    /// the PID file but not the lock) and PID-reuse rejection.
     pub fn acquire(path: &Path) -> Result<Self, DaemonError> {
         // Ensure parent directory exists.
         if let Some(parent) = path.parent() {
@@ -57,10 +87,42 @@ impl PidFile {
             }
         }
 
-        // Step 1-3: handle existing file.
+        // Step 0: kernel-atomic exclusion. Held for the daemon's whole
+        // lifetime; released on drop or process death. If another daemon
+        // holds it, we lose here — report its PID from the file if legible.
+        let lock_path = lock_path_for(path);
+        let lock = match try_lock_file(&lock_path) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                let pid = read_pid(path).unwrap_or(0);
+                return Err(DaemonError::AlreadyRunning { pid });
+            }
+            Err(e) => {
+                return Err(DaemonError::SocketConnect {
+                    path: lock_path.clone(),
+                }
+                .with_source_platform(e));
+            }
+        };
+
+        // Step 1-3: handle existing file (now race-free under the lock).
         if path.exists() {
             match read_pid(path) {
-                Some(existing_pid) if process::is_pid_alive(existing_pid) => {
+                // A live PID defers to a possibly-older-binary daemon —
+                // but ONLY if the PID is actually csq. A recycled PID
+                // (dead daemon whose `Drop` never ran, kernel reissued
+                // the number) would otherwise make `acquire` fail
+                // `AlreadyRunning` forever: the desktop supervisor backs
+                // off, never hosts a daemon, and the Codex spawn gate —
+                // which hard-requires a healthy daemon — refuses every
+                // run. We already hold the flock here, so no live daemon
+                // of a flock-aware build owns this file; the identity
+                // check covers the pre-flock-binary case too and fails
+                // open, so a real daemon is never displaced.
+                Some(existing_pid)
+                    if process::is_pid_alive(existing_pid)
+                        && !process::is_pid_foreign(existing_pid) =>
+                {
                     return Err(DaemonError::AlreadyRunning { pid: existing_pid });
                 }
                 _ => {
@@ -77,11 +139,12 @@ impl PidFile {
         let our_pid = std::process::id();
         write_pid_atomic(path, our_pid)?;
 
-        // Step 5: verify we own it (race check).
+        // Step 5: verify we own it (belt-and-suspenders under the lock).
         match read_pid(path) {
             Some(pid) if pid == our_pid => Ok(PidFile {
                 path: path.to_path_buf(),
                 owned_pid: our_pid,
+                _lock: lock,
             }),
             Some(other) => Err(DaemonError::AlreadyRunning { pid: other }),
             None => Err(DaemonError::SocketConnect {
@@ -270,6 +333,102 @@ mod tests {
             }
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
+    }
+
+    /// Regression: a PID file naming a LIVE but FOREIGN process must not
+    /// block acquisition.
+    ///
+    /// This is the defect that made the originating incident unrecoverable
+    /// rather than merely noisy. The desktop supervisor's loop detects
+    /// daemon state, decides to take over, then calls `acquire`. With a
+    /// recycled PID in the file, `acquire` returned `AlreadyRunning`
+    /// every iteration, so the supervisor backed off — capped at 60s —
+    /// and never hosted a daemon. Because the Codex spawn path hard-gates
+    /// on a healthy daemon, `csq run <codex-slot>` was permanently
+    /// refused while Anthropic slots (which fall back to direct mode)
+    /// kept working. Hence "issues with codex but not the others".
+    #[cfg(unix)]
+    #[test]
+    fn acquire_takes_over_when_pid_file_names_a_live_foreign_process() {
+        let dir = TempDir::new().unwrap();
+        let p = pid_path(&dir);
+
+        let mut foreign = crate::platform::process::spawn_foreign_test_process();
+        fs::write(&p, format!("{}\n", foreign.id())).unwrap();
+
+        let result = PidFile::acquire(&p);
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+
+        match result {
+            Ok(guard) => {
+                assert_eq!(
+                    guard.owned_pid(),
+                    std::process::id(),
+                    "the taking-over process must own the file"
+                );
+                assert_eq!(read_pid(&p), Some(std::process::id()));
+            }
+            Err(e) => {
+                panic!("acquire must take over a recycled PID, not refuse forever; got {e:?}")
+            }
+        }
+    }
+
+    // Unix-only: Windows named mutexes are re-entrant within the same
+    // thread (`platform::lock` docs), so a same-thread second `acquire`
+    // re-enters the mutex and this same-process test is unreliable there.
+    // The production guarantee (cross-PROCESS exclusion) holds on Windows;
+    // it is exercised by real two-process contention, not this unit test.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_flock_blocks_second_even_without_live_pidfile() {
+        // The flock (Step 0) — not the PID-file heuristic — must be the
+        // authority. Hold a PidFile, then remove the PID file so the
+        // is-pid-alive check (Steps 1-2) would let a second acquire
+        // proceed. The flock alone must still refuse it. This is the F1
+        // double-win the write-then-re-read heuristic admitted.
+        let dir = TempDir::new().unwrap();
+        let p = pid_path(&dir);
+
+        let _guard = PidFile::acquire(&p).unwrap();
+        // Drop the PID file — without the flock, the next acquire would
+        // see NotRunning and happily write a second owner.
+        fs::remove_file(&p).unwrap();
+
+        match PidFile::acquire(&p) {
+            Err(DaemonError::AlreadyRunning { .. }) => {}
+            other => panic!("flock must refuse a second acquire, got {other:?}"),
+        }
+    }
+
+    // Unix-only: the Unix lock backend creates a `<pidfile>.lock` FILE
+    // (flock target); the Windows backend uses a named kernel mutex and
+    // writes no such file, so this assertion is Unix-specific.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_creates_sibling_lock_file() {
+        let dir = TempDir::new().unwrap();
+        let p = pid_path(&dir);
+        let _guard = PidFile::acquire(&p).unwrap();
+        assert!(
+            lock_path_for(&p).exists(),
+            "acquire must create the sibling <pidfile>.lock"
+        );
+    }
+
+    #[test]
+    fn acquire_succeeds_again_after_previous_guard_dropped() {
+        // Releasing the guard (Drop) releases the flock, so a fresh acquire
+        // on the same path succeeds — no stuck lock.
+        let dir = TempDir::new().unwrap();
+        let p = pid_path(&dir);
+        {
+            let _g = PidFile::acquire(&p).unwrap();
+        }
+        let g2 = PidFile::acquire(&p).unwrap();
+        assert_eq!(g2.owned_pid(), std::process::id());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Subprocess-based Claude OAuth login command.
 //!
-//! Phase 1 of #389 — adds `start_claude_login_subprocess` Tauri command
+//! Phase 1 of an internal ticket — adds `start_claude_login_subprocess` Tauri command
 //! alongside the existing parallel-race flow in [`super::race`]. CC is
 //! the reference OAuth client; this command shells out to
 //! `claude auth login` with `CLAUDE_CONFIG_DIR=<base>/config-<N>` and
@@ -10,7 +10,7 @@
 //! canonically, write the `.csq-account` marker, and run
 //! [`csq_core::accounts::login::finalize_login`] for the email +
 //! profiles.json update — identical to the CLI's `handle_direct` path
-//! that landed in #388.
+//! that landed in an internal ticket.
 //!
 //! # Why not race the loopback in-process
 //!
@@ -102,6 +102,13 @@ pub async fn start_claude_login_subprocess(
     // can attach progress events without breaking the frontend's
     // invoke shape.
     let _ = window;
+
+    // GH an internal ticket: the reverse conflict guard that used to run here
+    // (redteam R3) is retired — a stale Gemini/native marker is now detected
+    // pre-mint and cleared on the SUCCESS path by `finalize_login`
+    // (`binding_guard::detect_stale_marker_binding` +
+    // `clear_detected_marker_binding`) rather than refused up-front. See
+    // those functions' doc comments.
 
     let _lock = match AccountLoginLock::acquire(&base, account_num) {
         Ok(AcquireOutcome::Acquired(g)) => g,
@@ -274,14 +281,14 @@ mod tests {
         assert_eq!(json, r#"{"account":5,"email":"user@example.com"}"#);
     }
 
-    /// Phase 2 / #389 follow-up: drive the full command with a stub
+    /// Phase 2 / an internal ticket follow-up: drive the full command with a stub
     /// `claude` binary on PATH. Requires the `stub-claude` bin and a
     /// `clean_command`-style env reset (rules/testing.md MUST Rule 4a)
     /// that the existing `cli_deps_login_integration` harness already
     /// builds for the CLI side; mirroring it here is non-trivial
     /// because the desktop command needs `tauri::Window` which is
     /// hard to fake outside of `tauri::test::mock_app()`. Tracked on
-    /// #389 as the desktop-side end-to-end gap.
+    /// an internal ticket as the desktop-side end-to-end gap.
     #[allow(dead_code)]
     fn _phase2_end_to_end_test_placeholder() {}
 }

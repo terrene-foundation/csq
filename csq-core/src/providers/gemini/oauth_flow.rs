@@ -49,6 +49,7 @@ use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -120,7 +121,12 @@ pub enum OauthFlowError {
 /// gemini-cli's `oauth_creds.json` shape. Field names match what
 /// gemini-cli writes after a successful `Sign in with Google` flow,
 /// so the file is interchangeable.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written, NOT derived — see the `impl fmt::Debug` just
+/// below and `credential-type-hygiene.md` Rule 1. `Serialize` is retained
+/// because this struct IS the on-disk `oauth_creds.json` shape; only the
+/// `Debug` rendering is redacted, never the write path.
+#[derive(Serialize, Deserialize)]
 struct OauthCreds {
     access_token: String,
     refresh_token: String,
@@ -130,8 +136,28 @@ struct OauthCreds {
     expiry_date: i64,
 }
 
+impl fmt::Debug for OauthCreds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `access_token`/`refresh_token` are bearer material and
+        // `id_token` is a Google OpenID JWT carrying email + subject
+        // claims, so all three render as `<redacted>`. `scope`,
+        // `token_type` and `expiry_date` are non-secret and stay legible
+        // — they are the fields that make a Debug line worth printing.
+        f.debug_struct("OauthCreds")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("token_type", &self.token_type)
+            .field("id_token", &"<redacted>")
+            .field("expiry_date", &self.expiry_date)
+            .finish()
+    }
+}
+
 /// Token-endpoint response shape per Google's docs.
-#[derive(Debug, Deserialize)]
+/// `Debug` is hand-written, NOT derived (`credential-type-hygiene.md`
+/// Rule 1) — this is the raw Google token-endpoint response.
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
@@ -139,6 +165,26 @@ struct TokenResponse {
     scope: String,
     token_type: String,
     id_token: Option<String>,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Same redaction set as `OauthCreds`; `refresh_token` and
+        // `id_token` are Option here, so presence is preserved (a
+        // missing refresh token is a real diagnostic signal) while the
+        // value never renders.
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("token_type", &self.token_type)
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Drives the full OAuth flow, blocking until completion or timeout.
@@ -939,6 +985,82 @@ fn extract_assigned_string(body: &str, var_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Debug redaction (credential-type-hygiene Rule 1) ─────────
+
+    #[test]
+    fn oauth_creds_debug_redacts_every_token_field() {
+        let creds: OauthCreds = serde_json::from_str(
+            r#"{"access_token":"ya29-SECRET-ACCESS","refresh_token":"1//SECRET-REFRESH",
+                 "scope":"https://www.googleapis.com/auth/cloud-platform",
+                 "token_type":"Bearer","id_token":"eyJ-SECRET-ID","expiry_date":1775726524877}"#,
+        )
+        .expect("fixture should deserialize");
+
+        // Non-vacuity: the fixture really does carry the secrets.
+        assert_eq!(creds.access_token, "ya29-SECRET-ACCESS");
+
+        let rendered = format!("{creds:?}");
+        for secret in ["ya29-SECRET-ACCESS", "1//SECRET-REFRESH", "eyJ-SECRET-ID"] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug leaked {secret}: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("<redacted>"),
+            "no redaction placeholder: {rendered}"
+        );
+        // Serialize is untouched — this struct IS the on-disk shape.
+        let json = serde_json::to_string(&creds).expect("should serialize");
+        assert!(
+            json.contains("ya29-SECRET-ACCESS"),
+            "redaction must not reach the on-disk write path: {json}"
+        );
+    }
+
+    #[test]
+    fn token_response_debug_redacts_every_token_field() {
+        let tr: TokenResponse = serde_json::from_str(
+            r#"{"access_token":"ya29-SECRET-ACCESS","refresh_token":"1//SECRET-REFRESH",
+                 "expires_in":3599,"scope":"openid","token_type":"Bearer",
+                 "id_token":"eyJ-SECRET-ID"}"#,
+        )
+        .expect("fixture should deserialize");
+
+        assert_eq!(tr.access_token, "ya29-SECRET-ACCESS");
+
+        let rendered = format!("{tr:?}");
+        for secret in ["ya29-SECRET-ACCESS", "1//SECRET-REFRESH", "eyJ-SECRET-ID"] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug leaked {secret}: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("<redacted>"),
+            "no redaction placeholder: {rendered}"
+        );
+        assert!(
+            rendered.contains("3599"),
+            "expires_in was masked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn token_response_debug_distinguishes_absent_from_redacted() {
+        let tr: TokenResponse = serde_json::from_str(
+            r#"{"access_token":"ya29-only","expires_in":3599,"scope":"openid",
+                 "token_type":"Bearer"}"#,
+        )
+        .expect("fixture should deserialize");
+        let rendered = format!("{tr:?}");
+        assert!(
+            rendered.contains("refresh_token: None") && rendered.contains("id_token: None"),
+            "absent optionals should render None, got: {rendered}"
+        );
+        assert!(!rendered.contains("ya29-only"), "leaked: {rendered}");
+    }
 
     #[test]
     fn extract_assigned_string_handles_minified_js() {

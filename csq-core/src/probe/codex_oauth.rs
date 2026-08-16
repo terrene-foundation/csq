@@ -382,8 +382,8 @@ mod tests {
         );
     }
 
-    /// #516 sibling + #534 follow-up: the codex-oauth probe's missing-creds
-    /// Skip arm (post-#534 = `SkipReason::NoCodexCredentials`) MUST NOT
+    /// an internal ticket sibling + an internal ticket follow-up: the codex-oauth probe's missing-creds
+    /// Skip arm (post-an internal ticket = `SkipReason::NoCodexCredentials`) MUST NOT
     /// interpolate any resolved path (identity-store, legacy, or otherwise)
     /// into operator-facing strings — `security.md` §2 (no path-bearing
     /// detail in operator output). Slot number is on `ProbeRecord.slot`.

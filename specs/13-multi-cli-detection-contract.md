@@ -1,11 +1,16 @@
 # 13 — Multi-CLI Detection Contract
 
-**Spec version:** 1.6.0
+**Spec version:** 1.8.0
 **Status:** active
 
 ## 1. Purpose
 
-This spec governs how csq detects, version-gates, installs, and upgrades the three external CLIs csq integrates with: `claude` (Anthropic Claude Code), `codex` (OpenAI codex-cli), `gemini` (Google gemini-cli). It owns:
+This spec governs how csq detects, version-gates, installs, and upgrades the external CLIs csq integrates with. Two roles share the machinery:
+
+- **Session surfaces** — `claude` (Anthropic Claude Code), `codex` (OpenAI codex-cli), `gemini` (Google gemini-cli): `csq run` / `csq login` dispatch interactive sessions to them.
+- **Managed tools** — `kimi` (Moonshot Kimi Code), `grok` (xAI Grok CLI): csq installs and keeps them current (`csq cli install/upgrade`) but does not dispatch sessions to their native binaries. They self-update via their own subcommand (`kimi upgrade` / `grok update`); first install is the vendor `install.sh`, which csq prints but never auto-executes (§10).
+
+It owns:
 
 - The structural surface for binary detection (`cli_deps` module public API).
 - Per-surface minimum-version constants and their code-cited rationale.
@@ -21,10 +26,10 @@ Distinct from spec 07 (provider-surface-dispatch), which owns _how csq dispatche
 
 ```rust
 #[non_exhaustive]
-pub enum SurfaceCli { Claude, Codex, Gemini }
+pub enum SurfaceCli { Claude, Codex, Gemini, Kimi, Grok }
 ```
 
-`#[non_exhaustive]` is mandatory. Adding a fourth CLI surface (e.g. a hypothetical Bedrock CLI) MUST be a non-breaking change for downstream consumers. Add a new variant + extend dispatch + minimums; consumers' `match` blocks gain a new arm but never lose an existing one.
+`#[non_exhaustive]` is mandatory. Adding a further CLI surface MUST be a non-breaking change for downstream consumers. Add a new variant + extend dispatch + minimums; consumers' `match` blocks gain a new arm but never lose an existing one. `Kimi`/`Grok` are managed tools (not session surfaces) — the session-dispatch consumers reach them only via safe default arms, never as a spawn target.
 
 ## 3. CliStatus + WrongBinaryReason
 
@@ -50,7 +55,7 @@ pub enum WrongBinaryReason {
 
 | Variant               | Doctor row | Login default     | Login `--ignore-cli-version` |
 | --------------------- | ---------- | ----------------- | ---------------------------- |
-| `Ok`                  | ✓          | proceed           | proceed                      |
+| `Ok`                  | ✓          | proceed (see §3.2) | proceed (see §3.2)          |
 | `Outdated`            | ⚠          | BAIL              | proceed-with-WARN (see §3.1) |
 | `WrongBinary`         | ⚠          | BAIL              | BAIL (no override)           |
 | `Missing`             | ✗          | BAIL              | BAIL (no override)           |
@@ -71,6 +76,19 @@ WARN lines MUST be emitted to stderr on every honor — no per-process suppressi
 
 Per-invocation only. No marker file, no env-var memory, no config persistence — the WARN line IS the user-visible state.
 
+### 3.2 Track-latest opt-in (`--track-latest` / `CSQ_TRACK_LATEST=1`)
+
+The default gate is **floor-guarded**: auto-update fires only on `Outdated` (below the §4 floor). A binary that probes `Ok` (≥ floor) is left alone even when a newer release exists. **Track-latest** is an opt-in mode (default **OFF**) that, on an `Ok` probe, additionally attempts an upgrade to the latest release **within the supported major**:
+
+- **Enable:** `--track-latest` on `csq run` / `csq login`, OR `CSQ_TRACK_LATEST=1`.
+- **Master kill-switch:** `--no-auto-update-cli` / `CSQ_NO_AUTO_UPDATE_CLI=1` suppresses track-latest too, not just the `Outdated` floor-update.
+- **Mechanism:** reuses the same upgrade path as the `Outdated` arm. The §6 `upgrade_command` table is **range-pinned** (`@pkg@>=M.m.p <N.0.0`), so `npm install -g` resolves the newest release inside the supported range and NEVER crosses a major boundary. A true cross-major `@latest` requires a `min_version` bump per §7. Managers with no upgrade path are a silent no-op.
+- **Throttle:** at most once per CLI per 24h, via a per-CLI stamp `~/.claude/accounts/.track-latest-<cli>.stamp` (recorded before the attempt so a persistent failure does not re-hammer the registry; an absurd future stamp self-heals to due).
+- **Concurrency:** a per-CLI non-blocking advisory lock serializes concurrent launches so two `csq run`s don't both fire `npm install -g`; the loser skips. An unwritable base dir also skips (degrades to OFF).
+- **Non-fatal:** runs against an already-floor-passing binary, so any failure (offline, npm error, no upgrade path) proceeds with the installed version — it never BAILs.
+
+Track-latest has NO effect on any non-`Ok` variant — `Outdated` still floor-updates, `Missing` / `WrongBinary` still BAIL.
+
 ## 4. Minimum versions
 
 | CLI    | Floor  | Rationale (code-cited at HEAD)                                                                                                                                                                                                                                                      |
@@ -78,6 +96,8 @@ Per-invocation only. No marker file, no env-var memory, no config persistence �
 | Codex  | 0.40.0 | `--device-auth` landing version per `csq-core/src/providers/codex/desktop_login.rs` (parser orchestration handles v0.40.x AND v0.41+). 0.24 predates it.                                                                                                                            |
 | Gemini | 0.41.2 | `csq-core/src/providers/gemini/oauth_login.rs` — "rewritten for gemini-cli v0.41.2+." Pre-0.41.2 had `gemini auth login` subcommand csq's flow no longer expects.                                                                                                                   |
 | Claude | 2.0.0  | csq's credential-format assumptions tied to Claude Code's 2.x `claudeAiOauth` schema. Anchor: spec 01 — the `storageData.claudeAiOauth = { accessToken, refreshToken, expiresAt, scopes }` write in Claude Code's published OAuth storage behavior. 1.x predates that schema shape. |
+| Kimi   | 0.27.0 | csq-integration baseline (first shipped `kimi` bundled with csq). No feature-gate rationale yet; floor = first-integrated version. `kimi --version` prints a bare semver.                                                                                                           |
+| Grok   | 0.2.0  | csq-integration baseline (first shipped `grok`). `grok --version` prints `grok <semver> (<hash>)`; the `"grok "` prefix gate (§8) distinguishes it from the unrelated Elastic `grok` tool.                                                                                          |
 
 `PINNED_GEMINI_CLI_VERSION = "0.38"` in `csq-core/src/providers/gemini/mod.rs` retains its "QA'd against" meaning — distinct concept, distinct constant. If line numbers drift, re-locate via `grep -n` against the symbol/comment quoted.
 
@@ -90,7 +110,10 @@ Per-invocation only. No marker file, no env-var memory, no config persistence �
 | `/opt/homebrew/lib/node_modules/`, `~/.npm-global/lib/...`, `/usr/local/lib/node_modules/` | `NpmGlobal`                                                                                                            |
 | `/opt/homebrew/Cellar/gemini-cli/`                                                         | `BrewFormula`                                                                                                          |
 | `/opt/homebrew/Cellar/codex/`                                                              | **blocklisted** — wrong codex; classified as `WrongBinary { InstallPathBlocklisted }` regardless of `--version` output |
+| `~/.kimi-code/`, `~/.grok/` (any ancestor)                                                 | `SelfManaged` — self-updating CLI; upgrade via own subcommand                                                          |
 | Other                                                                                      | `Unknown`                                                                                                              |
+
+**Known-location fallback (§8):** `kimi`/`grok` install to `~/.kimi-code/bin` / `~/.grok/bin` and add it to the interactive-shell PATH. Because csq subprocesses can run under a minimal PATH that omits it, `find_in_path` checks these fixed dirs after the PATH walk fails. Grok's `bin/grok` symlinks into `~/.grok/downloads/`, so classification matches the `~/.grok/` ancestor, not the `bin/` leaf.
 
 The blocklist for codex defends against the homebrew-formula `codex` (a different OpenAI tool with the same name, different version scheme `0.1.250529...`).
 
@@ -106,11 +129,15 @@ The blocklist for codex defends against the homebrew-formula `codex` (a differen
 | `(Claude, NpmGlobal)`             | `["npm", "i", "-g", "@anthropic-ai/claude-code@>=2.0.0 <3.0.0"]`  | same                                           |
 | `(Claude, BrewCask)`              | `["brew", "install", "--cask", "claude-code"]`                    | `["brew", "upgrade", "--cask", "claude-code"]` |
 | `(Claude, ClaudeNativeInstaller)` | **`None`** — csq prints the official upgrade command for the user | **`None`** — same                              |
+| `(Kimi, SelfManaged)`             | **`None`** — csq prints the `install.sh` hint (no curl-bash)      | `["kimi", "upgrade"]`                          |
+| `(Grok, SelfManaged)`             | **`None`** — csq prints the `install.sh` hint (no curl-bash)      | `["grok", "update"]`                           |
 | `(*, Unknown)`                    | `None` — csq prints the npm hint                                  | `None`                                         |
 
 `@>=floor <next-major>` semver-range pinning (NOT `@latest`) makes registry-side downgrade attacks visible: a registry returning `0.39.0` for the codex install fails with "outside requested range."
 
-**Symmetry MUST rule:** every `(SurfaceCli, InstallManager)` row defines BOTH `install_command` AND `upgrade_command`. `same` means the argv literal matches; `None` is permitted symmetrically (e.g. `(Claude, ClaudeNativeInstaller)` returns `None` for both). Adding a row with one half defined and the other absent is BLOCKED — implementer authoring a fourth surface MUST wire both halves in the same change.
+**Symmetry MUST rule:** every `(SurfaceCli, InstallManager)` row defines BOTH `install_command` AND `upgrade_command`. `same` means the argv literal matches; `None` is permitted symmetrically (e.g. `(Claude, ClaudeNativeInstaller)` returns `None` for both). Adding a row with one half defined and the other absent is BLOCKED for package-manager managers (`NpmGlobal`, `BrewFormula`, `BrewCask`) — an implementer authoring a package-manager surface MUST wire both halves in the same change.
+
+**SelfManaged asymmetry carve-out:** `SelfManaged` CLIs are the one permitted asymmetry — `install_command` is `None` (first install is the vendor `install.sh`, which csq prints but never auto-runs per §10's no-curl-bash boundary) while `upgrade_command` is the CLI's own update subcommand (`kimi upgrade` / `grok update`, which requires the binary to already exist). This is not a wiring gap: the two halves have genuinely different mechanisms.
 
 ## 7. 1.0-bump policy
 
@@ -448,11 +475,11 @@ This is the ONLY way the field appears on a community build, and it is a read-on
 
 ## 10. Security boundary
 
-- **Argv allowlist:** `csq cli install/upgrade <name>` accepts only literal `claude | codex | gemini` via clap `value_parser` allowlist. Any other input rejected at parser layer.
+- **Argv allowlist:** `csq cli install/upgrade <name>` accepts only literal `claude | codex | gemini | kimi | grok` via clap `value_parser` allowlist. Any other input rejected at parser layer.
 - **Hard-coded dispatch:** `(manager, package_id)` tuple is hard-coded. No user-supplied string reaches argv.
 - **No `shell=true`:** `Command::new(arg0).args(rest)` only. No `sh -c`, no string interpolation.
 - **Range-pinned argv:** `@>=<floor> <next-major>` not `@latest`.
-- **No curl-bash regression:** `(Claude, ClaudeNativeInstaller)` returns `None`; csq prints the official upgrade command.
+- **No curl-bash regression:** `(Claude, ClaudeNativeInstaller)` AND `(Kimi|Grok, SelfManaged)` return `None` for `install_command`; csq prints the vendor install command/`install.sh` for the operator to run. csq NEVER auto-executes a `curl … | bash`. Self-managed **upgrade** runs the CLI's own subcommand (`kimi upgrade` / `grok update`) via `Command::new(arg0).args(rest)` — argv-only, no shell, no remote script.
 - **Sanitize-for-display:** every string captured from a third-party subprocess passes through `sanitize_for_display` (strips bytes in `\x00..=\x1f` EXCEPT `\t`; ALSO strips `\x7f` (DEL); caps result to 200 bytes) before printing.
 - **Stderr redaction:** failed-install stderr passes through `error::redact_tokens`.
 - **Single canonicalize per probe:** no double-resolution TOCTOU.

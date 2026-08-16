@@ -108,7 +108,7 @@ pub fn suggest(base_dir: &Path, current: Option<AccountNum>) -> Suggestion {
 mod tests {
     use super::*;
     use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
-    use crate::quota::{QuotaFile, UsageWindow};
+    use crate::quota::UsageWindow;
     use crate::types::{AccessToken, RefreshToken};
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -131,7 +131,7 @@ mod tests {
     }
 
     fn setup_quota(base: &Path, account: u16, five_hour_pct: f64, resets_at: u64) {
-        let mut quota = quota_state::load_state(base).unwrap_or_else(|_| QuotaFile::empty());
+        let mut quota = quota_state::load_state_salvage(base);
         quota.set(
             account,
             AccountQuota {

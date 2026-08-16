@@ -113,9 +113,11 @@ pub fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Write;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     fn write_with_mode(dir: &Path, name: &str, mode: u32) -> std::path::PathBuf {
         let p = dir.join(name);
         let mut f = std::fs::File::create(&p).unwrap();

@@ -125,7 +125,7 @@ pub fn ensure_cli_shim(source: &Path, target: &Path) -> Result<ShimOutcome> {
 /// (no re-sign churn, no recurrence loop).
 ///
 /// Fallback (no helper present — the community ad-hoc build, which does NOT
-/// exhibit #813, or any non-bundle layout): return `current_exe` unchanged, i.e.
+/// exhibit an internal ticket, or any non-bundle layout): return `current_exe` unchanged, i.e.
 /// today's behavior.
 pub fn resolve_shim_source(current_exe: &Path) -> PathBuf {
     // The helper sits at `…/Contents/Helpers/csq-cli`, sibling to the running
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn shim_source_falls_back_to_exe_when_helper_absent() {
-        // Bundle layout but NO helper (community ad-hoc build / pre-#813-fix).
+        // Bundle layout but NO helper (community ad-hoc build / pre-an internal ticket-fix).
         let dir = TempDir::new().unwrap();
         let macos = dir.path().join("App.app/Contents/MacOS/csq");
         write_exe(&macos, b"bundle-main");

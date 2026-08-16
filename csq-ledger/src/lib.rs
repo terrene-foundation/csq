@@ -22,6 +22,7 @@
 //! The full protocol is specified in `specs/17-csq-ledger-protocol.md`.
 
 pub mod anchor;
+pub mod anchor_verdict;
 pub mod checkpoint;
 pub mod config;
 pub mod merkle;

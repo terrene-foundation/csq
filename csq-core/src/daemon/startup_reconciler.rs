@@ -104,34 +104,34 @@ pub struct ReconcileSummary {
     /// PR-CA10c T9: number of `.pending/` files left in place because their
     /// `schema_version` was unknown (awaiting a future-version daemon).
     pub audit_pending_files_unknown_version: usize,
-    /// M6 #909: number of `.pending-mcp-gate/*.json` outbox files seen during the
+    /// M6 an internal ticket: number of `.pending-mcp-gate/*.json` outbox files seen during the
     /// MCP-gate attestation drain. Always 0 in the community edition (the proxy
     /// producer is enterprise-only, so the outbox is never written).
     pub mcp_gate_pending_files_seen: usize,
-    /// M6 #909: MCP-gate outbox files whose decision was appended to the chain OR
+    /// M6 an internal ticket: MCP-gate outbox files whose decision was appended to the chain OR
     /// was already accounted for (deduped / no chain) — source deleted.
     pub mcp_gate_pending_files_drained: usize,
-    /// M6 #909: MCP-gate outbox files deleted as unrecoverable (malformed / wrong
+    /// M6 an internal ticket: MCP-gate outbox files deleted as unrecoverable (malformed / wrong
     /// shape).
     pub mcp_gate_pending_files_invalid: usize,
-    /// M6 #909: MCP-gate outbox files left in place (unknown `schema_version`).
+    /// M6 an internal ticket: MCP-gate outbox files left in place (unknown `schema_version`).
     pub mcp_gate_pending_files_unknown_version: usize,
-    /// M6 #909: MCP-gate outbox files left in place because the decision could not
+    /// M6 an internal ticket: MCP-gate outbox files left in place because the decision could not
     /// be confirmed on the chain (a transient/deterministic emit error, or a
     /// signing-cutoff skip) — fail-closed retry on next start.
     pub mcp_gate_pending_files_write_failed: usize,
-    /// M6 #914: the subset of `mcp_gate_pending_files_write_failed` whose emit
+    /// M6 an internal ticket: the subset of `mcp_gate_pending_files_write_failed` whose emit
     /// error was DETERMINISTIC (not a `ChainLockTimeout` and not a signing-cutoff
     /// skip). A lock-timeout / cutoff backlog self-heals on the next start; a
     /// deterministic-error backlog is operator-actionable. Always 0 in the
     /// community edition.
     pub mcp_gate_pending_files_write_failed_terminal: usize,
-    /// M6 #909: the MCP-gate drain was deferred because the chain was not
+    /// M6 an internal ticket: the MCP-gate drain was deferred because the chain was not
     /// appendable (broken sentinel, uninitialised, or malformed `chain_id`) — every
     /// outbox file was left for a next-start retry after the operator repairs /
     /// initialises the chain.
     pub mcp_gate_drain_deferred_chain_unavailable: bool,
-    /// M6 #914: the number of `.json` outbox files present when the drain was
+    /// M6 an internal ticket: the number of `.json` outbox files present when the drain was
     /// deferred. Distinguishes "0 files queued" from "N files ALL left
     /// unprocessed" (the deferred path never enters the per-file loop, so
     /// `mcp_gate_pending_files_seen` stays 0). Always 0 in the community edition.
@@ -287,7 +287,7 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     pass3_quota_v1_to_v2(base_dir, &mut summary);
     pass4_strip_legacy_api_key_helper(base_dir, &mut summary);
     pass5_audit_drain(base_dir, &mut summary);
-    // M6 #909: drain the MCP gate-decision durable outbox onto the chain. Sibling
+    // M6 an internal ticket: drain the MCP gate-decision durable outbox onto the chain. Sibling
     // of pass5 (both are audit drains) but a SEPARATE `.pending-mcp-gate/` dir +
     // record shape, so ordering vs pass5 is independent. No other pass reads that
     // dir, so it satisfies `reconciler-cleanup-parity.md` Rule 2 trivially.
@@ -296,7 +296,7 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     #[cfg(feature = "enterprise")]
     pass6_mcp_gate_drain(base_dir, &mut summary);
 
-    // M6 #909 shard B: stamp this drain cycle so shard D's `csq doctor`
+    // M6 an internal ticket shard B: stamp this drain cycle so shard D's `csq doctor`
     // daemon-aware "stuck" predicate can distinguish an actively-draining daemon
     // (recent stamp → a persistent backlog is genuinely STUCK) from a down daemon
     // (stale stamp → backlog merely PENDING, no false alarm). Startup is one of
@@ -505,7 +505,7 @@ pub enum Phase4GateError {
     /// "`credentials/codex-<N>.json` exists on disk." profiles.json
     /// itself carries no per-surface binding map; the legacy canonical's
     /// presence is the unambiguous signal (parity with
-    /// `gemini::provisioning::detect_other_surface_binding`).
+    /// `accounts::binding_guard::detect_bound_surface`).
     #[error(
         "csq daemon refuses to start: slot {slot} is Codex-bound but \
          identities/<uuid>/credentials-codex.json is unseeded — re-run \
@@ -648,7 +648,7 @@ pub fn phase4_gate_check(base_dir: &Path) -> Result<(), Phase4GateError> {
         // slots that are Codex-bound on disk. The legacy
         // `credentials/codex-<N>.json` canonical's presence is the
         // structural signal (parity with
-        // `gemini::provisioning::detect_other_surface_binding`).
+        // `accounts::binding_guard::detect_bound_surface`).
         // Slots with no Codex binding fall through without check 5.
         //
         // The `AccountNum::try_from(slot)` conversion enforces the
@@ -1316,7 +1316,7 @@ fn floor_emit_is_retryable(e: &crate::audit::persist::AuditV2Error) -> bool {
 /// Per-drain tally for the `csq run` audit-floor outbox (`csq-runs/.pending/`),
 /// returned by [`drain_run_floor`] and copied into the reconciler's
 /// `ReconcileSummary` by the startup wrapper [`pass5_audit_drain`]. Extracted so
-/// the same drain runs on the periodic refresher-tick backstop (M6 #909 shard B),
+/// the same drain runs on the periodic refresher-tick backstop (M6 an internal ticket shard B),
 /// not only at daemon start.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct RunFloorDrainSummary {
@@ -1334,7 +1334,7 @@ pub(crate) struct RunFloorDrainSummary {
 
 /// Drain the `csq run` audit-floor outbox (`csq-runs/.pending/*.jsonl`) onto the
 /// chain, returning a per-drain tally. Shared by the daemon-start reconciler
-/// (via [`pass5_audit_drain`]) and the periodic refresher-tick backstop (M6 #909
+/// (via [`pass5_audit_drain`]) and the periodic refresher-tick backstop (M6 an internal ticket
 /// shard B — [`crate::daemon::refresher`]). Best-effort: never panics, never
 /// propagates. Single-threaded-safe on both call sites (startup runs before socket
 /// bind; the periodic tick runs the drain under `spawn_blocking`, and each drained
@@ -1599,7 +1599,7 @@ pub(crate) fn drain_run_floor(base_dir: &Path) -> RunFloorDrainSummary {
 
 /// Pass 5 — drain the `csq run` audit floor at daemon start. Thin wrapper over
 /// [`drain_run_floor`] that copies the per-drain tally into the reconciler summary
-/// (the drain body is shared with the periodic refresher-tick backstop, M6 #909
+/// (the drain body is shared with the periodic refresher-tick backstop, M6 an internal ticket
 /// shard B). See spec 12 §12.7 and spec 04 §4.2.8.
 fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
     let s = drain_run_floor(base_dir);
@@ -1609,7 +1609,7 @@ fn pass5_audit_drain(base_dir: &Path, summary: &mut ReconcileSummary) {
     summary.audit_pending_files_unknown_version += s.unknown_version;
 }
 
-/// Pass 6 — M6 #909: drain the MCP gate-decision durable outbox onto the chain.
+/// Pass 6 — M6 an internal ticket: drain the MCP gate-decision durable outbox onto the chain.
 ///
 /// Thin wrapper over [`crate::audit::mcp_gate_outbox::drain_pending`] (which owns
 /// the read/dispatch/emit/delete logic + the fail-closed disposition) that copies
@@ -2397,19 +2397,37 @@ fn pass_rn1_e_backfill_by_slot_identity(base_dir: &Path, summary: &mut Reconcile
         // intentionally NOT gated: a slot bound to a provider but not yet
         // authenticated is still that provider's slot and must be
         // recognised, not left flagged as an orphan.
-        let Some(provider_id) = id_from_display_name(&info.label) else {
-            // The display name came from `provider_from_base_url`'s fixed
-            // vocabulary; an unmappable name means the URL classifier and
-            // the catalog have drifted — a real config defect. Surface it
-            // rather than silently swallow it (the slot stays an orphan,
-            // and the warning is the diagnostic trail to the drift).
-            warn!(
-                error_kind = "by_slot_identity_backfill_failed",
-                slot = %slot_key,
-                provider = %info.label,
-                "by_slot_identity backfill (RN1-E): 3P provider display name not in catalog — slot left unbackfilled"
-            );
-            continue;
+        // Cloud-Claude slots (an internal ticket) carry an ID-shaped provider ("claude-vertex"
+        // / "claude-bedrock") in their `source`, NOT a catalog display name, and
+        // `bind_cloud_claude_backend_to_slot` already wrote the synchronous
+        // `apikey:<id>` identity — so derive the id directly and let the self-heal
+        // skip-check below no-op it. Without this, `id_from_display_name` on the
+        // id-shaped label returns `None` → a false-positive "display name not in
+        // catalog" WARN on EVERY daemon startup for a healthy cloud slot (redteam
+        // F3). Real 3P slots still route through `id_from_display_name`.
+        let provider_id: String = match &info.source {
+            crate::accounts::AccountSource::ThirdParty { provider }
+                if provider == "claude-vertex" || provider == "claude-bedrock" =>
+            {
+                provider.clone()
+            }
+            _ => {
+                let Some(id) = id_from_display_name(&info.label) else {
+                    // The display name came from `provider_from_base_url`'s fixed
+                    // vocabulary; an unmappable name means the URL classifier and
+                    // the catalog have drifted — a real config defect. Surface it
+                    // rather than silently swallow it (the slot stays an orphan,
+                    // and the warning is the diagnostic trail to the drift).
+                    warn!(
+                        error_kind = "by_slot_identity_backfill_failed",
+                        slot = %slot_key,
+                        provider = %info.label,
+                        "by_slot_identity backfill (RN1-E): 3P provider display name not in catalog — slot left unbackfilled"
+                    );
+                    continue;
+                };
+                id.to_string()
+            }
         };
         let label = format!("apikey:{provider_id}");
         // (2) FM-5 self-heal parity with the Gemini arm: skip ONLY when the
@@ -4382,7 +4400,7 @@ mod tests {
         );
     }
 
-    /// M6 #909 shard B: the extracted `drain_run_floor` drains a staged `.pending/`
+    /// M6 an internal ticket shard B: the extracted `drain_run_floor` drains a staged `.pending/`
     /// v1 record directly (proving the extraction preserves pass5's behaviour for
     /// the periodic-backstop caller, not only via the reconciler wrapper).
     #[test]
@@ -4437,7 +4455,7 @@ mod tests {
         );
     }
 
-    /// M6 #909 shard B: `run_reconciler` writes the last-drain-cycle stamp when the
+    /// M6 an internal ticket shard B: `run_reconciler` writes the last-drain-cycle stamp when the
     /// chain dir exists, so shard D's daemon-aware "stuck" predicate has a
     /// drain-liveness signal.
     #[test]
@@ -4456,7 +4474,7 @@ mod tests {
         );
     }
 
-    /// M6 #909 shard B: `run_reconciler` on a base with NO `csq-runs/` writes no
+    /// M6 an internal ticket shard B: `run_reconciler` on a base with NO `csq-runs/` writes no
     /// stamp (nothing could be queued) and does not create the dir.
     #[test]
     fn run_reconciler_no_stamp_without_csq_runs() {
@@ -4469,7 +4487,7 @@ mod tests {
         );
     }
 
-    /// M6 #909: `run_reconciler` drains the MCP gate-decision durable outbox via
+    /// M6 an internal ticket: `run_reconciler` drains the MCP gate-decision durable outbox via
     /// `pass6_mcp_gate_drain` — proving the pass is WIRED, not just the unit
     /// `drain_pending`. Bootstraps a chain, stages one outbox file, runs the full
     /// reconciler, and asserts the decision landed on the chain, the source was
@@ -5552,6 +5570,35 @@ mod tests {
             summary.by_slot_identity_backfilled, 1,
             "summary counter must be 1 after backfilling one slot"
         );
+    }
+
+    /// an internal ticket redteam F3: a cloud-Claude slot (id-shaped `claude-vertex` provider,
+    /// NOT a catalog display name) backfills to `apikey:claude-vertex` via the
+    /// direct-id path — NOT the `id_from_display_name`-None WARN branch that fired
+    /// on every daemon startup before the fix.
+    #[test]
+    fn backfill_writes_identity_for_cloud_claude_slot() {
+        use crate::accounts::profiles::profiles_path;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let cfg = base.join("config-7");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1","ANTHROPIC_VERTEX_PROJECT_ID":"p","CLOUD_ML_REGION":"r","GOOGLE_APPLICATION_CREDENTIALS":"/x/sa.json"}}"#,
+        )
+        .unwrap();
+
+        let mut summary = ReconcileSummary::default();
+        pass_rn1_e_backfill_by_slot_identity(base, &mut summary);
+
+        let pf = crate::accounts::profiles::load(&profiles_path(base)).unwrap();
+        assert_eq!(
+            pf.by_slot_identity.get("7").map(|s| s.as_str()),
+            Some("apikey:claude-vertex"),
+            "cloud-vertex slot must backfill to apikey:claude-vertex, not hit the WARN branch"
+        );
+        assert_eq!(summary.by_slot_identity_backfilled, 1);
     }
 
     /// RN1-E AC: backfill writes `by_slot_identity` for a Codex OAuth slot

@@ -3,10 +3,10 @@
 //! Polls `GET https://platform.minimax.io/v1/api/openplatform/coding_plan/remains`
 //! for authoritative usage data (5-hour and 7-day windows).
 
-use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+use crate::quota::{state as quota_state, AccountQuota, UsageWindow};
 use tracing::debug;
 
-use super::{HttpGetFn, PollError};
+use super::{classify_transport_error, HttpGetFn, PollError};
 
 /// MiniMax quota data parsed from the `/coding_plan/remains` endpoint.
 ///
@@ -48,7 +48,14 @@ pub(crate) fn poll_minimax_quota(
     };
     let extra_headers = [("Content-Type", "application/json")];
 
-    let (status, body) = http_get(&url, api_key, &extra_headers).map_err(PollError::Transport)?;
+    // MED-3 (an internal ticket redteam): `url` interpolates the per-slot,
+    // operator-supplied `MINIMAX_GROUP_ID` raw into a query string
+    // (see `third_party.rs::tick_3p`) — the one production URL in this
+    // poller that can trip the outbound char guard. Classify so a
+    // rejected group id logs a distinct, actionable `error_kind`
+    // instead of "transport error".
+    let (status, body) =
+        http_get(&url, api_key, &extra_headers).map_err(classify_transport_error)?;
 
     match status {
         429 => return Err(PollError::RateLimited),
@@ -166,7 +173,22 @@ pub(crate) fn write_minimax_quota(
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
-    let mut quota = quota_state::load_state(base_dir).unwrap_or_else(|_| QuotaFile::empty());
+    // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
+    // falling back to QuotaFile::empty() — a load failure here must SKIP
+    // the write, not persist a one-row file that wipes every sibling
+    // account's row (mirrors usage_poller::gemini_oauth::write_quota).
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            tracing::warn!(
+                account = account_id,
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "MiniMax poller: quota.json unreadable, skipping write to avoid clobbering sibling rows"
+            );
+            return Ok(());
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -197,6 +219,36 @@ mod tests {
         Arc::new(move |_url: &str, _token: &str, _headers: &[(&str, &str)]| {
             Ok((200, response.as_bytes().to_vec()))
         })
+    }
+
+    #[test]
+    fn bad_url_error_classifies_distinctly_from_transport_error() {
+        // MED-3 (an internal ticket redteam): a per-slot MINIMAX_GROUP_ID that
+        // trips the outbound char guard (interpolated raw into the
+        // query string by `poll_minimax_quota`) must classify as
+        // BadUrl, not Transport — so the 3P poller's shared tick match
+        // logs a distinct, actionable error_kind instead of "transport
+        // error".
+        //
+        // The mock `http_get` closure below never inspects the URL it's
+        // called with — it classifies purely on the transport error
+        // string it's told to return. `group_id` is therefore a benign
+        // value here (round-2 redteam NIT: a prior version passed
+        // `Some("bad'group")`, which read as if the malformed group id
+        // were what fired the guard; that's not what this test proves).
+        let http: HttpGetFn =
+            Arc::new(|_u, _t, _h| Err(crate::http::ERR_URL_UNSAFE_CHARS.to_string()));
+        let result = poll_minimax_quota("key", Some("ok"), "MiniMax-M2", &http);
+        assert!(matches!(result, Err(PollError::BadUrl(_))));
+    }
+
+    #[test]
+    fn transport_error_propagates_as_transport_not_bad_url() {
+        // Non-regression: a genuine network failure must NOT be
+        // misclassified as BadUrl.
+        let http: HttpGetFn = Arc::new(|_u, _t, _h| Err("connection refused".to_string()));
+        let result = poll_minimax_quota("key", Some("123"), "MiniMax-M2", &http);
+        assert!(matches!(result, Err(PollError::Transport(_))));
     }
 
     #[test]
@@ -307,5 +359,44 @@ mod tests {
             sd.used_percentage
         );
         assert_eq!(sd.resets_at, 1783900800);
+    }
+
+    /// MED-1 (an internal ticket redteam): a schema-drifted `quota.json` must NOT
+    /// be clobbered by this write leg. Before the fix,
+    /// `load_state_or_warn`'s `QuotaFile::empty()` fallback let this
+    /// write persist a one-row file, wiping every sibling account's row.
+    #[test]
+    fn write_minimax_quota_skips_on_poisoned_file_preserving_siblings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let poisoned = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        std::fs::write(quota_state::quota_path(dir.path()), poisoned).unwrap();
+
+        let mm = MiniMaxQuota {
+            five_hour: Some(UsageWindow {
+                used_percentage: 10.0,
+                resets_at: 4_102_444_800,
+            }),
+            seven_day: None,
+        };
+        let result = write_minimax_quota(dir.path(), 3, &mm);
+        assert!(result.is_ok(), "skip must be Ok(()), not an error");
+
+        let raw = std::fs::read_to_string(quota_state::quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["accounts"]["1"]["five_hour"]["used_percentage"].as_f64(),
+            Some(50.0)
+        );
+        assert_eq!(
+            v["accounts"]["2"]["five_hour"]["used_percentage"].as_f64(),
+            Some(80.0)
+        );
+        assert!(v["accounts"].get("3").is_none());
     }
 }

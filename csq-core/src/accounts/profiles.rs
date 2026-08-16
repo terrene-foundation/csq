@@ -3447,7 +3447,7 @@ mod tests {
 
     /// G4/AC-7 (FM-1, an internal journal entry D4): a `config-N/` slot with a
     /// `by_slot_identity[N]` entry (3P/Codex/Gemini recovery channel) OR
-    /// #578: direct contract test for the canonical `is_slot_recovery_backed`
+    /// an internal ticket: direct contract test for the canonical `is_slot_recovery_backed`
     /// predicate shared by `audit_coexistence`, `detect_decimal_marker`, and
     /// the `csq doctor` `legacy_count` heuristic. Covers all three channels
     /// + the symlink-rejection rule + the genuine-orphan case.
@@ -3488,7 +3488,7 @@ mod tests {
                 .unwrap();
             assert!(
                 !is_slot_recovery_backed(base, &pf, 4),
-                "a SYMLINKED gemini marker must NOT count as recovery-backed (#578)"
+                "a SYMLINKED gemini marker must NOT count as recovery-backed (an internal ticket)"
             );
         }
 

@@ -31,14 +31,22 @@
 //! server, refresher, usage poller, and auto-rotator all observe the
 //! same token and drain gracefully. The `PidFile` drops last,
 //! cleaning up the `.csq-daemon.pid` file.
+//!
+//! `csq daemon stop` reaches this same token from OUTSIDE the process,
+//! via a platform-specific bridge installed once in [`supervisor_loop`]:
+//! a named shutdown event on Windows, a real `SIGTERM` handler on Unix
+//! (an internal ticket — without it, the OS default disposition for an
+//! unhandled `SIGTERM` would terminate the whole app). A stop-requested
+//! sentinel (`csq_core::daemon::stop_sentinel`) additionally prevents the
+//! supervisor loop from silently re-acquiring the daemon afterwards.
 
-use csq_core::daemon::{self, detect_daemon, DetectResult, PidFile};
+use csq_core::daemon;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 // Imports for run_daemon (server, refresher subsystems). Cross-platform
-// as of #786 — the Windows supervisor now runs the same subsystems over a
+// as of an internal ticket — the Windows supervisor now runs the same subsystems over a
 // named pipe instead of a Unix socket.
 use csq_core::accounts::AccountInfo;
 use csq_core::daemon::{
@@ -47,59 +55,6 @@ use csq_core::daemon::{
 use csq_core::http;
 use csq_core::oauth::OAuthStateStore;
 use std::sync::Arc;
-
-/// Minimum wait between failed takeover attempts. Short enough
-/// that a crashing external daemon doesn't starve csq for minutes
-/// before our supervisor catches the gap.
-const BACKOFF_MIN: Duration = Duration::from_secs(1);
-
-/// Maximum wait between failed takeover attempts. 60s keeps the
-/// loop from hot-spinning under pathological contention (e.g. two
-/// csq apps racing each other to own the same PidFile) while also
-/// being well below the 5-minute refresh interval.
-const BACKOFF_MAX: Duration = Duration::from_secs(60);
-
-/// Supervisor backoff state. Starts at [`BACKOFF_MIN`], doubles on
-/// each failed attempt, caps at [`BACKOFF_MAX`], resets to
-/// `BACKOFF_MIN` after a CLEAN daemon session exit (not merely on
-/// takeover — a `run_daemon` that fails fast must keep backing off).
-///
-/// Addresses an internal journal entry design question 1: the fixed 60s poll
-/// burns a full minute of refresh downtime every time an external
-/// daemon crashes, and hot-loops under pathological contention.
-/// Exponential backoff gives instant recovery in the common case
-/// (1s) while bounding the worst case (60s).
-#[derive(Debug, Clone, Copy)]
-struct Backoff {
-    current: Duration,
-}
-
-impl Backoff {
-    fn new() -> Self {
-        Self {
-            current: BACKOFF_MIN,
-        }
-    }
-
-    fn current(&self) -> Duration {
-        self.current
-    }
-
-    /// Doubles the wait up to [`BACKOFF_MAX`]. Call after a failed
-    /// attempt before the next retry.
-    fn bump(&mut self) {
-        let next = self.current.saturating_mul(2);
-        self.current = std::cmp::min(next, BACKOFF_MAX);
-    }
-
-    /// Resets to [`BACKOFF_MIN`]. Call after a daemon session exits
-    /// CLEANLY (ran, then stopped) so the next cycle recovers instantly.
-    /// NOT called on a fast `run_daemon` failure (e.g. a license-gate
-    /// refusal) — those must keep backing off, not hot-loop.
-    fn reset(&mut self) {
-        self.current = BACKOFF_MIN;
-    }
-}
 
 /// Top-level handle returned to the Tauri setup() hook. Owns the
 /// shutdown token; dropping it does **not** stop the daemon — call
@@ -127,6 +82,12 @@ impl SupervisorHandle {
 /// This function returns immediately — the work happens on the
 /// returned tokio task.
 pub fn start(base_dir: PathBuf) -> SupervisorHandle {
+    // an internal ticket: reopening the desktop app is itself an explicit "start"
+    // intent — clear any stop-requested sentinel left by a prior `csq
+    // daemon stop` (or a crash that left it set) so this launch is never
+    // silently refused. Cheap and best-effort; see `stop_sentinel` doc.
+    daemon::clear_stop_requested(&base_dir);
+
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
@@ -137,160 +98,153 @@ pub fn start(base_dir: PathBuf) -> SupervisorHandle {
     SupervisorHandle { shutdown }
 }
 
-/// Supervisor main loop. Owns the lifetime of the in-process daemon
-/// across crashes and external-daemon contention.
+/// Supervisor main loop. Delegates to the shared
+/// [`csq_core::daemon::supervise::run_forever`] loop, passing the
+/// desktop [`run_daemon`] as the per-session body. The detect/acquire/
+/// backoff/cohabitation machinery lives in csq-core so the standalone
+/// `csq daemon start --supervised` daemon and this in-process supervisor
+/// share exactly one implementation (daemon-auth-resilience Wave B).
 ///
-/// Backoff semantics:
-/// - Cold start: `BACKOFF_MIN` (1s)
-/// - On each failed takeover attempt (external daemon owns the lock): double
-///   the wait, cap at `BACKOFF_MAX` (60s)
-/// - On a CLEAN daemon exit (we owned it, ran a session, cancellation not
-///   fired): reset to `BACKOFF_MIN` and retry almost immediately
-/// - On a fast `run_daemon` FAILURE (socket-bind error, or — once the real
-///   key is baked — a license-gate refusal): do NOT reset; back off
-///   exponentially so a durable refusal is a slow poll, not a 1s hot loop
+/// an internal ticket — the Windows named-pipe daemon is wired end to end
+/// (`run_daemon` binds `daemon::serve_windows` + the same subsystems as
+/// Unix), so the detect/acquire/run loop is identical across platforms;
+/// only `run_daemon`'s transport bind differs.
 async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
-    // #786 — the Windows named-pipe daemon is now wired end to end
-    // (`run_daemon` binds `daemon::serve_windows` + the same subsystems
-    // as Unix), so the former Windows honesty-guard bail (an internal journal entry
-    // P1-3) is retired. The detect/acquire/run loop is identical across
-    // platforms; only `run_daemon`'s transport bind differs.
-    supervisor_loop_inner(base_dir, cancel).await;
+    // Windows: the desktop app is the PRIMARY daemon host with no per-process
+    // SIGTERM, so `csq daemon stop` fires a named event. Bridge it into the
+    // top-level `cancel` ONCE for the whole supervisor lifetime — NOT per
+    // session. A per-session bridge (inside `run_daemon`) would spawn a fresh
+    // `wait_blocking` thread on every subsystem-death restart (an internal ticket) while the
+    // prior one orphans (dropping its handle detaches, never aborts, the
+    // blocking task), leaking a blocking-pool thread per restart under a
+    // death-restart storm (an internal ticket redteam MED-1). This mirrors the CLI
+    // supervised path, which spawns its SIGTERM bridge once outside
+    // `run_forever` (`handle_start_supervised`). Unix gets the structurally
+    // identical bridge below, for the mirror-image reason: unlike Windows,
+    // Unix DOES deliver a real SIGTERM to this process (`csq daemon stop` →
+    // `kill(pid, SIGTERM)`, `csq-core/src/daemon/lifecycle.rs::stop_daemon`)
+    // whenever this app's PID happens to be the PidFile owner — and with no
+    // handler installed, the OS default disposition would terminate the
+    // WHOLE desktop app, not just the daemon session.
+    #[cfg(windows)]
+    match csq_core::daemon::create_shutdown_event() {
+        Ok(event) => {
+            let stop = cancel.clone();
+            tokio::task::spawn_blocking(move || {
+                event.wait_blocking();
+                log::info!("in-process daemon stopping (csq daemon stop)");
+                stop.cancel();
+            });
+        }
+        Err(e) => {
+            log::warn!(
+                "could not create Windows shutdown event ({e}); \
+                 `csq daemon stop` will not signal the desktop daemon"
+            );
+        }
+    }
+
+    // Unix (an internal ticket follow-up): install a SIGTERM handler ONCE, same
+    // lifetime and same leaked-task rationale as the Windows arm above.
+    // Cancels the SAME `cancel` token so both platforms share identical
+    // semantics from here down. Never `.expect()`s — this runs inside an
+    // already-live GUI app, unlike the CLI's `wait_for_shutdown` (which can
+    // afford to panic at process startup); a registration failure is
+    // logged and the app keeps running, just without a Unix `csq daemon
+    // stop` bridge.
+    //
+    // Composition with the stop-requested sentinel (`stop_sentinel.rs`):
+    // this bridge stops THIS app session's in-process daemon when SIGTERM
+    // actually reaches it (i.e. this app's PID was the PidFile owner). The
+    // sentinel, checked inside `run_forever` on every iteration, is the
+    // OTHER half — it stops the loop from re-acquiring afterwards, and
+    // also covers the case where SIGTERM went to some OTHER owner (e.g.
+    // the standalone `--supervised` daemon) while this app's loop was
+    // merely backing off. Both are needed; neither alone makes `csq
+    // daemon stop` true for every cohabitation ordering.
+    #[cfg(unix)]
+    install_unix_sigterm_bridge(cancel.clone());
+
+    daemon::supervise::run_forever(base_dir, cancel, |base, session_cancel| async move {
+        run_daemon(&base, session_cancel).await
+    })
+    .await;
 }
 
-async fn supervisor_loop_inner(base_dir: PathBuf, cancel: CancellationToken) {
-    log::info!("daemon supervisor starting");
-    let mut backoff = Backoff::new();
-    loop {
-        // ── 1. Detect current state ──────────────────────────────
-        //
-        // `detect_daemon` returns `NotRunning` (fresh state),
-        // `Healthy` (someone else owns it — observe), `Stale`
-        // (cleanup + take over), or `Unhealthy` (another daemon is
-        // struggling; back off so we don't race it).
-        match detect_daemon(&base_dir) {
-            DetectResult::Healthy {
-                pid,
-                daemon_version,
-                ..
-            } => {
-                // Surface drift loudly so an operator inspecting desktop
-                // logs can see why the running daemon's data lags the
-                // freshly-installed app. We do not unilaterally take over
-                // — that would kill an in-flight CLI flow — but a
-                // `warn!` line is enough to point at the remediation.
-                if let Some(reason) = daemon::version_drift_reason(&daemon_version) {
-                    log::warn!(
-                        "external daemon (PID {pid}) reports drift: {reason}; deferring {:?}",
-                        backoff.current()
-                    );
-                } else {
-                    log::debug!(
-                        "external daemon already running (PID {pid}); deferring {:?}",
-                        backoff.current()
-                    );
-                }
-                // Wait and re-poll. If the external daemon dies, the
-                // next detect returns NotRunning/Stale and we take over.
-                if wait_or_cancelled(&cancel, backoff.current()).await {
-                    return;
-                }
-                backoff.bump();
-                continue;
-            }
-            DetectResult::Unhealthy { reason } => {
-                log::warn!(
-                    "existing daemon is unhealthy ({reason}); deferring {:?}",
-                    backoff.current()
-                );
-                if wait_or_cancelled(&cancel, backoff.current()).await {
-                    return;
-                }
-                backoff.bump();
-                continue;
-            }
-            DetectResult::Stale { reason } => {
-                log::info!("stale daemon state detected ({reason}); taking over");
-                // Fall through — PidFile::acquire will clean up the
-                // stale file by virtue of being a fresh PidFile.
-            }
-            DetectResult::NotRunning => {
-                log::info!("no daemon running; taking over");
-            }
+/// Installs a one-shot SIGTERM→cancel bridge for the process's lifetime.
+///
+/// Split out of [`supervisor_loop`] so it is independently testable: a
+/// real signal cannot be raised against a `#[cfg(windows)]` shutdown
+/// event, but it CAN be raised against this function directly — see the
+/// `unix_sigterm_bridge_cancels_the_token` test below, which sends a
+/// genuine `SIGTERM` to the current process and asserts `cancel` fires.
+///
+/// Returns immediately after spawning the listener task; never blocks,
+/// never panics. A registration failure (an exceptional kernel
+/// condition — see [`tokio::signal::unix::signal`]'s own error docs) is
+/// logged and swallowed: this runs inside an already-live GUI app, so
+/// `.expect()`-ing here would crash a running app over a missing
+/// SIGTERM bridge, which is strictly worse than the bridge just not
+/// existing.
+#[cfg(unix)]
+fn install_unix_sigterm_bridge(cancel: CancellationToken) {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::spawn(async move {
+                term.recv().await;
+                log::info!("in-process daemon stopping (SIGTERM / csq daemon stop)");
+                cancel.cancel();
+            });
         }
-
-        // ── 2. Try to acquire ownership ──────────────────────────
-        let pid_path = daemon::pid_file_path(&base_dir);
-        let pid_file = match PidFile::acquire(&pid_path) {
-            Ok(f) => f,
-            Err(e) => {
-                // Race: another process grabbed the PidFile between
-                // our detect call and our acquire call. Back off
-                // exponentially and let the loop observe next
-                // iteration. Protects against hot-loops when two
-                // csq apps fight over the same account dir.
-                log::debug!(
-                    "PidFile::acquire failed ({e}); another daemon raced us; backing off {:?}",
-                    backoff.current()
-                );
-                if wait_or_cancelled(&cancel, backoff.current()).await {
-                    return;
-                }
-                backoff.bump();
-                continue;
-            }
-        };
-
-        // ── 3. Run one daemon instance until it exits ────────────
-        //
-        // Binds the IPC transport (Unix socket / Windows named pipe),
-        // spawns the same subsystems on both platforms, and waits for
-        // either cancellation or a subsystem failure, then cleans up
-        // (#786 wired the Windows named-pipe daemon end to end).
-        //
-        // NB: `backoff.reset()` is applied ONLY after a CLEAN exit (Ok) — a daemon that
-        // actually ran a session. A `run_daemon` that returns Err (socket-bind failure,
-        // or — once the real key is baked — a license-gate refusal at the top of
-        // `run_daemon`) must NOT reset, so repeated fast failures back off exponentially
-        // instead of hot-looping at BACKOFF_MIN. A missing/expired/revoked license would
-        // otherwise re-run the gate (and, past it, an audit-chain verify) every second.
-        let run_result = run_daemon(&base_dir, cancel.clone()).await;
-        drop(pid_file);
-
-        // If the outer cancel fired during run_daemon, exit the supervisor loop.
-        if cancel.is_cancelled() {
-            return;
-        }
-
-        let wait = match run_result {
-            Ok(()) => {
-                // Clean exit — the daemon ran a real session; recover promptly.
-                log::info!("in-process daemon exited cleanly");
-                backoff.reset();
-                BACKOFF_MIN
-            }
-            Err(e) => {
-                // Fast/persistent failure — grow the wait so a durable refusal is a slow
-                // poll (still eventually picks up a newly-installed license), not a hot loop.
-                let w = backoff.current();
-                log::warn!("in-process daemon exited with error: {e} (retry in {w:?})");
-                backoff.bump();
-                w
-            }
-        };
-        if wait_or_cancelled(&cancel, wait).await {
-            return;
+        Err(e) => {
+            log::warn!(
+                "could not install SIGTERM handler ({e}); `csq daemon stop` will not \
+                 signal the desktop daemon when this app's PID owns the PidFile"
+            );
         }
     }
 }
 
-/// Sleeps for `duration` or until the cancellation token fires.
-/// Returns `true` if cancelled, `false` if the sleep completed
-/// normally. Lets the supervisor loop respect shutdown promptly.
-async fn wait_or_cancelled(cancel: &CancellationToken, duration: Duration) -> bool {
-    tokio::select! {
-        _ = cancel.cancelled() => true,
-        _ = tokio::time::sleep(duration) => false,
+#[cfg(all(test, unix))]
+mod sigterm_bridge_tests {
+    use super::install_unix_sigterm_bridge;
+    use tokio_util::sync::CancellationToken;
+
+    /// Non-vacuity + correctness proof for an internal ticket's Unix half: a
+    /// REAL `SIGTERM` raised against the current process reaches the
+    /// bridged token, exercising the exact signal `csq daemon stop`
+    /// sends (`csq-core/src/daemon/lifecycle.rs::stop_daemon` →
+    /// `kill(pid, SIGTERM)`) when this app's PID is the PidFile owner.
+    ///
+    /// # Why raising a real SIGTERM at the whole test-binary process is
+    /// safe here
+    ///
+    /// `tokio::signal::unix::signal` registers with the process-wide
+    /// `signal-hook-registry`, which OVERRIDES the OS default
+    /// disposition (process termination) for `SIGTERM` for the
+    /// remainder of the process once ANY listener has been registered.
+    /// So once `install_unix_sigterm_bridge` returns `Ok`, self-raising
+    /// `SIGTERM` cannot terminate the test binary — it can only reach
+    /// registered listeners, which is exactly the behavior under test.
+    /// `yield_now` gives the listener's registration (synchronous,
+    /// inside `signal()` itself, before any task runs) a scheduling
+    /// point to complete before the raise — a scheduling nicety, not a
+    /// correctness requirement, since the syscall itself is synchronous.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unix_sigterm_bridge_cancels_the_token() {
+        let cancel = CancellationToken::new();
+        install_unix_sigterm_bridge(cancel.clone());
+        tokio::task::yield_now().await;
+
+        // SAFETY: raises SIGTERM against our OWN pid only. See the
+        // doc comment above for why this cannot terminate the process.
+        unsafe {
+            libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("a real SIGTERM must cancel the bridged token within 5s");
     }
 }
 
@@ -302,7 +256,7 @@ async fn wait_or_cancelled(cancel: &CancellationToken, duration: Duration) -> bo
 /// stays in exactly one shape — refresher + usage poller +
 /// auto-rotate + server, all sharing a single shutdown token.
 ///
-/// Cross-platform as of #786: the whole body is shared; only the
+/// Cross-platform as of an internal ticket: the whole body is shared; only the
 /// transport bind (`daemon::serve` Unix socket vs `daemon::serve_windows`
 /// named pipe) is `#[cfg]`-gated. `daemon::socket_path` already resolves
 /// to the named-pipe path on Windows.
@@ -322,10 +276,14 @@ async fn run_daemon(
 
     let sock_path = daemon::socket_path(base_dir);
 
-    // Local shutdown token derived from outer_cancel. The server
-    // gets its own internal token (created by `serve`); we cancel
-    // our subsystems plus the server when the outer token fires.
-    let shutdown = outer_cancel.clone();
+    // Local shutdown token — a CHILD of outer_cancel (not a clone). The
+    // server gets its own internal token (created by `serve`). When
+    // `outer_cancel` fires (app quit / supervisor stop), this child cancels
+    // too and every subsystem drains. When a subsystem dies mid-session
+    // (an internal ticket), the drain path cancels THIS child to wind the siblings down
+    // WITHOUT firing `outer_cancel` — so `run_forever` restarts the session
+    // rather than treating it as an intentional stop.
+    let shutdown = outer_cancel.child_token();
 
     let refresh_cache: Arc<TtlCache<u16, daemon::RefreshStatus>> =
         Arc::new(TtlCache::with_default_age());
@@ -500,7 +458,7 @@ Run `csq audit verify --full` for diagnosis."
 
     // Clone before move into router_state so the anchor gate below can consult it.
     let audit_health_for_anchor = audit_health.clone();
-    // #1060 — resolve the active transparency-log sink ONCE (twin of the CLI
+    // an internal ticket — resolve the active transparency-log sink ONCE (twin of the CLI
     // daemon path) so both the anchor HTTP handler (RouterState.anchor_sink) and
     // the cadence drain task below share the same Arc + config. `None` in the
     // default local-only build → handler surfaces `inclusion_proof: null`.
@@ -516,9 +474,9 @@ Run `csq audit verify --full` for diagnosis."
         gemini_consumer: gemini_consumer.clone(),
         audit_health,
         anchor_sink: anchor_sink_desktop.clone(),
-        // #783 — seed the interactive enforcement registry from the fail-closed
+        // an internal ticket — seed the interactive enforcement registry from the fail-closed
         // §10.5 activation gate (absent → empty/503).
-        // #784 follow-up — inject the cross-SDK kailash projector (the csq crate
+        // an internal ticket follow-up — inject the cross-SDK kailash projector (the csq crate
         // owns the seam; csq-core cannot name it).
         // T-M4.3 — inject the PACT governor factory (twin of the CLI daemon path)
         // so a configured operating envelope wires the first production
@@ -562,21 +520,44 @@ Run `csq audit verify --full` for diagnosis."
     // error's `Display` carries operator-actionable next steps per
     // `tauri-commands.md` MUST Rule 6.
     if let Err(e) = csq_core::daemon::startup_reconciler::phase4_gate_check(base_dir) {
+        // Log before returning, mirroring the CLI twin: the desktop app has no
+        // attached console, so the rolling daemon log is the ONLY place an
+        // operator can see why the in-process daemon refused to start.
+        //
+        // `tracing::`, NOT `log::` — the rolling daemon log is fed by the
+        // tracing subscriber's file layer, installed via `set_global_default`
+        // with no `LogTracer` bridge, so `log::` records go to tauri-plugin-log
+        // (stdout / app log dir / webview) and never reach the file this
+        // comment is about. Same `error_kind` tag as the CLI twin.
+        tracing::error!(
+            error_kind = "phase4_gate_refused",
+            "phase 4 gate refused start (desktop daemon): {e}"
+        );
         return Err(format!("phase 4 gate refused start: {e}"));
     }
 
+    // ── M19: Emit capture-matrix record (sidecar dedup) ──────────────────────
+    // Emitted AFTER audit_health is finalised, BEFORE the transport binds —
+    // same contract as the CLI twin, via the one shared orchestrator. Before
+    // this call existed the desktop in-process daemon never emitted a matrix
+    // record at all, so a desktop-only user's chain held ZERO
+    // `ProvenanceCaptureMatrix` records forever.
+    csq_core::audit::seam::emit_startup_capture_matrix(
+        base_dir,
+        audit_health_for_anchor.is_operational(),
+    );
+
     // Bind the transport. Unix binds a domain socket; Windows binds a
     // named pipe. Both return a handle with `.shutdown()` + a
-    // `JoinHandle<()>`, so the drain tail below is shared (#786).
+    // `JoinHandle<()>`, so the drain tail below is shared (an internal ticket).
     #[cfg(unix)]
     let (server, server_join) = daemon::serve(&sock_path, router_state)
         .await
         .map_err(|e| format!("socket bind failed: {e}"))?;
     #[cfg(windows)]
-    let (server, server_join) =
-        daemon::serve_windows(&sock_path.to_string_lossy().into_owned(), router_state)
-            .await
-            .map_err(|e| format!("named-pipe bind failed: {e}"))?;
+    let (server, server_join) = daemon::serve_windows(&sock_path.to_string_lossy(), router_state)
+        .await
+        .map_err(|e| format!("named-pipe bind failed: {e}"))?;
     log::info!("in-process daemon IPC bound at {}", sock_path.display());
 
     // Subsystems share `shutdown` so a single cancel drains them
@@ -608,9 +589,11 @@ Run `csq audit verify --full` for diagnosis."
         shutdown.clone(),
     ));
     // PR-A1: pass claude_home so the rotator can re-materialize
-    // settings.json after each handle dir repoint. Reuse the same
-    // dirs::home_dir() resolution the sweep uses. None → rotator no-op.
-    let claude_home_for_rotate = dirs::home_dir().map(|h| h.join(".claude"));
+    // settings.json after each handle dir repoint. Uses the SAME resolver as
+    // the CLI twin (`$CLAUDE_HOME` override, else `~/.claude`) — a bare
+    // `dirs::home_dir().join(".claude")` here silently ignored the operator's
+    // `$CLAUDE_HOME` and pointed the rotator at the wrong tree. None → no-op.
+    let claude_home_for_rotate = crate::cli::commands::claude_home().ok();
     let auto_rotator = daemon::spawn_auto_rotate(
         base_dir.to_path_buf(),
         claude_home_for_rotate,
@@ -621,8 +604,9 @@ Run `csq audit verify --full` for diagnosis."
     // cannot resolve ~/.claude (no $HOME in a sandboxed env), pass
     // `None` so the sweep still runs but skips preservation —
     // better to lose images than route them into a fallback path
-    // like base_dir/image-cache/ that CC will never find.
-    let claude_home_for_sweep = dirs::home_dir().map(|h| h.join(".claude"));
+    // like base_dir/image-cache/ that CC will never find. Same `$CLAUDE_HOME`-
+    // aware resolver as the CLI twin.
+    let claude_home_for_sweep = crate::cli::commands::claude_home().ok();
     let sweep = csq_core::session::spawn_sweep(
         base_dir.to_path_buf(),
         claude_home_for_sweep,
@@ -635,13 +619,39 @@ Run `csq audit verify --full` for diagnosis."
     // sub-ms instead of running the ~20s live transcript scan on the dashboard
     // render path. Daemon is the SOLE producer; terminals only read
     // (account-terminal-separation.md Rule 1, extended for billing telemetry).
-    let claude_home_for_ledger = dirs::home_dir().map(|h| h.join(".claude"));
+    // Same `$CLAUDE_HOME`-aware resolver as the CLI twin; None → writer no-op.
+    let claude_home_for_ledger = crate::cli::commands::claude_home().ok();
     let usage_ledger_writer = daemon::spawn_usage_ledger_writer(
         base_dir.to_path_buf(),
         claude_home_for_ledger,
         shutdown.clone(),
         chrono::Utc::now,
     );
+
+    // Parse-cache sweeper (PR-CA9b / T20) — twin of the CLI daemon's spawn.
+    // Reads `<base_dir>/coc-roots-seen.jsonl` and GCs stale
+    // `<root>/.cache/parsed-<lock_sha>.bin` files older than 30 days OR whose
+    // lock_sha no longer matches the root's current COC.lock digest.
+    //
+    // The desktop in-process daemon previously omitted this entirely, so a
+    // user whose ONLY daemon host is the desktop app never GC'd a single parse
+    // cache and `csq doctor --json::cache_sweeper` reported `never_run`
+    // forever. The two daemons are mutually exclusive (one PidFile), so the
+    // omission meant no sweep at all — not a sweep performed elsewhere.
+    // Roots path comes from the SHARED resolver that `csq run`'s
+    // `record_root_seen` writer also uses; the state snapshot stays under
+    // base_dir, where `csq doctor` reads it.
+    let coc_cache_sweeper = daemon::spawn_coc_cache_sweeper(
+        csq_core::daemon::coc_cache_sweeper::roots_seen_path_or_inert(base_dir),
+        base_dir.to_path_buf(),
+        shutdown.clone(),
+    );
+
+    // Daemon rolling-log GC (#1a-2, daemon-auth-resilience Wave A2) — twin
+    // of the CLI daemon's spawn. 14-day retention sweep over the persistent
+    // rolling file log this in-process daemon writes via
+    // `init_logging_subscriber`'s rolling-file layer (`crate::daemon_log`).
+    let log_gc = csq_core::daemon::log_gc::spawn(base_dir.to_path_buf(), shutdown.clone());
 
     // Background update check — same 24-hour-cached behavior as the
     // CLI. Fires a detached OS thread on daemon start so desktop
@@ -660,7 +670,7 @@ Run `csq audit verify --full` for diagnosis."
     // FIX-2: gate on audit_health.is_operational() so the anchor is not
     // spawned when the chain is Broken/Unknown (mirrors CLI daemon.rs).
     let anchor_handle = if audit_health_for_anchor.is_operational() {
-        // #1060 — reuse the sink + config resolved once above for
+        // an internal ticket — reuse the sink + config resolved once above for
         // RouterState.anchor_sink (no second config read / resolve).
         anchor_sink_desktop.and_then(|s| {
             daemon::spawn_anchor_task(
@@ -677,63 +687,78 @@ Run `csq audit verify --full` for diagnosis."
         None
     };
 
-    // Block until cancellation fires from the app lifecycle OR — on Windows —
-    // the `csq daemon stop` shutdown event fires. On Windows the desktop app is
-    // the PRIMARY daemon host and there is no per-process SIGTERM, so without
-    // listening on the named event here `csq daemon stop` would fire an event
-    // nobody awaits, then `stop_daemon` would delete this live daemon's PID file
-    // (#786 redteam HIGH-2). When the event fires we cancel `outer_cancel` so the
-    // supervisor loop treats it as an intentional stop and does NOT respawn the
-    // daemon we were just asked to stop. `shutdown` is a clone of `outer_cancel`,
-    // so cancelling it also drains every subsystem below. Unix keeps the plain
-    // await — SIGTERM reaches the process regardless of which task installed it.
-    #[cfg(windows)]
-    {
-        match csq_core::daemon::create_shutdown_event() {
-            Ok(event) => {
-                let external_stop = outer_cancel.clone();
-                let event_wait = tokio::task::spawn_blocking(move || event.wait_blocking());
-                tokio::select! {
-                    _ = outer_cancel.cancelled() => {
-                        log::info!("in-process daemon stopping (app lifecycle)");
-                    }
-                    _ = event_wait => {
-                        log::info!("in-process daemon stopping (csq daemon stop)");
-                        external_stop.cancel();
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "could not create Windows shutdown event ({e}); \
-                     `csq daemon stop` will not signal the desktop daemon"
-                );
-                outer_cancel.cancelled().await;
-            }
-        }
+    // Collect every long-lived subsystem into a uniform set (label +
+    // JoinHandle<()>) so the session can watch them for premature exit
+    // (an internal ticket — the mass-expiry failure shape one level down) AND drain them
+    // with one loop.
+    //
+    // CONTRACT (an internal ticket redteam LOW-1): every member here MUST run until
+    // `shutdown` fires. `await_session_stop` treats ANY return from a member
+    // — clean `Ok(())` or panic — as a fault that restarts the whole session.
+    // A subsystem that returns early on a benign "nothing to do" condition
+    // would trigger a restart storm; such a subsystem must instead idle-loop
+    // on `shutdown` (see `auto_rotate::run_loop`), not return.
+    //
+    // `ipc_server` is the one member that exits on its OWN internal token
+    // (fired by `server.shutdown()` during teardown below), NOT the shared
+    // `shutdown` — but it still never returns during normal operation, so its
+    // premature exit (a panicked accept loop) is a genuine fault worth a
+    // restart (an internal ticket): a dead IPC server silently breaks login / status /
+    // provision while the refresher keeps going.
+    let mut subsystems: Vec<daemon::supervise::Subsystem> = vec![
+        ("refresher", refresher.join),
+        ("usage_poller", usage_poller.join),
+        ("gemini_midnight", gemini_midnight),
+        ("auto_rotator", auto_rotator.join),
+        ("handle_dir_sweep", sweep.join),
+        ("coc_cache_sweeper", coc_cache_sweeper.join),
+        ("usage_ledger_writer", usage_ledger_writer.join),
+        ("daemon_log_gc", log_gc),
+        ("ipc_server", server_join),
+    ];
+    #[cfg(feature = "enterprise")]
+    subsystems.push(("license_crl_refresher", crl_refresher.join));
+    if let Some(handle) = anchor_handle {
+        subsystems.push(("audit_anchor", handle.join));
     }
-    #[cfg(not(windows))]
-    {
-        outer_cancel.cancelled().await;
-    }
+
+    // Block until a graceful stop (`outer_cancel` fires from the app
+    // lifecycle / stop event) OR a subsystem dies mid-session (an internal ticket). On
+    // Windows the `csq daemon stop` named event is bridged into the top-level
+    // cancel token ONCE in `supervisor_loop` (a per-session bridge here would
+    // leak a `wait_blocking` thread per restart — an internal ticket redteam MED-1), and
+    // `outer_cancel` is a clone of that token (`run_forever` passes
+    // `cancel.clone()` per session), so a stop event resolves this wait on
+    // every platform. The
+    // subsystems share `shutdown` (a child of `outer_cancel`), so on a
+    // graceful stop they are already winding down.
+    let stop = daemon::supervise::await_session_stop(&outer_cancel, &mut subsystems).await;
 
     log::info!("in-process daemon stopping");
     server.shutdown();
 
-    // Drain with per-subsystem deadlines so one stuck HTTP call
-    // can't wedge app shutdown. The same 5s budget the CLI uses.
-    let _ = tokio::time::timeout(Duration::from_secs(5), refresher.join).await;
-    #[cfg(feature = "enterprise")]
-    let _ = tokio::time::timeout(Duration::from_secs(5), crl_refresher.join).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), usage_poller.join).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), gemini_midnight).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), auto_rotator.join).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), sweep.join).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), usage_ledger_writer.join).await;
-    if let Some(handle) = anchor_handle {
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
+    if let daemon::supervise::SessionStop::SubsystemExited(name) = &stop {
+        // A subsystem died while the daemon was meant to be running. Fire the
+        // CHILD `shutdown` token to drain the siblings WITHOUT cancelling
+        // `outer_cancel` (so `run_forever` restarts rather than exits), then
+        // return Err below.
+        log::error!(
+            "daemon subsystem '{name}' exited mid-session; draining siblings and restarting"
+        );
+        shutdown.cancel();
     }
-    let _ = tokio::time::timeout(Duration::from_secs(5), server_join).await;
+
+    // Drain every remaining subsystem with a 5s per-handle deadline so one
+    // stuck HTTP call can't wedge app shutdown (the dead one, if any, was
+    // already removed by `await_session_stop`, so no handle is double-polled).
+    // Includes `ipc_server` unless IT exited — `server.shutdown()` above fired
+    // its accept loop's exit, so its handle completes here (no separate drain,
+    // which would double-poll it — an internal ticket redteam hazard).
+    daemon::supervise::drain_subsystems(subsystems, Duration::from_secs(5)).await;
+
+    if let daemon::supervise::SessionStop::SubsystemExited(name) = stop {
+        return Err(format!("daemon subsystem exited mid-session: {name}"));
+    }
 
     Ok(())
 }
@@ -789,59 +814,8 @@ fn resolve_anchor_sink_desktop(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_starts_at_min() {
-        let b = Backoff::new();
-        assert_eq!(b.current(), BACKOFF_MIN);
-    }
-
-    #[test]
-    fn backoff_doubles_on_bump() {
-        let mut b = Backoff::new();
-        assert_eq!(b.current(), Duration::from_secs(1));
-        b.bump();
-        assert_eq!(b.current(), Duration::from_secs(2));
-        b.bump();
-        assert_eq!(b.current(), Duration::from_secs(4));
-        b.bump();
-        assert_eq!(b.current(), Duration::from_secs(8));
-    }
-
-    #[test]
-    fn backoff_caps_at_max() {
-        let mut b = Backoff::new();
-        // Hammer it 20 times — way past the cap.
-        for _ in 0..20 {
-            b.bump();
-        }
-        assert_eq!(b.current(), BACKOFF_MAX);
-    }
-
-    #[test]
-    fn backoff_reset_drops_to_min() {
-        let mut b = Backoff::new();
-        b.bump();
-        b.bump();
-        b.bump();
-        assert!(b.current() > BACKOFF_MIN);
-        b.reset();
-        assert_eq!(b.current(), BACKOFF_MIN);
-    }
-
-    #[test]
-    fn backoff_saturates_on_overflow() {
-        // Guard against u128 overflow in Duration multiplication.
-        // Doubling a 60s Duration once is 120s; capping to 60s means
-        // we never get near overflow in practice — the saturating
-        // mul is defense in depth.
-        let mut b = Backoff::new();
-        for _ in 0..100 {
-            b.bump();
-        }
-        assert_eq!(b.current(), BACKOFF_MAX);
-    }
-}
+// The supervisor loop + backoff tests moved to
+// `csq_core::daemon::supervise` alongside the extracted `run_forever`
+// loop (daemon-auth-resilience Wave B). This module's remaining logic
+// (`run_daemon`, `resolve_anchor_sink_desktop`) is exercised by the
+// desktop self-test + live desktop verification (Wave C).

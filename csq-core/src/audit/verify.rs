@@ -158,7 +158,7 @@ pub struct VerifySummary {
     pub verified_count: u64,
     /// Number of v1 records skipped (not v2 chain records).
     pub skipped_v1_count: u64,
-    /// GH #910 — number of records that carried an `EventKind` this build does
+    /// GH an internal ticket — number of records that carried an `EventKind` this build does
     /// not know (written by a NEWER csq) and were verified OPAQUE-BUT-INTACT:
     /// their signature + hash-chain verified, but their typed payload semantics
     /// were deferred. These records ARE included in `verified_count` (they passed
@@ -591,7 +591,7 @@ fn m3a_fold_record(
 
 /// A parsed chain record for the per-record verification loop: either a fully
 /// typed [`SignedRecord`] (known `EventKind`) or an [`OpaqueRecord`] whose
-/// `EventKind` this binary does not recognize (GH #910 forward-compat). The loop
+/// `EventKind` this binary does not recognize (GH an internal ticket forward-compat). The loop
 /// runs the SAME five integrity checks + multi-sig verification on both via
 /// these accessors — only the payload SEMANTICS of an opaque record are
 /// deferred, never a cryptographic check.
@@ -909,7 +909,7 @@ pub fn verify_chain_in(
             // despite containing the v1 string, treat as v2. In practice
             // v1 records will not parse as SignedRecord.
             //
-            // GH #910: a v2 record with a NEWER `EventKind` also fails the
+            // GH an internal ticket: a v2 record with a NEWER `EventKind` also fails the
             // `SignedRecord` parse but parses as an `OpaqueRecord` — and its
             // verbatim payload could legitimately CONTAIN the `"schema_version":
             // "1"` substring. Such a record MUST route to the opaque verify path,
@@ -1003,7 +1003,7 @@ pub fn verify_chain_in(
 
     for (verified_idx, raw_line) in v2_lines.iter().enumerate() {
         // Parse v2 record.
-        // Parse: a fully typed record (known EventKind), or — GH #910 forward-
+        // Parse: a fully typed record (known EventKind), or — GH an internal ticket forward-
         // compat — an `OpaqueRecord` whose EventKind a NEWER writer added. A line
         // that is NEITHER a known record nor a well-formed forward record is
         // `IntegrityBroken`. Both variants run EVERY check below via `RecordView`
@@ -1024,7 +1024,7 @@ pub fn verify_chain_in(
             },
         };
 
-        // GH #910: surface an unknown-kind record loudly and count it so tally
+        // GH an internal ticket: surface an unknown-kind record loudly and count it so tally
         // consumers stay honest. Counting here (before the checks) is safe: any
         // check failure returns `Err`, which discards `summary` — the count only
         // survives on a chain that verifies clean end-to-end.
@@ -1563,7 +1563,7 @@ pub struct VerifyJsonOutput {
     pub verified_count: u64,
     /// Number of v1 records skipped (not counted toward failures).
     pub skipped_v1_count: u64,
-    /// GH #910 — number of records verified OPAQUE-BUT-INTACT because they carry
+    /// GH an internal ticket — number of records verified OPAQUE-BUT-INTACT because they carry
     /// an `EventKind` a NEWER csq added (signature + hash-chain verified; typed
     /// payload semantics deferred). Included in `verified_count`; surfaced here so
     /// a `--json` consumer sees "ok; N records newer than this reader" instead of
@@ -2300,7 +2300,7 @@ mod tests {
         let _ = LocalSigningKey::delete_from_keychain(&svc, chain_id);
     }
 
-    // ── GH #910 — forward-compat opaque-record tests ─────────────────────────
+    // ── GH an internal ticket — forward-compat opaque-record tests ─────────────────────────
     //
     // These build GENUINELY-SIGNED records whose `EventKind` this binary does
     // NOT know (as a NEWER writer would emit), then assert `verify_chain` treats
@@ -5498,7 +5498,7 @@ mod tests {
         let _ = LocalSigningKey::delete_from_keychain(&svc, chain_id);
     }
 
-    // ── RosterFloorAnchorStatus detector tests (#694 item 2) ─────────────
+    // ── RosterFloorAnchorStatus detector tests (an internal ticket item 2) ─────────────
 
     use crate::audit::key_custody::write_roster_floor_to_keychain;
 
@@ -5588,7 +5588,7 @@ mod tests {
     }
 
     /// When a roster is installed but the keychain entry has no floor (e.g.
-    /// pre-#694 keychain entry), `verify_chain` yields `Unconfirmed` — the
+    /// pre-an internal ticket keychain entry), `verify_chain` yields `Unconfirmed` — the
     /// detection layer is chain.json-only for that installation.
     #[test]
     fn roster_floor_anchor_unconfirmed_when_keychain_has_no_floor() {
@@ -5601,7 +5601,7 @@ mod tests {
         std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         // Arrange — init chain, plant a floor in chain.json, but do NOT write
-        // the floor into the keychain (simulating a pre-#694 keychain entry).
+        // the floor into the keychain (simulating a pre-an internal ticket keychain entry).
         let base = tempfile::TempDir::new().unwrap();
         let base = base.path();
         let svc = format!("csq-test-rfanchor-unconf-{}", std::process::id());
@@ -5623,7 +5623,7 @@ mod tests {
         assert_eq!(
             summary.roster_floor_anchor,
             RosterFloorAnchorStatus::Unconfirmed,
-            "pre-#694 keychain entry (no floor field) must yield Unconfirmed"
+            "pre-an internal ticket keychain entry (no floor field) must yield Unconfirmed"
         );
 
         let _ = LocalSigningKey::delete_from_keychain(&svc, &chain.chain_id);

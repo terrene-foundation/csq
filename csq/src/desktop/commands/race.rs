@@ -1,4 +1,4 @@
-// Phase 2 of #389 — the parallel-race orchestrator is no longer
+// Phase 2 of an internal ticket — the parallel-race orchestrator is no longer
 // reachable from the renderer (`csq/src/desktop/mod.rs::invoke_handler!`
 // drops `start_claude_login_race`, `submit_paste_code`, and
 // `cancel_race_login` as of this PR). The source compiles for one
@@ -774,6 +774,13 @@ pub async fn start_claude_login_race(
         return Err(format!("base directory does not exist: {base_dir}"));
     }
 
+    // GH an internal ticket: the reverse conflict guard that used to run here
+    // (redteam R3) is retired — a stale Gemini/native marker is now detected
+    // pre-mint and cleared on the SUCCESS path by `finalize_login`
+    // (`binding_guard::detect_stale_marker_binding` +
+    // `clear_detected_marker_binding`) rather than refused up-front. See
+    // those functions' doc comments.
+
     // SEC-R2-04: capture the calling renderer's window label so all
     // emits go through emit_to(label, ...). Stored on the slot and
     // passed into the orchestrator task.
@@ -1287,7 +1294,7 @@ async fn finalize_login(
         // does not apply. This command is currently unregistered (renderer uses
         // `start_claude_login_subprocess`). If re-registered as a live first-login
         // path, mint the UUID from `credential`'s `oauthAccount.emailAddress`
-        // BEFORE this save, or fresh installs reintroduce #633 (fail-closed save).
+        // BEFORE this save, or fresh installs reintroduce an internal ticket (fail-closed save).
         credentials::save_canonical_for(&base_owned, account, &credential).map_err(|e| {
             (
                 format!("credential write failed: {}", redact_tokens(&e.to_string())),

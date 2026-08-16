@@ -33,7 +33,7 @@ path = "src/main.rs"
 csq-core = { path = "../csq-core" }
 # csq-merkle: the RFC 6962 Merkle verifier, extracted from this crate's former
 # `src/merkle.rs` into a shared leaf so csq-core can also verify inclusion proofs
-# without a csq-core↔csq-ledger cycle (#980). `src/merkle.rs` now re-exports it.
+# without a csq-core↔csq-ledger cycle (an internal ticket). `src/merkle.rs` now re-exports it.
 csq-merkle.workspace = true
 serde.workspace = true
 serde_json.workspace = true

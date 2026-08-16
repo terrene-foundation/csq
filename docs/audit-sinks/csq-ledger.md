@@ -7,6 +7,13 @@ the recommended path. It stores `SignedRecord`s in an append-only log, serves
 RFC 6962 Merkle inclusion proofs, and publishes a signed tree head
 (checkpoint).
 
+**csq-ledger is INTERNAL-ONLY.** It is never exposed to the public internet —
+not directly, and not behind a reverse proxy either. Deploy it inside your own
+trusted network, reachable only by the csq daemons and verifiers that live
+there. This is enforced structurally, not left to a deployment note: revoke
+and verifier-bootstrap redemption are served from a SEPARATE listener that
+defaults to loopback-only (see "Two listeners" below).
+
 This guide covers Docker deployment, environment variables, wiring csq to
 anchor here, monitoring, the **threat model** (read this before deciding your
 compliance posture), and the recommended write-once-storage deploy patterns.
@@ -28,6 +35,10 @@ csq-ledger is a **single-instance** transparency log. It is:
   truncate, compact, vacuum, or garbage-collection operation. Once a submit
   returns HTTP 200, the bytes that produced the inclusion proof are append-only
   forever from csq-ledger's perspective.
+- **Internal-only** — designed to run inside your trusted network, never on
+  the public internet. There is no per-request authentication; the boundary is
+  which listener a caller can reach, not an in-process check (see "Two
+  listeners" below).
 
 It is **NOT**, on its own:
 
@@ -64,6 +75,15 @@ The published image is `ghcr.io/terrene-foundation/csq-ledger:<version>`
 (`registry.terrene.foundation`) is a Foundation-ops decision; M10 ships against
 GHCR.
 
+**Only port 8080 (read/write) is published above — this is intentional.** The
+authority listener binds `127.0.0.1:8081` by default; even publishing
+`-p 8081:8081` would NOT make it reachable from the host, because a
+loopback-bound process inside a container is only reachable from within that
+container's own network namespace. To revoke or redeem a verifier bootstrap,
+either `docker exec` into the container and call `127.0.0.1:8081` from there,
+or explicitly set `CSQ_LEDGER_AUTHORITY_BIND=0.0.0.0`, publish `8081`, and put
+your own network control (firewall, separate VLAN) in front of it.
+
 ### docker-compose
 
 A minimal single-instance example ships at
@@ -94,15 +114,37 @@ sudo chown -R 65532:65532 /var/lib/csq-ledger
 
 ## Environment variables
 
-| Variable                      | Default               | Purpose                                                                             |
-| ----------------------------- | --------------------- | ----------------------------------------------------------------------------------- |
-| `CSQ_LEDGER_DATA_DIR`         | `/var/lib/csq-ledger` | Data directory (segment files, size marker, anchors, signing key).                  |
-| `CSQ_LEDGER_PORT`             | `8080`                | TCP port to bind.                                                                   |
-| `CSQ_LEDGER_BIND`             | `0.0.0.0`             | Bind address. Front with a reverse proxy / firewall (no authn).                     |
-| `CSQ_LEDGER_SIGNING_KEY_PATH` | _(unset)_             | Path to an operator-provisioned signing key. Setting it clears the first-boot WARN. |
+| Variable                      | Default               | Purpose                                                                                                         |
+| ----------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `CSQ_LEDGER_DATA_DIR`         | `/var/lib/csq-ledger` | Data directory (segment files, size marker, anchors, signing key).                                              |
+| `CSQ_LEDGER_PORT`             | `8080`                | TCP port for the READ/WRITE listener.                                                                           |
+| `CSQ_LEDGER_BIND`             | `0.0.0.0`             | Bind address for the READ/WRITE listener. Reachable within your internal network; never expose it publicly.     |
+| `CSQ_LEDGER_AUTHORITY_PORT`   | `8081`                | TCP port for the AUTHORITY listener (revoke, verifier-bootstraps).                                              |
+| `CSQ_LEDGER_AUTHORITY_BIND`   | `127.0.0.1`           | Bind address for the AUTHORITY listener. Loopback-only by default — widening it is an explicit operator choice. |
+| `CSQ_LEDGER_SIGNING_KEY_PATH` | _(unset)_             | Path to an operator-provisioned signing key. Setting it clears the first-boot WARN.                             |
 
-CLI flags mirror the env vars (`--data-dir`, `--port`, `--bind`) plus the
-anchor flags (`--anchor-to-sink`, `--anchor-cadence`).
+CLI flags mirror the env vars (`--data-dir`, `--port`, `--bind`,
+`--authority-port`, `--authority-bind`) plus the anchor flags
+(`--anchor-to-sink`, `--anchor-cadence`).
+
+### Two listeners: read/write and authority (H3)
+
+csq-ledger binds and serves TWO independent HTTP listeners from one process:
+
+- **Read/write** (`--bind`/`--port`) — submit, get-entry (+ tenant-bound
+  verdict), checkpoint, health. Reachable wherever your internal network
+  places it.
+- **Authority** (`--authority-bind`/`--authority-port`) — revoke and
+  verifier-bootstrap redemption ONLY, **loopback-only by default**. Revocation
+  is permanent (there is no un-revoke), so any principal that can reach it can
+  permanently deny any anchor for any tenant. The read/write listener's router
+  never registers these two routes at all — a request to either on the
+  read/write port gets a plain 404, not a permission check.
+
+If you need to reach the authority listener from another host (e.g. a
+dedicated revocation console), widen `--authority-bind` explicitly and put
+your own network control (firewall rule, separate VLAN, bastion) in front of
+it — that is additive to, not a substitute for, the listener split.
 
 ### First-boot signing key (read this)
 
@@ -133,16 +175,34 @@ For higher assurance, provision the key from an HSM or KMS export and point
 
 ## HTTP API
 
-| Method | Path                   | Purpose                                                                                                                        |
-| ------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| POST   | `/v1/log/entries`      | Submit a `SignedRecord`. Returns `{inclusion_proof, log_index, checkpoint_at_submit}` **after the record is fsync'd to disk**. |
-| GET    | `/v1/log/entries/{id}` | Retrieve a record by `record_id` + its current inclusion proof.                                                                |
-| GET    | `/v1/checkpoint`       | Current signed tree head: `{tree_size, root_hash, signed_by_key_id, public_key, signature, anchored_to?}`.                     |
-| GET    | `/v1/health`           | `{status, tree_size, signing_key_warning?}`.                                                                                   |
+| Listener   | Method | Path                                         | Purpose                                                                                                                                                                                                        |
+| ---------- | ------ | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| read/write | POST   | `/v1/log/entries`                            | Submit a `SignedRecord`. Returns `{inclusion_proof, log_index, checkpoint_at_submit}` **after the record is fsync'd to disk**.                                                                                 |
+| read/write | GET    | `/v1/log/entries/{id}`                       | Retrieve a record by `record_id` + its current inclusion proof. `?tenant_id=<id>` also returns a fresh Ed25519-signed anchor verdict bound to that record, tenant, checkpoint, expiry, and monotonic version.  |
+| authority  | POST   | `/v1/log/entries/{id}/revoke?tenant_id=<id>` | Authority-only permanent revocation for a record/tenant pair. Returns a signed revocation; future tenant-bound verdicts deny. Idempotent: replaying it for an already-revoked pair returns the identical fact. |
+| authority  | POST   | `/v1/log/verifier-bootstraps/{id}`           | Redeem one durable bootstrap for a verifier namespace. Body: a fresh 64-hex challenge; 201 returns its signed challenge-bound receipt and any later redemption returns 409.                                    |
+| read/write | GET    | `/v1/checkpoint`                             | Current signed tree head: `{tree_size, root_hash, signed_by_key_id, public_key, signature, anchored_to?}`.                                                                                                     |
+| read/write | GET    | `/v1/health`                                 | `{status, tree_size, signing_key_warning?}`.                                                                                                                                                                   |
 
-There is **no authentication** in this release. Deploy csq-ledger behind your
-own reverse proxy / VPN / mTLS termination. The server is the storage + proof
-primitive, not the access-control plane.
+There is **no per-request authentication** in this release. The access-control
+boundary is which listener a caller can reach (see "Two listeners" above) —
+csq-ledger is internal-only end to end, never fronted for public-internet
+access. The server is the storage + proof primitive, not an internet-facing
+access-control plane.
+
+`POST /v1/log/entries/{id}/revoke` is served ONLY by the authority listener,
+loopback-only by default. The service does not accept a caller-provided status
+or private key. For `GET` verdicts, clients must pin `signed_by_key_id`,
+verify the signature and binding to their expected record and tenant, require
+a fresh `expires_at`, persist the greatest version they accepted, reject a
+non-increasing version, and deny `status: "revoked"`.
+
+`POST /v1/log/verifier-bootstraps/{id}` is served by the same authority
+listener. A consumer that needs durable local replay tracking supplies a stable
+operator-provisioned verifier id and a new random challenge for each attempt,
+then creates its local state only after pin-verifying the matching signed 201
+receipt. Once consumed, the CSQ-side append-only record returns 409 forever;
+deleting every local consumer file cannot recreate bootstrap authority.
 
 `POST /v1/log/entries` returns HTTP 200 **only after** the record's storage
 write has been fsync'd to disk. If the server 200s, the record is durable: a

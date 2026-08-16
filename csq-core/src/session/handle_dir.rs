@@ -11,6 +11,7 @@ use crate::accounts::identity_store::{
 };
 use crate::accounts::markers;
 use crate::accounts::profiles;
+use crate::credentials::keychain;
 use crate::error::CredentialError;
 use crate::session::isolation::{self, SHARED_ITEMS};
 use crate::session::merge::merge_settings;
@@ -43,6 +44,160 @@ const ACCOUNT_BOUND_ITEMS: &[&str] = &[
     ".current-account",
     ".quota-cursor",
 ];
+
+// ── Ephemeral handle-dir prefix registry (positive allowlist) ──────────────
+//
+// Every filename PREFIX under `<base_dir>` (the `accounts/` root) that csq
+// recognizes as an EPHEMERAL, csq-managed handle-dir namespace: a directory
+// some producer creates transiently, that some reaper is responsible for
+// eventually removing. This is a POSITIVE ALLOWLIST (`cc-artifacts.md` Rule
+// 10) — a producer that invents a new ephemeral-dir name shape without
+// registering its prefix here leaks forever, because every reaper in this
+// module keys off a specific prefix rather than "everything under
+// `accounts/` that isn't a known-permanent dir".
+//
+// This registry exists to close the `codex-exec-`/`gemini-exec-` incident:
+// `csq exec` (`csq/src/cli/commands/exec.rs`) minted `codex-exec-<pid>` and
+// `gemini-exec-<pid>` handle dirs with best-effort, error-discarding cleanup
+// (`let _ = std::fs::remove_dir_all(...)`), and no sweeper's `term-`-only
+// name check ever recognized the shape — so a kill, panic, or early return
+// leaked the dir on disk forever. 54 such dirs were found orphaned on a
+// single host.
+//
+// Each entry's producer + reaper:
+//   "term-"                — csq run / csq swap         — sweep_dead_handles (main loop)
+//   CAPTURE_DIR_PREFIX      — phase2b interactive capture — sweep_stale_capture_dirs
+//   EXEC_CODEX_DIR_PREFIX   — csq exec --provider codex   — sweep_stale_exec_dirs
+//   EXEC_GEMINI_DIR_PREFIX  — csq exec --provider gemini  — sweep_stale_exec_dirs
+//
+// Adding a new ephemeral producer? Add its prefix here AND wire a reaper
+// call in `sweep_dead_handles` in the SAME change — `assert_dir_name_prefix_registered`
+// (called by `create_handle_dir_named` / `create_handle_dir_codex_named`)
+// refuses to create a dir whose prefix isn't registered, so a producer
+// routed through those two functions fails loudly at creation time instead
+// of leaking silently. A producer that mints its directory via raw
+// `std::fs` calls (bypassing both `_named` helpers — as `csq exec`'s Gemini
+// path does) is NOT caught by that guard; register its prefix here anyway
+// so the reaper and `find_unregistered_ephemeral_looking_dirs` still see it.
+
+/// Prefix for `csq exec --provider codex`'s ephemeral handle dirs
+/// (`csq/src/cli/commands/exec.rs`, via [`create_handle_dir_codex_named`]).
+/// Reaped by `sweep_stale_exec_dirs`. The producer always writes
+/// `.live-pid` (`create_handle_dir_codex_named` calls
+/// `markers::write_live_pid` unconditionally), so the reaper can use the
+/// authoritative marker; it also tolerates a missing marker by falling
+/// back to the PID embedded in the dir name itself (`codex-exec-<pid>`
+/// has no further suffix, unlike `interactive-capture-<pid>-<seq>`).
+pub const EXEC_CODEX_DIR_PREFIX: &str = "codex-exec-";
+
+/// Prefix for `csq exec --provider gemini`'s ephemeral handle dirs
+/// (`csq/src/cli/commands/exec.rs::create_gemini_handle_dir`). That
+/// producer does NOT go through [`create_handle_dir_named`] (gemini-cli
+/// reads credentials from `~/.gemini/oauth_creds.json`, not from a
+/// symlinked handle dir, so none of the shared helper's symlink logic
+/// applies) — it calls `std::fs::create_dir_all` directly and never
+/// writes `.live-pid`. `assert_dir_name_prefix_registered` therefore
+/// cannot guard this producer at creation time; the reaper
+/// (`sweep_stale_exec_dirs`) falls back to parsing the PID straight out
+/// of the dir name (`gemini-exec-<pid>`) for liveness.
+pub const EXEC_GEMINI_DIR_PREFIX: &str = "gemini-exec-";
+
+/// The full positive allowlist of ephemeral handle-dir prefixes. See the
+/// module comment above for the producer/reaper pairing of each entry.
+pub const EPHEMERAL_HANDLE_DIR_PREFIXES: &[&str] = &[
+    "term-",
+    CAPTURE_DIR_PREFIX,
+    EXEC_CODEX_DIR_PREFIX,
+    EXEC_GEMINI_DIR_PREFIX,
+];
+
+/// `true` when `name` starts with a registered ephemeral-handle-dir prefix.
+pub fn is_registered_ephemeral_handle_dir_name(name: &str) -> bool {
+    EPHEMERAL_HANDLE_DIR_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Refuses to create a handle dir whose name is neither the default
+/// `term-<pid>` shape nor a registered prefix from
+/// [`EPHEMERAL_HANDLE_DIR_PREFIXES`]. Called by [`create_handle_dir_named`]
+/// and [`create_handle_dir_codex_named`] before any filesystem mutation —
+/// a producer that invents a new prefix without registering it fails HERE,
+/// loudly and immediately, instead of leaking a directory that no sweeper
+/// will ever recognize (the exact bug class this registry exists to close).
+fn assert_dir_name_prefix_registered(dir_name: &str) -> Result<(), CredentialError> {
+    if is_registered_ephemeral_handle_dir_name(dir_name) {
+        return Ok(());
+    }
+    Err(CredentialError::Corrupt {
+        path: PathBuf::from(dir_name),
+        reason: format!(
+            "refusing to create ephemeral handle dir '{dir_name}': its prefix is not \
+             registered in EPHEMERAL_HANDLE_DIR_PREFIXES (csq-core/src/session/handle_dir.rs). \
+             Register the prefix there and wire a reaper into sweep_dead_handles before using it \
+             — an unregistered ephemeral dir leaks forever, because no sweeper's name check \
+             recognizes it."
+        ),
+    })
+}
+
+/// Top-level directory names/prefixes under `<base_dir>` (the `accounts/`
+/// root) that are PERMANENT — never ephemeral, never swept. `config-<N>` is
+/// prefix-matched (per-slot); `identities` and `credentials` are exact
+/// names. See `specs/02-csq-handle-dir-model.md` INV-01.
+const PERMANENT_TOP_LEVEL_DIR_NAMES: &[&str] = &["identities", "credentials"];
+const PERMANENT_TOP_LEVEL_DIR_PREFIXES: &[&str] = &["config-"];
+
+/// Lists directory names directly under `base_dir` that are neither a
+/// registered ephemeral handle-dir prefix
+/// ([`is_registered_ephemeral_handle_dir_name`]) nor a known-permanent
+/// directory. A non-empty result means some producer is creating a
+/// directory shape no predicate in this module recognizes — exactly the
+/// `codex-exec-`/`gemini-exec-` incident this registry exists to close.
+///
+/// Hidden entries (`.swap-lock`, `.sweep-tombstone-*`, and similar
+/// dotfile/dotdir state) and non-directory entries are excluded — this
+/// function is scoped to the directory-namespace shape a handle-dir
+/// producer creates, not every file under `accounts/`.
+///
+/// Not wired into any CLI/doctor surface yet (that wiring is a follow-up);
+/// its purpose today is to give a future unregistered producer a way to
+/// fail a TEST rather than leak silently and undetectably — see
+/// `handle_dir_prefix_registry_flags_unregistered_dir` in this module's
+/// test suite for the non-vacuity proof.
+pub fn find_unregistered_ephemeral_looking_dirs(base_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut unrecognized = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if is_registered_ephemeral_handle_dir_name(name) {
+            continue;
+        }
+        if PERMANENT_TOP_LEVEL_DIR_NAMES.contains(&name)
+            || PERMANENT_TOP_LEVEL_DIR_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        unrecognized.push(name.to_string());
+    }
+    unrecognized
+}
 
 /// Creates an ephemeral handle directory `term-<pid>` under `base_dir`.
 ///
@@ -116,6 +271,7 @@ pub fn create_handle_dir_named(
     pid: u32,
     dir_name: &str,
 ) -> Result<PathBuf, CredentialError> {
+    assert_dir_name_prefix_registered(dir_name)?;
     let config_dir = base_dir.join(format!("config-{}", account));
     if !config_dir.is_dir() {
         return Err(CredentialError::Corrupt {
@@ -337,6 +493,7 @@ pub fn create_handle_dir_codex_named(
     pid: u32,
     dir_name: &str,
 ) -> Result<PathBuf, CredentialError> {
+    assert_dir_name_prefix_registered(dir_name)?;
     let config_dir = base_dir.join(format!("config-{}", account));
     if !config_dir.is_dir() {
         return Err(CredentialError::Corrupt {
@@ -538,9 +695,14 @@ pub fn create_handle_dir_codex_named(
 /// The base carries user-global customization (statusLine, permissions,
 /// plugins, env experiments). The overlay carries slot-specific env for
 /// 3P bindings (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
-/// `ANTHROPIC_MODEL`). Overlay keys win on merge. For OAuth slots where
-/// neither overlay source is present, the materialized file equals the
-/// user's global settings.
+/// `ANTHROPIC_MODEL`). Precedence is slot overlay > user-global > csq
+/// defaults ([`default_settings`]): overlay keys win on merge, and a csq
+/// default fills in only when neither the user-global nor the overlay
+/// sets the key. For OAuth slots where neither overlay source is present,
+/// the materialized file equals the user's global settings plus any csq
+/// default the user has not explicitly set (currently `effortLevel:
+/// "high"` — an explicit `effortLevel` in the global, e.g. `"xhigh"`,
+/// always wins).
 ///
 /// Failures at each step:
 /// - Missing `claude_home/settings.json` → base is `{}`
@@ -565,6 +727,20 @@ pub fn materialize_handle_settings(
     config_dir: &Path,
 ) -> Result<(), CredentialError> {
     materialize_handle_settings_inner(handle_dir, claude_home, config_dir, None)
+}
+
+/// csq-shipped default settings for materialized handle dirs, applied
+/// UNDER the user-global layer: a key set explicitly in
+/// `~/.claude/settings.json` or in a slot overlay always wins; the
+/// default fills in only when neither sets it.
+///
+/// `effortLevel: "high"` — the default effort for Claude Code CLI
+/// sessions on Anthropic OAuth slots (csq 1–10). Without this layer the
+/// handle inherits whatever CC's built-in default is (currently
+/// `xhigh`); users who explicitly set `effortLevel` in their global keep
+/// their choice untouched.
+fn default_settings() -> Value {
+    serde_json::json!({ "effortLevel": "high" })
 }
 
 /// Internal implementation for [`materialize_handle_settings`] with optional
@@ -594,7 +770,12 @@ fn materialize_handle_settings_inner(
         _ => config_dir.join("settings.json"),
     };
     let overlay = read_json_object_or_empty(&overlay_path);
-    let merged = merge_settings(&base, &overlay);
+    // Three-layer merge: csq defaults < user-global < slot overlay. The
+    // defaults layer fills in keys (currently `effortLevel`) only when
+    // neither the user-global nor the slot overlay sets them — an
+    // explicit user setting always wins, and the user-global file itself
+    // is never written.
+    let merged = merge_settings(&merge_settings(&default_settings(), &base), &overlay);
 
     let settings_path = handle_dir.join("settings.json");
     let json = serde_json::to_string_pretty(&merged).map_err(|e| CredentialError::Corrupt {
@@ -661,7 +842,7 @@ fn read_json_object_or_empty(path: &Path) -> Value {
 /// pre-canonicalized path (`auto_rotate` canonicalizes at the top of its loop)
 /// resolve to the SAME inode. Without this, a symlink component anywhere in the
 /// accounts base splits the two into different lock files that never contend, so
-/// the rename lock silently fails to serialize concurrent repoints (#928).
+/// the rename lock silently fails to serialize concurrent repoints (an internal ticket).
 /// Falls back to the raw path when canonicalize fails (dangling dir) — the same
 /// posture both callers use for their own canonicalization.
 ///
@@ -795,14 +976,14 @@ pub fn repoint_handle_dir(
     // flock is per-open-file-description, so re-`flock`-ing the SAME file from a
     // second fd in the same process blocks forever. Merging this inner rename
     // lock onto `.swap-lock` would therefore self-deadlock every swap and every
-    // rotation — hence `.swap.lock` (dot) stays a separate file (#928).
+    // rotation — hence `.swap.lock` (dot) stays a separate file (an internal ticket).
     //
     // `repoint_lock_path` canonicalizes the dir BEFORE computing the lock path so
     // this rename lock resolves to the SAME inode whether the caller passed a raw
     // path (`csq swap` — swap.rs passes `source.path()` verbatim) or a
     // pre-canonicalized one (`auto_rotate` canonicalizes at the top of its loop).
     // Without this, a symlink component in the accounts base makes the two lock
-    // different inodes and the inner lock silently fails to serialize them (#928
+    // different inodes and the inner lock silently fails to serialize them (an internal ticket
     // latent gap).
     //
     // `.swap.lock` lives inside the handle dir so it is automatically cleaned up
@@ -821,7 +1002,7 @@ pub fn repoint_handle_dir(
     // an internal journal entry WBS line 124 + 04-phase3-readiness.md §M3-4).  Splitting
     // the two into separate commits would open a window where the bump targets
     // `config-N/.credentials.json` but the symlink resolves to
-    // `identities/<UUID>/credentials.json` — a silent #270-class regression.
+    // `identities/<UUID>/credentials.json` — a silent an internal ticket-class regression.
     let target_identity_paths = account_to_identity_paths(base_dir, target);
 
     // Determine the actual credentials file the symlink will point at
@@ -856,7 +1037,7 @@ pub fn repoint_handle_dir(
     // precision), CC will silently skip the reload and the swap appears
     // to "not take effect" until something else perturbs the file. The
     // pre/post traces below make the invariant visible at INFO level so a
-    // future repro of #270 produces actionable evidence.
+    // future repro of an internal ticket produces actionable evidence.
     let pre_swap_creds_target = stat_creds_target(handle_dir);
 
     // an internal ticket fix: bump the new target's mtime strictly above the
@@ -993,7 +1174,7 @@ pub fn repoint_handle_dir(
     // them during the session) are preserved so `--resume` and per-CWD
     // state survive the swap. See `rebuild_claude_json_for_swap` for
     // the atomic write + projects merge.
-    // #832: capture the pre-rebuild `.claude.json` oauthAccount email (the stale/old
+    // an internal ticket: capture the pre-rebuild `.claude.json` oauthAccount email (the stale/old
     // value, before the rebuild overwrites it) so the reconcile can distinguish a
     // stale copy it MAY overwrite from a foreign-account signal (a concurrent CC
     // in-session `/login`) it MUST NOT overwrite. Read BEFORE the rebuild.
@@ -1001,7 +1182,7 @@ pub fn repoint_handle_dir(
 
     rebuild_claude_json_for_swap(&new_config, handle_dir);
 
-    // #832: the rebuild sources `oauthAccount` from `config-<target>/.claude.json`,
+    // an internal ticket: the rebuild sources `oauthAccount` from `config-<target>/.claude.json`,
     // which can be absent (rebuild bails → stale copy retained) or carry no email.
     // Reconcile `oauthAccount.emailAddress` to the authoritative identity anchor so
     // the custodian wrong-account gate matches on the next tick instead of
@@ -1034,7 +1215,7 @@ pub fn repoint_handle_dir(
     );
     // Default csq log level is `warn`, so the INFO trace above is invisible
     // to operators who haven't opted into `CSQ_LOG=info`. Emit a WARN only
-    // on the exact #270 failure mode (both stats succeeded + mtimes equal)
+    // on the exact an internal ticket failure mode (both stats succeeded + mtimes equal)
     // so the bug surfaces in default-log sessions and the next manifestation
     // can be diagnosed without first asking the operator to opt back in.
     // Spec 02 INV-04 §2.94 already acknowledges this caveat.
@@ -1094,7 +1275,7 @@ fn mtime_changed(pre: &Option<CredsTargetStat>, post: &Option<CredsTargetStat>) 
 }
 
 /// True ONLY when both stats succeeded AND mtimes are identical — the exact
-/// #270 hypothesised failure mode where CC's `mtimeMs !== lastCredentialsMtimeMs`
+/// an internal ticket hypothesised failure mode where CC's `mtimeMs !== lastCredentialsMtimeMs`
 /// check (spec 01 §1.4) silently skips the credential reload. Distinguishes
 /// the bug condition from stat-read failures (None on either side), which
 /// the caller surfaces separately. The complement of [`mtime_changed`]
@@ -1231,7 +1412,7 @@ pub fn repoint_handle_dir_codex(
     //
     // Distinct from the A4a `.swap-lock` (hyphen) keychain guard and
     // canonicalized via `repoint_lock_path` for the same reasons as
-    // `repoint_handle_dir` (#928): codex swaps take no outer A4a guard
+    // `repoint_handle_dir` (an internal ticket): codex swaps take no outer A4a guard
     // (fresh-dir / keychain-absent), so this `.swap.lock` (dot) IS the sole
     // rename serializer for concurrent codex repoints — canonicalizing the dir
     // keeps that serialization sound even when the caller passes a raw,
@@ -1308,7 +1489,7 @@ pub fn repoint_handle_dir_codex(
     // an internal ticket fix (Codex parallel, M3-4 retarget): bump the new auth.json
     // target's mtime strictly above the pre-swap target's mtime BEFORE the
     // atomic rename.  codex-cli re-reads auth.json before each API call (spec
-    // 07 §7.5); an mtime collision would cause the same silent-skip bug as #270.
+    // 07 §7.5); an mtime collision would cause the same silent-skip bug as an internal ticket.
     // Pre-bumping is defensive.  Failure is non-fatal: the swap proceeds.
     //
     // PRIMARY METHODOLOGICAL DIRECTIVE 1: bump targets `auth_symlink_target`
@@ -1495,7 +1676,7 @@ fn materialize_handle_claude_json(config_dir: &Path, handle_dir: &Path) {
 /// (`config_dir/.claude.json`) we leave the handle dir's file alone.
 /// Wiping it would strand CC with zero state, which is strictly worse
 /// than keeping the stale copy.
-/// #832: reconcile the handle dir's `.claude.json` `oauthAccount.emailAddress` to the
+/// an internal ticket: reconcile the handle dir's `.claude.json` `oauthAccount.emailAddress` to the
 /// authoritative identity anchor after a swap — WITHOUT clobbering a foreign-account
 /// signal.
 ///
@@ -1598,7 +1779,7 @@ fn reconcile_handle_dir_oauth_email(
             .is_some_and(|old| !old.is_empty() && cur.eq_ignore_ascii_case(old)),
     };
     if !safe_to_write {
-        debug!("swap: #832 reconcile skipped — .claude.json names a non-pre-swap account");
+        debug!("swap: an internal ticket reconcile skipped — .claude.json names a non-pre-swap account");
         return;
     }
     // Force oauthAccount.emailAddress, creating (or replacing a non-object)
@@ -1616,7 +1797,7 @@ fn reconcile_handle_dir_oauth_email(
     let out = match serde_json::to_string(&json) {
         Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, "swap: failed to serialize .claude.json for #832 reconcile");
+            warn!(error = %e, "swap: failed to serialize .claude.json for an internal ticket reconcile");
             return;
         }
     };
@@ -1624,22 +1805,22 @@ fn reconcile_handle_dir_oauth_email(
     let tmp = crate::platform::fs::unique_tmp_path(&path);
     if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
-        warn!(path = %tmp.display(), error = %e, "swap: #832 reconcile temp write failed");
+        warn!(path = %tmp.display(), error = %e, "swap: an internal ticket reconcile temp write failed");
         return;
     }
     // 0600 the tmp before the rename (security.md §5a canonical pipeline): the file
     // carries the account email = PII. secure_file is a no-op on Windows.
     if let Err(e) = crate::platform::fs::secure_file(&tmp) {
         let _ = std::fs::remove_file(&tmp);
-        warn!(path = %tmp.display(), error = %e, "swap: #832 reconcile secure_file failed");
+        warn!(path = %tmp.display(), error = %e, "swap: an internal ticket reconcile secure_file failed");
         return;
     }
     if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
-        warn!(path = %path.display(), error = %e, "swap: #832 reconcile atomic replace failed");
+        warn!(path = %path.display(), error = %e, "swap: an internal ticket reconcile atomic replace failed");
         return;
     }
-    debug!("swap: reconciled .claude.json oauthAccount.emailAddress to identity anchor (#832)");
+    debug!("swap: reconciled .claude.json oauthAccount.emailAddress to identity anchor (an internal ticket)");
 }
 
 fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
@@ -1734,8 +1915,135 @@ fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
 /// Callers should only pass `None` when they cannot safely determine
 /// where `~/.claude/image-cache/` lives.
 ///
+/// Clear the macOS keychain OAuth item for a dead `term-<pid>` handle dir
+/// about to be reaped by [`sweep_dead_handles`], immediately before it is
+/// deleted (the item is keyed on the dir's canonicalized path — once the dir
+/// is gone, nothing can ever locate the item again).
+///
+/// **Cost predicate first** (`security.md` MUST-6): the reaper runs on every
+/// account on a fixed cadence, so a `security` subprocess call per dead dir
+/// regardless of whether it ever held an item would be wasted work on the hot
+/// path. [`keychain::handle_dir_might_have_anthropic_keychain_item`] is a
+/// pure filesystem check (no keychain access) that gates the call — see its
+/// doc comment for why the predicate is sound, not merely convenient.
+///
+/// `clear_fn` is a test seam: production always passes
+/// [`keychain::clear_handle_dir_reporting`]; tests inject a counting spy so
+/// the gating behavior (called vs. not-called) is provable without shelling
+/// `security` — `keychain_mirror_disabled()` makes the real function return
+/// `Ok(false)` unconditionally under `cfg!(test)`, which is indistinguishable
+/// from "never called" by return value alone.
+///
+/// **Fail-open, matching an internal ticket's `clear_bound_keychain_items` posture — WITH
+/// the same security-review-1386 H1 compensating mechanism.** The keychain
+/// item is a MIRROR at the moment this runs (the credential also lives at
+/// `identities/<UUID>/credentials.json`), so refusing the whole sweep on a
+/// keychain timeout is the wrong trade — the reaper is a periodic
+/// background loop touching every account and MUST NOT wedge or abort
+/// because one dir's keychain is locked or unreachable (a common,
+/// transient, non-macOS-Aqua-session condition). But an unconfirmed clear
+/// here is a STRONGER case than logout's: the tombstone rename that deletes
+/// this dir happens immediately after this call returns, so the item
+/// becomes UNREACHABLE — no future code path can ever reconstruct this
+/// exact `abs` again to retry — the instant that rename lands. So instead
+/// of only logging and dropping it, an unconfirmed clear is queued via
+/// [`keychain::record_pending_clear`], the SAME durable retry channel
+/// `logout::clear_bound_keychain_items` uses, picked up by
+/// [`spawn_sweep`]'s `sweep_pending_clears` call on the SAME 60s tick
+/// (immediately after `sweep_dead_handles` returns) AND by `csq run` /
+/// `csq exec` / the phase2b subscription client's opportunistic sweeps
+/// (F10 — four convergence points now, not two, so a headless install
+/// driven entirely through `csq exec` or a subscription capture with no
+/// daemon and no `csq run` still drains this queue). Failures are never
+/// silently dropped either way (`zero-tolerance.md` Rule 3): an unconfirmed
+/// clear logs a WARN with a fixed-vocabulary `error_kind` and the dead PID
+/// only — never an absolute path (`security.md` MUST-2).
+///
+/// `base_dir` is the accounts dir (`record_pending_clear`'s queue lives at
+/// `base_dir/keychain-pending-clears.json` — pure file I/O against a path
+/// the caller already owns, no dependency on `path`/`abs` continuing to
+/// exist afterward: `sweep_pending_clears` retries by SERVICE NAME string
+/// alone, never by re-deriving a directory path — see its doc comment).
+fn clear_dead_handle_keychain_item(
+    path: &Path,
+    owner_pid: u32,
+    base_dir: &Path,
+    clear_fn: &mut impl FnMut(&Path) -> Result<bool, keychain::KeychainClearUnconfirmed>,
+) {
+    clear_dead_handle_keychain_item_inner(path, owner_pid, base_dir, clear_fn, &mut |b, s| {
+        keychain::record_pending_clear(b, s)
+    });
+}
+
+/// Test seam for [`clear_dead_handle_keychain_item`]: `record_fn` is the
+/// pending-clear queue write the unconfirmed arm performs, injectable for the
+/// SAME reason `clear_fn` is — [`keychain::record_pending_clear`] is
+/// `#[cfg(not(target_os = "macos"))] {}`, a structural no-op on every non-macOS
+/// target, so on the Linux CI runner "queued" and "never called" are
+/// indistinguishable by observing `keychain-pending-clears.json`. Asserting on
+/// that file is therefore a macOS-only instrument (`instrument-discipline.md`
+/// MUST-1: off macOS no result it could produce would falsify the claim). The
+/// seam keeps the WIRING — does the unconfirmed arm reach the recorder at all,
+/// with this dir's own service name — provable on every platform, which is what
+/// the enterprise job (Linux) can actually discriminate.
+///
+/// Production's only caller ([`clear_dead_handle_keychain_item`] above) always
+/// passes the real `keychain::record_pending_clear`.
+fn clear_dead_handle_keychain_item_inner(
+    path: &Path,
+    owner_pid: u32,
+    base_dir: &Path,
+    clear_fn: &mut impl FnMut(&Path) -> Result<bool, keychain::KeychainClearUnconfirmed>,
+    record_fn: &mut impl FnMut(&Path, &str),
+) {
+    if !keychain::handle_dir_might_have_anthropic_keychain_item(path) {
+        return;
+    }
+    // Security review 1386 M1 (mirrored from `logout::clear_bound_keychain_items`):
+    // a canonicalize failure MUST NOT fall back to the non-canonical `path` — that
+    // hashes to a DIFFERENT keychain service name than the one CC actually uses (CC
+    // hashes the canonicalized `CLAUDE_CONFIG_DIR`), so `clear_fn` would target
+    // nothing, `security` would report "no such item" (a subprocess that ran to
+    // completion, `Ok(true)`), and the caller would wrongly believe the real item
+    // was handled. Skip with a WARN instead.
+    let Ok(abs) = std::fs::canonicalize(path) else {
+        warn!(
+            error_kind = "keychain_clear_canonicalize_failed",
+            pid = owner_pid,
+            "sweep: could not canonicalize this dead handle dir's path — its keychain \
+             item (if any) was NOT targeted for clearing (non-fatal — sweep continues)"
+        );
+        return;
+    };
+    if let Err(keychain::KeychainClearUnconfirmed) = clear_fn(&abs) {
+        warn!(
+            error_kind = "keychain_clear_unconfirmed",
+            pid = owner_pid,
+            "sweep: could not confirm the keychain OAuth item was cleared for this dead \
+             handle dir (non-fatal — keychain may be locked or unavailable; queued for \
+             automatic retry; sweep continues)"
+        );
+        record_fn(base_dir, &keychain::service_name(&abs));
+    }
+}
+
 /// Returns the number of directories removed.
 pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize {
+    sweep_dead_handles_inner(base_dir, claude_home, keychain::clear_handle_dir_reporting)
+}
+
+/// Test seam for [`sweep_dead_handles`]: `clear_keychain_item` is the
+/// per-dir keychain-clear call `clear_dead_handle_keychain_item` invokes,
+/// injectable so tests can prove the reaper's WIRING (called for an
+/// Anthropic-bound dead dir, skipped for one that never held an item)
+/// without shelling `security` — production's only caller
+/// ([`sweep_dead_handles`] above) always passes
+/// [`keychain::clear_handle_dir_reporting`].
+fn sweep_dead_handles_inner(
+    base_dir: &Path,
+    claude_home: Option<&Path>,
+    mut clear_keychain_item: impl FnMut(&Path) -> Result<bool, keychain::KeychainClearUnconfirmed>,
+) -> usize {
     let mut removed = 0;
 
     // Clean up any stale tombstones from a crashed previous sweep
@@ -1859,6 +2167,31 @@ pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize 
             }
         }
 
+        // Clear this dir's macOS keychain OAuth item BEFORE it is deleted —
+        // the item is keyed on the dir's canonicalized path, so once the dir
+        // is gone nothing can ever locate or clear it again and it becomes a
+        // permanent orphan (`account-terminal-separation.md`; an internal ticket closed
+        // the equivalent gap on the `csq logout` path — this closes it on
+        // the reaper path, which an internal ticket explicitly left open, see its doc
+        // comment on `clear_bound_keychain_items`). That is sufficient reason
+        // on its own: the imminent deletion of the keyed-on path is what
+        // makes the item unreachable, independent of anything about the
+        // occupant that is about to replace it.
+        //
+        // It is NOT primarily a defense against `term-<pid>` PID recycling.
+        // an internal ticket also made `csq run`'s own keychain sync unconditionally pass
+        // `account_changed=true` (`sync_cc_keychain` ->
+        // `sync_handle_dir_account_changed`), which bypasses the
+        // newer-than-keychain guard and always overwrites-or-clears — so a
+        // NEW dir created at a recycled path self-heals on its own next
+        // launch whether or not this reaper ever ran. Reaping here still
+        // matters for the narrower window it closes: a path that is never
+        // reused would otherwise leave its item stranded forever, and a
+        // recycled path would otherwise carry a stale, wrong-account item
+        // for however long the dir sits dead-but-unreaped before the next
+        // `csq run` lands on it.
+        clear_dead_handle_keychain_item(&path, owner_pid, base_dir, &mut clear_keychain_item);
+
         // Atomic rename-to-tombstone frees the term-<pid> path in
         // one syscall. Any concurrent `create_handle_dir` calls
         // after the rename see a missing path and create fresh
@@ -1892,6 +2225,7 @@ pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize 
     }
 
     removed += sweep_stale_capture_dirs(base_dir);
+    removed += sweep_stale_exec_dirs(base_dir);
 
     if removed > 0 {
         info!(removed, "handle dir sweep complete");
@@ -1942,6 +2276,61 @@ pub(crate) fn sweep_stale_capture_dirs(base_dir: &Path) -> usize {
             None => dir_age_exceeds(&dir, CAPTURE_REAP_GRACE),
         };
         if reapable && std::fs::remove_dir_all(&dir).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Reap orphaned `csq exec` handle dirs (`codex-exec-<pid>` /
+/// `gemini-exec-<pid>`, `csq/src/cli/commands/exec.rs`). That producer's
+/// cleanup is best-effort and error-discarding
+/// (`let _ = std::fs::remove_dir_all(&handle_dir)`), so a kill, panic, or
+/// early return leaks the dir forever unless something else reaps it —
+/// this is that something else. Wired into [`sweep_dead_handles`] so it
+/// runs on the same 60s daemon cadence as the `term-*` sweep.
+///
+/// Both producers name their dir `<prefix><pid>` with NO further suffix
+/// (unlike `interactive-capture-<pid>-<seq>`), so the owning PID is always
+/// recoverable straight from the dir name — this reaper does NOT need an
+/// age-based fallback. `codex-exec-*` additionally writes `.live-pid`
+/// (`create_handle_dir_codex_named`); when present it is preferred as the
+/// authoritative owner (covers the rare case where the OS recycled the
+/// dir-name PID since creation). `gemini-exec-*` never writes `.live-pid`
+/// (its producer bypasses the shared handle-dir helpers — see
+/// [`EXEC_GEMINI_DIR_PREFIX`]), so it always falls back to the dir-name PID.
+/// A name that doesn't parse as `<prefix><pid>` is left alone — fail safe,
+/// per `reconciler-cleanup-parity.md` Rule 5 (KEEP on any doubt).
+pub(crate) fn sweep_stale_exec_dirs(base_dir: &Path) -> usize {
+    sweep_exec_dirs_with_prefix(base_dir, EXEC_CODEX_DIR_PREFIX)
+        + sweep_exec_dirs_with_prefix(base_dir, EXEC_GEMINI_DIR_PREFIX)
+}
+
+fn sweep_exec_dirs_with_prefix(base_dir: &Path, prefix: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(name_pid) = name
+            .strip_prefix(prefix)
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            // Either a different namespace, or a name this reaper doesn't
+            // recognize the shape of — skip rather than guess (fail safe).
+            continue;
+        };
+        let dir = entry.path();
+        let marker_pid: Option<u32> = std::fs::read_to_string(dir.join(".live-pid"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        let owner_pid = marker_pid.unwrap_or(name_pid);
+        if is_pid_alive(owner_pid) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&dir).is_ok() {
             removed += 1;
         }
     }
@@ -2511,7 +2900,6 @@ fn is_pid_alive(pid: u32) -> bool {
 
     #[cfg(windows)]
     {
-        use std::ptr;
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         extern "system" {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
@@ -2519,7 +2907,7 @@ fn is_pid_alive(pid: u32) -> bool {
         }
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() || handle == ptr::null_mut() {
+            if handle.is_null() {
                 return false;
             }
             CloseHandle(handle);
@@ -2572,6 +2960,19 @@ pub fn spawn_sweep(
             let home = claude_home.clone();
             let _ = tokio::task::spawn_blocking(move || sweep_dead_handles(&dir, home.as_deref()))
                 .await;
+
+            // Security review 1386 H1: retry any macOS keychain OAuth item a
+            // logout could not confirm clearing (locked/unreachable keychain
+            // at the time). Piggybacks on this existing 60s tick rather than
+            // its own timer — cheap when the queue is empty (one file read,
+            // no subprocess calls), and this is the recurring channel for any
+            // install that runs the daemon; `csq run` carries the same sweep
+            // for the headless/no-daemon case.
+            let dir = base_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::credentials::keychain::sweep_pending_clears(&dir)
+            })
+            .await;
 
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -2642,6 +3043,238 @@ mod tests {
         assert_eq!(sweep_stale_capture_dirs(base.path()), 0);
         assert!(base.path().join("term-12345").exists());
         assert!(base.path().join("config-1").exists());
+    }
+
+    // ── codex-exec-*/gemini-exec-* sweep (permanent-leak fix) ────────────────
+    //
+    // 54 orphaned `codex-exec-<pid>` dirs were found on a maintainer host —
+    // `csq exec`'s best-effort cleanup never ran (kill/panic/early-return) and
+    // no sweeper's `term-`-only name check recognized the shape.
+
+    fn make_exec_dir(base: &Path, prefix: &str, pid: u32, live_pid: Option<u32>) -> PathBuf {
+        let dir = base.join(format!("{prefix}{pid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(marker_pid) = live_pid {
+            std::fs::write(dir.join(".live-pid"), marker_pid.to_string()).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn sweep_exec_reaps_dead_codex_dir_via_live_pid_marker() {
+        // codex-exec-* always writes .live-pid (create_handle_dir_codex_named).
+        // A dead marker PID must be reaped even though the dir-name PID differs
+        // (proves the marker, not just the name, is consulted).
+        let base = TempDir::new().unwrap();
+        let dir = make_exec_dir(base.path(), EXEC_CODEX_DIR_PREFIX, 111, Some(999_999_999));
+        assert_eq!(sweep_stale_exec_dirs(base.path()), 1);
+        assert!(
+            !dir.exists(),
+            "dead-marker-pid codex-exec dir must be reaped"
+        );
+    }
+
+    #[test]
+    fn sweep_exec_keeps_live_codex_dir_via_live_pid_marker() {
+        // Non-vacuity pair for the above: a LIVE marker pid must be kept even
+        // though the dir-name pid (999_999_998) is a dead placeholder — proves
+        // the reaper is not merely deleting everything.
+        let base = TempDir::new().unwrap();
+        let dir = make_exec_dir(
+            base.path(),
+            EXEC_CODEX_DIR_PREFIX,
+            999_999_998,
+            Some(std::process::id()),
+        );
+        assert_eq!(sweep_stale_exec_dirs(base.path()), 0);
+        assert!(dir.exists(), "live-marker-pid codex-exec dir must be kept");
+    }
+
+    #[test]
+    fn sweep_exec_reaps_dead_gemini_dir_via_dir_name_pid() {
+        // gemini-exec-* never writes .live-pid (its producer bypasses the
+        // shared handle-dir helpers) — the reaper MUST fall back to the PID
+        // embedded in the dir name itself.
+        let base = TempDir::new().unwrap();
+        let dir = make_exec_dir(base.path(), EXEC_GEMINI_DIR_PREFIX, 999_999_997, None);
+        assert_eq!(sweep_stale_exec_dirs(base.path()), 1);
+        assert!(
+            !dir.exists(),
+            "dead dir-name-pid gemini-exec dir must be reaped"
+        );
+    }
+
+    #[test]
+    fn sweep_exec_keeps_live_gemini_dir_via_dir_name_pid() {
+        // Safety-critical direction: a live process's gemini-exec dir (no
+        // marker at all) MUST NOT be reaped — this is the exact scenario the
+        // task's safety requirement names ("a live dir MUST NOT be reaped").
+        let base = TempDir::new().unwrap();
+        let own_pid = std::process::id();
+        let dir = make_exec_dir(base.path(), EXEC_GEMINI_DIR_PREFIX, own_pid, None);
+        assert_eq!(sweep_stale_exec_dirs(base.path()), 0);
+        assert!(dir.exists(), "live gemini-exec dir must be kept");
+    }
+
+    #[test]
+    fn sweep_exec_ignores_non_exec_dirs() {
+        let base = TempDir::new().unwrap();
+        std::fs::create_dir_all(base.path().join("term-12345")).unwrap();
+        std::fs::create_dir_all(base.path().join("config-1")).unwrap();
+        std::fs::create_dir_all(base.path().join(format!("{CAPTURE_DIR_PREFIX}999999999-0")))
+            .unwrap();
+        assert_eq!(sweep_stale_exec_dirs(base.path()), 0);
+        assert!(base.path().join("term-12345").exists());
+        assert!(base.path().join("config-1").exists());
+    }
+
+    #[test]
+    fn sweep_exec_skips_unparseable_suffix_fail_safe() {
+        // A dir shaped like "codex-exec-<not-a-number>" doesn't match the
+        // <prefix><pid> shape this reaper understands. Fail safe: skip, don't
+        // guess (reconciler-cleanup-parity.md Rule 5 — KEEP on any doubt).
+        let base = TempDir::new().unwrap();
+        let dir = base
+            .path()
+            .join(format!("{EXEC_CODEX_DIR_PREFIX}not-a-pid"));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(sweep_stale_exec_dirs(base.path()), 0);
+        assert!(dir.exists(), "unparseable-suffix dir must be kept");
+    }
+
+    #[test]
+    fn sweep_dead_handles_reaps_orphaned_exec_dirs_end_to_end() {
+        // sweep_dead_handles is the function actually wired into the 60s
+        // daemon watcher (spawn_sweep) — prove the exec-dir reap is reachable
+        // from THAT entrypoint, not only from the unit-level helper.
+        let base = TempDir::new().unwrap();
+        let dead = make_exec_dir(base.path(), EXEC_CODEX_DIR_PREFIX, 111, Some(999_999_996));
+        let live = make_exec_dir(
+            base.path(),
+            EXEC_GEMINI_DIR_PREFIX,
+            std::process::id(),
+            None,
+        );
+        let removed = sweep_dead_handles(base.path(), None);
+        assert_eq!(removed, 1);
+        assert!(
+            !dead.exists(),
+            "orphaned codex-exec dir reaped via sweep_dead_handles"
+        );
+        assert!(
+            live.exists(),
+            "live gemini-exec dir untouched via sweep_dead_handles"
+        );
+    }
+
+    // ── ephemeral handle-dir prefix registry (positive allowlist) ────────────
+
+    #[test]
+    fn assert_dir_name_prefix_registered_accepts_every_registered_prefix() {
+        for name in [
+            "term-123",
+            "interactive-capture-1-0",
+            "codex-exec-1",
+            "gemini-exec-1",
+        ] {
+            assert!(
+                assert_dir_name_prefix_registered(name).is_ok(),
+                "registered-prefix name '{name}' must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn assert_dir_name_prefix_registered_rejects_unregistered_prefix() {
+        // Non-vacuity: an unregistered producer prefix MUST fail loudly at
+        // creation time rather than silently mint a dir no sweeper recognizes.
+        let err = assert_dir_name_prefix_registered("foo-exec-123")
+            .expect_err("unregistered prefix must be rejected");
+        match err {
+            CredentialError::Corrupt { reason, .. } => {
+                assert!(reason.contains("EPHEMERAL_HANDLE_DIR_PREFIXES"));
+            }
+            other => panic!("expected CredentialError::Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_handle_dir_named_rejects_unregistered_dir_name() {
+        // End-to-end: the guard is actually wired into the production
+        // constructor, not just callable in isolation.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let account = AccountNum::try_from(1u16).unwrap();
+        setup_config_dir(base, 1);
+        let result = create_handle_dir_named(
+            base,
+            &claude_home,
+            account,
+            4242,
+            "unregistered-prefix-4242",
+        );
+        assert!(result.is_err(), "unregistered dir_name must be refused");
+        assert!(
+            !base.join("unregistered-prefix-4242").exists(),
+            "no directory should be created on refusal"
+        );
+    }
+
+    #[test]
+    fn create_handle_dir_codex_named_rejects_unregistered_dir_name() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(base.join("credentials")).unwrap();
+        std::fs::write(base.join("credentials").join("codex-1.json"), "{}").unwrap();
+        let result = create_handle_dir_codex_named(base, account, 4242, "unregistered-prefix-4242");
+        assert!(result.is_err(), "unregistered dir_name must be refused");
+        assert!(
+            !base.join("unregistered-prefix-4242").exists(),
+            "no directory should be created on refusal"
+        );
+    }
+
+    #[test]
+    fn find_unregistered_ephemeral_looking_dirs_flags_unregistered_producer() {
+        // Non-vacuity (fires): an unregistered producer's dir is surfaced.
+        let base = TempDir::new().unwrap();
+        std::fs::create_dir_all(base.path().join("foo-exec-1234")).unwrap();
+        let unrecognized = find_unregistered_ephemeral_looking_dirs(base.path());
+        assert_eq!(unrecognized, vec!["foo-exec-1234".to_string()]);
+    }
+
+    #[test]
+    fn find_unregistered_ephemeral_looking_dirs_silent_on_registered_and_permanent() {
+        // Non-vacuity (silent): every registered prefix AND every known
+        // permanent dir must NOT be flagged — proves the detector isn't
+        // simply flagging everything.
+        let base = TempDir::new().unwrap();
+        for name in [
+            "term-1",
+            "interactive-capture-1-0",
+            "codex-exec-1",
+            "gemini-exec-1",
+            "config-1",
+            "config-42",
+            "identities",
+            "credentials",
+        ] {
+            std::fs::create_dir_all(base.path().join(name)).unwrap();
+        }
+        // Hidden state (lock files, tombstones) and non-directory entries are
+        // also excluded.
+        std::fs::create_dir_all(base.path().join(".swap-lock")).unwrap();
+        std::fs::write(base.path().join("profiles.json"), "{}").unwrap();
+        let unrecognized = find_unregistered_ephemeral_looking_dirs(base.path());
+        assert!(
+            unrecognized.is_empty(),
+            "expected no unrecognized dirs, got {unrecognized:?}"
+        );
     }
 
     #[test]
@@ -2806,7 +3439,7 @@ mod tests {
         setup_config_dir(base, 2);
 
         // Force IDENTICAL mtimes on both slots' credentials files — the
-        // exact #270 bug condition. Pick a fixed mtime in the past so the
+        // exact an internal ticket bug condition. Pick a fixed mtime in the past so the
         // bump's `max(now, ...)` branch is the one being exercised.
         let collision_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         for slot in [1u16, 2u16] {
@@ -2887,7 +3520,7 @@ mod tests {
         // INV-P08 mode (0o400) that `save_canonical_for` sets after Codex
         // login/refresh. Without this, the test does not cover the production
         // case where `bump_mtime_above` opens a 0o400 file — the bug that
-        // made the Codex #270 fix non-functional before the O_RDONLY fix.
+        // made the Codex an internal ticket fix non-functional before the O_RDONLY fix.
         let collision_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         for slot in [1u16, 2u16] {
             let cred_path = creds_dir.join(format!("codex-{slot}.json"));
@@ -2980,12 +3613,12 @@ mod tests {
     }
 
     /// `mtime_collision` is the gate for the WARN emit that surfaces issue
-    /// #270's failure mode in default-log sessions. It MUST fire only when
+    /// an internal ticket's failure mode in default-log sessions. It MUST fire only when
     /// both stats succeeded AND mtimes match — distinguishing the bug class
     /// from stat-read failures (None) and from the happy path (mtimes
     /// differ). A regression that returns true for None inputs would emit
     /// a spurious WARN on first-bind handle dirs; one that returns false
-    /// for the bug condition would silently lose #270's signal. Pin both.
+    /// for the bug condition would silently lose an internal ticket's signal. Pin both.
     #[test]
     fn mtime_collision_fires_only_when_both_stats_present_and_mtimes_equal() {
         let same_mtime = 1_500_000_000_i128;
@@ -2995,7 +3628,7 @@ mod tests {
         });
         let stat_b = Some(super::CredsTargetStat {
             mtime_ns: same_mtime,
-            ino: 2, // different inode but identical mtime — the #270 bug class
+            ino: 2, // different inode but identical mtime — the an internal ticket bug class
         });
         let stat_c = Some(super::CredsTargetStat {
             mtime_ns: 2_000_000_000,
@@ -3508,6 +4141,460 @@ mod tests {
         #[cfg(unix)]
         assert!(alive.exists(), "live handle dir should remain");
 
+        assert!(removed >= 1);
+    }
+
+    // ── dead-handle reaper clears the keychain OAuth item (fix/sweep-dead-
+    // handles-clears-keychain) ──────────────────────────────────────────
+    //
+    // an internal ticket closed the keychain-orphan gap on `csq logout`; its own doc
+    // comment on `clear_bound_keychain_items` names this reaper path as the
+    // one still open. The item is keyed on the dir's canonicalized path, and
+    // the reaper is about to delete that path — once it does, nothing can
+    // locate the item again unless a future `csq run` happens to recycle the
+    // same `term-<pid>` path, so an unreaped item risks becoming a
+    // PERMANENT orphan (see `clear_dead_handle_keychain_item` above). an internal ticket
+    // separately made `csq run` always pass `account_changed=true` on its
+    // own keychain sync, so even a recycled path self-heals on its NEXT
+    // launch regardless of this reaper — what reaping here closes is the
+    // orphan/litter window, not a credential-collision risk.
+    //
+    // An unconfirmed clear is also routed into the security-review-1386 H1
+    // pending-clear queue (`keychain::record_pending_clear`), the SAME
+    // mechanism `logout::clear_bound_keychain_items` uses. That is proven on
+    // TWO axes, because one instrument cannot carry both:
+    //
+    // - **Queue CONTENT**, by reading `keychain-pending-clears.json` directly
+    //   rather than spying — `record_pending_clear` is pure file I/O and is NOT
+    //   gated by `keychain_mirror_disabled()` (see its own doc comment), so this
+    //   exercises the real write. macOS-ONLY: that function is
+    //   `#[cfg(not(target_os = "macos"))] {}`, a structural no-op elsewhere, so
+    //   off macOS the file is absent whether the arm queued or was deleted
+    //   outright — an instrument that cannot return the other answer
+    //   (`instrument-discipline.md` MUST-1). Same gate the sibling
+    //   `..._all_drain_arms` below and keychain.rs's own pending-clear block
+    //   already carry.
+    // - **WIRING**, on EVERY platform including the Linux enterprise runner, via
+    //   the `clear_dead_handle_keychain_item_inner` `record_fn` seam — the same
+    //   argument that made `clear_fn` a seam, applied to the recorder.
+
+    /// `clear_dead_handle_keychain_item` MUST invoke `clear_fn` for a dead
+    /// dir whose `.credentials.json` is Anthropic-shaped — this is the
+    /// "sweeper clears the item" half. Uses an injected spy (not the real
+    /// `keychain::clear_handle_dir_reporting`, which is `Ok(false)`
+    /// unconditionally under `cfg!(test)` and therefore CANNOT distinguish
+    /// "called" from "never called" by its return value alone).
+    #[test]
+    fn clear_dead_handle_keychain_item_calls_clear_fn_for_anthropic_bound_dir() {
+        let base = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+
+        let mut called = false;
+        let mut spy = |_p: &Path| {
+            called = true;
+            Ok(true)
+        };
+        clear_dead_handle_keychain_item(dir.path(), 999_999_998, base.path(), &mut spy);
+
+        assert!(
+            called,
+            "an Anthropic-shaped dead dir must trigger the keychain clear call"
+        );
+    }
+
+    /// The cost predicate half: a dead dir that never held an Anthropic
+    /// credential (absent `.credentials.json`) MUST NOT trigger a keychain
+    /// call at all — proven with the same spy technique, discriminating
+    /// "not called" from "called and happened to no-op".
+    #[test]
+    fn clear_dead_handle_keychain_item_skips_clear_fn_when_no_credential_file() {
+        let base = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        // No `.credentials.json` written at all.
+
+        let mut called = false;
+        let mut spy = |_p: &Path| {
+            called = true;
+            Ok(true)
+        };
+        clear_dead_handle_keychain_item(dir.path(), 999_999_997, base.path(), &mut spy);
+
+        assert!(
+            !called,
+            "a dir that never held an Anthropic credential must not trigger a \
+             keychain call — this is the cost predicate the reaper needs on its \
+             every-account, every-tick hot path"
+        );
+    }
+
+    /// Same cost-predicate proof for a non-Anthropic (Codex/3P) credential
+    /// shape — a `term-*` handle dir CAN be bound to a 3P provider, and its
+    /// `.credentials.json` never has the `claudeAiOauth` shape the Anthropic
+    /// keychain mirror writes under.
+    #[test]
+    fn clear_dead_handle_keychain_item_skips_clear_fn_for_non_anthropic_credential() {
+        let base = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"openaiAuth":{"token":"x"}}"#,
+        )
+        .unwrap();
+
+        let mut called = false;
+        let mut spy = |_p: &Path| {
+            called = true;
+            Ok(true)
+        };
+        clear_dead_handle_keychain_item(dir.path(), 999_999_996, base.path(), &mut spy);
+
+        assert!(
+            !called,
+            "a non-Anthropic credential shape must not trigger a keychain call"
+        );
+    }
+
+    /// An unconfirmed clear (`Err(KeychainClearUnconfirmed)`, e.g. a locked
+    /// keychain) MUST NOT panic and MUST NOT abort the caller — the reaper's
+    /// fail-open posture. Proven by simply not panicking; the WARN log this
+    /// path emits is covered by `security.md` MUST-2 / `zero-tolerance.md`
+    /// Rule 3 (fixed-vocabulary `error_kind`, no path) by code inspection —
+    /// matching `logout.rs`'s equivalent handling of the same error variant.
+    #[test]
+    fn clear_dead_handle_keychain_item_does_not_panic_on_unconfirmed_clear() {
+        let base = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+
+        let mut spy = |_p: &Path| Err(crate::credentials::keychain::KeychainClearUnconfirmed);
+        clear_dead_handle_keychain_item(dir.path(), 999_999_995, base.path(), &mut spy);
+        // Reaching here without panicking is the assertion.
+    }
+
+    /// Security review 1386 H1, mirrored here: an unconfirmed clear MUST be
+    /// durably queued for retry, not just logged and dropped — this dir is
+    /// deleted (tombstone-renamed) immediately after this call returns, so
+    /// the item is UNREACHABLE the instant that happens; this is a
+    /// STRONGER case than logout's (logout's file copies are merely deleted
+    /// moments later — this caller cannot even reconstruct `abs` again
+    /// afterward). Proven by reading `keychain-pending-clears.json`
+    /// directly (not a spy) — `record_pending_clear` is real file I/O, not
+    /// gated by `keychain_mirror_disabled()`, so this is genuine coverage
+    /// of the write, not a stand-in for it.
+    ///
+    /// **macOS-only, and not to dodge a red job.** `record_pending_clear` is
+    /// `#[cfg(not(target_os = "macos"))] pub fn record_pending_clear(_, _) {}`
+    /// — a structural no-op on every other target, because there is no keychain
+    /// there to have queued anything for. So off macOS this file is absent
+    /// whether the production arm queues correctly or the `record_fn` call is
+    /// deleted outright: no result this instrument can produce would falsify
+    /// the claim (`instrument-discipline.md` MUST-1), and it panicked on the
+    /// Linux enterprise runner for exactly that reason. Same gate the sibling
+    /// `clear_dead_handle_keychain_item_all_drain_arms` below and every
+    /// pending-clear test in `keychain.rs` already carry. The platform-
+    /// independent half — that the unconfirmed arm reaches the recorder at all,
+    /// with this dir's own service name — is
+    /// `clear_dead_handle_keychain_item_wiring_reaches_recorder_on_unconfirmed`
+    /// below, which DOES run on Linux.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clear_dead_handle_keychain_item_queues_unconfirmed_clear_for_retry() {
+        let base = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+        let abs = std::fs::canonicalize(dir.path()).unwrap();
+        let expected_service = crate::credentials::keychain::service_name(&abs);
+
+        let mut spy = |_p: &Path| Err(crate::credentials::keychain::KeychainClearUnconfirmed);
+        clear_dead_handle_keychain_item(dir.path(), 999_999_994, base.path(), &mut spy);
+
+        let queue_raw = std::fs::read_to_string(base.path().join("keychain-pending-clears.json"))
+            .expect("an unconfirmed clear must persist the pending-clears queue file");
+        let queue: serde_json::Value = serde_json::from_str(&queue_raw).unwrap();
+        // Security review 1386 round 2: each entry is now an object
+        // ({service, attempts, next_attempt_unix_secs}), not a bare string —
+        // pull the `service` field out of each.
+        let services: Vec<&str> = queue["services"]
+            .as_array()
+            .expect("queue file must have a services array")
+            .iter()
+            .map(|v| v["service"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            services,
+            vec![expected_service.as_str()],
+            "the dead dir's own service name must be queued for retry"
+        );
+    }
+
+    /// The cost predicate ALSO gates the pending-clear queue write — a dir
+    /// that never had an Anthropic credential must not just skip the
+    /// keychain call, it must not touch the queue file either (no service
+    /// name to even compute).
+    #[test]
+    fn clear_dead_handle_keychain_item_skips_queue_write_when_no_credential_file() {
+        let base = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        // No `.credentials.json` written at all.
+
+        let mut spy = |_p: &Path| Err(crate::credentials::keychain::KeychainClearUnconfirmed);
+        clear_dead_handle_keychain_item(dir.path(), 999_999_993, base.path(), &mut spy);
+
+        assert!(
+            !base.path().join("keychain-pending-clears.json").exists(),
+            "a dir with no Anthropic credential must never reach the queue write"
+        );
+    }
+
+    /// The platform-independent half of the H1 retry-queue proof — this one
+    /// runs on the LINUX enterprise runner, where the two file-reading tests
+    /// above cannot discriminate anything (`record_pending_clear` is a
+    /// `#[cfg(not(target_os = "macos"))]` no-op there, so the queue file is
+    /// absent either way).
+    ///
+    /// Spies on the `record_fn` seam instead of the file, so it pins the
+    /// WIRING on every target: the unconfirmed arm reaches the recorder, with
+    /// the caller's own `base_dir` and THIS dir's canonicalized service name —
+    /// and the cost predicate gates the recorder too, not just `clear_fn`.
+    ///
+    /// Mutations this catches, on Linux as well as macOS: deleting the
+    /// `record_fn(...)` call (arm 1 sees 0 calls); moving it above the
+    /// `handle_dir_might_have_anthropic_keychain_item` gate or out of the
+    /// `if let Err(..)` arm (arms 2 and 3 see a spurious call); passing the
+    /// non-canonical `path` or a hardcoded/parent service name (arm 1's
+    /// service assert); passing the wrong `base_dir` (arm 1's base assert).
+    #[test]
+    fn clear_dead_handle_keychain_item_wiring_reaches_recorder_on_unconfirmed() {
+        let anthropic = r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#;
+        // (credential contents, clear_fn verdict, expected recorder calls)
+        let cases: [(&str, Option<&str>, Result<bool, _>, usize); 3] = [
+            (
+                "unconfirmed clear on an Anthropic dir",
+                Some(anthropic),
+                Err(crate::credentials::keychain::KeychainClearUnconfirmed),
+                1,
+            ),
+            (
+                "confirmed clear must NOT queue",
+                Some(anthropic),
+                Ok(true),
+                0,
+            ),
+            (
+                "no credential file — cost predicate gates the recorder too",
+                None,
+                Err(crate::credentials::keychain::KeychainClearUnconfirmed),
+                0,
+            ),
+        ];
+
+        for (label, creds, verdict, expected_calls) in cases {
+            let base = TempDir::new().unwrap();
+            let dir = TempDir::new().unwrap();
+            if let Some(raw) = creds {
+                std::fs::write(dir.path().join(".credentials.json"), raw).unwrap();
+            }
+
+            let mut recorded: Vec<(std::path::PathBuf, String)> = Vec::new();
+            let mut clear_spy = |_p: &Path| verdict;
+            let mut record_spy =
+                |b: &Path, s: &str| recorded.push((b.to_path_buf(), s.to_string()));
+            clear_dead_handle_keychain_item_inner(
+                dir.path(),
+                999_999_991,
+                base.path(),
+                &mut clear_spy,
+                &mut record_spy,
+            );
+
+            assert_eq!(
+                recorded.len(),
+                expected_calls,
+                "{label}: expected {expected_calls} recorder call(s), got {}",
+                recorded.len()
+            );
+            if expected_calls == 1 {
+                let abs = std::fs::canonicalize(dir.path()).unwrap();
+                assert_eq!(
+                    recorded[0].0,
+                    base.path(),
+                    "{label}: the recorder must be handed the caller's own base_dir"
+                );
+                assert_eq!(
+                    recorded[0].1,
+                    crate::credentials::keychain::service_name(&abs),
+                    "{label}: the recorder must be handed THIS dead dir's own \
+                     canonicalized service name — a non-canonical or borrowed one \
+                     hashes to an item nothing will ever retry"
+                );
+            }
+        }
+    }
+
+    /// Security review 1386 F1 + N1, closed on the shared `drain_service_inner`
+    /// loop this reaper's production `clear_fn`
+    /// (`keychain::clear_handle_dir_reporting` -> `clear_service_reporting` ->
+    /// `drain_service` -> `drain_service_inner`) delegates to. Two upstream
+    /// fixes landed in sequence and each changed what a single exit code
+    /// means here:
+    ///
+    /// - **F1**: before it, a refusing-but-completed `security` call (a
+    ///   prompt non-zero exit, NOT a hang) was scored identical to a real
+    ///   success, so this reaper's `Err` branch — and therefore
+    ///   `record_pending_clear` — was UNREACHABLE from a refusal.
+    /// - **N1**: `security delete-generic-password` removes exactly ONE
+    ///   matching item per call, so a lone exit `0` means PROGRESS (a
+    ///   duplicate was deleted, a sibling may remain), never ABSENCE by
+    ///   itself. Only `SECURITY_ITEM_NOT_FOUND` (44) confirms absence; the
+    ///   loop keeps calling on `0` up to `MAX_DUPLICATE_DELETE_ITERATIONS`
+    ///   before giving up unconfirmed.
+    ///
+    /// This test drives the REAL loop (`keychain::drain_service_inner`) with
+    /// a SCRIPTED SEQUENCE of exit codes per case — not a single classified
+    /// value — so it fails if the loop's shape ever changes, not just if
+    /// this reaper's own wrapper logic regresses:
+    ///
+    /// | script                              | verdict     | expected reaper behavior | mutation this arm CATCHES (not merely represents) |
+    /// |---------------------------------------|-------------|---------------------------|------|
+    /// | `[SECURITY_ITEM_NOT_FOUND]`            | confirmed   | NOT queued                | a fix that queues on ANY exit, including `44` |
+    /// | `[0, SECURITY_ITEM_NOT_FOUND]`         | confirmed   | NOT queued (the N1 case — one duplicate drained, then absence) | `Some(0) => return Err(..)` — progress misread as FAILURE |
+    /// | `[0; MAX_DUPLICATE_DELETE_ITERATIONS]` | unconfirmed | queued (cap exhausted, never confirms) | `Some(0) => return Ok(true)` — progress misread as ABSENCE (the actual pre-N1 bug) |
+    /// | `[51]`                                 | unconfirmed | queued (a refusal)        | a fix that confirms on ANY exit, including a refusal (the F1 bug) |
+    ///
+    /// **Verified, not assumed** (a prior review round claimed the `[0, 44]`
+    /// arm was the one that "pins N1" — it is not; RE-RUNNING the
+    /// `Some(0) => return Ok(true)` mutation against it shows it returns
+    /// `Ok(true)` on the FIRST element either way, buggy or fixed, so it
+    /// cannot distinguish them for THAT mutation). It DOES distinguish the
+    /// opposite error (`Some(0) => return Err(..)`, above), which is why it
+    /// stays: the two arms guard opposite misreadings of the SAME match arm,
+    /// not the same one twice. Do not delete `[0, 44]` as "redundant" after
+    /// observing it pass under the `return Ok(true)` mutation — it is
+    /// discriminating against a different one.
+    ///
+    /// The must-NOT-queue arms matter as much as the must-queue ones: an
+    /// over-eager fix that queued on ANY `0` would pass a test that checked
+    /// only the refusal case, then leave every genuinely-cleared duplicate
+    /// permanently in the retry queue; a fix that confirmed on a LONE `0`
+    /// (the pre-N1 bug, reached a different way) would silently leave a
+    /// shadowing sibling's live token unqueued.
+    ///
+    /// The fifth logical arm — a genuine HANG (`security` never returns,
+    /// `run_security_bounded` yields `None`) — has no exit code to construct
+    /// and is already covered by
+    /// `clear_dead_handle_keychain_item_queues_unconfirmed_clear_for_retry`
+    /// above.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clear_dead_handle_keychain_item_all_drain_arms() {
+        let not_found = crate::credentials::keychain::SECURITY_ITEM_NOT_FOUND;
+        let cap = crate::credentials::keychain::MAX_DUPLICATE_DELETE_ITERATIONS as usize;
+        let cap_exhausted: Vec<i32> = vec![0; cap];
+
+        let cases: [(&str, &[i32], bool); 4] = [
+            // Catches: queuing on ANY exit, including a genuine not-found.
+            ("no item, immediately confirmed", &[not_found], false),
+            // Catches: `Some(0) => return Err(..)` — progress on the FIRST
+            // element misread as a failure. Does NOT catch `Some(0) =>
+            // return Ok(true)` (that mutation also confirms on the first
+            // element here) — see the cap-exhausted arm below for that one.
+            (
+                "one duplicate drained, then confirmed (the N1 case)",
+                &[0, not_found],
+                false,
+            ),
+            // Catches: `Some(0) => return Ok(true)` — progress misread as
+            // ABSENCE (the actual pre-N1 bug: a lone `0` confirms
+            // immediately instead of looping). This is the arm that fired
+            // against that exact mutation.
+            (
+                "cap exhausted — never confirms",
+                cap_exhausted.as_slice(),
+                true,
+            ),
+            // Catches: confirming on ANY exit, including a refusal (the F1 bug).
+            ("refused", &[51], true),
+        ];
+
+        for (label, script, expect_queued) in cases {
+            let base = TempDir::new().unwrap();
+            let dir = TempDir::new().unwrap();
+            std::fs::write(
+                dir.path().join(".credentials.json"),
+                r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#,
+            )
+            .unwrap();
+
+            // Drive the REAL loop with the scripted sequence — this is the
+            // verdict `clear_handle_dir_reporting` would produce in
+            // production for a keychain that behaved this way.
+            let mut remaining = script.iter().copied();
+            let mut delete_fn = |_svc: &str| remaining.next();
+            let verdict = crate::credentials::keychain::drain_service_inner(
+                "fake-service-for-test",
+                &mut delete_fn,
+            );
+
+            let mut spy = |_p: &Path| verdict;
+            clear_dead_handle_keychain_item(dir.path(), 999_999_992, base.path(), &mut spy);
+
+            let queued = base.path().join("keychain-pending-clears.json").exists();
+            assert_eq!(
+                queued, expect_queued,
+                "{label} (script={script:?}): verdict={verdict:?}, queued={queued}, \
+                 expected queued={expect_queued}"
+            );
+        }
+    }
+
+    /// End-to-end wiring, mirroring `logout.rs`'s
+    /// `logout_reaches_keychain_clear_step_for_dead_bound_handle_dir`: a
+    /// dead, Anthropic-bound `term-<pid>` handle dir is reaped through the
+    /// REAL production path (`sweep_dead_handles`, not the `_inner` test
+    /// seam) without panicking, and is actually removed. Under `cfg!(test)`
+    /// the real `keychain::clear_handle_dir_reporting` short-circuits to
+    /// `Ok(false)` (host safety — never shells `security` from a unit
+    /// test), so this proves reachability + no regression on the delete
+    /// path, not the real macOS clear (that is
+    /// `clear_dead_handle_keychain_item_calls_clear_fn_for_anthropic_bound_dir`
+    /// above, via the injectable seam).
+    #[test]
+    fn sweep_dead_handles_reaches_keychain_clear_step_for_anthropic_bound_dead_dir() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let dead_pid: u32 = 999_999_994;
+        let dead = base.join(format!("term-{dead_pid}"));
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join(".live-pid"), dead_pid.to_string()).unwrap();
+        std::fs::write(
+            dead.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+
+        let removed = sweep_dead_handles(base, Some(&claude_home));
+
+        assert!(
+            !dead.exists(),
+            "the Anthropic-bound dead dir must still be reaped after the \
+             keychain-clear step is added"
+        );
         assert!(removed >= 1);
     }
 
@@ -4435,6 +5522,120 @@ mod tests {
         );
     }
 
+    /// Reads the materialized handle settings.json for a finished
+    /// `create_handle_dir` call.
+    #[cfg(unix)]
+    fn read_materialized_settings(handle: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn materialized_settings_default_effort_high_when_no_layer_sets_it() {
+        // Neither the user-global nor the slot overlay sets
+        // `effortLevel` → the csq default layer supplies "high".
+        // Non-vacuity: this assertion fails if the default resolves to
+        // anything other than "high" (e.g. "xhigh" or "max"), and fails
+        // if the key is absent.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{ "permissions": { "defaultMode": "bypassPermissions" } }"#,
+        )
+        .unwrap();
+        setup_config_dir(base, 1); // empty {} overlay
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 77777).unwrap();
+
+        let materialized = read_materialized_settings(&handle);
+        assert_eq!(
+            materialized
+                .pointer("/effortLevel")
+                .and_then(|v| v.as_str()),
+            Some("high"),
+        );
+        // The default must not shadow other user-global keys.
+        assert_eq!(
+            materialized
+                .pointer("/permissions/defaultMode")
+                .and_then(|v| v.as_str()),
+            Some("bypassPermissions"),
+        );
+        // The user-global itself is untouched — no effortLevel written back.
+        let global: Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_home.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            global.get("effortLevel").is_none(),
+            "csq must never write its default into the user-global"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn materialized_settings_user_global_effort_wins_over_default() {
+        // An explicit `effortLevel` in the user-global is an override,
+        // not a candidate for the default: "xhigh" must survive into the
+        // handle unchanged. Guards against a blanket clobber regression.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{ "effortLevel": "xhigh" }"#,
+        )
+        .unwrap();
+        setup_config_dir(base, 1);
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 77778).unwrap();
+
+        let materialized = read_materialized_settings(&handle);
+        assert_eq!(
+            materialized
+                .pointer("/effortLevel")
+                .and_then(|v| v.as_str()),
+            Some("xhigh"),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn materialized_settings_slot_overlay_effort_wins_over_default_and_global() {
+        // The slot overlay is the highest-precedence layer: an
+        // `effortLevel` pinned in config-<N>/settings.json beats both
+        // the csq default and the user-global.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{ "effortLevel": "xhigh" }"#,
+        )
+        .unwrap();
+        let config = setup_config_dir(base, 1);
+        std::fs::write(config.join("settings.json"), r#"{ "effortLevel": "low" }"#).unwrap();
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 77779).unwrap();
+
+        let materialized = read_materialized_settings(&handle);
+        assert_eq!(
+            materialized
+                .pointer("/effortLevel")
+                .and_then(|v| v.as_str()),
+            Some("low"),
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn keybindings_json_stays_a_file_through_multiple_csq_runs() {
@@ -4541,9 +5742,9 @@ mod tests {
         );
     }
 
-    // ── #928: repoint rename-lock path canonicalization ───────────────────
+    // ── an internal ticket: repoint rename-lock path canonicalization ───────────────────
 
-    /// Regression guard: #928.
+    /// Regression guard: an internal ticket.
     ///
     /// The inner rename lock (`repoint_lock_path`) MUST resolve to the SAME
     /// file whether the caller passes a raw, symlink-containing path (`csq swap`
@@ -4574,7 +5775,7 @@ mod tests {
         let lock_via_raw = repoint_lock_path(&via_symlink);
         let lock_via_canonical = repoint_lock_path(&canonical);
 
-        // Both callers resolve to the SAME lock file (the #928 invariant).
+        // Both callers resolve to the SAME lock file (the an internal ticket invariant).
         assert_eq!(
             lock_via_raw, lock_via_canonical,
             "raw and canonical callers must resolve to the same rename lock; \
@@ -4593,7 +5794,7 @@ mod tests {
 
         // The inner rename lock MUST stay a DIFFERENT file from the A4a
         // `.swap-lock` (hyphen) keychain guard — merging them self-deadlocks a
-        // process that holds the outer guard across the repoint call (#928).
+        // process that holds the outer guard across the repoint call (an internal ticket).
         let a4a_guard = crate::credentials::keychain::swap_lock_path(&canonical);
         assert_ne!(
             lock_via_raw, a4a_guard,
@@ -5617,7 +6818,7 @@ mod tests {
         assert!(leaked.is_empty(), "§5a leaked tmp files: {leaked:?}");
     }
 
-    // ── #832: reconcile_handle_dir_oauth_email ───────────────────────────────
+    // ── an internal ticket: reconcile_handle_dir_oauth_email ───────────────────────────────
 
     fn read_oauth_email_field(handle_dir: &Path) -> Option<String> {
         let content = std::fs::read_to_string(handle_dir.join(".claude.json")).ok()?;
@@ -6527,7 +7728,7 @@ mod tests {
         );
     }
 
-    /// #832: the real DA-1 case — `config-<target>/.claude.json` is ABSENT, so
+    /// an internal ticket: the real DA-1 case — `config-<target>/.claude.json` is ABSENT, so
     /// `rebuild_claude_json_for_swap` bails and the handle retains the OLD (pre-swap)
     /// account's stale `.claude.json`. `repoint_handle_dir` then reconciles
     /// `oauthAccount.emailAddress` to the swap target's identity anchor (the current

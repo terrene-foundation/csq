@@ -1,0 +1,54 @@
+name: daemon-twin parity
+
+# Enforces that the CLI daemon (`csq daemon start`) and the desktop in-process
+# daemon supervise the IDENTICAL set of subsystems. The two are mutually
+# exclusive at runtime (one PidFile, one socket), so a subsystem wired into only
+# one twin simply never runs for the other launch mode — a silent capability
+# loss with no error and no failing test.
+#
+# Why it exists: a cache-sweeper subsystem was once wired into the CLI daemon and
+# not the desktop twin, so desktop-only users ran for months with that subsystem
+# simply absent — no error, no failing test, nothing to notice. Review caught the
+# asymmetry but could not call it a defect, because nothing mechanical said which
+# of the two lists was the correct one. This gate says.
+#
+# NOTE: this file ships to the public community repo. Keep it to the technical
+# contract; internal provenance (journal numbers, PR numbers, review history,
+# commit SHAs) does not belong here — the community tree has no `.claude/` or
+# `workspaces/` for such references to resolve against, and the extraction's
+# leak gate does not match free-form narrative.
+#
+# Pure Python gate (no toolchain, no build, no secrets) — runs on every PR that
+# touches either twin or the gate itself.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "csq/src/cli/commands/daemon.rs"
+      - "csq/src/desktop/daemon_supervisor.rs"
+      - "scripts/check-daemon-twin-parity.py"
+      - ".github/workflows/daemon-twin-parity.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "csq/src/cli/commands/daemon.rs"
+      - "csq/src/desktop/daemon_supervisor.rs"
+      - "scripts/check-daemon-twin-parity.py"
+      - ".github/workflows/daemon-twin-parity.yml"
+
+# Cancel a superseded run on the same ref — same self-hosted-fleet
+# CONTENTION rationale as test.yml (see that file's comment). `main` is
+# excluded: a push to main must produce a verdict for every commit.
+concurrency:
+  group: daemon-twin-parity-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  daemon-twin-parity:
+    name: daemon twins supervise the same subsystems
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Gate — CLI and desktop daemon twins have identical subsystem sets
+        run: python3 scripts/check-daemon-twin-parity.py

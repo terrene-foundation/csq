@@ -208,8 +208,8 @@ mod tests {
     }
 
     fn state(dir: &std::path::Path) -> Arc<AppState> {
-        let store = LedgerStore::open(dir).unwrap();
         let key = ServerSigningKey::load_or_generate(dir, None).unwrap();
+        let store = LedgerStore::open_with_authority(dir, key.key_id()).unwrap();
         Arc::new(AppState::new(store, key, None))
     }
 

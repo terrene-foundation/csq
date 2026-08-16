@@ -1,6 +1,6 @@
 //! csq CLI surface.
 //!
-//! Originally `csq-cli/src/main.rs`, moved here under #295 (single-binary
+//! Originally `csq-cli/src/main.rs`, moved here under an internal ticket (single-binary
 //! restructure). The unified `csq` binary's `main()` calls `cli::run()` after
 //! mode detection determines this is a terminal invocation.
 
@@ -9,6 +9,7 @@ pub(crate) mod commands;
 mod log_volume_layer;
 mod trace_file;
 
+use crate::daemon_log;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
@@ -171,6 +172,20 @@ enum Command {
         /// to revert to the old bail-and-tell behaviour.
         #[arg(long = "no-auto-update-cli")]
         no_auto_update_cli: bool,
+        /// Keep this slot's managed CLI at the ABSOLUTE latest release
+        /// within its supported major, rather than only guarding the
+        /// minimum-version floor. When set, csq attempts an upgrade
+        /// (`npm install -g <package>`, range-pinned so never a cross-major
+        /// bump) even when the binary already passes the floor — throttled
+        /// to at most once per CLI per day so it does not slow every launch.
+        /// The once-a-day check may add a brief pause before the CLI starts
+        /// (and up to ~2 min if the npm registry is unreachable); it never
+        /// blocks the launch — a failed check proceeds with the installed
+        /// binary. Suppressed by `--no-auto-update-cli`. Also enabled by
+        /// `CSQ_TRACK_LATEST=1`. Default: OFF (the floor guard is the safe
+        /// default).
+        #[arg(long = "track-latest")]
+        track_latest: bool,
         /// Skip writing the audit record for THIS invocation only (M06).
         ///
         /// By default `csq run` writes a tamper-evident audit record for the
@@ -329,8 +344,17 @@ enum Command {
         /// `~/.gemini/oauth_creds.json` and writes the binding marker).
         /// For Gemini AI Studio API keys or Vertex AI service accounts
         /// (non-OAuth credential paths), use `csq setkey gemini --slot N`
-        /// instead.
-        #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "gemini"])]
+        /// instead. `kimi-cli` / `grok` (an internal journal entry) run the native
+        /// vendor CLI's own device-code login (`kimi login` /
+        /// `grok login --device-auth`) into a PER-SLOT isolated vendor
+        /// home (`native-homes/{kimi,grok}-N/`, via `KIMI_CODE_HOME` /
+        /// `GROK_HOME`) — so each slot is an independent vendor account,
+        /// like Codex. csq stores no credentials of its own for these; the
+        /// vendor CLI owns + self-refreshes its auth inside that per-slot
+        /// home. Distinct from the Bearer 3P `kimi` provider
+        /// (`csq setkey kimi --slot N`), which runs `claude` against
+        /// `ANTHROPIC_BASE_URL=kimi.com`.
+        #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "gemini", "kimi-cli", "grok"])]
         provider: String,
         /// No-op alias for the default. Kept so scripts that hard-coded
         /// `--legacy-shell` keep parsing. `csq login` already shells
@@ -365,6 +389,21 @@ enum Command {
         /// the old bail-and-tell behaviour.
         #[arg(long = "no-auto-update-cli")]
         no_auto_update_cli: bool,
+        /// Keep the managed CLI at the ABSOLUTE latest release within its
+        /// supported major during the login pre-flight, rather than only
+        /// guarding the minimum-version floor. Range-pinned (never a
+        /// cross-major bump); throttled to once per CLI per day; never blocks
+        /// the login. Suppressed by `--no-auto-update-cli`. Also enabled by
+        /// `CSQ_TRACK_LATEST=1`. Default: OFF.
+        #[arg(long = "track-latest")]
+        track_latest: bool,
+        /// Emit the an internal ticket fail-fast pre-flight refusal as a `csq.login.v1`
+        /// JSON envelope on stdout instead of plain text, when this
+        /// provider's login flow needs an attended session (TTY/browser)
+        /// and none is present. Does not change the human-facing text
+        /// output of a login flow that proceeds normally.
+        #[arg(long = "json")]
+        json: bool,
     },
 
     /// Remove an account: deletes credentials, config dir, and profile entry.
@@ -372,6 +411,19 @@ enum Command {
     #[command(alias = "remove")]
     Logout {
         /// Account number to log out
+        account: u16,
+        /// Skip the interactive confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
+    /// Release a stuck login lock for a slot. If a `csq login N` hung (e.g.
+    /// its OAuth browser callback never completed), it holds `.login-N.lock`
+    /// and blocks every re-auth attempt (CLI and desktop). This shows what is
+    /// holding the lock, terminates the stuck login, and clears the lock so
+    /// you can retry.
+    Unlock {
+        /// Account/slot number whose login lock to release
         account: u16,
         /// Skip the interactive confirmation prompt
         #[arg(short = 'y', long = "yes")]
@@ -528,17 +580,24 @@ enum Command {
     /// accepts the `cc` alias for `claude-code` (the `--surface cc|codex|gemini`
     /// spelling established by `csq classify`, spec-10 §10.7.4.1). `--json`
     /// emits the full `SpawnPayload`.
+    ///
+    /// `kimi` and `grok` are accepted too: each native surface has its OWN
+    /// translator (workspace hermes-parity an internal journal entry supersedes journal
+    /// 0133's Codex-aliasing) — `--surface kimi` emits `SpawnPayload::Kimi`
+    /// and `--surface grok` emits `SpawnPayload::Grok`, distinct shapes from
+    /// `--surface codex`'s `SpawnPayload::Codex`.
     Translate {
         /// Which Surface translator to invoke. Accepts `cc` (alias of
-        /// `claude-code`), `claude-code`, `codex`, or `gemini`.
-        #[arg(long = "surface", value_parser = ["cc", "claude-code", "codex", "gemini"])]
+        /// `claude-code`), `claude-code`, `codex`, `gemini`, `kimi`, or
+        /// `grok` — each with its own translator (see above).
+        #[arg(long = "surface", value_parser = ["cc", "claude-code", "codex", "gemini", "kimi", "grok"])]
         surface: String,
         /// Start the discovery walk from this path instead of CWD.
         #[arg(long)]
         start: Option<std::path::PathBuf>,
     },
 
-    /// Manage external CLI dependencies (claude, codex, gemini).
+    /// Manage external CLI dependencies (claude, codex, gemini, kimi, grok).
     ///
     /// Fully implemented since v2.7.0 (M4 PR-MCD4): `csq cli install <name>`
     /// and `csq cli upgrade <name>` dispatch to the real probe +
@@ -666,13 +725,16 @@ pub enum SdkCommands {
 
 /// Subcommands for `csq cli` — external CLI dependency management.
 ///
-/// Per spec/13 §10: the `<name>` allowlist (`claude | codex | gemini`) is
-/// enforced at the clap layer via `value_parser`. Any other input is rejected
-/// before the handler is called. This mirrors the precedent at line 154
-/// (`csq login --provider`) and line 348 (`csq inspect translate <surface>`).
+/// Per spec/13 §10: the `<name>` allowlist (`claude | codex | gemini | kimi |
+/// grok`) is enforced at the clap layer via `value_parser`. Any other input is
+/// rejected before the handler is called. This mirrors the precedent at line
+/// 154 (`csq login --provider`) and line 348 (`csq inspect translate <surface>`).
 ///
-/// Both `install` and `upgrade` run the full dispatch (npm/brew spawn,
-/// consent gate, re-probe) — shipped in M4 PR-MCD4.
+/// For the npm/brew session surfaces `install` and `upgrade` run the full
+/// dispatch (npm/brew spawn, consent gate, re-probe) — shipped in M4 PR-MCD4.
+/// For the self-managed CLIs (kimi/grok) `install` prints the vendor
+/// `install.sh` hint (no curl-bash auto-exec) and `upgrade` runs the CLI's own
+/// update subcommand.
 #[derive(Subcommand, Debug)]
 enum CliCommand {
     /// Install the named CLI via the user's package manager (npm, brew).
@@ -681,15 +743,15 @@ enum CliCommand {
     /// Range-pinned semver (`@>=<floor> <next-major>`, NOT `@latest`).
     /// EACCES non-escalation: csq does NOT invoke sudo.
     Install {
-        /// CLI name to install. Allowed: claude, codex, gemini.
-        #[arg(value_parser = ["claude", "codex", "gemini"])]
+        /// CLI name to install. Allowed: claude, codex, gemini, kimi, grok.
+        #[arg(value_parser = ["claude", "codex", "gemini", "kimi", "grok"])]
         name: String,
     },
     /// Upgrade the named CLI to the latest version within csq's supported
     /// range. Requires interactive consent ([y/N]). Non-TTY refusal enforced.
     Upgrade {
-        /// CLI name to upgrade. Allowed: claude, codex, gemini.
-        #[arg(value_parser = ["claude", "codex", "gemini"])]
+        /// CLI name to upgrade. Allowed: claude, codex, gemini, kimi, grok.
+        #[arg(value_parser = ["claude", "codex", "gemini", "kimi", "grok"])]
         name: String,
     },
 }
@@ -915,7 +977,7 @@ enum AuditCmd {
         apply: bool,
     },
 
-    /// Declare or clear **attestation intent** (M6 #909 shard C).
+    /// Declare or clear **attestation intent** (M6 an internal ticket shard C).
     ///
     /// Controls whether gated MCP decisions made BEFORE `csq audit init` are
     /// preserved or dropped. On a host where you intend to keep the signed audit
@@ -1286,7 +1348,7 @@ enum AuditCmd {
     },
 
     /// Submit an audit anchor request to the daemon and print the
-    /// `AnchorPayload` projection as JSON (enterprise-only, #952 S3).
+    /// `AnchorPayload` projection as JSON (enterprise-only, an internal ticket S3).
     ///
     /// POSTs the current audit record to the daemon's
     /// `POST /api/audit/anchor` route.  The daemon signs the record
@@ -1295,7 +1357,7 @@ enum AuditCmd {
     /// `canonical_hash`, `chain_id`, `seq`, and `verification_level`.
     ///
     /// The CLI NEVER computes `canonical_hash` client-side; the daemon
-    /// is the sole signer (DIRECTIVE-1 from #1057).
+    /// is the sole signer (DIRECTIVE-1 from an internal ticket).
     #[cfg(feature = "enterprise")]
     Anchor {
         /// Output the anchor result as machine-parseable JSON.
@@ -1335,11 +1397,12 @@ enum InspectCmd {
     /// Show what the per-Surface translator emits for this `.coc/` set.
     /// Output is the deterministic spawn-time payload (per spec 09
     /// FR-DISP-* family). Used by harness fixtures + cross-process
-    /// determinism tests.
+    /// determinism tests. Accepts `kimi`/`grok` — each has its own
+    /// translator (see the top-level `csq translate` doc comment).
     Translate {
         /// Which Surface translator to invoke. Accepts the `cc` alias for
         /// `claude-code` (consistent with the top-level `csq translate`).
-        #[arg(value_parser = ["cc", "claude-code", "codex", "gemini"])]
+        #[arg(value_parser = ["cc", "claude-code", "codex", "gemini", "kimi", "grok"])]
         surface: String,
         /// Start the discovery walk from this path instead of CWD.
         #[arg(long)]
@@ -1364,6 +1427,13 @@ enum DaemonCmd {
         /// Detach and run in the background (re-execs the binary without this flag)
         #[arg(short = 'd', long = "background")]
         background: bool,
+
+        /// Run under the in-process supervisor loop (crash-restart + backoff +
+        /// PidFile cohabitation). Set by the launchd-managed plist installed by
+        /// the desktop app / `csq daemon install` (daemon-auth-resilience Wave B);
+        /// not intended for direct interactive use. Hidden from `--help`.
+        #[arg(long = "supervised", hide = true, conflicts_with = "background")]
+        supervised: bool,
 
         /// Maximum number of audit chain records to verify at daemon start
         /// (M05). Records beyond this limit produce an `audit_verify_limit_exceeded`
@@ -1411,12 +1481,44 @@ enum SetkeyCmd {
         #[arg(long)]
         slot: Option<u16>,
     },
-    /// Claude API key (for non-OAuth flows)
+    /// Kimi coding-subscription API key (`sk-kimi-…`, Anthropic-API-compatible
+    /// endpoint at `https://api.kimi.com/coding`)
+    Kimi {
+        #[arg(long)]
+        key: Option<String>,
+        /// Bind the key to slot N. If omitted, the key is only stored
+        /// in the global settings-kimi.json.
+        #[arg(long)]
+        slot: Option<u16>,
+    },
+    /// Claude API key (for non-OAuth flows), OR — with `--backend` — provision a
+    /// slot to route Anthropic Claude through Google Vertex AI / AWS Bedrock (an internal ticket).
     Claude {
         #[arg(long)]
         key: Option<String>,
         #[arg(long)]
         slot: Option<u16>,
+        /// Cloud-Claude routing backend: `vertex` (Google Vertex AI) or `bedrock`
+        /// (AWS Bedrock). Enterprise-only. Requires `--slot`, `--region`, and —
+        /// for vertex — `--project` + `--sa-file`; for bedrock the bearer token is
+        /// read from stdin. Fail-closed-refused on an OAuth/Codex/Gemini/3P slot.
+        #[cfg(feature = "enterprise")]
+        #[arg(long, requires_all = ["slot", "region"])]
+        backend: Option<String>,
+        /// GCP project id (vertex backend). DNS-label-validated. Requires `--backend`.
+        #[cfg(feature = "enterprise")]
+        #[arg(long, requires = "backend")]
+        project: Option<String>,
+        /// GCP/AWS region (e.g. `us-east5` / `us-east-1`). DNS-label-validated.
+        /// Requires `--backend` (a region is only meaningful for cloud routing).
+        #[cfg(feature = "enterprise")]
+        #[arg(long, requires = "backend")]
+        region: Option<String>,
+        /// Path to the GCP service-account JSON (vertex backend). Validated:
+        /// regular non-symlink file ≤ 64 KiB, canonicalised. Requires `--backend`.
+        #[cfg(feature = "enterprise")]
+        #[arg(long, requires = "backend")]
+        sa_file: Option<String>,
     },
     /// Ollama profile (keyless — creates the settings file with defaults)
     Ollama {
@@ -1443,7 +1545,7 @@ enum SetkeyCmd {
         #[arg(long)]
         vertex_sa_json: Option<std::path::PathBuf>,
     },
-    /// Azure OpenAI (#962) — direct-API native client (OpenAI Chat
+    /// Azure OpenAI (an internal ticket) — direct-API native client (OpenAI Chat
     /// Completions wire, `api-key` header). Config lives in the global
     /// `settings-azure.json`; the key is read from stdin (hidden/piped)
     /// so it never enters argv or shell history.
@@ -1471,7 +1573,7 @@ enum SetkeyCmd {
         #[arg(long)]
         key: Option<String>,
     },
-    /// GCP Vertex AI (#962) — direct-API native client (Google
+    /// GCP Vertex AI (an internal ticket) — direct-API native client (Google
     /// generateContent wire, Bearer access-token). Config lives in the
     /// global `settings-vertex.json`; the access token is read from stdin
     /// (hidden/piped) so it never enters argv or shell history.
@@ -1564,7 +1666,7 @@ enum ModelsCmd {
 #[cfg(feature = "enterprise")]
 pub(crate) fn enforce_enterprise_license(base_dir: &std::path::Path) -> anyhow::Result<()> {
     let now = license_now_fail_closed()?;
-    // Soft enforcement (#968): the gate verdict is unchanged (fail-closed on any
+    // Soft enforcement (an internal ticket): the gate verdict is unchanged (fail-closed on any
     // missing/invalid/expired/revoked license); on success we additionally surface an
     // approaching-expiry renewal nudge to STDERR — never stdout, so JSON envelopes on
     // the per-op surfaces stay clean.
@@ -1611,6 +1713,25 @@ pub(crate) fn enforce_enterprise_license_startup(base_dir: &std::path::Path) -> 
         .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message.as_str()))
 }
 
+/// Event-ceiling mode for the tracing stderr layer, by command.
+///
+/// The ceiling bounds a single one-shot command's stderr volume (NFR-OBS-01).
+/// `csq daemon` is a long-lived process, NOT one-shot: applying the one-shot
+/// ceiling silences the refresher's warn/error trail after ~10 events for the
+/// daemon's entire multi-day lifetime, which hid a ~3.5-day silent token-
+/// refresh outage on disk (2026-07-24 mass-expiry incident). The daemon logs
+/// unbounded; `csq run --debug` keeps its higher debug ceiling; everything
+/// else keeps the default.
+fn ceiling_mode_for(command: &Command) -> CeilingMode {
+    if matches!(command, Command::Run { debug: true, .. }) {
+        CeilingMode::Debug
+    } else if matches!(command, Command::Daemon { .. }) {
+        CeilingMode::Unbounded
+    } else {
+        CeilingMode::Default
+    }
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1625,6 +1746,7 @@ pub fn run() -> Result<()> {
         no_coc_cache: false,
         ignore_cli_version: false,
         no_auto_update_cli: false,
+        track_latest: false,
         no_audit: false,
         #[cfg(feature = "native-harness")]
         native: false,
@@ -1651,11 +1773,7 @@ pub fn run() -> Result<()> {
     //
     // The count-gated and trace-file Layers are independent — `--trace`
     // never lifts the stderr ceiling. See an internal journal entry (Q4 resolution).
-    let ceiling_mode = if matches!(&command, Command::Run { debug: true, .. }) {
-        CeilingMode::Debug
-    } else {
-        CeilingMode::Default
-    };
+    let ceiling_mode = ceiling_mode_for(&command);
     core_log_volume::reset_event_counter();
     let env_filter = EnvFilter::try_from_env("CSQ_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -1677,11 +1795,38 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
+    // #1a-2 (daemon-auth-resilience Wave A2) — `csq daemon` gets a
+    // persistent rolling-file log layer in addition to the stderr layer
+    // above. A long-lived daemon's stderr is easy to lose (Finder-launched
+    // `.app`, closed terminal, a redirected-then-truncated file); the
+    // rolling file survives the daemon's whole lifetime and is GC'd on a
+    // 14-day retention by `csq_core::daemon::log_gc`. Non-fatal:
+    // `make_writer` returns `None` on a directory-create failure and the
+    // daemon still runs with only the stderr layer.
+    let (daemon_file_layer, daemon_log_guard) = if matches!(command, Command::Daemon { .. }) {
+        match daemon_log::make_writer(&base_dir) {
+            Some((nb, guard)) => (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(nb),
+                ),
+                Some(guard),
+            ),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     tracing_subscriber::registry()
         .with(env_filter)
         .with(stderr_layer)
         .with(trace_layer)
+        .with(daemon_file_layer)
         .init();
+    if let Some(g) = daemon_log_guard {
+        daemon_log::store_guard(g);
+    }
 
     // Spawn a background thread to check for updates on every command run
     // except `csq update` itself. The thread checks at most once per 24 hours
@@ -1717,6 +1862,7 @@ pub fn run() -> Result<()> {
             no_coc_cache,
             ignore_cli_version,
             no_auto_update_cli,
+            track_latest,
             no_audit,
             #[cfg(feature = "native-harness")]
             native,
@@ -1765,6 +1911,7 @@ pub fn run() -> Result<()> {
                 coc_cache_enabled,
                 ignore_cli_version,
                 no_auto_update_cli,
+                track_latest,
                 no_audit,
                 &rest,
             )
@@ -1840,6 +1987,8 @@ pub fn run() -> Result<()> {
             non_interactive,
             ignore_cli_version,
             no_auto_update_cli,
+            track_latest,
+            json,
         } => {
             let account_num = AccountNum::try_from(account)
                 .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
@@ -1852,12 +2001,19 @@ pub fn run() -> Result<()> {
                 non_interactive,
                 ignore_cli_version,
                 no_auto_update_cli,
+                track_latest,
+                json,
             )
         }
         Command::Logout { account, yes } => {
             let account_num = AccountNum::try_from(account)
                 .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
             commands::logout::handle(&base_dir, account_num, yes)
+        }
+        Command::Unlock { account, yes } => {
+            let account_num = AccountNum::try_from(account)
+                .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
+            commands::unlock::handle(&base_dir, account_num, yes)
         }
         Command::Move { from, to, yes } => {
             let from_num = AccountNum::try_from(from)
@@ -1884,7 +2040,7 @@ pub fn run() -> Result<()> {
                     vertex_sa_json.as_deref(),
                 );
             }
-            // Azure OpenAI / Vertex AI (#962) — multi-field direct-API config
+            // Azure OpenAI / Vertex AI (an internal ticket) — multi-field direct-API config
             // (endpoint coordinates + credential) that does not fit the single
             // `{key, slot}` shape. They persist to the GLOBAL settings file
             // (`settings-azure.json` / `settings-vertex.json`), which the native
@@ -1921,11 +2077,35 @@ pub fn run() -> Result<()> {
                     access_token.as_deref(),
                 );
             }
+            // Cloud-Claude routing (an internal ticket): `setkey claude --backend vertex|bedrock`
+            // provisions a per-slot ClaudeCode binding routed through Vertex/Bedrock.
+            // Distinct from the direct-API-key path below (which has no `--backend`).
+            #[cfg(feature = "enterprise")]
+            if let SetkeyCmd::Claude {
+                backend: Some(backend),
+                slot,
+                project,
+                region,
+                sa_file,
+                key,
+            } = &sk
+            {
+                return commands::setkey::handle_cloud_claude(
+                    &base_dir,
+                    backend,
+                    *slot,
+                    project.as_deref(),
+                    region.as_deref(),
+                    sa_file.as_deref(),
+                    key.as_deref(),
+                );
+            }
             let (provider, key, slot) = match sk {
                 SetkeyCmd::Mm { key, slot } => ("mm", key, slot),
                 SetkeyCmd::Zai { key, slot } => ("zai", key, slot),
                 SetkeyCmd::Deepseek { key, slot } => ("deepseek", key, slot),
-                SetkeyCmd::Claude { key, slot } => ("claude", key, slot),
+                SetkeyCmd::Kimi { key, slot } => ("kimi", key, slot),
+                SetkeyCmd::Claude { key, slot, .. } => ("claude", key, slot),
                 SetkeyCmd::Ollama { slot } => ("ollama", None, slot),
                 SetkeyCmd::Gemini { .. } => unreachable!("handled above"),
                 #[cfg(feature = "enterprise")]
@@ -1993,17 +2173,22 @@ pub fn run() -> Result<()> {
         Command::Daemon { action } => match action {
             DaemonCmd::Start {
                 background,
+                supervised,
                 audit_verify_limit,
             } => {
                 // M05: propagate --audit-verify-limit via env var so
-                // handle_start's tokio runtime can read it.
+                // the daemon session's tokio runtime can read it.
                 if let Some(limit) = audit_verify_limit {
                     // SAFETY: single-threaded at this point (before tokio runtime starts).
                     unsafe {
                         std::env::set_var("CSQ_AUDIT_VERIFY_LIMIT", limit.to_string());
                     }
                 }
-                if background {
+                if supervised {
+                    // Wave B — the launchd-managed background daemon: the daemon
+                    // session wrapped in the crash-restart supervisor loop.
+                    commands::daemon::handle_start_supervised(&base_dir)
+                } else if background {
                     commands::daemon::handle_start_background(&base_dir)
                 } else {
                     commands::daemon::handle_start(&base_dir)
@@ -2303,8 +2488,81 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, LayerIntent};
+    use super::{ceiling_mode_for, Cli, Command, InspectCmd, LayerIntent};
     use clap::Parser;
+    use csq_core::capability_layer::log_volume::CeilingMode;
+
+    /// 2026-07-24 mass-expiry regression: the daemon is long-lived, so its
+    /// tracing must NOT be capped by the one-shot event ceiling (which silenced
+    /// the refresher's failure trail for the whole process lifetime).
+    #[test]
+    fn daemon_command_logs_unbounded() {
+        let cli = Cli::try_parse_from(["csq", "daemon", "status"]).unwrap();
+        let cmd = cli.command.expect("daemon status parses to a command");
+        assert_eq!(ceiling_mode_for(&cmd), CeilingMode::Unbounded);
+    }
+
+    #[test]
+    fn non_daemon_command_keeps_default_ceiling() {
+        let cli = Cli::try_parse_from(["csq", "logout", "1"]).unwrap();
+        let cmd = cli.command.expect("logout parses to a command");
+        assert_eq!(ceiling_mode_for(&cmd), CeilingMode::Default);
+    }
+
+    #[test]
+    fn run_debug_keeps_debug_ceiling() {
+        let cli = Cli::try_parse_from(["csq", "run", "1", "--debug"]).unwrap();
+        let cmd = cli.command.expect("run --debug parses to a command");
+        assert_eq!(ceiling_mode_for(&cmd), CeilingMode::Debug);
+    }
+
+    /// an internal ticket redteam F4: cloud-Claude flags MUST require `--backend`, so a typo'd
+    /// invocation errors loudly instead of silently discarding them and prompting
+    /// for an API key.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn setkey_claude_cloud_flags_require_backend() {
+        // --project without --backend → clap error, not silent-discard.
+        Cli::try_parse_from(["csq", "setkey", "claude", "--slot", "5", "--project", "p"])
+            .expect_err("--project without --backend must be a clap error");
+        // --backend without --region → clap error (backend requires slot+region).
+        Cli::try_parse_from([
+            "csq",
+            "setkey",
+            "claude",
+            "--backend",
+            "vertex",
+            "--slot",
+            "5",
+        ])
+        .expect_err("--backend without --region must be a clap error");
+        // Full vertex invocation parses cleanly.
+        Cli::try_parse_from([
+            "csq",
+            "setkey",
+            "claude",
+            "--backend",
+            "vertex",
+            "--slot",
+            "5",
+            "--region",
+            "us-east5",
+            "--project",
+            "p",
+            "--sa-file",
+            "/x/sa.json",
+        ])
+        .expect("full vertex cloud-Claude invocation must parse");
+        // R2 LOW-1: the ordinary direct-API-key path (no --backend) must STILL
+        // parse — the cloud `requires` constraints are one-directional and must
+        // not gate --key/--slot.
+        Cli::try_parse_from([
+            "csq", "setkey", "claude", "--key", "sk-ant-x", "--slot", "5",
+        ])
+        .expect("direct-API-key path must parse without --backend");
+        Cli::try_parse_from(["csq", "setkey", "claude", "--slot", "5"])
+            .expect("--slot alone (stdin key) must parse without --backend");
+    }
 
     #[test]
     fn login_default_does_not_set_legacy_shell() {
@@ -2347,6 +2605,24 @@ mod tests {
             .expect("parse codex login");
         match cli.command {
             Some(Command::Login { provider, .. }) => assert_eq!(provider, "codex"),
+            other => panic!("expected Login subcommand, got {other:?}"),
+        }
+    }
+
+    /// an internal ticket: `--json` defaults to off (unchanged human-facing text output on
+    /// every pre-existing invocation) and parses when passed explicitly.
+    #[test]
+    fn login_json_flag_defaults_off_and_parses() {
+        let cli = Cli::try_parse_from(["csq", "login", "2"]).expect("parse default login");
+        match cli.command {
+            Some(Command::Login { json, .. }) => assert!(!json, "--json must default to off"),
+            other => panic!("expected Login subcommand, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["csq", "login", "2", "--json"]).expect("parse login with --json");
+        match cli.command {
+            Some(Command::Login { json, .. }) => assert!(json),
             other => panic!("expected Login subcommand, got {other:?}"),
         }
     }
@@ -2484,6 +2760,44 @@ mod tests {
                 assert!(keywords.is_none(), "--keywords defaults to None");
             }
             other => panic!("expected Classify subcommand, got {other:?}"),
+        }
+    }
+
+    /// `csq translate --surface kimi|grok` MUST clap-parse — pre-fix, clap's
+    /// `value_parser` allowlist rejected these two strings BEFORE the
+    /// command handler ever ran (a loud, structural refusal distinct from
+    /// the handler-level `handle_translate` fix covered in
+    /// `inspect_coc.rs`'s own tests).
+    #[test]
+    fn translate_subcommand_accepts_kimi_and_grok_surface() {
+        for surface in ["kimi", "grok"] {
+            let cli = Cli::try_parse_from(["csq", "translate", "--surface", surface])
+                .unwrap_or_else(|e| panic!("--surface {surface} must clap-parse, got: {e}"));
+            match cli.command {
+                Some(Command::Translate {
+                    surface: parsed, ..
+                }) => assert_eq!(parsed, surface),
+                other => panic!("expected Translate subcommand, got {other:?}"),
+            }
+        }
+    }
+
+    /// `csq inspect translate kimi|grok` — the sibling `InspectCmd::Translate`
+    /// value_parser MUST accept the same two names.
+    #[test]
+    fn inspect_translate_subcommand_accepts_kimi_and_grok_surface() {
+        for surface in ["kimi", "grok"] {
+            let cli = Cli::try_parse_from(["csq", "inspect", "translate", surface])
+                .unwrap_or_else(|e| panic!("inspect translate {surface} must parse, got: {e}"));
+            match cli.command {
+                Some(Command::Inspect {
+                    target:
+                        InspectCmd::Translate {
+                            surface: parsed, ..
+                        },
+                }) => assert_eq!(parsed, surface),
+                other => panic!("expected Inspect Translate subcommand, got {other:?}"),
+            }
         }
     }
 

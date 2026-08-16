@@ -8,7 +8,7 @@ import { tick } from "svelte";
 //   invoke('list_providers')                    — when modal opens
 //   invoke('get_accounts', { baseDir })         — when modal opens (slot check)
 //   invoke('start_claude_login_subprocess', { baseDir, account })
-//                                               — Phase 2 of #389
+//                                               — Phase 2 of an internal ticket
 //   invoke('set_provider_key', { baseDir, providerId, key })
 
 const mockInvoke = vi.fn();
@@ -76,6 +76,25 @@ const GEMINI_PROVIDER = {
   default_model: "gemini-2.5-pro",
 };
 
+// Wave 3 W3-5 (an internal journal entry) — native Kimi/Grok session-surface fixtures.
+const KIMI_NATIVE_CLI = {
+  id: "kimi-cli",
+  display_name: "Kimi (native CLI)",
+  default_model: "kimi-for-coding",
+  surface: "kimi",
+  binary: "kimi",
+};
+
+const GROK_NATIVE_CLI = {
+  id: "grok",
+  display_name: "Grok (native CLI)",
+  // an internal journal entry Wave A empirical finding — grok-cli's own default model
+  // (see csq-core/src/providers/native.rs::GROK); no longer empty.
+  default_model: "grok-4.5",
+  surface: "grok",
+  binary: "grok",
+};
+
 const mockOpenDialog = vi.fn();
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: (...args: unknown[]) => mockOpenDialog(...args),
@@ -86,8 +105,11 @@ let mockResponses: Record<string, unknown> = {};
 function setupMocks(overrides: Record<string, unknown> = {}) {
   mockResponses = {
     list_providers: [ANTHROPIC_PROVIDER, MINIMAX_PROVIDER, OLLAMA_PROVIDER],
+    // Wave 3 W3-5: no native CLIs by default — tests exercising the
+    // native picker cards override this explicitly.
+    list_native_clis: [],
     get_accounts: [],
-    // Phase 2 of #389: claude OAuth is one synchronous-from-frontend
+    // Phase 2 of an internal ticket: claude OAuth is one synchronous-from-frontend
     // invoke that resolves with { account, email } after the
     // `claude auth login` subprocess exits. Tests that exercise the
     // happy path or specific error shapes override this default.
@@ -300,6 +322,99 @@ describe("AddAccountModal", () => {
     await tick();
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  // ── Escape / focus trap (F4 i-audit/i-harden fix) ────────────
+  //
+  // Pre-fix, Escape was wired to the *backdrop's* onkeydown, but
+  // `.modal`'s own onkeydown called `e.stopPropagation()`. Keydown
+  // bubbles from the focused element upward, so any focus INSIDE the
+  // modal — every real interaction — hit stopPropagation before the
+  // backdrop's handler ever ran. A test that fires Escape with focus
+  // on the backdrop itself would pass against the OLD broken code too
+  // (vacuous, since that was the one case the old code handled). The
+  // test below fires Escape with focus inside the modal, which is the
+  // actual bug this fix closes.
+
+  it("closes on Escape when focus is inside the modal (the actual F4 bug)", async () => {
+    const onClose = vi.fn();
+    const { container } = renderModal({ onClose });
+    await tick();
+    await tick();
+    await tick();
+
+    const slotInput = container.querySelector(
+      'input[type="number"]',
+    ) as HTMLInputElement;
+    expect(slotInput).not.toBeNull();
+    slotInput.focus();
+    expect(document.activeElement).toBe(slotInput);
+
+    await fireEvent.keyDown(document, { key: "Escape" });
+    await tick();
+
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("does not escape the focus trap on Tab — wraps from last focusable back to first", async () => {
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const focusables = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".modal button:not([disabled]), .modal input:not([disabled])",
+      ),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+
+    last.focus();
+    expect(document.activeElement).toBe(last);
+
+    await fireEvent.keyDown(document, { key: "Tab" });
+    await tick();
+
+    // Focus must land back INSIDE the dialog (at `first`), never on
+    // `document.body` / the page behind the modal.
+    expect(document.activeElement).toBe(first);
+  });
+
+  it("does not escape the focus trap on Shift+Tab — wraps from first focusable back to last", async () => {
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const focusables = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".modal button:not([disabled]), .modal input:not([disabled])",
+      ),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+
+    first.focus();
+    expect(document.activeElement).toBe(first);
+
+    await fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    await tick();
+
+    expect(document.activeElement).toBe(last);
+  });
+
+  it("moves initial focus into the dialog when opened", async () => {
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const modal = container.querySelector(".modal") as HTMLElement;
+    expect(modal).not.toBeNull();
+    expect(modal.contains(document.activeElement)).toBe(true);
   });
 
   // ── Bearer flow ─────────────────────────────────────────────
@@ -924,6 +1039,120 @@ describe("AddAccountModal", () => {
     expect(container.textContent).toContain("Vertex SA: /abs/picked/sa.json");
   });
 
+  // ── an internal ticket PR-2: cloud-Claude (Vertex/Bedrock) provisioning ────────────
+
+  it("hides the cloud-Claude card in a community build", async () => {
+    setupMocks({ get_build_edition: "community" });
+    const { container } = renderModal();
+    await settle();
+    expect(
+      container.querySelector('[data-testid="cloud-claude-card"]'),
+    ).toBeNull();
+  });
+
+  it("provisions a Claude slot via Vertex from the cloud-Claude card", async () => {
+    setupMocks({
+      get_build_edition: "enterprise",
+      cloud_claude_provision_vertex: undefined,
+    });
+    mockOpenDialog.mockResolvedValueOnce("/abs/sa.json");
+
+    const { container } = renderModal();
+    // Edition loads as the 4th await in the mount chain — flush extra.
+    await settle(15);
+
+    // Enterprise-only card is visible; open the cloud-Claude flow.
+    const card = container.querySelector(
+      '[data-testid="cloud-claude-card"]',
+    ) as HTMLButtonElement;
+    expect(card).not.toBeNull();
+    await fireEvent.click(card);
+    await settle();
+
+    // Vertex is the default tab.
+    const project = container.querySelector(
+      '[data-testid="cloud-claude-vertex-project"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(project, { target: { value: "my-gcp-project" } });
+    const region = container.querySelector(
+      '[data-testid="cloud-claude-vertex-region"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(region, { target: { value: "us-east5" } });
+
+    const pick = container.querySelector(
+      '[data-testid="cloud-claude-vertex-pick"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(pick);
+    await settle();
+    expect(mockOpenDialog).toHaveBeenCalled();
+
+    const submit = container.querySelector(
+      '[data-testid="cloud-claude-vertex-submit"]',
+    ) as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    await fireEvent.click(submit);
+    await settle();
+
+    expect(mockInvoke).toHaveBeenCalledWith("cloud_claude_provision_vertex", {
+      baseDir: "/home/test/.claude/accounts",
+      slot: 3,
+      project: "my-gcp-project",
+      region: "us-east5",
+      saPath: "/abs/sa.json",
+    });
+    expect(container.textContent).toContain("Google Vertex AI");
+  });
+
+  it("provisions a Claude slot via Bedrock from the cloud-Claude card", async () => {
+    setupMocks({
+      get_build_edition: "enterprise",
+      cloud_claude_provision_bedrock: undefined,
+    });
+
+    const { container } = renderModal();
+    // Edition loads as the 4th await in the mount chain — flush extra.
+    await settle(15);
+
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-card"]',
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    // Switch to the Bedrock tab.
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-tab-bedrock"]',
+      ) as HTMLButtonElement,
+    );
+    await tick();
+
+    const region = container.querySelector(
+      '[data-testid="cloud-claude-bedrock-region"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(region, { target: { value: "us-east-1" } });
+    const token = container.querySelector(
+      '[data-testid="cloud-claude-bedrock-token"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(token, { target: { value: "bedrock-bearer-token" } });
+
+    const submit = container.querySelector(
+      '[data-testid="cloud-claude-bedrock-submit"]',
+    ) as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    await fireEvent.click(submit);
+    await settle();
+
+    expect(mockInvoke).toHaveBeenCalledWith("cloud_claude_provision_bedrock", {
+      baseDir: "/home/test/.claude/accounts",
+      slot: 3,
+      region: "us-east-1",
+      bearerToken: "bedrock-bearer-token",
+    });
+    expect(container.textContent).toContain("AWS Bedrock");
+  });
+
   it("disables api-key Provision button until key is non-empty", async () => {
     setupMocks({
       list_providers: [GEMINI_PROVIDER],
@@ -946,7 +1175,358 @@ describe("AddAccountModal", () => {
     expect(submit.disabled).toBe(true);
   });
 
-  // ── Claude OAuth subprocess flow (#389 Phase 2) ─────────────
+  // ── Native Kimi/Grok device-auth flow (an internal journal entry C8) ─────
+  //
+  // Per-slot vendor-home device-code login, mirroring the Codex
+  // device-auth flow: `start_native_login` pre-checks (no side
+  // effects), then `complete_native_login` drives the vendor's own
+  // sign-in and emits `native-device-code` events. These cards render
+  // alongside the bearer/OAuth/keyless `providers` entries in the same
+  // picker grid, so native Kimi sits next to the existing 3P-bearer
+  // Kimi provider.
+
+  it("renders native Kimi and Grok cards alongside the provider cards", async () => {
+    setupMocks({
+      list_providers: [ANTHROPIC_PROVIDER],
+      list_native_clis: [KIMI_NATIVE_CLI, GROK_NATIVE_CLI],
+    });
+    const { container } = renderModal();
+    await settle();
+
+    const cards = Array.from(container.querySelectorAll(".provider-card"));
+    // Anthropic (bearer/OAuth) + Kimi (native) + Grok (native) = 3 cards.
+    expect(cards.length).toBe(3);
+    expect(
+      container.querySelector('[data-testid="native-cli-card-kimi-cli"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="native-cli-card-grok"]'),
+    ).not.toBeNull();
+    const kimiCard = container.querySelector(
+      '[data-testid="native-cli-card-kimi-cli"]',
+    );
+    expect(kimiCard!.textContent).toContain("Kimi (native CLI)");
+    const grokCard = container.querySelector(
+      '[data-testid="native-cli-card-grok"]',
+    );
+    expect(grokCard!.textContent).toContain("Grok (native CLI)");
+  });
+
+  it("navigates to native-cli-confirm and probes via start_native_login when a native card is picked", async () => {
+    setupMocks({
+      list_providers: [],
+      list_native_clis: [KIMI_NATIVE_CLI],
+      start_native_login: {
+        native_id: "kimi-cli",
+        display_name: "Kimi (native CLI)",
+        cli_installed: true,
+      },
+    });
+    const { container } = renderModal({ nextAccountId: 4 });
+    await settle();
+
+    const kimiCard = container.querySelector(
+      '[data-testid="native-cli-card-kimi-cli"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(kimiCard);
+    await settle();
+
+    const lede = container.querySelector(
+      '[data-testid="native-cli-confirm-lede"]',
+    );
+    expect(lede).not.toBeNull();
+    expect(lede!.textContent).toContain("Kimi (native CLI)");
+    expect(lede!.textContent).toContain("slot #4");
+    // Explains the CLI's own device-code sign-in — no key field anywhere.
+    expect(container.textContent).toContain("device-code sign-in");
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    // Missing-CLI hint must NOT show once the pre-flight resolves installed=true.
+    expect(
+      container.querySelector('[data-testid="native-cli-missing-hint"]'),
+    ).toBeNull();
+    const call = mockInvoke.mock.calls.find(
+      (args) => args[0] === "start_native_login",
+    );
+    expect(call?.[1]).toMatchObject({
+      baseDir: "/home/test/.claude/accounts",
+      nativeId: "kimi-cli",
+      slot: 4,
+    });
+  });
+
+  it("drives complete_native_login on Confirm and shows success after the device-code flow completes", async () => {
+    const onAccountAdded = vi.fn();
+    setupMocks({
+      list_providers: [],
+      list_native_clis: [GROK_NATIVE_CLI],
+      start_native_login: {
+        native_id: "grok",
+        display_name: "Grok (native CLI)",
+        cli_installed: true,
+      },
+      complete_native_login: null,
+    });
+    const { container } = renderModal({ nextAccountId: 9, onAccountAdded });
+    await settle();
+
+    const grokCard = container.querySelector(
+      '[data-testid="native-cli-card-grok"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(grokCard);
+    await settle();
+
+    const confirmBtn = container.querySelector(
+      '[data-testid="native-cli-confirm-button"]',
+    ) as HTMLButtonElement;
+    expect(confirmBtn).not.toBeNull();
+    expect(confirmBtn.disabled).toBe(false);
+    await fireEvent.click(confirmBtn);
+    await settle();
+
+    const call = mockInvoke.mock.calls.find(
+      (args) => args[0] === "complete_native_login",
+    );
+    expect(call).toBeTruthy();
+    expect(call?.[1]).toMatchObject({
+      baseDir: "/home/test/.claude/accounts",
+      nativeId: "grok",
+      slot: 9,
+    });
+    expect(onAccountAdded).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain(
+      "Grok (native CLI) bound to slot #9",
+    );
+  });
+
+  it("renders the native device code from the native-device-code event with a working copy-to-clipboard button", async () => {
+    // Mirrors the codex device-code test: complete_native_login never
+    // resolves so the flow stays in `native-running` for the assertions.
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    setupMocks({
+      list_providers: [],
+      list_native_clis: [KIMI_NATIVE_CLI],
+      start_native_login: {
+        native_id: "kimi-cli",
+        display_name: "Kimi (native CLI)",
+        cli_installed: true,
+      },
+      complete_native_login: new Promise(() => {}),
+    });
+
+    let deviceCodeHandler:
+      | ((e: {
+          payload: {
+            surface: string;
+            user_code: string;
+            verification_url: string;
+          };
+        }) => void)
+      | null = null;
+    mockListen.mockImplementation((event: string, handler: unknown) => {
+      if (event === "native-device-code") {
+        deviceCodeHandler = handler as typeof deviceCodeHandler;
+      }
+      return Promise.resolve(() => {});
+    });
+
+    const { container } = renderModal();
+    await settle();
+    const kimiCard = container.querySelector(
+      '[data-testid="native-cli-card-kimi-cli"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(kimiCard);
+    await settle();
+    const confirmBtn = container.querySelector(
+      '[data-testid="native-cli-confirm-button"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(confirmBtn);
+    await settle();
+
+    expect(deviceCodeHandler).not.toBeNull();
+    deviceCodeHandler!({
+      payload: {
+        surface: "kimi",
+        user_code: "WXYZ-1234",
+        verification_url:
+          "https://www.kimi.com/code/authorize_device?user_code=WXYZ-1234",
+      },
+    });
+    await settle();
+
+    const codeEl = container.querySelector(".device-code");
+    expect(codeEl).not.toBeNull();
+    expect(codeEl!.textContent).toBe("WXYZ-1234");
+
+    const copyBtn = container.querySelector(
+      '[data-testid="copy-native-device-code"]',
+    ) as HTMLButtonElement;
+    expect(copyBtn).not.toBeNull();
+    await fireEvent.click(copyBtn);
+    await settle();
+    expect(writeText).toHaveBeenCalledWith("WXYZ-1234");
+    expect(mockOpenUrl).toHaveBeenCalledWith(
+      "https://www.kimi.com/code/authorize_device?user_code=WXYZ-1234",
+    );
+  });
+
+  it("surfaces backend error on start_native_login rejection and blocks Confirm", async () => {
+    setupMocks({
+      list_providers: [],
+      list_native_clis: [KIMI_NATIVE_CLI],
+    });
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_native_login") {
+        return Promise.reject(
+          new Error("slot 5 is bound to Codex — run `csq logout 5` to rebind"),
+        );
+      }
+      if (cmd in mockResponses) return Promise.resolve(mockResponses[cmd]);
+      return Promise.resolve(undefined);
+    });
+    const { container } = renderModal({ nextAccountId: 5 });
+    await settle();
+
+    const kimiCard = container.querySelector(
+      '[data-testid="native-cli-card-kimi-cli"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(kimiCard);
+    await settle();
+
+    expect(container.textContent).toContain(
+      "slot 5 is bound to Codex — run `csq logout 5` to rebind",
+    );
+    // A blocking start_native_login rejection disables Confirm — retrying
+    // the spawn would hit the identical conflict.
+    const confirmBtn = container.querySelector(
+      '[data-testid="native-cli-confirm-button"]',
+    ) as HTMLButtonElement;
+    expect(confirmBtn.disabled).toBe(true);
+  });
+
+  it("surfaces backend error on complete_native_login failure", async () => {
+    setupMocks({
+      list_providers: [],
+      list_native_clis: [KIMI_NATIVE_CLI],
+      start_native_login: {
+        native_id: "kimi-cli",
+        display_name: "Kimi (native CLI)",
+        cli_installed: true,
+      },
+    });
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "complete_native_login") {
+        return Promise.reject(
+          new Error("kimi login exited with non-zero status"),
+        );
+      }
+      if (cmd in mockResponses) return Promise.resolve(mockResponses[cmd]);
+      return Promise.resolve(undefined);
+    });
+    const { container } = renderModal({ nextAccountId: 5 });
+    await settle();
+
+    const kimiCard = container.querySelector(
+      '[data-testid="native-cli-card-kimi-cli"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(kimiCard);
+    await settle();
+
+    const confirmBtn = container.querySelector(
+      '[data-testid="native-cli-confirm-button"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(confirmBtn);
+    await settle();
+
+    expect(container.textContent).toContain(
+      "kimi login exited with non-zero status",
+    );
+  });
+
+  it("shows an install hint with a working Recheck button when the native CLI is missing", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    let installed = false;
+    setupMocks({
+      list_providers: [],
+      list_native_clis: [KIMI_NATIVE_CLI],
+    });
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_native_login") {
+        return Promise.resolve({
+          native_id: "kimi-cli",
+          display_name: "Kimi (native CLI)",
+          cli_installed: installed,
+        });
+      }
+      if (cmd in mockResponses) return Promise.resolve(mockResponses[cmd]);
+      return Promise.resolve(undefined);
+    });
+    const { container } = renderModal();
+    await settle();
+
+    const kimiCard = container.querySelector(
+      '[data-testid="native-cli-card-kimi-cli"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(kimiCard);
+    await settle();
+
+    // The hint is informational, not blocking — Confirm stays enabled.
+    const hint = container.querySelector(
+      '[data-testid="native-cli-missing-hint"]',
+    );
+    expect(hint).not.toBeNull();
+    expect(hint!.textContent).toContain("csq cli install kimi");
+    const confirmBtn = container.querySelector(
+      '[data-testid="native-cli-confirm-button"]',
+    ) as HTMLButtonElement;
+    expect(confirmBtn.disabled).toBe(false);
+
+    const copyBtn = container.querySelector(
+      '[data-testid="copy-native-cli-install-cmd"]',
+    ) as HTMLButtonElement;
+    expect(copyBtn).not.toBeNull();
+    await fireEvent.click(copyBtn);
+    await settle();
+    expect(writeText).toHaveBeenCalledWith("csq cli install kimi");
+
+    // Recheck re-probes start_native_login; simulate the user having
+    // installed the CLI in a terminal between the first probe and now.
+    installed = true;
+    const recheckBtn = container.querySelector(
+      '[data-testid="native-cli-recheck"]',
+    ) as HTMLButtonElement;
+    expect(recheckBtn).not.toBeNull();
+    await fireEvent.click(recheckBtn);
+    await settle();
+
+    expect(
+      container.querySelector('[data-testid="native-cli-missing-hint"]'),
+    ).toBeNull();
+  });
+
+  it("respects the slot picker — native cards disabled when slot is taken", async () => {
+    setupMocks({
+      list_providers: [],
+      list_native_clis: [KIMI_NATIVE_CLI],
+      get_accounts: [{ id: 4 }],
+    });
+    const { container } = renderModal({ nextAccountId: 4 });
+    await settle();
+
+    const kimiCard = container.querySelector(
+      '[data-testid="native-cli-card-kimi-cli"]',
+    ) as HTMLButtonElement;
+    expect(kimiCard.disabled).toBe(true);
+  });
+
+  // ── Claude OAuth subprocess flow (an internal ticket Phase 2) ─────────────
   //
   // The modal now shells out to `claude auth login` via the
   // `start_claude_login_subprocess` Tauri command (Phase 1 output).

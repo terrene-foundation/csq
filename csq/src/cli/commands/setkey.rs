@@ -6,7 +6,6 @@
 //! exceed this limit.
 
 use anyhow::{anyhow, Context, Result};
-use csq_core::accounts::identity_store;
 use csq_core::accounts::third_party;
 use csq_core::cli_deps::sanitize::redact_path;
 use csq_core::platform::secret::{self, SecretError};
@@ -47,7 +46,7 @@ pub fn handle(
     // `csq setkey` overlays 3P env keys (ANTHROPIC_BASE_URL / _AUTH_TOKEN) onto
     // the slot's settings.json; against an OAuth/device-auth slot that silently
     // overrides a live login and orphans the account's `by_slot` mapping (the
-    // #995 root cause). The user must `csq logout <N>` first. Identity-store-
+    // an internal ticket root cause). The user must `csq logout <N>` first. Identity-store-
     // aware per `account-terminal-separation.md` MUST Rule 4 — keyed on the
     // identity store, not the M4-12-retired legacy credential mirrors.
     if let Some(msg) = check_slot_surface_conflict(base_dir, slot, provider) {
@@ -159,22 +158,38 @@ pub fn handle_gemini(
 }
 
 /// FR-CLI-05 parity for Gemini: refuse to clobber a slot that is
-/// already bound to Codex (OAuth device-auth) or Anthropic OAuth.
-/// The user has to `csq logout <N>` first.
+/// already bound to Codex (OAuth device-auth), Anthropic OAuth, or a
+/// native-CLI surface (Kimi/Grok). The user has to `csq logout <N>` first.
 ///
 /// Identity-store-aware (`account-terminal-separation.md` MUST Rule 4). The
 /// prior implementation stat-ed the M4-12-retired legacy mirrors
 /// (`credentials/codex-<N>.json`, `credentials/<N>.json`) which a current login
 /// no longer writes — so it was blind to every post-A++ Codex / Anthropic slot.
+///
+/// Native-CLI check added by redteam R2 MED-1: without it, `csq setkey
+/// gemini --slot N` onto a slot already bound to Kimi/Grok
+/// (`credentials/{kimi,grok}-<N>.json`) silently created a dual-bind — the
+/// slot double-lists in `csq ls` and `csq run N` dispatches to whichever
+/// surface wins precedence, orphaning the other. The generic `csq setkey
+/// <3P provider>` path already routes through
+/// `third_party::conflicting_bound_surface`, which is native-aware; this
+/// Gemini-specific guard was the one sibling left blind.
 fn refuse_if_slot_bound_to_other_surface(base_dir: &Path, slot: AccountNum) -> Result<()> {
-    if identity_store::is_codex_bound_slot_identity_aware(base_dir, slot) {
+    // Unified pre-bind conflict guard (an internal journal entry FD#1): detection flows
+    // through the single `binding_guard::detect_bound_surface` union detector,
+    // so this Gemini setkey path can never be blind to a surface. Re-binding
+    // Gemini onto an already-Gemini slot is idempotent (`None`); every other
+    // surface — Codex / Anthropic OAuth / native Kimi-Grok / 3P bearer — is
+    // refused. (The 3P-bearer arm closes the gap the hand-rolled predicate
+    // list left open.)
+    if let Some(bound) = csq_core::accounts::binding_guard::conflicting_bound_surface(
+        base_dir,
+        slot,
+        Surface::Gemini,
+    ) {
         return Err(anyhow!(
-            "slot {slot} is bound to Codex — run `csq logout {slot}` to rebind to Gemini"
-        ));
-    }
-    if identity_store::is_anthropic_bound_slot(base_dir, slot) {
-        return Err(anyhow!(
-            "slot {slot} is bound to Claude (Anthropic OAuth) — run `csq logout {slot}` to rebind to Gemini"
+            "slot {slot} is bound to {} — run `csq logout {slot}` to rebind to Gemini",
+            bound.label()
         ));
     }
     Ok(())
@@ -243,7 +258,7 @@ fn provision_vertex(base_dir: &Path, slot: AccountNum, sa_path: &Path) -> Result
 }
 
 /// `csq setkey azure --resource R [--deployment D] [--api-version V] [--key K]`
-/// (#962)
+/// (an internal ticket)
 ///
 /// Azure OpenAI is a direct-API native provider (OpenAI Chat Completions wire,
 /// `api-key` header). Unlike the 3P passthrough providers it does NOT bind a
@@ -266,7 +281,7 @@ pub fn handle_azure(
     api_version: Option<&str>,
     key_arg: Option<&str>,
 ) -> Result<()> {
-    // #962 H1: every URL-interpolated component is allowlist-validated before it
+    // an internal ticket H1: every URL-interpolated component is allowlist-validated before it
     // can reach `read_native_env_string` → the Azure endpoint `format!`. Guards
     // against credential-redirection (a doctored `--resource evil.com/` would
     // otherwise send the live api-key to an attacker host).
@@ -326,7 +341,7 @@ pub fn handle_azure(
     Ok(())
 }
 
-/// `csq setkey vertex --project P --region R [--access-token T]` (#962)
+/// `csq setkey vertex --project P --region R [--access-token T]` (an internal ticket)
 ///
 /// GCP Vertex AI is a direct-API native provider (Google generateContent wire,
 /// Bearer access-token). Its endpoint config (`VERTEX_PROJECT`, `VERTEX_REGION`)
@@ -350,7 +365,7 @@ pub fn handle_vertex(
     region: &str,
     token_arg: Option<&str>,
 ) -> Result<()> {
-    // #962 H1: allowlist-validate the URL-interpolated Vertex components before
+    // an internal ticket H1: allowlist-validate the URL-interpolated Vertex components before
     // they reach the endpoint `format!` — same credential-redirection defense as
     // handle_azure (a doctored `--region` / `--project` could otherwise send the
     // live Bearer service-account token to an attacker host).
@@ -392,6 +407,108 @@ pub fn handle_vertex(
     Ok(())
 }
 
+/// Maps a cloud-Claude provisioning `ConfigError` to an operator-facing error,
+/// redacting any host path (redteam M2). Only `InvalidJson` carries an absolute
+/// path (a tmp/settings path — filesystem-layout/username disclosure per
+/// `operator-surface-verification.md` Rules 2/6); its `reason` is a fixed string
+/// or io error and carries no secret. Every other variant (`SlotSurfaceConflict`,
+/// `MergeConflict` validation, `ResidencyDenied`) is path- and token-free and
+/// surfaces its own actionable Display verbatim.
+#[cfg(feature = "enterprise")]
+fn map_cloud_claude_error(e: csq_core::error::ConfigError) -> anyhow::Error {
+    use csq_core::error::ConfigError;
+    match e {
+        ConfigError::InvalidJson { path, reason } => anyhow!(
+            "cloud-Claude provisioning failed at {}: {reason}",
+            redact_path(&path)
+        ),
+        other => anyhow!("{other}"),
+    }
+}
+
+/// `csq setkey claude --backend vertex|bedrock --slot N …` (an internal ticket)
+///
+/// Provisions a ClaudeCode slot to route Anthropic Claude through Google Vertex
+/// AI / AWS Bedrock. Delegates to `bind_cloud_claude_backend_to_slot`, which
+/// writes the cloud env into the slot's `config-N/settings.json` (fail-closed on
+/// a non-bare slot) — CC reads it on the next `csq run N`.
+///
+/// - `vertex`: `--project`, `--region`, `--sa-file <SA JSON path>` required.
+/// - `bedrock`: `--region` required; the `AWS_BEARER_TOKEN_BEDROCK` value is read
+///   from stdin (hidden on a TTY, piped otherwise) so it never enters argv.
+///
+/// Enterprise-only.
+#[cfg(feature = "enterprise")]
+#[allow(clippy::too_many_arguments)]
+pub fn handle_cloud_claude(
+    base_dir: &Path,
+    backend: &str,
+    slot: Option<u16>,
+    project: Option<&str>,
+    region: Option<&str>,
+    sa_file: Option<&str>,
+    key: Option<&str>,
+) -> Result<()> {
+    use csq_core::accounts::third_party::{
+        bind_cloud_claude_backend_to_slot, CloudClaudeBackendSpec,
+    };
+
+    if key.is_some() {
+        return Err(anyhow!(
+            "--key is for the direct-API-key path — do not combine it with --backend"
+        ));
+    }
+    let slot_num = slot.ok_or_else(|| anyhow!("--slot <N> is required with --backend"))?;
+    let slot = AccountNum::try_from(slot_num).map_err(|e| anyhow!("invalid --slot: {e}"))?;
+    let region = region.ok_or_else(|| anyhow!("--region is required with --backend"))?;
+
+    match backend {
+        "vertex" => {
+            let project =
+                project.ok_or_else(|| anyhow!("--project is required for --backend vertex"))?;
+            let sa_file = sa_file
+                .ok_or_else(|| anyhow!("--sa-file <path> is required for --backend vertex"))?;
+            let sa_path = std::path::Path::new(sa_file);
+            bind_cloud_claude_backend_to_slot(
+                base_dir,
+                slot,
+                &CloudClaudeBackendSpec::Vertex {
+                    project,
+                    region,
+                    sa_path,
+                },
+            )
+            .map_err(map_cloud_claude_error)?;
+            println!("Provisioned slot {slot_num} → Claude via Google Vertex AI");
+            println!("  Project: {project}");
+            println!("  Region:  {region}");
+            println!("  SA file: {}", redact_path(sa_path));
+        }
+        "bedrock" => {
+            let token = read_key_arg_or_stdin(None)
+                .context("reading AWS_BEARER_TOKEN_BEDROCK from stdin")?;
+            bind_cloud_claude_backend_to_slot(
+                base_dir,
+                slot,
+                &CloudClaudeBackendSpec::Bedrock {
+                    region,
+                    bearer_token: &token,
+                },
+            )
+            .map_err(map_cloud_claude_error)?;
+            println!("Provisioned slot {slot_num} → Claude via AWS Bedrock");
+            println!("  Region: {region}");
+        }
+        other => {
+            return Err(anyhow!(
+                "unknown --backend '{other}' (expected 'vertex' or 'bedrock')"
+            ));
+        }
+    }
+    println!("  Launch with: csq run {slot_num}");
+    Ok(())
+}
+
 /// Reads a key/token from `--key`/`--access-token` when present, else from stdin
 /// (hidden on a TTY, piped otherwise). Trims whitespace and a trailing `\r`.
 ///
@@ -428,28 +545,26 @@ fn map_vault_error(e: SecretError) -> anyhow::Error {
     }
 }
 
-/// Maps a [`ProvisionError`] to user-actionable text. Vault paths
-/// inside this enum re-use [`map_vault_error`].
+/// Maps a [`ProvisionError`] to user-actionable text. Vault errors
+/// route through [`map_vault_error`] for its richer per-variant
+/// remediation text; every other variant delegates to
+/// [`ProvisionError::redacted_message`] — the canonical mapper shared
+/// with the desktop Tauri IPC boundary
+/// (`csq/src/desktop/commands/mod.rs`) so the two editions can't drift
+/// on path-redaction behavior (`rules/tauri-commands.md` MUST-3,
+/// an internal ticket). `ProfilesIdentity`'s CLI-specific "Gemini slot"
+/// phrasing (vs the shared mapper's edition-neutral wording) is kept
+/// here because the CLI's session already told the user "gemini" by
+/// context in a way the shared mapper cannot assume.
 fn map_provision_error(e: ProvisionError) -> anyhow::Error {
     match e {
         ProvisionError::Vault(v) => map_vault_error(v),
-        ProvisionError::VertexSaInvalid { path, reason } => {
-            anyhow!("--vertex-sa-json {} rejected: {reason}", redact_path(&path))
-        }
-        ProvisionError::Malformed { path, reason } => {
-            anyhow!("binding marker {} is corrupt: {reason}", redact_path(&path))
-        }
-        ProvisionError::Io { path, source } => {
-            anyhow!("provisioning I/O at {}: {source}", redact_path(&path))
-        }
-        ProvisionError::AtomicReplace { path, reason } => {
-            anyhow!("atomic write at {}: {reason}", redact_path(&path))
-        }
         ProvisionError::ProfilesIdentity { reason } => anyhow!(
             "Gemini slot provisioned and usable now ({reason}). The recovery \
              label could not be written yet; the daemon repairs it on its \
              next start — no action needed."
         ),
+        other => anyhow!("{}", other.redacted_message()),
     }
 }
 
@@ -513,6 +628,14 @@ fn check_slot_surface_conflict(
             ),
             hint: format!(
                 "(slot {slot} is a Claude subscription/OAuth account; `csq setkey` would override it with an API key — run `csq logout {slot}` first)"
+            ),
+        },
+        Surface::Kimi | Surface::Grok => SlotSurfaceConflict {
+            headline: format!(
+                "slot {slot} is bound to a native CLI (Kimi/Grok) — run `csq logout {slot}` to rebind"
+            ),
+            hint: format!(
+                "(slot {slot} runs the native vendor CLI, which self-authenticates; `csq setkey` does not apply — run `csq logout {slot}` first)"
             ),
         },
     })
@@ -623,6 +746,14 @@ fn stdin_is_tty() -> bool {
 /// Step signal returned by `handle_key_byte`: either continue reading
 /// the next byte or break out of the read loop because the user hit
 /// a submit key.
+///
+/// Production caller is the `#[cfg(unix)]` `read_hidden_line`; the
+/// windows `read_hidden_line` fallback does not use it. Also exercised
+/// directly by the byte-handler unit tests below (which run on every
+/// platform), hence `cfg(any(unix, test))` rather than a bare
+/// `cfg(unix)` — the latter would make this unresolved on a windows
+/// test build.
+#[cfg(any(unix, test))]
 #[derive(Debug, PartialEq, Eq)]
 enum KeyInputStep {
     /// Keep reading. The buffer may or may not have been mutated.
@@ -648,6 +779,7 @@ enum KeyInputStep {
 /// * `0x08`, `0x7f` (backspace, DEL) — pop the last byte
 /// * `MAX_KEY_LEN` reached — `Err("key input too large")`
 /// * anything else — push to the buffer and continue
+#[cfg(any(unix, test))]
 fn handle_key_byte(byte: u8, key: &mut Vec<u8>) -> Result<KeyInputStep> {
     match byte {
         b'\n' | b'\r' => Ok(KeyInputStep::Done),
@@ -841,7 +973,7 @@ mod tests {
 
     #[test]
     fn refuses_setkey_mm_on_identity_only_anthropic_slot() {
-        // THE #995 origin: a 3P key write over an Anthropic OAuth slot silently
+        // THE an internal ticket origin: a 3P key write over an Anthropic OAuth slot silently
         // overrode the subscription token and orphaned by_slot. Now refused.
         let dir = TempDir::new().unwrap();
         bind_identity(dir.path(), 3, "anthropic");
@@ -872,6 +1004,68 @@ mod tests {
             check_slot_surface_conflict(dir.path(), Some(acc(3)), claude).is_some(),
             "setkey claude (API key) must refuse to override an Anthropic OAuth slot"
         );
+    }
+
+    #[test]
+    fn refuses_setkey_gemini_on_native_bound_slot() {
+        // redteam R2 MED-1: a slot already bound to a native surface
+        // (Kimi/Grok, credentials/{kimi,grok}-<N>.json) must refuse a
+        // `csq setkey gemini --slot N` — without this, the bind silently
+        // dual-binds the slot (double-lists in `csq ls`; `csq run N`
+        // dispatches to whichever surface wins precedence, orphaning the
+        // other's vendor home).
+        let dir = TempDir::new().unwrap();
+        let slot = acc(6);
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            slot,
+            csq_core::providers::catalog::Surface::Kimi,
+        )
+        .unwrap();
+
+        let err = refuse_if_slot_bound_to_other_surface(dir.path(), slot).unwrap_err();
+        assert!(
+            err.to_string().contains("Kimi (native CLI)"),
+            "error must name the bound native surface: {err}"
+        );
+        assert!(
+            err.to_string().contains("csq logout 6"),
+            "error must point at the rebind workflow: {err}"
+        );
+    }
+
+    #[test]
+    fn refuses_setkey_gemini_on_3p_bearer_slot() {
+        // redteam R3 M1: the NEW gemini-onto-3P-bearer refusal at the `csq setkey
+        // gemini` delivery point. The pre-refactor Gemini guard was blind to 3P
+        // (only checked codex/anthropic/native), so this bind silently
+        // dual-bound a 3P slot with a Gemini marker.
+        let dir = TempDir::new().unwrap();
+        let slot = acc(7);
+        csq_core::accounts::third_party::bind_provider_to_slot(
+            dir.path(),
+            "deepseek",
+            slot,
+            Some("sk-deepseek-xxxxxxxx"),
+            None,
+        )
+        .unwrap();
+
+        let err = refuse_if_slot_bound_to_other_surface(dir.path(), slot).unwrap_err();
+        assert!(
+            err.to_string().contains("a third-party provider"),
+            "error must name the 3P binding accurately: {err}"
+        );
+        assert!(
+            err.to_string().contains("csq logout 7"),
+            "error must point at the rebind workflow: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_setkey_gemini_on_unbound_slot() {
+        let dir = TempDir::new().unwrap();
+        assert!(refuse_if_slot_bound_to_other_surface(dir.path(), acc(7)).is_ok());
     }
 
     #[test]
@@ -1000,7 +1194,7 @@ mod tests {
         assert_eq!(err, "cancelled");
     }
 
-    // ── #962 H1: endpoint-component allowlist (credential-redirection defense) ──
+    // ── an internal ticket H1: endpoint-component allowlist (credential-redirection defense) ──
 
     #[cfg(feature = "enterprise")]
     #[test]
@@ -1088,6 +1282,94 @@ mod tests {
         .to_string();
         assert!(err.contains("region rejected"), "got: {err}");
         assert!(!dir.path().join("settings-vertex.json").exists());
+    }
+
+    // ── an internal ticket: cloud-Claude `setkey claude --backend` arg validation ──
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_cloud_claude_rejects_key_with_backend() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_cloud_claude(
+            dir.path(),
+            "vertex",
+            Some(7),
+            Some("p"),
+            Some("r"),
+            Some("/x/sa.json"),
+            Some("sk-ant-somekey"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--key"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_cloud_claude_requires_slot() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_cloud_claude(
+            dir.path(),
+            "vertex",
+            None,
+            Some("p"),
+            Some("r"),
+            Some("/x/sa.json"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--slot"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_cloud_claude_requires_region() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_cloud_claude(dir.path(), "bedrock", Some(7), None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--region"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_cloud_claude_rejects_unknown_backend() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_cloud_claude(dir.path(), "gcp", Some(7), None, Some("r"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown --backend"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn handle_cloud_claude_vertex_requires_project_and_sa_file() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_cloud_claude(
+            dir.path(),
+            "vertex",
+            Some(7),
+            None,
+            Some("r"),
+            Some("/x/sa.json"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--project"), "got: {err}");
+        let err = handle_cloud_claude(
+            dir.path(),
+            "vertex",
+            Some(7),
+            Some("p"),
+            Some("r"),
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--sa-file"), "got: {err}");
     }
 
     #[test]

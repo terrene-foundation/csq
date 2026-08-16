@@ -132,7 +132,7 @@ pub fn verify_record_multi_sig(
     verify_multi_sig_authorizations(ms_blob, &hash, membership)
 }
 
-/// Forward-compat (GH #910): verify the multi-sig authorization on a record
+/// Forward-compat (GH an internal ticket): verify the multi-sig authorization on a record
 /// whose `EventKind` is UNKNOWN to this binary.
 ///
 /// An unknown kind cannot be mapped to an [`OpClass`], so M12 roster-membership
@@ -166,7 +166,7 @@ pub(crate) fn verify_opaque_multi_sig(
 
 /// Verify the inner authorizations of a `multi_sig` blob against a precomputed
 /// `intent_hash`. Shared by [`verify_record_multi_sig`] (typed records) and
-/// [`verify_opaque_multi_sig`] (unknown-kind forward-compat records, GH #910).
+/// [`verify_opaque_multi_sig`] (unknown-kind forward-compat records, GH an internal ticket).
 ///
 /// `membership` is `Some((op_class, registry, record_seq))` when M12 roster
 /// enforcement applies — then only pubkeys enrolled for `op_class` at

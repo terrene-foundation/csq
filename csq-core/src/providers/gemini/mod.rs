@@ -13,7 +13,7 @@
 //! like OpenClaw that bypass the official CLI; csq spawns the official
 //! `gemini` binary as a subprocess, structurally identical to running
 //! it under tmux, nohup, or a shell alias) and on cited issue numbers
-//! (#20632, #22970) that do not resolve in the upstream repo. The
+//! (an internal ticket) that do not resolve in the upstream repo. The
 //! runtime enforcement has been removed. csq treats Gemini the same
 //! way it treats Claude and Codex: spawn the official CLI, let it
 //! handle auth.

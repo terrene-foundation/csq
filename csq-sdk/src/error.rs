@@ -22,8 +22,16 @@ use csq_redact::RedactedString;
 /// consumer matches on these; adding a variant is a compat event, so new
 /// failure modes map onto an existing code unless a genuinely new consumer
 /// branch is warranted.
+///
+/// `#[non_exhaustive]`: "closed" describes the vocabulary at any given crate
+/// version, not a promise it will never grow — `LicenseRequired` itself landed
+/// after the first four codes shipped (W4). Sealing forces an external `match` to
+/// carry a `_ =>` fallback, so a future code degrades gracefully instead of
+/// failing to compile. Unit-variant construction (`SdkErrorCode::Internal`) is
+/// unaffected — only exhaustive matching is restricted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SdkErrorCode {
     /// Caller passed malformed / conflicting arguments (both prompt sources,
     /// both `--provider` and `--slot`, neither, an empty prompt, …).
@@ -51,6 +59,15 @@ pub enum SdkErrorCode {
     /// Ed25519-signed license key (W4). A community build never emits this code —
     /// it is a reserved member of the closed vocabulary the enterprise gate uses.
     LicenseRequired,
+    /// The op requires an attended interactive session — a TTY the caller can
+    /// block on (a device-auth confirmation, a paste prompt) or a local browser
+    /// the provider's own subprocess can drive — and neither is present. Distinct
+    /// from [`Self::InvalidInput`]: the caller-supplied arguments are well-formed;
+    /// the RUNTIME cannot proceed non-interactively. Exists so a host driving
+    /// `csq login` unattended (piped stdin, no TTY, no local display) gets an
+    /// immediate, actionable signal instead of the op blocking on a read that
+    /// will never be satisfied (an internal ticket).
+    InteractionRequired,
 }
 
 impl SdkErrorCode {
@@ -68,6 +85,7 @@ impl SdkErrorCode {
             Self::ProviderError => "provider_error",
             Self::Internal => "internal",
             Self::LicenseRequired => "license_required",
+            Self::InteractionRequired => "interaction_required",
         }
     }
 }
@@ -77,10 +95,24 @@ impl SdkErrorCode {
 /// Construct via [`SdkError::new`] (redacts an untrusted message) or
 /// [`SdkError::trusted`] (a csq-authored const label with no secret-derivable
 /// content). The `message` is a [`RedactedString`] by type, not by convention.
+///
+/// `#[non_exhaustive]`: forces every external construction through [`SdkError::new`]
+/// / [`SdkError::trusted`], which is what makes the redaction-by-type guarantee
+/// unconditional — there is no external struct-literal path that could hand a
+/// pre-built `RedactedString` (bypassing [`RedactedString::from_untrusted`]) or an
+/// un-redacted `String` straight into `message`.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SdkError {
     pub code: SdkErrorCode,
     pub message: RedactedString,
+    /// The set of valid values, for a `code` in the "named X does not
+    /// resolve to a known Y" family (e.g. [`SdkErrorCode::ProviderNotFound`]).
+    /// Lets a consumer recover programmatically instead of re-parsing
+    /// `message`. `None` for error classes with no natural "known set"
+    /// (e.g. [`SdkErrorCode::Timeout`]). Attach via [`SdkError::with_known`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known: Option<Vec<String>>,
 }
 
 impl SdkError {
@@ -92,6 +124,7 @@ impl SdkError {
         Self {
             code,
             message: RedactedString::from_untrusted(message),
+            known: None,
         }
     }
 
@@ -102,7 +135,17 @@ impl SdkError {
         Self {
             code,
             message: RedactedString::from_trusted(message),
+            known: None,
         }
+    }
+
+    /// Attach the set of valid values a "not found" / "unknown X" error was
+    /// resolved against — e.g. `registry::known_ids()` for a
+    /// [`SdkErrorCode::ProviderNotFound`] on an unrecognized `--provider`.
+    #[must_use]
+    pub fn with_known(mut self, known: Vec<String>) -> Self {
+        self.known = Some(known);
+        self
     }
 }
 
@@ -123,6 +166,7 @@ mod tests {
             (SdkErrorCode::ProviderError, "provider_error"),
             (SdkErrorCode::Internal, "internal"),
             (SdkErrorCode::LicenseRequired, "license_required"),
+            (SdkErrorCode::InteractionRequired, "interaction_required"),
         ] {
             assert_eq!(code.as_str(), wire);
             let json = serde_json::to_string(&code).unwrap();
@@ -147,5 +191,24 @@ mod tests {
     fn trusted_message_is_verbatim() {
         let err = SdkError::trusted(SdkErrorCode::InvalidInput, "prompt must not be empty");
         assert_eq!(err.message.as_str(), "prompt must not be empty");
+    }
+
+    #[test]
+    fn known_is_omitted_when_absent() {
+        let err = SdkError::trusted(SdkErrorCode::ProviderNotFound, "unknown provider `bogus`");
+        let rendered = serde_json::to_value(&err).unwrap();
+        assert!(
+            rendered.get("known").is_none(),
+            "known must be omitted, not serialized as null: {rendered}"
+        );
+    }
+
+    #[test]
+    fn with_known_attaches_the_valid_set() {
+        let err = SdkError::trusted(SdkErrorCode::ProviderNotFound, "unknown provider `bogus`")
+            .with_known(vec!["claude".to_string(), "grok".to_string()]);
+        let rendered = serde_json::to_value(&err).unwrap();
+        assert_eq!(rendered["known"], serde_json::json!(["claude", "grok"]));
+        assert_eq!(rendered["code"], "provider_not_found");
     }
 }

@@ -69,30 +69,27 @@ fn payload_from_json_output(
     edition: &'static str,
     record_verification_level: Option<String>,
 ) -> VerifyPayload {
-    VerifyPayload {
-        status: o.status,
-        verified_count: o.verified_count,
-        skipped_v1_count: o.skipped_v1_count,
-        unknown_kind_count: o.unknown_kind_count,
-        historical_key_gaps: o
-            .historical_key_gaps
-            .into_iter()
-            .map(|g| csq_sdk::VerifyKeyGap {
-                key_id: g.key_id,
-                first_seq: g.first_seq,
-                last_seq: g.last_seq,
-                count: g.count,
-            })
-            .collect(),
-        failure_detail: o.failure_detail.map(|d| csq_sdk::VerifyFailureDetail {
-            kind: d.kind,
-            message: d.message,
-        }),
-        trust_plane_grade: o.trust_plane_grade,
-        verification_level_summary: o.verification_level_summary,
-        record_verification_level,
-        edition,
+    let mut payload = VerifyPayload::new(o.status, o.verified_count, o.skipped_v1_count, edition)
+        .with_unknown_kind_count(o.unknown_kind_count)
+        .with_historical_key_gaps(
+            o.historical_key_gaps
+                .into_iter()
+                .map(|g| csq_sdk::VerifyKeyGap::new(g.key_id, g.first_seq, g.last_seq, g.count))
+                .collect(),
+        );
+    if let Some(d) = o.failure_detail {
+        payload = payload.with_failure_detail(csq_sdk::VerifyFailureDetail::new(d.kind, d.message));
     }
+    if let Some(grade) = o.trust_plane_grade {
+        payload = payload.with_trust_plane_grade(grade);
+    }
+    if let Some(summary) = o.verification_level_summary {
+        payload = payload.with_verification_level_summary(summary);
+    }
+    if let Some(level) = record_verification_level {
+        payload = payload.with_record_verification_level(level);
+    }
+    payload
 }
 
 #[cfg(test)]

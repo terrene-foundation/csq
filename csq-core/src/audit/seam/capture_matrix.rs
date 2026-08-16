@@ -363,6 +363,88 @@ pub fn emit_matrix_record(
         })
 }
 
+/// Emits the M19 capture-matrix chain record at daemon start, with sidecar
+/// content-hash dedup. Non-fatal by construction — every failure logs and
+/// returns; the daemon is never blocked.
+///
+/// **This is the ONE entry point both daemon twins call.** It exists because
+/// the emission was originally inlined in `csq daemon`'s session body only, so
+/// the desktop in-process daemon (`csq::desktop::daemon_supervisor::run_daemon`)
+/// never emitted a matrix record at all — a desktop-only user's chain held ZERO
+/// `ProvenanceCaptureMatrix` records forever. Keeping the orchestration here,
+/// rather than duplicated in each twin, makes that class of drift impossible:
+/// a change to the dedup or sidecar-advance rules lands once for both.
+///
+/// Call it AFTER audit health is finalised and BEFORE the transport binds.
+///
+/// `audit_operational` is the caller's `audit_health.is_operational()`. When
+/// false the emit is skipped entirely — appending to a Broken/Unknown chain is
+/// pointless and potentially misleading.
+///
+/// Sidecar advance rule (M19 Finding B):
+/// - `Ok(true)`  → record written → advance the sidecar.
+/// - `Ok(false)` → chain-broken skip → do NOT advance; a recovered chain must
+///   re-emit on the next startup.
+/// - `Err(..)`   → hard failure → do NOT advance.
+///
+/// A chain re-genesis changes `chain_id`, which changes the dedup key, so a
+/// re-genesised chain re-emits even when the surface content is identical
+/// (M19 Finding C).
+pub fn emit_startup_capture_matrix(base: &Path, audit_operational: bool) {
+    if !audit_operational {
+        tracing::debug!("M19: capture matrix emit skipped — audit subsystem not operational");
+        return;
+    }
+
+    let payload = match build_capture_matrix(base) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error_kind = "capture_matrix_build_failed",
+                "M19: could not build capture matrix (non-fatal): {e}"
+            );
+            return;
+        }
+    };
+
+    let content_hash = matrix_content_hash(&payload);
+    let chain_id = crate::audit::op_emit::load_chain_id(base);
+    let dedup_key = sidecar_dedup_key(&chain_id, &content_hash);
+
+    if read_last_hash(base).as_deref() == Some(dedup_key.as_str()) {
+        tracing::debug!("M19: capture matrix unchanged (dedup key stable); skipping re-emit");
+        return;
+    }
+
+    // Matrix changed or chain re-genesised — emit the chain record.
+    match emit_matrix_record(base, &chain_id, payload) {
+        Ok(true) => {
+            // Record written — advance the sidecar so the next restart dedups.
+            if let Err(e) = write_last_hash(base, &dedup_key) {
+                tracing::warn!(
+                    error_kind = "capture_matrix_sidecar_write_failed",
+                    "M19: could not update .last-capture-matrix sidecar: {e}"
+                );
+            }
+        }
+        Ok(false) => {
+            // Chain-broken skip — sidecar NOT advanced so a recovered chain
+            // re-emits the matrix on the next daemon start.
+            tracing::warn!(
+                error_kind = "capture_matrix_skipped_no_sidecar_advance",
+                "M19: capture-matrix emit skipped (chain-broken); \
+                 sidecar NOT advanced — recovered chain will re-emit"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error_kind = "capture_matrix_emit_failed",
+                "M19: capture-matrix chain record emit failed (non-fatal): {e}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +458,47 @@ mod tests {
         let dir = base.join("audit");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("surface-registry.json"), json).unwrap();
+    }
+
+    /// Seeds a genesis record so the chain exists and `load_chain_id` resolves.
+    /// Returns the chain_id. Without this a fresh tempdir has an EMPTY chain_id,
+    /// which `emit_matrix_record` correctly rejects
+    /// (`emit_matrix_record_errors_on_empty_chain_id`).
+    fn seed_genesis_chain(base: &Path) -> String {
+        use crate::audit::persist::write_record_v2;
+        use crate::audit::types::{CsqRunPayload, RecordId};
+
+        let chain_id_str = crate::audit::persist::gen_chain_id();
+        let chain_id =
+            RecordId::try_new(chain_id_str.clone()).expect("chain_id must be valid ULID");
+        let run_record_id =
+            RecordId::try_new(crate::audit::persist::gen_chain_id()).expect("record_id valid");
+        let key_id =
+            KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).expect("placeholder key_id");
+        let seed = SignedRecord {
+            schema_version: AUDIT_SCHEMA_VERSION.to_string(),
+            record_id: run_record_id,
+            chain_id,
+            seq: 0,
+            prev_hash: Sha256Hex::genesis(),
+            kind: EventKind::CsqRun,
+            payload: EventPayload::CsqRun(CsqRunPayload {
+                run_id: "seed-for-startup-matrix-test".to_string(),
+            }),
+            ts: crate::audit::persist::current_iso8601_utc_persist(),
+            key_id,
+            canonical_hash: Sha256Hex::genesis(),
+            signature: Ed25519Signature::new([0u8; 64]),
+            actor: None,
+            authority: None,
+            trust: None,
+            eatp_start_ts: None,
+            eatp_end_ts: None,
+            op_phase: None,
+            verification_level: None,
+        };
+        write_record_v2(seed, Some(base)).expect("seed write must succeed");
+        chain_id_str
     }
 
     // ── AC-1: matrix emits per-surface capture status ──────────────────────────
@@ -824,6 +947,137 @@ mod tests {
         assert!(
             last.as_deref() == Some(dedup_key.as_str()),
             "when dedup keys match, caller skips emit"
+        );
+    }
+
+    // ── emit_startup_capture_matrix — the shared twin entry point ─────────────
+    //
+    // The tests above simulate the caller's dedup/advance logic by hand, which
+    // is exactly how the CLI and desktop daemons drifted apart: the logic lived
+    // inlined in one twin and was never mirrored to the other. These exercise
+    // the real orchestrator both twins now call.
+
+    /// A non-operational audit subsystem MUST skip entirely — no chain record,
+    /// no sidecar. Appending to a Broken/Unknown chain is pointless and
+    /// potentially misleading.
+    #[test]
+    fn startup_emit_skips_when_audit_not_operational() {
+        let base = make_base();
+        emit_startup_capture_matrix(base.path(), false);
+        assert_eq!(
+            read_last_hash(base.path()),
+            None,
+            "a non-operational audit subsystem must not advance the sidecar"
+        );
+    }
+
+    /// The first operational call on an initialised chain emits and advances the
+    /// sidecar to the dedup key derived from the CURRENT chain_id + content.
+    #[test]
+    fn startup_emit_advances_sidecar_on_first_run() {
+        let base = make_base();
+        seed_genesis_chain(base.path());
+        assert_eq!(
+            read_last_hash(base.path()),
+            None,
+            "precondition: no sidecar"
+        );
+
+        emit_startup_capture_matrix(base.path(), true);
+
+        let payload = build_capture_matrix(base.path()).unwrap();
+        let expected = sidecar_dedup_key(
+            &crate::audit::op_emit::load_chain_id(base.path()),
+            &matrix_content_hash(&payload),
+        );
+        assert_eq!(
+            read_last_hash(base.path()).as_deref(),
+            Some(expected.as_str()),
+            "first operational emit must advance the sidecar to the current dedup key"
+        );
+    }
+
+    /// A second call with unchanged chain_id + matrix content dedups: the
+    /// sidecar is unchanged and no duplicate record is emitted.
+    #[test]
+    fn startup_emit_dedups_on_unchanged_restart() {
+        let base = make_base();
+        seed_genesis_chain(base.path());
+
+        emit_startup_capture_matrix(base.path(), true);
+        let after_first = read_last_hash(base.path());
+        assert!(after_first.is_some(), "first emit must advance the sidecar");
+
+        emit_startup_capture_matrix(base.path(), true);
+        assert_eq!(
+            read_last_hash(base.path()),
+            after_first,
+            "an unchanged restart must not change the sidecar (dedup)"
+        );
+    }
+
+    /// A chain re-genesis changes `chain_id`, which changes the dedup key, so
+    /// the matrix re-emits even when the surface content is identical
+    /// (M19 Finding C). Simulated by planting a sidecar key derived from a
+    /// DIFFERENT chain_id and asserting the next startup overwrites it.
+    #[test]
+    fn startup_emit_reemits_after_chain_regenesis() {
+        let base = make_base();
+        seed_genesis_chain(base.path());
+        let payload = build_capture_matrix(base.path()).unwrap();
+        let content_hash = matrix_content_hash(&payload);
+
+        // Sidecar from a PRIOR chain generation.
+        let stale = sidecar_dedup_key("chain-id-from-a-previous-genesis", &content_hash);
+        write_last_hash(base.path(), &stale).unwrap();
+
+        emit_startup_capture_matrix(base.path(), true);
+
+        let current = sidecar_dedup_key(
+            &crate::audit::op_emit::load_chain_id(base.path()),
+            &content_hash,
+        );
+        assert_ne!(
+            stale, current,
+            "precondition: a different chain_id must yield a different dedup key"
+        );
+        assert_eq!(
+            read_last_hash(base.path()).as_deref(),
+            Some(current.as_str()),
+            "a re-genesised chain must re-emit and overwrite the stale sidecar key"
+        );
+    }
+
+    /// Fail-safe: on a host whose audit chain was never initialised, `chain_id`
+    /// is empty and `emit_matrix_record` rejects the append. The startup emit
+    /// MUST return normally (non-fatal — the daemon is never blocked) and MUST
+    /// NOT advance the sidecar, so the matrix re-emits once the chain exists.
+    #[test]
+    fn startup_emit_does_not_advance_sidecar_on_uninitialised_chain() {
+        let base = make_base();
+        // No seed_genesis_chain — chain_id resolves empty.
+        emit_startup_capture_matrix(base.path(), true);
+        assert_eq!(
+            read_last_hash(base.path()),
+            None,
+            "an uninitialised chain must not advance the sidecar"
+        );
+    }
+
+    /// The emit is non-fatal by contract — the daemon is never blocked. A base
+    /// dir with a malformed surface registry must return normally (build fails,
+    /// logs a WARN) rather than panicking or advancing the sidecar.
+    #[test]
+    fn startup_emit_is_non_fatal_on_malformed_registry() {
+        let base = make_base();
+        write_surface_registry(base.path(), "{ not valid json");
+
+        emit_startup_capture_matrix(base.path(), true);
+
+        assert_eq!(
+            read_last_hash(base.path()),
+            None,
+            "a failed build must not advance the sidecar"
         );
     }
 }

@@ -58,8 +58,6 @@ pub fn symlink_exclusive(target: &Path, link: &Path) -> Result<(), PlatformError
     const FSCTL_SET_REPARSE_POINT: u32 = 0x000900A4;
     // IO_REPARSE_TAG_MOUNT_POINT (junction) = 0xA0000003
     const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
-    // FILE_ATTRIBUTE_DIRECTORY
-    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     // Encode a &Path as a null-terminated wide string.
     fn to_wide(p: &Path) -> Vec<u16> {
         p.as_os_str()

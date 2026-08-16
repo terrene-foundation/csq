@@ -42,13 +42,22 @@ use std::sync::OnceLock;
 // ── Public types ───────────────────────────────────────────────────────────────
 
 /// Per-`csq run` surface tag.  Serializes as lowercase string per the JSON
-/// schema enum: `"cc"`, `"codex"`, `"gemini"`.
+/// schema enum: `"cc"`, `"codex"`, `"gemini"`, `"kimi"`, `"grok"`.
+///
+/// `Kimi` and `Grok` (W3-2, Wave 3 native Kimi/Grok session surfaces) tag
+/// audit records produced by native `csq run` dispatch to the Kimi CLI
+/// (`kimi`) or Grok CLI (`grok`) — `providers::native` sessions, not
+/// capability-layer-spawned `codex`/`gemini` subprocesses. See
+/// `coc-eval/schemas/csq-runs-schema-v1.json` `surface.enum` (kept in sync
+/// per spec 12 §12.7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Surface {
     Cc,
     Codex,
     Gemini,
+    Kimi,
+    Grok,
 }
 
 /// Coarse outcome classification.  Serializes as lowercase strings.
@@ -671,7 +680,7 @@ pub(crate) fn read_or_init_chain_genesis(
     // `seam::reconcile`, and the `mcp_gate_outbox` drain's confirmed-on-chain
     // delete). Clear it here so the new chain starts with no stale dedup state.
     // Fires ONLY when a genesis is actually minted (inside `.chain-lock`), never on
-    // an existing chain. Redteam #909 R2 (rust-specialist F3).
+    // an existing chain. Redteam an internal ticket R2 (rust-specialist F3).
     let _ = std::fs::remove_file(csq_runs_dir.join(SEAM_DEDUP_INDEX));
 
     let genesis = ChainGenesis {
@@ -1453,7 +1462,7 @@ fn load_or_rebuild_dedup_index(
                 crate::audit::types::EventPayload::CsqRun(p) => {
                     set.insert(format!("run:{}", p.run_id));
                 }
-                // #784: the `GovernanceTurn` per-turn attestation record reuses
+                // an internal ticket: the `GovernanceTurn` per-turn attestation record reuses
                 // this in-lock dedup index (keyed `gov:<session_id>:<record_seq>`)
                 // so a re-flush of the same governance events appends exactly one
                 // record per event. Both key components are mirrored into the
@@ -2039,6 +2048,8 @@ mod tests {
             serde_json::to_string(&Surface::Gemini).unwrap(),
             "\"gemini\""
         );
+        assert_eq!(serde_json::to_string(&Surface::Kimi).unwrap(), "\"kimi\"");
+        assert_eq!(serde_json::to_string(&Surface::Grok).unwrap(), "\"grok\"");
     }
 
     #[test]
@@ -2818,7 +2829,7 @@ mod tests {
         );
     }
 
-    /// Redteam #909 R2 (rust-specialist F3): minting a fresh genesis (chain.json
+    /// Redteam an internal ticket R2 (rust-specialist F3): minting a fresh genesis (chain.json
     /// absent) must CLEAR any stale `.seam-dedup-index` sidecar left by a prior
     /// chain (manual chain.json deletion + re-init), so its chain_id-unscoped keys
     /// cannot false-positive for a `seam_dedup_index_contains(_or_rebuild)`

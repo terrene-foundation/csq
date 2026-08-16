@@ -65,12 +65,19 @@ pub fn write_slot_model_with_uuid_routing(
                 "slot {slot} is not bound — add it via the Add Account modal or `csq setkey` first"
             )
         } else {
-            format!("read {}: {e}", settings_path.display())
+            format!(
+                "read {}: {e}",
+                crate::cli_deps::sanitize::redact_path(&settings_path)
+            )
         }
     })?;
 
-    let mut value: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("{} is not valid JSON: {e}", settings_path.display()))?;
+    let mut value: Value = serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "{} is not valid JSON: {e}",
+            crate::cli_deps::sanitize::redact_path(&settings_path)
+        )
+    })?;
 
     let env = value
         .as_object_mut()
@@ -79,7 +86,7 @@ pub fn write_slot_model_with_uuid_routing(
         .ok_or_else(|| {
             format!(
                 "{} has no `env` object — can't set model",
-                settings_path.display()
+                crate::cli_deps::sanitize::redact_path(&settings_path)
             )
         })?;
 
@@ -96,7 +103,10 @@ pub fn write_slot_model_with_uuid_routing(
     // umask-default 0o644.
     if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("write tmp {}: {e}", tmp.display()));
+        return Err(format!(
+            "write tmp {}: {e}",
+            crate::cli_deps::sanitize::redact_path(&tmp)
+        ));
     }
     if let Err(e) = secure_file(&tmp) {
         let _ = std::fs::remove_file(&tmp);

@@ -239,6 +239,45 @@ mod tests {
         assert!(!codex_scaffold.contains("RULE-CC-ONLY"));
     }
 
+    /// A live `csq run` on a Kimi/Grok slot MUST see codex-scoped `.coc/`
+    /// content exactly like a live codex session does — Kimi/Grok "share the
+    /// Codex (AGENTS.md) capability-layer translator" per the doc comments on
+    /// `coc::translate::mod::translate` and `flatten::surface_header`
+    /// (an internal journal entry). Before the `flatten::in_scope` fix this test would
+    /// have failed: `ScaffoldStage::run` calls `flatten_artifacts` with the
+    /// RAW `Surface::Kimi`/`::Grok` value (not coerced to `Surface::Codex`),
+    /// so a rule scoped `applies_to: [codex]` was silently dropped from every
+    /// live Kimi/Grok scaffold while reaching a live Codex scaffold.
+    #[test]
+    fn scaffold_kimi_grok_share_codex_scope() {
+        let set = coc_set_with_rules(vec![
+            rule_with_applies_to("RULE-CODEX-ONLY", "codex-only body", &[Surface::Codex]),
+            rule_with_applies_to("RULE-CC-ONLY", "cc-only body", &[Surface::ClaudeCode]),
+        ]);
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let mut out = PreSpawnState::default();
+            ScaffoldStage::run(
+                ScaffoldInputs {
+                    coc_set: set.clone(),
+                    prompt: UserPrompt { text: "x".into() },
+                    class: PromptClass::PR_CA4_DEFAULT,
+                    surface,
+                },
+                &mut out,
+            )
+            .unwrap();
+            let scaffold = out.scaffold.unwrap();
+            assert!(
+                scaffold.contains("RULE-CODEX-ONLY"),
+                "{surface} scaffold must include the codex-scoped rule: {scaffold}"
+            );
+            assert!(
+                !scaffold.contains("RULE-CC-ONLY"),
+                "{surface} scaffold must NOT include the cc-only rule: {scaffold}"
+            );
+        }
+    }
+
     /// S2 (an internal ticket): `rules_only_scaffold` carries RULES but NOT
     /// agents/skills/commands (they go native via `--plugin-dir` in Level-2),
     /// while the full `scaffold` carries all four kinds. Both are built from the

@@ -105,32 +105,18 @@ pub(crate) fn format_live_pid_info_line(from: AccountNum, live_pids: &[u32]) -> 
 }
 
 fn notify_daemon_cache_invalidation(base_dir: &Path) {
-    #[cfg(unix)]
-    {
-        let sock = csq_core::daemon::socket_path(base_dir);
-        if sock.exists() {
-            let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = base_dir;
+    csq_core::daemon::notify::cache_invalidation(base_dir);
 }
 
 /// Fire-and-forget targeted per-slot cache invalidation (SEC-2.11).
 ///
-/// Routes through `csq_core::daemon::notify_slot_swap` — the single
-/// production chokepoint shared with the desktop `move_account` Tauri
-/// command. Do NOT inline the body-building here.
+/// Routes through `csq_core::daemon::notify::slot_swap` — the single
+/// cross-platform production chokepoint (an internal ticket; formerly Unix-only,
+/// shared with the desktop `move_account` Tauri command via the lower-level
+/// `csq_core::daemon::notify_slot_swap`, which that Unix-only caller still
+/// uses directly). Do NOT inline the body-building here.
 fn notify_daemon_slot_swap(base_dir: &Path, from: AccountNum, to: AccountNum) {
-    #[cfg(unix)]
-    {
-        let sock = csq_core::daemon::socket_path(base_dir);
-        let _ = csq_core::daemon::notify_slot_swap(&sock, from.get(), to.get());
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (base_dir, from, to);
-    }
+    csq_core::daemon::notify::slot_swap(base_dir, from.get(), to.get());
 }
 
 #[cfg(test)]

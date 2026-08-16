@@ -351,26 +351,26 @@ fn parse_applies_to(fm: &Frontmatter, path: &Path) -> Result<BTreeSet<Surface>, 
 
     let mut out = BTreeSet::new();
     for item in raw_items {
-        match item.as_str() {
-            "all" => {
-                out.insert(Surface::ClaudeCode);
-                out.insert(Surface::Codex);
-                out.insert(Surface::Gemini);
+        if item == "all" {
+            out.extend(Surface::ALL.iter().copied());
+            continue;
+        }
+        // Every surface tag is addressable by its canonical `as_str` name,
+        // resolved through the single `Surface::from_tag` inverse rather
+        // than a hand-rolled match. The previous hand-rolled arms omitted
+        // `kimi` and `grok` entirely, so `applies_to: [kimi]` was not a
+        // no-op — it was a hard ParseError ("unknown surface `kimi`") that
+        // failed the whole artifact. A `.coc/` author could not express a
+        // rule scoped to either native CLI at all.
+        match Surface::from_tag(&item) {
+            Some(surface) => {
+                out.insert(surface);
             }
-            "claude-code" => {
-                out.insert(Surface::ClaudeCode);
-            }
-            "codex" => {
-                out.insert(Surface::Codex);
-            }
-            "gemini" => {
-                out.insert(Surface::Gemini);
-            }
-            other => {
+            None => {
                 return Err(ParseError::InvalidValue {
                     path: path.to_path_buf(),
                     field: "applies_to",
-                    reason: format!("unknown surface `{other}`"),
+                    reason: format!("unknown surface `{item}`"),
                 });
             }
         }
@@ -619,6 +619,10 @@ mod tests {
         assert_eq!(set.version, CocVersion::ZERO);
     }
 
+    /// `applies_to: [all]` MUST expand to EVERY surface, not to the three
+    /// that existed when the parser was written. Asserted against
+    /// `Surface::ALL` rather than a literal count so adding a sixth
+    /// surface fails here loudly instead of silently narrowing `[all]`.
     #[test]
     fn parses_all_surface_when_applies_to_all() {
         let dir = tempfile::tempdir().unwrap();
@@ -630,6 +634,87 @@ mod tests {
         );
         let set = parse_coc_dir(dir.path(), CocSource::LegacyClaude).unwrap();
         let rule = set.rules.values().next().unwrap();
-        assert_eq!(rule.applies_to.len(), 3);
+        let expected: BTreeSet<Surface> = Surface::ALL.iter().copied().collect();
+        assert_eq!(
+            rule.applies_to, expected,
+            "`applies_to: [all]` must cover every Surface variant"
+        );
+        // The regression this pins: the old hand-rolled list stopped at
+        // gemini, so `[all]` reached neither native CLI.
+        assert!(rule.applies_to.contains(&Surface::Kimi));
+        assert!(rule.applies_to.contains(&Surface::Grok));
+    }
+
+    /// The native-CLI surfaces are addressable by name. Before this, both
+    /// tags were a hard `ParseError` — a `.coc/` author could not scope a
+    /// rule to Kimi or Grok at all, and the whole artifact failed to load.
+    #[test]
+    fn parses_native_cli_surface_tags() {
+        for (tag, expected) in [("kimi", Surface::Kimi), ("grok", Surface::Grok)] {
+            let dir = tempfile::tempdir().unwrap();
+            build_minimal_coc(dir.path());
+            write_md(
+                &dir.path().join("rules"),
+                "RULE-N.md",
+                &format!("---\nid: RULE-N\napplies_to: [{tag}]\n---\nbody\n"),
+            );
+            let set = parse_coc_dir(dir.path(), CocSource::LegacyClaude)
+                .unwrap_or_else(|e| panic!("`applies_to: [{tag}]` must parse, got {e:?}"));
+            let rule = set.rules.values().next().unwrap();
+            assert_eq!(
+                rule.applies_to,
+                std::iter::once(expected).collect::<BTreeSet<_>>(),
+                "`applies_to: [{tag}]` must resolve to exactly {expected}"
+            );
+        }
+    }
+
+    /// Every surface's canonical `as_str` tag is accepted by the parser.
+    /// Enumerated from `Surface::ALL`, so a new variant whose tag the
+    /// parser cannot resolve fails here rather than at a user's `csq run`.
+    #[test]
+    fn every_surface_tag_is_parseable_in_applies_to() {
+        for surface in Surface::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            build_minimal_coc(dir.path());
+            write_md(
+                &dir.path().join("rules"),
+                "RULE-S.md",
+                &format!(
+                    "---\nid: RULE-S\napplies_to: [{}]\n---\nbody\n",
+                    surface.as_str()
+                ),
+            );
+            let set = parse_coc_dir(dir.path(), CocSource::LegacyClaude)
+                .unwrap_or_else(|e| panic!("tag `{surface}` must parse, got {e:?}"));
+            assert!(set
+                .rules
+                .values()
+                .next()
+                .unwrap()
+                .applies_to
+                .contains(surface));
+        }
+    }
+
+    /// An unknown tag stays a hard error naming the offending token — the
+    /// permissive path (silently ignoring it) would let a typo'd
+    /// `applies_to: [codexx]` silently drop the rule from every surface.
+    #[test]
+    fn unknown_surface_tag_is_still_a_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        build_minimal_coc(dir.path());
+        write_md(
+            &dir.path().join("rules"),
+            "RULE-BAD.md",
+            "---\nid: RULE-BAD\napplies_to: [kimmi]\n---\nbody\n",
+        );
+        let err = parse_coc_dir(dir.path(), CocSource::LegacyClaude)
+            .expect_err("a typo'd surface tag must not parse");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("kimmi"),
+            "error must name the offending tag, got {rendered}"
+        );
     }
 }

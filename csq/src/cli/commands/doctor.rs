@@ -17,6 +17,7 @@ use csq_core::cli_deps::{
     SurfaceCli, WrongBinaryReason,
 };
 use csq_core::daemon::coc_cache_sweeper;
+#[cfg(unix)]
 use csq_core::platform::process::is_pid_alive;
 use csq_core::refresh::sentinel as fanout;
 use csq_core::types::AccountNum;
@@ -25,18 +26,26 @@ use std::path::Path;
 
 #[derive(Serialize)]
 struct DoctorReport {
-    /// Top-level doctor JSON schema version. The community build reports `19`
-    /// and the enterprise build reports `21` — the `mcp_gate_outbox_backlog` field
-    /// (v20 #914, gaining the v21 M6 #909 shard-D daemon-aware `state` +
-    /// `last_drain_age_secs`) is enterprise-only, so it raises only the enterprise
-    /// ceiling (see `DOCTOR_SCHEMA_VERSION` below). The full per-version history (v1–v21,
-    /// which version introduced which field, and which fields are
-    /// enterprise-only) is the contract in
+    /// Top-level doctor JSON schema version. Both editions report `23` as of
+    /// this field's v23 addition (`stale_quota_slots`) — it is NOT
+    /// `cfg`-gated (the community build computes and emits it too), so per
+    /// the shared-monotonic-counter contract it raises the community
+    /// ceiling PAST every intervening enterprise-only version (v20-v22,
+    /// including v22 `audit_bundle_floor_anchor` an internal ticket b2b), exactly as v19
+    /// (`mcp_partial_coverage`) jumped it from 16 straight to 19 past
+    /// v17-v18. The full per-version history (which version introduced
+    /// which field, and which fields are
     /// `specs/13-multi-cli-detection-contract.md` §9 — the single source of
     /// truth. Do NOT re-enumerate it here: the prior inline history drifted
     /// (it stalled at v7 while fields landed through v18), which is exactly the
     /// drift §9 exists to prevent.
     schema_version: u32,
+    /// `csq.doctor.vN` (an internal ticket Track B), derived from [`DOCTOR_SCHEMA_VERSION`]
+    /// via [`doctor_schema_string`] — never hand-written a second time. Additive
+    /// alongside `schema_version` (kept for back-compat): a host now has ONE
+    /// detection rule — presence of `schema` + a `starts_with` match on the major —
+    /// instead of parsing the bare numeric `schema_version` itself.
+    schema: String,
     version: String,
     platform: PlatformInfo,
     /// Claude Code CLI status.  Populated when at least one Anthropic slot
@@ -84,6 +93,22 @@ struct DoctorReport {
     settings: SettingsInfo,
     daemon: DaemonInfo,
     accounts: AccountsInfo,
+    /// v23: slots whose quota poll has gone stale — sourced from the SAME
+    /// channel `csq status` reads
+    /// ([`csq_core::quota::status::show_status`] → `AccountStatus::stale_secs`,
+    /// which applies `STALE_THRESHOLD_SECS` via `poll_freshness`) per
+    /// `account-terminal-separation.md` MUST Rule 4 (a diagnostic surface MUST
+    /// source from the same channel the daemon's production paths use). The
+    /// `Accounts:` row above only reports marker-existence / credential-expiry
+    /// — it is blind to a frozen poll on a slot whose marker and credentials
+    /// are both nominally healthy (e.g. a native Kimi/Grok slot whose vendor
+    /// token silently expired: `csq doctor` read all-green while `csq status`
+    /// showed the same slot `stale 1d`+). Empty when every polled slot is
+    /// fresh or never-polled. Omitted entirely (not `[]`) from the JSON
+    /// envelope when empty, matching `unrecoverable_label_relocations` /
+    /// `pass0_skipped_slots`'s convention.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stale_quota_slots: Vec<StaleQuotaSlotJson>,
     broker_failed: BrokerFailedInfo,
     mixed_state_slots: MixedStateInfo,
     terminals: TerminalInfo,
@@ -228,17 +253,41 @@ struct DoctorReport {
     ///
     /// Note: no host paths included; `error_kind` is a fixed-vocabulary tag.
     audit_chain_state: csq_core::audit::AuditHealth,
+    /// Records the verifier SKIPPED because the chain exceeded its
+    /// `record_limit` (daemon default 10,000). `0` means whole-chain coverage.
+    ///
+    /// This exists because `audit_chain_state` CANNOT express it.
+    /// `AuditHealth::Verified` is a unit variant, so a tail-only run and a
+    /// whole-chain run are indistinguishable through the enum — which is how
+    /// `csq doctor` came to print a bare `✓ verified` on a host where the
+    /// verifier had just logged `audit_verify_limit_exceeded … skipped=658`,
+    /// the skipped records INCLUDING the genesis. `compliance_report.rs` had
+    /// the honest rendering all along; the operator surface did not.
+    ///
+    /// A `✓` that reads the same whether or not the genesis was verified is an
+    /// instrument that cannot fail (`instrument-discipline.md` MUST-1).
+    ///
+    /// `#[serde(skip)]` deliberately: this plumbs the count to the TEXT
+    /// renderer only. The `--json` surface is versioned by
+    /// `DOCTOR_SCHEMA_VERSION` under spec 13 §9, so adding a wire field is a
+    /// schema bump and belongs in its own change rather than riding along with
+    /// a render fix. `--json` therefore still cannot express partial coverage —
+    /// stated here rather than left for the next reader to discover.
+    #[serde(skip)]
+    audit_records_unverified: u64,
     /// M2 T2.5 — trust-plane conformance grade for the audit chain
     /// (`"COMPATIBLE"` / `"CONFORMANT"` / `"COMPLETE"`). Added in **enterprise**
     /// schema v17.
     ///
-    /// **Enterprise edition only.** The schema version is edition-specific
-    /// (community `19` / enterprise `22`; see `DOCTOR_SCHEMA_VERSION` + spec 13 §9
-    /// for the authoritative current values + full history): this grade field
-    /// arrived at v17, so the enterprise build carries it and reports the higher
-    /// ceiling, while the community build always emits `None` here and
-    /// `skip_serializing_if` omits the field — so the community wire output is
-    /// byte-identical to pre-T2.5 (dog/tail model, `rules/independence.md`).
+    /// **Enterprise edition only.** This grade field itself arrived at v17
+    /// enterprise-only and stays that way regardless of where the shared
+    /// `schema_version` counter currently sits. See `DOCTOR_SCHEMA_VERSION`
+    /// and spec 13 §9 for the authoritative current values and full history
+    /// (a later CROSS-EDITION field, e.g. v19 or v23, can carry BOTH
+    /// ceilings to the same number without changing which fields each
+    /// edition emits). The community build always emits `None` here and
+    /// `skip_serializing_if` omits the field — so the community wire output
+    /// is byte-identical to pre-T2.5 (dog/tail model, `rules/independence.md`).
     /// `None` (omitted) when the chain did not verify (`broken`/`unknown`
     /// `audit_chain_state`), or in any community build.
     /// Mirrors the `csq audit verify --json` `trust_plane_grade` field.
@@ -262,7 +311,7 @@ struct DoctorReport {
     audit_keychain_anchor: csq_core::audit::KeychainAnchorStatus,
 
     /// Keychain roster-version-floor anchor verdict (a DETECTOR — never bricks).
-    /// Added in schema v16 (`#694` item 2).
+    /// Added in schema v16 (`an internal ticket` item 2).
     /// `confirmed` = chain.json floor matches keychain-anchored floor;
     /// `unconfirmed` = no roster installed yet (chain.json has no floor), OR
     ///   keychain entry absent / unreadable — detection is file-only for now;
@@ -276,7 +325,7 @@ struct DoctorReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     audit_roster_floor_anchor: Option<csq_core::audit::RosterFloorAnchorStatus>,
 
-    /// #787 b2b — the policy-bundle version-floor keychain-anchor cross-check
+    /// an internal ticket b2b — the policy-bundle version-floor keychain-anchor cross-check
     /// (DETECTOR posture; enforcement always uses the FILE floor). One of:
     /// `confirmed` (file floor ↔ keychain anchor agree), `unavailable` (no
     /// keychain anchor readable — file-only tamper-detection), `corrupt` (the
@@ -382,7 +431,7 @@ struct DoctorReport {
     /// serialized so the state is present in `csq doctor --json`.
     mcp_partial_coverage: McpPartialCoverage,
 
-    /// M6 #914: MCP-gate attestation outbox backlog — enforced `tools/call`
+    /// M6 an internal ticket: MCP-gate attestation outbox backlog — enforced `tools/call`
     /// decisions durably queued in `csq-runs/.pending-mcp-gate/` that the daemon
     /// startup drain has not yet landed on the signed audit chain. `Some` with
     /// `warn=true` signals a STUCK backlog (an enforced-but-unrecorded
@@ -393,8 +442,13 @@ struct DoctorReport {
     /// outbox). The read is edition-agnostic, so a community `csq doctor` run
     /// against a `$HOME` an enterprise `csq-ee` populated will faithfully report
     /// that enterprise-written backlog (count + age are edition-neutral, not
-    /// proprietary logic) — the M6 #909 shard-D daemon-aware fields bump only the
-    /// enterprise `schema_version` ceiling (v20 → v21), never the community one (v19).
+    /// proprietary logic) — this field (v20) and its M6 an internal ticket shard-D daemon-aware
+    /// extension (v21) are enterprise-only + `skip_serializing_if`, so at the time
+    /// each landed it bumped only the enterprise ceiling, leaving the community
+    /// ceiling wherever it stood (see `DOCTOR_SCHEMA_VERSION` + spec 13 §9 for the
+    /// current, edition-specific-or-converged, values — a LATER cross-edition
+    /// field can still carry both ceilings to the same number without changing
+    /// which fields this community build emits).
     /// JSON shape: `{ pending_count, oldest_age_secs, state, last_drain_age_secs, warn }`
     /// (omitted when None).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -422,14 +476,14 @@ struct McpPartialCoverage {
     cli_sources: Vec<String>,
 }
 
-/// M6 #914: MCP-gate attestation outbox backlog surfaced by `csq doctor`.
+/// M6 an internal ticket: MCP-gate attestation outbox backlog surfaced by `csq doctor`.
 ///
 /// The outbox (`csq-runs/.pending-mcp-gate/`) durably queues gated `tools/call`
 /// decisions when the live POST to the daemon fails; the startup reconciler
 /// drains it onto the signed chain on the next daemon start. A record that
 /// lingers means an enforced decision is not yet recorded — a governance gap the
-/// operator should see, not just have silently preserved on disk (the #909 fix
-/// guarantees no record is LOST; #914 makes a stuck backlog VISIBLE).
+/// operator should see, not just have silently preserved on disk (the an internal ticket fix
+/// guarantees no record is LOST; an internal ticket makes a stuck backlog VISIBLE).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct McpGateOutboxBacklog {
     /// `.pending-mcp-gate/*.json` files queued (enforced MCP-gate decisions not
@@ -448,11 +502,11 @@ struct McpGateOutboxBacklog {
     /// PAST mtimes, so the age axis fires as intended; a same-user actor forging a
     /// future mtime is out of the threat model (they can delete the file outright).
     oldest_age_secs: Option<u64>,
-    /// M6 #909 shard D: the daemon-aware disposition — `stuck` (actionable),
+    /// M6 an internal ticket shard D: the daemon-aware disposition — `stuck` (actionable),
     /// `draining` (daemon up, young backlog), or `pending_daemon_down` (daemon not
-    /// draining; drains when it resumes). Replaces #914's fixed-6h age judgment.
+    /// draining; drains when it resumes). Replaces an internal ticket's fixed-6h age judgment.
     state: McpGateBacklogState,
-    /// M6 #909 shard D: seconds since the daemon last ran a drain cycle (the
+    /// M6 an internal ticket shard D: seconds since the daemon last ran a drain cycle (the
     /// `.outbox-drain-stamp`), or `None` when no drain has stamped on this base. A
     /// small value ⟺ the daemon is actively draining; a large/absent value ⟺ the
     /// daemon is down — the signal that distinguishes a genuinely-STUCK backlog from
@@ -465,26 +519,26 @@ struct McpGateOutboxBacklog {
     warn: bool,
 }
 
-/// M6 #909 shard D: a drain stamp (`csq-runs/.outbox-drain-stamp`, written by every
+/// M6 an internal ticket shard D: a drain stamp (`csq-runs/.outbox-drain-stamp`, written by every
 /// drain cycle) newer than this (seconds) means the daemon is UP and its continuous
 /// drain loop is running. Set to ~3 refresher intervals (the drain rides the 5-min
 /// refresher tick), so a stamp within 15 min ⟺ "daemon actively draining", and a
 /// staler stamp ⟺ "daemon down / drain not running" (→ PENDING, not a false STUCK
-/// alarm during a maintenance window). Replaces #914's fixed 6h wall-clock.
+/// alarm during a maintenance window). Replaces an internal ticket's fixed 6h wall-clock.
 const MCP_GATE_DRAIN_STAMP_FRESH_SECS: u64 = 15 * 60;
 
-/// M6 #909 shard D: with the daemon actively draining (a fresh stamp), a queued file
+/// M6 an internal ticket shard D: with the daemon actively draining (a fresh stamp), a queued file
 /// older than this (seconds) is STUCK — the drain has run several cycles and still
 /// cannot land the record, so the chain is not appendable (`csq audit verify` /
-/// `csq audit init`). ~3 drain cycles; far faster + more accurate than #914's 6h
+/// `csq audit init`). ~3 drain cycles; far faster + more accurate than an internal ticket's 6h
 /// (which had to be generous precisely because it could not tell an up-and-draining
 /// daemon from a down one).
 const MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS: u64 = 15 * 60;
 
-/// #914: a queued-file count above this flips the doctor surface to WARN
+/// an internal ticket: a queued-file count above this flips the doctor surface to WARN
 /// regardless of age OR daemon state — a large backlog is itself a signal, even
 /// behind a down daemon (so an unbounded pending queue is never silently tolerated;
-/// M6 #909 shard D keeps this axis unconditional). Mirrors the seam custody soft
+/// M6 an internal ticket shard D keeps this axis unconditional). Mirrors the seam custody soft
 /// cap ([`check_seam_pending_backlog`]'s 1 000-file threshold).
 const MCP_GATE_OUTBOX_STUCK_COUNT: u32 = 1_000;
 
@@ -559,6 +613,52 @@ struct AuditSinkDoctorInfo {
     pending_count: u64,
     /// Drift events detected since last reset.
     replication_drift_count: u64,
+}
+
+/// JSON representation of one slot whose quota poll has gone stale.
+///
+/// `age_secs` and the `Stale` classification itself come from
+/// `csq_core::quota::status::poll_freshness` via `show_status` — the exact
+/// function `csq status` calls for its fallback (non-daemon-delegated) path.
+/// `remedy` is surface-specific: native Kimi/Grok slots MUST re-authenticate
+/// THROUGH csq (`csq login <N> --provider <kimi-cli|grok>`), never via a bare
+/// vendor-CLI login — that writes to the vendor's own home dir
+/// (`~/.grok`/`~/.kimi-code`) and leaves the csq slot token expired with
+/// quota frozen (see `discovery_native_slot_login_must_go_through_csq`).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct StaleQuotaSlotJson {
+    /// Slot number.
+    slot: u16,
+    /// Account label (email or manual label) — control chars stripped via
+    /// `sanitize_for_display` before this struct is built.
+    label: String,
+    /// `Surface::as_str()` — `"claude-code"` / `"codex"` / `"gemini"` /
+    /// `"kimi"` / `"grok"`.
+    surface: String,
+    /// Seconds since the slot's quota row was last successfully updated.
+    age_secs: u64,
+    /// Actionable remediation string (`tauri-commands.md` MUST NOT Rule 6 —
+    /// named conditions map to specific, actionable text, not a generic tag).
+    remedy: String,
+    /// Whether this staleness is EXPECTED and needs no operator action.
+    ///
+    /// True only for vendor-authed native-CLI surfaces (Kimi, Grok): their
+    /// token lives ~15 min, csq deliberately never refreshes it (an internal journal entry),
+    /// and the poll re-authorizes when the slot is next used. Such a slot is
+    /// stale almost always while idle.
+    ///
+    /// Drives the icon: `⚠` means "needs attention", and a line that warns
+    /// permanently while needing no action is alarm fatigue — it degrades
+    /// every OTHER line on the surface an operator consults when something is
+    /// already wrong. Expected staleness renders `ℹ` instead.
+    ///
+    /// Set from the `Surface` ENUM at build time, never by matching the
+    /// serialized surface string, so it cannot drift from
+    /// `stale_quota_remedy`'s arms. Note the 3P Bearer Kimi provider is
+    /// catalogued `Surface::ClaudeCode`, so it is correctly NOT expected here
+    /// — only the native-CLI slot is.
+    #[serde(default)]
+    expected: bool,
 }
 
 /// JSON representation of one unrecoverable rename label slot.
@@ -769,6 +869,10 @@ struct CacheSweeperInfo {
     files_swept_last_run: u64,
     files_skipped_last_run: u64,
     cache_sweep_blocked: u64,
+    /// `true` when the roots-seen FIFO does not exist — the sweeper has no
+    /// input at all. Forces `status: "degraded"`; see the setter's docstring
+    /// for why "no input" must be distinguishable from "nothing to do".
+    roots_source_missing: bool,
 }
 
 /// Round-3 R3-M3 + R2-M2 shape: status + count + first-name
@@ -779,13 +883,25 @@ struct CacheSweeperInfo {
 #[derive(Serialize)]
 struct HostIsolationStatus {
     /// `"ok"` or `"warning"`. Round-1 H4 gate: `warning` only
-    /// fires when a Gemini slot exists AND production-shaped
-    /// secrets are present. cc/codex-only deployments without a
-    /// Gemini slot see `ok` even with secrets in env.
+    /// fires when a Gemini slot OR a non-ollama 3P bearer slot
+    /// (kimi/zai/mm/deepseek — host-isolation-parity-followups (2))
+    /// exists AND production-shaped secrets are present.
+    /// cc/codex-only deployments without a Gemini or 3P bearer slot
+    /// see `ok` even with secrets in env.
     status: &'static str,
     /// Whether at least one Gemini slot is provisioned. The gate
     /// requires this — operators who never use gemini get `ok`.
     gemini_slots_present: bool,
+    /// Whether at least one slot is bound to a non-ollama 3P bearer
+    /// provider (kimi/zai/mm/deepseek) — the same surfaces `csq run`
+    /// warns for via `launch_third_party` /
+    /// `emit_host_isolation_warning_if_needed` in
+    /// `csq/src/cli/commands/run.rs`. Loopback ollama is excluded
+    /// (mirrors that file's `surface_name != "ollama"` gate) — see
+    /// `third_party_bearer_slots_present()`. Additive field
+    /// (host-isolation-parity-followups (2)); existing
+    /// `gemini_slots_present` consumers are unaffected.
+    third_party_bearer_slots_present: bool,
     /// Number of detected production-shaped env-var names (round-2
     /// R2-H3 disclosure-minimization — count + exemplar only by
     /// default).
@@ -1222,7 +1338,29 @@ pub struct PerSlotQuota {
     /// `<base_dir>/quota.json`'s per-account `five_hour` window. When
     /// the daemon has not yet polled the slot, this is 0.0 — callers
     /// MUST treat 0.0 as "no data" rather than "fully fresh".
+    ///
+    /// Stays `f64` (never `Option`) because
+    /// `coc-eval/scripts/validate-doctor-json.py` pins it as numeric and
+    /// rejects any other type. Read `window_present` to tell a measured
+    /// 0% from an absent window.
     pub utilization: f64,
+    /// Whether `utilization` is a MEASUREMENT or a placeholder.
+    ///
+    /// `false` means the row carries no 5-hour window at all, so
+    /// `utilization` is the `unwrap_or(0.0)` default rather than an
+    /// observation. Balance-metered slots (DeepSeek) and weekly-only
+    /// slots (Grok) are permanently in this state — they have no 5-hour
+    /// window to report and never will.
+    ///
+    /// This field exists because a fabricated `0.0` is not merely
+    /// cosmetic here: `validate-doctor-json.py` gates benchmark recording
+    /// on `utilization < ceiling`, so a slot with no 5-hour window passed
+    /// the gate as "0% used" no matter how exhausted it actually was. The
+    /// validator now fails closed on `window_present: false` rather than
+    /// reading the placeholder as a measurement
+    /// (`eval-instrument-discipline.md`: an instrument that cannot
+    /// discriminate is not evidence).
+    pub window_present: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -1270,7 +1408,9 @@ fn build_per_slot_report(base_dir: &Path, slot: u16) -> Result<PerSlotReport> {
     }
 
     // Quota readout — load quota.json and pull the slot's 5h window.
-    let utilization = read_slot_five_hour_pct(base_dir, slot);
+    // `None` = no window to measure; the placeholder 0.0 below is reported
+    // as such via `window_present` rather than passed off as a reading.
+    let measured = read_slot_five_hour_pct(base_dir, slot);
 
     let status = if !present || expired {
         "error".to_string()
@@ -1281,26 +1421,40 @@ fn build_per_slot_report(base_dir: &Path, slot: u16) -> Result<PerSlotReport> {
     Ok(PerSlotReport {
         slot,
         status,
-        quota: PerSlotQuota { utilization },
+        quota: PerSlotQuota {
+            utilization: measured.unwrap_or(0.0),
+            window_present: measured.is_some(),
+        },
         credentials: PerSlotCredentials { present, expired },
     })
 }
 
-fn read_slot_five_hour_pct(base_dir: &Path, slot: u16) -> f64 {
+/// Reads the slot's 5-hour utilization, distinguishing a MEASUREMENT from
+/// an absent window.
+///
+/// Returns `None` when the file is missing/corrupt, the slot has no row, or
+/// the row carries no `five_hour` window. Every one of those is "not
+/// measured" — the caller decides how to render that, rather than inheriting
+/// a `0.0` that is indistinguishable from a real 0% reading.
+fn read_slot_five_hour_pct(base_dir: &Path, slot: u16) -> Option<f64> {
     use csq_core::quota::QuotaFile;
     let path = base_dir.join("quota.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return 0.0;
-    };
-    let Ok(qf) = serde_json::from_str::<QuotaFile>(&content) else {
-        return 0.0;
-    };
-    qf.get(slot).map(|q| q.five_hour_pct()).unwrap_or(0.0)
+    let content = std::fs::read_to_string(&path).ok()?;
+    let qf = serde_json::from_str::<QuotaFile>(&content).ok()?;
+    qf.get(slot)?.five_hour_pct_opt()
 }
 
 fn print_per_slot_report(r: &PerSlotReport) {
     println!("slot {}: status={}", r.slot, r.status);
-    println!("  quota.utilization: {:.1}%", r.quota.utilization);
+    if r.quota.window_present {
+        println!("  quota.utilization: {:.1}%", r.quota.utilization);
+    } else {
+        // No 5-hour window on this row — printing "0.0%" here read as
+        // "quota healthy, look elsewhere", which is a confident wrong
+        // answer on the surface an operator consults when something is
+        // already broken.
+        println!("  quota.utilization: n/a (no 5h window for this slot)");
+    }
     println!(
         "  credentials: present={} expired={}",
         r.credentials.present, r.credentials.expired
@@ -1333,7 +1487,7 @@ fn gemini_unreadable_slots(base_dir: &Path) -> Vec<u16> {
 /// Slots whose Codex binding file is spawn-admissible
 /// (`is_codex_bound_slot`) and parses successfully but does NOT carry a
 /// Codex variant — operator wrote an Anthropic-shape credential to the
-/// Codex-prefixed path (wrong-variant, an internal ticket / #525). These slots
+/// Codex-prefixed path (wrong-variant, an internal ticket / an internal ticket). These slots
 /// are invisible to quota polling and CLI surface checks yet the daemon
 /// WILL attempt to use them. Named directly with a self-sufficient
 /// remediation instead of delegating to `csq probe --all`.
@@ -1351,25 +1505,47 @@ fn codex_wrong_variant_slots(base_dir: &Path) -> Vec<u16> {
 /// actually emits. v17 (`audit_trust_plane_grade`) and v18
 /// (`audit_verification_level_summary`) are enterprise-only + `skip_serializing_if`,
 /// so the community build skipped them (its ceiling was v16). v19
-/// (`mcp_partial_coverage`, CU4 #764) ships on BOTH editions, raising the
-/// community ceiling 16 → 19. **v20** (`mcp_gate_outbox_backlog`, #914) is the
+/// (`mcp_partial_coverage`, CU4 an internal ticket) ships on BOTH editions, raising the
+/// community ceiling 16 → 19. **v20** (`mcp_gate_outbox_backlog`, an internal ticket) is the
 /// next enterprise-only + `skip_serializing_if` field — it serializes on the
-/// enterprise build when the MCP-gate outbox is non-empty. **v21** (M6 #909 shard D)
+/// enterprise build when the MCP-gate outbox is non-empty. **v21** (M6 an internal ticket shard D)
 /// extends that SAME enterprise-only field with the daemon-aware `state`
 /// (`stuck` / `draining` / `pending_daemon_down`) + `last_drain_age_secs`,
-/// replacing #914's fixed-6h stuck judgment — a shape change to an enterprise-only
+/// replacing an internal ticket's fixed-6h stuck judgment — a shape change to an enterprise-only
 /// field, so the enterprise ceiling rises 20 → **21** while the community ceiling
 /// stays at **19** (the field is never emitted there — the outbox producer is
-/// enterprise-only). **v22** (`audit_bundle_floor_anchor`, #787 b2b) is the next
+/// enterprise-only). **v22** (`audit_bundle_floor_anchor`, an internal ticket b2b) is the next
 /// enterprise-only + `skip_serializing_if` field — the policy-bundle floor
 /// keychain-anchor DETECTOR verdict, emitted on the enterprise build once a bundle
 /// is installed. The enterprise ceiling rises 21 → **22**; the community ceiling
-/// stays at **19** (the phase-2b bundle floor is moat-stripped). The `#[cfg]` split
-/// carries that edition delta.
+/// stays at **19** (the phase-2b bundle floor is moat-stripped). **v23**
+/// (`stale_quota_slots`) is the operator-surface fix for the `csq doctor`
+/// all-green / `csq status` `stale Nd` gap — sourced from `csq status`'s own
+/// staleness channel (`account-terminal-separation.md` MUST Rule 4). Unlike
+/// v20-v22 this field is NOT `cfg`-gated — the community build computes and
+/// emits it too (`skip_serializing_if` describes a RUNTIME state, no stale
+/// slots right now, not an edition capability) — so per the "highest
+/// field-version an edition emits" contract the community ceiling jumps
+/// PAST v20/v21/v22 straight to v23, the same way v19
+/// (`mcp_partial_coverage`) jumped it from 16 straight to 19 past v17/v18.
+/// BOTH ceilings land on the SAME number: enterprise 22 → **23**, community
+/// 19 → **23**.
 #[cfg(feature = "enterprise")]
-const DOCTOR_SCHEMA_VERSION: u32 = 22;
+const DOCTOR_SCHEMA_VERSION: u32 = 23;
 #[cfg(not(feature = "enterprise"))]
-const DOCTOR_SCHEMA_VERSION: u32 = 19;
+const DOCTOR_SCHEMA_VERSION: u32 = 23;
+
+/// Derive the `schema` string from [`DOCTOR_SCHEMA_VERSION`] — the ONLY place
+/// `"csq.doctor.v"` + the version number are concatenated (an internal ticket Track B: a
+/// contract-change policy for this field lives here, next to the constant it
+/// derives from). Additive-only within a major: a new field may be added under the
+/// same `schema` value; a rename, removal, or retype of an EXISTING field requires
+/// bumping [`DOCTOR_SCHEMA_VERSION`] (and therefore this string) to a new major.
+/// Hosts detect the contract via presence of `schema` + a `starts_with` match on
+/// the major (`"csq.doctor.v23"` matches `"csq.doctor.v23"`, never `"csq.doctor.v24"`).
+fn doctor_schema_string() -> String {
+    format!("csq.doctor.v{DOCTOR_SCHEMA_VERSION}")
+}
 
 /// M2 T2.5 / M3a — trust-plane grade for the `csq doctor` schema, derived
 /// from the chain's `AuditHealth` and the M3a `verification_levels_populated`
@@ -1412,7 +1588,7 @@ fn gated_doctor_trust_plane_grade(
     }
 }
 
-/// #787 b2b — project the policy-bundle floor keychain-anchor cross-check into
+/// an internal ticket b2b — project the policy-bundle floor keychain-anchor cross-check into
 /// the doctor report. DETECTOR posture: reports the anchor status but never
 /// changes the enforced (file) floor. Returns `None` (field omitted) until a
 /// bundle has been installed. Enterprise-only; the community variant is always
@@ -1498,6 +1674,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         audit_roster_floor_anchor,
         audit_verification_levels_populated,
         audit_level_summary_raw,
+        audit_records_unverified,
     ) = check_audit_chain(base_dir);
 
     // Enterprise gate-coverage (task #77): the trust-plane grade is enterprise-differentiated
@@ -1522,6 +1699,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
 
     DoctorReport {
         schema_version: DOCTOR_SCHEMA_VERSION,
+        schema: doctor_schema_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: check_platform(),
         claude_code,
@@ -1536,6 +1714,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         settings: check_settings(),
         daemon: check_daemon(base_dir),
         accounts: check_accounts(base_dir),
+        stale_quota_slots: check_stale_quota_polls(base_dir),
         broker_failed: check_broker_failed(base_dir),
         mixed_state_slots: check_mixed_state_slots(base_dir),
         terminals: check_terminals(base_dir),
@@ -1554,6 +1733,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         audit_trust_plane_grade,
         audit_verification_level_summary,
         audit_chain_state,
+        audit_records_unverified,
         audit_keychain_anchor,
         audit_roster_floor_anchor,
         audit_bundle_floor_anchor: doctor_bundle_floor_anchor(base_dir),
@@ -1647,11 +1827,11 @@ fn check_seam_registry_status(base_dir: &Path) -> String {
     }
 }
 
-/// M6 #914: inspect the MCP-gate attestation outbox for a stuck backlog.
+/// M6 an internal ticket: inspect the MCP-gate attestation outbox for a stuck backlog.
 ///
 /// Reads `<base>/csq-runs/.pending-mcp-gate/*.json` directly (independent of the
 /// daemon — `csq doctor` runs whether or not the daemon is up) and reports the
-/// queued count + the OLDEST file's age + the daemon-aware `state` (M6 #909 shard D,
+/// queued count + the OLDEST file's age + the daemon-aware `state` (M6 an internal ticket shard D,
 /// via [`classify_mcp_gate_backlog`]). WARNs (`state == Stuck`) when the daemon is
 /// draining yet the oldest file persists past
 /// [`MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS`], or the count exceeds the soft
@@ -1711,7 +1891,7 @@ fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog
         // Dir exists but empty (drained clean) → nothing to report.
         return None;
     }
-    // M6 #909 shard D: read the last-drain stamp (shard B) as the daemon-liveness +
+    // M6 an internal ticket shard D: read the last-drain stamp (shard B) as the daemon-liveness +
     // drain-activity signal, and classify. `now_secs` shares the `now` used for the
     // per-file mtime ages above.
     let now_secs = now
@@ -1731,8 +1911,8 @@ fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog
     })
 }
 
-/// M6 #909 shard D: the daemon-aware disposition of a non-empty mcp-gate outbox
-/// backlog, replacing #914's fixed-6h wall-clock. Serialized in the doctor JSON
+/// M6 an internal ticket shard D: the daemon-aware disposition of a non-empty mcp-gate outbox
+/// backlog, replacing an internal ticket's fixed-6h wall-clock. Serialized in the doctor JSON
 /// (v21). Only `Stuck` is operator-actionable (`warn`); the other two are info.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1754,7 +1934,7 @@ enum McpGateBacklogState {
     PendingDaemonDown,
 }
 
-/// Pure daemon-aware backlog classifier (M6 #909 shard D), replacing #914's fixed-6h
+/// Pure daemon-aware backlog classifier (M6 an internal ticket shard D), replacing an internal ticket's fixed-6h
 /// `mcp_gate_outbox_is_stuck`. The `last_drain_secs` stamp (shard B) is the
 /// daemon-liveness + drain-activity signal. Disposition:
 ///
@@ -2045,6 +2225,44 @@ fn check_audit_orphan_intents_m13(base_dir: &Path) -> Vec<csq_core::audit::Orpha
     }
 }
 
+/// Builds the operator-facing `Audit chain:` line.
+///
+/// Extracted from the renderer so both branches of the partial-coverage split
+/// are testable. Inline, the only way to exercise them was to capture stdout,
+/// which is why the bare-`✓`-on-a-partial-run defect shipped untested.
+///
+/// `records_unverified` is the count the verifier SKIPPED at its record limit.
+/// It is a separate parameter rather than part of `health` because
+/// `AuditHealth::Verified` is a unit variant and cannot carry it.
+fn audit_chain_line(health: &csq_core::audit::AuditHealth, records_unverified: u64) -> String {
+    use csq_core::audit::AuditHealth;
+    match health {
+        // A bare `✓ verified` is truthful only for WHOLE-CHAIN coverage. When
+        // the verifier hits its record limit it logs `audit_verify_limit_exceeded`
+        // and skips the oldest records — the genesis among them — yet
+        // `AuditHealth::Verified` looks identical either way. Discriminate here,
+        // or this line cannot fail (`instrument-discipline.md` MUST-1).
+        AuditHealth::Verified if records_unverified > 0 => format!(
+            "  Audit chain:   {} PARTIAL — tail verified; {records_unverified} older record(s), \
+             INCLUDING the genesis, were NOT verified (run `csq audit verify --full`)",
+            warn(),
+        ),
+        AuditHealth::Verified => format!("  Audit chain:   {} verified", ok()),
+        AuditHealth::Degraded { gaps } => format!(
+            "  Audit chain:   {} DEGRADED ({} historical gap{})",
+            warn(),
+            gaps.len(),
+            if gaps.len() == 1 { "" } else { "s" }
+        ),
+        AuditHealth::Broken { error_kind, .. } => {
+            format!("  Audit chain:   {} BROKEN ({error_kind})", fail())
+        }
+        AuditHealth::Unknown { reason } => {
+            format!("  Audit chain:   {} UNVERIFIED ({reason})", warn())
+        }
+    }
+}
+
 /// Return shape of [`check_audit_chain`]: historical-key gaps, the chain-health
 /// classification, the keychain + roster-floor anchor verdicts, the M3a
 /// `verification_levels_populated` signal, and the M3a per-level disclosure map
@@ -2059,6 +2277,14 @@ type AuditChainCheck = (
     Option<csq_core::audit::RosterFloorAnchorStatus>,
     bool,
     Option<std::collections::BTreeMap<String, u64>>,
+    // Records the verifier SKIPPED because the chain exceeded `record_limit`.
+    // Carried separately because `AuditHealth` cannot express it: `Verified` is
+    // a unit variant, so `from_verify_result` discards this count and every
+    // consumer of the enum alone is blind to partial coverage. Surfacing it here
+    // keeps the fix confined to the operator surface that was lying, rather than
+    // churning a trust-bearing enum across its twelve consumers — see the render
+    // site for the residual that leaves.
+    u64,
 );
 
 /// Runs a lightweight `verify_chain` scan (tail 1,000 records) and returns
@@ -2166,6 +2392,7 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
                 floor_anchor,
                 vl_populated,
                 vl_summary,
+                summary.limit_exceeded_count,
             )
         }
         // KeychainUnavailable is the transient case where the keychain genuinely
@@ -2173,6 +2400,10 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
         // self-contradictory "chain unverified + anchor confirmed"). For a
         // genuinely-fatal Broken error there is no anchor verdict; default to
         // Confirmed (N/A) — the Broken health line carries the failure.
+        // 0 on both Err arms: the verifier did not complete, so there is no
+        // coverage figure to report. The Broken/Unknown health line already
+        // carries the failure, and a non-zero count here would imply a partial
+        // verification that never happened.
         Err(LedgerError::KeychainUnavailable { .. }) => (
             Vec::new(),
             health,
@@ -2180,6 +2411,7 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
             None,
             false,
             None,
+            0,
         ),
         Err(_) => (
             Vec::new(),
@@ -2188,6 +2420,7 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
             None,
             false,
             None,
+            0,
         ),
     }
 }
@@ -2468,7 +2701,7 @@ fn detect_legacy_canonical_codex(base_dir: &Path) -> Option<LegacyCompatEntry> {
 /// UUID shape. The decimal-content shape is informational (M4-7 reader is
 /// tolerant of both formats).
 ///
-/// #578: the identity-store skip prevents two false-positive classes —
+/// an internal ticket: the identity-store skip prevents two false-positive classes —
 /// 3P API-key slots (decimal by design, `by_slot_identity = "apikey:*"`)
 /// and modern OAuth slots whose marker simply never got rewritten by a
 /// login/swap flow. The detector now fires only for slots with no map
@@ -2479,7 +2712,7 @@ fn detect_legacy_canonical_codex(base_dir: &Path) -> Option<LegacyCompatEntry> {
 /// already UUID-shaped or missing, or every decimal-marked slot is an
 /// identity-store member.
 fn detect_decimal_marker(base_dir: &Path) -> Option<LegacyCompatEntry> {
-    // #578: a slot recovery-backed by ANY identity channel is a MODERN
+    // an internal ticket: a slot recovery-backed by ANY identity channel is a MODERN
     // account, regardless of its `.csq-account` marker content. For a
     // `config-<N>` dir the slot derives from the dir NAME and the identity
     // from a channel (`by_slot` UUID for OAuth, `by_slot_identity` for 3P
@@ -2511,7 +2744,7 @@ fn detect_decimal_marker(base_dir: &Path) -> Option<LegacyCompatEntry> {
         let Ok(slot) = rest.parse::<u16>() else {
             continue;
         };
-        // Skip identity-store members (#578) via the SINGLE authoritative
+        // Skip identity-store members (an internal ticket) via the SINGLE authoritative
         // recovery-backed predicate (by_slot ∪ by_slot_identity ∪
         // regular-file gemini-<N>.json marker). Shared with
         // `audit_coexistence` + the `legacy_count` heuristic so the three
@@ -2577,6 +2810,10 @@ fn check_cache_sweeper(base_dir: &Path) -> CacheSweeperInfo {
                 files_swept_last_run: 0,
                 files_skipped_last_run: 0,
                 cache_sweep_blocked: 0,
+                // Distinct condition: the sweeper has never written a snapshot
+                // at all, which `never_run` already conveys. Claiming the roots
+                // source is missing would be an unverified assertion.
+                roots_source_missing: false,
             };
         }
     };
@@ -2588,11 +2825,18 @@ fn check_cache_sweeper(base_dir: &Path) -> CacheSweeperInfo {
         .unwrap_or(0);
 
     // R4/B90 acceptance: sweep_partial=true for >24h ⇒ degraded.
-    let status: &'static str = if snap.sweep_partial && lag_minutes > 24 * 60 {
-        "degraded"
-    } else {
-        "ok"
-    };
+    //
+    // `roots_source_missing` ⇒ degraded immediately (no lag grace): the sweeper
+    // has NO INPUT, which is a wiring fault, not a workload state. Reporting
+    // "ok" here is what let a sweeper reading a path nothing writes look
+    // healthy indefinitely — `files_swept_last_run: 0` is the same value a
+    // correctly-wired idle sweeper reports.
+    let status: &'static str =
+        if snap.roots_source_missing || (snap.sweep_partial && lag_minutes > 24 * 60) {
+            "degraded"
+        } else {
+            "ok"
+        };
 
     CacheSweeperInfo {
         status,
@@ -2603,6 +2847,7 @@ fn check_cache_sweeper(base_dir: &Path) -> CacheSweeperInfo {
         files_swept_last_run: snap.files_swept_last_run,
         files_skipped_last_run: snap.files_skipped_last_run,
         cache_sweep_blocked: snap.cache_sweep_blocked,
+        roots_source_missing: snap.roots_source_missing,
     }
 }
 
@@ -2649,11 +2894,12 @@ fn check_host_isolation(base_dir: &Path) -> HostIsolationStatus {
 /// iterator explicitly so tests can pass synthetic env without
 /// mutating `std::env` (which would race across tests).
 ///
-/// Round-1 H4 gate: `warning` requires BOTH a provisioned Gemini
-/// slot AND production-shaped secrets in the parent env. Operators
-/// who never use Gemini get `ok` regardless of env shape — the
-/// warning is action-relevant only when a Gemini spawn could
-/// actually expose secrets.
+/// Round-1 H4 gate: `warning` requires BOTH (a provisioned Gemini
+/// slot OR a non-ollama 3P bearer slot — host-isolation-parity-
+/// followups (2)) AND production-shaped secrets in the parent env.
+/// Operators who never use Gemini or a 3P bearer provider get `ok`
+/// regardless of env shape — the warning is action-relevant only
+/// when an affected spawn could actually expose secrets.
 fn check_host_isolation_with_env<'a, I>(base_dir: &Path, env_var_names: I) -> HostIsolationStatus
 where
     I: IntoIterator<Item = &'a str>,
@@ -2705,8 +2951,18 @@ where
             .filter_map(|n| AccountNum::try_from(n).ok())
             .any(|slot| is_gemini_bound_slot(base_dir, slot));
 
-    // Round-1 H4 gate.
-    let status = if gemini_slots_present && detected_count > 0 {
+    // host-isolation-parity-followups (2): the same MED-03 risk
+    // (spawned model reads $HOME unfiltered) applies to every 3P
+    // bearer-auth spawn (`launch_third_party`), not only Gemini —
+    // `csq run` already warns for kimi/zai/mm/deepseek (an internal ticket).
+    // `csq doctor` MUST use the same gate so the aggregate
+    // diagnostic doesn't under-report relative to what `csq run`
+    // actually warns about.
+    let third_party_bearer_slots_present = third_party_bearer_slots_present(base_dir);
+
+    // Round-1 H4 gate, extended (2) to the 3P bearer surface.
+    let status = if (gemini_slots_present || third_party_bearer_slots_present) && detected_count > 0
+    {
         "warning"
     } else {
         "ok"
@@ -2715,12 +2971,45 @@ where
     HostIsolationStatus {
         status,
         gemini_slots_present,
+        third_party_bearer_slots_present,
         detected_count,
         first_name,
         // Default mode: empty list (round-2 R2-M2 disclosure-min).
         // Verbose-mode wiring is a follow-up.
         detected_var_names: Vec::new(),
     }
+}
+
+/// host-isolation-parity-followups (2): true when at least one slot
+/// is bound to a non-ollama 3P bearer-auth provider (kimi/zai/mm/
+/// deepseek) — the exact surfaces `csq run`'s `launch_third_party`
+/// warns for via `emit_host_isolation_warning_if_needed`
+/// (`csq/src/cli/commands/run.rs`).
+///
+/// Reuses `discovery::discover_per_slot_third_party` (the SAME
+/// per-slot 3P enumeration `csq run`'s `is_third_party` guard and
+/// `resolve_third_party_surface_name` are built on) and
+/// `csq_core::providers::catalog::id_from_display_name` to resolve
+/// each slot's display name to its catalog id — no duplicated
+/// classification logic (`account-terminal-separation.md` MUST
+/// Rule 4: diagnostic surfaces read the same channel as production
+/// paths).
+///
+/// Loopback ollama is excluded — mirrors `launch_third_party`'s
+/// `surface_name != "ollama"` gate: a loopback endpoint
+/// (`http://localhost:11434`) has no remote vendor to exfiltrate to,
+/// so the vendor-exposure warning would be misleading. A REMOTE
+/// ollama-compatible endpoint is classified `"third-party"`, not
+/// `"ollama"`, by `provider_from_base_url`, and still counts here.
+fn third_party_bearer_slots_present(base_dir: &Path) -> bool {
+    discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .any(|a| match &a.source {
+            AccountSource::ThirdParty { provider } => {
+                csq_core::providers::catalog::id_from_display_name(provider) != Some("ollama")
+            }
+            _ => false,
+        })
 }
 
 /// Probes for a `node` or `bun` binary using the same two-stage
@@ -2748,7 +3037,7 @@ fn check_js_runtime() -> JsRuntimeInfo {
 ///
 /// This is a mixed-state slot — on `csq run N` CC will route to the
 /// 3P endpoint because `env.ANTHROPIC_BASE_URL` wins over OAuth, so
-/// the OAuth credential sits unused. `csq login N` on a post-PR-#130
+/// the OAuth credential sits unused. `csq login N` on a post-PR-an internal ticket
 /// build auto-strips the 3P env block; older installs leave the slot
 /// stuck.
 fn check_mixed_state_slots(base_dir: &Path) -> MixedStateInfo {
@@ -2871,6 +3160,7 @@ fn manager_display(m: InstallManager) -> &'static str {
         InstallManager::BrewFormula => "brew_formula",
         InstallManager::BrewCask => "brew_cask",
         InstallManager::ClaudeNativeInstaller => "claude_native",
+        InstallManager::SelfManaged => "self_managed",
         InstallManager::Unknown => "unknown",
     }
 }
@@ -2990,9 +3280,65 @@ fn count_authenticated_slots(base_dir: &Path, cli: SurfaceCli) -> usize {
             .into_iter()
             .filter(|a| a.has_credentials)
             .count(),
+        // W3-3 (an internal journal entry): native Kimi/Grok slots have no `discover_*`
+        // helper yet (deferred — see the plan's discovery.rs shard). A native
+        // slot has no credentials of its own to be "authenticated" in the
+        // OAuth/API-key sense — the credential-less binding marker's
+        // existence IS the authentication signal (the vendor CLI owns the
+        // real auth). Count slots whose marker exists, mirroring how
+        // `discover_gemini` scans `credentials/` for its own marker shape.
+        SurfaceCli::Kimi => {
+            count_native_authenticated_slots(base_dir, csq_core::providers::catalog::Surface::Kimi)
+        }
+        SurfaceCli::Grok => {
+            count_native_authenticated_slots(base_dir, csq_core::providers::catalog::Surface::Grok)
+        }
         // SurfaceCli is #[non_exhaustive]; future variants return 0.
         _ => 0,
     }
+}
+
+/// Counts slots bound to a native-CLI `surface` (Kimi/Grok) — i.e. slots
+/// whose credential-less binding marker
+/// (`credentials/{kimi,grok}-<N>.json`) exists. Mirrors
+/// `discovery::discover_gemini`'s `credentials/` directory scan (same
+/// marker-existence-keys-the-slot shape), then confirms each candidate via
+/// [`csq_core::providers::native::marker_exists`] rather than trusting the
+/// filename-parse alone.
+fn count_native_authenticated_slots(
+    base_dir: &Path,
+    surface: csq_core::providers::catalog::Surface,
+) -> usize {
+    use csq_core::providers::native;
+
+    let creds_dir = base_dir.join("credentials");
+    let entries = match std::fs::read_dir(&creds_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let prefix = format!("{}-", surface.as_str());
+    entries
+        .flatten()
+        .filter(|entry| {
+            // Reject symlinks at the discovery boundary — mirrors
+            // `discover_gemini`'s identical guard.
+            entry
+                .file_type()
+                .map(|ft| !ft.is_symlink())
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            let num_str = stem.strip_prefix(&prefix)?;
+            let id: u16 = num_str.parse().ok()?;
+            AccountNum::try_from(id).ok()
+        })
+        .filter(|slot| native::marker_exists(base_dir, *slot, surface))
+        .count()
 }
 
 fn check_settings() -> SettingsInfo {
@@ -3128,6 +3474,180 @@ fn check_accounts(base_dir: &Path) -> AccountsInfo {
         total,
         with_credentials,
         expired,
+    }
+}
+
+/// Builds the `stale_quota_slots` row — the ONLY doctor check that reads
+/// [`csq_core::quota::status::show_status`], the same function `csq status`
+/// calls on its fallback (non-daemon) path, so `stale_secs` classification
+/// (age > `STALE_THRESHOLD_SECS`, computed by `poll_freshness`) is
+/// byte-identical between the two commands (`account-terminal-separation.md`
+/// MUST Rule 4). `check_accounts` above deliberately does NOT read this
+/// channel — it answers a different question (does the slot have live
+/// credentials / has the OAuth token expired), which is blind to a slot
+/// whose credentials AND binding marker are both healthy but whose quota
+/// poll has silently frozen (the native Kimi/Grok vendor-token-expiry case
+/// this field exists to surface).
+///
+/// `active` is `None` — staleness classification does not depend on which
+/// slot is the CLI's current binding.
+fn check_stale_quota_polls(base_dir: &Path) -> Vec<StaleQuotaSlotJson> {
+    csq_core::quota::status::show_status(base_dir, None)
+        .into_iter()
+        .filter_map(|a| {
+            let age_secs = a.stale_secs?;
+            Some(StaleQuotaSlotJson {
+                slot: a.id,
+                label: sanitize_for_display(&a.label),
+                surface: a.surface.as_str().to_string(),
+                age_secs,
+                remedy: stale_quota_remedy(a.id, a.surface, &a.method, &a.source),
+                expected: is_expected_stale_surface(a.surface),
+            })
+        })
+        .collect()
+}
+
+/// Whether a stale quota poll on this surface is EXPECTED — i.e. needs no
+/// operator action and resolves itself.
+///
+/// True only for the vendor-authed native-CLI surfaces. csq deliberately never
+/// refreshes their tokens (an internal journal entry design lock); measured 2026-08-06 a
+/// Kimi vendor token lives 900 s and IS refreshed by a real `csq run` but by
+/// nothing else, so an idle native slot is stale almost always.
+///
+/// Deliberately a POSITIVE allowlist over the `Surface` enum, matching
+/// [`stale_quota_remedy`]'s arms one-for-one. A future surface is NOT expected
+/// by default — a new surface whose staleness is genuinely a fault must keep
+/// warning, and silence-by-default is the wrong failure direction here.
+fn is_expected_stale_surface(surface: csq_core::providers::catalog::Surface) -> bool {
+    use csq_core::providers::catalog::Surface;
+    matches!(surface, Surface::Kimi | Surface::Grok)
+}
+
+/// Actionable, surface-specific remediation for a stale quota poll.
+///
+/// Native Kimi/Grok remedy verified against `csq/src/cli/commands/login.rs`
+/// `handle` (2026-08-04): `--provider kimi-cli` routes to `handle_native(...,
+/// Surface::Kimi, ...)`, `--provider grok` routes to `handle_native(...,
+/// Surface::Grok, ...)` — both re-bind the slot THROUGH csq. A bare vendor
+/// CLI login (`grok login` / `kimi-code login`) writes to the vendor's own
+/// home dir (`~/.grok`, `~/.kimi-code`) and never touches csq's binding
+/// marker or the slot's quota poll — the slot stays frozen even though the
+/// vendor CLI itself now has a fresh session (`account-terminal-separation.md`,
+/// user memory `discovery_native_slot_login_must_go_through_csq`).
+///
+/// `method` and `source` come straight from the `AccountStatus` row
+/// `check_stale_quota_polls` already reads (`AccountInfo.method` /
+/// `AccountInfo.source`, set once per slot at discovery time — never
+/// re-derived from a legacy marker, per `account-terminal-separation.md`
+/// MUST NOT Rule 4). They are the auth-MECHANISM axis (OAuth login vs a
+/// static key) and are orthogonal to `BillingMode` (the per-PLAN axis —
+/// MiniMax/Z.AI/DeepSeek ship both subscription and pay-per-token plans
+/// behind the SAME static-key binding, so `BillingMode` cannot tell
+/// "csq login will work here" from "it won't").
+///
+/// `ClaudeCode` and `Gemini` both multiplex an OAuth mode and one or more
+/// static-credential modes onto the same `Surface`, so — unlike Kimi/Grok/
+/// Codex, which have exactly one auth mechanism each — their remedy MUST
+/// branch on `method`. Sending `csq login` to a static-credential slot is
+/// the exact defect this function exists to avoid (SWEEP-2026-08-12): it
+/// cannot work (there is no OAuth session to refresh) and burns trust in
+/// every other remedy on this surface, same as the native treadmill above.
+fn stale_quota_remedy(
+    slot: u16,
+    surface: csq_core::providers::catalog::Surface,
+    method: &str,
+    source: &csq_core::accounts::AccountSource,
+) -> String {
+    use csq_core::providers::catalog::Surface;
+    match surface {
+        // Native-CLI surfaces: staleness here is EXPECTED and needs no action.
+        //
+        // Measured 2026-08-06: a Kimi vendor token lives 900 s, and csq
+        // deliberately never refreshes native tokens (an internal journal entry design
+        // lock). A real `csq run <slot>` DOES refresh it — verified,
+        // `expires_at` moved 00:20:33 -> 08:06:20 — but nothing refreshes it
+        // while the slot is idle. So the slot goes stale ~15 min after ANY
+        // login and csq's poll 401s until the slot is next used.
+        //
+        // The previous remedy told the operator to re-login. That is a
+        // TREADMILL: it buys ~15 minutes and the warning returns. The
+        // maintainer followed it, and the slot was stale again within the
+        // hour. Prescribing an action that cannot work is worse than
+        // prescribing none, because it burns trust in every other remedy on
+        // this surface.
+        //
+        // `csq status` renders the same state as "· re-auths on use" (an internal ticket);
+        // these two operator surfaces MUST NOT contradict each other.
+        //
+        // The re-login IS still the remedy when the vendor session is
+        // genuinely revoked — which shows up as the slot failing IN USE, not
+        // as a stale poll. That is the condition named here.
+        Surface::Kimi => format!(
+            "expected — the vendor token lives ~15 min and csq does not refresh it; \
+             the poll re-authorizes when you next USE slot {slot}. Re-login only if \
+             the slot fails in use: `csq login {slot} --provider kimi-cli` (NOT a bare \
+             `kimi-code` login, which writes to ~/.kimi-code and never rebinds the slot)"
+        ),
+        Surface::Grok => format!(
+            "expected — the vendor token is short-lived and csq does not refresh it; \
+             the poll re-authorizes when you next USE slot {slot}. Re-login only if \
+             the slot fails in use: `csq login {slot} --provider grok` (NOT a bare \
+             `grok` login, which writes to ~/.grok and never rebinds the slot)"
+        ),
+        Surface::Codex => format!(
+            "check `csq daemon status`; if healthy, run `csq login {slot} --provider codex` \
+             to re-authenticate"
+        ),
+        // Gemini has three binding modes (spec 07 §7.3.4): Code Assist OAuth
+        // (`csq login --provider gemini`), AI Studio API key, and Vertex SA —
+        // the latter two are set via `csq setkey gemini`, never `csq login`
+        // (`csq/src/cli/commands/login.rs::handle` "gemini" arm only ever
+        // calls `handle_gemini_oauth`; there is no OAuth flow for the other
+        // two modes to re-authenticate).
+        Surface::Gemini if method == "code_assist_oauth" => format!(
+            "check `csq daemon status`; if healthy, run `csq login {slot} --provider gemini` \
+             to re-authenticate"
+        ),
+        Surface::Gemini => format!(
+            "check `csq daemon status`; this slot is bound via a static credential \
+             (AI Studio key or Vertex service account), not OAuth — re-run `csq setkey \
+             gemini --slot {slot}` (add `--vertex-sa-json <path>` for Vertex SA) with a \
+             fresh key; `csq login {slot} --provider gemini` only re-authenticates the \
+             Code Assist OAuth path and will not help here"
+        ),
+        // `ClaudeCode` covers real Anthropic OAuth (`method == "oauth"`) AND
+        // every 3P Bearer provider (MiniMax, Z.AI, DeepSeek, Kimi's Bearer
+        // variant, Ollama) plus cloud-Claude Vertex/Bedrock routing — all of
+        // which bind via a static credential through `csq setkey`, not
+        // `csq login` (`csq/src/cli/commands/setkey.rs::handle`). Resolve the
+        // exact provider id from the display name `AccountSource::ThirdParty`
+        // carries where possible (`catalog::id_from_display_name`); a cloud-
+        // Claude slot's provider id ("claude-vertex"/"claude-bedrock") is not
+        // a catalog display name, so it falls through to the generic hint
+        // rather than guessing a command that might be wrong.
+        Surface::ClaudeCode if method == "oauth" => format!(
+            "check `csq daemon status`; if healthy, run `csq login {slot}` to re-authenticate"
+        ),
+        Surface::ClaudeCode => {
+            let setkey_hint = match source {
+                csq_core::accounts::AccountSource::ThirdParty { provider } => {
+                    csq_core::providers::catalog::id_from_display_name(provider).map(|id| {
+                        format!("re-run `csq setkey {id} --slot {slot}` with a fresh key")
+                    })
+                }
+                _ => None,
+            }
+            .unwrap_or_else(|| {
+                "re-run the bind command you originally used for this slot".to_string()
+            });
+            format!(
+                "check `csq daemon status`; this slot is bound via a static credential, \
+                 not OAuth — {setkey_hint}; `csq login {slot}` only re-authenticates \
+                 Anthropic OAuth slots and will not help here"
+            )
+        }
     }
 }
 
@@ -3345,7 +3865,7 @@ fn check_broker_failed(base_dir: &Path) -> BrokerFailedInfo {
 /// - `modern_count` = number of `term-<pid>` dirs with a living PID
 /// - `legacy_count` = number of `config-N` dirs that have credentials,
 ///   are NOT referenced by any living `term-<pid>` symlink, AND are NOT
-///   recovery-backed per `is_slot_recovery_backed` (#578 — `by_slot` ∪
+///   recovery-backed per `is_slot_recovery_backed` (an internal ticket — `by_slot` ∪
 ///   `by_slot_identity` ∪ gemini marker; an idle but identity-store member
 ///   account is modern, not legacy; only pre-migration config-N dirs with
 ///   no identity channel at all are counted)
@@ -3356,11 +3876,11 @@ fn check_terminals(base_dir: &Path) -> TerminalInfo {
     #[cfg(not(unix))]
     {
         let _ = base_dir;
-        return TerminalInfo {
+        TerminalInfo {
             modern_count: 0,
             legacy_count: 0,
             check_available: false,
-        };
+        }
     }
 
     #[cfg(unix)]
@@ -3493,7 +4013,7 @@ fn check_terminals_unix(base_dir: &Path) -> TerminalInfo {
             continue;
         }
 
-        // #578: a slot recovery-backed by ANY identity channel is a MODERN
+        // an internal ticket: a slot recovery-backed by ANY identity channel is a MODERN
         // account. An idle modern account (credentials on disk but no live
         // handle dir bound right now) is NOT a legacy terminal — the legacy
         // signal is a PRE-identity-store config-N being driven directly
@@ -3781,6 +4301,29 @@ fn print_report(r: &DoctorReport) {
     }
     println!("  Accounts:    {acct_icon} {acct_detail}");
 
+    // v23: stale quota polls — same channel `csq status` reads. Named per
+    // slot (not a bare count) so the operator does not have to cross-run
+    // `csq status` to find out WHICH slot is frozen — closes the gap where
+    // `csq doctor` read all-green while `csq status` showed native
+    // Kimi/Grok slots `stale 1d`+ with an expired vendor token.
+    for s in &r.stale_quota_slots {
+        println!(
+            "  Quota poll:  {} slot {} [{}] \"{}\" stale {} — {}",
+            // `⚠` on this surface means "needs attention". A native slot is
+            // stale ~15 min after every login BY DESIGN and needs none, so
+            // warning permanently would be alarm fatigue — it teaches the
+            // operator to skim a surface they only visit when something is
+            // already wrong. Expected staleness is `ℹ`; the age and the
+            // explanation are still printed, so nothing is hidden.
+            if s.expected { info() } else { warn() },
+            s.slot,
+            s.surface,
+            s.label,
+            csq_core::quota::format::fmt_time(s.age_secs),
+            s.remedy
+        );
+    }
+
     // Mixed-state slots (3P env block + OAuth creds)
     if r.mixed_state_slots.count > 0 {
         for entry in &r.mixed_state_slots.entries {
@@ -3832,7 +4375,7 @@ fn print_report(r: &DoctorReport) {
                 c.drift_dirs.join(", "),
             );
             println!(
-                "               → the gate will refuse all token adoptions for those accounts (refresh war returns). If this persists across runs, Claude Code changed format — file a csq issue (#833)."
+                "               → the gate will refuse all token adoptions for those accounts (refresh war returns). If this persists across runs, Claude Code changed format — file a csq issue (an internal ticket)."
             );
             // Show the fresh/not-yet-populated sessions the discriminator excluded,
             // so the operator can see drift was distinguished from benign fresh dirs
@@ -3868,11 +4411,14 @@ fn print_report(r: &DoctorReport) {
     }
 
     // PR-CA8b commit 4: spec 08 MED-03 host-isolation surface.
+    // host-isolation-parity-followups (2): generalized from
+    // Gemini-only to Gemini + non-ollama 3P bearer slots
+    // (kimi/zai/mm/deepseek), matching the `csq run` warning surface.
     // Always print the line (so operators see "ok" confirmation
-    // when their workstation is clean for Gemini), but use the
-    // warn() icon when status == "warning". Round-1 H4 gate
-    // ensures the warning fires only when a Gemini slot exists
-    // AND production-shaped secrets are present in env.
+    // when their workstation is clean), but use the warn() icon when
+    // status == "warning". Round-1 H4 gate ensures the warning fires
+    // only when an affected slot (Gemini OR 3P bearer) exists AND
+    // production-shaped secrets are present in env.
     let hi = &r.host_isolation;
     let (hi_icon, hi_detail) = match hi.status {
         "warning" => {
@@ -3884,7 +4430,7 @@ fn print_report(r: &DoctorReport) {
             (
                 warn(),
                 format!(
-                    "{} production-shaped env-var name(s) detected (e.g. {}) — Gemini reads $HOME unfiltered; specs/08 MED-03",
+                    "{} production-shaped env-var name(s) detected (e.g. {}) — Gemini/3P bearer models (kimi/zai/mm/deepseek) read $HOME unfiltered; specs/08 MED-03",
                     hi.detected_count,
                     first_name
                 ),
@@ -3892,10 +4438,19 @@ fn print_report(r: &DoctorReport) {
         }
         _ => (
             ok(),
-            if hi.gemini_slots_present {
-                "no production-shaped secrets in env (Gemini slot(s) provisioned)".to_string()
-            } else {
-                "no Gemini slot — gate inactive".to_string()
+            match (hi.gemini_slots_present, hi.third_party_bearer_slots_present) {
+                (true, true) => {
+                    "no production-shaped secrets in env (Gemini + 3P bearer slot(s) provisioned)"
+                        .to_string()
+                }
+                (true, false) => {
+                    "no production-shaped secrets in env (Gemini slot(s) provisioned)".to_string()
+                }
+                (false, true) => {
+                    "no production-shaped secrets in env (3P bearer slot(s) provisioned)"
+                        .to_string()
+                }
+                (false, false) => "no Gemini or 3P bearer slot — gate inactive".to_string(),
             },
         ),
     };
@@ -4003,25 +4558,10 @@ fn print_report(r: &DoctorReport) {
     println!("  Signing key:   {sk_icon} {sk_detail}");
 
     // FIX-4: audit chain state line (next to signing key).
-    {
-        use csq_core::audit::AuditHealth;
-        let chain_line = match &r.audit_chain_state {
-            AuditHealth::Verified => format!("  Audit chain:   {} verified", ok()),
-            AuditHealth::Degraded { gaps } => format!(
-                "  Audit chain:   {} DEGRADED ({} historical gap{})",
-                warn(),
-                gaps.len(),
-                if gaps.len() == 1 { "" } else { "s" }
-            ),
-            AuditHealth::Broken { error_kind, .. } => {
-                format!("  Audit chain:   {} BROKEN ({error_kind})", fail())
-            }
-            AuditHealth::Unknown { reason } => {
-                format!("  Audit chain:   {} UNVERIFIED ({reason})", warn())
-            }
-        };
-        println!("{chain_line}");
-    }
+    println!(
+        "{}",
+        audit_chain_line(&r.audit_chain_state, r.audit_records_unverified)
+    );
 
     // Keychain integrity-anchor verdict (DETECTOR — never bricks the chain).
     {
@@ -4070,7 +4610,7 @@ fn print_report(r: &DoctorReport) {
         println!("{floor_line}");
     }
 
-    // #787 b2b — policy-bundle version-floor keychain-anchor verdict (DETECTOR —
+    // an internal ticket b2b — policy-bundle version-floor keychain-anchor verdict (DETECTOR —
     // enforcement always uses the FILE floor; the anchor is a tamper tripwire).
     if let Some(ref bundle_floor) = r.audit_bundle_floor_anchor {
         let line = if bundle_floor == "confirmed" {
@@ -4185,14 +4725,14 @@ fn print_report(r: &DoctorReport) {
         );
     }
 
-    // M6 #914 — MCP-gate attestation outbox backlog. Printed only when the
+    // M6 an internal ticket — MCP-gate attestation outbox backlog. Printed only when the
     // outbox is non-empty (None in the community edition — never written there).
     if let Some(ref backlog) = r.mcp_gate_outbox_backlog {
         let age_note = match backlog.oldest_age_secs {
             Some(secs) => format!(", oldest {}", fmt_age_secs(secs)),
             None => String::new(),
         };
-        // M6 #909 shard D: three daemon-aware dispositions replace the fixed-6h
+        // M6 an internal ticket shard D: three daemon-aware dispositions replace the fixed-6h
         // warn/info split. Only `Stuck` is operator-actionable.
         match backlog.state {
             McpGateBacklogState::Stuck => {
@@ -4236,7 +4776,7 @@ fn print_report(r: &DoctorReport) {
 }
 
 /// Compact human-readable age from a second count: `45s`, `12m`, `6h`, `3d`.
-/// Used by the #914 MCP-gate outbox backlog line so the operator sees "oldest
+/// Used by the an internal ticket MCP-gate outbox backlog line so the operator sees "oldest
 /// 8h" rather than a raw second count.
 fn fmt_age_secs(secs: u64) -> String {
     if secs < 60 {
@@ -4516,6 +5056,208 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // ── stale-quota remedy: doctor must not contradict `csq status` ───────
+
+    /// `csq status` renders a stale native slot as "· re-auths on use"
+    /// (an internal ticket). `csq doctor` told the operator to re-login the same slot.
+    /// Two operator surfaces, one state, opposite instructions.
+    ///
+    /// The re-login is a TREADMILL: the vendor token lives ~15 min and csq
+    /// never refreshes it, so a login buys ~15 minutes and the warning
+    /// returns. The maintainer followed the old advice and the slot was stale
+    /// again within the hour.
+    ///
+    /// Non-vacuity: restore the old text ("run `csq login …`" as the leading
+    /// instruction) and the first two assertions fail.
+    #[test]
+    fn native_stale_remedy_says_expected_not_go_re_login() {
+        use csq_core::accounts::AccountSource;
+        use csq_core::providers::catalog::Surface;
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let source = AccountSource::Native { surface };
+            let r = stale_quota_remedy(14, surface, "native_cli", &source);
+            assert!(
+                r.starts_with("expected"),
+                "native staleness must lead with 'expected', not an action: {r}"
+            );
+            assert!(
+                r.contains("when you next USE"),
+                "must name what actually clears it: {r}"
+            );
+            assert!(
+                r.contains("only if"),
+                "the re-login must be conditional on failure-in-use, not \
+                 unconditional: {r}"
+            );
+            // The bare-vendor-login trap is load-bearing and must survive.
+            assert!(
+                r.contains("NOT a bare"),
+                "must keep the bare-vendor-login warning: {r}"
+            );
+        }
+    }
+
+    /// The `⚠`-vs-`ℹ` split, at the source of truth rather than the printer.
+    ///
+    /// Ratified 2026-08-06: a native slot is stale ~15 min after every login
+    /// by design, so warning permanently is alarm fatigue on a surface an
+    /// operator only visits when something is already wrong.
+    ///
+    /// Non-vacuity: make `is_expected_stale_surface` return `true`
+    /// unconditionally and the second loop fails; return `false`
+    /// unconditionally and the first fails.
+    #[test]
+    fn only_vendor_authed_surfaces_are_expected_stale() {
+        use csq_core::providers::catalog::Surface;
+        for s in [Surface::Kimi, Surface::Grok] {
+            assert!(
+                is_expected_stale_surface(s),
+                "{s:?} is vendor-authed — its staleness needs no action"
+            );
+        }
+        for s in [Surface::ClaudeCode, Surface::Codex, Surface::Gemini] {
+            assert!(
+                !is_expected_stale_surface(s),
+                "{s:?} staleness CAN mean re-auth is needed — it must keep \
+                 warning. Note the 3P Bearer Kimi provider is catalogued \
+                 ClaudeCode, so it correctly lands here, not in the expected set"
+            );
+        }
+    }
+
+    /// The NON-native surfaces are genuinely actionable — a stale poll there
+    /// really can mean re-auth is needed. They must NOT inherit the
+    /// native "expected, do nothing" framing.
+    #[test]
+    fn non_native_stale_remedy_still_prescribes_an_action() {
+        use csq_core::accounts::AccountSource;
+        use csq_core::providers::catalog::Surface;
+        // OAuth-bound examples of each surface — the API-key-bound siblings
+        // are covered by `stale_remedy_uses_setkey_not_login_for_api_key_slots`
+        // below, which pins the opposite branch this test does not exercise.
+        let cases = [
+            (Surface::ClaudeCode, "oauth", AccountSource::Anthropic),
+            (Surface::Codex, "oauth", AccountSource::Codex),
+            (Surface::Gemini, "code_assist_oauth", AccountSource::Gemini),
+        ];
+        for (surface, method, source) in cases {
+            let r = stale_quota_remedy(3, surface, method, &source);
+            assert!(
+                !r.starts_with("expected"),
+                "a non-native stale poll is NOT expected — it must stay \
+                 actionable: {r}"
+            );
+            assert!(
+                r.contains("csq daemon status"),
+                "non-native remedy should still point at the daemon: {r}"
+            );
+        }
+    }
+
+    /// SWEEP-2026-08-12: a slot bound via `csq setkey <provider> --slot N`
+    /// (ClaudeCode 3P Bearer, cloud-Claude Vertex/Bedrock) or `csq setkey
+    /// gemini --slot N` (Gemini AI Studio / Vertex SA) has NO OAuth session
+    /// to re-authenticate — `csq login` cannot work for it
+    /// (`csq/src/cli/commands/login.rs::handle`'s "gemini"/`""` arms only
+    /// ever drive an OAuth flow). Before this fix `stale_quota_remedy`
+    /// dispatched on `Surface` alone and told every stale ClaudeCode/Gemini
+    /// slot to `csq login`, regardless of how it was actually bound.
+    ///
+    /// Non-vacuity: restore the old `Surface`-only dispatch (drop the
+    /// `method`/`source` branch) and every assertion below fails — each
+    /// remedy reverts to the unconditional `csq login {slot}` text.
+    #[test]
+    fn stale_remedy_uses_setkey_not_login_for_api_key_slots() {
+        use csq_core::accounts::AccountSource;
+        use csq_core::providers::catalog::Surface;
+
+        // 3P Bearer provider (e.g. `csq setkey kimi --slot 13`) — resolves
+        // the exact provider id from the display name the ThirdParty source
+        // carries.
+        let kimi_bearer = AccountSource::ThirdParty {
+            provider: "Kimi".to_string(),
+        };
+        let r = stale_quota_remedy(13, Surface::ClaudeCode, "api_key", &kimi_bearer);
+        assert!(
+            r.contains("csq setkey kimi --slot 13"),
+            "must name the exact setkey command for a resolvable 3P provider: {r}"
+        );
+        assert!(
+            !r.contains("if healthy, run `csq login 13` to re-authenticate"),
+            "must not prescribe a bare OAuth re-login as the ACTION for an api-key slot \
+             (mentioning `csq login` as the thing that will NOT help is fine): {r}"
+        );
+
+        // Cloud-Claude Vertex routing — provider id ("claude-vertex") is not
+        // a catalog display name, so it must fall back to the generic hint
+        // rather than fabricating a wrong command.
+        let cloud_vertex = AccountSource::ThirdParty {
+            provider: "claude-vertex".to_string(),
+        };
+        let r = stale_quota_remedy(9, Surface::ClaudeCode, "api_key", &cloud_vertex);
+        assert!(
+            r.contains("re-run the bind command you originally used"),
+            "unresolvable provider id must fall back, not guess: {r}"
+        );
+
+        // Gemini AI Studio API key.
+        let r = stale_quota_remedy(5, Surface::Gemini, "api_key", &AccountSource::Gemini);
+        assert!(
+            r.contains("csq setkey gemini --slot 5"),
+            "AI Studio slot must point at setkey, not OAuth login: {r}"
+        );
+        assert!(
+            !r.contains("--provider gemini` to re-authenticate"),
+            "must not prescribe the OAuth remedy for an api-key Gemini slot: {r}"
+        );
+
+        // Gemini Vertex SA.
+        let r = stale_quota_remedy(6, Surface::Gemini, "vertex_sa", &AccountSource::Gemini);
+        assert!(
+            r.contains("--vertex-sa-json"),
+            "Vertex SA slot must mention the vertex-sa flag: {r}"
+        );
+
+        // Every non-login-remedy string must still route through
+        // `csq daemon status` first, matching every other remedy on this
+        // surface (`non_native_stale_remedy_still_prescribes_an_action`).
+        let r = stale_quota_remedy(13, Surface::ClaudeCode, "api_key", &kimi_bearer);
+        assert!(r.contains("csq daemon status"), "{r}");
+    }
+
+    /// W3-3 (an internal journal entry): `count_authenticated_slots` for native Kimi/Grok
+    /// slots counts binding-marker existence, not a `.credentials.json`
+    /// file (native surfaces store no credentials of their own). Replaces
+    /// the pre-fix `_ => 0` tripwire, which would have silently under-
+    /// reported every native slot as unauthenticated.
+    #[test]
+    fn count_authenticated_slots_counts_native_kimi_and_grok_markers() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::providers::native;
+        use csq_core::types::AccountNum;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        assert_eq!(count_authenticated_slots(base, SurfaceCli::Kimi), 0);
+        assert_eq!(count_authenticated_slots(base, SurfaceCli::Grok), 0);
+
+        native::write_binding(base, AccountNum::try_from(3u16).unwrap(), Surface::Kimi).unwrap();
+        native::write_binding(base, AccountNum::try_from(7u16).unwrap(), Surface::Kimi).unwrap();
+        native::write_binding(base, AccountNum::try_from(5u16).unwrap(), Surface::Grok).unwrap();
+
+        assert_eq!(
+            count_authenticated_slots(base, SurfaceCli::Kimi),
+            2,
+            "two Kimi binding markers must count as two authenticated Kimi slots"
+        );
+        assert_eq!(
+            count_authenticated_slots(base, SurfaceCli::Grok),
+            1,
+            "one Grok binding marker must count as one authenticated Grok slot"
+        );
+    }
+
     #[test]
     fn gated_doctor_trust_grade_suppressed_when_unlicensed() {
         // Task #77 gate-coverage: an unlicensed enterprise binary suppresses the doctor
@@ -4573,6 +5315,7 @@ mod tests {
     // ── helpers ───────────────────────────────────────────────────────────
 
     /// Create a minimal `config-<N>` directory with a real `.credentials.json`.
+    #[cfg(unix)]
     fn make_config(base: &std::path::Path, n: u16) -> std::path::PathBuf {
         let dir = base.join(format!("config-{n}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4634,6 +5377,37 @@ mod tests {
         assert!(!info.sweep_partial);
     }
 
+    /// A sweeper with NO INPUT must report `degraded`, not `ok`. A snapshot
+    /// with zero swept files is indistinguishable from a healthy idle sweeper
+    /// on its counters alone — which is exactly how a sweeper reading a path
+    /// nothing writes reported `ok` indefinitely. `roots_source_missing` is
+    /// the discriminator, and it degrades immediately with no lag grace
+    /// because it signals a wiring fault, not a workload state.
+    #[test]
+    fn cache_sweeper_reports_degraded_when_roots_source_missing() {
+        let tmp = TempDir::new().unwrap();
+        let state_path = coc_cache_sweeper::state_file_path(tmp.path());
+        let snap = coc_cache_sweeper::SweeperSnapshot {
+            // A snapshot that looks perfectly healthy on every other field.
+            last_sweep_at: Some("2026-05-03T10:00:00Z".into()),
+            last_sweep_duration_ms: 0,
+            sweep_partial: false,
+            sweep_lag_minutes: 0,
+            files_swept_last_run: 0,
+            files_skipped_last_run: 0,
+            cache_sweep_blocked: 0,
+            roots_source_missing: true,
+        };
+        coc_cache_sweeper::write_state_file(&state_path, &snap).unwrap();
+
+        let info = check_cache_sweeper(tmp.path());
+        assert_eq!(
+            info.status, "degraded",
+            "a sweeper with no roots source must not report ok"
+        );
+        assert!(info.roots_source_missing);
+    }
+
     #[test]
     fn doctor_json_surfaces_sweeper_state_after_sweep_runs() {
         let tmp = TempDir::new().unwrap();
@@ -4647,6 +5421,7 @@ mod tests {
             files_swept_last_run: 42,
             files_skipped_last_run: 7,
             cache_sweep_blocked: 0,
+            roots_source_missing: false,
         };
         coc_cache_sweeper::write_state_file(&state_path, &snap).unwrap();
 
@@ -4703,7 +5478,7 @@ mod tests {
         assert_eq!(info.modern_count, 0);
     }
 
-    /// #578 regression: an IDLE but identity-store-member account
+    /// an internal ticket regression: an IDLE but identity-store-member account
     /// (`config-N` has credentials, `profiles.json::by_slot` has a UUID for
     /// slot N, but no live `term-<pid>` is bound to it right now) is MODERN,
     /// not legacy. The prior heuristic counted every unbound config-N as
@@ -4721,12 +5496,12 @@ mod tests {
 
         assert_eq!(
             info.legacy_count, 0,
-            "an idle account present in by_slot is MODERN (#578), not legacy"
+            "an idle account present in by_slot is MODERN (an internal ticket), not legacy"
         );
         assert_eq!(info.modern_count, 0, "no live handle dir → zero modern");
     }
 
-    /// #578 regression companion: a `config-N` with credentials and NO
+    /// an internal ticket regression companion: a `config-N` with credentials and NO
     /// `by_slot` entry (genuine pre-identity-store install) IS still counted
     /// as legacy — the refinement narrows the predicate, it does not disable
     /// it. Guards against over-correction that would silence the real signal.
@@ -4741,11 +5516,11 @@ mod tests {
 
         assert_eq!(
             info.legacy_count, 1,
-            "a config-N with creds and no by_slot UUID is genuine legacy (#578)"
+            "a config-N with creds and no by_slot UUID is genuine legacy (an internal ticket)"
         );
     }
 
-    /// #578 redteam follow-up (deep-analyst MED-1): `legacy_count` MUST use
+    /// an internal ticket redteam follow-up (deep-analyst MED-1): `legacy_count` MUST use
     /// the SAME recovery-backed keep-set as `detect_decimal_marker` /
     /// `audit_coexistence` — `by_slot` ∪ `by_slot_identity` ∪ gemini marker
     /// — not `by_slot` alone. A 3P API-key / Codex slot (recovery-backed via
@@ -4772,11 +5547,11 @@ mod tests {
 
         assert_eq!(
             info.legacy_count, 0,
-            "a by_slot_identity (3P) recovery-backed slot is MODERN, not legacy (#578 MED-1)"
+            "a by_slot_identity (3P) recovery-backed slot is MODERN, not legacy (an internal ticket MED-1)"
         );
     }
 
-    /// #578 redteam follow-up (deep-analyst MED-2): the gemini binding-marker
+    /// an internal ticket redteam follow-up (deep-analyst MED-2): the gemini binding-marker
     /// channel (regular-file `credentials/gemini-<N>.json`) is the third
     /// recovery channel. A slot backed ONLY by that marker (pre-backfill
     /// Gemini window — no `by_slot`, no `by_slot_identity`) must NOT be
@@ -4796,7 +5571,7 @@ mod tests {
 
         assert_eq!(
             info.legacy_count, 0,
-            "a gemini-marker recovery-backed slot is MODERN, not legacy (#578 MED-2)"
+            "a gemini-marker recovery-backed slot is MODERN, not legacy (an internal ticket MED-2)"
         );
     }
 
@@ -4911,10 +5686,62 @@ mod tests {
 
     // ── TerminalInfo JSON serialization ───────────────────────────────────
 
+    // ── Audit-chain line: whole-chain vs tail-only coverage ───────────────
+
+    #[test]
+    fn audit_chain_line_says_partial_when_records_were_skipped() {
+        // The originating defect: on a host where the verifier logged
+        // `audit_verify_limit_exceeded … skipped=658`, `csq doctor` printed a
+        // bare `✓ verified`. The genesis was among the 658.
+        let line = audit_chain_line(&csq_core::audit::AuditHealth::Verified, 658);
+        assert!(
+            line.contains("PARTIAL"),
+            "a tail-only run must not render as a clean verify: {line}"
+        );
+        assert!(
+            line.contains("658"),
+            "the operator needs the count to judge coverage: {line}"
+        );
+        assert!(
+            line.contains("genesis"),
+            "the genesis being unverified is the load-bearing detail: {line}"
+        );
+    }
+
+    #[test]
+    fn audit_chain_line_says_verified_only_on_whole_chain_coverage() {
+        // The other direction. Without this the test above passes trivially
+        // for an implementation that ALWAYS says PARTIAL, which would be a
+        // different instrument that also cannot fail.
+        let line = audit_chain_line(&csq_core::audit::AuditHealth::Verified, 0);
+        assert!(line.contains("verified"), "{line}");
+        assert!(
+            !line.contains("PARTIAL"),
+            "whole-chain coverage must not be hedged: {line}"
+        );
+    }
+
+    #[test]
+    fn audit_chain_line_partial_split_applies_only_to_verified() {
+        // A skipped-record count must not silently rewrite Broken/Degraded,
+        // whose own failure text is the load-bearing signal.
+        let broken = audit_chain_line(
+            &csq_core::audit::AuditHealth::Broken {
+                error_kind: "chain_corrupt".into(),
+                reason: "r".into(),
+            },
+            658,
+        );
+        assert!(broken.contains("BROKEN"), "{broken}");
+        assert!(!broken.contains("PARTIAL"), "{broken}");
+    }
+
     /// Helper: build a minimal DoctorReport with specific terminal info.
     fn make_report(terminals: TerminalInfo) -> DoctorReport {
         DoctorReport {
             schema_version: DOCTOR_SCHEMA_VERSION,
+            schema: doctor_schema_string(),
+            audit_records_unverified: 0,
             version: "0.0.0".into(),
             platform: PlatformInfo {
                 os: "test".into(),
@@ -4948,6 +5775,7 @@ mod tests {
                 with_credentials: 0,
                 expired: 0,
             },
+            stale_quota_slots: Vec::new(),
             broker_failed: BrokerFailedInfo {
                 count: 0,
                 entries: Vec::new(),
@@ -4966,6 +5794,7 @@ mod tests {
             host_isolation: HostIsolationStatus {
                 status: "ok",
                 gemini_slots_present: false,
+                third_party_bearer_slots_present: false,
                 detected_count: 0,
                 first_name: None,
                 detected_var_names: Vec::new(),
@@ -4979,6 +5808,10 @@ mod tests {
                 files_swept_last_run: 0,
                 files_skipped_last_run: 0,
                 cache_sweep_blocked: 0,
+                // Distinct condition: the sweeper has never written a snapshot
+                // at all, which `never_run` already conveys. Claiming the roots
+                // source is missing would be an unverified assertion.
+                roots_source_missing: false,
             },
             identity_store: None,
             legacy_compat_state: Vec::new(),
@@ -5023,7 +5856,7 @@ mod tests {
     }
 
     // ============================================================
-    // #787 b2b — policy-bundle floor keychain-anchor doctor projection
+    // an internal ticket b2b — policy-bundle floor keychain-anchor doctor projection
     // ============================================================
 
     /// No policy bundle installed (no floor file) → the field is omitted.
@@ -5346,6 +6179,84 @@ mod tests {
         );
     }
 
+    /// host-isolation-parity-followups (2): `csq doctor`'s
+    /// `host_isolation` gate MUST fire for a kimi-bound slot's
+    /// production-shaped secrets, using the SAME `csq run`
+    /// classification (`discovery::discover_per_slot_third_party` +
+    /// `csq_core::providers::catalog::id_from_display_name`) that
+    /// `launch_third_party` uses. Mirrors
+    /// `csq::cli::commands::run::tests::host_isolation_warning_gate_skips_ollama_but_fires_for_kimi`.
+    #[test]
+    fn csq_doctor_reports_host_isolation_warning_for_kimi_slot() {
+        let tmp = TempDir::new().unwrap();
+        let kimi_dir = tmp.path().join("config-21");
+        std::fs::create_dir_all(&kimi_dir).unwrap();
+        std::fs::write(
+            kimi_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-kimi-test"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let env = ["PATH", "HOME", "ANTHROPIC_API_KEY"];
+        let status = check_host_isolation_with_env(tmp.path(), env.iter().copied());
+
+        assert!(
+            status.third_party_bearer_slots_present,
+            "a kimi-bound slot MUST register as a 3P bearer slot for the \
+             security gate"
+        );
+        assert!(
+            !status.gemini_slots_present,
+            "precondition: no Gemini slot is provisioned in this fixture"
+        );
+        assert_eq!(
+            status.status, "warning",
+            "spec-08 MED-03: kimi slot + production secrets MUST warn, \
+             matching the csq run gate in launch_third_party"
+        );
+    }
+
+    /// host-isolation-parity-followups (2): a loopback-ollama-ONLY
+    /// deployment MUST NOT trigger the `host_isolation` gate, mirroring
+    /// `launch_third_party`'s `surface_name != "ollama"` exclusion — a
+    /// loopback endpoint has no remote vendor to exfiltrate to, so the
+    /// vendor-exposure warning would be misleading (alarm fatigue on a
+    /// privacy-motivated local workflow).
+    #[test]
+    fn csq_doctor_host_isolation_ignores_loopback_ollama_only_slot() {
+        let tmp = TempDir::new().unwrap();
+        let ollama_dir = tmp.path().join("config-20");
+        std::fs::create_dir_all(&ollama_dir).unwrap();
+        std::fs::write(
+            ollama_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": { "ANTHROPIC_BASE_URL": "http://localhost:11434" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let env = ["PATH", "HOME", "ANTHROPIC_API_KEY"];
+        let status = check_host_isolation_with_env(tmp.path(), env.iter().copied());
+
+        assert!(
+            !status.third_party_bearer_slots_present,
+            "a loopback-ollama-only slot MUST NOT register as a 3P bearer \
+             slot — no remote vendor to exfiltrate to (mirrors the csq run \
+             gate)"
+        );
+        assert_eq!(
+            status.status, "ok",
+            "ollama-only + no Gemini slot + secrets in env → gate inactive → ok"
+        );
+    }
+
     /// Redteam R3 HIGH-01 / MED-01 / LOW-02: the self-legibility row
     /// must NAME the offending slot(s) directly (not delegate to
     /// `csq probe --all`, which shares `discover_gemini`'s blindness),
@@ -5406,7 +6317,7 @@ mod tests {
     /// (`is_codex_wrong_variant_bound` == true). Mirrors the
     /// `gemini_unreadable_slots` regression test shape.
     ///
-    /// Fixture shape matches #520's `write_wrong_variant_codex` helper:
+    /// Fixture shape matches an internal ticket's `write_wrong_variant_codex` helper:
     /// an Anthropic `claudeAiOauth` JSON payload written to the
     /// Codex-prefixed credential path. Synthetic-token discipline:
     /// `sk-ant-oat01-x` (live OAuth prefix + 1-char suffix, <20-char
@@ -5904,7 +6815,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn canary_flags_populated_claude_json_without_oauth_account() {
-        // The #833 drift signal: a live Anthropic session whose `.claude.json`
+        // The an internal ticket drift signal: a live Anthropic session whose `.claude.json`
         // is populated but has no oauthAccount.emailAddress.
         let tmp = TempDir::new().unwrap();
         let pid = std::process::id(); // self → alive
@@ -6039,7 +6950,7 @@ mod tests {
     fn check_mixed_state_slots_flags_oauth_plus_3p_slot() {
         // Arrange: write a 3P env block AND a valid-shape OAuth
         // credential for slot 3. This is the exact state the PR
-        // #130 login flow now prevents; older installs can still
+        // an internal ticket login flow now prevents; older installs can still
         // produce it via manual filesystem edits.
         //
         // M4-12: `check_mixed_state_slots` reads from the UUID-keyed
@@ -6208,6 +7119,202 @@ mod tests {
         std::fs::write(&path, json.to_string()).unwrap();
     }
 
+    // ── v23 stale_quota_slots ──────────────────────────────────────────────
+
+    /// Writes `quota.json` with an explicit `updated_at` (epoch seconds) and
+    /// `surface`, so tests can pin a row's age precisely relative to
+    /// `STALE_THRESHOLD_SECS` (`csq_core::quota::status`). Merges onto any
+    /// existing quota.json (write_credentials/write_quota callers may share
+    /// the same base dir across multiple slots in one test).
+    fn write_quota_with_updated_at(
+        base: &std::path::Path,
+        slot: u16,
+        surface: &str,
+        updated_at: f64,
+    ) {
+        let path = base.join("quota.json");
+        let mut root: serde_json::Value = if path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        } else {
+            serde_json::json!({ "schema_version": 2, "accounts": {} })
+        };
+        root["accounts"][slot.to_string()] = serde_json::json!({
+            "surface": surface,
+            "kind": "utilization",
+            "five_hour": { "used_percentage": 10.0, "resets_at": 4_102_444_800u64 },
+            "seven_day": null,
+            "updated_at": updated_at,
+        });
+        std::fs::write(&path, root.to_string()).unwrap();
+    }
+
+    /// Fresh row (age well under `STALE_THRESHOLD_SECS` = 3600s) → not
+    /// reported, and `csq doctor`'s new row stays silent.
+    #[test]
+    fn check_stale_quota_polls_empty_when_fresh() {
+        let tmp = TempDir::new().unwrap();
+        write_credentials(tmp.path(), 1, 4_102_444_800_000);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64;
+        write_quota_with_updated_at(tmp.path(), 1, "claude-code", now - 60.0);
+
+        let slots = check_stale_quota_polls(tmp.path());
+        assert!(
+            slots.is_empty(),
+            "fresh row must not be reported stale: {slots:?}"
+        );
+    }
+
+    /// Never-polled row (`updated_at: 0.0` — the v2 default sentinel, per
+    /// `PollFreshness::NeverPolled`'s doc comment) is DISTINCT from a stale
+    /// row and MUST NOT be reported — there is no age to report, and
+    /// reporting it would mislabel "no data yet" as "poll stopped".
+    #[test]
+    fn check_stale_quota_polls_excludes_never_polled_row() {
+        let tmp = TempDir::new().unwrap();
+        write_credentials(tmp.path(), 1, 4_102_444_800_000);
+        write_quota_with_updated_at(tmp.path(), 1, "claude-code", 0.0);
+
+        let slots = check_stale_quota_polls(tmp.path());
+        assert!(
+            slots.is_empty(),
+            "never-polled row (updated_at=0.0) must not be reported as stale: {slots:?}"
+        );
+    }
+
+    /// The confirmed-live incident shape: a native Grok slot whose vendor
+    /// token silently expired — credentials/marker healthy, quota poll
+    /// frozen ~1d ago. Named in the returned list, age reported, and the
+    /// remedy is the csq-driven re-login (NOT a bare `grok` login).
+    #[test]
+    fn check_stale_quota_polls_names_stale_native_grok_slot_with_csq_remedy() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::types::AccountNum;
+
+        let tmp = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(17u16).unwrap();
+        csq_core::providers::native::write_binding(tmp.path(), slot, Surface::Grok).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64;
+        // ~1 day stale — comfortably past STALE_THRESHOLD_SECS (3600s) and
+        // matching the maintainer-observed incident ("grok-17 ... stale 1d").
+        write_quota_with_updated_at(tmp.path(), 17, "grok", now - 86_400.0);
+
+        let slots = check_stale_quota_polls(tmp.path());
+        assert_eq!(slots.len(), 1, "expected exactly one stale slot: {slots:?}");
+        let s = &slots[0];
+        assert_eq!(s.slot, 17);
+        assert_eq!(s.surface, "grok");
+        assert!(
+            (86_000..=86_800).contains(&s.age_secs),
+            "unexpected staleness age: {}",
+            s.age_secs
+        );
+        assert!(
+            s.remedy.contains("csq login 17 --provider grok"),
+            "remedy must direct the operator through csq, not a bare vendor login: {}",
+            s.remedy
+        );
+        assert!(
+            s.remedy.contains("~/.grok"),
+            "remedy must name why a bare vendor login does not fix the frozen slot: {}",
+            s.remedy
+        );
+    }
+
+    /// SWEEP-2026-08-12, end-to-end: a `csq setkey kimi --slot N`-bound 3P
+    /// Bearer slot (`config-N/settings.json` env block — the real on-disk
+    /// shape `discovery::discover_per_slot_third_party` reads, mirroring
+    /// `csq_doctor_reports_host_isolation_warning_for_kimi_slot`'s fixture)
+    /// whose quota poll has frozen. Confirms `check_stale_quota_polls`
+    /// actually threads `AccountStatus.method`/`.source` through to the
+    /// remedy, not just that the pure `stale_quota_remedy` function branches
+    /// correctly in isolation.
+    ///
+    /// Non-vacuity: this exact fixture, run against the pre-fix
+    /// `stale_quota_remedy(a.id, a.surface)` call, prints `csq login 21` —
+    /// verified by stashing the fix and re-running (see PR description).
+    #[test]
+    fn check_stale_quota_polls_uses_setkey_for_api_key_bound_slot() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_dir = tmp.path().join("config-21");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-kimi-test"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64;
+        write_quota_with_updated_at(tmp.path(), 21, "claude-code", now - 86_400.0);
+
+        let stale = check_stale_quota_polls(tmp.path());
+        assert_eq!(stale.len(), 1, "expected exactly one stale slot: {stale:?}");
+        let s = &stale[0];
+        assert_eq!(s.slot, 21);
+        assert!(
+            s.remedy.contains("csq setkey kimi --slot 21"),
+            "api-key-bound slot must be told to setkey, not login: {}",
+            s.remedy
+        );
+        assert!(
+            !s.remedy
+                .contains("if healthy, run `csq login 21` to re-authenticate"),
+            "must not prescribe a bare OAuth re-login as the ACTION for an api-key slot \
+             (mentioning `csq login` as the thing that will NOT help is fine): {}",
+            s.remedy
+        );
+    }
+
+    /// Doctor's existing `Accounts:` row (credential-expiry based) and the
+    /// new `stale_quota_slots` row answer DIFFERENT questions — a native
+    /// slot has no OAuth credential to expire (`check_accounts` only walks
+    /// `discover_anthropic`), so the marker-existence count stays healthy
+    /// even while the quota poll is frozen. This is the exact gap the v23
+    /// field closes: `check_accounts` alone would report zero problems.
+    #[test]
+    fn check_stale_quota_polls_independent_of_check_accounts_for_native_slots() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::types::AccountNum;
+
+        let tmp = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(14u16).unwrap();
+        csq_core::providers::native::write_binding(tmp.path(), slot, Surface::Kimi).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64;
+        write_quota_with_updated_at(tmp.path(), 14, "kimi", now - 172_800.0); // ~2d
+
+        // check_accounts only ever walks discover_anthropic — a native slot
+        // never appears there, so it reports zero total/with_credentials.
+        let acct = check_accounts(tmp.path());
+        assert_eq!(acct.total, 0);
+        assert_eq!(acct.with_credentials, 0);
+
+        // check_stale_quota_polls DOES see it via show_status (discover_all).
+        let stale = check_stale_quota_polls(tmp.path());
+        assert_eq!(
+            stale.len(),
+            1,
+            "native slot's frozen poll must be visible: {stale:?}"
+        );
+        assert_eq!(stale[0].surface, "kimi");
+        assert!(stale[0].remedy.contains("kimi-cli"));
+    }
+
     #[test]
     fn per_slot_report_status_ok_when_creds_fresh_and_quota_under_threshold() {
         let tmp = TempDir::new().unwrap();
@@ -6283,9 +7390,65 @@ mod tests {
         let r = build_per_slot_report(tmp.path(), 3).unwrap();
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
-        assert!(json.contains("\"quota\":{\"utilization\":42.0}"));
-        // The validate-doctor-json.py contract: status + quota.utilization
-        // are the load-bearing keys; adding fields is non-breaking.
+        // The validate-doctor-json.py contract: `status` and a NUMERIC
+        // `quota.utilization` are the load-bearing keys. `utilization` MUST
+        // stay `f64` — the validator rejects any other type, so making it an
+        // Option would break the recording gate outright. Asserted on the
+        // exact serialized substring so a type change to `null` fails here
+        // rather than in the eval pipeline.
+        assert!(
+            json.contains("\"utilization\":42.0"),
+            "utilization must serialize as a bare number: {json}"
+        );
+        // `window_present` distinguishes a measured 0% from an absent 5h
+        // window. Adding a key is non-breaking for the validator (it checks
+        // required keys, not exact shape), and the validator now fails closed
+        // when this is false rather than reading the placeholder as a reading.
+        assert!(
+            json.contains("\"window_present\":true"),
+            "a slot with a real 5h window must report window_present=true: {json}"
+        );
+    }
+
+    /// The gap `window_present` exists to close: a slot whose row carries NO
+    /// 5-hour window reports `utilization: 0.0`, which is byte-identical to a
+    /// slot measured at 0%. Balance-metered (DeepSeek) and weekly-only (Grok)
+    /// slots are permanently in that state.
+    ///
+    /// This matters beyond cosmetics — `validate-doctor-json.py` gates
+    /// benchmark recording on `utilization < ceiling`, so before this field
+    /// such a slot passed the gate as "0% used" however exhausted it was.
+    ///
+    /// Non-vacuity: with `window_present` hardcoded true, this fails.
+    #[test]
+    fn per_slot_report_marks_an_absent_five_hour_window_as_not_measured() {
+        let tmp = TempDir::new().unwrap();
+        let future_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 86_400_000) as u64;
+        write_credentials(tmp.path(), 4, future_ms);
+
+        // A balance-shaped row: no five_hour, no seven_day, a real balance.
+        let quota_json = r#"{"schema_version":2,"accounts":{"4":{"surface":"claude-code","kind":"balance","five_hour":null,"seven_day":null,"balance":{"currency":"USD","remaining":165.32},"updated_at":1785852918.0}}}"#;
+        std::fs::write(tmp.path().join("quota.json"), quota_json).unwrap();
+
+        let r = build_per_slot_report(tmp.path(), 4).unwrap();
+        assert!(
+            !r.quota.window_present,
+            "a row with no 5h window must report window_present=false"
+        );
+        assert_eq!(
+            r.quota.utilization, 0.0,
+            "the placeholder stays 0.0 for the validator's numeric contract"
+        );
+
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains("\"window_present\":false"),
+            "the not-measured signal must reach the JSON consumer: {json}"
+        );
     }
 
     // ─── M1-8 / M2-6 doctor tests ────────────────────────────────────────────
@@ -6325,15 +7488,14 @@ mod tests {
         // Act: build the report (read-only; no daemon / CLI probe invocations).
         let report = build_report(base);
 
-        // Assert: schema_version is edition-specific — community v19, enterprise
-        // v22 (enterprise-only fields: mcp_gate_outbox_backlog v20 #914 + v21 M6
-        // #909 shard-D daemon-aware fields + audit_bundle_floor_anchor v22 #787
-        // b2b, raising only the enterprise ceiling). Pinned to the build-active
-        // const so the test is correct under both feature sets.
+        // Assert: schema_version — both editions currently converge on v23
+        // (stale_quota_slots, cross-edition). Pinned to the build-active const
+        // so the test is correct under both feature sets and stays correct
+        // across future bumps; see DOCTOR_SCHEMA_VERSION + spec 13 §9 for the
+        // authoritative current values and full history.
         assert_eq!(
             report.schema_version, DOCTOR_SCHEMA_VERSION,
-            "schema_version must equal the edition-active DOCTOR_SCHEMA_VERSION \
-             (community 19 / enterprise 22)"
+            "schema_version must equal the edition-active DOCTOR_SCHEMA_VERSION"
         );
 
         // Assert: identity_store is present and state is Coexisting.
@@ -6574,8 +7736,8 @@ mod tests {
         // structurally valid report.
         let report = build_report(base);
 
-        // Assert: schema_version equals the edition-active const (community 19 /
-        // enterprise 22). Pinned to the const so it stays correct across bumps.
+        // Assert: schema_version equals the edition-active const (both editions
+        // currently 23). Pinned to the const so it stays correct across bumps.
         assert_eq!(
             report.schema_version, DOCTOR_SCHEMA_VERSION,
             "schema_version must equal the edition-active DOCTOR_SCHEMA_VERSION"
@@ -6597,6 +7759,49 @@ mod tests {
             json.contains("\"legacy_compat_state\""),
             "schema v6 JSON must include the legacy_compat_state field; got: {json}"
         );
+    }
+
+    /// Golden fixture (an internal ticket Track B): `csq doctor --json` carries BOTH
+    /// `schema` (new, string, `"csq.doctor.vN"`) and `schema_version` (existing,
+    /// numeric) simultaneously, and they AGREE on the major — `schema` is
+    /// DERIVED from `schema_version` via `doctor_schema_string`, never
+    /// hand-written a second time. A future edit that lets the two drift, or
+    /// that renames/removes `schema_version` without a compensating major bump,
+    /// REDS this test (verified by hand: changing `doctor_schema_string`'s format
+    /// string to `"csq.doctor.v{}"` with a hardcoded literal number instead of
+    /// `DOCTOR_SCHEMA_VERSION` fails the `starts_with` assertion below the next
+    /// time `DOCTOR_SCHEMA_VERSION` is bumped without updating the literal).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[test]
+    fn doctor_json_schema_field_agrees_with_schema_version() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+
+        let report = build_report(base);
+
+        // Struct-level: `schema` is present and derived, not duplicated by hand.
+        assert_eq!(report.schema, doctor_schema_string());
+        assert_eq!(
+            report.schema,
+            format!("csq.doctor.v{}", report.schema_version)
+        );
+
+        // Wire-level: both fields present, both agree with the SAME major.
+        let v: serde_json::Value = serde_json::to_value(&report).unwrap();
+        let schema = v["schema"].as_str().expect("schema is a string");
+        let schema_version = v["schema_version"]
+            .as_u64()
+            .expect("schema_version is a number");
+        assert_eq!(schema, format!("csq.doctor.v{schema_version}"));
+        assert!(
+            schema.starts_with(&format!("csq.doctor.v{DOCTOR_SCHEMA_VERSION}")),
+            "a host's detection rule (starts_with on the major) must match; got schema={schema}"
+        );
+        // `schema_version` is KEPT for back-compat — a pre-an internal ticket consumer still works.
+        assert_eq!(schema_version as u32, DOCTOR_SCHEMA_VERSION);
     }
 
     /// M4-11 acceptance criterion (a): `csq doctor --json` emits the
@@ -6742,7 +7947,7 @@ mod tests {
         );
     }
 
-    /// #578 regression: `detect_decimal_marker` MUST skip slots that are
+    /// an internal ticket regression: `detect_decimal_marker` MUST skip slots that are
     /// identity-store members. A decimal `.csq-account` marker on a slot
     /// present in `by_slot` (modern OAuth) or `by_slot_identity` (3P API
     /// key / codex / gemini) is cosmetic, not a pending-migration bridge.
@@ -6809,7 +8014,7 @@ mod tests {
         }
         assert!(
             detect_decimal_marker(base2).is_none(),
-            "all decimal-marked slots are identity-store members → detector MUST be silent (#578)"
+            "all decimal-marked slots are identity-store members → detector MUST be silent (an internal ticket)"
         );
     }
 
@@ -7051,7 +8256,7 @@ mod tests {
         );
     }
 
-    /// Schema version was bumped 15 → 16 by #694 item 2 (audit_roster_floor_anchor
+    /// Schema version was bumped 15 → 16 by an internal ticket item 2 (audit_roster_floor_anchor
     /// field). Pins the contract so a future change has to surface
     /// explicitly in the spec/12 §12.11.5 record.
     #[test]
@@ -7067,7 +8272,7 @@ mod tests {
         assert_eq!(report.schema_version, DOCTOR_SCHEMA_VERSION);
     }
 
-    // ── #694 item 2: audit_roster_floor_anchor field ──────────────────────
+    // ── an internal ticket item 2: audit_roster_floor_anchor field ──────────────────────
 
     /// When no roster is installed `audit_roster_floor_anchor` is omitted from
     /// the JSON (None → skip_serializing_if). The assertion pins to the
@@ -7188,7 +8393,7 @@ mod tests {
         );
     }
 
-    // ── M6 #914: MCP-gate attestation outbox backlog predicate ───────────────
+    // ── M6 an internal ticket: MCP-gate attestation outbox backlog predicate ───────────────
 
     /// Absent outbox dir → None (healthy steady state; always the community case).
     #[test]
@@ -7247,7 +8452,7 @@ mod tests {
         );
     }
 
-    /// M6 #909 shard D wiring: `check_mcp_gate_outbox_backlog` reads the last-drain
+    /// M6 an internal ticket shard D wiring: `check_mcp_gate_outbox_backlog` reads the last-drain
     /// stamp (shard B) and classifies. A fresh stamp + a young backlog → `Draining`
     /// (daemon actively draining), with a small `last_drain_age_secs`. This proves
     /// the read is wired, complementing the pure-classifier unit test below.
@@ -7273,7 +8478,7 @@ mod tests {
         );
     }
 
-    /// M6 #909 shard D: the daemon-aware classifier across the count-cap,
+    /// M6 an internal ticket shard D: the daemon-aware classifier across the count-cap,
     /// drain-freshness, and age axes — Stuck / Draining / PendingDaemonDown.
     #[test]
     fn classify_mcp_gate_backlog_daemon_aware() {

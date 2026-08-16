@@ -39,13 +39,17 @@ fn read_oauth_email_from_cred_path(cred_path: &Path) -> Option<String> {
 ///
 /// Sources checked in priority order:
 /// 1. Anthropic OAuth (`credentials/N.json`)
-/// 2. Per-slot third-party bindings (`config-N/settings.json` with a 3P
+/// 2. Codex OAuth (`credentials/codex-N.json`)
+/// 3. Gemini bindings (`credentials/gemini-N.json`)
+/// 4. Native-CLI session surfaces (Kimi, Grok — Wave 3, an internal journal entry),
+///    stored as `credentials/{kimi,grok}-N.json`
+/// 5. Per-slot third-party bindings (`config-N/settings.json` with a 3P
 ///    `ANTHROPIC_BASE_URL`) — these take numbered slots (9, 10, …)
 ///    alongside OAuth accounts so users see one unified list.
-/// 3. Global third-party bindings (`settings-mm.json` / `settings-zai.json`
+/// 6. Global third-party bindings (`settings-mm.json` / `settings-zai.json`
 ///    at the base dir level, synthetic slots 901/902) — suppressed if the
 ///    same provider is already bound to a numbered slot above.
-/// 4. Manual accounts (`dashboard-accounts.json`)
+/// 7. Manual accounts (`dashboard-accounts.json`)
 ///
 /// First source wins on duplicate slot IDs.
 pub fn discover_all(base_dir: &Path) -> Vec<AccountInfo> {
@@ -76,6 +80,17 @@ pub fn discover_all(base_dir: &Path) -> Vec<AccountInfo> {
     // `credentials/gemini-<N>.json`; the binding marker carries the
     // auth-mode tag.
     for info in discover_gemini(base_dir) {
+        if seen.insert(info.id, ()).is_none() {
+            accounts.push(info);
+        }
+    }
+
+    // Priority 1d (Wave 3, an internal journal entry): native-CLI session surfaces
+    // (Kimi, Grok). Landed in the same OAuth-first priority band as
+    // Codex/Gemini above — the credential-less binding marker's
+    // existence keys the slot exactly like Gemini's binding marker
+    // does, so it follows the identical precedence rule.
+    for info in discover_native(base_dir) {
         if seen.insert(info.id, ()).is_none() {
             accounts.push(info);
         }
@@ -172,6 +187,17 @@ pub(crate) fn provider_from_base_url(base_url: &str) -> Option<&'static str> {
     if lower.contains("deepseek") {
         return Some("DeepSeek");
     }
+    // Kimi — the coding-subscription endpoint `https://api.kimi.com/coding`.
+    // Without this arm a `csq setkey kimi --slot N` slot classifies to None and is
+    // silently dropped by every consumer of this fn: `discover_per_slot_third_party`
+    // (invisible in `csq ls`/desktop/quota), the reconciler 3P identity backfill,
+    // AND `purge_previous_provider_extras` (which would leak kimi's extra_env on a
+    // rebind — the orphan-extras bug class). Match `kimi.com` (the subscription
+    // host); a hypothetical pay-per-token `api.moonshot.ai` kimi slot is out of
+    // scope (the catalog default is the subscription endpoint).
+    if lower.contains("kimi.com") {
+        return Some("Kimi");
+    }
     if lower.contains("localhost") || lower.contains("127.0.0.1") {
         return Some("Ollama");
     }
@@ -249,7 +275,23 @@ pub fn discover_per_slot_third_party(base_dir: &Path) -> Vec<AccountInfo> {
             .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
             .or_else(|| json.get("ANTHROPIC_BASE_URL"))
             .and_then(|v| v.as_str());
-        let Some(base_url) = base_url else { continue };
+        let Some(base_url) = base_url else {
+            // No 3P `ANTHROPIC_BASE_URL` — but this MAY be a cloud-Claude slot
+            // (an internal ticket): a `ClaudeCode` slot routed through Google Vertex AI / AWS
+            // Bedrock carries `CLAUDE_CODE_USE_VERTEX` / `CLAUDE_CODE_USE_BEDROCK`
+            // in its settings env and NO `ANTHROPIC_BASE_URL`. Derive the backend
+            // from the same authoritative helper `csq status` uses (single source
+            // of truth — never drift from what the spawned `claude` reads). A
+            // non-`Direct` backend means the slot is a cloud-Claude binding; surface
+            // it in the unified 3P list so it appears in `csq status`, is caught by
+            // `detect_bound_surface`'s 3P arm (conflict/reverse guards), and launches
+            // through the existing `launch_third_party` path (which only sets
+            // `CLAUDE_CONFIG_DIR` + spawns `claude`; CC reads the cloud env itself).
+            if let Some(info) = cloud_claude_account_info(base_dir, id, env) {
+                accounts.push(info);
+            }
+            continue;
+        };
 
         let Some(provider_name) = provider_from_base_url(base_url) else {
             continue;
@@ -285,6 +327,55 @@ pub fn discover_per_slot_third_party(base_dir: &Path) -> Vec<AccountInfo> {
     // Deterministic ordering by slot id for dashboard stability.
     accounts.sort_by_key(|a| a.id);
     accounts
+}
+
+/// Builds an [`AccountInfo`] for a cloud-Claude slot (an internal ticket) — a `ClaudeCode`
+/// slot routed through Google Vertex AI / AWS Bedrock. Returns `None` for a
+/// `Direct`-backend slot (the ordinary Anthropic/3P path, surfaced by the other
+/// discovery arms).
+///
+/// Classified as `AccountSource::ThirdParty { provider: "claude-vertex" |
+/// "claude-bedrock" }`: structurally a cloud slot IS a settings-env binding with
+/// no OAuth and no daemon refresh — the exact `ThirdParty` contract
+/// (`has_oauth_refresh() == false`, `BillingMode::ApiKey`, pay-per-token). The
+/// `[vertex]` / `[bedrock]` surface tag on `csq status` comes from the orthogonal
+/// [`crate::accounts::Backend`] axis (`quota::status`, derived by
+/// `backend_for_slot`), NOT from this provider id.
+fn cloud_claude_account_info(
+    base_dir: &Path,
+    id: u16,
+    env: Option<&serde_json::Value>,
+) -> Option<AccountInfo> {
+    use crate::accounts::Backend;
+    let backend = crate::providers::settings::backend_for_slot(base_dir, id);
+    let (provider_name, cred_key) = match backend {
+        Backend::Vertex => ("claude-vertex", "GOOGLE_APPLICATION_CREDENTIALS"),
+        Backend::Bedrock => ("claude-bedrock", "AWS_BEARER_TOKEN_BEDROCK"),
+        // The ordinary path — surfaced by the OAuth / 3P arms, not here.
+        Backend::Direct => return None,
+    };
+    // `has_credentials` reflects whether the backend's credential env is present
+    // and non-empty. Fail-closed provisioning always writes it, so a missing value
+    // signals a hand-edited / half-provisioned slot (surfaced, but flagged).
+    let has_credentials = env
+        .and_then(|e| e.get(cred_key))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let label =
+        profiles::slot_rename_label(base_dir, id).unwrap_or_else(|| provider_name.to_string());
+    Some(AccountInfo {
+        id,
+        label,
+        oauth_email: None,
+        source: AccountSource::ThirdParty {
+            provider: provider_name.to_string(),
+        },
+        surface: Surface::ClaudeCode,
+        method: "api_key".into(),
+        has_credentials,
+        billing_mode: BillingMode::ApiKey,
+    })
 }
 
 /// Discovers Anthropic OAuth accounts.
@@ -627,7 +718,7 @@ pub fn discover_codex(base_dir: &Path) -> Vec<AccountInfo> {
 
                     // Path-free fixed-vocabulary tag; never `error = %e` (CredentialError::Display
                     // echoes the absolute path AND for `Corrupt`, raw serde_json fragments).
-                    // security.md §2; in-scope per zero-tolerance.md Rule 5; mirror of #514's
+                    // security.md §2; in-scope per zero-tolerance.md Rule 5; mirror of an internal ticket's
                     // ambiguous_binding leak fix. The path interpolation in `path = %path.display()`
                     // is intentional for the structured-log subscriber audit trail (path is a
                     // local OS path, not a token); the `error = %e` was the load-bearing leak.
@@ -867,6 +958,116 @@ pub fn discover_gemini(base_dir: &Path) -> Vec<AccountInfo> {
                 AuthMode::CodeAssistOAuth => BillingMode::Subscription,
                 AuthMode::ApiKey | AuthMode::VertexSa { .. } => BillingMode::ApiKey,
             },
+        });
+    }
+    accounts.sort_by_key(|a| a.id);
+    accounts
+}
+
+/// Discovers native-CLI session-surface bindings (Kimi, Grok — Wave 3,
+/// an internal journal entry) from `credentials/{kimi,grok}-<N>.json`.
+///
+/// A native slot's binding marker is credential-less — the vendor CLI
+/// (`kimi` / `grok`) self-authenticates against its own home directory
+/// (`~/.kimi-code/`, `~/.grok/auth.json`), so csq stores no secret. The
+/// marker's mere EXISTENCE keys the slot, mirroring [`discover_gemini`]
+/// exactly (symlink rejection, leading-zero rejection, corrupt-marker
+/// skip-with-warn). Before this function landed, a provisioned native
+/// slot's marker was written by [`crate::providers::native::write_binding`]
+/// but never enumerated here, so the slot was invisible in `csq ls` and
+/// the desktop account list (an internal journal entry W3-3 §5 discovery bullet).
+pub fn discover_native(base_dir: &Path) -> Vec<AccountInfo> {
+    use crate::providers::native::{self, NATIVE_CLIS};
+    use crate::types::AccountNum;
+
+    let creds_dir = base_dir.join("credentials");
+    let entries = match std::fs::read_dir(&creds_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut accounts = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Reject symlinks at the discovery boundary — mirrors
+        // `discover_gemini`'s identical guard (redteam round 1 M1,
+        // an internal journal entry).
+        if let Ok(file_type) = entry.file_type() {
+            if file_type.is_symlink() {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Match against every native descriptor's filename prefix
+        // (`kimi-`, `grok-`) rather than hardcoding — new native
+        // surfaces added to `NATIVE_CLIS` are picked up automatically.
+        let matched = NATIVE_CLIS.iter().find_map(|nc| {
+            let prefix = format!("{}-", nc.surface.as_str());
+            stem.strip_prefix(prefix.as_str())
+                .map(|num_str| (nc.surface, num_str))
+        });
+        let Some((surface, num_str)) = matched else {
+            continue;
+        };
+        let id: u16 = match num_str.parse() {
+            Ok(n) if (1..=999).contains(&n) => n,
+            _ => continue,
+        };
+        // Reject leading-zero filename forms (`kimi-013.json`) so they
+        // don't collide with `kimi-13.json` at the same id — mirrors
+        // `discover_gemini`'s identical guard (redteam round 1 LOW).
+        if num_str != id.to_string() {
+            continue;
+        }
+        let slot = match AccountNum::try_from(id) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Err(e) = native::read_binding(base_dir, slot, surface) {
+            // `error_kind` is the path-free fixed-vocabulary tag
+            // (security.md §2); mirrors the discover_gemini /
+            // discover_codex fix. A corrupt or unknown-schema marker
+            // is skipped — the slot is treated as unbound rather than
+            // surfacing invalid state.
+            warn!(
+                path = %path.display(),
+                error_kind = e.error_kind_tag(),
+                "skipping unreadable native binding"
+            );
+            continue;
+        }
+        // A user rename (`by_slot_label`) wins over the `<surface>-N`
+        // default, matching the Anthropic `get_email` / Gemini /
+        // Codex step-1 precedence.
+        let label = profiles::slot_rename_label(base_dir, id)
+            .unwrap_or_else(|| format!("{}-{id}", surface.as_str()));
+        accounts.push(AccountInfo {
+            id,
+            label,
+            oauth_email: None,
+            source: AccountSource::Native { surface },
+            surface,
+            method: "native_cli".into(),
+            // The marker's existence IS the authentication signal — the
+            // vendor CLI owns the real auth. There is no credential of
+            // csq's own to be invalid, so a readable marker is always
+            // `has_credentials: true` (mirrors `discover_gemini`).
+            has_credentials: true,
+            // Native CLIs are vendor subscription products (Kimi
+            // Coding Subscription, Grok's own plan). Both are polled:
+            // Kimi for 5h+7d utilization (`daemon::usage_poller::kimi`),
+            // Grok for monthly billing credit
+            // (`daemon::usage_poller::grok`). Billing classification
+            // matches the 3P bearer Kimi provider
+            // (`billing_mode_for_3p` default).
+            billing_mode: BillingMode::Subscription,
         });
     }
     accounts.sort_by_key(|a| a.id);
@@ -1498,6 +1699,250 @@ mod tests {
         );
     }
 
+    // ── discover_native (Wave 3, an internal journal entry) ────────────────────
+
+    #[test]
+    fn discover_native_finds_kimi_and_grok_markers() {
+        use crate::providers::catalog::Surface;
+        use crate::providers::native::write_binding;
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(7u16).unwrap(),
+            Surface::Kimi,
+        )
+        .unwrap();
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(8u16).unwrap(),
+            Surface::Grok,
+        )
+        .unwrap();
+
+        let accounts = discover_native(dir.path());
+        assert_eq!(accounts.len(), 2);
+
+        let kimi = accounts.iter().find(|a| a.id == 7).expect("slot 7 kimi");
+        assert_eq!(
+            kimi.source,
+            AccountSource::Native {
+                surface: Surface::Kimi
+            }
+        );
+        assert_eq!(kimi.surface, Surface::Kimi);
+        assert_eq!(kimi.label, "kimi-7");
+        assert!(kimi.has_credentials);
+        assert_eq!(kimi.method, "native_cli");
+        assert_eq!(kimi.billing_mode, BillingMode::Subscription);
+
+        let grok = accounts.iter().find(|a| a.id == 8).expect("slot 8 grok");
+        assert_eq!(
+            grok.source,
+            AccountSource::Native {
+                surface: Surface::Grok
+            }
+        );
+        assert_eq!(grok.surface, Surface::Grok);
+        assert_eq!(grok.label, "grok-8");
+        assert_eq!(grok.method, "native_cli");
+        assert!(grok.has_credentials);
+        // C4 (an internal journal entry): native Kimi/Grok are vendor SUBSCRIPTION
+        // products (Kimi Coding Subscription, Grok's own plan), not
+        // pay-per-token APIs — both native surfaces MUST classify
+        // Subscription so the desktop/CLI suppress per-token cost framing.
+        // The Kimi assertion already existed above; Grok's was missing.
+        assert_eq!(grok.billing_mode, BillingMode::Subscription);
+    }
+
+    /// C4 (an internal journal entry, issue 3): both native Kimi and Grok slots resolve
+    /// `BillingMode::Subscription` — the classification that suppresses the
+    /// per-token cost path downstream. Standalone from
+    /// `discover_native_finds_kimi_and_grok_markers` (which asserts many
+    /// fields) so this specific acceptance criterion has its own
+    /// unambiguous pass-line.
+    #[test]
+    fn discover_native_kimi_and_grok_resolve_subscription_billing_mode() {
+        use crate::providers::catalog::Surface;
+        use crate::providers::native::write_binding;
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(1u16).unwrap(),
+            Surface::Kimi,
+        )
+        .unwrap();
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(2u16).unwrap(),
+            Surface::Grok,
+        )
+        .unwrap();
+
+        let accounts = discover_native(dir.path());
+        for a in &accounts {
+            assert_eq!(
+                a.billing_mode,
+                BillingMode::Subscription,
+                "native slot {} (surface {:?}) must classify Subscription, not ApiKey",
+                a.id,
+                a.surface
+            );
+        }
+        assert_eq!(accounts.len(), 2);
+    }
+
+    #[test]
+    fn discover_native_rename_wins() {
+        use crate::providers::catalog::Surface;
+        use crate::providers::native::write_binding;
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(4u16).unwrap(),
+            Surface::Kimi,
+        )
+        .unwrap();
+
+        let mut profiles = profiles::ProfilesFile::empty();
+        profiles.by_slot_label.insert("4".into(), "my-kimi".into());
+        profiles::save(&profiles::profiles_path(dir.path()), &profiles).unwrap();
+
+        let accounts = discover_native(dir.path());
+        let slot4 = accounts.iter().find(|a| a.id == 4).expect("slot 4 present");
+        assert_eq!(
+            slot4.label, "my-kimi",
+            "user rename must win over the kimi-N default"
+        );
+    }
+
+    #[test]
+    fn discover_native_skips_corrupt_marker() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
+        std::fs::write(
+            dir.path().join("credentials/kimi-2.json"),
+            "{ not valid json",
+        )
+        .unwrap();
+
+        let accounts = discover_native(dir.path());
+        assert!(
+            accounts.is_empty(),
+            "corrupt marker must be skipped, not surfaced as a bogus account"
+        );
+    }
+
+    #[test]
+    fn discover_native_rejects_leading_zero_slot() {
+        use crate::providers::catalog::Surface;
+        use crate::providers::native::write_binding;
+        let dir = TempDir::new().unwrap();
+        // Genuine marker at slot 3, plus a leading-zero-form duplicate that
+        // must not be picked up as a second, distinct slot.
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(3u16).unwrap(),
+            Surface::Kimi,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("credentials/kimi-03.json"), "{}").unwrap();
+
+        let accounts = discover_native(dir.path());
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, 3);
+    }
+
+    #[test]
+    fn discover_all_includes_native_slot() {
+        use crate::providers::catalog::Surface;
+        use crate::providers::native::write_binding;
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            crate::types::AccountNum::try_from(5u16).unwrap(),
+            Surface::Grok,
+        )
+        .unwrap();
+
+        let accounts = discover_all(dir.path());
+        let native = accounts
+            .iter()
+            .find(|a| a.id == 5)
+            .expect("native slot 5 must appear in discover_all");
+        assert_eq!(
+            native.source,
+            AccountSource::Native {
+                surface: Surface::Grok
+            }
+        );
+        assert_eq!(native.surface, Surface::Grok);
+    }
+
+    #[test]
+    fn discover_all_native_slot_not_deduped_by_other_surfaces() {
+        // A slot list spanning every surface discover_all enumerates —
+        // Anthropic (1), Codex (2), Gemini (3), native Kimi (7), native
+        // Grok (8), 3P per-slot MiniMax (9). Every one of these is a
+        // DISTINCT id, so none should collide in the `seen` dedup map;
+        // this pins that adding native discovery does not accidentally
+        // swallow — or get swallowed by — any sibling surface's slots.
+        use crate::providers::catalog::Surface;
+        use crate::providers::gemini::provisioning::{
+            write_binding as gemini_write_binding, AuthMode, GeminiBinding,
+        };
+        use crate::providers::native::write_binding as native_write_binding;
+        use crate::types::AccountNum;
+
+        let dir = TempDir::new().unwrap();
+        write_cred(dir.path(), 1);
+        // Codex slot 2 — legacy numeric scan shape (reuses the helper
+        // `discover_codex`'s own tests build their fixtures with).
+        write_codex_cred(dir.path(), 2);
+        std::fs::write(dir.path().join("credentials/gemini-3.json"), "{}").unwrap();
+        gemini_write_binding(
+            dir.path(),
+            AccountNum::try_from(3u16).unwrap(),
+            &GeminiBinding::new(AuthMode::ApiKey, "gemini-2.5-flash"),
+        )
+        .unwrap();
+        native_write_binding(
+            dir.path(),
+            AccountNum::try_from(7u16).unwrap(),
+            Surface::Kimi,
+        )
+        .unwrap();
+        native_write_binding(
+            dir.path(),
+            AccountNum::try_from(8u16).unwrap(),
+            Surface::Grok,
+        )
+        .unwrap();
+        write_slot_settings(dir.path(), 9, "https://api.minimax.io/anthropic", "tok-mm");
+
+        let accounts = discover_all(dir.path());
+        let ids: Vec<u16> = {
+            let mut v: Vec<u16> = accounts.iter().map(|a| a.id).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ids, vec![1, 2, 3, 7, 8, 9]);
+
+        let kimi = accounts.iter().find(|a| a.id == 7).unwrap();
+        assert_eq!(
+            kimi.source,
+            AccountSource::Native {
+                surface: Surface::Kimi
+            }
+        );
+        let grok = accounts.iter().find(|a| a.id == 8).unwrap();
+        assert_eq!(
+            grok.source,
+            AccountSource::Native {
+                surface: Surface::Grok
+            }
+        );
+    }
+
     #[test]
     fn discover_manual_round_trip() {
         let dir = TempDir::new().unwrap();
@@ -1624,6 +2069,17 @@ mod tests {
         assert_eq!(provider_from_base_url("https://example.com/api"), None);
     }
 
+    #[test]
+    fn provider_from_url_classifies_kimi() {
+        // Wave-1 completeness HIGH: without this arm a kimi slot is invisible to
+        // discovery/desktop/quota and leaks its extra_env on rebind. The base URL
+        // is the Kimi coding-subscription endpoint (api.kimi.com/coding).
+        assert_eq!(
+            provider_from_base_url("https://api.kimi.com/coding"),
+            Some("Kimi")
+        );
+    }
+
     // ── discover_per_slot_third_party ──────────────────────
 
     /// Writes a `{base}/config-N/settings.json` with the given base
@@ -1635,6 +2091,101 @@ mod tests {
             r#"{{"env":{{"ANTHROPIC_BASE_URL":"{base_url}","ANTHROPIC_AUTH_TOKEN":"{token}"}}}}"#
         );
         std::fs::write(dir.join("settings.json"), json).unwrap();
+    }
+
+    /// Writes a config-N/settings.json env block with a raw JSON body — used by
+    /// the cloud-Claude (an internal ticket) discovery tests to seed `CLAUDE_CODE_USE_*`.
+    fn write_slot_settings_raw(base: &Path, slot: u16, env_body: &str) {
+        let dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `env_body` is the comma-separated key:value contents of the `env`
+        // object — wrap it in braces so the result is a valid `{"env":{...}}`.
+        std::fs::write(
+            dir.join("settings.json"),
+            format!(r#"{{"env":{{{env_body}}}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn per_slot_discovers_cloud_claude_vertex() {
+        // an internal ticket: a cloud-Claude Vertex slot carries CLAUDE_CODE_USE_VERTEX (no
+        // ANTHROPIC_BASE_URL) and must surface as ThirdParty{claude-vertex}, ApiKey.
+        let dir = TempDir::new().unwrap();
+        write_slot_settings_raw(
+            dir.path(),
+            7,
+            r#""CLAUDE_CODE_USE_VERTEX":"1","ANTHROPIC_VERTEX_PROJECT_ID":"my-proj","CLOUD_ML_REGION":"us-east5","GOOGLE_APPLICATION_CREDENTIALS":"/keys/sa.json""#,
+        );
+
+        let accounts = discover_per_slot_third_party(dir.path());
+        let s7 = accounts.iter().find(|a| a.id == 7).expect("slot 7 present");
+        assert_eq!(
+            s7.source,
+            AccountSource::ThirdParty {
+                provider: "claude-vertex".into()
+            }
+        );
+        assert_eq!(s7.surface, Surface::ClaudeCode);
+        assert_eq!(s7.billing_mode, BillingMode::ApiKey);
+        assert!(
+            s7.has_credentials,
+            "GOOGLE_APPLICATION_CREDENTIALS present + non-empty → has_credentials"
+        );
+    }
+
+    #[test]
+    fn per_slot_discovers_cloud_claude_bedrock() {
+        let dir = TempDir::new().unwrap();
+        write_slot_settings_raw(
+            dir.path(),
+            8,
+            r#""CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1","AWS_BEARER_TOKEN_BEDROCK":"tok-bedrock""#,
+        );
+
+        let accounts = discover_per_slot_third_party(dir.path());
+        let s8 = accounts.iter().find(|a| a.id == 8).expect("slot 8 present");
+        assert_eq!(
+            s8.source,
+            AccountSource::ThirdParty {
+                provider: "claude-bedrock".into()
+            }
+        );
+        assert_eq!(s8.billing_mode, BillingMode::ApiKey);
+        assert!(s8.has_credentials);
+    }
+
+    #[test]
+    fn per_slot_cloud_claude_missing_creds_flagged_not_credentialed() {
+        // A CLAUDE_CODE_USE_VERTEX slot with NO GOOGLE_APPLICATION_CREDENTIALS
+        // (hand-edited / half-provisioned) is still surfaced, but has_credentials
+        // is false so the operator sees it is incomplete.
+        let dir = TempDir::new().unwrap();
+        write_slot_settings_raw(
+            dir.path(),
+            9,
+            r#""CLAUDE_CODE_USE_VERTEX":"1","ANTHROPIC_VERTEX_PROJECT_ID":"p","CLOUD_ML_REGION":"r""#,
+        );
+        let accounts = discover_per_slot_third_party(dir.path());
+        let s9 = accounts.iter().find(|a| a.id == 9).expect("slot 9 present");
+        assert!(
+            matches!(&s9.source, AccountSource::ThirdParty { provider } if provider == "claude-vertex")
+        );
+        assert!(!s9.has_credentials, "missing SA cred → not credentialed");
+    }
+
+    #[test]
+    fn per_slot_plain_slot_without_base_url_or_cloud_flag_is_skipped() {
+        // A config-N/settings.json with neither ANTHROPIC_BASE_URL nor a cloud
+        // flag (e.g. a bare OAuth slot's settings) is NOT a 3P/cloud binding and
+        // must not be surfaced by this arm.
+        let dir = TempDir::new().unwrap();
+        write_slot_settings_raw(dir.path(), 5, r#""SOME_OTHER":"x""#);
+        let accounts = discover_per_slot_third_party(dir.path());
+        assert!(
+            !accounts.iter().any(|a| a.id == 5),
+            "plain slot with no 3P/cloud markers must be skipped"
+        );
     }
 
     #[test]
@@ -1803,6 +2354,7 @@ mod tests {
                 AccountSource::Gemini => "Gemini",
                 AccountSource::ThirdParty { provider } => provider.as_str(),
                 AccountSource::Manual => "Manual",
+                AccountSource::Native { surface } => surface.as_str(),
             })
             .collect();
         assert_eq!(

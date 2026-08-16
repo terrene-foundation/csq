@@ -46,7 +46,7 @@ use crate::error::redact_tokens;
 use crate::http::codex::{parse_wham_response, WhamSnapshot};
 use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
 use crate::providers::catalog::Surface;
-use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+use crate::quota::{state as quota_state, AccountQuota, UsageWindow};
 use crate::types::AccountNum;
 use std::collections::HashMap;
 use std::path::Path;
@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use super::{HttpGetFn, PollError, CALL_TIMEOUT, MAX_ACCOUNTS_PER_TICK};
+use super::{classify_transport_error, HttpGetFn, PollError, CALL_TIMEOUT, MAX_ACCOUNTS_PER_TICK};
 
 // ─── Circuit-breaker constants ─────────────────────────────────────────
 
@@ -288,18 +288,78 @@ pub(crate) async fn tick(base_dir: &Path, http_get_codex: &HttpGetFn, breakers: 
                 breaker_record_failure(breakers, info.id, Instant::now());
             }
             Ok(Err(PollCodexError::Poll(kind))) => {
-                let tag = match kind {
-                    PollError::RateLimited => "codex_poll_rate_limited",
-                    PollError::Unauthorized => "codex_poll_unauthorized",
-                    PollError::Transport(_) => "codex_poll_transport_error",
-                    PollError::Parse(_) => "codex_poll_parse_error",
-                    PollError::HttpError(_) => "codex_poll_http_error",
-                };
-                debug!(
-                    account = info.id,
-                    error_kind = tag,
-                    "codex usage poller: tick failed"
-                );
+                // A single flat match over every `PollError` variant — no
+                // catch-all, no `unreachable!()` — mirrors
+                // `anthropic.rs`/`kimi.rs`/`grok.rs`/`third_party.rs`
+                // (round-7 redteam A-L1). The PRIOR shape split `BadUrl`
+                // into its own earlier match ARM (matched before this
+                // one) and covered it AGAIN inside this arm's nested
+                // match via `unreachable!("handled by the arm above")`,
+                // relying on ARM ORDER to keep that branch dead. Any
+                // future edit that reordered or removed the earlier arm
+                // — the match stays EXHAUSTIVE either way, so the
+                // compiler would not warn — turned this poller's every
+                // `BadUrl` tick into a PANIC on the daemon's hot polling
+                // path instead of a mis-tagged log line. Handling every
+                // variant here, once, removes the order dependency
+                // entirely.
+                match kind {
+                    PollError::BadUrl(_) => {
+                        // Reachable for the codex TOKEN guard even though
+                        // this poller's own URL is the fixed
+                        // `WHAM_USAGE_URL` constant (round-2 redteam
+                        // R6-rust corrected a stale "unreachable in
+                        // practice" comment here): `ERR_TOKEN_UNSAFE_CHARS`
+                        // checks whatever access token THIS caller passes,
+                        // regardless of the URL — a corrupted stored Codex
+                        // credential trips it here, now that this call
+                        // site routes through `classify_transport_error`.
+                        // WARN (distinct from the shared `debug!` every
+                        // other variant below gets) because this is a
+                        // permanent, operator-actionable state (re-login
+                        // needed), not a network blip.
+                        warn!(
+                            account = info.id,
+                            error_kind = "codex_poll_bad_url",
+                            "codex usage poller: outbound url or token rejected pre-flight — check the account's stored credentials"
+                        );
+                    }
+                    PollError::RateLimited => {
+                        debug!(
+                            account = info.id,
+                            error_kind = "codex_poll_rate_limited",
+                            "codex usage poller: tick failed"
+                        );
+                    }
+                    PollError::Unauthorized => {
+                        debug!(
+                            account = info.id,
+                            error_kind = "codex_poll_unauthorized",
+                            "codex usage poller: tick failed"
+                        );
+                    }
+                    PollError::Transport(_) => {
+                        debug!(
+                            account = info.id,
+                            error_kind = "codex_poll_transport_error",
+                            "codex usage poller: tick failed"
+                        );
+                    }
+                    PollError::Parse(_) => {
+                        debug!(
+                            account = info.id,
+                            error_kind = "codex_poll_parse_error",
+                            "codex usage poller: tick failed"
+                        );
+                    }
+                    PollError::HttpError(_) => {
+                        debug!(
+                            account = info.id,
+                            error_kind = "codex_poll_http_error",
+                            "codex usage poller: tick failed"
+                        );
+                    }
+                }
                 breaker_record_failure(breakers, info.id, Instant::now());
             }
             Err(_join_err) => {
@@ -338,7 +398,7 @@ pub(crate) fn poll_codex_usage_capture(
 ) -> Result<(WhamSnapshot, Vec<u8>), PollCodexError> {
     let url = crate::http::codex::WHAM_USAGE_URL;
     let (status, bytes) = http_get_codex(url, access_token, &[])
-        .map_err(|e| PollCodexError::Poll(PollError::Transport(e)))?;
+        .map_err(|e| PollCodexError::Poll(classify_transport_error(e)))?;
 
     // Map non-200s into the PollError hierarchy before touching the
     // body, so we never feed an error envelope into the success
@@ -371,7 +431,22 @@ pub(crate) fn write_wham_to_quota(
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
-    let mut quota = quota_state::load_state(base_dir).unwrap_or_else(|_| QuotaFile::empty());
+    // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
+    // falling back to QuotaFile::empty() — a load failure here must SKIP
+    // the write, not persist a one-row file that wipes every sibling
+    // account's row (mirrors usage_poller::gemini_oauth::write_quota).
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            warn!(
+                account = account.get(),
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "codex usage poller: quota.json unreadable, skipping write to avoid clobbering sibling rows"
+            );
+            return Ok(());
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -436,7 +511,22 @@ pub(crate) fn write_unknown_to_quota(
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
-    let mut quota = quota_state::load_state(base_dir).unwrap_or_else(|_| QuotaFile::empty());
+    // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
+    // falling back to QuotaFile::empty() — a load failure here must SKIP
+    // the write, not persist a one-row file that wipes every sibling
+    // account's row (mirrors usage_poller::gemini_oauth::write_quota).
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            warn!(
+                account = account.get(),
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "codex usage poller: quota.json unreadable, skipping write to avoid clobbering sibling rows"
+            );
+            return Ok(());
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -742,6 +832,12 @@ mod tests {
         // secondary_window null. The mapping keys off limit_window_seconds,
         // so the 7-day window lands in seven_day (NOT five_hour) and
         // five_hour is correctly absent — the regression this fix closes.
+        //
+        // `reset_at` MUST be a far-future literal (4102444800 = 2100-01-01,
+        // testing.md Rule 1). The original 1784682780 was a near-future value
+        // that decoded to 2026-07-22 01:13 UTC; once real time crossed it,
+        // `load_state`'s `clear_expired` zeroed the 7-day window and this test
+        // began failing on every PR. Do NOT "tidy" it back to a plausible date.
         let body = br#"{
             "plan_type": "pro",
             "rate_limit": {
@@ -751,7 +847,7 @@ mod tests {
                     "used_percent": 37,
                     "limit_window_seconds": 604800,
                     "reset_after_seconds": 555089,
-                    "reset_at": 1784682780
+                    "reset_at": 4102444800
                 },
                 "secondary_window": null
             }
@@ -768,7 +864,7 @@ mod tests {
         assert!((q.seven_day_pct() - 37.0).abs() < 0.01, "7-day = 37%");
         assert_eq!(
             q.seven_day.as_ref().unwrap().resets_at,
-            1_784_682_780,
+            4_102_444_800,
             "7-day reset carried through"
         );
     }
@@ -784,6 +880,64 @@ mod tests {
         assert_eq!(q.kind, "unknown");
         assert!(q.five_hour.is_none());
         assert!(q.seven_day.is_none());
+    }
+
+    /// MED-1 (an internal ticket redteam): a schema-drifted `quota.json` must NOT
+    /// be clobbered by either codex write leg. Before the fix,
+    /// `load_state_or_warn`'s `QuotaFile::empty()` fallback let a single
+    /// `quota.set` + `save_state` persist a one-row file, wiping every
+    /// sibling account's row.
+    fn write_poisoned_quota_file(dir: &std::path::Path) {
+        let poisoned = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        std::fs::write(quota_state::quota_path(dir), poisoned).unwrap();
+    }
+
+    fn assert_siblings_untouched_and_target_skipped(dir: &std::path::Path, target_slot: u16) {
+        let raw = std::fs::read_to_string(quota_state::quota_path(dir)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["accounts"]["1"]["five_hour"]["used_percentage"].as_f64(),
+            Some(50.0),
+            "slot 1 must survive untouched"
+        );
+        assert_eq!(
+            v["accounts"]["2"]["five_hour"]["used_percentage"].as_f64(),
+            Some(80.0),
+            "slot 2 must survive untouched"
+        );
+        assert!(
+            v["accounts"].get(target_slot.to_string()).is_none(),
+            "target slot write must have been skipped entirely, not persisted"
+        );
+    }
+
+    #[test]
+    fn write_wham_to_quota_skips_on_poisoned_file_preserving_siblings() {
+        let dir = TempDir::new().unwrap();
+        write_poisoned_quota_file(dir.path());
+        let snap = parse_wham_response(200, WHAM_GOLDEN).unwrap();
+        let account = AccountNum::try_from(3u16).unwrap();
+
+        let result = write_wham_to_quota(dir.path(), account, &snap);
+        assert!(result.is_ok(), "skip must be Ok(()), not an error");
+        assert_siblings_untouched_and_target_skipped(dir.path(), 3);
+    }
+
+    #[test]
+    fn write_unknown_to_quota_skips_on_poisoned_file_preserving_siblings() {
+        let dir = TempDir::new().unwrap();
+        write_poisoned_quota_file(dir.path());
+        let account = AccountNum::try_from(4u16).unwrap();
+
+        let result = write_unknown_to_quota(dir.path(), account);
+        assert!(result.is_ok(), "skip must be Ok(()), not an error");
+        assert_siblings_untouched_and_target_skipped(dir.path(), 4);
     }
 
     #[test]
@@ -861,6 +1015,19 @@ mod tests {
         })
     }
 
+    /// Returns the exact pre-flight rejection string
+    /// `classify_transport_error` classifies as `PollError::BadUrl` —
+    /// simulating a corrupted stored Codex access token (round-2 redteam
+    /// R6-rust: `ERR_TOKEN_UNSAFE_CHARS` inspects the TOKEN, not the URL,
+    /// so it is reachable even though `poll_codex_usage_capture` uses the
+    /// fixed `WHAM_USAGE_URL` constant).
+    fn mock_wham_bad_url(counter: Arc<AtomicU32>) -> HttpGetFn {
+        Arc::new(move |_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(crate::http::ERR_TOKEN_UNSAFE_CHARS.to_string())
+        })
+    }
+
     #[tokio::test]
     async fn tick_polls_codex_account_and_writes_quota() {
         let dir = TempDir::new().unwrap();
@@ -917,6 +1084,41 @@ mod tests {
 
         let guard = breakers.lock().unwrap();
         assert_eq!(guard.get(&7).map(|s| s.fails).unwrap_or(0), 1);
+    }
+
+    /// Round-7 redteam A-L1: before this fix, `PollError::BadUrl` was
+    /// handled twice — once by an earlier match arm, and again inside a
+    /// LATER catch-all arm's nested match via
+    /// `unreachable!("handled by the arm above")`. That is safe only as
+    /// long as the earlier arm stays first; nothing in the match's
+    /// EXHAUSTIVENESS check enforces that ordering, so a future edit
+    /// reordering or deleting the earlier arm would make every codex
+    /// poll of a corrupted-token account PANIC on this hot per-tick path
+    /// instead of logging a warning. This test does not (and cannot)
+    /// exercise "what if the arms get reordered" directly — Rust doesn't
+    /// let a test reorder match arms in another function — but it does
+    /// prove the CURRENT code takes the `BadUrl` path to completion
+    /// without panicking and records a breaker failure, which is the
+    /// behavior the merged single-arm match (mirroring
+    /// `anthropic.rs`/`kimi.rs`) now guarantees structurally rather than
+    /// via arm order.
+    #[tokio::test]
+    async fn tick_bad_url_records_failure_without_panicking() {
+        let dir = TempDir::new().unwrap();
+        install_codex_account(dir.path(), 11, "test-access-token");
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_wham_bad_url(Arc::clone(&counter));
+        let breakers: BreakerMap = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &breakers).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let guard = breakers.lock().unwrap();
+        assert_eq!(
+            guard.get(&11).map(|s| s.fails).unwrap_or(0),
+            1,
+            "BadUrl must record a breaker failure like every other poll error"
+        );
     }
 
     #[tokio::test]

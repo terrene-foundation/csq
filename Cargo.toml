@@ -102,7 +102,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "serde"
 uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-dirs = "5"
+dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "blocking"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
 hyper = { version = "1", features = ["server", "http1"] }

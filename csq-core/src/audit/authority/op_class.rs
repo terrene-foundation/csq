@@ -65,7 +65,7 @@ impl OpClass {
             // daemon noting a replayed event was dropped). Unguarded — same
             // rationale as SeamEventRejected.
             | EventKind::SeamDuplicateSuppressed
-            // #784 per-turn governance attestation is a passive observation of a
+            // an internal ticket per-turn governance attestation is a passive observation of a
             // turn the live session already governed — single-sig chain-signed,
             // not an own-ops decision requiring the M12 multi-sig roster.
             | EventKind::GovernanceTurn
@@ -78,7 +78,7 @@ impl OpClass {
             // chain-signed, not an own-ops decision requiring the M12 multi-sig
             // roster (same rationale as GovernanceTurn).
             | EventKind::McpGateDecision
-            // #787 b2b policy-bundle install is a passive own-op observation:
+            // an internal ticket b2b policy-bundle install is a passive own-op observation:
             // the bundle's own detached signature (verified against the
             // out-of-band --pubkey) IS its authority, so the record is
             // single-sig chain-signed, not an M12 multi-sig-roster decision
@@ -166,7 +166,7 @@ mod tests {
         // Exhaustiveness check: every EventKind in EventKind::ALL must be
         // handled by from_event_kind without panicking.
         for kind in EventKind::ALL {
-            let _ = OpClass::from_event_kind(&kind);
+            let _ = OpClass::from_event_kind(kind);
         }
     }
 }

@@ -56,7 +56,7 @@ pub enum OauthAccountState {
     NotYetPopulated,
     /// `.claude.json` is PRESENT with non-trivial content the wrong-account gate
     /// cannot extract a usable `oauthAccount.emailAddress` from. This is the
-    /// format-drift / gate-degradation signal (#833). It covers EVERY present,
+    /// format-drift / gate-degradation signal (an internal ticket). It covers EVERY present,
     /// non-fresh shape that makes `read_oauth_email` (the gate's reader) return
     /// `None`:
     /// - a populated JSON object with `oauthAccount` omitted, renamed, non-object,
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn classify_field_missing_when_populated_but_no_oauth_account() {
-        // The #833 drift signal: CC populated the file but no oauthAccount at all.
+        // The an internal ticket drift signal: CC populated the file but no oauthAccount at all.
         let dir = tempfile::TempDir::new().unwrap();
         write_claude_json(
             dir.path(),

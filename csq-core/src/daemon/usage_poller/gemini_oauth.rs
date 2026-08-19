@@ -494,6 +494,46 @@ fn write_quota(
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
 
+    // Re-verify the slot is STILL OAuth-bound, INSIDE the lock.
+    //
+    // `tick` enumerates OAuth slots ONCE and then makes a network round-trip
+    // before reaching this write, so its decision to write is stale by
+    // however long the fetch took. An operator who rebinds the slot to
+    // ApiKey/VertexSa during that window would otherwise get a fresh
+    // `kind: "utilization"` row written for a slot that nothing will ever
+    // poll again — reviving precisely the false-`stale` marker that
+    // `provisioning::write_binding`'s regime-change clear exists to remove,
+    // reached through a race instead of an omission.
+    //
+    // The placement is load-bearing, not incidental. Checking BEFORE taking
+    // the lock would only narrow the window: the rebind's own clear runs
+    // under this same lock, so a check outside it can still be overtaken by
+    // (rebind writes marker -> rebind clears row -> we write a stale row).
+    // Inside the lock the two orderings are both correct: either we observe
+    // the new marker and skip, or we write first and the rebind's clear —
+    // which must wait for this guard — removes the row afterwards.
+    match crate::providers::gemini::provisioning::read_binding(base_dir, slot) {
+        Ok(b) if matches!(b.auth, AuthMode::CodeAssistOAuth) => {}
+        Ok(_) => {
+            debug!(
+                slot = slot.get(),
+                "gemini_oauth poller: slot was rebound away from OAuth during the fetch; \
+                 skipping the quota write so the stale regime's row is not recreated"
+            );
+            return Ok(());
+        }
+        Err(_) => {
+            // Unreadable or absent marker: we cannot CONFIRM this slot is
+            // OAuth-bound, so we do not write. Fail closed — the cost is one
+            // skipped poll, and the slot repopulates on the next tick.
+            debug!(
+                slot = slot.get(),
+                "gemini_oauth poller: binding marker unreadable at write time; skipping"
+            );
+            return Ok(());
+        }
+    }
+
     // load_state failure → SKIP the write. Falling back to
     // QuotaFile::empty would silently destroy every other account's
     // quota when the file is corrupt.
@@ -680,6 +720,77 @@ mod tests {
 
     fn slot(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
+    }
+
+    fn test_projection() -> UsageWindowProjection {
+        UsageWindowProjection {
+            used_percentage: 42.0,
+            resets_at_iso: None,
+            limiting_model: None,
+            limiting_token_type: None,
+        }
+    }
+
+    fn quota_row_exists(base: &std::path::Path, n: u16) -> bool {
+        quota_state::load_state(base)
+            .map(|q| q.accounts.contains_key(&n.to_string()))
+            .unwrap_or(false)
+    }
+
+    /// `tick` enumerates OAuth slots BEFORE a network round-trip and writes
+    /// AFTER it, so its decision to write is stale by however long the fetch
+    /// took. A slot rebound to ApiKey/VertexSa in that window must NOT get a
+    /// fresh `kind: "utilization"` row — nothing will ever poll it again, so
+    /// that row freezes and renders a false `stale` marker an hour later:
+    /// the same class `provisioning::write_binding`'s regime-change clear
+    /// removes, reached by a race instead of an omission.
+    #[test]
+    fn write_quota_skips_a_slot_rebound_away_from_oauth_during_the_fetch() {
+        let dir = TempDir::new().unwrap();
+        // The state `tick` enumerated on: OAuth-bound.
+        write_binding(
+            dir.path(),
+            slot(3),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "auto"),
+        )
+        .unwrap();
+        // ... and the rebind that lands while the HTTP fetch is in flight.
+        write_binding(
+            dir.path(),
+            slot(3),
+            &GeminiBinding::new(AuthMode::ApiKey, "auto"),
+        )
+        .unwrap();
+
+        write_quota(dir.path(), slot(3), &test_projection(), false).unwrap();
+
+        assert!(
+            !quota_row_exists(dir.path(), 3),
+            "the poller wrote a utilization row for a slot that is no longer OAuth-bound; \
+             nothing polls it again, so that row freezes and renders a false `stale`"
+        );
+    }
+
+    /// The positive control for the guard above: a slot that IS still
+    /// OAuth-bound must still be written. Without this, a guard that
+    /// refused everything would satisfy the test above and silently stop
+    /// all Code Assist quota polling.
+    #[test]
+    fn write_quota_still_writes_a_slot_that_is_still_oauth_bound() {
+        let dir = TempDir::new().unwrap();
+        write_binding(
+            dir.path(),
+            slot(4),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "auto"),
+        )
+        .unwrap();
+
+        write_quota(dir.path(), slot(4), &test_projection(), false).unwrap();
+
+        assert!(
+            quota_row_exists(dir.path(), 4),
+            "an OAuth-bound slot was skipped — the guard is refusing legitimate writes"
+        );
     }
 
     #[test]

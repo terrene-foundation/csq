@@ -1,4 +1,4 @@
-//! Plain-language compliance-report generator (FR-GOV #788).
+//! Plain-language compliance-report generator (FR-GOV an internal ticket).
 //!
 //! The audit export bundle (`csq-core/src/audit/export.rs`) is machine-readable
 //! only: `chain.jsonl` (canonical-form signed records) plus a `verify` script.
@@ -495,7 +495,7 @@ fn lifecycle_label(payload: &EventPayload) -> (String, String) {
         P::ProvenanceAnchored(_) => ("provenance anchored".into(), String::new()),
         P::ProvenanceCaptureMatrix(_) => ("provenance capture matrix".into(), String::new()),
         P::SeamDuplicateSuppressed(_) => ("seam duplicate suppressed".into(), String::new()),
-        // #787 b2b — a signed policy-bundle install (own-op lifecycle record).
+        // an internal ticket b2b — a signed policy-bundle install (own-op lifecycle record).
         // Cites only non-secret fields: the bundle version and an 8-byte hex
         // fingerprint of the PUBLIC verifying key. The fingerprint is built
         // byte-by-byte (not by slicing a formatted string) so it is panic-proof

@@ -75,6 +75,10 @@ tracing.workspace = true
 # Cargo.toml comment) so the desktop tauri-plugin-log façade owns the log
 # crate. The cli surface re-uses the same workspace pin.
 tracing-subscriber.workspace = true
+# tracing-appender — daemon rolling-file log writer (#1a-2). Unconditional
+# (not feature-gated): both the CLI (`csq daemon start`) and the desktop
+# in-process daemon supervisor wire it into their subscriber.
+tracing-appender.workspace = true
 thiserror.workspace = true
 subtle.workspace = true
 base64.workspace = true

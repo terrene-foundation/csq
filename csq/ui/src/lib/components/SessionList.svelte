@@ -15,6 +15,14 @@
     account_label: string | null;
     five_hour_pct: number;
     seven_day_pct: number;
+    /// Whether the two percentages above are MEASUREMENTS. False when the
+    /// bound account has no quota row, or a row with no usage window at all
+    /// (a balance-metered slot like DeepSeek). The percentages are then
+    /// wire-format `0.0` defaults, and rendering them as `0%` styled healthy
+    /// is a confident wrong answer. Optional so an older backend that
+    /// predates the field degrades to the previous behaviour rather than
+    /// rendering every badge as pending.
+    has_quota?: boolean;
     started_at: number | null;
     tty: string | null;
     term_window: number | null;
@@ -303,12 +311,27 @@
                   {/if}
                 </span>
               {/if}
-              <span class="quota-badge {quotaClass(session.five_hour_pct)}">
-                5h:{session.five_hour_pct > 0 && session.five_hour_pct < 1 ? '<1' : Math.round(session.five_hour_pct)}%
-              </span>
-              <span class="quota-badge {quotaClass(session.seven_day_pct)}">
-                7d:{session.seven_day_pct > 0 && session.seven_day_pct < 1 ? '<1' : Math.round(session.seven_day_pct)}%
-              </span>
+              {#if session.has_quota === false}
+                <!--
+                  The bound account has no observable usage window — a
+                  balance-metered slot (DeepSeek), or one not yet polled.
+                  `five_hour_pct`/`seven_day_pct` are `0.0` only because that
+                  is the wire-format default, NOT a measured "0% used", so a
+                  `0%` badge styled healthy is indistinguishable from a real
+                  reading. Render the honest pending state instead — the same
+                  precedent AccountList.svelte uses for `has_quota === false`.
+                -->
+                <span class="quota-badge quota-badge-na" data-testid="session-quota-na">
+                  quota: n/a
+                </span>
+              {:else}
+                <span class="quota-badge {quotaClass(session.five_hour_pct)}">
+                  5h:{session.five_hour_pct > 0 && session.five_hour_pct < 1 ? '<1' : Math.round(session.five_hour_pct)}%
+                </span>
+                <span class="quota-badge {quotaClass(session.seven_day_pct)}">
+                  7d:{session.seven_day_pct > 0 && session.seven_day_pct < 1 ? '<1' : Math.round(session.seven_day_pct)}%
+                </span>
+              {/if}
             </div>
           </div>
         </div>
@@ -445,6 +468,13 @@
   .quota-badge {
     font-family: ui-monospace, monospace;
     font-size: 0.72rem;
+  }
+  /* Deliberately muted, and deliberately NOT .quota-ok green: "we cannot
+     measure this" must not read as "healthy". Matches the dimmed treatment
+     AccountList uses for its own pending states. */
+  .quota-badge-na {
+    color: var(--text-dim, an internal ticket);
+    font-style: italic;
   }
   .quota {
     font-family: ui-monospace, monospace;

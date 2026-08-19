@@ -1,12 +1,12 @@
 //! Quota state management — load, save, update with payload-hash cursor.
 
-use super::QuotaFile;
+use super::{AccountQuota, QuotaFile};
 use crate::error::ConfigError;
 use crate::platform::fs::{atomic_replace, secure_file};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use super::{AccountQuota, UsageWindow};
+use super::UsageWindow;
 #[cfg(test)]
 use crate::platform::lock;
 #[cfg(test)]
@@ -26,6 +26,182 @@ pub fn cursor_path(config_dir: &Path) -> PathBuf {
     config_dir.join(".quota-cursor")
 }
 
+/// Load `quota.json`, salvaging per-account-row on a typed-parse failure
+/// instead of discarding the whole file (an internal ticket).
+///
+/// Read-only consumers (status display, desktop, CLI statusline) call
+/// this in place of the old `load_state_or_warn` (superseded). The old
+/// shape fell back to `QuotaFile::empty()` on ANY parse failure,
+/// including a single corrupt row (e.g. a non-finite f64 serialized as
+/// `null` by a stale writer — the typed [`QuotaFile`] parse then rejects
+/// the WHOLE file), which blanked every sibling account's quota with no
+/// indication which row was actually bad (redteam R5 F1, an internal ticket). This
+/// function instead:
+///
+/// 1. Parses the top level as [`serde_json::Value`] rather than the
+///    typed `QuotaFile` shape, so a malformed row cannot poison the
+///    whole document.
+/// 2. Walks `accounts` one row at a time: a row that fails the typed
+///    [`AccountQuota`] parse, or whose key is not a valid `AccountNum`
+///    (1..=999), is DROPPED with a WARN naming the slot id — never the
+///    row's contents, which may be credential-adjacent (`security.md`
+///    MUST-2). Every other row survives.
+/// 3. Top-level JSON that is not even valid JSON (`{not valid json`) has
+///    no `accounts` object to walk — falls back to `QuotaFile::empty()`
+///    + WARN, matching the old whole-file behaviour for that case.
+/// 4. `schema_version > 2` still degrades to `QuotaFile::empty()` + WARN
+///    (VP-final R3: rollback UX) — a newer binary may have written a row
+///    shape this build cannot safely interpret at all, so per-row
+///    salvage is not attempted there.
+///
+/// This is a read path — it never writes. Write legs (usage pollers) use
+/// [`load_state_or_skip`], which fails closed instead of persisting a
+/// salvaged/partial file over sibling rows it cannot see.
+pub fn load_state_salvage(base_dir: &Path) -> QuotaFile {
+    let path = quota_path(base_dir);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return QuotaFile::empty(),
+    };
+    if content.trim().is_empty() {
+        return QuotaFile::empty();
+    }
+
+    let raw: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error_kind = "quota_json_unparseable",
+                "quota.json top-level JSON is malformed ({e}); falling back to \
+                 empty — sibling quota rows will be re-polled on their next ticks"
+            );
+            return QuotaFile::empty();
+        }
+    };
+
+    let schema_version = raw
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+
+    if schema_version > 2 {
+        tracing::warn!(
+            path = %path.display(),
+            schema_version,
+            error_kind = "schema_version_newer",
+            "quota.json schema_version {} is newer than this csq binary supports. \
+             Degrading to empty quota state. Upgrade csq to preserve existing quota data.",
+            schema_version
+        );
+        return QuotaFile::empty();
+    }
+
+    let mut quota_file = QuotaFile {
+        schema_version,
+        accounts: std::collections::HashMap::new(),
+    };
+
+    if let Some(accounts_obj) = raw.get("accounts").and_then(|v| v.as_object()) {
+        for (key, row_value) in accounts_obj.iter() {
+            let valid_key = key
+                .parse::<u16>()
+                .ok()
+                .and_then(|n| crate::types::AccountNum::try_from(n).ok())
+                .is_some();
+            if !valid_key {
+                tracing::warn!(
+                    path = %path.display(),
+                    slot = %key,
+                    error_kind = "quota_row_invalid_key",
+                    "quota.json account key is not a valid AccountNum (1..=999); \
+                     dropping this row, sibling rows preserved"
+                );
+                continue;
+            }
+
+            match serde_json::from_value::<AccountQuota>(row_value.clone()) {
+                Ok(q) => {
+                    quota_file.accounts.insert(key.clone(), q);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        slot = %key,
+                        error_kind = "quota_row_corrupt",
+                        error = %e,
+                        "quota.json account row failed to parse; dropping this row, \
+                         sibling rows preserved"
+                    );
+                }
+            }
+        }
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for quota in quota_file.accounts.values_mut() {
+        quota.clear_expired(now_secs);
+    }
+
+    quota_file
+}
+
+/// Peeks `schema_version` from the raw JSON without committing to the
+/// typed [`QuotaFile`] parse. Returns `None` when the file is absent,
+/// empty, or not valid JSON — callers fall through to [`load_state`]'s
+/// own handling for those cases (a missing/empty file is not a
+/// corruption risk for a write path; there is nothing to clobber).
+fn peek_schema_version(path: &Path) -> Option<u32> {
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let raw: serde_json::Value = serde_json::from_str(&content).ok()?;
+    Some(
+        raw.get("schema_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32,
+    )
+}
+
+/// Load `quota.json` for a write path that must NEVER clobber sibling
+/// account rows on a load failure.
+///
+/// `load_state_or_warn`'s `QuotaFile::empty()` fallback is safe ONLY for
+/// read-only consumers — a write leg that loads-modifies-saves against
+/// that synthesized empty file persists a ONE-row `quota.json`,
+/// destroying every OTHER account's row with nothing but a warn line
+/// (MED-1, an internal ticket redteam; the bug `load_state_or_warn`'s own doc
+/// comment already names but that every production poller write leg
+/// still called into). This returns `Err` on ANY condition that would
+/// otherwise silently degrade to an empty file — including the
+/// `schema_version > 2` rollback-UX case `load_state` itself treats as
+/// non-fatal (`Ok(QuotaFile::empty())`, per its own doc comment "this
+/// preserves rollback UX" — true for a READER showing no data, false
+/// for a WRITER about to overwrite every sibling row with that empty
+/// file). Callers MUST treat `Err` as "skip this write entirely",
+/// mirroring `usage_poller::gemini_oauth::write_quota`'s inline
+/// load-or-skip pattern — never as license to persist a
+/// freshly-synthesized empty file.
+pub fn load_state_or_skip(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
+    let path = quota_path(base_dir);
+    if let Some(schema_version) = peek_schema_version(&path) {
+        if schema_version > 2 {
+            return Err(ConfigError::InvalidJson {
+                path,
+                reason: format!(
+                    "schema_version {schema_version} is newer than this csq binary supports; \
+                     refusing to write over it and clobber sibling rows"
+                ),
+            });
+        }
+    }
+    load_state(base_dir)
+}
+
 /// Loads quota state from disk, auto-clearing expired windows.
 ///
 /// Returns an empty QuotaFile if the file doesn't exist.
@@ -35,6 +211,12 @@ pub fn cursor_path(config_dir: &Path) -> PathBuf {
 ///
 /// VP-final R5: account keys that are not valid u16 decimal strings are
 /// rejected with ConfigError::InvalidJson naming the bad key.
+///
+/// This is the STRICT read path: a single malformed row hard-errors the
+/// WHOLE file (`Err`), by design — write legs ([`load_state_or_skip`])
+/// depend on that to know when it is unsafe to persist. Read-only
+/// display consumers that want one bad row to degrade gracefully instead
+/// of blanking every account should call [`load_state_salvage`].
 pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
     let path = quota_path(base_dir);
     let mut quota_file = match std::fs::read_to_string(&path) {
@@ -332,6 +514,233 @@ fn parse_window(rate_limits: &serde_json::Value, key: &str) -> Option<UsageWindo
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // ─── MED-1 (an internal ticket redteam) — load_state_or_skip ────────────
+
+    #[test]
+    fn load_state_or_skip_missing_file_returns_empty_ok() {
+        // Nothing to clobber — a fresh install must still be able to
+        // perform its first write.
+        let dir = TempDir::new().unwrap();
+        let qf = load_state_or_skip(dir.path()).unwrap();
+        assert!(qf.accounts.is_empty());
+    }
+
+    #[test]
+    fn load_state_or_skip_valid_file_round_trips_data() {
+        let dir = TempDir::new().unwrap();
+        let mut qf = QuotaFile::empty();
+        qf.set(
+            5,
+            AccountQuota {
+                five_hour: Some(UsageWindow {
+                    used_percentage: 61.0,
+                    resets_at: 4_102_444_800,
+                }),
+                ..Default::default()
+            },
+        );
+        save_state(dir.path(), &qf).unwrap();
+
+        let loaded = load_state_or_skip(dir.path()).unwrap();
+        assert_eq!(loaded.get(5).unwrap().five_hour_pct(), 61.0);
+    }
+
+    #[test]
+    fn load_state_or_skip_corrupt_json_errs() {
+        let dir = TempDir::new().unwrap();
+        write_raw_quota_json(dir.path(), "{not valid json");
+        assert!(
+            load_state_or_skip(dir.path()).is_err(),
+            "a write leg must see Err on corrupt quota.json, never a \
+             synthesized empty file it could then clobber siblings with"
+        );
+    }
+
+    /// The MED-1 gap: `load_state` treats `schema_version > 2` as
+    /// non-fatal (`Ok(QuotaFile::empty())`) for read-only rollback UX —
+    /// but a write leg using THAT as license to load+modify+save would
+    /// destroy every sibling row a newer csq build wrote. This is the
+    /// specific scenario `load_state_or_warn` could not distinguish from
+    /// a genuinely-missing file; `load_state_or_skip` must.
+    #[test]
+    fn load_state_or_skip_schema_version_newer_errs_not_empty_ok() {
+        let dir = TempDir::new().unwrap();
+        let future = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), future);
+
+        // Sanity: load_state (the read path) degrades to empty, NOT an error.
+        assert_eq!(load_state(dir.path()).unwrap().accounts.len(), 0);
+
+        // load_state_or_skip (the write path) MUST refuse instead.
+        let err = load_state_or_skip(dir.path());
+        assert!(
+            err.is_err(),
+            "schema_version > 2 must be Err for a write leg, not Ok(empty) \
+             — Ok(empty) is exactly the state that let a poller's \
+             quota.set + save_state wipe every sibling row"
+        );
+    }
+
+    /// End-to-end regression for the bug class itself: a write leg using
+    /// the OLD `load_state_or_warn` pattern against a schema-drifted file
+    /// wipes sibling rows. Pins that `load_state_or_skip` + a
+    /// skip-on-error caller does NOT.
+    #[test]
+    fn load_state_or_skip_prevents_sibling_wipe_on_schema_drift() {
+        let dir = TempDir::new().unwrap();
+        let future = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), future);
+
+        // Simulate a write leg's skip-on-error handling (MED-1 fix shape).
+        match load_state_or_skip(dir.path()) {
+            Ok(_) => panic!("must not reach the write path on schema drift"),
+            Err(_) => { /* correct: skip the write entirely */ }
+        }
+
+        // The on-disk file is untouched — both sibling rows survive,
+        // even though this "poller" never wrote anything this tick.
+        let raw = std::fs::read_to_string(quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["accounts"]["1"]["five_hour"]["used_percentage"].as_f64(),
+            Some(50.0)
+        );
+        assert_eq!(
+            v["accounts"]["2"]["five_hour"]["used_percentage"].as_f64(),
+            Some(80.0)
+        );
+    }
+
+    // ─── an internal ticket — load_state_salvage per-row corruption isolation ──
+
+    /// The headline regression: ONE corrupt row (a `null` `used_percentage`
+    /// — the documented vector, since `serde_json` serializes a non-finite
+    /// f64 as `null` and `UsageWindow.used_percentage` is a bare `f64`)
+    /// must not take its siblings down with it.
+    ///
+    /// Non-vacuity: under the OLD `load_state_or_warn` shape (delegate to
+    /// the strict `load_state`, fall back to `QuotaFile::empty()` on ANY
+    /// error), this whole file hard-errors on row "2" and the fallback
+    /// replaces rows "1" and "3" with nothing — `accounts.len()` would be
+    /// `0`, not `2`. This test reds under that reverted behaviour.
+    #[test]
+    fn load_state_salvage_drops_one_corrupt_row_keeps_siblings() {
+        let dir = TempDir::new().unwrap();
+        let poisoned = r#"{
+            "schema_version": 2,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 10.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": null, "resets_at": 4102444800}, "updated_at": 1.0},
+                "3": {"five_hour": {"used_percentage": 30.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), poisoned);
+
+        let salvaged = load_state_salvage(dir.path());
+        assert_eq!(
+            salvaged.accounts.len(),
+            2,
+            "row 2 (null used_percentage) must be dropped; rows 1 and 3 must survive"
+        );
+        assert_eq!(salvaged.get(1).unwrap().five_hour_pct(), 10.0);
+        assert_eq!(salvaged.get(3).unwrap().five_hour_pct(), 30.0);
+        assert!(
+            salvaged.get(2).is_none(),
+            "the corrupt row must not silently reappear with a default value"
+        );
+
+        // Sanity: the STRICT load_state path still hard-errors on the same
+        // file — that contract is what load_state_or_skip's write-leg
+        // protection depends on, and this fix must not weaken it.
+        assert!(load_state(dir.path()).is_err());
+    }
+
+    /// Whole-file corruption (unparseable top-level JSON) has no `accounts`
+    /// object to walk row-by-row, so it MUST still degrade to empty —
+    /// exactly the pre-fix behaviour for this specific case.
+    ///
+    /// Non-vacuity: a salvage implementation that (incorrectly) attempted
+    /// to regex-scan the raw bytes for row-shaped substrings could make
+    /// this pass with nonzero accounts; asserting `is_empty()` reds any
+    /// such implementation, and reds the trivial "always return the raw
+    /// input" stub.
+    #[test]
+    fn load_state_salvage_whole_file_garbage_falls_back_to_empty() {
+        let dir = TempDir::new().unwrap();
+        write_raw_quota_json(dir.path(), "{not valid json");
+        let salvaged = load_state_salvage(dir.path());
+        assert!(
+            salvaged.accounts.is_empty(),
+            "unparseable top-level JSON must still degrade to empty"
+        );
+    }
+
+    /// An invalid account key (out of AccountNum's 1..=999 range) gets the
+    /// same per-row salvage treatment as a corrupt value — dropped, not
+    /// fatal to the file.
+    ///
+    /// Non-vacuity: under `load_state`'s strict per-key validation (which
+    /// this test also pins), the same input is `Err` for the WHOLE file;
+    /// a salvage implementation that forwarded that Err into `QuotaFile::
+    /// empty()` would fail this test's `accounts.len() == 1` assertion
+    /// (it would read 0, not 1).
+    #[test]
+    fn load_state_salvage_invalid_account_key_dropped_siblings_survive() {
+        let dir = TempDir::new().unwrap();
+        let bad_key = r#"{
+            "schema_version": 2,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "1000": {"five_hour": {"used_percentage": 99.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), bad_key);
+
+        let salvaged = load_state_salvage(dir.path());
+        assert_eq!(salvaged.accounts.len(), 1);
+        assert!(salvaged.get(1).is_some());
+        assert!(!salvaged.accounts.contains_key("1000"));
+
+        assert!(load_state(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_state_salvage_missing_file_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let salvaged = load_state_salvage(dir.path());
+        assert!(salvaged.accounts.is_empty());
+    }
+
+    /// `schema_version > 2` is a distinct failure tier from per-row
+    /// corruption (VP-final R3, rollback UX) and MUST still degrade the
+    /// whole file to empty — salvage does not attempt to interpret rows
+    /// under a schema newer than this binary understands.
+    #[test]
+    fn load_state_salvage_schema_version_newer_degrades_to_empty() {
+        let dir = TempDir::new().unwrap();
+        let future = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        write_raw_quota_json(dir.path(), future);
+        let salvaged = load_state_salvage(dir.path());
+        assert!(salvaged.accounts.is_empty());
+    }
 
     #[test]
     fn load_missing_returns_empty() {

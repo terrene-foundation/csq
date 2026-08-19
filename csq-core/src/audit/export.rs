@@ -2288,6 +2288,7 @@ the canonical_hash; stdout: {stdout}"
     // `canonical_bytes_with_real_hash` mirrors this. We therefore call
     // `canonical_bytes_for(&record)` AFTER computing the real canonical_hash —
     // that gives the correct prev_hash for the next record.
+    #[cfg(unix)]
     fn make_multi_record_chain(n: u64, tag: &str) -> (TempDir, String, String) {
         use crate::audit::traits::SigningKey as _;
         assert!(n >= 2, "multi-record chain must have at least 2 records");
@@ -3752,6 +3753,7 @@ the canonical_hash; stdout: {stdout}"
 
     /// Build a `ProvenanceAnchored` fixture with a populated `operator_ref` that
     /// LACKS `display_id` (the production `mk_event_v1` shape).
+    #[cfg(unix)]
     fn provenance_fixture_with_operator_ref(
         decision_id: &str,
         with_display_id: bool,

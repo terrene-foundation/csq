@@ -16,6 +16,13 @@
 //! The parent test spawns two such subprocesses simultaneously and waits for
 //! both to finish.
 
+// Whole-file gate: the only `#[test]` in this file
+// (`profiles_lock_cross_process_both_rows_survive`) is `#[cfg(unix)]` — the
+// subprocess-mode helpers below (`maybe_run_as_subprocess`, `spawn_writer`,
+// `ensure_subprocess_checked`) exist solely to serve it, so on a windows
+// build the entire file compiles to nothing.
+#![cfg(unix)]
+
 use csq_core::accounts::identity_store::IdentityId;
 use csq_core::accounts::profiles;
 use csq_core::accounts::profiles_lock::ProfilesFileLock;

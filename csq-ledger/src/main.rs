@@ -10,7 +10,9 @@ use tracing::{error, info, warn};
 
 use csq_ledger::anchor::{self, AnchorTarget};
 use csq_ledger::config::Config;
-use csq_ledger::server::{build_router, submit::build_checkpoint, AppState};
+use csq_ledger::server::{
+    build_authority_router, build_read_router, submit::build_checkpoint, AppState,
+};
 use csq_ledger::signing::{ServerSigningKey, AUTO_KEY_WARNING, SIGNING_KEY_PATH_ENV};
 use csq_ledger::storage::LedgerStore;
 
@@ -32,16 +34,6 @@ async fn main() {
 async fn run() -> Result<(), i32> {
     let config = Config::parse();
 
-    // ── Open the append-only store (recovers prior records, fsync property) ───
-    let store = match LedgerStore::open(&config.data_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "failed to open ledger storage");
-            return Err(74); // EX_IOERR
-        }
-    };
-    info!(tree_size = store.tree_size(), data_dir = %config.data_dir.display(), "ledger storage opened");
-
     // ── Load or generate the checkpoint signing key (decision 2) ─────────────
     let env_override = std::env::var(SIGNING_KEY_PATH_ENV).ok();
     let signing_key =
@@ -60,6 +52,19 @@ async fn run() -> Result<(), i32> {
         // Persistent first-boot WARN (also surfaced on GET /v1/health).
         warn!("[csq-ledger] {AUTO_KEY_WARNING}");
     }
+
+    // ── Open append-only storage after authority-key load ───────────────────
+    // Recovery pins durable anchor verdict/revocation artifacts to this key;
+    // accepting an arbitrary self-signed file here could turn a local write
+    // into an authority-approved denial.
+    let store = match LedgerStore::open_with_authority(&config.data_dir, signing_key.key_id()) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "failed to open ledger storage");
+            return Err(74); // EX_IOERR
+        }
+    };
+    info!(tree_size = store.tree_size(), data_dir = %config.data_dir.display(), "ledger storage opened");
 
     // ── Resolve the optional anchor target (Strengthening 1) ─────────────────
     let anchor_target = match &config.anchor_to_sink {
@@ -100,21 +105,59 @@ async fn run() -> Result<(), i32> {
         });
     }
 
-    // ── Bind + serve ─────────────────────────────────────────────────────────
+    // ── Bind + serve: two listeners, two routers (H3) ───────────────────────
+    // The read/write listener carries submit + all read routes. The authority
+    // listener carries ONLY revoke + verifier-bootstrap redemption, defaults
+    // to loopback-only, and is bound independently so an operator can
+    // firewall it more tightly than the read/write traffic. See
+    // `server::mod` doc "Two listeners, two routers" + spec 17 §17.3.
     let addr = config.socket_addr();
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            error!(error = %e, addr = %addr, "failed to bind");
+            error!(error = %e, addr = %addr, "failed to bind read/write listener");
             return Err(74);
         }
     };
-    info!(addr = %addr, "csq-ledger listening");
+    info!(addr = %addr, "csq-ledger read/write listener");
 
-    let router = build_router(state);
-    if let Err(e) = axum::serve(listener, router).await {
-        error!(error = %e, "server error");
-        return Err(70); // EX_SOFTWARE
+    let authority_addr = config.authority_socket_addr();
+    let authority_listener = match tokio::net::TcpListener::bind(&authority_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, addr = %authority_addr, "failed to bind authority listener");
+            return Err(74);
+        }
+    };
+    info!(
+        addr = %authority_addr,
+        "csq-ledger authority listener (revoke, verifier-bootstraps; internal-only by default)"
+    );
+
+    let read_router = build_read_router(Arc::clone(&state));
+    let authority_router = build_authority_router(state);
+
+    let read_server = axum::serve(listener, read_router);
+    let authority_server = axum::serve(authority_listener, authority_router);
+
+    // Either listener exiting (only possible on an IO error — neither server
+    // has a configured graceful-shutdown trigger) brings the whole process
+    // down; a half-alive server (e.g. authority listener dead, read/write
+    // listener still serving) is a worse operator experience than a clean
+    // exit + restart.
+    tokio::select! {
+        res = read_server => {
+            if let Err(e) = res {
+                error!(error = %e, "read/write server error");
+                return Err(70); // EX_SOFTWARE
+            }
+        }
+        res = authority_server => {
+            if let Err(e) = res {
+                error!(error = %e, "authority server error");
+                return Err(70); // EX_SOFTWARE
+            }
+        }
     }
     Ok(())
 }

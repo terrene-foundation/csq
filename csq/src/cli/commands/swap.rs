@@ -37,6 +37,7 @@ use csq_core::audit::types::{
 };
 use csq_core::cli_deps::sanitize::redact_path;
 use csq_core::providers::catalog::Surface;
+#[cfg(unix)]
 use csq_core::providers::codex::surface as codex_surface;
 use csq_core::session::handle_dir;
 use csq_core::types::AccountNum;
@@ -132,11 +133,47 @@ fn route(
 
 /// Read the slot number from a handle dir's `.csq-account` marker.
 ///
-/// Returns `None` when the marker is absent or not a valid slot number.
+/// Returns `None` when the marker is absent or not resolvable to a slot.
 /// Used by the audit wiring to derive `from_slot` for the `AccountSwap`
 /// payload without modifying the `SourceHandle` API.
-fn read_slot_from_handle_dir(handle_dir_path: &Path) -> Option<AccountNum> {
-    csq_core::accounts::markers::read_csq_account(handle_dir_path)
+///
+/// M4-7 (an internal ticket Phase 4): the marker's CONTENT is a UUID whenever a
+/// `by_slot` mapping exists (`markers::write_csq_account`, written by
+/// `csq run` / `finalize_login`), so this resolves through
+/// `resolve_marker_to_slot` (numeric-or-UUID) rather than the numeric-only
+/// `read_csq_account` — the latter returned `None` on every modern slot,
+/// which silently dropped the `AccountSwap` audit record AND defeated the
+/// `source_env_transport` exfiltration guard below
+/// (`guard-reader-writer-parity.md`).
+fn read_slot_from_handle_dir(base_dir: &Path, handle_dir_path: &Path) -> Option<AccountNum> {
+    csq_core::accounts::markers::resolve_marker_to_slot(base_dir, handle_dir_path)
+}
+
+/// Resolves the source-side env-transport discriminator for the
+/// `(ClaudeCode, ClaudeCode)` routing cell, FAIL-CLOSED.
+///
+/// A slot that pins `env.ANTHROPIC_BASE_URL` (3P: DeepSeek/Z.AI/MiniMax, or
+/// Ollama) injects its base URL + auth token into CC's process env at
+/// launch — FROZEN for the process lifetime. An in-flight symlink repoint
+/// cannot change them, so any swap touching such a slot on either side MUST
+/// exec-replace (a fresh CC reads the new settings.json env). The source
+/// flag is only knowable when the source marker resolved (`from_slot`).
+///
+/// `from_slot == None` means csq CANNOT determine whether the source is an
+/// env-transport slot — it does NOT mean the source is Anthropic. Reporting
+/// `false` in that case (the pre-fix behavior) is the UNSAFE direction: it
+/// lets `route()` choose `SameSurfaceClaudeCode` (in-flight repoint) for a
+/// source that might actually be 3P/Ollama, which is exactly the
+/// Anthropic-OAuth-token-to-frozen-3P-endpoint exfiltration path
+/// `RouteKind::ClaudeCodeEnvTransportExecReplace`'s doc comment describes.
+/// This function fails CLOSED instead: an unresolved marker reports `true`,
+/// forcing the safer exec-replace path. The target flag alone (computed
+/// separately by the caller) still forces exec-replace whenever the TARGET
+/// is env-transport, covering the Anthropic→3P direction independently.
+fn resolve_source_env_transport(base_dir: &Path, from_slot: Option<AccountNum>) -> bool {
+    from_slot
+        .map(|s| csq_core::providers::settings::slot_pins_anthropic_base_url(base_dir, s.get()))
+        .unwrap_or(true)
 }
 
 /// PR-C7 entry point. `yes` bypasses the cross-surface confirmation
@@ -152,7 +189,7 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     // M13b — derive from_slot from the source handle dir marker.
     // If the marker is absent we skip audit (pre-side-effect information
     // unavailable → no intent emitted, consistent with the WBS T4 invariant).
-    let from_slot = read_slot_from_handle_dir(source.path());
+    let from_slot = read_slot_from_handle_dir(base_dir, source.path());
 
     // Capture the handle-dir path before `source` is moved into the route arms.
     // After a Claude-surface swap we mirror the new account's credential into
@@ -160,18 +197,9 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     // from the keychain, not the symlinked `.credentials.json`).
     let handle_dir_path = source.path().to_path_buf();
 
-    // Env-transport discriminator for the (ClaudeCode, ClaudeCode) cell. A slot
-    // that pins `env.ANTHROPIC_BASE_URL` (3P: DeepSeek/Z.AI/MiniMax, or Ollama)
-    // injects its base URL + auth token into CC's process env at launch — FROZEN
-    // for the process lifetime. An in-flight symlink repoint cannot change them,
-    // so any swap touching such a slot on either side MUST exec-replace (a fresh
-    // CC reads the new settings.json env). The source flag is only knowable when
-    // the source marker resolved (`from_slot`); an absent marker conservatively
-    // reports `false` — the target flag alone still forces exec-replace whenever
-    // the TARGET is env-transport, which covers the Anthropic→3P direction.
-    let source_env_transport = from_slot
-        .map(|s| csq_core::providers::settings::slot_pins_anthropic_base_url(base_dir, s.get()))
-        .unwrap_or(false);
+    // Env-transport discriminator for the (ClaudeCode, ClaudeCode) cell — see
+    // `resolve_source_env_transport` for the fail-closed rationale.
+    let source_env_transport = resolve_source_env_transport(base_dir, from_slot);
     let target_env_transport =
         csq_core::providers::settings::slot_pins_anthropic_base_url(base_dir, target.get());
 
@@ -198,10 +226,28 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     // Cross-surface / Codex routes create a FRESH handle dir (keychain absent from
     // birth), so they have no such race and need neither guard.
     let _swap_guard = if matches!(route_kind, RouteKind::SameSurfaceClaudeCode) {
-        let abs =
-            std::fs::canonicalize(&handle_dir_path).unwrap_or_else(|_| handle_dir_path.clone());
+        // Security review 1386 M4 (sibling instance — swap.rs was not one of
+        // the three originally-audited writer sites): a canonicalize failure
+        // must NOT feed the keychain clear below — that hashes to a
+        // DIFFERENT service name than the one CC (and either clearer) uses,
+        // so `clear_handle_dir` would target nothing and this dir's real
+        // item (if any) would survive the swap uncleared. The lock is kept
+        // unconditional — it still serializes against harvest regardless of
+        // whether a keychain op happens under it.
+        let (abs, keychain_write_allowed) =
+            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir_path);
         let guard = csq_core::credentials::keychain::lock_handle_dir_for_swap(&abs);
-        csq_core::credentials::keychain::clear_handle_dir(&abs);
+        if keychain_write_allowed {
+            csq_core::credentials::keychain::clear_handle_dir(&abs);
+        } else {
+            tracing::warn!(
+                error_kind = "keychain_sync_canonicalize_failed",
+                "csq swap: could not canonicalize this handle dir's path — \
+                 the pre-repoint keychain clear was SKIPPED (non-fatal — \
+                 swap continues; CC falls back to the symlinked \
+                 .credentials.json)"
+            );
+        }
         guard
     } else {
         None
@@ -224,8 +270,22 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     };
 
     if result.is_ok() && matches!(target_surface, Surface::ClaudeCode) {
-        let abs = std::fs::canonicalize(&handle_dir_path).unwrap_or(handle_dir_path);
-        super::run::sync_cc_keychain(&abs, true);
+        // Security review 1386 M4 (sibling instance): gate the post-repoint
+        // keychain mirror on canonicalize having actually succeeded, for the
+        // same reason as the pre-repoint clear above.
+        let (abs, keychain_write_allowed) =
+            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir_path);
+        if keychain_write_allowed {
+            super::run::sync_cc_keychain(&abs, true);
+        } else {
+            tracing::warn!(
+                error_kind = "keychain_sync_canonicalize_failed",
+                "csq swap: could not canonicalize this handle dir's path — \
+                 the post-repoint keychain mirror was SKIPPED (non-fatal — \
+                 swap continues; CC falls back to the symlinked \
+                 .credentials.json)"
+            );
+        }
     }
     // `_swap_guard` (if any) drops here, AFTER sync_cc_keychain — the dir is now
     // consistent (symlink + keychain agree), so the next harvest may read it.
@@ -726,6 +786,12 @@ fn exec_replace_swap(
             exec_claude_code_after_binding(base_dir, target, pid, resume_conversation)
         }
         Surface::Gemini => exec_gemini_after_binding(base_dir, target, pid),
+        // W3-4 (an internal journal entry): native-CLI swap exec. Mirrors
+        // exec_gemini_after_binding — no resume flag (native CLIs have no
+        // resume concept csq drives).
+        Surface::Kimi | Surface::Grok => {
+            exec_native_after_binding(base_dir, target, target_surface, pid)
+        }
     }
 }
 
@@ -760,6 +826,12 @@ fn create_target_handle_dir(
             // Gemini binding: verify the marker exists and create the handle dir.
             // The vault open and spawn_gemini are deferred to exec_gemini_after_binding.
             create_gemini_handle_dir(base_dir, target, pid)
+        }
+        // W3-4 (an internal journal entry): native-CLI binding: verify the marker exists
+        // and create the handle dir. The vendor-binary resolution + exec are
+        // deferred to exec_native_after_binding.
+        Surface::Kimi | Surface::Grok => {
+            create_native_handle_dir(base_dir, target, target_surface, pid)
         }
     }
 }
@@ -877,7 +949,12 @@ fn exec_claude_code_after_binding(
     // Mirrors `exec_gemini_after_binding`, which already re-derives rather than recreates.
     let handle_dir = base_dir.join(format!("term-{pid}"));
 
-    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+    // Security review 1386 M4 (sibling instance): the usual non-canonical
+    // fallback stays for `handle_dir_abs` (still the right `CLAUDE_CONFIG_DIR`
+    // to exec against) but the keychain mirror below is gated on canonicalize
+    // having actually succeeded.
+    let (handle_dir_abs, keychain_write_allowed) =
+        csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
 
     // Mirror the target account's credential into the keychain CC reads for this
     // FRESH handle dir before exec — current CC reads OAuth keychain-first, and a
@@ -885,7 +962,16 @@ fn exec_claude_code_after_binding(
     // yet (the post-route sync in `handle` covers only the same-surface paths,
     // which don't exec). Without this, a Codex/Gemini→Claude swap launches CC
     // against an unwritten keychain → "Please run /login · 401". Mirrors run.rs.
-    super::run::sync_cc_keychain(&handle_dir_abs, true);
+    if keychain_write_allowed {
+        super::run::sync_cc_keychain(&handle_dir_abs, true);
+    } else {
+        tracing::warn!(
+            error_kind = "keychain_sync_canonicalize_failed",
+            "csq swap: could not canonicalize this fresh handle dir's path — \
+             the keychain mirror was SKIPPED before exec (non-fatal — CC \
+             falls back to the symlinked .credentials.json)"
+        );
+    }
 
     let mut cmd = std::process::Command::new("claude");
     cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
@@ -1034,22 +1120,165 @@ fn exec_gemini_after_binding(_base_dir: &Path, _target: AccountNum, _pid: u32) -
     ))
 }
 
-// ─── Daemon cache invalidation (unchanged from pre-PR-C7) ───────────
-
-/// Best-effort cache invalidation: POST /api/invalidate-cache to
-/// the daemon if it's reachable.
+/// W3-4 (an internal journal entry): Create the native-CLI (Kimi/Grok) handle dir for a
+/// cross-surface swap (binding step, step 3 of `exec_replace_swap`).
+///
+/// Verifies the credential-less binding marker exists, creates `term-<pid>/`,
+/// writes `.csq-account`. Returns Ok(()) on success. Does NOT resolve the
+/// vendor binary or exec — those are deferred to `exec_native_after_binding`
+/// (step 5). Mirrors `create_gemini_handle_dir`.
 #[cfg(unix)]
-fn notify_daemon_cache_invalidation(base_dir: &Path) {
-    let sock = csq_core::daemon::socket_path(base_dir);
-    if !sock.exists() {
-        return;
+fn create_native_handle_dir(
+    base_dir: &Path,
+    target: AccountNum,
+    target_surface: Surface,
+    pid: u32,
+) -> Result<()> {
+    use csq_core::accounts::markers;
+    use csq_core::providers::native;
+
+    let descriptor = native::descriptor(target_surface).ok_or_else(|| {
+        anyhow!("swap target surface {target_surface} is not a native-CLI surface")
+    })?;
+
+    // Refuse symlink at the binding marker — same posture as
+    // `create_gemini_handle_dir`.
+    let binding_path = native::marker_path(base_dir, target, target_surface);
+    let meta = std::fs::symlink_metadata(&binding_path).map_err(|e| {
+        anyhow!(
+            "stat {} — {} binding missing for swap target {target}; \
+             run `csq login {target} --provider {}` first ({e})",
+            redact_path(&binding_path),
+            descriptor.display_name,
+            descriptor.id,
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing {} swap: {} is a symlink — external mutation detected",
+            descriptor.display_name,
+            redact_path(&binding_path)
+        ));
     }
-    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+
+    // Build the minimal handle dir + .csq-account marker.
+    let handle_dir = base_dir.join(format!("term-{pid}"));
+    std::fs::create_dir_all(&handle_dir).map_err(|e| {
+        anyhow!(
+            "failed to create {} handle dir for swap target {target}: {e}",
+            descriptor.display_name
+        )
+    })?;
+    // M4-7: use UUID marker when available.
+    let marker_result =
+        match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get()) {
+            Some(uuid) => markers::write_csq_account(&handle_dir, uuid),
+            None => markers::write_csq_account_legacy(&handle_dir, target),
+        };
+    if let Err(e) = marker_result {
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        return Err(anyhow!(
+            ".csq-account marker write failed for swap target {target}: {e}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn notify_daemon_cache_invalidation(_base_dir: &Path) {
-    // Windows named-pipe invalidation is not yet implemented (M8-03).
+fn create_native_handle_dir(
+    _base_dir: &Path,
+    _target: AccountNum,
+    _target_surface: Surface,
+    _pid: u32,
+) -> Result<()> {
+    Err(anyhow!(
+        "cross-surface csq swap is Unix-only today. \
+         On Windows, exit the current surface and run `csq run <N>`."
+    ))
+}
+
+/// W3-4 (an internal journal entry): Exec the native vendor binary (`kimi`/`grok`) after
+/// the target handle dir has already been created by
+/// `create_native_handle_dir`. The handle dir path is re-derived from the
+/// PID (mirrors `exec_codex_after_binding`/`exec_claude_code_after_binding`
+/// — a second `create_*_handle_dir` call with the same pid would trip the
+/// live-PID guard).
+///
+/// No resume flag: native CLIs have no resume concept csq drives (mirrors
+/// `exec_gemini_after_binding`) — `resume_conversation` in
+/// `exec_replace_swap` is already `false` for `Surface::Kimi | Surface::Grok`.
+#[cfg(unix)]
+fn exec_native_after_binding(
+    // Unused: unlike Codex/Gemini, native CLIs have no HOME-equivalent env
+    // var to redirect — the handle dir written by `create_native_handle_dir`
+    // exists only for `.csq-account` bookkeeping, and the vendor binary
+    // execs directly in the caller's inherited cwd.
+    _base_dir: &Path,
+    target: AccountNum,
+    target_surface: Surface,
+    pid: u32,
+) -> Result<()> {
+    use csq_core::providers::native;
+    use std::os::unix::process::CommandExt;
+
+    let descriptor = native::descriptor(target_surface).ok_or_else(|| {
+        anyhow!("swap target surface {target_surface} is not a native-CLI surface")
+    })?;
+
+    let binary_path = csq_core::cli_deps::install_path::find_in_path(descriptor.binary)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} binary ({}) not found on PATH or in its known install dir — \
+                 run `csq cli install {}` first",
+                descriptor.display_name,
+                descriptor.binary,
+                descriptor.binary
+            )
+        })?;
+
+    println!(
+        "Swapping to {} account {} (term-{})...",
+        descriptor.display_name, target, pid
+    );
+
+    let mut cmd = std::process::Command::new(&binary_path);
+    // Scrub csq-session-dir env so the native CLI never accidentally
+    // resolves a stale csq-managed config dir from the source surface
+    // (mirrors exec_codex_after_binding / exec_claude_code_after_binding's
+    // identical scrub posture).
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+    cmd.env_remove("CLAUDE_HOME");
+    cmd.env_remove(codex_surface::HOME_ENV_VAR);
+
+    let err = cmd.exec();
+    Err(anyhow!(
+        "exec `{}` failed after source handle dir was removed — \
+         re-run `csq run {target}` to relaunch. Error: {err}",
+        descriptor.binary
+    ))
+}
+
+#[cfg(not(unix))]
+fn exec_native_after_binding(
+    _base_dir: &Path,
+    _target: AccountNum,
+    _target_surface: Surface,
+    _pid: u32,
+) -> Result<()> {
+    Err(anyhow!(
+        "cross-surface csq swap is Unix-only today. \
+         On Windows, exit the current surface and run `csq run <N>`."
+    ))
+}
+
+// ─── Daemon cache invalidation ───────────────────────────────────────
+
+/// Best-effort cache invalidation: notify the daemon (Unix socket or
+/// Windows named pipe) that on-disk account state changed. Routes through
+/// the single cross-platform chokepoint — see `csq_core::daemon::notify`
+/// (an internal ticket).
+fn notify_daemon_cache_invalidation(base_dir: &Path) {
+    csq_core::daemon::notify::cache_invalidation(base_dir);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -1432,8 +1661,18 @@ mod tests {
     // ── M13b FIX-3+4 — swap audit tests ─────────────────────────────────────
 
     /// Helper: write a minimal `.csq-account` marker file into `handle_dir`
-    /// containing the decimal string for `slot`. This simulates what `csq run`
-    /// writes for a handle-dir-model terminal.
+    /// containing the decimal string for `slot`.
+    ///
+    /// **This is the LEGACY (pre-M4-7) shape, not what `csq run` writes
+    /// today.** M4-7 (an internal ticket Phase 4) flipped the writer
+    /// (`markers::write_csq_account`) to UUID content whenever the slot has
+    /// a `by_slot` mapping — `finalize_login` and `csq run` both write UUIDs
+    /// on any modern install. This helper's original doc comment claimed
+    /// otherwise (`guard-reader-writer-parity.md`); it is retained ONLY for
+    /// pure-legacy-slot coverage (a slot with no `by_slot` entry). Tests
+    /// exercising the production (UUID) marker shape MUST use
+    /// `csq_core::testing::identity_fixtures::write_uuid_account_marker`
+    /// instead — see `read_slot_from_handle_dir_resolves_uuid_marker`.
     fn write_csq_account_marker(handle_dir: &std::path::Path, slot: u16) {
         std::fs::write(handle_dir.join(".csq-account"), slot.to_string()).unwrap();
     }
@@ -1464,7 +1703,7 @@ mod tests {
         let handle_dir = base.path().join("term-99");
         std::fs::create_dir(&handle_dir).unwrap();
 
-        let from_slot = read_slot_from_handle_dir(&handle_dir); // → None
+        let from_slot = read_slot_from_handle_dir(base.path(), &handle_dir); // → None
         let result = begin_swap_audit(base.path(), from_slot, AccountNum::try_from(2u16).unwrap());
         assert!(result.is_ok(), "absent marker must not error: {result:?}");
         assert!(result.unwrap().is_none(), "absent marker → Ok(None)");
@@ -1484,7 +1723,7 @@ mod tests {
         std::fs::create_dir(&handle_dir).unwrap();
         write_csq_account_marker(&handle_dir, 3);
 
-        let from_slot = read_slot_from_handle_dir(&handle_dir);
+        let from_slot = read_slot_from_handle_dir(base.path(), &handle_dir);
         assert_eq!(
             from_slot.map(|a| a.get()),
             Some(3),
@@ -1529,6 +1768,84 @@ mod tests {
         let _ = ctx;
     }
 
+    /// `resolve_source_env_transport` MUST fail CLOSED (`true`) when the
+    /// source marker is unresolvable — this is the security-relevant half
+    /// of the M4-7 marker-reader fix: pre-fix, an unresolvable marker
+    /// (which was EVERY modern slot, since `read_slot_from_handle_dir` could
+    /// not parse a UUID marker) reported `false`, letting `route()` choose
+    /// the in-flight-repoint path for a source that might actually be a
+    /// frozen 3P/Ollama env-transport slot.
+    #[test]
+    fn resolve_source_env_transport_fails_closed_when_marker_unresolved() {
+        let base = tempfile::TempDir::new().unwrap();
+        assert!(
+            resolve_source_env_transport(base.path(), None),
+            "unresolved source marker must fail CLOSED (assume env-transport), not open"
+        );
+    }
+
+    /// A resolved source slot with no `env.ANTHROPIC_BASE_URL` pin reports
+    /// `false` — the safe, correct, non-fail-closed case.
+    #[test]
+    fn resolve_source_env_transport_false_for_plain_anthropic_slot() {
+        let base = tempfile::TempDir::new().unwrap();
+        let config_dir = base.path().join("config-3");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // No settings.json written — slot_pins_anthropic_base_url returns false.
+        assert!(!resolve_source_env_transport(
+            base.path(),
+            Some(AccountNum::try_from(3u16).unwrap())
+        ));
+    }
+
+    /// A resolved source slot whose `settings.json` pins
+    /// `env.ANTHROPIC_BASE_URL` reports `true`.
+    #[test]
+    fn resolve_source_env_transport_true_for_env_transport_slot() {
+        let base = tempfile::TempDir::new().unwrap();
+        let config_dir = base.path().join("config-4");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://3p.example.com"}}"#,
+        )
+        .unwrap();
+        assert!(resolve_source_env_transport(
+            base.path(),
+            Some(AccountNum::try_from(4u16).unwrap())
+        ));
+    }
+
+    /// M4-7 regression (`guard-reader-writer-parity.md`): a UUID-content
+    /// `.csq-account` marker — the shape `csq run` / `finalize_login`
+    /// actually write on any modern install — MUST resolve to a slot.
+    /// Before the fix, `read_slot_from_handle_dir` called the numeric-only
+    /// `markers::read_csq_account`, so `from_slot` came back `None` for
+    /// EVERY swap sourced from a modern slot: `begin_swap_audit` then
+    /// skipped emitting an `AccountSwap` record (an unaudited swap), and
+    /// `source_env_transport` fell back to `false` — the unsafe direction
+    /// for the exfiltration guard this same defect closes (see
+    /// `resolve_source_env_transport_fails_closed_when_marker_unresolved`).
+    #[test]
+    fn read_slot_from_handle_dir_resolves_uuid_marker() {
+        let base = tempfile::TempDir::new().unwrap();
+        let handle_dir = base.path().join("term-88");
+        std::fs::create_dir(&handle_dir).unwrap();
+        // UUID-content marker (M4-7 writer shape), provisions
+        // profiles.json::by_slot[9] via the shared fixture helper.
+        csq_core::testing::identity_fixtures::write_uuid_account_marker(
+            base.path(),
+            &handle_dir,
+            9,
+        );
+
+        assert_eq!(
+            read_slot_from_handle_dir(base.path(), &handle_dir),
+            Some(AccountNum::try_from(9u16).unwrap()),
+            "UUID .csq-account marker must resolve to its by_slot slot number"
+        );
+    }
+
     /// FIX-4 AC: intent-persist failure (read-only csq-runs/) → begin_swap_audit
     /// returns Err, and the audited wrappers fail closed (swap does NOT proceed).
     #[cfg(unix)]
@@ -1549,7 +1866,7 @@ mod tests {
         std::fs::create_dir(&handle_dir).unwrap();
         write_csq_account_marker(&handle_dir, 1);
 
-        let from_slot = read_slot_from_handle_dir(&handle_dir);
+        let from_slot = read_slot_from_handle_dir(base.path(), &handle_dir);
         let result = begin_swap_audit(base.path(), from_slot, AccountNum::try_from(2u16).unwrap());
 
         // Restore so TempDir cleanup works.
@@ -1632,7 +1949,7 @@ mod tests {
         // Set the .chain-broken sentinel.
         csq_core::audit::set_chain_broken(base.path(), "chain_broken_test");
 
-        let from_slot = read_slot_from_handle_dir(&handle_dir);
+        let from_slot = read_slot_from_handle_dir(base.path(), &handle_dir);
         let result = begin_swap_audit(base.path(), from_slot, AccountNum::try_from(5u16).unwrap());
 
         // MUST succeed with None (degrade, not fail-closed).

@@ -67,15 +67,27 @@ pub struct ClassifierInputs {
 /// (split on `-`, length ≥ 3, lowercased, with the literal `rule`
 /// stripped because it's a constant prefix in every rule id).
 ///
-/// Filters by `Surface` per the existing scaffold semantics: rules
-/// whose `applies_to` is empty (universal) OR contains the target
-/// `Surface` contribute their RULE_IDs to the index. Rule body text
-/// is not indexed at PR-CA7a (see spec 10 §10.7.0).
+/// Filters by `Surface` via the SAME shared predicate the scaffold +
+/// translator flatten uses (`crate::coc::translate::flatten::in_scope` —
+/// universal rules, rules whose `applies_to` contains the target `Surface`,
+/// and — for Kimi/Grok — rules scoped `applies_to: [codex]`, since Kimi/Grok
+/// share the Codex capability-layer scope, not just its header; an internal journal entry).
+/// Rule body text is not indexed at PR-CA7a (see spec 10 §10.7.0).
+///
+/// This used to carry its OWN inline copy of the surface-scope check
+/// (`applies_to.is_empty() || applies_to.contains(&surface)`) rather than
+/// calling `flatten::in_scope` — the exact duplication `flatten::in_scope`'s
+/// own doc comment says must not happen ("THE single surface-scope
+/// predicate... cannot drift"). It had already drifted: the inline copy
+/// lacked the Kimi/Grok→Codex fallback, so the classifier's keyword index
+/// (and therefore Compliance-vs-FreeForm prompt classification) silently
+/// used a narrower rule set than the scaffold/citation set for a live
+/// Kimi/Grok session. Routing through the shared predicate closes both the
+/// duplication and the drift in one fix.
 pub fn build_keyword_index(coc_set: &CocSet, surface: Surface) -> BTreeSet<String> {
     let mut keywords = BTreeSet::new();
     for (rule_id, rule) in &coc_set.rules {
-        let in_scope = rule.applies_to.is_empty() || rule.applies_to.contains(&surface);
-        if !in_scope {
+        if !crate::coc::translate::flatten::in_scope(&rule.applies_to, surface) {
             continue;
         }
         for token in rule_id.as_str().split('-') {
@@ -228,6 +240,31 @@ mod tests {
         assert!(!kw_cc.contains("log") || !kw_cc.contains("cdx"));
         assert!(kw_cdx.contains("log"));
         assert!(!kw_cdx.contains("auth"));
+    }
+
+    /// `build_keyword_index` now routes through the shared
+    /// `flatten::in_scope` predicate — a codex-scoped rule MUST contribute
+    /// keywords for Kimi/Grok exactly like it does for Codex (an internal journal entry;
+    /// the Kimi/Grok→Codex `applies_to` fallback lives in `in_scope`). Before
+    /// the de-duplication this returned an empty set for Kimi/Grok because
+    /// the inline copy never had the fallback clause.
+    #[test]
+    fn build_keyword_index_kimi_grok_share_codex_scope() {
+        let set = coc_set(vec![
+            rule("RULE-CDX-LOG", "codex-only", &[Surface::Codex]),
+            rule("RULE-CC-AUTH", "cc-only", &[Surface::ClaudeCode]),
+        ]);
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let kw = build_keyword_index(&set, surface);
+            assert!(
+                kw.contains("log"),
+                "{surface} must see codex-scoped `log`, got {kw:?}"
+            );
+            assert!(
+                !kw.contains("auth"),
+                "{surface} must NOT see cc-only `auth`, got {kw:?}"
+            );
+        }
     }
 
     #[test]

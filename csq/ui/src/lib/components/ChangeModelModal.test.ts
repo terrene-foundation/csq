@@ -284,6 +284,104 @@ describe("ChangeModelModal", () => {
     resolvePull();
   });
 
+  // ── Escape / focus trap (F4 i-audit sweep fix) ──────────────
+  //
+  // Pre-fix, Escape was wired to the *backdrop's* onkeydown, but
+  // `.modal`'s own onkeydown called `e.stopPropagation()`. Keydown
+  // bubbles from the focused element upward, so any focus INSIDE the
+  // modal — every real interaction — hit stopPropagation before the
+  // backdrop's handler ever ran. A test that fires Escape with focus
+  // on the backdrop itself would pass against the OLD broken code too
+  // (vacuous, since that was the one case the old code handled). The
+  // test below fires Escape with focus inside the modal, which is the
+  // actual bug this fix closes — same shape as an internal ticket's
+  // AddAccountModal regression test.
+
+  it("closes on Escape when focus is inside the modal (the actual F4 bug)", async () => {
+    mockInvoke.mockResolvedValueOnce(["gemma4:latest", "llama3:8b"]);
+    const onClose = vi.fn();
+    const { container } = renderModal({ onClose });
+    await tick();
+    await tick();
+    await tick();
+
+    const customInput = container.querySelector(
+      'input[type="text"]',
+    ) as HTMLInputElement;
+    expect(customInput).not.toBeNull();
+    customInput.focus();
+    expect(document.activeElement).toBe(customInput);
+
+    await fireEvent.keyDown(document, { key: "Escape" });
+    await tick();
+
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("does not escape the focus trap on Tab — wraps from last focusable back to first", async () => {
+    mockInvoke.mockResolvedValueOnce(["gemma4:latest", "llama3:8b"]);
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const focusables = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".modal button:not([disabled]), .modal input:not([disabled]), .modal select:not([disabled])",
+      ),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+
+    last.focus();
+    expect(document.activeElement).toBe(last);
+
+    await fireEvent.keyDown(document, { key: "Tab" });
+    await tick();
+
+    // Focus must land back INSIDE the dialog (at `first`), never on
+    // `document.body` / the page behind the modal.
+    expect(document.activeElement).toBe(first);
+  });
+
+  it("does not escape the focus trap on Shift+Tab — wraps from first focusable back to last", async () => {
+    mockInvoke.mockResolvedValueOnce(["gemma4:latest", "llama3:8b"]);
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const focusables = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".modal button:not([disabled]), .modal input:not([disabled]), .modal select:not([disabled])",
+      ),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+
+    first.focus();
+    expect(document.activeElement).toBe(first);
+
+    await fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    await tick();
+
+    expect(document.activeElement).toBe(last);
+  });
+
+  it("moves initial focus into the dialog when opened", async () => {
+    mockInvoke.mockResolvedValueOnce(["gemma4:latest", "llama3:8b"]);
+    const { container } = renderModal();
+    await tick();
+    await tick();
+    await tick();
+
+    const modal = container.querySelector(".modal") as HTMLElement;
+    expect(modal).not.toBeNull();
+    expect(modal.contains(document.activeElement)).toBe(true);
+  });
+
   // ── PR-G5 — Gemini picker (FR-G-UI-02) ─────────────────────
 
   it("renders 5 canonical Gemini models with auto first when surface=gemini", async () => {

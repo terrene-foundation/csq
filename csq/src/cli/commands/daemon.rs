@@ -33,13 +33,13 @@
 //! `csq::desktop::daemon_supervisor`. Both the standalone `csq daemon
 //! start` here and the in-process supervisor now run over a Windows
 //! named pipe (`daemon::serve_windows`) as well as a Unix socket, with a
-//! per-user named-event graceful stop (#786).
+//! per-user named-event graceful stop (an internal ticket).
 
 use anyhow::{Context, Result};
 use csq_core::daemon::{self, DaemonStatus, PidFile};
 use csq_core::http;
 use csq_core::oauth::OAuthStateStore;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Runs `csq daemon start` in the foreground.
@@ -50,16 +50,9 @@ use std::sync::Arc;
 /// is stopped (socket removed) and the PID file is removed via
 /// `PidFile`'s Drop impl.
 pub fn handle_start(base_dir: &Path) -> Result<()> {
-    // Enterprise license gate for the daemon-hosted governance / audit / EATP stack
-    // (task #77 shard 3). Uses the STARTUP variant (structural validity + definitive
-    // revocation, no liveness deny) so a licensed-but-offline-beyond-grace customer can
-    // still start the daemon whose CRL refresher recovers their cache — the full
-    // per-op `enforce` would be a fail-closed deadlock here. Inert while the placeholder
-    // key is baked; community builds carry no gate. The re-exec'd child of
-    // `handle_start_background` runs this same path, so both foreground and background
-    // starts are covered.
-    #[cfg(feature = "enterprise")]
-    super::super::enforce_enterprise_license_startup(base_dir)?;
+    // an internal ticket: an explicit start always undoes a prior explicit stop —
+    // clear FIRST, before anything else can observe the sentinel.
+    daemon::clear_stop_requested(base_dir);
 
     let pid_path = daemon::pid_file_path(base_dir);
 
@@ -80,754 +73,763 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
         pid_file.owned_pid()
     );
 
-    // Multi-threaded runtime so the accept loop and in-flight
-    // requests can make progress concurrently with signal handling.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(2)
-        .thread_name("csq-daemon")
-        .build()
-        .context("failed to build tokio runtime for daemon")?;
-
-    let base_dir_for_runtime = base_dir.to_path_buf();
+    let rt = build_daemon_runtime()?;
+    let base = base_dir.to_path_buf();
     rt.block_on(async move {
-        // Bind the IPC transport (Unix socket / Windows named pipe) +
-        // axum router, then wire the subsystems. The whole body is
-        // cross-platform — only the `serve` bind call and the
-        // shutdown-wait are `#[cfg]`-gated per transport (#786).
-        {
-            // Create the shared refresh-status cache at the daemon
-            // level so both the refresher (writer) and the HTTP
-            // routes (readers) see the same entries.
-            let refresh_cache: Arc<daemon::TtlCache<u16, daemon::RefreshStatus>> =
-                Arc::new(daemon::TtlCache::with_default_age());
-
-            // Short-TTL discovery cache shared between the
-            // `/api/accounts` and `/api/refresh-status` routes.
-            // Bounds the filesystem scan rate so a statusline
-            // polling on a tight interval cannot DoS the daemon
-            // (M8.5 security review MED #1).
-            let discovery_cache: Arc<daemon::TtlCache<(), Vec<csq_core::accounts::AccountInfo>>> =
-                Arc::new(daemon::TtlCache::new(
-                    daemon::server::DISCOVERY_CACHE_MAX_AGE,
-                ));
-
-            // Create the shared OAuth state store for pending
-            // paste-code logins. `GET /api/login/{N}` inserts
-            // entries; `POST /api/oauth/exchange` consumes them.
-            // No TCP callback listener is needed — Anthropic's
-            // current OAuth flow for this client_id is paste-code,
-            // not loopback-redirect.
-            let oauth_store: Arc<OAuthStateStore> = Arc::new(OAuthStateStore::new());
-
-            // Shared shutdown token so every subsystem (server,
-            // refresher, usage poller, auto-rotate) exits on the
-            // same signal.
-            let shutdown = tokio_util::sync::CancellationToken::new();
-
-            // Anthropic endpoints are behind Cloudflare which blocks
-            // reqwest's rustls TLS fingerprint (JA3/JA4). Use Node.js
-            // subprocess transport for token refresh — its OpenSSL
-            // fingerprint passes Cloudflare. Falls back to reqwest if
-            // no JS runtime is available.
-            let http_post: daemon::HttpPostFn =
-                Arc::new(|url: &str, body: &str| http::post_json_node(url, body));
-
-            // Router state: refresh cache + discovery cache +
-            // base_dir + OAuth store. Arc'd so per-request
-            // State clones stay cheap.
-            // Shared Gemini consumer state — same applied-set + quota
-            // mutex as the NDJSON drainer (PR-G3, spec 05 §5.8.1).
-            let gemini_consumer =
-                csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default();
-
-            // PR-C4: clamp Codex invariants before any subsystem starts.
-            // Pass 1 flips canonical credentials/codex-N.json to 0o400
-            // (INV-P08); Pass 2 rewrites config-N/config.toml when its
-            // `cli_auth_credentials_store = "file"` directive has drifted
-            // (INV-P03). Both passes are surface-scoped to Codex and
-            // mutex-coordinated with the refresher (INV-P09), so they're
-            // safe to run before `spawn_refresher`.
-            let _reconcile_summary = daemon::run_reconciler(&base_dir_for_runtime);
-
-            // M3-7 + M4-5: Phase 4 fail-closed gate (an internal journal entry Delta F /
-            // OQ #7; strengthened in M4-5). Refuse to start if the on-disk
-            // store predates Phase 4 layout. Error's `Display` carries
-            // operator-actionable next steps per `tauri-commands.md` MUST
-            // Rule 6.
-            if let Err(e) =
-                csq_core::daemon::startup_reconciler::phase4_gate_check(&base_dir_for_runtime)
-            {
-                tracing::error!(
-                    error_kind = "phase4_gate_refused",
-                    "phase 4 gate refused daemon start: {e}"
-                );
-                return Err(anyhow::anyhow!("phase 4 gate refused start: {e}"));
-            }
-
-            // M05 — Audit-chain verification before IPC socket bind.
-            //
-            // Per spec 12 §12.13.5: verification NEVER blocks daemon startup.
-            // Every outcome (clean, degraded, broken, timeout) maps to an
-            // `AuditHealth` variant and the daemon ALWAYS proceeds to socket
-            // bind so token-refresh and quota-polling are never taken offline
-            // by an audit-chain integrity failure. Protection is achieved via:
-            //
-            //   (a) Loud logging: ERROR for Broken, WARN for Degraded.
-            //   (b) Audit-subsystem fail-closed: anchor task and emit IPC
-            //       route both check `audit_health.is_operational()` and skip
-            //       / reject when the chain is not healthy.
-            //   (c) Operator surfaces: `csq doctor` / `csq daemon status`
-            //       expose `audit_health` so the broken state is visible.
-            //
-            // The prior posture (abort on fatal LedgerError) only protected
-            // the client-detection window; it did not protect the on-disk chain
-            // itself (a broken chain is already written) and it collaterally
-            // took down refresh + polling — both unrelated to audit integrity.
-            //
-            // The verify step is wrapped in a `tokio::time::timeout` (default
-            // 5s, configurable). On timeout: `AuditHealth::Unknown` with
-            // reason "audit_verify_timeout" — audit subsystem fails closed.
-            let audit_health: csq_core::audit::AuditHealth = {
-                // FIX-5b: clamp timeout floor to 1s so CSQ_AUDIT_VERIFY_TIMEOUT_SECS=0
-                // (or an unparseable value) cannot silently suppress verification.
-                let timeout_secs: u64 = std::env::var("CSQ_AUDIT_VERIFY_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|v| v.max(1))
-                    .unwrap_or(5);
-                let record_limit: usize = std::env::var("CSQ_AUDIT_VERIFY_LIMIT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(10_000);
-                let verify_cfg = csq_core::audit::VerifyConfig {
-                    record_limit,
-                    keychain_service: csq_core::audit::AUDIT_SIGNING_SERVICE_NAME.to_string(),
-                };
-                let base_for_verify = base_dir_for_runtime.clone();
-                let verify_future = tokio::task::spawn_blocking(move || {
-                    // M3 §10.5 (W2a): reconcile the born-canonical EATP attestation
-                    // chain's own `.chain-broken` sentinel inside the SAME
-                    // spawn_blocking so the startup timeout covers both chains. Side
-                    // pass — the EATP chain does not gate daemon startup (the op-chain
-                    // result below is the authority). Inert until the EATP chain
-                    // exists (`verify_chain_in` returns Ok(default) for absent
-                    // `eatp-runs/`).
-                    let eatp = csq_core::audit::verify_chain_in(
-                        &base_for_verify,
-                        &verify_cfg,
-                        None,
-                        csq_core::audit::ChainKind::Eatp,
-                    );
-                    csq_core::audit::reconcile_chain_sentinel(
-                        &base_for_verify,
-                        csq_core::audit::ChainKind::Eatp.runs_subdir(),
-                        &eatp,
-                    );
-                    csq_core::audit::verify_chain(&base_for_verify, &verify_cfg, None)
-                });
-                let health = match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    verify_future,
-                )
-                .await
-                {
-                    // ── Clean: all records sig-verified ─────────────────────
-                    Ok(Ok(Ok(summary))) if summary.historical_key_gaps.is_empty() => {
-                        tracing::info!(
-                            verified_count = summary.verified_count,
-                            "audit chain verified clean; proceeding to socket bind"
-                        );
-                        csq_core::audit::AuditHealth::Verified
-                    }
-
-                    // ── Degraded: historical-key gaps (Option B) ─────────────
-                    Ok(Ok(Ok(summary))) => {
-                        for gap in &summary.historical_key_gaps {
-                            tracing::warn!(
-                                audit_verify_historical_key_gap = true,
-                                key_id = gap.key_id.as_str(),
-                                first_seq = gap.first_seq,
-                                last_seq = gap.last_seq,
-                                count = gap.count,
-                                "audit chain: historical signing key absent from keychain — \
-                                 signature verification degraded for this key's records; \
-                                 chain-linking verified end-to-end"
-                            );
-                        }
-                        tracing::warn!(
-                            gap_count = summary.historical_key_gaps.len(),
-                            "audit chain DEGRADED (historical-key gaps); proceeding to socket \
-                             bind — audit subsystem remains operational"
-                        );
-                        csq_core::audit::AuditHealth::Degraded {
-                            gaps: summary.historical_key_gaps,
-                        }
-                    }
-
-                    // ── LedgerError: Broken (fatal) OR Unknown (transient) ────
-                    // KeychainUnavailable (a transient keychain ACCESS error) maps
-                    // to Unknown, NOT Broken — surface it as DEFERRED, not BROKEN,
-                    // and do not fabricate an integrity-failure tag.
-                    Ok(Ok(Err(ref e))) => {
-                        let health = csq_core::audit::AuditHealth::from_ledger_error(e);
-                        match &health {
-                            csq_core::audit::AuditHealth::Unknown { reason } => {
-                                tracing::error!(
-                                    error_kind = reason.as_str(),
-                                    "audit chain verify could not read the signing key \
-                                     (keychain locked / access-denied) — audit subsystem \
-                                     fail-closed this run; token-refresh and quota-polling \
-                                     continue. Run `csq audit migrate-keys` to make the key \
-                                     daemon-readable."
-                                );
-                                eprintln!(
-                                    "csq daemon: AUDIT VERIFY DEFERRED — the signing key is \
-present but the keychain could not be read (locked / access-denied). The chain is NOT \
-broken. Token-refresh and quota-polling are unaffected; audit anchoring/emit are disabled \
-this run. Run `csq audit migrate-keys` to make the key daemon-readable."
-                                );
-                            }
-                            _ => {
-                                let error_kind = if let csq_core::audit::AuditHealth::Broken {
-                                    ref error_kind,
-                                    ..
-                                } = health
-                                {
-                                    error_kind.clone()
-                                } else {
-                                    "audit_chain_integrity_failure".to_string()
-                                };
-                                tracing::error!(
-                                    error_kind = error_kind.as_str(),
-                                    "audit chain BROKEN — audit subsystem will fail-closed; \
-                                     token-refresh and quota-polling continue normally. \
-                                     Run `csq audit verify --full` for diagnosis."
-                                );
-                                eprintln!(
-                                    "csq daemon: AUDIT CHAIN BROKEN ({error_kind}). \
-Token-refresh and quota-polling are unaffected. \
-Audit anchoring and new audit-record emits are disabled until the chain is repaired. \
-Run `csq audit verify --full` for diagnosis."
-                                );
-                            }
-                        }
-                        health
-                    }
-
-                    // ── Task panicked ────────────────────────────────────────
-                    // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
-                    Ok(Err(join_err)) => {
-                        tracing::error!(
-                            error_kind = "audit_verify_task_panicked",
-                            "audit verify task panicked: {join_err} — \
-                             could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
-                        );
-                        eprintln!(
-                            "csq daemon: AUDIT VERIFY TASK PANICKED. \
-Could not confirm chain soundness. Audit anchoring and new audit-record emits are disabled. \
-Run `csq audit verify --full` for diagnosis."
-                        );
-                        csq_core::audit::AuditHealth::Unknown {
-                            reason: "audit_verify_task_panicked".to_string(),
-                        }
-                    }
-
-                    // ── Timeout ───────────────────────────────────────────────
-                    // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
-                    Err(_timeout) => {
-                        tracing::error!(
-                            error_kind = "audit_verify_timeout",
-                            timeout_secs = timeout_secs,
-                            "audit chain verify timed out after {timeout_secs}s — \
-                             could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
-                        );
-                        eprintln!(
-                            "csq daemon: AUDIT VERIFY TIMED OUT after {timeout_secs}s. \
-Could not confirm chain soundness. Audit anchoring and new audit-record emits are disabled. \
-Run `csq audit verify --full` for diagnosis."
-                        );
-                        csq_core::audit::AuditHealth::Unknown {
-                            reason: "audit_verify_timeout".to_string(),
-                        }
-                    }
-                };
-
-                // FIX-1/FIX-2: set or clear the .chain-broken sentinel so
-                // CLI-side writers (op_emit, rotate, anchor) are also gated.
-                // FIX-2: Unknown (timeout/panic) leaves the sentinel UNCHANGED —
-                // a transient verify failure must not produce a durable write-lockout.
-                // Only Broken (a real LedgerError) sets the sentinel.
-                match &health {
-                    csq_core::audit::AuditHealth::Verified
-                    | csq_core::audit::AuditHealth::Degraded { .. } => {
-                        csq_core::audit::clear_chain_broken(&base_dir_for_runtime);
-                    }
-                    csq_core::audit::AuditHealth::Broken { error_kind, .. } => {
-                        csq_core::audit::set_chain_broken(&base_dir_for_runtime, error_kind);
-                    }
-                    csq_core::audit::AuditHealth::Unknown { .. } => {
-                        // Transient condition — do not set a durable sentinel.
-                        // The in-RAM audit_health still gates daemon emit/anchor.
-                    }
-                }
-
-                health
-            };
-
-            // #1060 — resolve the active transparency-log sink ONCE so both the
-            // anchor HTTP handler (RouterState.anchor_sink, for synchronous
-            // inclusion-proof projection on `POST /api/audit/anchor`) and the
-            // cadence-driven drain task below share the same Arc + config. In the
-            // default local-only build `sink = "none"` (or the requested sink's
-            // feature is not compiled in) → `resolve_anchor_sink` returns `None`
-            // and the handler surfaces `inclusion_proof: null` (honest).
-            let anchor_sink_cfg =
-                csq_core::audit::AuditSinkConfig::load(&base_dir_for_runtime).unwrap_or_default();
-            let anchor_sink: Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> =
-                resolve_anchor_sink(&anchor_sink_cfg);
-
-            let router_state = daemon::server::RouterState {
-                cache: Arc::clone(&refresh_cache),
-                discovery_cache: Arc::clone(&discovery_cache),
-                base_dir: Arc::new(base_dir_for_runtime.clone()),
-                oauth_store: Some(Arc::clone(&oauth_store)),
-                gemini_consumer: gemini_consumer.clone(),
-                audit_health: audit_health.clone(),
-                anchor_sink: anchor_sink.clone(),
-                // #783 — seed the interactive enforcement registry from the
-                // fail-closed §10.5 activation gate (absent → empty/503).
-                // #784 follow-up — inject the cross-SDK kailash projector (the
-                // csq crate owns the seam; csq-core cannot name it).
-                // T-M4.3 — inject the PACT governor factory so a configured
-                // operating envelope wires the first production ActionGovernor
-                // (fail-closed: a present-but-unloadable envelope refuses to open).
-                #[cfg(feature = "enterprise")]
-                interactive: Arc::new({
-                    let reg = daemon::interactive_live::seed_registry(
-                        &base_dir_for_runtime,
-                        Some(crate::kailash_projector::make_kailash_projector()),
-                        Some(crate::kailash_governor::make_governor_factory()),
-                        // T-M4.5 — inject the lifecycle-audit-sink factory so every
-                        // session records a signed Delegate-lifecycle audit trail.
-                        Some(crate::kailash_audit_sink::make_audit_sink_factory()),
-                    );
-                    // M3 §10.5 W2b — inject the EATP born-canonical genesis guard.
-                    // Classifies the genesis record on every session open; non-BornCanonical
-                    // refuses EATP chain appends but the session still proceeds.
-                    // M3 §10.5 W3 — inject the EATP session-close attestation writer.
-                    // Appends a born-canonical session-close attestation on every
-                    // close (fail-closed-NON-FATAL — never blocks teardown).
-                    reg.with_eatp_genesis_guard(
-                        crate::kailash_eatp_genesis::make_eatp_genesis_guard(
-                            &base_dir_for_runtime,
-                        ),
-                    )
-                    .with_eatp_attestor(
-                        crate::kailash_eatp_attest::make_eatp_session_close_attestor(
-                            &base_dir_for_runtime,
-                        ),
-                    )
-                }),
-            };
-
-            // ── M19: Emit capture-matrix record (sidecar dedup) ───────────────────
-            // Emitted AFTER audit_health is finalised, BEFORE daemon::serve.
-            // Skipped when the audit subsystem is not operational (Broken/Unknown),
-            // or when the dedup key matches (stable chain_id + same content across
-            // restarts). A chain re-genesis changes chain_id → forces a re-emit even
-            // when the surface content is identical (Finding C fix).
-            // Non-fatal: a failure here logs WARN and continues; the daemon is not
-            // blocked.
-            //
-            // Sidecar advance rule (Finding B fix):
-            //   Ok(true)  → record written → advance sidecar.
-            //   Ok(false) → chain-broken skip → do NOT advance sidecar; a recovered
-            //               chain must re-emit on next startup.
-            //   Err(..)   → hard failure → do NOT advance sidecar.
-            if audit_health.is_operational() {
-                match csq_core::audit::seam::build_capture_matrix(&base_dir_for_runtime) {
-                    Ok(payload) => {
-                        let content_hash =
-                            csq_core::audit::seam::matrix_content_hash(&payload);
-                        use csq_core::audit::op_emit::load_chain_id;
-                        let chain_id = load_chain_id(&base_dir_for_runtime);
-                        let dedup_key = csq_core::audit::seam::sidecar_dedup_key(
-                            &chain_id,
-                            &content_hash,
-                        );
-                        let last_key =
-                            csq_core::audit::seam::read_last_hash(&base_dir_for_runtime);
-                        if last_key.as_deref() != Some(dedup_key.as_str()) {
-                            // Matrix changed or chain re-genesised — emit chain record.
-                            match csq_core::audit::seam::emit_matrix_record(
-                                &base_dir_for_runtime,
-                                &chain_id,
-                                payload,
-                            ) {
-                                Ok(true) => {
-                                    // Record written — advance sidecar so next restart deduplicates.
-                                    if let Err(e) = csq_core::audit::seam::write_last_hash(
-                                        &base_dir_for_runtime,
-                                        &dedup_key,
-                                    ) {
-                                        tracing::warn!(
-                                            error_kind = "capture_matrix_sidecar_write_failed",
-                                            "M19: could not update .last-capture-matrix sidecar: {e}"
-                                        );
-                                    }
-                                }
-                                Ok(false) => {
-                                    // Chain-broken skip — sidecar NOT advanced so a recovered
-                                    // chain re-emits the matrix on next daemon start.
-                                    tracing::warn!(
-                                        error_kind = "capture_matrix_skipped_no_sidecar_advance",
-                                        "M19: capture-matrix emit skipped (chain-broken); \
-                                         sidecar NOT advanced — recovered chain will re-emit"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error_kind = "capture_matrix_emit_failed",
-                                        "M19: capture-matrix chain record emit failed (non-fatal): {e}"
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::debug!(
-                                "M19: capture matrix unchanged (dedup key stable); skipping re-emit"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error_kind = "capture_matrix_build_failed",
-                            "M19: could not build capture matrix (non-fatal): {e}"
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    "M19: capture matrix emit skipped — audit subsystem not operational"
-                );
-            }
-
-            // Bind the transport. Unix binds a domain socket
-            // (`daemon::serve`); Windows binds a named pipe
-            // (`daemon::serve_windows`). Both return a handle exposing
-            // `.shutdown()` + a `JoinHandle<()>`, so the entire tail
-            // below is shared. `sock_path` already resolves to the
-            // named-pipe path on Windows (`daemon::socket_path`).
-            #[cfg(unix)]
-            let serve_result = daemon::serve(&sock_path, router_state).await;
-            #[cfg(windows)]
-            let serve_result = daemon::serve_windows(
-                &sock_path.to_string_lossy().into_owned(),
-                router_state,
-            )
-            .await;
-            match serve_result {
-                Ok((server, server_join)) => {
-                    tracing::info!("IPC server bound at {}", sock_path.display());
-
-                    // Start the background refresher, sharing the
-                    // outer shutdown token so it exits on the same
-                    // signal as the OAuth callback listener. The
-                    // Unix-socket server owns its own shutdown
-                    // token (cancelled via `server.shutdown()`
-                    // below) — the outer token drives the other
-                    // two subsystems.
-                    // Codex refresh transport — same Node-subprocess
-                    // wrapper but returns the response `Date` header so
-                    // the broker can emit `clock_skew_detected` per
-                    // spec 07 §7.5 INV-P01 (PR-C4).
-                    let http_post_codex: daemon::HttpPostFnCodex =
-                        Arc::new(|url: &str, body: &str| http::post_json_node_with_date(url, body));
-
-                    let refresher = daemon::spawn_refresher(
-                        base_dir_for_runtime.clone(),
-                        Arc::clone(&refresh_cache),
-                        http_post,
-                        http_post_codex,
-                        shutdown.clone(),
-                    );
-
-                    // License CRL refresher (task #77 shard 2): keeps the signed
-                    // revocation list fresh so the enterprise license gate can fail
-                    // closed on a revoked/stale license without bricking a paying
-                    // customer on a network blip. Enterprise-only; inert while the
-                    // placeholder key is baked.
-                    #[cfg(feature = "enterprise")]
-                    let crl_refresher = daemon::spawn_crl_refresher(
-                        base_dir_for_runtime.clone(),
-                        shutdown.clone(),
-                    );
-
-                    // Start the background usage poller, sharing the
-                    // same shutdown token. Polls GET /api/oauth/usage
-                    // for each Anthropic account every 5 min and writes
-                    // quota data to the local quota.json file so
-                    // `csq status` shows real percentages.
-                    // Usage poller also hits Anthropic (api.anthropic.com)
-                    // — same Cloudflare fingerprint issue.
-                    let http_get: daemon::HttpGetFn =
-                        Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
-                            http::get_bearer_node(url, token, headers)
-                        });
-                    let http_post_probe: daemon::HttpPostProbeFn =
-                        Arc::new(|url: &str, headers: &[(String, String)], body: &str| {
-                            http::post_json_with_headers(url, headers, body)
-                        });
-                    let usage_poller = daemon::spawn_usage_poller(
-                        base_dir_for_runtime.clone(),
-                        http_get,
-                        http_post_probe,
-                        gemini_consumer.clone(),
-                        shutdown.clone(),
-                    );
-
-                    // Gemini midnight-LA reset task — zeroes the
-                    // per-day request counter at midnight LA per
-                    // ADR-G05. Cancellation-aware via the shared
-                    // shutdown token.
-                    let gemini_midnight =
-                        tokio::spawn(csq_core::daemon::usage_poller::gemini::run_midnight_reset(
-                            base_dir_for_runtime.clone(),
-                            gemini_consumer.clone(),
-                            shutdown.clone(),
-                        ));
-
-                    // Start the background auto-rotation loop (PR-A1).
-                    // Walks term-<pid>/ handle dirs and calls
-                    // repoint_handle_dir to atomically repoint symlinks
-                    // without touching config-N/ (INV-01). Disabled by
-                    // default; enable via {base_dir}/rotation.json.
-                    // claude_home is needed to re-materialize settings.json
-                    // after each repoint; pass None if $HOME is unavailable
-                    // and the rotator becomes a no-op.
-                    let claude_home_for_rotate = super::claude_home().ok();
-                    let auto_rotator = daemon::spawn_auto_rotate(
-                        base_dir_for_runtime.clone(),
-                        claude_home_for_rotate,
-                        shutdown.clone(),
-                    );
-
-                    // Start the handle-dir sweep. Scans term-* dirs
-                    // every 60 seconds, preserves each dead dir's
-                    // per-session image cache to ~/.claude/image-cache/,
-                    // then removes the orphan. See an internal journal entry
-                    //
-                    // If `claude_home()` cannot resolve `~/.claude`
-                    // (malformed $CLAUDE_HOME, missing $HOME), pass
-                    // `None` so the sweep still runs but skips
-                    // preservation rather than routing images into a
-                    // fallback path CC will never look at.
-                    let claude_home_for_sweep = super::claude_home().ok();
-                    let sweep = csq_core::session::spawn_sweep(
-                        base_dir_for_runtime.clone(),
-                        claude_home_for_sweep,
-                        shutdown.clone(),
-                    );
-
-                    // Start the parse-cache sweeper (PR-CA9b / T20). Reads
-                    // ~/.csq/coc-roots-seen.jsonl and GCs stale
-                    // <root>/.cache/parsed-<lock_sha>.bin files older than
-                    // 30 days OR whose lock_sha no longer matches the
-                    // root's current COC.lock digest. R2/B59 budget: 30s
-                    // wall-clock per tick; partial sweeps resume on the
-                    // next tick.
-                    let roots_seen_path = base_dir_for_runtime.join("coc-roots-seen.jsonl");
-                    let coc_cache_sweeper =
-                        daemon::spawn_coc_cache_sweeper(roots_seen_path, shutdown.clone());
-
-                    // Start the daemon-written usage-ledger writer (an internal ticket).
-                    // Periodically re-derives each account's usage history from
-                    // CC's transcripts and atomically publishes it to the per-slot
-                    // ledger, so the desktop dashboard reads a sub-ms ledger
-                    // instead of running the ~20s live scan on the render path.
-                    // The daemon is the SOLE producer; terminals only read
-                    // (account-terminal-separation.md Rule 1, extended for
-                    // billing telemetry). `claude_home()` → None (no $HOME) makes
-                    // the writer a no-op, mirroring the sweep/rotator wiring.
-                    let claude_home_for_ledger = super::claude_home().ok();
-                    let usage_ledger_writer = daemon::spawn_usage_ledger_writer(
-                        base_dir_for_runtime.clone(),
-                        claude_home_for_ledger,
-                        shutdown.clone(),
-                        chrono::Utc::now,
-                    );
-
-                    // M14 — external anchoring task. Reads `audit-sink.json`;
-                    // no-op when sink == "none" (default). When a sink is
-                    // configured, periodically anchors the chain HEAD to the
-                    // external witness and fires immediately on high-impact ops
-                    // (KeyRotate, IdentityMint, ReleaseAuth) via head-kind detection.
-                    //
-                    // Audit-subsystem fail-closed: when `audit_health` is Broken
-                    // or Unknown the anchor task is NOT started. Appending new
-                    // anchor records to a broken chain is pointless and potentially
-                    // misleading. Logs a WARN so the operator can see why anchoring
-                    // is inactive. The operator repairs the chain (csq audit verify
-                    // --full) and restarts the daemon to resume anchoring.
-                    let anchor_handle = if !audit_health.is_operational() {
-                        tracing::warn!(
-                            error_kind = "audit_anchor_skipped_broken_chain",
-                            "audit anchor task NOT started — chain is not operational \
-                             (audit_health={:?}). Restart daemon after repairing the chain.",
-                            audit_health
-                        );
-                        None
-                    } else {
-                        // #1060 — reuse the sink + config resolved once above for
-                        // RouterState.anchor_sink (no second config read / resolve).
-                        anchor_sink.clone().and_then(|s| {
-                            daemon::spawn_anchor_task(
-                                base_dir_for_runtime.clone(),
-                                anchor_sink_cfg.clone(),
-                                s,
-                                shutdown.clone(),
-                            )
-                        })
-                    };
-
-                    // Block until a graceful-stop signal arrives.
-                    // Unix: SIGTERM/SIGINT. Windows: the per-user named
-                    // shutdown event fired by `csq daemon stop`, OR Ctrl-C
-                    // in the foreground (#786).
-                    wait_for_shutdown().await;
-
-                    eprintln!("csq daemon stopping...");
-                    // Cancel the outer token first so refresher +
-                    // usage poller + auto-rotate start winding down.
-                    shutdown.cancel();
-                    // Then cancel the server's internal token so
-                    // the accept loop exits on its next poll.
-                    server.shutdown();
-
-                    // Await the refresher with a 5s deadline so a
-                    // stuck HTTP call can't block shutdown.
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), refresher.join)
-                        .await
-                    {
-                        Ok(Ok(())) => tracing::info!("refresher stopped cleanly"),
-                        Ok(Err(e)) => tracing::warn!(error = %e, "refresher task panicked"),
-                        Err(_) => tracing::warn!("refresher did not stop within 5s deadline"),
-                    }
-
-                    // Await the usage poller with a 5s deadline.
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), usage_poller.join)
-                        .await
-                    {
-                        Ok(Ok(())) => tracing::info!("usage poller stopped cleanly"),
-                        Ok(Err(e)) => tracing::warn!(error = %e, "usage poller task panicked"),
-                        Err(_) => tracing::warn!("usage poller did not stop within 5s deadline"),
-                    }
-
-                    // Await the license CRL refresher with a 5s deadline.
-                    #[cfg(feature = "enterprise")]
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        crl_refresher.join,
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => tracing::info!("license CRL refresher stopped cleanly"),
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "license CRL refresher task panicked")
-                        }
-                        Err(_) => {
-                            tracing::warn!("license CRL refresher did not stop within 5s deadline")
-                        }
-                    }
-
-                    // Await the Gemini midnight-LA reset task with a
-                    // 5s deadline.
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), gemini_midnight)
-                        .await
-                    {
-                        Ok(Ok(())) => tracing::info!("gemini midnight reset stopped cleanly"),
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "gemini midnight reset task panicked")
-                        }
-                        Err(_) => {
-                            tracing::warn!("gemini midnight reset did not stop within 5s deadline")
-                        }
-                    }
-
-                    // Await the auto-rotation loop with a 5s deadline.
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), auto_rotator.join)
-                        .await
-                    {
-                        Ok(Ok(())) => tracing::info!("auto-rotation loop stopped cleanly"),
-                        Ok(Err(e)) => tracing::warn!(error = %e, "auto-rotation task panicked"),
-                        Err(_) => tracing::warn!("auto-rotation did not stop within 5s deadline"),
-                    }
-
-                    // Await the handle-dir sweep with a 5s deadline.
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), sweep.join).await
-                    {
-                        Ok(Ok(())) => tracing::info!("handle-dir sweep stopped cleanly"),
-                        Ok(Err(e)) => tracing::warn!(error = %e, "handle-dir sweep panicked"),
-                        Err(_) => tracing::warn!("handle-dir sweep did not stop within 5s"),
-                    }
-
-                    // Await the parse-cache sweeper with a 5s deadline.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        coc_cache_sweeper.join,
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => tracing::info!("coc-cache sweeper stopped cleanly"),
-                        Ok(Err(e)) => tracing::warn!(error = %e, "coc-cache sweeper panicked"),
-                        Err(_) => tracing::warn!("coc-cache sweeper did not stop within 5s"),
-                    }
-
-                    // Await the usage-ledger writer with a 5s deadline.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        usage_ledger_writer.join,
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => tracing::info!("usage-ledger writer stopped cleanly"),
-                        Ok(Err(e)) => tracing::warn!(error = %e, "usage-ledger writer panicked"),
-                        Err(_) => tracing::warn!("usage-ledger writer did not stop within 5s"),
-                    }
-
-                    // Await the M14 anchor task with a 5s deadline (if active).
-                    if let Some(handle) = anchor_handle {
-                        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.join)
-                            .await
-                        {
-                            Ok(Ok(())) => tracing::info!("anchor task stopped cleanly"),
-                            Ok(Err(e)) => tracing::warn!(error = %e, "anchor task panicked"),
-                            Err(_) => tracing::warn!("anchor task did not stop within 5s"),
-                        }
-                    }
-
-                    // Give the accept loop up to 5s to exit.
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(5), server_join).await;
-                }
-                Err(e) => {
-                    // Bind failure is fatal — the daemon can't do
-                    // anything useful without its IPC socket.
-                    eprintln!(
-                        "error: failed to bind daemon socket at {}: {e}",
-                        sock_path.display()
-                    );
-                    return Err::<(), anyhow::Error>(anyhow::anyhow!("socket bind failed: {e}"));
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
+        // Foreground: bridge SIGTERM/SIGINT (Unix) / the named stop event
+        // (Windows) into the session cancel token, then run ONE session.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_for_signal = cancel.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown().await;
+            cancel_for_signal.cancel();
+        });
+        run_daemon_session(base, cancel)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
     })?;
 
     // Explicit drop for clarity — PidFile::Drop removes the file if
     // it still contains our PID.
     drop(pid_file);
     eprintln!("csq daemon stopped cleanly");
+
+    Ok(())
+}
+
+/// Runs `csq daemon start --supervised` — the launchd-managed background
+/// daemon (daemon-auth-resilience Wave B).
+///
+/// Unlike [`handle_start`] (foreground, single run), this wraps the daemon
+/// session in the shared supervisor loop
+/// ([`csq_core::daemon::supervise::run_forever`]): it acquires the PidFile
+/// per session, restarts the session in-process on a transient failure
+/// (exponential backoff), and cohabits with an external daemon via the
+/// PidFile guard. launchd's `KeepAlive={SuccessfulExit:false}` is the outer
+/// layer — it respawns the whole process on a hard crash, while the
+/// in-process loop handles transient session failures without a full
+/// process restart.
+///
+/// This is the recurrence-prevention core for the mass-token-expiry
+/// incident (an internal journal entry): the refresher now runs in a launchd-managed
+/// process that survives the desktop app quitting or crashing, closing the
+/// "no daemon running for 3.5 days" gap.
+///
+/// The hidden `--supervised` flag is set by the managed plist's
+/// `ProgramArguments`; users still run `csq daemon start` (foreground) or
+/// `-d` (background) directly.
+pub fn handle_start_supervised(base_dir: &Path) -> Result<()> {
+    // an internal ticket: this is also the path a reboot takes via launchd/systemd
+    // `RunAtLoad` — the crash-recovery boundary for a stop-requested
+    // sentinel left set by an unclean shutdown. Clear FIRST.
+    daemon::clear_stop_requested(base_dir);
+
+    // No PidFile acquire here — `run_forever` acquires it per session so it
+    // can cohabit with (and take over from) an external daemon.
+    eprintln!("csq daemon started (supervised mode)");
+    eprintln!("  Base:   {}", base_dir.display());
+    eprintln!("Send SIGTERM or Ctrl-C to stop.");
+
+    let rt = build_daemon_runtime()?;
+    let base = base_dir.to_path_buf();
+    rt.block_on(async move {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_for_signal = cancel.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown().await;
+            cancel_for_signal.cancel();
+        });
+        csq_core::daemon::supervise::run_forever(base, cancel, |b, c| async move {
+            run_daemon_session(b, c).await
+        })
+        .await;
+    });
+
+    Ok(())
+}
+
+/// Builds the multi-threaded tokio runtime the daemon hosts run on. Two
+/// worker threads so the accept loop and in-flight requests make progress
+/// concurrently with signal handling.
+fn build_daemon_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("csq-daemon")
+        .build()
+        .context("failed to build tokio runtime for daemon")
+}
+
+/// One full run of the standalone csq daemon: license gate, bind the IPC
+/// transport, spawn every subsystem (refresher, usage poller, auto-rotate,
+/// CRL refresher, ledger writer, log GC, anchor, server), then block until
+/// `cancel` fires and drain cleanly.
+///
+/// Returns `Err(String)` on a fast/persistent failure (license-gate
+/// refusal, phase-4 gate refusal, socket-bind failure) so the supervisor
+/// loop ([`handle_start_supervised`]) backs off instead of hot-looping;
+/// `Ok(())` on a clean cancellation-driven shutdown.
+///
+/// MUST NOT acquire the PidFile — the caller owns it (foreground:
+/// [`handle_start`]; supervised: the `run_forever` loop).
+async fn run_daemon_session(
+    base_dir: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+) -> std::result::Result<(), String> {
+    // Enterprise license gate for the daemon-hosted governance / audit /
+    // EATP stack (task #77 shard 3). STARTUP variant (structural validity +
+    // definitive revocation, no liveness deny) so a licensed-but-offline-
+    // beyond-grace customer can still start the daemon whose CRL refresher
+    // recovers their cache — the full per-op `enforce` would be a
+    // fail-closed deadlock. Inert while the placeholder key is baked;
+    // community builds carry no gate. A refusal returns `Err` so the
+    // supervised loop backs off (twin of the desktop `run_daemon` gate).
+    #[cfg(feature = "enterprise")]
+    if let Err(e) = super::super::enforce_enterprise_license_startup(&base_dir) {
+        return Err(format!("enterprise license gate refused daemon start: {e}"));
+    }
+
+    let base_dir_for_runtime = base_dir;
+    let sock_path = daemon::socket_path(&base_dir_for_runtime);
+    // Subsystems share this token. It is a CHILD of the caller's `cancel`
+    // (not a clone), so:
+    //   - when `cancel` fires (SIGTERM bridge / supervisor stop), the child
+    //     cancels too and every subsystem drains — the graceful path; and
+    //   - when a subsystem dies mid-session (an internal ticket), the session body can
+    //     cancel THIS child to drain the siblings WITHOUT firing `cancel`
+    //     itself, so `run_forever` sees a fast `Err` and restarts the
+    //     session rather than treating it as an intentional stop
+    //     (`supervise.rs::run_forever` returns on `cancel.is_cancelled()`).
+    let shutdown = cancel.child_token();
+
+    // Bind the IPC transport (Unix socket / Windows named pipe) +
+    // axum router, then wire the subsystems. The whole body is
+    // cross-platform — only the `serve` bind call and the
+    // shutdown-wait are `#[cfg]`-gated per transport (an internal ticket).
+    {
+        // Create the shared refresh-status cache at the daemon
+        // level so both the refresher (writer) and the HTTP
+        // routes (readers) see the same entries.
+        let refresh_cache: Arc<daemon::TtlCache<u16, daemon::RefreshStatus>> =
+            Arc::new(daemon::TtlCache::with_default_age());
+
+        // Short-TTL discovery cache shared between the
+        // `/api/accounts` and `/api/refresh-status` routes.
+        // Bounds the filesystem scan rate so a statusline
+        // polling on a tight interval cannot DoS the daemon
+        // (M8.5 security review MED #1).
+        let discovery_cache: Arc<daemon::TtlCache<(), Vec<csq_core::accounts::AccountInfo>>> =
+            Arc::new(daemon::TtlCache::new(
+                daemon::server::DISCOVERY_CACHE_MAX_AGE,
+            ));
+
+        // Create the shared OAuth state store for pending
+        // paste-code logins. `GET /api/login/{N}` inserts
+        // entries; `POST /api/oauth/exchange` consumes them.
+        // No TCP callback listener is needed — Anthropic's
+        // current OAuth flow for this client_id is paste-code,
+        // not loopback-redirect.
+        let oauth_store: Arc<OAuthStateStore> = Arc::new(OAuthStateStore::new());
+
+        // `shutdown` (the subsystem cancel token) is defined at the top
+        // of `run_daemon_session` as a clone of the caller's `cancel`.
+
+        // Anthropic endpoints are behind Cloudflare which blocks
+        // reqwest's rustls TLS fingerprint (JA3/JA4). Use Node.js
+        // subprocess transport for token refresh — its OpenSSL
+        // fingerprint passes Cloudflare. Falls back to reqwest if
+        // no JS runtime is available.
+        let http_post: daemon::HttpPostFn =
+            Arc::new(|url: &str, body: &str| http::post_json_node(url, body));
+
+        // Router state: refresh cache + discovery cache +
+        // base_dir + OAuth store. Arc'd so per-request
+        // State clones stay cheap.
+        // Shared Gemini consumer state — same applied-set + quota
+        // mutex as the NDJSON drainer (PR-G3, spec 05 §5.8.1).
+        let gemini_consumer =
+            csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default();
+
+        // PR-C4: clamp Codex invariants before any subsystem starts.
+        // Pass 1 flips canonical credentials/codex-N.json to 0o400
+        // (INV-P08); Pass 2 rewrites config-N/config.toml when its
+        // `cli_auth_credentials_store = "file"` directive has drifted
+        // (INV-P03). Both passes are surface-scoped to Codex and
+        // mutex-coordinated with the refresher (INV-P09), so they're
+        // safe to run before `spawn_refresher`.
+        let _reconcile_summary = daemon::run_reconciler(&base_dir_for_runtime);
+
+        // M3-7 + M4-5: Phase 4 fail-closed gate (an internal journal entry Delta F /
+        // OQ #7; strengthened in M4-5). Refuse to start if the on-disk
+        // store predates Phase 4 layout. Error's `Display` carries
+        // operator-actionable next steps per `tauri-commands.md` MUST
+        // Rule 6.
+        if let Err(e) =
+            csq_core::daemon::startup_reconciler::phase4_gate_check(&base_dir_for_runtime)
+        {
+            tracing::error!(
+                error_kind = "phase4_gate_refused",
+                "phase 4 gate refused daemon start: {e}"
+            );
+            return Err(format!("phase 4 gate refused start: {e}"));
+        }
+
+        // M05 — Audit-chain verification before IPC socket bind.
+        //
+        // Per spec 12 §12.13.5: verification NEVER blocks daemon startup.
+        // Every outcome (clean, degraded, broken, timeout) maps to an
+        // `AuditHealth` variant and the daemon ALWAYS proceeds to socket
+        // bind so token-refresh and quota-polling are never taken offline
+        // by an audit-chain integrity failure. Protection is achieved via:
+        //
+        //   (a) Loud logging: ERROR for Broken, WARN for Degraded.
+        //   (b) Audit-subsystem fail-closed: anchor task and emit IPC
+        //       route both check `audit_health.is_operational()` and skip
+        //       / reject when the chain is not healthy.
+        //   (c) Operator surfaces: `csq doctor` / `csq daemon status`
+        //       expose `audit_health` so the broken state is visible.
+        //
+        // The prior posture (abort on fatal LedgerError) only protected
+        // the client-detection window; it did not protect the on-disk chain
+        // itself (a broken chain is already written) and it collaterally
+        // took down refresh + polling — both unrelated to audit integrity.
+        //
+        // The verify step is wrapped in a `tokio::time::timeout` (default
+        // 5s, configurable). On timeout: `AuditHealth::Unknown` with
+        // reason "audit_verify_timeout" — audit subsystem fails closed.
+        let audit_health: csq_core::audit::AuditHealth = {
+            // FIX-5b: clamp timeout floor to 1s so CSQ_AUDIT_VERIFY_TIMEOUT_SECS=0
+            // (or an unparseable value) cannot silently suppress verification.
+            let timeout_secs: u64 = std::env::var("CSQ_AUDIT_VERIFY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|v| v.max(1))
+                .unwrap_or(5);
+            let record_limit: usize = std::env::var("CSQ_AUDIT_VERIFY_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000);
+            let verify_cfg = csq_core::audit::VerifyConfig {
+                record_limit,
+                keychain_service: csq_core::audit::AUDIT_SIGNING_SERVICE_NAME.to_string(),
+            };
+            let base_for_verify = base_dir_for_runtime.clone();
+            let verify_future = tokio::task::spawn_blocking(move || {
+                // M3 §10.5 (W2a): reconcile the born-canonical EATP attestation
+                // chain's own `.chain-broken` sentinel inside the SAME
+                // spawn_blocking so the startup timeout covers both chains. Side
+                // pass — the EATP chain does not gate daemon startup (the op-chain
+                // result below is the authority). Inert until the EATP chain
+                // exists (`verify_chain_in` returns Ok(default) for absent
+                // `eatp-runs/`).
+                let eatp = csq_core::audit::verify_chain_in(
+                    &base_for_verify,
+                    &verify_cfg,
+                    None,
+                    csq_core::audit::ChainKind::Eatp,
+                );
+                csq_core::audit::reconcile_chain_sentinel(
+                    &base_for_verify,
+                    csq_core::audit::ChainKind::Eatp.runs_subdir(),
+                    &eatp,
+                );
+                csq_core::audit::verify_chain(&base_for_verify, &verify_cfg, None)
+            });
+            let health = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                verify_future,
+            )
+            .await
+            {
+                // ── Clean: all records sig-verified ─────────────────────
+                Ok(Ok(Ok(summary))) if summary.historical_key_gaps.is_empty() => {
+                    tracing::info!(
+                        verified_count = summary.verified_count,
+                        "audit chain verified clean; proceeding to socket bind"
+                    );
+                    csq_core::audit::AuditHealth::Verified
+                }
+
+                // ── Degraded: historical-key gaps (Option B) ─────────────
+                Ok(Ok(Ok(summary))) => {
+                    for gap in &summary.historical_key_gaps {
+                        tracing::warn!(
+                            audit_verify_historical_key_gap = true,
+                            key_id = gap.key_id.as_str(),
+                            first_seq = gap.first_seq,
+                            last_seq = gap.last_seq,
+                            count = gap.count,
+                            "audit chain: historical signing key absent from keychain — \
+                                 signature verification degraded for this key's records; \
+                                 chain-linking verified end-to-end"
+                        );
+                    }
+                    tracing::warn!(
+                        gap_count = summary.historical_key_gaps.len(),
+                        "audit chain DEGRADED (historical-key gaps); proceeding to socket \
+                             bind — audit subsystem remains operational"
+                    );
+                    csq_core::audit::AuditHealth::Degraded {
+                        gaps: summary.historical_key_gaps,
+                    }
+                }
+
+                // ── LedgerError: Broken (fatal) OR Unknown (transient) ────
+                // KeychainUnavailable (a transient keychain ACCESS error) maps
+                // to Unknown, NOT Broken — surface it as DEFERRED, not BROKEN,
+                // and do not fabricate an integrity-failure tag.
+                Ok(Ok(Err(ref e))) => {
+                    let health = csq_core::audit::AuditHealth::from_ledger_error(e);
+                    match &health {
+                        csq_core::audit::AuditHealth::Unknown { reason } => {
+                            tracing::error!(
+                                error_kind = reason.as_str(),
+                                "audit chain verify could not read the signing key \
+                                     (keychain locked / access-denied) — audit subsystem \
+                                     fail-closed this run; token-refresh and quota-polling \
+                                     continue. Run `csq audit migrate-keys` to make the key \
+                                     daemon-readable."
+                            );
+                            eprintln!(
+                                "csq daemon: AUDIT VERIFY DEFERRED — the signing key is \
+present but the keychain could not be read (locked / access-denied). The chain is NOT \
+broken. Token-refresh and quota-polling are unaffected; audit anchoring/emit are disabled \
+this run. Run `csq audit migrate-keys` to make the key daemon-readable."
+                            );
+                        }
+                        _ => {
+                            let error_kind = if let csq_core::audit::AuditHealth::Broken {
+                                ref error_kind,
+                                ..
+                            } = health
+                            {
+                                error_kind.clone()
+                            } else {
+                                "audit_chain_integrity_failure".to_string()
+                            };
+                            tracing::error!(
+                                error_kind = error_kind.as_str(),
+                                "audit chain BROKEN — audit subsystem will fail-closed; \
+                                     token-refresh and quota-polling continue normally. \
+                                     Run `csq audit verify --full` for diagnosis."
+                            );
+                            eprintln!(
+                                "csq daemon: AUDIT CHAIN BROKEN ({error_kind}). \
+Token-refresh and quota-polling are unaffected. \
+Audit anchoring and new audit-record emits are disabled until the chain is repaired. \
+Run `csq audit verify --full` for diagnosis."
+                            );
+                        }
+                    }
+                    health
+                }
+
+                // ── Task panicked ────────────────────────────────────────
+                // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
+                Ok(Err(join_err)) => {
+                    tracing::error!(
+                            error_kind = "audit_verify_task_panicked",
+                            "audit verify task panicked: {join_err} — \
+                             could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
+                        );
+                    eprintln!(
+                        "csq daemon: AUDIT VERIFY TASK PANICKED. \
+Could not confirm chain soundness. Audit anchoring and new audit-record emits are disabled. \
+Run `csq audit verify --full` for diagnosis."
+                    );
+                    csq_core::audit::AuditHealth::Unknown {
+                        reason: "audit_verify_task_panicked".to_string(),
+                    }
+                }
+
+                // ── Timeout ───────────────────────────────────────────────
+                // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
+                Err(_timeout) => {
+                    tracing::error!(
+                            error_kind = "audit_verify_timeout",
+                            timeout_secs = timeout_secs,
+                            "audit chain verify timed out after {timeout_secs}s — \
+                             could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
+                        );
+                    eprintln!(
+                        "csq daemon: AUDIT VERIFY TIMED OUT after {timeout_secs}s. \
+Could not confirm chain soundness. Audit anchoring and new audit-record emits are disabled. \
+Run `csq audit verify --full` for diagnosis."
+                    );
+                    csq_core::audit::AuditHealth::Unknown {
+                        reason: "audit_verify_timeout".to_string(),
+                    }
+                }
+            };
+
+            // FIX-1/FIX-2: set or clear the .chain-broken sentinel so
+            // CLI-side writers (op_emit, rotate, anchor) are also gated.
+            // FIX-2: Unknown (timeout/panic) leaves the sentinel UNCHANGED —
+            // a transient verify failure must not produce a durable write-lockout.
+            // Only Broken (a real LedgerError) sets the sentinel.
+            match &health {
+                csq_core::audit::AuditHealth::Verified
+                | csq_core::audit::AuditHealth::Degraded { .. } => {
+                    csq_core::audit::clear_chain_broken(&base_dir_for_runtime);
+                }
+                csq_core::audit::AuditHealth::Broken { error_kind, .. } => {
+                    csq_core::audit::set_chain_broken(&base_dir_for_runtime, error_kind);
+                }
+                csq_core::audit::AuditHealth::Unknown { .. } => {
+                    // Transient condition — do not set a durable sentinel.
+                    // The in-RAM audit_health still gates daemon emit/anchor.
+                }
+            }
+
+            health
+        };
+
+        // an internal ticket — resolve the active transparency-log sink ONCE so both the
+        // anchor HTTP handler (RouterState.anchor_sink, for synchronous
+        // inclusion-proof projection on `POST /api/audit/anchor`) and the
+        // cadence-driven drain task below share the same Arc + config. In the
+        // default local-only build `sink = "none"` (or the requested sink's
+        // feature is not compiled in) → `resolve_anchor_sink` returns `None`
+        // and the handler surfaces `inclusion_proof: null` (honest).
+        let anchor_sink_cfg =
+            csq_core::audit::AuditSinkConfig::load(&base_dir_for_runtime).unwrap_or_default();
+        let anchor_sink: Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> =
+            resolve_anchor_sink(&anchor_sink_cfg);
+
+        let router_state = daemon::server::RouterState {
+            cache: Arc::clone(&refresh_cache),
+            discovery_cache: Arc::clone(&discovery_cache),
+            base_dir: Arc::new(base_dir_for_runtime.clone()),
+            oauth_store: Some(Arc::clone(&oauth_store)),
+            gemini_consumer: gemini_consumer.clone(),
+            audit_health: audit_health.clone(),
+            anchor_sink: anchor_sink.clone(),
+            // an internal ticket — seed the interactive enforcement registry from the
+            // fail-closed §10.5 activation gate (absent → empty/503).
+            // an internal ticket follow-up — inject the cross-SDK kailash projector (the
+            // csq crate owns the seam; csq-core cannot name it).
+            // T-M4.3 — inject the PACT governor factory so a configured
+            // operating envelope wires the first production ActionGovernor
+            // (fail-closed: a present-but-unloadable envelope refuses to open).
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new({
+                let reg = daemon::interactive_live::seed_registry(
+                    &base_dir_for_runtime,
+                    Some(crate::kailash_projector::make_kailash_projector()),
+                    Some(crate::kailash_governor::make_governor_factory()),
+                    // T-M4.5 — inject the lifecycle-audit-sink factory so every
+                    // session records a signed Delegate-lifecycle audit trail.
+                    Some(crate::kailash_audit_sink::make_audit_sink_factory()),
+                );
+                // M3 §10.5 W2b — inject the EATP born-canonical genesis guard.
+                // Classifies the genesis record on every session open; non-BornCanonical
+                // refuses EATP chain appends but the session still proceeds.
+                // M3 §10.5 W3 — inject the EATP session-close attestation writer.
+                // Appends a born-canonical session-close attestation on every
+                // close (fail-closed-NON-FATAL — never blocks teardown).
+                reg.with_eatp_genesis_guard(crate::kailash_eatp_genesis::make_eatp_genesis_guard(
+                    &base_dir_for_runtime,
+                ))
+                .with_eatp_attestor(
+                    crate::kailash_eatp_attest::make_eatp_session_close_attestor(
+                        &base_dir_for_runtime,
+                    ),
+                )
+            }),
+        };
+
+        // ── M19: Emit capture-matrix record (sidecar dedup) ───────────────────
+        // Emitted AFTER audit_health is finalised, BEFORE daemon::serve.
+        // The orchestration (dedup key, sidecar-advance rule, non-fatal error
+        // handling) lives in ONE place shared with the desktop in-process
+        // daemon twin — see `emit_startup_capture_matrix`'s docstring for why.
+        csq_core::audit::seam::emit_startup_capture_matrix(
+            &base_dir_for_runtime,
+            audit_health.is_operational(),
+        );
+
+        // Bind the transport. Unix binds a domain socket
+        // (`daemon::serve`); Windows binds a named pipe
+        // (`daemon::serve_windows`). Both return a handle exposing
+        // `.shutdown()` + a `JoinHandle<()>`, so the entire tail
+        // below is shared. `sock_path` already resolves to the
+        // named-pipe path on Windows (`daemon::socket_path`).
+        #[cfg(unix)]
+        let serve_result = daemon::serve(&sock_path, router_state).await;
+        #[cfg(windows)]
+        let serve_result = daemon::serve_windows(&sock_path.to_string_lossy(), router_state).await;
+        match serve_result {
+            Ok((server, server_join)) => {
+                tracing::info!("IPC server bound at {}", sock_path.display());
+
+                // Start the background refresher, sharing the
+                // outer shutdown token so it exits on the same
+                // signal as the OAuth callback listener. The
+                // Unix-socket server owns its own shutdown
+                // token (cancelled via `server.shutdown()`
+                // below) — the outer token drives the other
+                // two subsystems.
+                // Codex refresh transport — same Node-subprocess
+                // wrapper but returns the response `Date` header so
+                // the broker can emit `clock_skew_detected` per
+                // spec 07 §7.5 INV-P01 (PR-C4).
+                let http_post_codex: daemon::HttpPostFnCodex =
+                    Arc::new(|url: &str, body: &str| http::post_json_node_with_date(url, body));
+
+                let refresher = daemon::spawn_refresher(
+                    base_dir_for_runtime.clone(),
+                    Arc::clone(&refresh_cache),
+                    http_post,
+                    http_post_codex,
+                    shutdown.clone(),
+                );
+
+                // License CRL refresher (task #77 shard 2): keeps the signed
+                // revocation list fresh so the enterprise license gate can fail
+                // closed on a revoked/stale license without bricking a paying
+                // customer on a network blip. Enterprise-only; inert while the
+                // placeholder key is baked.
+                #[cfg(feature = "enterprise")]
+                let crl_refresher =
+                    daemon::spawn_crl_refresher(base_dir_for_runtime.clone(), shutdown.clone());
+
+                // Start the background usage poller, sharing the
+                // same shutdown token. Polls GET /api/oauth/usage
+                // for each Anthropic account every 5 min and writes
+                // quota data to the local quota.json file so
+                // `csq status` shows real percentages.
+                // Usage poller also hits Anthropic (api.anthropic.com)
+                // — same Cloudflare fingerprint issue.
+                let http_get: daemon::HttpGetFn =
+                    Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+                        http::get_bearer_node(url, token, headers)
+                    });
+                let http_post_probe: daemon::HttpPostProbeFn =
+                    Arc::new(|url: &str, headers: &[(String, String)], body: &str| {
+                        http::post_json_with_headers(url, headers, body)
+                    });
+                let usage_poller = daemon::spawn_usage_poller(
+                    base_dir_for_runtime.clone(),
+                    http_get,
+                    http_post_probe,
+                    gemini_consumer.clone(),
+                    shutdown.clone(),
+                );
+
+                // Gemini midnight-LA reset task — zeroes the
+                // per-day request counter at midnight LA per
+                // ADR-G05. Cancellation-aware via the shared
+                // shutdown token.
+                let gemini_midnight =
+                    tokio::spawn(csq_core::daemon::usage_poller::gemini::run_midnight_reset(
+                        base_dir_for_runtime.clone(),
+                        gemini_consumer.clone(),
+                        shutdown.clone(),
+                    ));
+
+                // Start the background auto-rotation loop (PR-A1).
+                // Walks term-<pid>/ handle dirs and calls
+                // repoint_handle_dir to atomically repoint symlinks
+                // without touching config-N/ (INV-01). Disabled by
+                // default; enable via {base_dir}/rotation.json.
+                // claude_home is needed to re-materialize settings.json
+                // after each repoint; pass None if $HOME is unavailable
+                // and the rotator becomes a no-op.
+                let claude_home_for_rotate = super::claude_home().ok();
+                let auto_rotator = daemon::spawn_auto_rotate(
+                    base_dir_for_runtime.clone(),
+                    claude_home_for_rotate,
+                    shutdown.clone(),
+                );
+
+                // Start the handle-dir sweep. Scans term-* dirs
+                // every 60 seconds, preserves each dead dir's
+                // per-session image cache to ~/.claude/image-cache/,
+                // then removes the orphan. See an internal journal entry
+                //
+                // If `claude_home()` cannot resolve `~/.claude`
+                // (malformed $CLAUDE_HOME, missing $HOME), pass
+                // `None` so the sweep still runs but skips
+                // preservation rather than routing images into a
+                // fallback path CC will never look at.
+                let claude_home_for_sweep = super::claude_home().ok();
+                let sweep = csq_core::session::spawn_sweep(
+                    base_dir_for_runtime.clone(),
+                    claude_home_for_sweep,
+                    shutdown.clone(),
+                );
+
+                // Start the parse-cache sweeper (PR-CA9b / T20). Reads
+                // ~/.csq/coc-roots-seen.jsonl and GCs stale
+                // <root>/.cache/parsed-<lock_sha>.bin files older than
+                // 30 days OR whose lock_sha no longer matches the
+                // root's current COC.lock digest. R2/B59 budget: 30s
+                // wall-clock per tick; partial sweeps resume on the
+                // next tick.
+                // Roots path comes from the SHARED resolver that `csq run`'s
+                // `record_root_seen` writer also uses — a hardcoded join here
+                // is what made this sweeper inert: it read
+                // `<base_dir>/coc-roots-seen.jsonl` while the writer populated
+                // `~/.csq/coc-roots-seen.jsonl`, so it swept nothing, ever.
+                // The state snapshot stays under base_dir, where `csq doctor`
+                // reads it.
+                let coc_cache_sweeper = daemon::spawn_coc_cache_sweeper(
+                    csq_core::daemon::coc_cache_sweeper::roots_seen_path_or_inert(
+                        &base_dir_for_runtime,
+                    ),
+                    base_dir_for_runtime.clone(),
+                    shutdown.clone(),
+                );
+
+                // Start the daemon-written usage-ledger writer (an internal ticket).
+                // Periodically re-derives each account's usage history from
+                // CC's transcripts and atomically publishes it to the per-slot
+                // ledger, so the desktop dashboard reads a sub-ms ledger
+                // instead of running the ~20s live scan on the render path.
+                // The daemon is the SOLE producer; terminals only read
+                // (account-terminal-separation.md Rule 1, extended for
+                // billing telemetry). `claude_home()` → None (no $HOME) makes
+                // the writer a no-op, mirroring the sweep/rotator wiring.
+                let claude_home_for_ledger = super::claude_home().ok();
+                let usage_ledger_writer = daemon::spawn_usage_ledger_writer(
+                    base_dir_for_runtime.clone(),
+                    claude_home_for_ledger,
+                    shutdown.clone(),
+                    chrono::Utc::now,
+                );
+
+                // Start the daemon rolling-log GC (#1a-2,
+                // daemon-auth-resilience Wave A2). 14-day retention sweep
+                // over the persistent rolling file log this same `csq
+                // daemon` process writes via the `daemon_log` module's
+                // subscriber wiring in `cli::run`. Mirrors the
+                // coc_cache_sweeper's spawn/tick idiom.
+                let log_gc =
+                    csq_core::daemon::log_gc::spawn(base_dir_for_runtime.clone(), shutdown.clone());
+
+                // M14 — external anchoring task. Reads `audit-sink.json`;
+                // no-op when sink == "none" (default). When a sink is
+                // configured, periodically anchors the chain HEAD to the
+                // external witness and fires immediately on high-impact ops
+                // (KeyRotate, IdentityMint, ReleaseAuth) via head-kind detection.
+                //
+                // Audit-subsystem fail-closed: when `audit_health` is Broken
+                // or Unknown the anchor task is NOT started. Appending new
+                // anchor records to a broken chain is pointless and potentially
+                // misleading. Logs a WARN so the operator can see why anchoring
+                // is inactive. The operator repairs the chain (csq audit verify
+                // --full) and restarts the daemon to resume anchoring.
+                let anchor_handle = if !audit_health.is_operational() {
+                    tracing::warn!(
+                        error_kind = "audit_anchor_skipped_broken_chain",
+                        "audit anchor task NOT started — chain is not operational \
+                             (audit_health={:?}). Restart daemon after repairing the chain.",
+                        audit_health
+                    );
+                    None
+                } else {
+                    // an internal ticket — reuse the sink + config resolved once above for
+                    // RouterState.anchor_sink (no second config read / resolve).
+                    anchor_sink.clone().and_then(|s| {
+                        daemon::spawn_anchor_task(
+                            base_dir_for_runtime.clone(),
+                            anchor_sink_cfg.clone(),
+                            s,
+                            shutdown.clone(),
+                        )
+                    })
+                };
+
+                // Collect every long-lived subsystem into a uniform set so
+                // the session can watch them for premature exit AND drain
+                // them with one loop. Each entry is a stable label + its
+                // `JoinHandle<()>` (directly, or via the handle struct's
+                // `.join`).
+                //
+                // CONTRACT (an internal ticket redteam LOW-1): every member here MUST run
+                // until `shutdown` fires. `await_session_stop` treats ANY
+                // return from a member — clean `Ok(())` or panic — as a fault
+                // that restarts the whole session. A subsystem that returns
+                // early on a benign "nothing to do" condition would trigger a
+                // restart storm; such a subsystem must idle-loop on `shutdown`
+                // (see `auto_rotate::run_loop`), not return.
+                //
+                // `ipc_server` is the one member that exits on its OWN internal
+                // token (fired by `server.shutdown()` during teardown below),
+                // NOT the shared `shutdown` — but it still never returns during
+                // normal operation, so its premature exit (a panicked accept
+                // loop) is a genuine fault worth a restart (an internal ticket): a dead IPC
+                // server silently breaks login / status / provision while the
+                // refresher keeps going.
+                let mut subsystems: Vec<daemon::supervise::Subsystem> = vec![
+                    ("refresher", refresher.join),
+                    ("usage_poller", usage_poller.join),
+                    ("gemini_midnight", gemini_midnight),
+                    ("auto_rotator", auto_rotator.join),
+                    ("handle_dir_sweep", sweep.join),
+                    ("coc_cache_sweeper", coc_cache_sweeper.join),
+                    ("usage_ledger_writer", usage_ledger_writer.join),
+                    ("daemon_log_gc", log_gc),
+                    ("ipc_server", server_join),
+                ];
+                #[cfg(feature = "enterprise")]
+                subsystems.push(("license_crl_refresher", crl_refresher.join));
+                if let Some(handle) = anchor_handle {
+                    subsystems.push(("audit_anchor", handle.join));
+                }
+
+                // Block until EITHER a graceful stop (`cancel` fires: the
+                // SIGTERM/SIGINT bridge in foreground, or the supervisor stop
+                // when supervised) OR a subsystem dies mid-session (an internal ticket —
+                // the mass-expiry failure shape one level down). The
+                // subsystems share `shutdown` (a child of `cancel`), so on a
+                // graceful stop they are already winding down.
+                let stop = daemon::supervise::await_session_stop(&cancel, &mut subsystems).await;
+
+                eprintln!("csq daemon stopping...");
+                // Cancel the server's OWN internal token so its accept loop
+                // exits on the next poll.
+                server.shutdown();
+
+                if let daemon::supervise::SessionStop::SubsystemExited(name) = &stop {
+                    // A subsystem exited while the daemon was meant to be
+                    // running. Fire the CHILD `shutdown` token to wind the
+                    // siblings down (this does NOT cancel the caller's
+                    // `cancel`, so `run_forever` restarts rather than exits),
+                    // then return `Err` below.
+                    tracing::error!(
+                        subsystem = %name,
+                        error_kind = "daemon_subsystem_exited",
+                        "daemon subsystem exited mid-session; draining siblings and restarting"
+                    );
+                    shutdown.cancel();
+                }
+
+                // Drain every remaining subsystem with a 5s per-handle deadline
+                // (the dead one, if any, was already removed by
+                // `await_session_stop`, so no handle is double-polled). This
+                // includes `ipc_server` unless IT was the one that exited —
+                // `server.shutdown()` above fired its accept loop's exit, so its
+                // handle completes here (no separate drain, which would
+                // double-poll it — an internal ticket redteam hazard).
+                daemon::supervise::drain_subsystems(subsystems, std::time::Duration::from_secs(5))
+                    .await;
+
+                if let daemon::supervise::SessionStop::SubsystemExited(name) = stop {
+                    return Err(format!("daemon subsystem exited mid-session: {name}"));
+                }
+            }
+            Err(e) => {
+                // Bind failure is fatal — the daemon can't do
+                // anything useful without its IPC socket.
+                eprintln!(
+                    "error: failed to bind daemon socket at {}: {e}",
+                    sock_path.display()
+                );
+                return Err(format!("socket bind failed: {e}"));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -912,7 +914,21 @@ fn resolve_anchor_sink(
 
 /// Runs `csq daemon stop` — sends SIGTERM to the running daemon and
 /// polls for exit.
+///
+/// Also sets the [`daemon::set_stop_requested`] sentinel (an internal ticket) so
+/// a desktop-app in-process supervisor, if one is cohabiting with the
+/// process we just stopped, does NOT silently re-acquire the daemon on
+/// its next detect tick. The sentinel is cleared by every `csq daemon
+/// start` entry point — this stop is not permanent, only explicit.
 pub fn handle_stop(base_dir: &Path) -> Result<()> {
+    // an internal ticket: set the stop-requested sentinel BEFORE signalling. A
+    // desktop-app in-process supervisor cohabiting with the PidFile owner
+    // we are about to stop must see this sentinel on its very next
+    // detect/acquire tick, or it silently takes over and "csq daemon
+    // stopped" becomes a lie the moment it is printed. Best-effort: a
+    // sentinel-write failure does not block the stop signal itself.
+    daemon::set_stop_requested(base_dir);
+
     let pid_path = daemon::pid_file_path(base_dir);
 
     match daemon::stop_daemon(&pid_path) {
@@ -925,17 +941,23 @@ pub fn handle_stop(base_dir: &Path) -> Result<()> {
             Ok(())
         }
         Err(csq_core::error::DaemonError::StalePidFile { pid }) => {
-            // Two paths reach here and the old wording ("not alive — cleaned up")
-            // lied on the second: (a) Unix/dead-PID pre-check — the PID is
-            // genuinely gone and its stale file was removed; (b) Windows — the
-            // daemon's shutdown event is absent (an exceptional startup failure)
-            // even though the PID is ALIVE, so the file is intentionally NOT
-            // removed (a live daemon keeps its lock). Word it truthfully for both
-            // (#786 redteam R3 LOW).
+            // THREE paths reach here and the wording must hold for all of
+            // them: (a) Unix/dead-PID pre-check — the PID is genuinely gone
+            // and its stale file was removed; (b) Windows — the daemon's
+            // shutdown event is absent (an exceptional startup failure) even
+            // though the PID is ALIVE, so the file is intentionally NOT
+            // removed (a live daemon keeps its lock) (an internal ticket redteam R3 LOW);
+            // (c) the PID is alive but belongs to an unrelated program
+            // because the OS recycled a dead daemon's PID — csq deliberately
+            // did not signal it and removed the stale file. Naming (c)
+            // explicitly matters: the operator otherwise reads "not
+            // reachable" as "my daemon is wedged" and reaches for `kill`.
             eprintln!(
                 "csq daemon not reachable for a graceful stop (PID {pid} — already \
-                 stopped, or its shutdown channel is unavailable). If a daemon is \
-                 still running, restart it to restore a working shutdown channel."
+                 stopped, or that PID now belongs to an unrelated program after \
+                 the OS reused it, or its shutdown channel is unavailable). csq \
+                 did not signal the PID. If a daemon is still running, restart it \
+                 to restore a working shutdown channel."
             );
             Ok(())
         }
@@ -974,11 +996,69 @@ pub fn handle_status(base_dir: &Path) -> Result<()> {
             eprintln!("  Run `csq daemon start` to clean up and restart.");
             std::process::exit(1);
         }
+        // Distinct wording from `Stale`: that PID *is* alive, so calling it
+        // dead would send the operator hunting for a daemon that isn't
+        // theirs. Naming PID reuse explicitly also pre-empts the reflex to
+        // `kill` the PID by hand — it belongs to an unrelated program.
+        DaemonStatus::PidReused { pid } => {
+            println!("stale");
+            eprintln!(
+                "  Stale PID file at {} names PID {pid}, which is alive but is NOT a",
+                pid_path.display()
+            );
+            eprintln!("  csq process — the OS reused a dead daemon's PID. No daemon is running,");
+            eprintln!("  and csq will not signal that PID. Do not kill it by hand.");
+            eprintln!("  Run `csq daemon start`; it clears the stale file and takes over.");
+            std::process::exit(1);
+        }
         DaemonStatus::NotRunning => {
             println!("not running");
             std::process::exit(1);
         }
     }
+}
+
+/// The canonical daemon log path: `<base_dir>/csq-daemon.log`.
+///
+/// Kept as one helper so the detached mode and the launchd/systemd service
+/// mode cannot drift onto different files — a split would leave an operator
+/// reading a log the running daemon is not writing, which is the failure
+/// this whole path exists to prevent.
+pub fn daemon_log_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("csq-daemon.log")
+}
+
+/// Opens the daemon log for APPEND, creating it 0600.
+///
+/// Append (never truncate): a detached start must not wipe lines the service
+/// mode or a previous run wrote. 0600 because the log carries account labels,
+/// which are email addresses (`security.md` §2 — the log is an audit-trail
+/// surface, not world-readable chat).
+fn open_daemon_log_for_append(base_dir: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = daemon_log_path(base_dir).parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let path = daemon_log_path(base_dir);
+    let f = opts
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    // `mode()` applies only on CREATE, so an existing file keeps whatever
+    // permissions it had. Tighten it explicitly — a log created by an older
+    // csq (or by launchd, which uses its own default) may be world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(f)
 }
 
 /// Spawns the daemon in the background by re-executing the current binary
@@ -993,16 +1073,52 @@ pub fn handle_start_background(base_dir: &Path) -> Result<()> {
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["daemon", "start"]);
 
-    // Redirect all stdio to /dev/null so the detached process has no
-    // inherited file descriptors pointing back to the terminal.
+    // Detach stdin from the terminal — the daemon never reads it.
     let devnull = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(if cfg!(windows) { "NUL" } else { "/dev/null" })
         .context("could not open /dev/null")?;
     cmd.stdin(devnull.try_clone().context("stdin dup")?);
-    cmd.stdout(devnull.try_clone().context("stdout dup")?);
-    cmd.stderr(devnull.try_clone().context("stderr dup")?);
+
+    // stdout/stderr go to the SAME rolling log the launchd/systemd service
+    // mode writes (`ensure_managed_daemon_plist` sets this exact path), NOT
+    // to /dev/null.
+    //
+    // Routing them to /dev/null discarded every line a detached daemon ever
+    // emitted. Because `tracing` only writes WARN+ here, that meant the one
+    // channel reporting real faults was silently destroyed for the mode
+    // explicitly documented as "survives terminal close" — i.e. the mode a
+    // long-running host actually uses.
+    //
+    // This is not hypothetical. Kimi dropped the `used` field from its
+    // `/usages` payload; the poller detected it correctly and emitted
+    // "possible API contract drift" on every tick. Nobody could read it, two
+    // slots showed a frozen quota for days, and the cause was only found by
+    // starting a FOREGROUND daemon with stdout captured by hand. The warning
+    // was right the whole time and had nowhere to go.
+    //
+    // `log_gc.rs` already garbage-collects `csq-daemon.log.<date>` siblings,
+    // so the rest of the system already assumes this file exists.
+    //
+    // Best-effort by design: if the log cannot be opened (read-only $HOME,
+    // full disk, permissions), fall back to /dev/null and start anyway.
+    // Losing logs is bad; refusing to start the daemon over logs is worse.
+    match open_daemon_log_for_append(base_dir) {
+        Ok(log) => {
+            cmd.stdout(log.try_clone().context("stdout dup")?);
+            cmd.stderr(log);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error_kind = "daemon_log_open_failed",
+                reason = %e,
+                "detached daemon: could not open the log file — output will be discarded"
+            );
+            cmd.stdout(devnull.try_clone().context("stdout dup")?);
+            cmd.stderr(devnull.try_clone().context("stderr dup")?);
+        }
+    }
 
     // On Unix, place the child in a new process group so it is no
     // longer a member of the terminal's session and won't receive
@@ -1058,10 +1174,29 @@ fn launchd_plist_path() -> Result<std::path::PathBuf> {
 
 /// Build the launchd plist XML for the given binary path and log path.
 /// Exported for unit-testing the generated XML.
+///
+/// The MANAGED form (daemon-auth-resilience Wave B):
+/// - `ProgramArguments` runs `<exe> daemon start --supervised` — the
+///   crash-restart supervisor loop, NOT the foreground daemon.
+/// - `KeepAlive={SuccessfulExit:false}` restarts the process ONLY on a
+///   non-zero/crash exit; a clean `csq daemon stop` (SIGTERM → exit 0)
+///   stays stopped.
+/// - `ThrottleInterval=10` bounds launchd's respawn rate under a crash
+///   loop (its own floor is 10s; stated explicitly for clarity).
+///
+/// `exe` MUST be a real file OUTSIDE the app bundle (see
+/// [`resolve_managed_daemon_exe`]) — a bundle path is misdetected as
+/// Desktop mode by `mode::detect()` and would launch the whole app.
 #[cfg(target_os = "macos")]
 pub fn build_launchd_plist(exe: &Path, log_path: &Path) -> String {
-    let exe_str = exe.display();
-    let log_str = log_path.display();
+    // XML-escape: launchd plists are XML 1.0. An unescaped `&`/`<`/`>` in a
+    // path (relocated $HOME, unusual install dir) yields a malformed plist
+    // that `launchctl load` rejects — which, via the best-effort desktop
+    // caller, silently skips the managed-daemon install. Escaping keeps the
+    // plist well-formed for ANY path and closes a same-UID injection vector
+    // now that the exe can originate from a PATH walk.
+    let exe_str = xml_escape(&exe.display().to_string());
+    let log_str = xml_escape(&log_path.display().to_string());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1074,11 +1209,17 @@ pub fn build_launchd_plist(exe: &Path, log_path: &Path) -> String {
 		<string>{exe_str}</string>
 		<string>daemon</string>
 		<string>start</string>
+		<string>--supervised</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>StandardOutPath</key>
@@ -1091,25 +1232,94 @@ pub fn build_launchd_plist(exe: &Path, log_path: &Path) -> String {
     )
 }
 
+/// Minimal XML text escaper for plist `<string>` values (XML 1.0).
 #[cfg(target_os = "macos")]
-fn platform_install() -> Result<()> {
-    let plist_path = launchd_plist_path()?;
-
-    // Check if already installed.
-    if plist_path.exists() {
-        eprintln!(
-            "csq daemon service already installed at {}",
-            plist_path.display()
-        );
-        eprintln!("  Use `csq daemon uninstall` first if you want to reinstall.");
-        return Ok(());
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
     }
+    out
+}
 
-    let exe = std::env::current_exe().context("could not determine current executable path")?;
+/// Resolve the binary path to bake into the managed plist's
+/// `ProgramArguments[0]`.
+///
+/// MUST be a real file OUTSIDE the app bundle so `mode::detect()`
+/// resolves it to CLI mode: a bundle path (`.../Contents/MacOS/csq`) is
+/// misdetected as Desktop mode by [`crate::mode::detect`] and would
+/// launch the whole desktop app instead of the daemon (an internal journal entry).
+///
+/// Prefers the current exe when it is itself a standalone CLI binary
+/// (the `csq daemon install` case, run from a terminal `csq`); falls
+/// back to the persistent shim (`~/.local/bin/csq`) for the desktop
+/// bundle case where `current_exe()` is the misdetected bundle binary.
+#[cfg(target_os = "macos")]
+fn resolve_managed_daemon_exe() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let s = exe.to_string_lossy();
+        let in_bundle =
+            s.contains("/Contents/MacOS/") || s.contains(".app/") || s.contains(".AppImage");
+        if !in_bundle && exe.is_file() {
+            return Some(exe);
+        }
+    }
+    csq_core::cli_deps::cli_shim::resolve_shim_target()
+}
+
+/// Outcome of an idempotent managed-plist install/repair.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedPlistOutcome {
+    /// Plist was absent and has been written + loaded.
+    Installed,
+    /// Plist existed but drifted from the expected content; rewritten + reloaded.
+    Repaired,
+    /// Plist already matched the expected content; nothing changed.
+    AlreadyCurrent,
+}
+
+/// Idempotently installs or repairs the launchd-managed daemon plist
+/// (daemon-auth-resilience Wave B). Safe to call on every desktop launch:
+/// - Absent → write + `launchctl load` → [`ManagedPlistOutcome::Installed`].
+/// - Present but drifted → unload + rewrite + reload → [`ManagedPlistOutcome::Repaired`].
+/// - Present + byte-identical → no-op → [`ManagedPlistOutcome::AlreadyCurrent`].
+///
+/// The managed plist runs `<shim> daemon start --supervised` under
+/// `KeepAlive={SuccessfulExit:false}`, so the token refresher survives
+/// the desktop app quitting or crashing — the structural fix for the
+/// mass-token-expiry incident (an internal journal entry).
+///
+/// Best-effort by contract: the desktop caller MUST treat any `Err` as
+/// non-fatal (a launchctl hiccup must never block app launch).
+#[cfg(target_os = "macos")]
+pub fn ensure_managed_daemon_plist() -> Result<ManagedPlistOutcome> {
+    let plist_path = launchd_plist_path()?;
+    let exe = resolve_managed_daemon_exe()
+        .context("could not resolve a managed-daemon binary path (no CLI shim available)")?;
     let home = dirs::home_dir().context("could not determine home directory")?;
-    let log_path = home.join(".claude").join("accounts").join("csq-daemon.log");
+    // Same helper the detached mode uses, so the two cannot drift onto
+    // different files and leave an operator reading a log nothing writes.
+    let log_path = daemon_log_path(&home.join(".claude").join("accounts"));
+    let expected = build_launchd_plist(&exe, &log_path);
 
-    // Ensure the LaunchAgents directory exists.
+    // Idempotent: if the on-disk content already matches, do nothing —
+    // and (critically) skip the `launchctl load`, which returns non-zero
+    // for an already-loaded agent.
+    if let Ok(existing) = std::fs::read_to_string(&plist_path) {
+        if existing == expected {
+            return Ok(ManagedPlistOutcome::AlreadyCurrent);
+        }
+    }
+    let drifted = plist_path.exists();
+
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -1119,26 +1329,72 @@ fn platform_install() -> Result<()> {
         })?;
     }
 
-    let plist_content = build_launchd_plist(&exe, &log_path);
-    std::fs::write(&plist_path, &plist_content)
-        .with_context(|| format!("could not write plist to {}", plist_path.display()))?;
-
-    // Load the agent.
-    let status = std::process::Command::new("launchctl")
-        .args(["load", &plist_path.to_string_lossy()])
-        .status()
-        .context("could not run launchctl load")?;
-
-    if !status.success() {
-        // Remove the plist so we leave a clean state.
-        let _ = std::fs::remove_file(&plist_path);
-        anyhow::bail!("launchctl load failed with exit code {:?}", status.code());
+    // A drifted plist must be unloaded before the rewrite so launchd picks
+    // up the new ProgramArguments on the reload (best-effort; the agent may
+    // not currently be loaded).
+    if drifted {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .status();
     }
 
-    eprintln!("csq daemon service installed and started.");
-    eprintln!("  Plist:   {}", plist_path.display());
-    eprintln!("  Log:     {}", log_path.display());
-    eprintln!("  Binary:  {}", exe.display());
+    if let Err(e) = std::fs::write(&plist_path, &expected) {
+        let _ = std::fs::remove_file(&plist_path);
+        return Err(e)
+            .with_context(|| format!("could not write plist to {}", plist_path.display()));
+    }
+
+    // On ANY `launchctl load` failure (spawn error or non-zero exit), remove
+    // the freshly-written plist. Otherwise the content-match fast-path at the
+    // top of this function would report `AlreadyCurrent` on the next call —
+    // permanently skipping the load retry and leaving the managed daemon
+    // UNLOADED while reporting success, which silently defeats Wave B's
+    // after-app-quit coverage (redteam R2 finding 6; restores the pre-Wave-B
+    // `platform_install` cleanup that this extraction dropped).
+    match std::process::Command::new("launchctl")
+        .args(["load", &plist_path.to_string_lossy()])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let _ = std::fs::remove_file(&plist_path);
+            anyhow::bail!("launchctl load failed with exit code {:?}", status.code());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&plist_path);
+            return Err(e).context("could not run launchctl load");
+        }
+    }
+
+    Ok(if drifted {
+        ManagedPlistOutcome::Repaired
+    } else {
+        ManagedPlistOutcome::Installed
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_install() -> Result<()> {
+    // Idempotent drift-repair (Wave B): re-running `csq daemon install`
+    // refreshes a drifted plist instead of the old "already installed, do
+    // nothing". The desktop app calls the same `ensure_managed_daemon_plist`
+    // on launch, so the two converge on one managed plist.
+    let outcome = ensure_managed_daemon_plist()?;
+    let plist_path = launchd_plist_path()?;
+    match outcome {
+        ManagedPlistOutcome::AlreadyCurrent => {
+            eprintln!("csq daemon service already installed and current.");
+            eprintln!("  Plist:   {}", plist_path.display());
+        }
+        ManagedPlistOutcome::Installed => {
+            eprintln!("csq daemon service installed and started.");
+            eprintln!("  Plist:   {}", plist_path.display());
+        }
+        ManagedPlistOutcome::Repaired => {
+            eprintln!("csq daemon service configuration repaired and reloaded.");
+            eprintln!("  Plist:   {}", plist_path.display());
+        }
+    }
     Ok(())
 }
 
@@ -1336,7 +1592,7 @@ async fn wait_for_shutdown() {
     {
         // Windows has no SIGTERM. `csq daemon stop` fires a per-user
         // named event; the daemon waits on it here (via a blocking
-        // thread) alongside Ctrl-C for the foreground case (#786). If
+        // thread) alongside Ctrl-C for the foreground case (an internal ticket). If
         // the event cannot be created (an exceptional kernel condition),
         // fall back to Ctrl-C only so the daemon still runs.
         match csq_core::daemon::create_shutdown_event() {
@@ -1375,6 +1631,86 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── detached-mode logging (the observability defect) ──────────────
+
+    /// The detached daemon routed stdout AND stderr to /dev/null, so a
+    /// `-d` daemon — the mode documented as "survives terminal close" —
+    /// discarded every line it ever emitted. Since `tracing` only writes
+    /// WARN+ here, the sole channel reporting real faults was destroyed
+    /// for the mode a long-running host actually uses.
+    ///
+    /// Worked case: Kimi dropped `used` from `/usages`; the poller
+    /// emitted "possible API contract drift" every tick; two slots showed
+    /// frozen quota for days; the cause was found only by hand-capturing
+    /// a FOREGROUND daemon's stdout.
+    #[test]
+    fn detached_daemon_log_is_the_same_file_the_service_mode_writes() {
+        let base = PathBuf::from("/Users/alice/.claude/accounts");
+        // The literal the macOS plist test pins, inlined so this test is not
+        // macOS-gated — the detached mode and the systemd service mode share
+        // this path on Linux too.
+        assert_eq!(
+            super::daemon_log_path(&base),
+            PathBuf::from("/Users/alice/.claude/accounts/csq-daemon.log"),
+            "detached and service modes MUST write one file — a split \
+             leaves the operator reading a log nothing is writing"
+        );
+    }
+
+    #[test]
+    fn daemon_log_opens_append_and_0600_and_does_not_truncate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let path = super::daemon_log_path(base);
+        std::fs::write(&path, b"pre-existing line\n").unwrap();
+
+        // Deliberately world-readable first: a log created by an older
+        // csq, or by launchd's default umask, carries account labels —
+        // which are email addresses.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        {
+            use std::io::Write;
+            let mut f = super::open_daemon_log_for_append(base).unwrap();
+            writeln!(f, "second line").unwrap();
+        }
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.starts_with("pre-existing line"),
+            "must APPEND — a detached start must not wipe what the \
+             service mode or a prior run wrote: {body:?}"
+        );
+        assert!(body.contains("second line"), "new line missing: {body:?}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "log carries account emails — must be tightened even when \
+                 it already existed world-readable"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_log_is_created_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        assert!(!super::daemon_log_path(base).exists());
+        let _ = super::open_daemon_log_for_append(base).unwrap();
+        assert!(
+            super::daemon_log_path(base).exists(),
+            "a first detached start must create the log, not fail"
+        );
+    }
 
     // ── macOS plist generation ────────────────────────────────────────────────
 
@@ -1424,7 +1760,7 @@ mod tests {
         }
 
         #[test]
-        fn plist_contains_daemon_start_args() {
+        fn plist_contains_daemon_start_supervised_args() {
             // Arrange
             let exe = exe_path();
             let log = log_path();
@@ -1432,11 +1768,12 @@ mod tests {
             // Act
             let plist = build_launchd_plist(&exe, &log);
 
-            // Assert
+            // Assert — the managed plist runs the SUPERVISED daemon.
             assert!(
                 plist.contains("<string>daemon</string>")
-                    && plist.contains("<string>start</string>"),
-                "plist missing daemon start args: {plist}"
+                    && plist.contains("<string>start</string>")
+                    && plist.contains("<string>--supervised</string>"),
+                "plist missing `daemon start --supervised` args: {plist}"
             );
         }
 
@@ -1461,7 +1798,7 @@ mod tests {
         }
 
         #[test]
-        fn plist_sets_keep_alive_true() {
+        fn plist_sets_keep_alive_restart_on_crash_only() {
             // Arrange
             let exe = exe_path();
             let log = log_path();
@@ -1469,14 +1806,73 @@ mod tests {
             // Act
             let plist = build_launchd_plist(&exe, &log);
 
-            // Assert — KeepAlive key must be followed by <true/>
+            // Assert — KeepAlive is a dict `{SuccessfulExit: false}` so
+            // launchd restarts on crash but leaves a clean stop stopped.
             let keep_alive_pos = plist
                 .find("<key>KeepAlive</key>")
                 .expect("KeepAlive key missing");
             let after = &plist[keep_alive_pos..];
+            // KeepAlive must open a <dict> (NOT a bare <true/>) whose first
+            // key is SuccessfulExit=false — restart on crash, not on a clean
+            // stop. `<dict>` must precede the SuccessfulExit pair.
+            let dict_pos = after.find("<dict>").expect("KeepAlive not a dict");
+            let succ_pos = after
+                .find("<key>SuccessfulExit</key>")
+                .expect("KeepAlive dict missing SuccessfulExit");
+            assert!(dict_pos < succ_pos, "KeepAlive dict malformed: {plist}");
+            let succ_after = &after[succ_pos..];
             assert!(
-                after.contains("<true/>"),
-                "KeepAlive not set to true: {plist}"
+                succ_after.starts_with("<key>SuccessfulExit</key>")
+                    && succ_after[..40.min(succ_after.len())].contains("<false/>"),
+                "KeepAlive SuccessfulExit must be false: {plist}"
+            );
+        }
+
+        #[test]
+        fn plist_escapes_xml_metachars_in_paths() {
+            // A path with XML metacharacters (`&`, `<`, `>`) or a literal
+            // `</string>` must NOT break out of the <string> element or
+            // produce malformed XML — otherwise launchctl rejects the plist
+            // and the managed daemon silently never installs (L1).
+            let exe = PathBuf::from("/Users/a&b/</string><key>x</key>/csq");
+            let log = PathBuf::from("/Users/a&b/log.txt");
+
+            let plist = build_launchd_plist(&exe, &log);
+
+            // The raw metacharacters must be escaped, not present verbatim
+            // inside the interpolated value.
+            assert!(
+                plist.contains("/Users/a&amp;b/&lt;/string&gt;&lt;key&gt;x&lt;/key&gt;/csq"),
+                "exe path not XML-escaped: {plist}"
+            );
+            // No unescaped standalone `&` survives (every `&` starts an entity).
+            for (i, _) in plist.match_indices('&') {
+                let tail = &plist[i..];
+                assert!(
+                    tail.starts_with("&amp;")
+                        || tail.starts_with("&lt;")
+                        || tail.starts_with("&gt;")
+                        || tail.starts_with("&quot;")
+                        || tail.starts_with("&apos;"),
+                    "unescaped '&' at offset {i}: {plist}"
+                );
+            }
+        }
+
+        #[test]
+        fn plist_sets_throttle_interval() {
+            // Arrange
+            let exe = exe_path();
+            let log = log_path();
+
+            // Act
+            let plist = build_launchd_plist(&exe, &log);
+
+            // Assert — respawn rate is bounded under a crash loop.
+            assert!(
+                plist.contains("<key>ThrottleInterval</key>")
+                    && plist.contains("<integer>10</integer>"),
+                "plist missing ThrottleInterval=10: {plist}"
             );
         }
 
@@ -1683,11 +2079,16 @@ mod tests {
             },
         }
 
+        // Mirrors the real `DaemonCmd::Start` shape (incl. the Wave B
+        // `--supervised` flag and its `conflicts_with = "background"`) so
+        // clap integration is tested without spawning a process.
         #[derive(clap::Subcommand, Debug)]
         enum TestDaemonCmd {
             Start {
                 #[arg(short = 'd', long = "background")]
                 background: bool,
+                #[arg(long = "supervised", hide = true, conflicts_with = "background")]
+                supervised: bool,
             },
         }
 
@@ -1699,9 +2100,14 @@ mod tests {
 
             // Assert
             let TestCmd::Daemon {
-                action: TestDaemonCmd::Start { background },
+                action:
+                    TestDaemonCmd::Start {
+                        background,
+                        supervised,
+                    },
             } = cli.command;
             assert!(background, "--background should set flag to true");
+            assert!(!supervised, "supervised should default to false");
         }
 
         #[test]
@@ -1712,7 +2118,7 @@ mod tests {
 
             // Assert
             let TestCmd::Daemon {
-                action: TestDaemonCmd::Start { background },
+                action: TestDaemonCmd::Start { background, .. },
             } = cli.command;
             assert!(background, "-d should set flag to true");
         }
@@ -1725,9 +2131,45 @@ mod tests {
 
             // Assert
             let TestCmd::Daemon {
-                action: TestDaemonCmd::Start { background },
+                action:
+                    TestDaemonCmd::Start {
+                        background,
+                        supervised,
+                    },
             } = cli.command;
             assert!(!background, "background should default to false");
+            assert!(!supervised, "supervised should default to false");
+        }
+
+        #[test]
+        fn supervised_flag_parses() {
+            // Arrange + Act — Wave B: the launchd plist passes --supervised.
+            let cli = TestCli::try_parse_from(["csq", "daemon", "start", "--supervised"])
+                .expect("--supervised should parse");
+
+            // Assert
+            let TestCmd::Daemon {
+                action:
+                    TestDaemonCmd::Start {
+                        background,
+                        supervised,
+                    },
+            } = cli.command;
+            assert!(supervised, "--supervised should set flag to true");
+            assert!(!background, "background should default to false");
+        }
+
+        #[test]
+        fn supervised_and_background_conflict() {
+            // Arrange + Act — the two run-modes are mutually exclusive.
+            let result =
+                TestCli::try_parse_from(["csq", "daemon", "start", "--supervised", "--background"]);
+
+            // Assert
+            assert!(
+                result.is_err(),
+                "--supervised and --background must conflict"
+            );
         }
     }
 

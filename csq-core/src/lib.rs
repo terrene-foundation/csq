@@ -1,4 +1,8 @@
 pub mod accounts;
+// Crate-internal `declare_all_enum!` macro (never cross-crate-exported — see
+// its own doc for why). Declared early so every module below can `use
+// crate::all_enum::declare_all_enum;`.
+mod all_enum;
 pub mod audit;
 pub mod capability_layer;
 pub mod cli_deps;

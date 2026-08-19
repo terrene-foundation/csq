@@ -31,11 +31,40 @@ import AccountList from "./AccountList.svelte";
 
 // Flush async effects: the component's $effect fires fetchAccounts
 // which awaits homeDir → join → invoke, then Svelte re-renders.
-// Two ticks suffice for a single invoke; AccountList also mutates
-// displayOrder inside the effect, adding a render cycle.
 async function settle() {
   for (let i = 0; i < 8; i++) await tick();
 }
+
+// Ordered slot ids as currently rendered — reads the `#N` id chip on
+// each account card, in DOM order, so ordering tests assert on the
+// actual rendered sequence rather than the underlying array.
+function cardIds(container: HTMLElement): number[] {
+  return Array.from(container.querySelectorAll(".account-id")).map((el) =>
+    Number(el.textContent?.replace("#", "").trim()),
+  );
+}
+
+// Minimal empty usage payload for BillingLedger, which self-fetches
+// get_account_usage for any balance/unknown quota_kind account.
+const EMPTY_USAGE = {
+  total_input_tokens: 0,
+  total_output_tokens: 0,
+  total_cost_usd: 0,
+  last_30d_input_tokens: 0,
+  last_30d_output_tokens: 0,
+  last_30d_cost_usd: 0,
+  last_7d_input_tokens: 0,
+  last_7d_output_tokens: 0,
+  last_7d_cost_usd: 0,
+  last_5d_input_tokens: 0,
+  last_5d_output_tokens: 0,
+  last_5d_cost_usd: 0,
+  today_input_tokens: 0,
+  today_output_tokens: 0,
+  today_cost_usd: 0,
+  event_count: 0,
+  unestimated_cost_count: 0,
+};
 
 // ── Fixtures ───────────────────────────────────────────────────────
 
@@ -150,6 +179,37 @@ describe("AccountList", () => {
     await settle();
     const bars = container.querySelectorAll(".usage-bars");
     expect(bars.length).toBe(2);
+  });
+
+  it("HIGH-1 (an internal ticket redteam): has_quota===false renders an honest pending state, not a bare 0% bar", async () => {
+    const freshAccount = {
+      ...ACCOUNT_1,
+      id: 21,
+      label: "Fresh",
+      has_quota: false,
+      five_hour_pct: 0,
+      seven_day_pct: 0,
+      five_hour_resets_in: null,
+      seven_day_resets_in: null,
+    };
+    setupMocks({ get_accounts: [freshAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    expect(container.querySelector(".usage-bars")).toBeNull();
+    const pending = container.querySelector(
+      '[data-testid="usage-bars-pending"]',
+    ) as HTMLElement | null;
+    expect(pending).not.toBeNull();
+    expect(pending?.textContent).toContain("Checking usage");
+  });
+
+  it("has_quota===true (or absent, for backward-compatible fixtures) still renders the ordinary bars", async () => {
+    const { container } = render(AccountList);
+    await settle();
+    expect(
+      container.querySelector('[data-testid="usage-bars-pending"]'),
+    ).toBeNull();
+    expect(container.querySelectorAll(".usage-bars").length).toBe(2);
   });
 
   it("shows reset time info", async () => {
@@ -463,7 +523,7 @@ describe("AccountList", () => {
   // ── PR-C8 surface badge ──────────────────────────────────────
 
   it("renders 'claude' surface badge for claude-code slots (universal badges, an internal ticket)", async () => {
-    // Pre-PR-#310, the badge hid for `claude-code` ("the default
+    // Pre-PR-an internal ticket, the badge hid for `claude-code` ("the default
     // doesn't need a tag"). an internal ticket dropped that exclusion so all
     // three CLIs (CLAUDE / CODEX / GEMINI) appear consistently. The
     // displayed text maps `claude-code` → `claude`.
@@ -548,6 +608,112 @@ describe("AccountList", () => {
     // Codex CSS class MUST NOT also be applied — the chip color is
     // distinct (Google blue vs OpenAI green).
     expect(badge?.classList.contains("surface-codex")).toBe(false);
+  });
+
+  // ── an internal journal entry C5 — native Kimi/Grok surface badges ────────
+
+  it("renders a KIMI surface badge for a native Kimi slot instead of falling through to unknown", async () => {
+    const kimiAccount = {
+      ...ACCOUNT_1,
+      id: 14,
+      label: "kimi-14",
+      source: "native",
+      surface: "kimi",
+      provider_id: null,
+    };
+    setupMocks({ get_accounts: [kimiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const badge = container.querySelector(
+      '[data-testid="surface-badge"]',
+    ) as HTMLElement | null;
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent?.trim()).toBe("kimi");
+    expect(badge?.classList.contains("surface-kimi")).toBe(true);
+    // Must NOT fall through to the "unrecognized state" chip — the
+    // pre-0135-C5 gap this test regresses.
+    expect(badge?.classList.contains("surface-unknown")).toBe(false);
+    // The identity label is still shown alongside the badge, not instead
+    // of it.
+    expect(container.textContent).toContain("kimi-14");
+  });
+
+  it("renders a GROK surface badge for a native Grok slot instead of falling through to unknown", async () => {
+    const grokAccount = {
+      ...ACCOUNT_1,
+      id: 15,
+      label: "grok-15",
+      source: "native",
+      surface: "grok",
+      provider_id: null,
+    };
+    setupMocks({ get_accounts: [grokAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    const badge = container.querySelector(
+      '[data-testid="surface-badge"]',
+    ) as HTMLElement | null;
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent?.trim()).toBe("grok");
+    expect(badge?.classList.contains("surface-grok")).toBe(true);
+    expect(badge?.classList.contains("surface-unknown")).toBe(false);
+    // Distinct chip color from Kimi's — the two native surfaces must not
+    // be visually confusable.
+    expect(badge?.classList.contains("surface-kimi")).toBe(false);
+  });
+
+  it("renders the vendor-managed subscription state for a native Grok slot, not the pay-per-token ledger", async () => {
+    // Grok has no dedicated poller (unlike Kimi, HIGH-1 an internal ticket) — it
+    // stays on the true "native" vendor-managed-subscription path.
+    const grokAccount = {
+      ...ACCOUNT_1,
+      id: 15,
+      label: "grok-15",
+      source: "native",
+      surface: "grok",
+      provider_id: null,
+      billing_mode: "subscription",
+      quota_kind: "native" as const,
+    };
+    setupMocks({ get_accounts: [grokAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    // The dedicated native subscription state renders...
+    const nativeQuota = container.querySelector(
+      '[data-testid="native-quota"]',
+    ) as HTMLElement | null;
+    expect(nativeQuota).not.toBeNull();
+    expect(nativeQuota?.textContent).toContain("Subscription");
+    // ...and the pay-per-token ledger ("$0 / 0 tokens") does NOT — the
+    // 0135 issue-3 symptom must be gone.
+    expect(container.textContent).not.toContain("0 tokens");
+  });
+
+  it("HIGH-1 (an internal ticket redteam) defense-in-depth: a Kimi slot tagged quota_kind='native' by a stale backend renders bars, not the subscription banner", async () => {
+    // A version-matched backend never sends quota_kind:"native" for a
+    // Kimi slot post-fix (Kimi IS polled — see commands/mod.rs's
+    // Surface::Kimi arm). This simulates the version-skew window where
+    // an OLD daemon/backend still tags a native Kimi slot "native" —
+    // the frontend carve-out must still surface real bars rather than
+    // stranding the slot behind the static subscription text.
+    const kimiAccount = {
+      ...ACCOUNT_1,
+      id: 14,
+      label: "kimi-14",
+      source: "native",
+      surface: "kimi",
+      provider_id: null,
+      billing_mode: "subscription",
+      quota_kind: "native" as const,
+      has_quota: true,
+      five_hour_pct: 34.0,
+      seven_day_pct: 12.0,
+    };
+    setupMocks({ get_accounts: [kimiAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    expect(container.querySelector('[data-testid="native-quota"]')).toBeNull();
+    expect(container.querySelector(".usage-bars")).not.toBeNull();
   });
 
   it("renders 'quota: n/a' for Gemini slot with no counter yet", async () => {
@@ -722,7 +888,7 @@ describe("AccountList", () => {
     expect(container.querySelector(".balance-row")).not.toBeNull();
     // With no recorded usage (event_count: 0) the balance card passes
     // hideWhenEmpty=true, so BillingLedger renders NOTHING — no empty padded
-    // wrapper below the balance row (redteam #984 L2).
+    // wrapper below the balance row (redteam an internal ticket L2).
     expect(
       container.querySelector('[data-testid="billing-ledger"]'),
     ).toBeNull();
@@ -774,7 +940,7 @@ describe("AccountList", () => {
     );
     expect(balanceEl).not.toBeNull();
     // Before the first /user/balance poll, show a checking state — NOT a bare
-    // "—" that reads as a failure (redteam #984 F4).
+    // "—" that reads as a failure (redteam an internal ticket F4).
     expect(balanceEl?.textContent?.trim()).toBe("checking…");
     // Usage bars still suppressed.
     expect(container.querySelector(".usage-bars")).toBeNull();
@@ -871,5 +1037,439 @@ describe("AccountList", () => {
 
     // Assert: no rename error element exists.
     expect(container.querySelector('[data-testid="rename-error"]')).toBeNull();
+  });
+
+  // ── Ordering (provider-grouped reset sort) ───────────────────
+  //
+  // Regresses the "custom filter is not re-ordering by slot #" bug: a
+  // second, localStorage-persisted ordering (`csq-card-order`) used to
+  // compete with slot number and win after a `csq move` renumbered a
+  // slot. There is now exactly one ordering source for "custom" (the
+  // slot id), and the 5h/7d modes group by provider identity before
+  // sorting by reset time within each group.
+
+  describe("Ordering (provider-grouped reset sort)", () => {
+    it("custom mode orders strictly by ascending slot id", async () => {
+      const scrambled = [
+        { ...ACCOUNT_1, id: 15, label: "fifteen" },
+        { ...ACCOUNT_1, id: 3, label: "three" },
+        { ...ACCOUNT_1, id: 9, label: "nine" },
+      ];
+      setupMocks({ get_accounts: scrambled });
+      const { container } = render(AccountList);
+      await settle();
+
+      // sortMode defaults to "custom" — no pill click needed.
+      expect(cardIds(container)).toEqual([3, 9, 15]);
+    });
+
+    it("provider grouping puts a balance-only account last even when its reset field is null", async () => {
+      const claudeNative = {
+        ...ACCOUNT_1,
+        id: 1,
+        label: "claude-native",
+        source: "anthropic",
+        surface: "claude-code" as const,
+        provider_id: null,
+        seven_day_pct: 10,
+        seven_day_resets_in: 100,
+      };
+      const zai = {
+        ...ACCOUNT_1,
+        id: 5,
+        label: "zai-5",
+        source: "third_party",
+        surface: "claude-code" as const,
+        provider_id: "zai",
+        seven_day_pct: 20,
+        seven_day_resets_in: 50,
+      };
+      const deepseek = {
+        ...ACCOUNT_1,
+        id: 11,
+        label: "deepseek-11",
+        source: "third_party",
+        surface: "claude-code" as const,
+        provider_id: "deepseek",
+        billing_mode: "api-key" as const,
+        quota_kind: "balance" as const,
+        balance_display: "$100.00",
+        five_hour_pct: 0,
+        five_hour_resets_in: null,
+        seven_day_pct: 0,
+        seven_day_resets_in: null,
+      };
+      // Fetch order deliberately does NOT match the expected display order —
+      // ordering must come from the sort, not fetch order.
+      setupMocks({
+        get_accounts: [deepseek, zai, claudeNative],
+        get_account_usage: EMPTY_USAGE,
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      const pills = container.querySelectorAll(".sort-pill");
+      await fireEvent.click(pills[2]); // "7d reset"
+      await settle();
+
+      // Claude native (group 1) sorts before Z.AI (group 5) even though
+      // Z.AI's reset time (50s) is sooner than Claude's (100s) — group
+      // beats reset time. DeepSeek (no window at all) sorts LAST
+      // regardless of both.
+      expect(cardIds(container)).toEqual([1, 5, 11]);
+    });
+
+    it("two Kimi accounts (native + 3P bearer) group together despite different surface/method", async () => {
+      const codex = {
+        ...ACCOUNT_1,
+        id: 2,
+        label: "codex-2",
+        source: "codex",
+        surface: "codex" as const,
+        provider_id: null,
+        seven_day_pct: 5,
+        seven_day_resets_in: 10,
+      };
+      const kimiNative = {
+        ...ACCOUNT_1,
+        id: 7,
+        label: "kimi-native-7",
+        source: "native",
+        surface: "kimi" as const,
+        provider_id: null,
+        seven_day_pct: 15,
+        seven_day_resets_in: 500,
+      };
+      const kimiBearer = {
+        ...ACCOUNT_1,
+        id: 8,
+        label: "kimi-bearer-8",
+        source: "third_party",
+        surface: "claude-code" as const,
+        provider_id: "kimi",
+        seven_day_pct: 25,
+        seven_day_resets_in: 200,
+      };
+      const grok = {
+        ...ACCOUNT_1,
+        id: 9,
+        label: "grok-9",
+        source: "native",
+        surface: "grok" as const,
+        provider_id: null,
+        seven_day_pct: 30,
+        seven_day_resets_in: 300,
+      };
+      setupMocks({
+        get_accounts: [grok, kimiBearer, codex, kimiNative],
+        get_account_usage: EMPTY_USAGE,
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      const pills = container.querySelectorAll(".sort-pill");
+      await fireEvent.click(pills[2]); // "7d reset"
+      await settle();
+
+      const ids = cardIds(container);
+      // Codex (group 2) first; the two Kimi accounts (group 3) form an
+      // unbroken adjacent block (bearer's 200s < native's 500s within
+      // the group); Grok (group 4) last.
+      expect(ids).toEqual([2, 8, 7, 9]);
+    });
+
+    it("group order is stable when reset times tie", async () => {
+      // Two Z.AI accounts, same group, identical 7d reset time — their
+      // relative order must be preserved from the source array (a
+      // stable sort), not shuffled by the comparator.
+      const zaiA = {
+        ...ACCOUNT_1,
+        id: 20,
+        label: "zai-a",
+        source: "third_party",
+        surface: "claude-code" as const,
+        provider_id: "zai",
+        seven_day_pct: 10,
+        seven_day_resets_in: 400,
+      };
+      const zaiB = {
+        ...ACCOUNT_1,
+        id: 21,
+        label: "zai-b",
+        source: "third_party",
+        surface: "claude-code" as const,
+        provider_id: "zai",
+        seven_day_pct: 10,
+        seven_day_resets_in: 400,
+      };
+      setupMocks({ get_accounts: [zaiA, zaiB] });
+      const { container } = render(AccountList);
+      await settle();
+
+      const pills = container.querySelectorAll(".sort-pill");
+      await fireEvent.click(pills[2]); // "7d reset"
+      await settle();
+
+      expect(cardIds(container)).toEqual([20, 21]);
+    });
+  });
+
+  // ── F1 — quota staleness ─────────────────────────────────────
+  //
+  // STALE_THRESHOLD_SECS is 3600s, reused verbatim from
+  // `csq-core/src/quota/status.rs`. Both boundary tests use a 30s
+  // margin either side of the threshold (not the literal 3600/3601
+  // second) so the assertion is robust to the few ms of real wall-clock
+  // that elapse between building the fixture's `updated_at` and the
+  // component's `nowSecs` snapshot at mount — still an unambiguous
+  // non-vacuous check of both sides of the boundary.
+
+  describe("Quota staleness (F1)", () => {
+    it("an updated_at past the threshold dims the bars and labels the card explicitly stale", async () => {
+      const nowSecs = Math.floor(Date.now() / 1000);
+      const staleAccount = {
+        ...ACCOUNT_1,
+        id: 30,
+        label: "Stale-30",
+        updated_at: nowSecs - 3630, // 30s past 3600s — unambiguously stale
+      };
+      setupMocks({ get_accounts: [staleAccount] });
+      const { container } = render(AccountList);
+      await settle();
+
+      const label = container.querySelector(
+        '[data-testid="quota-stale-label"]',
+      );
+      expect(label).not.toBeNull();
+      expect(label?.textContent).toContain("stale");
+      // Both the 5h and 7d bars are dimmed via UsageBar's `stale` prop.
+      expect(
+        container.querySelectorAll('[data-testid="usage-bar-stale"]').length,
+      ).toBe(2);
+    });
+
+    it("an updated_at within the threshold does NOT mark the card stale", async () => {
+      const nowSecs = Math.floor(Date.now() / 1000);
+      const freshAccount = {
+        ...ACCOUNT_1,
+        id: 31,
+        label: "Fresh-31",
+        updated_at: nowSecs - 3570, // 30s inside 3600s — unambiguously fresh
+      };
+      setupMocks({ get_accounts: [freshAccount] });
+      const { container } = render(AccountList);
+      await settle();
+
+      expect(
+        container.querySelector('[data-testid="quota-stale-label"]'),
+      ).toBeNull();
+      expect(
+        container.querySelectorAll('[data-testid="usage-bar-stale"]').length,
+      ).toBe(0);
+    });
+
+    it("has_quota===false is never marked stale, even with the wire-format default updated_at:0", async () => {
+      // Guards the NeverPolled distinction (status.rs `PollFreshness`):
+      // a slot with no quota row yet renders the existing "Checking
+      // usage..." idiom, not the stale marker — updated_at:0 must not
+      // be read as "polled billions of seconds ago".
+      const neverPolled = {
+        ...ACCOUNT_1,
+        id: 32,
+        label: "NeverPolled-32",
+        has_quota: false,
+        updated_at: 0,
+        five_hour_pct: 0,
+        seven_day_pct: 0,
+        five_hour_resets_in: null,
+        seven_day_resets_in: null,
+      };
+      setupMocks({ get_accounts: [neverPolled] });
+      const { container } = render(AccountList);
+      await settle();
+
+      expect(
+        container.querySelector('[data-testid="quota-stale-label"]'),
+      ).toBeNull();
+      expect(
+        container.querySelector('[data-testid="usage-bars-pending"]'),
+      ).not.toBeNull();
+    });
+  });
+
+  // ── F2 — non-destructive poll failure + inline errors ────────
+
+  describe("Non-destructive poll failure + inline errors (F2)", () => {
+    it("a poll rejection after a successful load leaves the list rendered and shows a banner", async () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = render(AccountList);
+        await vi.advanceTimersByTimeAsync(0);
+        await settle();
+        // Initial load succeeded.
+        expect(container.querySelectorAll(".account-card").length).toBe(2);
+        expect(
+          container.querySelector('[data-testid="poll-error-banner"]'),
+        ).toBeNull();
+
+        // The NEXT 5s poll tick fails (e.g. the daemon stopped).
+        mockInvoke.mockImplementation((cmd: string) => {
+          if (cmd === "get_accounts") {
+            return Promise.reject(new Error("daemon unreachable"));
+          }
+          return Promise.resolve(mockResponses[cmd]);
+        });
+        await vi.advanceTimersByTimeAsync(5000);
+        await settle();
+
+        // Non-destructive: banner shown, cards STILL rendered, no
+        // full-page blanking `.error` replacement.
+        const banner = container.querySelector(
+          '[data-testid="poll-error-banner"]',
+        );
+        expect(banner).not.toBeNull();
+        expect(banner?.textContent).toContain("last known values");
+        expect(container.querySelectorAll(".account-card").length).toBe(2);
+        expect(container.querySelector(".error")).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a poll rejection on the very FIRST load (nothing cached yet) still shows the full-page error", async () => {
+      // No list exists to preserve — this is the one case that still
+      // replaces the whole view, per the template's `pollError &&
+      // accounts.length === 0` branch.
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === "get_accounts") {
+          return Promise.reject(new Error("network error"));
+        }
+        return Promise.resolve(mockResponses[cmd]);
+      });
+      const { container } = render(AccountList);
+      await settle();
+      expect(container.textContent).toContain("network error");
+      expect(container.querySelector(".account-card")).toBeNull();
+    });
+
+    it("a remove failure renders inline on the affected card without blanking the list", async () => {
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === "remove_account") {
+          // Tauri's `invoke` rejects with the RAW string a
+          // `Result<T, String>` command returns (no `Error` wrapper) —
+          // reject with a bare string here so `raw.startsWith(...)`'s
+          // ACCOUNT_IN_USE branch actually fires, the same as production.
+          return Promise.reject("ACCOUNT_IN_USE: pid 123");
+        }
+        return Promise.resolve(mockResponses[cmd]);
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      const removeBtns = container.querySelectorAll(".remove-btn");
+      await fireEvent.click(removeBtns[0]); // arm
+      await tick();
+      await fireEvent.click(removeBtns[0]); // confirm -> remove_account rejects
+      await settle();
+
+      const inlineErr = container.querySelector('[data-testid="remove-error"]');
+      expect(inlineErr).not.toBeNull();
+      expect(inlineErr?.textContent).toContain("still running");
+
+      // Both cards remain — the failure is scoped to account #1's card,
+      // and no global `.error` replacement occurred.
+      expect(container.querySelectorAll(".account-card").length).toBe(2);
+      expect(container.querySelector(".error")).toBeNull();
+    });
+
+    it("a move failure renders inline inside the still-open picker without blanking the list", async () => {
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === "move_account") {
+          // Bare string reject (matches real Tauri `Result<T, String>`
+          // semantics — no `Error` wrapper) so `raw.startsWith(...)`'s
+          // TARGET_EXISTS branch actually fires.
+          return Promise.reject("TARGET_EXISTS: slot 4 already configured");
+        }
+        return Promise.resolve(mockResponses[cmd]);
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      const renumberBtns = container.querySelectorAll(
+        '[data-testid="renumber-btn"]',
+      );
+      await fireEvent.click(renumberBtns[0]);
+      await tick();
+      const select = container.querySelector(
+        '[data-testid="renumber-target"]',
+      ) as HTMLSelectElement;
+      select.value = "4";
+      await fireEvent.change(select);
+      await tick();
+      const confirm = container.querySelector(
+        '[data-testid="renumber-confirm"]',
+      ) as HTMLButtonElement;
+      await fireEvent.click(confirm);
+      await settle();
+
+      // Picker stays OPEN on failure (unlike the success path).
+      expect(
+        container.querySelector('[data-testid="renumber-picker"]'),
+      ).not.toBeNull();
+      const inlineErr = container.querySelector('[data-testid="move-error"]');
+      expect(inlineErr).not.toBeNull();
+      expect(inlineErr?.textContent).toContain("already configured");
+      expect(container.querySelectorAll(".account-card").length).toBe(2);
+      expect(container.querySelector(".error")).toBeNull();
+    });
+  });
+
+  // ── F5 — keyboard access to card controls ─────────────────────
+
+  describe("Keyboard access (F5)", () => {
+    it("card-controls become visible when a control inside them receives focus", async () => {
+      const { container } = render(AccountList);
+      await settle();
+
+      const card = container.querySelector(".account-card") as HTMLElement;
+      const controls = card.querySelector(".card-controls") as HTMLElement;
+      const renumberBtn = controls.querySelector(
+        '[data-testid="renumber-btn"]',
+      ) as HTMLElement;
+
+      // jsdom applies :focus-within based on actual focus, so this
+      // exercises the same CSS the browser would.
+      renumberBtn.focus();
+      expect(document.activeElement).toBe(renumberBtn);
+      // getComputedStyle in jsdom does not resolve :focus-within
+      // cascades from a <style> block, so assert the structural
+      // precondition instead: the button that must trigger the reveal
+      // is actually focusable and focused.
+      expect(controls.contains(document.activeElement)).toBe(true);
+    });
+
+    it("Enter on the account label opens the rename input, matching double-click", async () => {
+      const { container } = render(AccountList);
+      await settle();
+
+      const label = container.querySelector(".account-label") as HTMLElement;
+      await fireEvent.keyDown(label, { key: "Enter" });
+      await tick();
+
+      expect(container.querySelector(".rename-input")).not.toBeNull();
+    });
+
+    it("Space on the account label opens the rename input and does not scroll the page", async () => {
+      const { container } = render(AccountList);
+      await settle();
+
+      const label = container.querySelector(".account-label") as HTMLElement;
+      const event = await fireEvent.keyDown(label, { key: " " });
+      // fireEvent returns false when preventDefault() was called.
+      expect(event).toBe(false);
+      await tick();
+
+      expect(container.querySelector(".rename-input")).not.toBeNull();
+    });
   });
 });

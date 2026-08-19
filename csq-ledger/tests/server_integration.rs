@@ -41,20 +41,27 @@ fn test_client() -> reqwest::blocking::Client {
         .expect("build test client")
 }
 
-/// A spawned ledger server child + its base URL.
+/// A spawned ledger server child + its base URLs. `base_url` is the
+/// read/write listener; `authority_base_url` is the separate authority
+/// listener (H3) — both must be given DISTINCT ephemeral ports, since the
+/// binary's own `--authority-port` default (8081) would otherwise collide
+/// across the multiple `LedgerServer` instances `cargo test` spawns
+/// concurrently in this file.
 struct LedgerServer {
     child: Child,
     base_url: String,
-    #[allow(dead_code)]
+    authority_base_url: String,
     data_dir: TempDir,
 }
 
 impl LedgerServer {
-    /// Spawns the binary against a fresh tempdir + ephemeral port, waiting for
-    /// `/v1/health` to answer. `extra_args` appends anchor flags when needed.
+    /// Spawns the binary against a fresh tempdir and two ephemeral ports (one
+    /// read, one authority), waiting for `/v1/health` to answer. `extra_args`
+    /// appends anchor flags when needed.
     fn spawn(extra_args: &[&str]) -> Self {
         let data_dir = TempDir::new().unwrap();
         let port = free_port();
+        let authority_port = free_port();
         let mut cmd = clean_command();
         cmd.arg("--data-dir")
             .arg(data_dir.path())
@@ -62,14 +69,20 @@ impl LedgerServer {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
+            .arg("--authority-bind")
+            .arg("127.0.0.1")
+            .arg("--authority-port")
+            .arg(authority_port.to_string())
             .args(extra_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = cmd.spawn().expect("spawn csq-ledger");
         let base_url = format!("http://127.0.0.1:{port}");
+        let authority_base_url = format!("http://127.0.0.1:{authority_port}");
         let server = Self {
             child,
             base_url,
+            authority_base_url,
             data_dir,
         };
         server.wait_for_health();
@@ -92,6 +105,16 @@ impl LedgerServer {
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Builds a URL against the AUTHORITY listener (revoke, verifier-bootstraps).
+    fn authority_url(&self, path: &str) -> String {
+        format!("{}{}", self.authority_base_url, path)
+    }
+
+    /// The server's data directory (for inspecting on-disk artifacts).
+    fn data_dir_path(&self) -> &std::path::Path {
+        self.data_dir.path()
     }
 }
 
@@ -247,6 +270,7 @@ fn csq_ledger_record_durable_before_200() {
     let acked_ids: Vec<String> = {
         let mut ids = Vec::new();
         let port = free_port();
+        let authority_port = free_port();
         let mut child = clean_command()
             .arg("--data-dir")
             .arg(data_dir.path())
@@ -254,6 +278,10 @@ fn csq_ledger_record_durable_before_200() {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
+            .arg("--authority-bind")
+            .arg("127.0.0.1")
+            .arg("--authority-port")
+            .arg(authority_port.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -289,6 +317,7 @@ fn csq_ledger_record_durable_before_200() {
 
     // Phase 2: restart against the SAME data dir, assert all acked records present.
     let port = free_port();
+    let authority_port = free_port();
     let mut child = clean_command()
         .arg("--data-dir")
         .arg(data_dir.path())
@@ -296,6 +325,10 @@ fn csq_ledger_record_durable_before_200() {
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
+        .arg("--authority-bind")
+        .arg("127.0.0.1")
+        .arg("--authority-port")
+        .arg(authority_port.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -380,6 +413,13 @@ fn csq_ledger_anchor_to_sink_populates_checkpoint_anchored_to_field() {
 fn csq_ledger_first_boot_auto_generates_key_and_warns() {
     let data_dir = TempDir::new().unwrap();
     let port = free_port();
+    // The authority listener (H3) must ALSO get an ephemeral port: the
+    // binary's own `--authority-port` default (8081) is not guaranteed free
+    // on a shared host, and a failed authority bind aborts startup before the
+    // read/write listener (already successfully bound) ever starts serving —
+    // this test would then see every `/v1/health` poll refused, not a
+    // meaningful health-check failure.
+    let authority_port = free_port();
     let mut child = clean_command()
         .arg("--data-dir")
         .arg(data_dir.path())
@@ -387,6 +427,10 @@ fn csq_ledger_first_boot_auto_generates_key_and_warns() {
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
+        .arg("--authority-bind")
+        .arg("127.0.0.1")
+        .arg("--authority-port")
+        .arg(authority_port.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -431,6 +475,7 @@ fn csq_ledger_first_boot_auto_generates_key_and_warns() {
 
     // Restart WITH the env var set → WARN cleared.
     let port2 = free_port();
+    let authority_port2 = free_port();
     let mut child2 = clean_command()
         .env("CSQ_LEDGER_SIGNING_KEY_PATH", &key_path)
         .arg("--data-dir")
@@ -439,6 +484,10 @@ fn csq_ledger_first_boot_auto_generates_key_and_warns() {
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port2.to_string())
+        .arg("--authority-bind")
+        .arg("127.0.0.1")
+        .arg("--authority-port")
+        .arg(authority_port2.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -549,7 +598,7 @@ fn csq_ledger_unknown_record_returns_404() {
 /// This replacement is in-process (`#[tokio::test]`) with zero timing
 /// dependence:
 ///
-/// 1. Build `AppState` + `build_router` from the crate's lib API (TempDir-backed
+/// 1. Build `AppState` + `build_read_router` from the crate's lib API (TempDir-backed
 ///    store, auto-generated signing key, no anchor).
 /// 2. **Acquire ALL `MAX_INFLIGHT_SUBMITS` permits upfront and hold them.**
 ///    `state.submit_limit.available_permits() == 0` is now a structural fact,
@@ -569,7 +618,7 @@ fn csq_ledger_unknown_record_returns_404() {
 async fn csq_ledger_overload_sheds_503_not_crash() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use csq_ledger::server::{build_router, AppState, MAX_INFLIGHT_SUBMITS};
+    use csq_ledger::server::{build_read_router, AppState, MAX_INFLIGHT_SUBMITS};
     use csq_ledger::signing::ServerSigningKey;
     use csq_ledger::storage::LedgerStore;
     use std::sync::Arc;
@@ -577,10 +626,10 @@ async fn csq_ledger_overload_sheds_503_not_crash() {
 
     // ── Step 1: build in-process AppState + router ───────────────────────────
     let dir = TempDir::new().unwrap();
-    let store = LedgerStore::open(dir.path()).unwrap();
     let signing_key = ServerSigningKey::load_or_generate(dir.path(), None).unwrap();
+    let store = LedgerStore::open_with_authority(dir.path(), signing_key.key_id()).unwrap();
     let state = Arc::new(AppState::new(store, signing_key, None));
-    let router = build_router(Arc::clone(&state));
+    let router = build_read_router(Arc::clone(&state));
 
     // ── Step 2: pre-exhaust the semaphore — zero permits remain ──────────────
     // `try_acquire_many_owned` on the Arc clone is Send + 'static so the guard
@@ -660,5 +709,168 @@ async fn csq_ledger_overload_sheds_503_not_crash() {
         ok_resp.status(),
         StatusCode::OK,
         "post-release submit must return 200 OK (server not permanently wedged)"
+    );
+}
+
+/// `test csq_ledger_authority_routes_are_not_reachable_on_read_listener`
+///
+/// H3: revoke and verifier-bootstrap redemption are served ONLY by the
+/// dedicated authority listener/router. The read/write listener's router
+/// never registers those routes at all, so a POST to them there gets axum's
+/// "no matching route" 404 — a structural absence, not a runtime auth check.
+/// The identical request against the authority listener succeeds.
+#[test]
+fn csq_ledger_authority_routes_are_not_reachable_on_read_listener() {
+    let server = LedgerServer::spawn(&[]);
+    let client = test_client();
+
+    let id = ulid_for(900);
+    let (status, _) = post_json(
+        &client,
+        &server.url("/v1/log/entries"),
+        &record_json(&id, "authority-split-run"),
+    );
+    assert_eq!(status, 200, "submit should succeed on the read listener");
+
+    // Revoke does not exist on the READ listener.
+    let revoke_path = format!("/v1/log/entries/{id}/revoke?tenant_id=tenant-split");
+    let resp = client
+        .post(server.url(&revoke_path))
+        .send()
+        .expect("post revoke to read listener");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "revoke must not be reachable on the read/write listener (H3)"
+    );
+
+    // Verifier-bootstrap redemption likewise does not exist on the READ listener.
+    let resp = client
+        .post(server.url("/v1/log/verifier-bootstraps/verifier-split"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&serde_json::json!({ "challenge": "a".repeat(64) })).unwrap())
+        .send()
+        .expect("post bootstrap to read listener");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "verifier-bootstrap redemption must not be reachable on the read/write listener (H3)"
+    );
+
+    // The SAME revoke request against the AUTHORITY listener succeeds.
+    let resp = client
+        .post(server.authority_url(&revoke_path))
+        .send()
+        .expect("post revoke to authority listener");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "revoke must succeed on the dedicated authority listener"
+    );
+}
+
+/// `test csq_ledger_revoke_is_idempotent_on_replay`
+///
+/// L3: replaying a revoke for an already-revoked `(anchor_id, tenant_id)`
+/// pair must return the IDENTICAL previously-issued revocation fact — same
+/// version, same signature — rather than allocating a fresh authority
+/// version and appending a new durable line for a fact that was already
+/// true after the first call.
+#[test]
+fn csq_ledger_revoke_is_idempotent_on_replay() {
+    let server = LedgerServer::spawn(&[]);
+    let client = test_client();
+
+    let id = ulid_for(901);
+    let (status, _) = post_json(
+        &client,
+        &server.url("/v1/log/entries"),
+        &record_json(&id, "idempotent-revoke-run"),
+    );
+    assert_eq!(status, 200);
+
+    let revoke_url = server.authority_url(&format!(
+        "/v1/log/entries/{id}/revoke?tenant_id=tenant-idem"
+    ));
+
+    let first_resp = client.post(&revoke_url).send().expect("first revoke");
+    assert_eq!(first_resp.status().as_u16(), 200);
+    let first: Value = serde_json::from_str(&first_resp.text().unwrap()).unwrap();
+    let first_version = first["version"]
+        .as_u64()
+        .expect("revocation carries a version");
+
+    let second_resp = client.post(&revoke_url).send().expect("replayed revoke");
+    assert_eq!(
+        second_resp.status().as_u16(),
+        200,
+        "a replayed revoke must still succeed, not error"
+    );
+    let second: Value = serde_json::from_str(&second_resp.text().unwrap()).unwrap();
+    assert_eq!(
+        second, first,
+        "a replayed revoke returns the IDENTICAL revocation fact (L3), not a new one"
+    );
+    assert_eq!(
+        second["version"].as_u64().unwrap(),
+        first_version,
+        "a replayed revoke must NOT allocate a new authority version"
+    );
+}
+
+/// `test csq_ledger_get_verdict_does_not_grow_a_durable_verdicts_file`
+///
+/// H2: an unauthenticated `GET .../entries/{id}?tenant_id=<anything>` — no
+/// prior relationship required — must NOT perform a durable, growing,
+/// fsync'd append per request. Before the fix, each call appended a full
+/// signed-verdict line to `anchor-verdicts.jsonl`, so polling this read route
+/// alone could grow that file without bound. After the fix, that legacy file
+/// is never created by a fresh deployment; only a small `anchor-verdict-version`
+/// counter marker is written, and its SIZE does not grow with request count
+/// (it holds one small decimal integer, overwritten in place each time).
+#[test]
+fn csq_ledger_get_verdict_does_not_grow_a_durable_verdicts_file() {
+    let server = LedgerServer::spawn(&[]);
+    let client = test_client();
+
+    let id = ulid_for(902);
+    let (status, _) = post_json(
+        &client,
+        &server.url("/v1/log/entries"),
+        &record_json(&id, "h2-no-append-run"),
+    );
+    assert_eq!(status, 200);
+
+    let verdicts_path = server.data_dir_path().join("anchor-verdicts.jsonl");
+    let marker_path = server.data_dir_path().join("anchor-verdict-version");
+
+    // Issue verdicts for many distinct tenants — the unauthenticated,
+    // unbounded axis H2 closes (any string passes `validate_tenant_id`).
+    let mut marker_sizes = Vec::new();
+    for i in 0..20 {
+        let (status, _) = get_json(
+            &client,
+            &server.url(&format!("/v1/log/entries/{id}?tenant_id=tenant-h2-{i}")),
+        );
+        assert_eq!(status, 200);
+        assert!(
+            !verdicts_path.exists(),
+            "H2: issuing a verdict must never create the legacy per-verdict jsonl file"
+        );
+        let marker_len = std::fs::metadata(&marker_path)
+            .expect("counter marker must exist after the first issued verdict")
+            .len();
+        marker_sizes.push(marker_len);
+    }
+
+    // The marker is a small, bounded, overwritten counter — NOT a growing
+    // log. 20 requests must not have made it meaningfully larger (a growing
+    // per-line JSONL log would instead be several hundred bytes PER request).
+    let first = marker_sizes[0];
+    let last = *marker_sizes.last().unwrap();
+    assert!(
+        last <= first + 2,
+        "marker size must stay ~constant across many issued verdicts \
+         (first={first} bytes, last={last} bytes) — it is a counter, not a log"
     );
 }

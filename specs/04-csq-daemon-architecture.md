@@ -1,6 +1,6 @@
 # 04 csq Daemon Architecture
 
-Spec version: 1.10.0 | Status: DRAFT | Governs: daemon subsystems, IPC surface, refresh logic, sweep, supervisor
+Spec version: 1.14.0 | Status: DRAFT | Governs: daemon subsystems, IPC surface, refresh logic, sweep, supervisor
 
 ---
 
@@ -10,12 +10,15 @@ This spec defines csq's long-running daemon: what subsystems it hosts, how they 
 
 ## 4.1 Process model
 
-The daemon is a tokio runtime embedded in one of two process hosts:
+The daemon is a tokio runtime that runs in one of three process hosts:
 
-- **Desktop app**: the `csq` desktop build (Tauri) starts the daemon in-process on launch. This is the canonical path on macOS for users running the Tauri UI.
-- **Standalone**: `csq daemon start` launches the daemon as a detached process. Used on headless Linux servers and for debugging.
+- **Managed background daemon (canonical on macOS).** `csq daemon start --supervised`, launched by a launchd LaunchAgent (`~/Library/LaunchAgents/foundation.terrene.csq.plist`) with `RunAtLoad=true`, `KeepAlive={SuccessfulExit:false}`, and `ThrottleInterval=10`. It survives the desktop app quitting or crashing and OS restarts, so the token refresher stays live regardless of the UI. The desktop app installs/repairs the plist on every launch (`ensure_managed_daemon_plist` in `csq/src/cli/commands/daemon.rs`), as does `csq daemon install`. `ProgramArguments[0]` is the persistent CLI shim (`resolve_managed_daemon_exe` → the running exe if outside a bundle, else `~/.local/bin/csq`), NEVER the app bundle binary — `mode::detect` (`csq/src/mode.rs`) would misread a `Contents/MacOS/` path as Desktop mode and launch the whole app instead of the daemon.
+- **Desktop in-process supervisor.** The Tauri app also hosts the daemon in-process (`csq/src/desktop/daemon_supervisor.rs`) — a cohabiting backup covering the window before the managed daemon loads. It defers to the managed daemon via the PidFile lock.
+- **Standalone foreground / background.** `csq daemon start` blocks the terminal; `-d`/`--background` re-execs detached. Used for debugging and on headless Linux, where a systemd user unit (`csq daemon install`) provides the KeepAlive-equivalent auto-restart.
 
-Only one daemon runs per user at a time. The Unix socket at `$base_dir/csq.sock` serves as both IPC and lockfile: binding the socket fails if another daemon is already running. The first process to bind wins; losers check socket liveness and either defer or take over if the existing daemon is dead.
+Only one daemon runs per user at a time, enforced by a **kernel-atomic advisory lock**: `PidFile::acquire` (`csq-core/src/daemon/pid.rs`) holds an exclusive `flock` (Unix) / named kernel mutex (Windows, via `csq-core/src/platform/lock.rs`) on a sibling `<pidfile>.lock` for the daemon's whole lifetime, released automatically on process death. A second daemon that loses the lock reports `DaemonError::AlreadyRunning` and (under the supervisor loop) backs off. The Unix socket at `$base_dir/csq.sock` is the IPC transport.
+
+All three hosts drive the same supervisor loop, `csq_core::daemon::supervise::run_forever(base, cancel, run_session)`.
 
 See `csq/src/desktop/daemon_supervisor.rs` for the takeover/defer state machine.
 
@@ -350,20 +353,25 @@ grep -n 'verify_chain\|daemon::serve\|UnixListener::bind' \
 
 ## 4.3 Supervisor
 
-The daemon supervisor (`csq/src/desktop/daemon_supervisor.rs`) handles:
+The supervisor loop `csq_core::daemon::supervise::run_forever` (shared by all three § 4.1 hosts) handles:
 
-- Takeover from stale daemons (PID dead but socket file present).
-- Graceful shutdown on app quit.
-- **Subsystem-level panic recovery:** each subsystem runs in a `tokio::spawn`ed task; the supervisor holds JoinHandles and on panic respawns with exponential backoff. Logs backtraces via the `tracing` subsystem.
+- **Detect → acquire → run → backoff.** Each iteration detects the current daemon (`detect_daemon`), defers to a healthy/unhealthy external daemon, cleans up a stale one, then acquires the PidFile lock and runs ONE session (`run_session`) until cancellation.
+- **Exponential backoff (1s → 60s).** Resets to 1s after a CLEAN session exit (ran, then cancelled); grows on a fast session failure (e.g. a socket-bind error) so a persistent failure is a slow poll, not a hot loop. `run_session` returns `Err(String)` on a startup failure; `Ok(())` on a cancellation-driven clean stop.
+- **Two-layer restart.** launchd `KeepAlive={SuccessfulExit:false}` is the OUTER layer — it respawns the whole process on a hard crash (non-zero exit), and leaves a clean `csq daemon stop` (SIGTERM → drain → exit 0) stopped. The in-process `run_forever` backoff is the INNER layer — it restarts a session that fails at startup without a full process respawn.
+- **Subsystem-death detection (session-boundary restart).** Each session body collects its long-lived subsystems (refresher, usage poller, auto-rotator, sweeps, ledger writer, log GC) into a uniform set and blocks on `supervise::await_session_stop(&cancel, &mut subsystems)`, which races `cancel` against the first subsystem exit. A subsystem that panics or returns early while the session is still meant to be running resolves as `SessionStop::SubsystemExited(name)`: the session cancels a CHILD shutdown token to drain the siblings (WITHOUT firing the supervisor's `cancel`, so this is a restart not a stop), then returns `Err(String)` → `run_forever` restarts the session with backoff. A graceful `cancel` resolves as `SessionStop::Cancelled` → clean drain, `Ok(())`. The restart is at the SESSION boundary (the whole session is re-run), not an in-place per-subsystem respawn; the subsystems' shutdown token is a `cancel.child_token()`. Shared helper `csq_core::daemon::supervise::{Subsystem, SessionStop, await_session_stop, drain_subsystems}`. The IPC server (`server_join`) is ALSO a monitored member (an internal ticket): a panicked accept loop resolves as `SessionStop::SubsystemExited("ipc_server")` → restart, so a dead IPC socket is no longer invisible until graceful shutdown. It exits on its own `server.shutdown()` token (fired before `drain_subsystems`), so its handle completes inside the single drain loop — no separate drain that would double-poll it.
+- **Cohabitation.** The desktop in-process supervisor and the managed launchd daemon both drive `run_forever`; the PidFile lock guarantees exactly one owns the daemon, the other observes and takes over on the owner's exit.
+- **Twin parity (INVARIANT).** The two session bodies — `csq/src/cli/commands/daemon.rs::run_daemon_session` and `csq/src/desktop/daemon_supervisor.rs::run_daemon` — MUST supervise the IDENTICAL set of subsystems. They are mutually exclusive at runtime (one PidFile, one socket), so a subsystem wired into only one twin does NOT get covered by the other: it simply never runs for whichever launch mode omits it, with no error, no log line, and no failing test. Enforced fail-closed in CI by `scripts/check-daemon-twin-parity.py`, which compares the two `Vec<daemon::supervise::Subsystem>` label sets; a genuinely one-sided subsystem must be declared in that script's `INTENTIONAL_DIFFERENCES` map with a comment naming the structural reason.
 
 ## 4.4 Shutdown
 
-On receipt of SIGTERM (standalone) or desktop app quit (embedded):
+On receipt of SIGTERM (standalone) or desktop app quit (embedded) — the `SessionStop::Cancelled` path:
 
-1. Supervisor signals `CancellationToken` to every subsystem.
-2. Each subsystem drains in-flight work (refresh, poll, sweep) with a 5-second deadline.
+1. Supervisor signals `CancellationToken` to every subsystem (the child shutdown token cancels when the supervisor's `cancel` fires).
+2. Each subsystem drains in-flight work (refresh, poll, sweep) with a 5-second per-handle deadline (`supervise::drain_subsystems`).
 3. Supervisor releases the PidFile and unbinds the Unix socket.
 4. Process exits.
+
+On a mid-session subsystem exit (the `SessionStop::SubsystemExited` path, § 4.3) the same drain runs — the session cancels the child shutdown token, drains the surviving subsystems and the server, then returns `Err` so `run_forever` restarts the session with backoff instead of exiting.
 
 ## 4.5 Cross-references
 
@@ -375,4 +383,8 @@ On receipt of SIGTERM (standalone) or desktop app quit (embedded):
 
 ## Revisions
 
-Spec version 1.10.0. This document describes the daemon as it ships in the current community edition.
+Spec version 1.14.0. This document describes the daemon as it ships in the current community edition.
+
+- 2026-07-25 — 1.14.0 — Daemon-twin parity: §4.3 NEW "Twin parity (INVARIANT)" bullet — the CLI and desktop session bodies MUST supervise the identical subsystem set, enforced fail-closed in CI by `scripts/check-daemon-twin-parity.py`. Fixed in code: `coc_cache_sweeper` (§4.2.6) was supervised by the CLI twin only, so a user whose sole daemon host is the desktop app GC'd zero parse caches and `csq doctor --json::cache_sweeper` reported `never_run` indefinitely — §4.2.6 describes no such carve-out. The desktop twin also resolved `claude_home` without honoring the `$CLAUDE_HOME` override the CLI twin honors, pointing the auto-rotator / handle-dir sweep / usage-ledger writer at the wrong tree for operators who set it.
+- 2026-07-25 — 1.13.0 — IPC server (`server_join`) added to the subsystem death-watch (an internal ticket): a panicked accept loop → `SessionStop::SubsystemExited("ipc_server")` → session restart, instead of a dead IPC socket lingering invisibly until graceful shutdown. Separate `server_join` drain removed (would double-poll; `server.shutdown()` fires before the single `drain_subsystems`). §4.3 updated.
+- 2026-07-25 — 1.12.0 — Subsystem-death detection (session-boundary restart): §4.3 NEW bullet + §4.4 `SessionStop::SubsystemExited` drain path. Each session now blocks on `supervise::await_session_stop` and restarts the session when a subsystem panics/exits mid-session, instead of leaving a dead refresher invisible until the next full restart. Shared helper `csq_core::daemon::supervise::{Subsystem, SessionStop, await_session_stop, drain_subsystems}` (community-shipped).

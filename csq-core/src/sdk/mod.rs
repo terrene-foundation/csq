@@ -19,9 +19,13 @@ pub mod verify;
 
 // The wire contract — re-exported verbatim from the public `csq-sdk` crate.
 pub use csq_sdk::{
-    emit, parse_claude_json, CapabilitiesPayload, Completion, Envelope, FinishReason, SdkError,
-    SdkErrorCode, Usage, VerifyFailureDetail, VerifyKeyGap, VerifyPayload, SCHEMA_ANCHOR_V1,
-    SCHEMA_CAPABILITIES_V1, SCHEMA_EVAL_V1, SCHEMA_EXEC_V1, SCHEMA_VERIFY_V1,
+    emit, parse_claude_json, CapabilitiesPayload, Completion, Envelope, ExecFeatures, Features,
+    FinishReason, LoginFlow, ProviderLogin, ProviderSummary, SdkCapability, SdkError, SdkErrorCode,
+    SdkSurface, ToolInfo, Usage, VerifyFailureDetail, VerifyKeyGap, VerifyPayload, CRATE_VERSION,
+    SCHEMA_ANCHOR_V1, SCHEMA_AUTHORING_DISTILL_V1, SCHEMA_AUTHORING_INTENT_V1,
+    SCHEMA_AUTHORING_MEMORY_V1, SCHEMA_AUTHORING_SESSION_V1, SCHEMA_CAPABILITIES_V1,
+    SCHEMA_EVAL_V1, SCHEMA_EXEC_V1, SCHEMA_LISTKEYS_V1, SCHEMA_LOGIN_V1, SCHEMA_MODELS_V1,
+    SCHEMA_STATUS_V1, SCHEMA_VERIFY_V1,
 };
 
 // The app-side verify builder (maps the internal chain-verify result → the DTO).

@@ -217,7 +217,7 @@ describe("InteractiveConsole", () => {
     expect(get(container, "block-reason")).toBeNull();
   });
 
-  it("renders the account picker when ≥2 subscription accounts exist (#793 §FD1)", async () => {
+  it("renders the account picker when ≥2 subscription accounts exist (an internal ticket §FD1)", async () => {
     routeByCommand({
       interactive_options: {
         provider: "claude",
@@ -320,7 +320,7 @@ describe("InteractiveConsole", () => {
     expect(select.options[1].textContent).toContain("7d 12%");
   });
 
-  it("passes the operator-chosen slot to interactive_open (#793 §FD1)", async () => {
+  it("passes the operator-chosen slot to interactive_open (an internal ticket §FD1)", async () => {
     routeByCommand({
       interactive_options: {
         provider: "claude",
@@ -392,7 +392,7 @@ describe("InteractiveConsole", () => {
     });
   });
 
-  it("renders the auth-mode badge from the daemon's open response (#793)", async () => {
+  it("renders the auth-mode badge from the daemon's open response (an internal ticket)", async () => {
     routeByCommand({
       interactive_open: {
         session_key: "KEY-sub",

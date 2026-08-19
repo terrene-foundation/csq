@@ -29,6 +29,12 @@ pub fn handle(base_dir: &Path, account: AccountNum, yes: bool) -> Result<()> {
             if summary.profiles_entry_removed {
                 parts.push("profiles entry");
             }
+            if summary.gemini_vault_cleared {
+                parts.push("gemini vault entry");
+            }
+            if summary.keychain_cleared {
+                parts.push("keychain item");
+            }
             let what = if parts.is_empty() {
                 "nothing (already empty)".to_string()
             } else {
@@ -64,16 +70,10 @@ fn confirm(account: AccountNum) -> Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
-#[cfg(unix)]
+/// Best-effort cache invalidation: notify the daemon (Unix socket or
+/// Windows named pipe) that on-disk account state changed. Routes through
+/// the single cross-platform chokepoint — see `csq_core::daemon::notify`
+/// (an internal ticket).
 fn notify_daemon_cache_invalidation(base_dir: &Path) {
-    let sock = csq_core::daemon::socket_path(base_dir);
-    if !sock.exists() {
-        return;
-    }
-    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-}
-
-#[cfg(not(unix))]
-fn notify_daemon_cache_invalidation(_base_dir: &Path) {
-    // Windows named-pipe invalidation is not yet implemented (M8-03).
+    csq_core::daemon::notify::cache_invalidation(base_dir);
 }

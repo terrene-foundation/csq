@@ -146,6 +146,8 @@ fn surface_str(s: Surface) -> &'static str {
         Surface::ClaudeCode => "claude-code",
         Surface::Codex => "codex",
         Surface::Gemini => "gemini",
+        Surface::Kimi => "kimi",
+        Surface::Grok => "grok",
     }
 }
 

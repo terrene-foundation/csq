@@ -129,12 +129,32 @@ const MAX_STATE_LEN: usize = 256;
 pub const PATH_SECRET_BYTES: usize = 16;
 
 /// Captured callback parameters after a successful single-shot accept.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written, NOT derived (`credential-type-hygiene.md`
+/// Rule 1): `code` is the OAuth authorization code, exchangeable for a
+/// token pair and — per `security.md` Rule 8 — carrying no stable prefix
+/// for `redact_tokens` to match on downstream.
+///
+/// `state` is deliberately NOT redacted. It is a single-use anti-CSRF
+/// nonce, worthless once the flow completes, and it is the field an
+/// operator actually needs when diagnosing a `StateMismatch` refusal.
+/// This matches the existing `RaceResult` impl, which prints `state` in
+/// the clear for the same reason.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CallbackParams {
     /// The OAuth `code` query parameter, percent-decoded.
     pub code: String,
     /// The OAuth `state` query parameter, percent-decoded.
     pub state: String,
+}
+
+impl std::fmt::Debug for CallbackParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallbackParams")
+            .field("code", &"[REDACTED]")
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 /// A bound, idle TCP listener on `127.0.0.1:<port>` waiting for the
@@ -516,6 +536,35 @@ mod tests {
 
     fn host_header(port: u16) -> String {
         format!("127.0.0.1:{port}")
+    }
+
+    // ── Debug redaction (credential-type-hygiene Rule 1) ─────────
+
+    #[test]
+    fn callback_params_debug_redacts_the_code_but_keeps_state() {
+        let p = CallbackParams {
+            code: "AUTHCODE-SECRET-VALUE".into(),
+            state: "state-nonce-abc".into(),
+        };
+        // Non-vacuity: the value really is in the struct.
+        assert_eq!(p.code, "AUTHCODE-SECRET-VALUE");
+
+        let rendered = format!("{p:?}");
+        assert!(
+            !rendered.contains("AUTHCODE-SECRET-VALUE"),
+            "Debug leaked the authorization code: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "no redaction placeholder: {rendered}"
+        );
+        // `state` is a single-use anti-CSRF nonce, worthless after the
+        // flow completes and the field an operator needs to diagnose a
+        // StateMismatch refusal. Redacting it would be net-negative.
+        assert!(
+            rendered.contains("state-nonce-abc"),
+            "state should stay legible: {rendered}"
+        );
     }
 
     /// Sends a raw HTTP request to the listener and returns the

@@ -491,6 +491,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Write a `.jsonl` file under `dir` and set its mtime to `now - age`.
+    #[cfg(unix)]
     fn plant_file_with_age(dir: &Path, name: &str, age: Duration) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, b"{}").unwrap();
@@ -534,12 +535,17 @@ mod tests {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn set_mtime_age(_path: &Path, _age: Duration) {
-        // No-op on non-Unix — mtime manipulation requires platform-specific APIs.
-        // The mtime-sensitive tests are marked #[cfg(unix)].
+        // No-op on non-Unix, non-Windows — mtime manipulation requires
+        // platform-specific APIs. The mtime-sensitive tests are marked
+        // #[cfg(unix)], and their sole (also unix-gated) caller
+        // `plant_file_with_age` never reaches this arm on Windows either,
+        // so this stub is scoped away from both to avoid a dead-code
+        // warning on the Windows test target.
     }
 
+    #[cfg(unix)]
     fn setup_csq_runs(tmp: &TempDir) -> (PathBuf, PathBuf) {
         let base = tmp.path().to_path_buf();
         let csq_runs = base.join("csq-runs");
@@ -781,6 +787,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn setup_trace(tmp: &TempDir) -> (PathBuf, PathBuf) {
         let base = tmp.path().to_path_buf();
         let csq_runs = base.join("csq-runs");

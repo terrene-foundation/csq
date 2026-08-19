@@ -5,6 +5,7 @@ pub use race::RaceLoginState;
 
 use crate::desktop::{AppState, CachedUpdateInfo};
 use csq_core::accounts::discovery;
+use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::accounts::AccountSource;
 use csq_core::capability_layer::{
     load_capability_layer_toggles, save_capability_layer_toggles, CapabilityLayerToggles,
@@ -19,10 +20,30 @@ use csq_core::rotation::RotationConfig;
 use csq_core::sessions;
 use csq_core::types::AccountNum;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_autostart::ManagerExt;
+
+/// Per-surface map of live native (Kimi/Grok) login children, guarded by a
+/// mutex. Shared type alias between `AppState.native_login_children` and
+/// the desktop command helpers below that read/write it (an internal journal entry C8)
+/// — keeps the nested
+/// `Arc<Mutex<HashMap<Surface, Option<Arc<Mutex<Child>>>>>>` shape out of
+/// every signature (clippy `type_complexity`).
+///
+/// A map ENTRY (regardless of its value) means "this surface is claimed
+/// — refuse a second `complete_native_login` for it." The value starts
+/// as a `None` **reservation** ([`reserve_native_login_slot`] inserts it
+/// under the SAME lock acquisition as its presence check, closing a
+/// TOCTOU where two concurrent callers for the same surface could both
+/// pass the check before either registered a real child) and is
+/// overwritten with `Some(child)` by [`spawn_native_device_auth_piped`]
+/// once the vendor binary actually spawns.
+pub type NativeLoginChildren = Arc<
+    Mutex<HashMap<csq_core::providers::catalog::Surface, Option<Arc<Mutex<std::process::Child>>>>>,
+>;
 
 /// Seconds-remaining threshold below which the token badge surfaces an
 /// "expiring" warning. Intentionally LOWER than the daemon's refresh
@@ -91,6 +112,16 @@ pub struct AccountView {
     /// Phase B' (an internal journal entry D5): "unknown" slots render the
     /// tokens-and-cost-over-time ledger view; others keep the 5h/7d bars.
     pub quota_kind: String,
+    /// True when `quota.json` holds a row for THIS slot whose `surface`
+    /// matches the slot's own dispatch shape (the same predicate that
+    /// gates `five_hour_pct`/`seven_day_pct` below). `false` means no
+    /// row has been polled yet — the percentage fields below are `0.0`
+    /// as a serialization default, NOT a measured "0% used". The
+    /// frontend MUST branch on this before reading the percentage
+    /// fields as real data (HIGH-1, an internal ticket redteam: a missing row
+    /// rendering as a bare 0% is indistinguishable from "quota
+    /// exhausted" or "genuinely unused").
+    pub has_quota: bool,
 
     /// Formatted balance string for pay-per-token providers (e.g. DeepSeek).
     ///
@@ -163,7 +194,8 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
     }
 
     let accounts = discovery::discover_all(&base);
-    let quota: QuotaFile = quota_state::load_state(&base).unwrap_or_else(|_| QuotaFile::empty());
+    // an internal ticket: salvage per-row — read-only IPC query, never writes back.
+    let quota: QuotaFile = quota_state::load_state_salvage(&base);
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -226,6 +258,21 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 // otherwise, no countdown. Sibling of the Codex branch closing
                 // the same `account-terminal-separation.md` MUST Rule 4 bug
                 // class one surface over (an internal journal entry follow-up).
+                let status = if a.has_credentials {
+                    "healthy"
+                } else {
+                    "missing"
+                };
+                (status.to_string(), None, None)
+            } else if matches!(a.source, AccountSource::Native { .. }) {
+                // Native-CLI session surfaces (Kimi/Grok — Wave 3, journal
+                // 0133) carry no credential of csq's own — the vendor CLI
+                // (`kimi` / `grok`) self-authenticates against its own home
+                // directory. `has_credentials` reflects binding-marker
+                // existence (always `true` for a slot `discover_native`
+                // returns), so the badge is always "healthy" with no
+                // countdown — the same no-expiry shape as the
+                // Gemini/ThirdParty branches above.
                 let status = if a.has_credentials {
                     "healthy"
                 } else {
@@ -353,6 +400,36 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 None
             };
 
+            // A usage window BEATS a balance whenever the observed row
+            // carries BOTH. Billing shape is per-PLAN, not per-provider:
+            // a Grok slot on a weekly-credit subscription writes a real
+            // `seven_day` window AND a `$0.00` on-demand balance, so any
+            // display shape derived from provider IDENTITY renders
+            // "Balance $0.00" over a live 7%-used window.
+            //
+            // The daemon already resolves this per-ROW —
+            // `usage_poller::grok` sets `kind` on exactly this rule
+            // (window ? "utilization" : balance ? "balance" : ...) — and
+            // the CLI resolves it per-ROW too, in
+            // `csq-core/src/quota/status.rs::quota_suffix` (080430f0,
+            // "a usage window beats a balance — grok-17 hid its 7%
+            // behind $0.00"). The desktop was the only surface still
+            // keying off the catalog, so it kept rendering the defect
+            // the other two had fixed. Read the row here as well.
+            // Deliberately reads the RAW `q`, not the surface-matched
+            // `utilization_quota` computed below. That is parity with the CLI,
+            // which does not surface-gate this decision either
+            // (`status.rs`'s `let q = quota.get(a.id);`). The visible
+            // consequence is that `quota_kind == "utilization"` with
+            // `has_quota == false` is producible — a slot whose catalog kind is
+            // "balance" carrying a stale cross-surface row with a window. Both
+            // render honest PENDING states ("Checking usage…" rather than
+            // "Balance checking…"), so neither makes a false claim; surface-
+            // gating here would BREAK the CLI parity to change one pending
+            // string into another. Intentional — recorded so the next reader
+            // does not "fix" it.
+            let row_shows_window = q.map(|q| q.shows_window()).unwrap_or(false);
+
             // Phase B' (an internal journal entry D5): expose the catalog's quota_kind
             // so the frontend can branch — `Unknown` slots get the new
             // tokens-and-cost-over-time ledger view instead of stuck-at-
@@ -365,6 +442,18 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                     .map(|p| match p.quota_kind {
                         providers::catalog::QuotaKind::Utilization => "utilization",
                         providers::catalog::QuotaKind::Counter => "counter",
+                        // Kimi's 3P Bearer provider is deliberately
+                        // catalogued `Unknown` so `tick_3p`'s generic probe
+                        // loop skips it — the dedicated
+                        // `usage_poller::kimi` owns the call instead
+                        // (catalog.rs's Kimi provider entry comment). That
+                        // `Unknown` is a POLLING-DISPATCH flag, not a
+                        // rendering flag: treating it as "no quota signal"
+                        // here routed the 3P Kimi slot into the
+                        // pay-per-token ledger even though the dedicated
+                        // poller writes real 5h/7d utilization rows for it
+                        // (HIGH-1, an internal ticket redteam).
+                        providers::catalog::QuotaKind::Unknown if p.id == "kimi" => "utilization",
                         providers::catalog::QuotaKind::Unknown => "unknown",
                         providers::catalog::QuotaKind::Balance => "balance",
                     })
@@ -382,6 +471,70 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 // so any of these labels works for a Gemini slot.
                 // "counter" matches the existing API-key default.
                 AccountSource::Gemini => "counter".to_string(),
+                // Native Kimi session (Wave 3, journals 0133/0135) IS
+                // polled by the dedicated `usage_poller::kimi` (this PR)
+                // — it writes real 5h/7d utilization rows keyed by this
+                // slot, so it takes the ordinary bar-rendering path like
+                // any other utilization surface. Routing it through
+                // "native" hid those rows behind a static
+                // "Subscription · vendor-managed" string (HIGH-1, PR
+                // an internal ticket redteam).
+                AccountSource::Native {
+                    surface: csq_core::providers::catalog::Surface::Kimi,
+                } => "utilization".to_string(),
+                // Every OTHER native-CLI session surface (currently just
+                // Grok) is SUBSCRIPTION (vendor-managed) with no
+                // csq-polled quota endpoint AND no pay-per-token cost —
+                // the vendor CLI owns auth + billing. Routing it to
+                // "unknown" (the pay-per-token ledger) would mislabel it
+                // as "$0 (0 tokens)" with an "unrecognized model" warning
+                // (0135 issue 3). The dedicated "native" kind renders a
+                // clean vendor-managed subscription state instead — no
+                // ledger, no stuck-at-zero bar.
+                // Grok native is ALSO csq-polled now. `usage_poller::grok`
+                // writes a real `kind: "balance"` row (credit balance +
+                // the weekly `currentPeriod` window) keyed by this slot,
+                // so it takes the balance-rendering path like any other
+                // balance surface.
+                //
+                // This is the IDENTICAL fix the Kimi arm above documents
+                // (HIGH-1, an internal ticket): routing a polled surface through
+                // "native" hides its rows behind the static
+                // "Subscription · vendor-managed" string. Grok was left
+                // on "native" because its poller genuinely produced
+                // nothing — `parse_grok_billing` read the billing fields
+                // at the JSON root while the endpoint nests them under
+                // `config` with `{"val": N}` wrappers, so EVERY tick died
+                // as `Parse("no recognised credit field")`. With that
+                // fixed in this same PR the premise of the comment below
+                // no longer holds, and leaving this arm as-is would ship
+                // a parser fix the operator cannot see.
+                AccountSource::Native {
+                    surface: csq_core::providers::catalog::Surface::Grok,
+                } => "balance".to_string(),
+                // Any FUTURE native-CLI surface with no csq-polled quota
+                // endpoint and no pay-per-token cost. Routing such a
+                // surface to "unknown" (the pay-per-token ledger) would
+                // mislabel it as "$0 (0 tokens)" with an "unrecognized
+                // model" warning (0135 issue 3); "native" renders a clean
+                // vendor-managed state instead. Kimi and Grok have both
+                // since grown real pollers and left this arm.
+                AccountSource::Native { .. } => "native".to_string(),
+            };
+
+            // Row beats catalog: a surface catalogued "balance" whose
+            // ACTUAL row carries a usage window renders bars, not a
+            // balance. The reverse promotion is deliberately NOT done —
+            // a row with neither a window nor a balance means "no data
+            // yet", which is not the same claim as "pay-per-token", and
+            // conflating the two is what `is_balance_only`'s doc comment
+            // in status.rs warns against. This only ever DEMOTES, so a
+            // freshly-bound Grok slot with no row at all keeps
+            // "balance" and renders the honest "checking…" state.
+            let quota_kind = if quota_kind == "balance" && row_shows_window {
+                "utilization".to_string()
+            } else {
+                quota_kind
             };
 
             // Gemini surface fields — pulled directly from quota.json
@@ -426,8 +579,29 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
             // None on every other slot type: subscription, counter, unknown, Gemini.
             // Uses the shared `fmt_balance` (csq-core) so currency formatting +
             // control-char sanitization have a single source of truth with the
-            // statusline (#984 redteam L1/M1).
+            // statusline (an internal ticket redteam L1/M1).
+            //
+            // Gated on `!row_shows_window` for the same reason
+            // `quota_kind` is demoted above, and it is load-bearing
+            // independently: `AccountList.svelte`'s balance arm fires on
+            // `quota_kind === 'balance' || account.balance_display`, so a
+            // populated `balance_display` alone is enough to route a
+            // window-carrying slot into the balance renderer even after
+            // the `quota_kind` demotion. Both gates are required.
+            //
+            // NOTE the asymmetry with the demotion above, which is
+            // deliberate: that one is conditioned on `quota_kind ==
+            // "balance"`, this one on NOTHING but the row. This gate is
+            // provider-agnostic by design — a Z.AI or MiniMax slot whose row
+            // carried both a window and a balance previously reached the
+            // balance renderer through `AccountList.svelte`'s
+            // `|| account.balance_display` disjunct and hid its window; it
+            // now renders bars. That is the correct per-PLAN outcome and
+            // matches the CLI, whose `quota_suffix` is likewise unconditional
+            // on provider. The class is not Grok-specific; Grok is merely the
+            // first plan shape that exercised it.
             let balance_display = q
+                .filter(|_| !row_shows_window)
                 .and_then(|q| q.balance.as_ref())
                 .map(csq_core::quota::format::fmt_balance);
 
@@ -451,7 +625,27 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
             //
             // Origin: redteam round 1 H2 (an internal journal entry) and an internal ticket
             // (codex 5h/7d desktop UI gap).
-            let utilization_quota = q.filter(|q| q.surface.as_str() == a.surface.as_str());
+            //
+            // Kimi is a structural exception to the bare surface-match
+            // above (HIGH-1, an internal ticket redteam): its native-CLI slot's OWN
+            // dispatch `Surface` (`Surface::Kimi`, `.as_str() == "kimi"`)
+            // never equals the row it actually writes (`"kimi-cli"` —
+            // `usage_poller::kimi::write_kimi_usages` doc comment), and
+            // its 3P Bearer slot's dispatch `Surface` is `ClaudeCode`
+            // (`"claude-code"`, it runs through the `claude` CLI) which
+            // never equals the row it writes (`"kimi"`). Neither Kimi
+            // shape's account `Surface` ever equals its own quota row's
+            // `surface` string, so the bare compare is correct for every
+            // OTHER surface but structurally wrong for both Kimi shapes.
+            let utilization_quota = q.filter(|q| match &a.source {
+                AccountSource::Native {
+                    surface: csq_core::providers::catalog::Surface::Kimi,
+                } => q.surface == "kimi" || q.surface == "kimi-cli",
+                AccountSource::ThirdParty { .. } if provider_id.as_deref() == Some("kimi") => {
+                    q.surface == "kimi"
+                }
+                _ => q.surface.as_str() == a.surface.as_str(),
+            });
             AccountView {
                 id: a.id,
                 label: a.label,
@@ -461,9 +655,16 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                     AccountSource::Gemini => "gemini".into(),
                     AccountSource::ThirdParty { .. } => "third_party".into(),
                     AccountSource::Manual => "manual".into(),
+                    // Native-CLI session surfaces (Kimi/Grok — Wave 3,
+                    // an internal journal entry). The `surface` field below already
+                    // carries the specific tag ("kimi"/"grok") the
+                    // frontend renders on; `source` distinguishes the
+                    // dispatch/credential model at the Rust layer.
+                    AccountSource::Native { .. } => "native".into(),
                 },
                 surface: a.surface.to_string(),
                 has_credentials: a.has_credentials,
+                has_quota: utilization_quota.is_some(),
                 five_hour_pct: utilization_quota.map(|q| q.five_hour_pct()).unwrap_or(0.0),
                 five_hour_resets_in: utilization_quota.and_then(|q| {
                     q.five_hour.as_ref().map(|w| {
@@ -524,7 +725,7 @@ pub fn rename_account(base_dir: String, account: u16, name: String) -> Result<()
         return Err("name must not contain control characters".into());
     }
     csq_core::accounts::profiles::update_email(&base, account_num, trimmed)
-        .map_err(|e| format!("rename failed: {e}"))
+        .map_err(|e| format!("rename failed: {}", e.redacted_message()))
 }
 
 /// Whether a provider CLI binary is installed (resolvable on `PATH` or a
@@ -532,15 +733,34 @@ pub fn rename_account(base_dir: String, account: u16, name: String) -> Result<()
 ///
 /// The desktop add-account flow calls this BEFORE launching a codex/gemini
 /// login so a missing CLI surfaces a friendly "install codex-cli" prompt
-/// instead of a raw error mid-device-auth. `binary` MUST be one of the known
-/// surface binaries; any other value returns `false` without probing (a caller
-/// cannot use this to test for arbitrary binaries).
+/// instead of a raw error mid-device-auth. Native Kimi/Grok reuse the same
+/// pre-flight (`kimi` / `grok` binaries) before offering
+/// [`start_native_login`] — an internal journal entry C8. `binary` MUST be one of the
+/// known surface binaries; any other value returns `false` without probing
+/// (a caller cannot use this to test for arbitrary binaries).
+///
+/// # C6 (an internal journal entry issue 1) — known-install-dir fallback
+///
+/// `csq_core::accounts::login::find_cli_binary` (the CC-family resolver)
+/// checks `$PATH` → system-wide well-known dirs (`/opt/homebrew/bin`,
+/// `/usr/local/bin`, …) → per-user `$HOME`-relative subdirs (`.local/bin`,
+/// `.cargo/bin`, …) — but has NO awareness of Kimi/Grok's own self-managed
+/// install dirs (`~/.kimi-code/bin`, `~/.grok/bin`). Chained with
+/// [`csq_core::cli_deps::install_path::find_in_path`] (which DOES carry
+/// that `known_install_dirs` fallback — spec/13 §5) so a self-managed
+/// kimi/grok install that never got symlinked onto PATH is still found,
+/// while codex/gemini/claude keep their existing broader dir coverage.
 #[tauri::command]
 pub fn provider_cli_installed(binary: String) -> bool {
-    if !matches!(binary.as_str(), "codex" | "gemini" | "claude") {
+    if !matches!(
+        binary.as_str(),
+        "codex" | "gemini" | "claude" | "kimi" | "grok"
+    ) {
         return false;
     }
-    csq_core::accounts::login::find_cli_binary(&binary).is_some()
+    csq_core::accounts::login::find_cli_binary(&binary)
+        .or_else(|| csq_core::cli_deps::install_path::find_in_path(&binary))
+        .is_some()
 }
 
 /// Removes an account: deletes credentials, config dir, profile entry,
@@ -714,6 +934,7 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                 canonical_removed: s.canonical_removed,
                 config_dir_removed: s.config_dir_removed,
                 profiles_entry_removed: s.profiles_entry_removed,
+                keychain_cleared: s.keychain_cleared,
             })
         }
         // Gemini-only slots have no `credentials/N.json` or `config-N/`,
@@ -745,6 +966,10 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                 canonical_removed: false,
                 config_dir_removed: false,
                 profiles_entry_removed: false,
+                // `logout_account` returned `NotConfigured` here — its keychain
+                // step never ran (no handle-dir/config-N state to process for a
+                // Gemini-only slot), so nothing was cleared by THIS call.
+                keychain_cleared: false,
             })
         }
         // R2-FIX-2: emit OUTCOME:Failed for the committed Gemini INTENT when
@@ -811,6 +1036,31 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
             }
             Err("REMOVE_FAILED: profiles.json error during logout".into())
         }
+        // logout_account's OWN Gemini vault step (see its doc comment) is a
+        // no-op here in practice — this handler already cleared the vault
+        // and unbound the marker above, so `is_gemini_bound_slot` reads
+        // `false` inside `logout_account`. This arm exists for exhaustivity
+        // and to fail loudly (rather than silently) on the residual case
+        // where it somehow still fires. Fixed-vocab tag only — no {e}.
+        Err(LogoutError::VaultUnavailable { error_kind, .. }) => {
+            if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
+                let _ = op_emit::emit_outcome(
+                    &base,
+                    &chain_id,
+                    EventKind::AccountLogout,
+                    payload,
+                    corr_id,
+                    OpOutcome::Failed {
+                        reason: RedactedString::from_untrusted(
+                            "logout_account failed after vault delete",
+                        ),
+                    },
+                );
+            }
+            Err(format!(
+                "REMOVE_FAILED: gemini vault unavailable ({error_kind})"
+            ))
+        }
     }
 }
 
@@ -820,6 +1070,11 @@ pub struct RemoveAccountSummary {
     pub canonical_removed: bool,
     pub config_dir_removed: bool,
     pub profiles_entry_removed: bool,
+    /// Mirrors `LogoutSummary::keychain_cleared` (security review 1386 M2) —
+    /// no secret content, just whether a macOS keychain OAuth item clear was
+    /// confirmed for at least one handle dir bound to this slot. Safe on IPC
+    /// per `tauri-commands.md` MUST-3.
+    pub keychain_cleared: bool,
 }
 
 /// Renames slot `from` to slot `to`. Wraps `csq_core::accounts::move_slot::move_account`.
@@ -948,8 +1203,16 @@ pub struct MoveAccountSummary {
 // the last computed all-slots aggregate (stale-tolerant) and, when the entry
 // is older than the TTL, kicks ONE guarded background thread to recompute. The
 // existing 5s `AccountList` poll picks up the refreshed numbers with no
-// frontend change. The fully-durable design (daemon-written persistent
-// `usage-{slot}.ndjson` that the command just reads) is tracked in #992.
+// frontend change.
+//
+// The fully-durable design this cache once stood in for — a daemon-written
+// persistent `usage-{slot}.ndjson` that the command just reads — is BUILT
+// (an internal ticket, CLOSED; shipped as [`csq_core::daemon::usage_ledger_writer`]).
+// `get_account_usage` below now reads that ledger FIRST ("Ledger-first",
+// an internal ticket) and only falls through to this cache as a cold-start path for
+// the first seconds after daemon launch, before the writer's first tick
+// completes. This cache is therefore the FALLBACK, not the primary path;
+// the comment above describes only the fallback.
 
 type UsagePairs = Vec<(AccountNum, csq_core::usage::ledger::UsageEvent)>;
 
@@ -985,7 +1248,7 @@ fn usage_cache() -> &'static std::sync::Mutex<Option<UsageCacheEntry>> {
 ///
 /// The real per-turn model is sourced from the transcript (an internal ticket); the
 /// callback below is only a FALLBACK for sessions whose transcript had no
-/// model line (prior to #986 this hardcoded model was applied to EVERY slot,
+/// model line (prior to an internal ticket this hardcoded model was applied to EVERY slot,
 /// costing a DeepSeek slot at Sonnet rates).
 fn aggregate_usage_pairs(base: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> UsagePairs {
     // Resolve $HOME/.claude — `get_base_dir` resolves ~/.claude/accounts, so
@@ -996,10 +1259,10 @@ fn aggregate_usage_pairs(base: &std::path::Path, now: chrono::DateTime<chrono::U
     // Model FALLBACK for the rare model-less transcript line: resolve the
     // slot's configured model (matching the daemon usage-ledger writer's
     // fallback) so the cold-start live-scan and the published ledger cost such
-    // lines identically. (#992 redteam R1 MEDIUM-2.)
+    // lines identically. (an internal ticket redteam R1 MEDIUM-2.)
     csq_core::usage::aggregator::aggregate(&claude_home, base, now, |slot| {
         csq_core::providers::settings::model_id_for_slot(base, slot.get())
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+            .unwrap_or_else(|| "claude-sonnet-5".to_string())
     })
 }
 
@@ -1133,7 +1396,7 @@ pub fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryV
             // fast. An EMPTY read is a miss (rolled-off / never-populated slot)
             // → fall through to the authoritative live-scan below, which yields
             // the same zero but defends against a transient empty tick blanking
-            // a populated slot. (#992 redteam R1 MEDIUM-1.)
+            // a populated slot. (an internal ticket redteam R1 MEDIUM-1.)
             if !result.events.is_empty() {
                 let summary = csq_core::usage::ledger::summarize(&result.events, now);
                 return Ok(summary_to_view(summary));
@@ -1177,16 +1440,16 @@ pub struct UsageSummaryView {
 #[tauri::command]
 pub fn get_rotation_config(base_dir: String) -> Result<RotationConfig, String> {
     let base = PathBuf::from(&base_dir);
-    rotation_config::load(&base).map_err(|e| e.to_string())
+    rotation_config::load(&base).map_err(|e| e.redacted_message())
 }
 
 /// Enables or disables auto-rotation, writing the change to `rotation.json`.
 #[tauri::command]
 pub fn set_rotation_enabled(base_dir: String, enabled: bool) -> Result<(), String> {
     let base = PathBuf::from(&base_dir);
-    let mut config = rotation_config::load(&base).map_err(|e| e.to_string())?;
+    let mut config = rotation_config::load(&base).map_err(|e| e.redacted_message())?;
     config.enabled = enabled;
-    rotation_config::save(&base, &config).map_err(|e| e.to_string())
+    rotation_config::save(&base, &config).map_err(|e| e.redacted_message())
 }
 
 /// IPC view of [`CapabilityLayerToggles`] for the desktop tray
@@ -1293,7 +1556,7 @@ pub fn set_capability_layer_toggles(
         return Err(format!("base directory does not exist: {base_dir}"));
     }
     let to_save: CapabilityLayerToggles = toggles.into();
-    save_capability_layer_toggles(&base, &to_save).map_err(|e| e.to_string())?;
+    save_capability_layer_toggles(&base, &to_save).map_err(|e| e.redacted_message())?;
     Ok(toggles)
 }
 
@@ -1321,9 +1584,25 @@ pub struct SessionView {
     /// or null if the account is unknown.
     pub account_label: Option<String>,
     /// Current 5-hour quota percentage for the bound account.
+    ///
+    /// `0.0` when `has_quota` is false — a wire-format default, NOT a
+    /// measurement. Gate any rendering on `has_quota` first.
     pub five_hour_pct: f64,
     /// Current 7-day quota percentage for the bound account.
+    ///
+    /// Same caveat as [`Self::five_hour_pct`].
     pub seven_day_pct: f64,
+    /// Whether the two percentages above are MEASUREMENTS.
+    ///
+    /// False when the bound account has no quota row, or has one carrying
+    /// no usage window at all (a balance-metered slot such as DeepSeek, or
+    /// a weekly-only slot before its first poll). Without this the badge
+    /// rendered `7d:0%` styled healthy for slots whose quota is simply not
+    /// observable — the same wire-format-default hazard `AccountView`
+    /// already carries `has_quota` to prevent. `SessionView` was missing
+    /// the companion field, so the session list could not tell the two
+    /// apart even though the account list could.
+    pub has_quota: bool,
     /// Unix seconds since the process started, or null if the
     /// platform could not report it.
     pub started_at: Option<u64>,
@@ -1339,6 +1618,125 @@ pub struct SessionView {
     /// Human-readable iTerm2 tab title resolved via osascript.
     /// Most specific identifier when available.
     pub terminal_title: Option<String>,
+}
+
+/// Resolves the slot a session's config dir is CURRENTLY bound to.
+///
+/// `dir_name_account` is the id parsed from the `config-<N>` directory
+/// NAME (`SessionInfo::account_id`). It is a last resort, never an
+/// override: `account-terminal-separation.md` MUST NOT Rule 3 makes the
+/// `.csq-account` marker the SOLE authority, with no exception for a
+/// marker that is present but unresolvable.
+///
+/// The two `None` cases of
+/// [`csq_core::accounts::markers::resolve_marker_to_slot`] mean opposite
+/// things and MUST be separated here:
+///
+/// - **no marker at all** — a genuine pre-`by_slot` legacy dir. The
+///   dir-name fallback is exactly what it was written for.
+/// - **marker present, but it will not resolve** — a UUID marker whose
+///   `by_slot` entry is missing or stale (`profiles.json` mid-update,
+///   or a `move_slot` rename in flight). Falling back to the dir name
+///   HERE re-opens the confident-wrong-answer this function exists to
+///   close, and does so in precisely the slot-rename scenario the
+///   caller's comment cites as its worked example. Render unknown.
+fn resolve_live_account(
+    base: &Path,
+    config_dir: &Path,
+    dir_name_account: Option<u16>,
+) -> Option<u16> {
+    match csq_core::accounts::markers::read_identity_marker(config_dir) {
+        // A marker EXISTS — it is the sole authority. Unresolvable means
+        // unknown, NOT "guess from the directory name".
+        Some(_) => {
+            csq_core::accounts::markers::resolve_marker_to_slot(base, config_dir).map(|n| n.get())
+        }
+        // No marker — legacy dir, the dir name is all there is.
+        None => dir_name_account,
+    }
+}
+
+#[cfg(test)]
+mod resolve_live_account_tests {
+    use super::resolve_live_account;
+    use csq_core::testing::identity_fixtures::{fixture_uuid_for_slot, write_uuid_account_marker};
+    use tempfile::TempDir;
+
+    /// (a) UUID marker WITH a `by_slot` entry — the modern, healthy slot.
+    #[test]
+    fn uuid_marker_with_by_slot_resolves_to_the_mapped_slot() {
+        let base = TempDir::new().unwrap();
+        let config = base.path().join("config-5");
+        std::fs::create_dir_all(&config).unwrap();
+        write_uuid_account_marker(base.path(), &config, 5);
+
+        // The dir-name id is deliberately WRONG (8, not 5). DO NOT "tidy"
+        // it to 5 — it is load-bearing twice over. It proves the marker
+        // beats the dir name, AND it is the only thing that discriminates
+        // a `base`/`config_dir` argument transposition: those two are both
+        // `&Path` and adjacent, so swapping them compiles cleanly. Under a
+        // swap, `read_identity_marker(base)` finds no marker at the
+        // TempDir root, takes the `None` arm, and returns Some(8) — which
+        // fails only because the expected value is 5.
+        assert_eq!(
+            resolve_live_account(base.path(), &config, Some(8)),
+            Some(5),
+            "the marker is the sole authority; the dir-name id must not win"
+        );
+    }
+
+    /// (b) UUID marker present but NOT resolvable. This fixture builds the
+    /// `by_slot`-**missing** variant (no `profiles.json` at all); the
+    /// **stale** variant (`profiles.json` present, no entry for this UUID)
+    /// routes through the same `resolve_uuid_to_slot` → `None` and is
+    /// covered by `resolve_uuid_to_slot_present_and_absent` in `markers.rs`.
+    ///
+    /// This is the arm the `.or(dir_name)` form got wrong: it rendered
+    /// another account's label and quota row in exactly the slot-rename
+    /// case the caller's comment cites.
+    ///
+    /// Why this cannot pass for the wrong reason: `dir_name_account` here
+    /// is `Some(6)`. Had the marker read returned `None` and taken the
+    /// wrong arm, the function would return `Some(6)`, not `None` — so
+    /// asserting `== None` structurally proves the `Some(_)` arm ran.
+    /// (The mutation probe recorded in this commit's history proves the
+    /// DEFECT is reproduced; it does NOT pin the fixture state, because
+    /// the old `.or()` code returns `Some(6)` for both a present-UUID
+    /// marker and an absent one. Two claims, two separate proofs.)
+    #[test]
+    fn uuid_marker_without_by_slot_entry_is_unknown_not_the_dir_name() {
+        let base = TempDir::new().unwrap();
+        let config = base.path().join("config-6");
+        std::fs::create_dir_all(&config).unwrap();
+        // Marker written WITHOUT provisioning a by_slot entry for it.
+        let orphan = fixture_uuid_for_slot(99);
+        csq_core::accounts::markers::write_csq_account(&config, orphan).unwrap();
+
+        assert_eq!(
+            resolve_live_account(base.path(), &config, Some(6)),
+            None,
+            "a present-but-unresolvable marker must render unknown, never \
+             fall back to the config-dir name (account-terminal-separation.md \
+             MUST NOT Rule 3 has no exception for an unresolvable marker)"
+        );
+    }
+
+    /// (c) No marker at all — a genuine pre-`by_slot` legacy dir. The
+    /// dir-name fallback is exactly what it was written for and MUST
+    /// survive; dropping it would regress legacy dirs to "unknown".
+    #[test]
+    fn absent_marker_falls_back_to_the_dir_name_id() {
+        let base = TempDir::new().unwrap();
+        let config = base.path().join("config-7");
+        std::fs::create_dir_all(&config).unwrap();
+        // No marker file written at all.
+
+        assert_eq!(
+            resolve_live_account(base.path(), &config, Some(7)),
+            Some(7),
+            "a markerless legacy dir must still resolve via the dir name"
+        );
+    }
 }
 
 /// Returns the list of live Claude Code sessions under the current
@@ -1363,23 +1761,35 @@ pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
     // session row to the *current* active account for its config
     // dir, which may have rotated since the process launched.
     let accounts = discovery::discover_all(&base);
-    let quota: QuotaFile = quota_state::load_state(&base).unwrap_or_else(|_| QuotaFile::empty());
+    // an internal ticket: salvage per-row — read-only IPC query, never writes back.
+    let quota: QuotaFile = quota_state::load_state_salvage(&base);
 
     let mut out = Vec::with_capacity(sessions.len());
     for s in sessions {
         // Use the `.csq-account` marker for the live account, not
         // the config dir name. The marker reflects swaps and renames
         // (e.g. config-8 with marker=7 after a slot rename).
-        let live_account = csq_core::accounts::markers::read_csq_account(&s.config_dir)
-            .map(|n| n.get())
-            .or(s.account_id);
+        //
+        // M4-7 (an internal ticket Phase 4): the marker's CONTENT is a UUID
+        // whenever a `by_slot` mapping exists, so the numeric-only
+        // `read_csq_account` returned `None` on every modern slot and the
+        // dir-name fallback then silently won — the confident wrong answer
+        // this comment forbids. `resolve_live_account` reads the marker as
+        // the sole authority and keeps the dir-name fallback for markerless
+        // legacy dirs ONLY (`guard-reader-writer-parity.md`).
+        let live_account = resolve_live_account(&base, &s.config_dir, s.account_id);
         let account_info = live_account.and_then(|id| accounts.iter().find(|a| a.id == id));
         let account_label = account_info.map(|a| a.label.clone());
-        let five_hour_pct = live_account
-            .and_then(|id| quota.get(id).map(|q| q.five_hour_pct()))
+        // A row exists AND carries at least one usage window. Both halves
+        // matter: a balance-metered slot has a row but no window, and its
+        // percentages below are wire-format defaults rather than readings.
+        let session_row = live_account.and_then(|id| quota.get(id));
+        let has_quota = session_row.map(|q| q.shows_window()).unwrap_or(false);
+        let five_hour_pct = session_row
+            .and_then(|q| q.five_hour_pct_opt())
             .unwrap_or(0.0);
-        let seven_day_pct = live_account
-            .and_then(|id| quota.get(id).map(|q| q.seven_day_pct()))
+        let seven_day_pct = session_row
+            .and_then(|q| q.seven_day_pct_opt())
             .unwrap_or(0.0);
 
         out.push(SessionView {
@@ -1390,6 +1800,7 @@ pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
             account_label,
             five_hour_pct,
             seven_day_pct,
+            has_quota,
             started_at: s.started_at,
             tty: s.tty,
             term_window: s.term_window,
@@ -1468,11 +1879,538 @@ pub fn list_providers() -> Result<Vec<ProviderView>, String> {
         .collect())
 }
 
+/// Public view of a native-CLI session-surface entry (Kimi, Grok), safe
+/// to send over IPC. Distinct from [`ProviderView`] — a native surface
+/// is a **self-authenticating vendor binary** csq dispatches sessions
+/// to but never stores credentials for (Design B, an internal journal entry), not a
+/// Bearer/OAuth provider in [`providers::PROVIDERS`].
+#[derive(Serialize)]
+pub struct NativeCliView {
+    /// Short identifier passed to [`start_native_login`] /
+    /// [`complete_native_login`] (`"kimi-cli"`, `"grok"`). Distinct from
+    /// the 3P-bearer Kimi provider's id (`"kimi"`) — the two are
+    /// separate picker entries.
+    pub id: String,
+    /// Display name for the picker (e.g. "Kimi (native CLI)").
+    pub display_name: String,
+    /// Vendor-selected default model, display-only — csq does not pin
+    /// it. Empty string means "vendor-selected"; the picker hides the
+    /// model line in that case.
+    pub default_model: String,
+    /// Dispatch-axis surface tag (`"kimi"` / `"grok"`), matching
+    /// `Surface::as_str`. Not currently consumed by the frontend but
+    /// kept for parity with `ProviderView` and future diagnostics.
+    pub surface: String,
+    /// Vendor binary name (`"kimi"` / `"grok"`) the frontend passes to
+    /// [`provider_cli_installed`] for the pre-flight CLI-missing hint.
+    /// Deliberately a SEPARATE field from `surface` — the two happen to
+    /// share the same string today but are independent concepts
+    /// (dispatch-axis tag vs PATH-resolvable binary name); the frontend
+    /// must not assume they stay in sync.
+    pub binary: String,
+}
+
+/// Returns the native-CLI session-surface catalog (Kimi, Grok) — vendor
+/// binaries csq dispatches `csq run N` sessions to but never stores
+/// credentials for; the vendor CLI self-authenticates on its own
+/// schedule.
+///
+/// The frontend renders these alongside [`list_providers`]'s entries in
+/// the Add Account picker (so native Kimi appears next to the existing
+/// 3P-bearer Kimi, and Grok appears as native-only); picking one starts
+/// the [`start_native_login`] / [`complete_native_login`] device-code
+/// flow instead of an OAuth/bearer/keyless one (an internal journal entry C8).
+#[tauri::command]
+pub fn list_native_clis() -> Result<Vec<NativeCliView>, String> {
+    Ok(csq_core::providers::native::NATIVE_CLIS
+        .iter()
+        .map(|nc| NativeCliView {
+            id: nc.id.to_string(),
+            display_name: nc.display_name.to_string(),
+            default_model: nc.default_model.to_string(),
+            surface: nc.surface.as_str().to_string(),
+            binary: nc.binary.to_string(),
+        })
+        .collect())
+}
+
+// ── Native Kimi/Grok desktop login commands (an internal journal entry C8) ─────
+//
+// Mirrors the Codex desktop twin's start/complete/cancel shape (PR-C8,
+// `start_codex_login` / `complete_codex_login` / `cancel_codex_login`)
+// but simpler: the 0135 design lock made native surfaces per-slot-authed
+// via an isolated vendor home (the `CODEX_HOME` pattern, without codex's
+// UUID/symlink/relocation machinery — native surfaces self-refresh, so
+// csq never needs to centrally rotate their tokens). All the real work —
+// spawn into the slot's vendor home, forward device codes, verify the
+// vendor's credential file, write the marker on success ONLY — already
+// lives in `csq_core::providers::native_login::login_native_with`. The
+// desktop layer here supplies ONLY the two DI seams `login_native_with`
+// needs: (a) a production `spawn` closure that starts the real vendor
+// binary with piped stdout and registers the child for cancellation,
+// and (b) an `on_device_code` callback that emits a `native-device-code`
+// Tauri event. Device-code parsing happens EXCLUSIVELY inside
+// `login_native_with` (the host-allowlisted `parse_native_device_code`)
+// — this layer never re-parses raw stdout itself, so the phishing
+// surface C1 closed for codex/native stays closed here too.
+
+/// Result view for [`start_native_login`]. IPC-safe.
+#[derive(Debug, Serialize)]
+pub struct StartNativeLoginView {
+    /// Echoes the resolved native id back (`"kimi-cli"` / `"grok"`).
+    pub native_id: String,
+    pub display_name: String,
+    /// Whether `binary` resolves via [`provider_cli_installed`]'s same
+    /// resolution chain (`find_cli_binary` OR
+    /// `cli_deps::install_path::find_in_path`). `false` surfaces an
+    /// install hint — it does NOT block [`complete_native_login`], which
+    /// re-resolves the binary at spawn time and errors cleanly if it is
+    /// still missing (mirrors the pre-0135 `native-cli-confirm` posture:
+    /// the missing-CLI state is informational, not a hard gate).
+    pub cli_installed: bool,
+}
+
+/// Device-code payload emitted to the desktop UI while a native vendor
+/// login subprocess is running. Mirrors
+/// `codex::desktop_login::DeviceCodeInfo` but carries `surface` so ONE
+/// Svelte listener (`native-device-code`) serves both the Kimi and Grok
+/// flows.
+#[derive(Serialize)]
+pub struct NativeDeviceCodeView {
+    /// `"kimi"` / `"grok"` — matches `Surface::as_str`.
+    pub surface: String,
+    pub user_code: String,
+    pub verification_url: String,
+}
+
+/// Resolves + validates a native-CLI login request. Shared by
+/// [`start_native_login`] and [`complete_native_login`] so both commands
+/// agree on unknown-id / invalid-slot / missing-base-dir / conflicting-
+/// binding rejection — this is the same validation the retired
+/// `provision_native_cli` (an internal journal entry W3-5) used to perform inline,
+/// factored out now that TWO commands need it.
+///
+/// # Errors
+///
+/// - `"unknown native CLI id: ..."` — id not in
+///   `providers::native::NATIVE_CLIS` (frontend sent a stale id)
+/// - `"invalid slot: ..."` — slot out of range 1..=999
+/// - `"base directory does not exist: ..."` — base dir missing
+/// - `"slot N is bound to <surface> — run \`csq logout N\` to rebind"`
+///   — conflicting surface already claims the slot (Codex, Claude/
+///   Anthropic OAuth, Gemini, 3P-bearer, or the OTHER native surface —
+///   see [`csq_core::providers::native::conflicting_bound_surface`])
+fn resolve_native_login_request(
+    base_dir: &str,
+    native_id: &str,
+    slot: u16,
+) -> Result<
+    (
+        &'static csq_core::providers::native::NativeCli,
+        PathBuf,
+        AccountNum,
+    ),
+    String,
+> {
+    use csq_core::providers::native;
+
+    let descriptor = native::descriptor_by_id(native_id)
+        .ok_or_else(|| format!("unknown native CLI id: {native_id}"))?;
+    let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
+    let base = PathBuf::from(base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+    // Use the `BoundSurface`-returning guard directly so a 3P-bearer conflict is
+    // labeled accurately ("a third-party provider") rather than mislabeled via
+    // the `ThirdPartyBearer→ClaudeCode` wire collapse (redteam R1 MEDIUM-1).
+    if let Some(existing) = csq_core::accounts::binding_guard::conflicting_bound_surface(
+        &base,
+        slot_num,
+        descriptor.surface,
+    ) {
+        return Err(format!(
+            "slot {slot} is bound to {} — run `csq logout {slot}` to rebind",
+            existing.label()
+        ));
+    }
+    Ok((descriptor, base, slot_num))
+}
+
+/// Pre-check step of a native Kimi/Grok Add Account flow (mirrors
+/// [`start_codex_login`]): validates the request (id/slot/base-dir/
+/// conflicting-binding) and surfaces whether the vendor CLI binary is
+/// installed, so the modal can render an in-flow install hint BEFORE
+/// spawning the login. No filesystem writes beyond the PATH probe.
+#[tauri::command]
+pub fn start_native_login(
+    base_dir: String,
+    native_id: String,
+    slot: u16,
+) -> Result<StartNativeLoginView, String> {
+    let (descriptor, _base, _slot_num) = resolve_native_login_request(&base_dir, &native_id, slot)?;
+    let cli_installed = csq_core::accounts::login::find_cli_binary(descriptor.binary)
+        .or_else(|| csq_core::cli_deps::install_path::find_in_path(descriptor.binary))
+        .is_some();
+    Ok(StartNativeLoginView {
+        native_id: descriptor.id.to_string(),
+        display_name: descriptor.display_name.to_string(),
+        cli_installed,
+    })
+}
+
+/// Atomically checks-and-reserves `surface` in `children` under a SINGLE
+/// lock acquisition, so two concurrent [`complete_native_login`] calls
+/// for the SAME surface cannot both pass the presence check before
+/// either registers.
+///
+/// # The TOCTOU this closes
+///
+/// The previous shape checked `contains_key(&surface)` under a lock,
+/// RELEASED the lock, and only registered the real child much later —
+/// inside [`spawn_native_device_auth_piped`], after `resolve_native_login_request`,
+/// `tokio::task::spawn_blocking`, and `login_native_with`'s home-dir
+/// creation had all run. Two `complete_native_login` calls for the same
+/// surface could both observe an empty map, both pass the check, and
+/// both go on to spawn a real vendor login — the second spawn's insert
+/// would silently overwrite the first's map entry, orphaning the first
+/// child (uncancellable via [`cancel_native_login`], and racing the same
+/// `native-homes/<surface>-<N>/` directory). Holding the lock across the
+/// check AND the reservation insert removes the window entirely: the
+/// second caller observes the first caller's reservation and is
+/// refused before ever reaching `spawn_blocking`.
+///
+/// The reservation is a `None` placeholder — see [`NativeLoginChildren`]
+/// — later overwritten with `Some(child)` by
+/// [`spawn_native_device_auth_piped`] once the vendor binary is
+/// actually spawned. [`complete_native_login`] clears the reservation
+/// (whether it ever became a real child or not) on every exit path, so
+/// a failed spawn can never wedge the surface permanently.
+///
+/// Extracted as a pure function (mirrors [`cancel_native_login_from`])
+/// so the refusal path is unit-testable without a live Tauri runtime.
+///
+/// # Errors
+///
+/// `"<display_name> login already in progress — cancel the running
+/// flow before starting a new one"` if `surface` already has an entry
+/// (reserved OR spawned).
+fn reserve_native_login_slot(
+    children: &NativeLoginChildren,
+    surface: csq_core::providers::catalog::Surface,
+    display_name: &str,
+) -> Result<(), String> {
+    let mut guard = children
+        .lock()
+        .map_err(|_| "native login slot poisoned".to_string())?;
+    if guard.contains_key(&surface) {
+        return Err(format!(
+            "{display_name} login already in progress — cancel the running flow before starting a new one"
+        ));
+    }
+    guard.insert(surface, None);
+    Ok(())
+}
+
+/// Belt-and-suspenders reservation cleanup for [`complete_native_login`]
+/// (redteam R2 LOW-1 + LOW-2).
+///
+/// The spawn closure's `wait` closure (inside
+/// [`spawn_native_device_auth_piped`]) already clears the surface's map
+/// entry on the happy path, once the vendor subprocess is reaped. But an
+/// early pre-spawn error (binary not found, or `login_native_with`
+/// erroring before it ever calls the spawn closure) would leave the
+/// `None` reservation from [`reserve_native_login_slot`] in place forever
+/// without a second cleanup path.
+///
+/// The naive fix — an unconditional `remove` after `login_native_with`
+/// returns — is a TOCTOU itself: once spawn succeeds, the `wait` closure
+/// ALWAYS clears the entry before `login_native_with` returns (see its
+/// doc), so an unconditional remove afterward runs AFTER that clear —
+/// and can delete a DIFFERENT, concurrent same-surface login's fresh
+/// reservation if one raced in during the gap (LOW-1). `spawned` — set
+/// `true` the instant [`spawn_native_device_auth_piped`] registers a real
+/// child — lets this guard tell "my reservation is still sitting
+/// untouched" (spawn never happened, safe to remove — nobody else could
+/// have reserved while our entry was present, since
+/// [`reserve_native_login_slot`] refuses a second reservation for the
+/// same surface) from "the wait closure already handled it" (spawn
+/// happened, never touch the entry again).
+///
+/// Implemented as a `Drop` guard rather than an unconditional post-call
+/// statement so cleanup ALSO fires if `login_native_with` panics
+/// (LOW-2) — Rust runs `Drop` impls during stack unwinding, so this
+/// guard clears a still-`None` reservation even when the panic unwinds
+/// past the point an ordinary "cleanup after the call" statement would
+/// have run. A panic AFTER a successful spawn (`spawned == true`)
+/// intentionally leaves the entry in place — a real subprocess may still
+/// be running and [`cancel_native_login`] needs the entry to reach it.
+struct NativeLoginReservationCleanup {
+    children: NativeLoginChildren,
+    surface: csq_core::providers::catalog::Surface,
+    spawned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for NativeLoginReservationCleanup {
+    fn drop(&mut self) {
+        if !self.spawned.load(std::sync::atomic::Ordering::Acquire) {
+            if let Ok(mut guard) = self.children.lock() {
+                guard.remove(&self.surface);
+            }
+        }
+    }
+}
+
+/// Completes a native Kimi/Grok Add Account flow: spawns the vendor's
+/// device-code login (`kimi login` / `grok login --device-auth`) into
+/// the slot's isolated vendor home (0135 design lock), forwards
+/// `native-device-code` events as the vendor's device code appears
+/// (via `login_native_with`'s host-allowlisted parser — see the module
+/// doc above), blocks until the subprocess exits, and writes the
+/// credential-less binding marker on success ONLY — no marker on
+/// failure, and no marker if the vendor exits 0 without ever writing
+/// its own credential file (`native_login::finish_native_login`).
+///
+/// # Concurrency (mirrors an internal journal entry finding 8, scoped per-surface)
+///
+/// Refused per SURFACE, not per slot or globally: a Kimi login already
+/// in flight blocks a second Kimi login (any slot), but a Grok login may
+/// run concurrently — independent vendor binary, independent vendor
+/// home. Observed via `AppState.native_login_children` keyed by
+/// [`csq_core::providers::catalog::Surface`].
+///
+/// The refusal check and the surface reservation happen under a SINGLE
+/// lock acquisition ([`reserve_native_login_slot`]) — two concurrent
+/// calls for the SAME surface cannot both pass the check before either
+/// registers, which a check-then-release-then-register-much-later
+/// sequence would allow (see that function's doc for the TOCTOU this
+/// closes).
+///
+/// # Cancellation
+///
+/// The spawned child is registered in `AppState.native_login_children`
+/// so [`cancel_native_login`] can kill it from the modal's
+/// close/unmount handler.
+#[tauri::command]
+pub async fn complete_native_login(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    base_dir: String,
+    native_id: String,
+    slot: u16,
+) -> Result<(), String> {
+    let (descriptor, base, slot_num) = resolve_native_login_request(&base_dir, &native_id, slot)?;
+    let surface = descriptor.surface;
+
+    reserve_native_login_slot(
+        &state.native_login_children,
+        surface,
+        descriptor.display_name,
+    )?;
+
+    let children = state.native_login_children.clone();
+    let children_for_cleanup = children.clone();
+    let app_for_task = app.clone();
+
+    let login_result: Result<(), String> = tokio::task::spawn_blocking(move || {
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cleanup = NativeLoginReservationCleanup {
+            children: children_for_cleanup,
+            surface,
+            spawned: spawned.clone(),
+        };
+
+        csq_core::providers::native_login::login_native_with(
+            &base,
+            slot_num,
+            surface,
+            |home, binary, args, home_env| {
+                spawn_native_device_auth_piped(
+                    home, binary, args, home_env, surface, &children, &spawned,
+                )
+            },
+            |code| {
+                let _ = app_for_task.emit_to(
+                    "main",
+                    "native-device-code",
+                    &NativeDeviceCodeView {
+                        surface: surface.as_str().to_string(),
+                        user_code: code.user_code,
+                        verification_url: code.verification_url,
+                    },
+                );
+            },
+        )
+        .map_err(|e| {
+            csq_core::error::redact_tokens(&csq_core::cli_deps::sanitize::redact_home_anywhere(
+                &format!("{e:#}"),
+            ))
+        })
+    })
+    .await
+    .map_err(|e| format!("complete_native_login task failed: {e}"))?;
+
+    login_result?;
+
+    // Best-effort daemon cache invalidation, mirroring
+    // complete_codex_login / the retired provision_native_cli. Fast
+    // local Unix-socket call — no spawn_blocking wrapper needed.
+    #[cfg(unix)]
+    {
+        let base = PathBuf::from(&base_dir);
+        let sock = csq_core::daemon::socket_path(&base);
+        if sock.exists() {
+            let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
+        }
+    }
+
+    Ok(())
+}
+
+/// Cancels an in-flight native (Kimi/Grok) login by killing the child
+/// process registered for `native_id`'s surface. No-op when no login is
+/// running for that surface. Mirrors [`cancel_codex_login`].
+#[tauri::command]
+pub fn cancel_native_login(state: State<'_, AppState>, native_id: String) -> Result<(), String> {
+    cancel_native_login_from(&state.native_login_children, &native_id)
+}
+
+/// Pure inner of [`cancel_native_login`] — takes the per-surface child
+/// map directly so the id-resolution + kill contract can be
+/// unit-tested without constructing a Tauri runtime (mirrors
+/// `consume_prefs_recovery_from`, which extracts for the same reason:
+/// `#[tauri::command]`'s `State<'_, AppState>` requires the full app
+/// handle to instantiate).
+fn cancel_native_login_from(children: &NativeLoginChildren, native_id: &str) -> Result<(), String> {
+    let descriptor = csq_core::providers::native::descriptor_by_id(native_id)
+        .ok_or_else(|| format!("unknown native CLI id: {native_id}"))?;
+    let handle_opt = {
+        let guard = children.lock().map_err(|_| "native login slot poisoned")?;
+        guard.get(&descriptor.surface).cloned()
+    };
+    // `None` (no map entry) = nothing running. `Some(None)` = a
+    // `reserve_native_login_slot` reservation that hasn't been
+    // overwritten with a real child yet (still resolving / pre-spawn) —
+    // also nothing to kill. Only `Some(Some(handle))` has a live child.
+    let Some(Some(handle)) = handle_opt else {
+        return Ok(());
+    };
+    let mut child = handle.lock().map_err(|_| "native login child poisoned")?;
+    let _ = child.kill();
+    Ok(())
+}
+
+/// Production spawn closure for [`complete_native_login`]. Starts the
+/// real vendor binary (`kimi` / `grok`) with `<home_env>=<home>` and
+/// piped stdout, registers the child in `AppState.native_login_children`
+/// (keyed by [`csq_core::providers::catalog::Surface`]) so
+/// [`cancel_native_login`] can kill it, and returns a
+/// [`csq_core::providers::native_login::SpawnedNativeLogin`] handle.
+///
+/// Device-code parsing happens ENTIRELY inside `login_native_with` —
+/// this function never inspects the piped stdout's content, only wires
+/// the raw reader through (0135 C8 primary methodological directive).
+///
+/// Resolves the binary via
+/// [`csq_core::cli_deps::install_path::find_in_path`] (kimi/grok
+/// known-install-dir aware) rather than the OS's own PATH search inside
+/// `Command::new`, mirroring [`spawn_codex_device_auth_piped`].
+///
+/// `spawned` is set `true` the instant a real child is registered in
+/// `children` (redteam R2 LOW-1 + LOW-2) — [`complete_native_login`]'s
+/// `ReservationCleanup` guard reads it to decide whether the belt-and-
+/// suspenders reservation cleanup is safe to run (it is NOT once a real
+/// spawn has happened, since the `wait` closure below already owns
+/// clearing the entry from that point on).
+#[allow(clippy::too_many_arguments)]
+fn spawn_native_device_auth_piped(
+    home: &std::path::Path,
+    binary: &str,
+    login_args: &[&str],
+    home_env: &str,
+    surface: csq_core::providers::catalog::Surface,
+    children: &NativeLoginChildren,
+    spawned: &Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<csq_core::providers::native_login::SpawnedNativeLogin> {
+    use std::process::{Command, Stdio};
+
+    let bin_path = csq_core::cli_deps::install_path::find_in_path(binary).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "could not locate the `{binary}` binary in $PATH or any standard install \
+                 location — install it and try again"
+            ),
+        )
+    })?;
+
+    let mut child = Command::new(&bin_path)
+        .args(login_args)
+        // Strip BOTH known native home vars before setting this
+        // surface's own — same strip-before-set discipline
+        // `set_native_home_env` uses for `csq run` (0135 design lock):
+        // a parent shell exporting the OTHER surface's home var must
+        // never leak into this spawn. Not a security defect on its own
+        // (the login subprocess only ever reads its own `home_env`),
+        // but keeps the discipline uniform across every native spawn
+        // site rather than leaving login as the one exception.
+        .env_remove(csq_core::providers::native::KIMI.home_env)
+        .env_remove(csq_core::providers::native::GROK.home_env)
+        .env(home_env, home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other(format!("spawned `{binary}` has no piped stdout")))?;
+
+    let child_arc = Arc::new(std::sync::Mutex::new(child));
+
+    // Register for cancel. Overwrite any stale entry defensively —
+    // `complete_native_login`'s pre-check rejects concurrent callers for
+    // the SAME surface, but a panicked prior run could leave a ghost
+    // entry (mirrors `spawn_codex_device_auth_piped`). Overwrites
+    // `reserve_native_login_slot`'s `None` placeholder with the real
+    // child handle.
+    {
+        let mut guard = children
+            .lock()
+            .map_err(|_| std::io::Error::other("native login child slot poisoned"))?;
+        guard.insert(surface, Some(child_arc.clone()));
+    }
+    // From this point on, the `wait` closure below owns clearing the map
+    // entry — mark `spawned` so `ReservationCleanup` (redteam R2 LOW-1)
+    // never touches it, even on a later panic (LOW-2) or an early return
+    // from this function's caller.
+    spawned.store(true, std::sync::atomic::Ordering::Release);
+
+    let children = children.clone();
+    Ok(csq_core::providers::native_login::SpawnedNativeLogin::new(
+        std::io::BufReader::new(stdout),
+        move || {
+            let status = {
+                let mut guard = child_arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.wait()
+            };
+            // Clear the slot now that the subprocess is fully reaped —
+            // mirrors `spawn_codex_device_auth_piped`'s post-wait clear.
+            if let Ok(mut guard) = children.lock() {
+                guard.remove(&surface);
+            }
+            status
+        },
+    ))
+}
+
 /// Result of [`begin_claude_login`]. Safe to send over IPC — contains
 /// the authorize URL, the CSRF state token, and the target account,
 /// but no tokens, verifier, or authorization code.
 ///
-/// Phase 2 of #389 — no longer reachable from the renderer; struct
+/// Phase 2 of an internal ticket — no longer reachable from the renderer; struct
 /// stays compiled until Phase 3's full deletion of the legacy login
 /// surface.
 #[allow(dead_code)]
@@ -1573,6 +2511,13 @@ pub fn begin_claude_login(
 pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
     let base = std::path::PathBuf::from(&base_dir);
+
+    // GH an internal ticket: the reverse conflict guard that used to run here
+    // (redteam R3) is retired — a stale Gemini/native marker is now detected
+    // pre-mint and cleared on the SUCCESS path by `finalize_login`
+    // (`binding_guard::detect_stale_marker_binding` +
+    // `clear_detected_marker_binding`) rather than refused up-front. See
+    // those functions' doc comments.
 
     tokio::task::spawn_blocking(move || {
         // Resolve `claude` via the shared finder before we start
@@ -1719,6 +2664,13 @@ pub async fn submit_oauth_code(
         .oauth_store
         .consume(&state_token)
         .map_err(|e| format!("no matching login: {e}"))?;
+
+    // GH an internal ticket: the reverse conflict guard that used to run here
+    // (redteam R3) is retired — a stale Gemini/native marker is now detected
+    // pre-mint and cleared on the SUCCESS path by `finalize_login`
+    // (`binding_guard::detect_stale_marker_binding` +
+    // `clear_detected_marker_binding`) rather than refused up-front. See
+    // those functions' doc comments.
 
     // Run the blocking token exchange on a worker thread so we
     // don't freeze the Tauri event loop during the HTTP call.
@@ -1896,12 +2848,12 @@ pub fn set_provider_key(
     }
 
     let mut settings = providers::settings::load_settings(&base, &provider_id)
-        .map_err(|e| format!("load settings: {e}"))?;
+        .map_err(|e| format!("load settings: {}", e.redacted_message()))?;
     settings
         .set_api_key(&key)
-        .map_err(|e| format!("set key: {e}"))?;
+        .map_err(|e| format!("set key: {}", e.redacted_message()))?;
     providers::settings::save_settings(&base, &settings)
-        .map_err(|e| format!("save settings: {e}"))?;
+        .map_err(|e| format!("save settings: {}", e.redacted_message()))?;
 
     Ok(settings.key_fingerprint())
 }
@@ -1982,7 +2934,7 @@ pub fn bind_keyed_provider(
         Some(&key),
         model.as_deref(),
     )
-    .map_err(|e| format!("bind provider to slot: {e}"))
+    .map_err(|e| format!("bind provider to slot: {}", e.redacted_message()))
 }
 
 /// Binds a keyless provider (Ollama) to an account slot, optionally
@@ -2047,7 +2999,7 @@ pub fn bind_keyless_provider(
         None,
         model.as_deref(),
     )
-    .map_err(|e| format!("bind provider: {e}"))
+    .map_err(|e| format!("bind provider: {}", e.redacted_message()))
 }
 
 /// Returns the list of locally-installed Ollama models by running
@@ -2906,10 +3858,99 @@ pub async fn start_codex_login(
             account_num,
             csq_core::providers::codex::keychain::probe_residue,
         )
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| {
+            csq_core::error::redact_tokens(&csq_core::cli_deps::sanitize::redact_home_anywhere(
+                &format!("{e:#}"),
+            ))
+        })
     })
     .await
     .map_err(|e| format!("start_codex_login task failed: {e}"))?
+}
+
+/// Fixed-vocabulary tag for the filesystem error [`AccountLoginLock::acquire`]
+/// returns when it cannot even attempt the lock (distinct from finding it
+/// already HELD, which carries no `io::Error` at all — see
+/// [`AcquireOutcome::Held`]). `std::io::Error`'s `Display` is unspecified and,
+/// for a hand-opened lock file, commonly embeds the absolute path — exactly
+/// the shape `tauri-commands.md` § Anti-Patterns bans ("BAD — leaks internal
+/// paths"). `ErrorKind`'s `Debug` never does, so it is the only part of the
+/// error this handler may interpolate into a renderer-facing string.
+fn login_lock_io_error_tag(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        _ => "io_other",
+    }
+}
+
+/// Acquires the per-account [`AccountLoginLock`] for a desktop Codex
+/// login, or returns a user-facing `Err`.
+///
+/// Extracted from [`complete_codex_login`] so the acquire/refuse
+/// branch is unit-testable without a Tauri `AppHandle` / `State` —
+/// mirrors the CLI's `acquire_login_lock` helper in
+/// `csq/src/cli/commands/login.rs`. `account` is the raw slot number
+/// (not `AccountNum`) purely for rendering in the error string, since
+/// callers already have both forms in scope.
+fn acquire_codex_desktop_login_lock(
+    base: &std::path::Path,
+    account_num: AccountNum,
+) -> Result<AccountLoginLock, String> {
+    let account = account_num.get();
+    match AccountLoginLock::acquire(base, account_num) {
+        Ok(AcquireOutcome::Acquired(guard)) => Ok(guard),
+        Ok(AcquireOutcome::Held { pid: Some(pid), .. }) => Err(format!(
+            "codex login already in progress for slot {account} (PID {pid}) — \
+             wait for it to finish or cancel it before starting a new one"
+        )),
+        Ok(AcquireOutcome::Held { pid: None, .. }) => Err(format!(
+            "codex login already in progress for slot {account} — \
+             wait for it to finish before starting a new one"
+        )),
+        // No path, no `{e}` — see `login_lock_io_error_tag`'s doc comment.
+        Err(e) => Err(format!(
+            "could not acquire login lock for slot {account} ({}) — check \
+             that the accounts directory is writable and try again",
+            login_lock_io_error_tag(&e)
+        )),
+    }
+}
+
+/// Validates `account` + `base_dir` and acquires the per-account
+/// [`AccountLoginLock`] — the full precondition chain
+/// [`complete_codex_login`] runs before any I/O. Extracted (like
+/// [`acquire_codex_desktop_login_lock`] above it) so the chain is
+/// unit-testable without a Tauri `AppHandle` / `State`.
+///
+/// The base-dir check MUST run before the lock acquire:
+/// `AccountLoginLock::acquire` convenience-calls
+/// `create_dir_all(base_dir)`, so without this ordering a
+/// renderer-supplied bad path would be silently CREATED instead of
+/// rejected — inverting the convention every other command in this
+/// file follows (49 call sites, incl. sibling `acknowledge_codex_tos`
+/// / `list_codex_models`, each testing this exact rejection).
+/// `desktop_login::complete_login` (called later, inside
+/// `spawn_blocking`) has its own base-dir check, but by the time it
+/// runs the lock acquire would already have created the directory,
+/// making that inner check permanently vacuous for this entry point.
+fn codex_login_preconditions(
+    base_dir: &str,
+    account: u16,
+) -> Result<(AccountNum, PathBuf, AccountLoginLock), String> {
+    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
+    let base = PathBuf::from(base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+    // Cross-process guard: a concurrent `csq login N --provider codex`
+    // (or another desktop instance — not expected, but the lock is
+    // cheap insurance) for this same slot is refused here rather than
+    // racing the codex-cli subprocess. Non-blocking try-lock —
+    // reports contention immediately instead of hanging the modal.
+    let lock = acquire_codex_desktop_login_lock(&base, account_num)?;
+    Ok((account_num, base, lock))
 }
 
 /// Completes a Codex Add Account flow after the UI has resolved the
@@ -2932,6 +3973,22 @@ pub async fn start_codex_login(
 /// populated we refuse. Once the first call completes (success or
 /// failure), the slot is cleared and a retry is allowed.
 ///
+/// # Cross-process exclusion
+///
+/// `AppState.codex_login_child` only protects against a second
+/// invocation *within this desktop process*. It says nothing about a
+/// concurrent `csq login N --provider codex` running in a terminal
+/// for the SAME slot — both spawn `codex login --device-auth` with
+/// the same `CODEX_HOME=config-<N>/`, racing the subprocess's own
+/// `auth.json` write before either side reaches
+/// `providers::codex::login::perform_with` /
+/// `desktop_login::complete_login`'s `ProfilesFileLock`, which only
+/// serialises the identity-mint + canonical-save step. The
+/// per-account [`AccountLoginLock`] (UX-R1-H3, shared with the CLI's
+/// Claude paths and [`claude_login_subprocess`]) closes that
+/// gap; acquired by [`codex_login_preconditions`] before the in-process
+/// slot check below, and held for the lifetime of this command.
+///
 /// # Cancellation (an internal journal entry finding 6)
 ///
 /// The running child process is registered in
@@ -2939,6 +3996,20 @@ pub async fn start_codex_login(
 /// SIGKILL it from the modal's close/unmount handler. Without this the
 /// subprocess orphans for the minutes-long device-auth window after
 /// the user closes the modal.
+///
+/// # Cross-surface marker cleanup (GH an internal ticket)
+///
+/// The reverse conflict guard that used to refuse here up-front (redteam R2
+/// MED-3) is retired. A stale Gemini or native (Kimi/Grok) marker on
+/// `account` is now detected pre-mint and cleared on the success path, deep
+/// inside [`csq_core::providers::codex::desktop_login::complete_login`]
+/// (mirroring the CLI codex path's `providers::codex::login::perform_with`),
+/// rather than refused here — silent replace, not refuse, matching the
+/// shipped 3P-unbind precedent. The desktop NATIVE provision path
+/// (`resolve_native_login_request` above, via
+/// `native::conflicting_bound_surface`) is UNCHANGED and still refuses
+/// native↔native and native↔other (an additive marker bind, not an
+/// OAuth-login replace).
 #[tauri::command]
 pub async fn complete_codex_login(
     app: AppHandle,
@@ -2947,8 +4018,8 @@ pub async fn complete_codex_login(
     account: u16,
     purge_keychain: bool,
 ) -> Result<csq_core::providers::codex::desktop_login::CompleteLoginView, String> {
-    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
-    let base = PathBuf::from(&base_dir);
+    let (account_num, base, _cross_process_lock) = codex_login_preconditions(&base_dir, account)?;
+
     let app_for_task = app.clone();
 
     // an internal journal entry finding 8: refuse concurrent invocations for any
@@ -2991,8 +4062,16 @@ pub async fn complete_codex_login(
         // through `redact_tokens` before it reaches the renderer.
         // Defense-in-depth — inner call sites already redact, but
         // a future `.context(...)` that omits redaction would leak
-        // without this outer wrapper.
-        .map_err(|e| csq_core::error::redact_tokens(&format!("{e:#}")));
+        // without this outer wrapper. `redact_home_anywhere` is the
+        // path-leak half of that same defense-in-depth (an internal ticket
+        // — the anyhow chain can wrap a path-bearing error, e.g.
+        // `CredentialError`/`ConfigError`, that a future `.context(...)`
+        // forgets to redact at its own construction site).
+        .map_err(|e| {
+            csq_core::error::redact_tokens(&csq_core::cli_deps::sanitize::redact_home_anywhere(
+                &format!("{e:#}"),
+            ))
+        });
 
         // Always clear the child slot once we exit, regardless of
         // result. The slot is cleared inside
@@ -3077,7 +4156,7 @@ pub fn cancel_codex_login(state: State<'_, AppState>) -> Result<(), String> {
 /// diagnostic falsely reports "codex-cli output format may have
 /// changed" for legitimate user-cancel cases.
 ///
-/// Origin: redteam follow-up to PRs #335-#337 (LOW finding —
+/// Origin: redteam follow-up to PRs an internal ticket-an internal ticket (LOW finding —
 /// user-cancel diagnostic mis-frame).
 fn should_emit_url_without_code_diagnostic(
     child_exited_successfully: bool,
@@ -3388,7 +4467,7 @@ fn spawn_codex_device_auth_piped(
     // mid-flow (after the URL is printed but before a code shape is
     // emitted) still routes to the upstream "user may have cancelled"
     // message rather than the false-positive "output format may have
-    // changed" diagnostic. Origin: redteam follow-up to PRs #335-#337
+    // changed" diagnostic. Origin: redteam follow-up to PRs an internal ticket-an internal ticket
     // (LOW finding — user-cancel diagnostic mis-frame).
     let saw_url = accumulator.lock().map(|acc| acc.saw_url()).unwrap_or(false);
     if should_emit_url_without_code_diagnostic(status.success(), saw_url, seen_code) {
@@ -3472,7 +4551,7 @@ fn fetch_codex_models_live(base_dir: &std::path::Path) -> Result<Vec<u8>, String
         csq_core::providers::catalog::Surface::Codex,
     );
     let creds = csq_core::credentials::load(&canonical)
-        .map_err(|e| format!("load codex credentials: {e}"))?;
+        .map_err(|e| format!("load codex credentials: {}", e.redacted_message()))?;
     let token = creds
         .codex()
         .ok_or_else(|| "credentials at canonical path are not codex-shape".to_string())?
@@ -3653,8 +4732,14 @@ pub fn set_codex_slot_model(
     // Explicit user choice → `Some`: the desktop model picker sets the per-slot
     // `model` key (mirrors the `csq models set codex` CLI path). login/spawn
     // callers pass `None`.
-    csq_core::providers::codex::surface::write_config_toml(&base, slot_num, Some(&model))
-        .map_err(|e| format!("write codex config.toml: {e}"))?;
+    csq_core::providers::codex::surface::write_config_toml(&base, slot_num, Some(&model)).map_err(
+        |e| {
+            format!(
+                "write codex config.toml: {}",
+                csq_core::cli_deps::sanitize::redact_display(e)
+            )
+        },
+    )?;
     let _ = app.emit(
         "slot-model-changed",
         serde_json::json!({ "slot": slot, "model": model, "surface": "codex" }),
@@ -3673,7 +4758,12 @@ pub fn acknowledge_codex_tos(base_dir: String) -> Result<(), String> {
     }
     csq_core::providers::codex::tos::acknowledge(&base)
         .map(|_| ())
-        .map_err(|e| format!("acknowledge codex tos: {e}"))
+        .map_err(|e| {
+            format!(
+                "acknowledge codex tos: {}",
+                csq_core::cli_deps::sanitize::redact_display(e)
+            )
+        })
 }
 
 // ── PR-G5 — Gemini desktop UI commands ──────────────────────────
@@ -3715,7 +4805,12 @@ pub fn acknowledge_gemini_tos(base_dir: String) -> Result<(), String> {
     }
     csq_core::providers::gemini::tos::acknowledge(&base)
         .map(|_| ())
-        .map_err(|e| format!("acknowledge gemini tos: {e}"))
+        .map_err(|e| {
+            format!(
+                "acknowledge gemini tos: {}",
+                csq_core::cli_deps::sanitize::redact_display(e)
+            )
+        })
 }
 
 /// Probes whether `~/.gemini/oauth_creds.json` exists. The Add
@@ -3749,9 +4844,7 @@ pub fn gemini_probe_tos_residue() -> Result<Option<String>, String> {
 /// bound to a non-Gemini surface (Codex / Anthropic OAuth).
 #[tauri::command]
 pub fn gemini_provision_api_key(base_dir: String, slot: u16, key: String) -> Result<(), String> {
-    use csq_core::providers::gemini::provisioning::{
-        detect_other_surface_binding, provision_api_key_via_vault, BoundSurface,
-    };
+    use csq_core::providers::gemini::provisioning::provision_api_key_via_vault;
     use secrecy::SecretString;
 
     let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
@@ -3784,13 +4877,14 @@ pub fn gemini_provision_api_key(base_dir: String, slot: u16, key: String) -> Res
         return Err(format!("base directory does not exist: {base_dir}"));
     }
 
-    if let Some(existing) = detect_other_surface_binding(&base, slot_num) {
-        let surface_name = match existing {
-            BoundSurface::Codex => "Codex",
-            BoundSurface::ClaudeCode => "Claude (Anthropic OAuth)",
-        };
+    if let Some(existing) = csq_core::accounts::binding_guard::conflicting_bound_surface(
+        &base,
+        slot_num,
+        csq_core::providers::catalog::Surface::Gemini,
+    ) {
         return Err(format!(
-            "slot {slot} is bound to {surface_name} — run `csq logout {slot}` to rebind to Gemini"
+            "slot {slot} is bound to {} — run `csq logout {slot}` to rebind to Gemini",
+            existing.label()
         ));
     }
 
@@ -3799,7 +4893,7 @@ pub fn gemini_provision_api_key(base_dir: String, slot: u16, key: String) -> Res
 
     let secret = SecretString::new(trimmed.to_string().into());
     provision_api_key_via_vault(&base, slot_num, &secret, vault.as_ref())
-        .map_err(|e| format!("provision api key: {e}"))?;
+        .map_err(|e| format!("provision api key: {}", e.redacted_message()))?;
     Ok(())
 }
 
@@ -3815,9 +4909,7 @@ pub fn gemini_provision_vertex_sa(
     slot: u16,
     sa_path: String,
 ) -> Result<String, String> {
-    use csq_core::providers::gemini::provisioning::{
-        detect_other_surface_binding, provision_vertex_sa, BoundSurface,
-    };
+    use csq_core::providers::gemini::provisioning::provision_vertex_sa;
 
     let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
     let trimmed = sa_path.trim();
@@ -3836,19 +4928,212 @@ pub fn gemini_provision_vertex_sa(
         return Err(format!("base directory does not exist: {base_dir}"));
     }
 
-    if let Some(existing) = detect_other_surface_binding(&base, slot_num) {
-        let surface_name = match existing {
-            BoundSurface::Codex => "Codex",
-            BoundSurface::ClaudeCode => "Claude (Anthropic OAuth)",
-        };
+    if let Some(existing) = csq_core::accounts::binding_guard::conflicting_bound_surface(
+        &base,
+        slot_num,
+        csq_core::providers::catalog::Surface::Gemini,
+    ) {
         return Err(format!(
-            "slot {slot} is bound to {surface_name} — run `csq logout {slot}` to rebind to Gemini"
+            "slot {slot} is bound to {} — run `csq logout {slot}` to rebind to Gemini",
+            existing.label()
         ));
     }
 
     let canonical = provision_vertex_sa(&base, slot_num, &path)
-        .map_err(|e| format!("provision vertex sa: {e}"))?;
+        .map_err(|e| format!("provision vertex sa: {}", e.redacted_message()))?;
     Ok(canonical.display().to_string())
+}
+
+// ── an internal ticket PR-2 — cloud-Claude desktop provisioning ──────────────
+//
+// Desktop parity for the `csq setkey claude --backend vertex|bedrock` CLI
+// (PR-1). Both commands are thin IPC wrappers: validate at the boundary,
+// then delegate to `bind_cloud_claude_backend_to_slot`, which owns the
+// fail-closed conflict guard (a cloud backend binds only over a bare slot
+// or an existing cloud slot), the SSRF/DNS-label validation of
+// project/region, the SA-path validation (regular file, ≤ 64 KiB, not a
+// symlink), the residency gate, and the locked `config-N/settings.json`
+// RMW. Nothing here re-implements that logic.
+//
+// Enterprise-only: cloud-Claude routing (Vertex/Bedrock Claude access) is
+// an enterprise entitlement, so `bind_cloud_claude_backend_to_slot` and
+// `CloudClaudeBackendSpec` are `#[cfg(feature = "enterprise")]`. The
+// commands and their `generate_handler!` registration carry the same gate,
+// and the renderer only surfaces the cloud-Claude card when
+// `get_build_edition()` returns `"enterprise"`.
+//
+// The Bedrock bearer token arrives as an IPC in-argument (mirroring
+// `gemini_provision_api_key`'s `key: String`) — a secret in a return type
+// is forbidden (`rules/tauri-commands.md` §3), but an inbound secret arg
+// is the same shape the Gemini API-key path already uses.
+
+/// Maps a cloud-Claude [`ConfigError`](csq_core::error::ConfigError) to user-actionable modal text
+/// without leaking the on-disk settings path. `SlotSurfaceConflict` and
+/// `MergeConflict` (input-validation rejects from the backend) already
+/// carry clean, path-free Display strings; `InvalidJson` is the only
+/// variant that embeds a path, so it is collapsed to a generic message.
+#[cfg(feature = "enterprise")]
+fn cloud_claude_error_text(e: csq_core::error::ConfigError) -> String {
+    use csq_core::error::ConfigError;
+    match e {
+        ConfigError::InvalidJson { .. } => {
+            "cloud-Claude provisioning failed writing the slot settings".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Provisions a `ClaudeCode` slot to route Anthropic Claude through Google
+/// Vertex AI (an internal ticket). Writes the cloud env block CC reads on startup
+/// (`CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`,
+/// `CLOUD_ML_REGION`, `GOOGLE_APPLICATION_CREDENTIALS`) into the per-slot
+/// `config-N/settings.json`. The `sa_path` is the GCP service-account JSON
+/// (validated by the backend: regular file, ≤ 64 KiB, not a symlink,
+/// canonicalised); `project`/`region` are DNS-label-validated by the
+/// backend before interpolation into the GCP endpoint (SSRF defense).
+///
+/// Fail-closed: binding a cloud backend over an Anthropic OAuth slot, a
+/// Codex/Gemini/native slot, or a real 3P-bearer slot is REFUSED by the
+/// backend (`SlotSurfaceConflict`) — surfaced here as the modal error.
+///
+/// Enterprise-only.
+#[cfg(feature = "enterprise")]
+#[tauri::command]
+pub fn cloud_claude_provision_vertex(
+    base_dir: String,
+    slot: u16,
+    project: String,
+    region: String,
+    sa_path: String,
+) -> Result<(), String> {
+    use csq_core::accounts::third_party::{
+        bind_cloud_claude_backend_to_slot, CloudClaudeBackendSpec,
+    };
+
+    let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
+
+    let project = project.trim();
+    if project.is_empty() {
+        return Err("Vertex project ID must not be empty".into());
+    }
+    let region = region.trim();
+    if region.is_empty() {
+        return Err("Vertex region must not be empty".into());
+    }
+    let sa_trimmed = sa_path.trim();
+    if sa_trimmed.is_empty() {
+        return Err("Vertex SA JSON path must not be empty".into());
+    }
+    let path = PathBuf::from(sa_trimmed);
+    if !path.is_absolute() {
+        return Err(format!(
+            "Vertex SA JSON path must be absolute (got `{sa_trimmed}`)"
+        ));
+    }
+
+    let base = PathBuf::from(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+
+    bind_cloud_claude_backend_to_slot(
+        &base,
+        slot_num,
+        &CloudClaudeBackendSpec::Vertex {
+            project,
+            region,
+            sa_path: &path,
+        },
+    )
+    .map_err(cloud_claude_error_text)
+}
+
+/// Provisions a `ClaudeCode` slot to route Anthropic Claude through AWS
+/// Bedrock (an internal ticket). Writes `CLAUDE_CODE_USE_BEDROCK`, `AWS_REGION`,
+/// and `AWS_BEARER_TOKEN_BEDROCK` into the per-slot `config-N/settings.json`.
+/// `region` is DNS-label-validated by the backend; `bearer_token` shape is
+/// validated by the backend (`validate_key_shape`). The token is an inbound
+/// IPC argument and is NEVER echoed back over IPC (no secret in the return
+/// type — `rules/tauri-commands.md` §3).
+///
+/// Fail-closed on a non-bare / non-cloud slot, identical to the Vertex path.
+///
+/// Enterprise-only.
+#[cfg(feature = "enterprise")]
+#[tauri::command]
+pub fn cloud_claude_provision_bedrock(
+    base_dir: String,
+    slot: u16,
+    region: String,
+    bearer_token: String,
+) -> Result<(), String> {
+    use csq_core::accounts::third_party::{
+        bind_cloud_claude_backend_to_slot, CloudClaudeBackendSpec,
+    };
+
+    let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
+
+    let region = region.trim();
+    if region.is_empty() {
+        return Err("Bedrock region must not be empty".into());
+    }
+    let token = bearer_token.trim();
+    if token.is_empty() {
+        return Err("AWS Bedrock bearer token must not be empty".into());
+    }
+    if token.chars().any(|c| c.is_ascii_control()) {
+        return Err("bearer token contains control characters — paste likely truncated".into());
+    }
+
+    let base = PathBuf::from(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+
+    bind_cloud_claude_backend_to_slot(
+        &base,
+        slot_num,
+        &CloudClaudeBackendSpec::Bedrock {
+            region,
+            bearer_token: token,
+        },
+    )
+    .map_err(cloud_claude_error_text)
+}
+
+/// Acquires the per-account [`AccountLoginLock`] for a desktop Gemini
+/// login, or returns a user-facing `Err`.
+///
+/// Extracted from [`gemini_provision_oauth`] so the acquire/refuse
+/// branch is unit-testable without a Tauri `AppHandle` / `State` —
+/// mirrors the CLI's `acquire_login_lock` helper in
+/// `csq/src/cli/commands/login.rs` (called there with `bypass_hint:
+/// None`, since gemini has no `--legacy-shell`-style escape hatch).
+/// `account` is the raw slot number (not `AccountNum`) purely for
+/// rendering in the error string, since callers already have both
+/// forms in scope.
+fn acquire_gemini_desktop_login_lock(
+    base: &std::path::Path,
+    account_num: AccountNum,
+) -> Result<AccountLoginLock, String> {
+    let account = account_num.get();
+    match AccountLoginLock::acquire(base, account_num) {
+        Ok(AcquireOutcome::Acquired(guard)) => Ok(guard),
+        Ok(AcquireOutcome::Held { pid: Some(pid), .. }) => Err(format!(
+            "gemini login already in progress for slot {account} (PID {pid}) — \
+             wait for it to finish or cancel it before starting a new one"
+        )),
+        Ok(AcquireOutcome::Held { pid: None, .. }) => Err(format!(
+            "gemini login already in progress for slot {account} — \
+             wait for it to finish before starting a new one"
+        )),
+        // No path, no `{e}` — see `login_lock_io_error_tag`'s doc comment.
+        Err(e) => Err(format!(
+            "could not acquire login lock for slot {account} ({}) — check \
+             that the accounts directory is writable and try again",
+            login_lock_io_error_tag(&e)
+        )),
+    }
 }
 
 /// Records a Gemini slot binding in Code Assist OAuth mode. csq drives
@@ -3880,6 +5165,20 @@ pub fn gemini_provision_vertex_sa(
 ///
 /// Boundary validation: rejects invalid account numbers and slots
 /// already bound to a non-Gemini surface (Codex / Anthropic OAuth).
+///
+/// # Cross-process exclusion
+///
+/// A concurrent `csq login N --provider gemini` running in a
+/// terminal for the SAME slot would otherwise race this command's
+/// call into `oauth_login::perform` — both drive the OAuth dance and
+/// write the SAME shared `~/.gemini/oauth_creds.json` (gemini-cli has
+/// no per-slot credential store), and both write the same per-slot
+/// `profiles.json` + identity marker on completion, so the last
+/// writer wins silently. The per-account [`AccountLoginLock`]
+/// (UX-R1-H3, shared with the CLI's `acquire_login_lock` and
+/// [`claude_login_subprocess`]) closes that gap; acquired
+/// here, before the `spawn_blocking` call into `perform`, and held
+/// for the lifetime of this command.
 ///
 /// # Performance
 ///
@@ -3917,6 +5216,29 @@ pub async fn gemini_provision_oauth(base_dir: String, slot: u16) -> Result<(), S
     use csq_core::providers::gemini::oauth_login;
 
     let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
+    let base = PathBuf::from(&base_dir);
+
+    // Validated BEFORE the lock acquire, not after: `AccountLoginLock::acquire`
+    // calls `create_dir_all(base_dir)` as a convenience for a legitimately
+    // missing (but creatable) base dir, which would silently paper over a
+    // genuinely bogus `base_dir` — the caller would get a confusing
+    // filesystem error (or, worse, the directory would be silently created)
+    // instead of the clear, established `"base directory does not exist"`
+    // this IPC boundary always returns (see every other command in this
+    // file). Checked explicitly here so that contract holds regardless of
+    // the lock's own directory-creation convenience behavior.
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+
+    // Cross-process guard (see doc comment above): a concurrent
+    // `csq login N --provider gemini` (or another desktop instance —
+    // not expected, but the lock is cheap insurance) for this same
+    // slot is refused here rather than racing the shared
+    // `~/.gemini/oauth_creds.json` write / OAuth flow. Non-blocking
+    // try-lock — reports contention immediately instead of hanging
+    // the modal on what looks like a slow OAuth flow.
+    let _cross_process_lock = acquire_gemini_desktop_login_lock(&base, slot_num)?;
 
     // All other boundary validation (base_dir existence, other-surface
     // conflict, .env shadow auth) lives inside `oauth_login::perform`
@@ -3928,16 +5250,18 @@ pub async fn gemini_provision_oauth(base_dir: String, slot: u16) -> Result<(), S
     // event-loop responsiveness even though the operation is fast
     // (milliseconds, no subprocess, no browser wait — an internal journal entry).
     //
-    // Redact at the IPC boundary: `BindingWriteFailed` wraps
-    // `ProvisionError` whose Display chain may include path / reason
-    // strings; defense-in-depth runs every error through
-    // `redact_tokens` before it reaches the renderer (round-2
-    // redteam MED).
-    let base = PathBuf::from(base_dir);
+    // Redact at the IPC boundary: `GeminiOauthCredsMalformed` /
+    // `GeminiOauthCredsUnreadable` / `BaseDirMissing` carry a `path`
+    // field directly, and `BindingWriteFailed` wraps `ProvisionError`
+    // (its own path fields redacted via `ProvisionError::redacted_message`) —
+    // `OauthLoginError::redacted_message` handles all of these by
+    // variant. `redact_tokens` on top is defense-in-depth for any
+    // secret material that reaches a Display string via `{0}`
+    // passthrough (round-2 redteam MED; an internal ticket for the path half).
     tokio::task::spawn_blocking(move || oauth_login::perform(&base, slot_num))
         .await
         .map_err(|e| format!("internal: spawn_blocking join failed: {e}"))?
-        .map_err(|e| csq_core::error::redact_tokens(&e.to_string()))?;
+        .map_err(|e| csq_core::error::redact_tokens(&e.redacted_message()))?;
     Ok(())
 }
 
@@ -3972,8 +5296,9 @@ pub fn gemini_switch_model(
 
     set_model_name(&base, slot_num, model_trimmed).map_err(|e| {
         format!(
-            "switch gemini model on slot {slot} to `{model_trimmed}`: {} ({e})",
-            e.error_kind_tag()
+            "switch gemini model on slot {slot} to `{model_trimmed}`: {} ({})",
+            e.error_kind_tag(),
+            e.redacted_message()
         )
     })?;
 
@@ -4002,7 +5327,7 @@ mod tests {
     // before a code shape is emitted. Only success-with-orphan-URL
     // is a "format may have changed" event; everything else routes
     // through the upstream "user may have cancelled" path.
-    // Origin: redteam follow-up to PRs #335-#337.
+    // Origin: redteam follow-up to PRs an internal ticket-an internal ticket.
 
     #[test]
     fn diagnostic_fires_on_success_with_url_and_no_code() {
@@ -4033,6 +5358,239 @@ mod tests {
         // Normal success path — code reached the user. No diagnostic.
         assert!(!should_emit_url_without_code_diagnostic(true, true, true));
         assert!(!should_emit_url_without_code_diagnostic(true, false, true));
+    }
+
+    // ── acquire_codex_desktop_login_lock: cross-process exclusion ──
+    //
+    // `complete_codex_login` (the real Tauri command) needs an
+    // `AppHandle` + `State<'_, AppState>`, which is impractical to
+    // fake outside `tauri::test::mock_app()` (see the sibling
+    // placeholder in `claude_login_subprocess.rs`'s test module for
+    // the same tracked gap). The lock acquire/refuse branch is
+    // extracted into this pure helper specifically so it is testable
+    // without that machinery — mirrors the CLI's `acquire_login_lock`.
+
+    #[test]
+    fn acquire_codex_desktop_login_lock_refuses_when_held() {
+        use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(31u16).unwrap();
+
+        // Hold the lock ourselves first. Same-process, second `open()`
+        // — flock is scoped to the open file description, not the
+        // process, so this genuinely reproduces cross-process
+        // contention (same pattern `login_lock.rs`'s own tests use).
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        let err = match acquire_codex_desktop_login_lock(dir.path(), account) {
+            Err(e) => e,
+            Ok(_) => panic!("must refuse while another guard holds the account's lock"),
+        };
+        assert!(
+            err.contains("already in progress"),
+            "error must name the contention, not some other failure: {err}"
+        );
+        assert!(
+            err.contains("31"),
+            "error must name the contended slot: {err}"
+        );
+    }
+
+    #[test]
+    fn acquire_codex_desktop_login_lock_succeeds_when_free() {
+        use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(32u16).unwrap();
+
+        let guard = acquire_codex_desktop_login_lock(dir.path(), account)
+            .expect("must succeed when nothing else holds the account's lock");
+
+        // Prove the returned guard genuinely HOLDS the flock (not a
+        // guard that already dropped, or a no-op stand-in): a second
+        // acquire attempt for the same account, while `guard` is
+        // still alive, must observe contention.
+        match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Held { .. } => {}
+            AcquireOutcome::Acquired(_) => {
+                panic!("returned guard must still hold the lock while alive")
+            }
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn acquire_codex_desktop_login_lock_is_per_account() {
+        use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let held_account = AccountNum::try_from(33u16).unwrap();
+        let other_account = AccountNum::try_from(34u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), held_account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        acquire_codex_desktop_login_lock(dir.path(), other_account)
+            .expect("a different account's slot must not be blocked");
+    }
+
+    // ── login_lock_io_error_tag / L1: no filesystem path over IPC ──
+    //
+    // `AccountLoginLock::acquire`'s `Err` arm carries a bare `std::io::Error`
+    // whose `Display` commonly embeds the absolute lock path (the lock file
+    // is hand-opened via `OpenOptions`, so there is no structured `path`
+    // field to redact by variant — same shape `redact_home_anywhere`'s own
+    // doc comment names). `security.md` MUST-2 / `tauri-commands.md` §
+    // Anti-Patterns ban that path reaching the renderer; the fix is to never
+    // interpolate `{e}` at all and instead classify by `ErrorKind`, whose
+    // `Debug` is a small fixed vocabulary that can never contain one.
+
+    #[test]
+    fn login_lock_io_error_tag_maps_known_kinds() {
+        assert_eq!(
+            login_lock_io_error_tag(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            "permission_denied"
+        );
+        assert_eq!(
+            login_lock_io_error_tag(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+            "not_found"
+        );
+        assert_eq!(
+            login_lock_io_error_tag(&std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+            "already_exists"
+        );
+        assert_eq!(
+            login_lock_io_error_tag(&std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            "io_other"
+        );
+    }
+
+    /// The tag is a fixed `&'static str` picked by `ErrorKind` alone, so it
+    /// structurally cannot echo whatever path-bearing text the OS put in the
+    /// underlying `io::Error`'s `Display` — proven here with an adversarial
+    /// message carrying a path, to make the non-leak an assertion rather
+    /// than an inference from the source.
+    #[test]
+    fn login_lock_io_error_tag_ignores_the_error_message_entirely() {
+        let poisoned = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13) at /Users/attacker/.claude/accounts/.login-4.lock",
+        );
+        let tag = login_lock_io_error_tag(&poisoned);
+        assert_eq!(tag, "permission_denied");
+        assert!(
+            !tag.contains('/'),
+            "tag must never carry path fragments: {tag}"
+        );
+    }
+
+    /// End-to-end: a genuine filesystem failure (base dir made unwritable)
+    /// reaches `acquire_codex_desktop_login_lock`'s `Err(e)` arm, and the
+    /// resulting renderer-facing string names neither the tempdir nor any
+    /// path separator — only the fixed tag and the slot number. Unix-only:
+    /// directory-mode-based permission injection is not portable to Windows
+    /// (`test(login): gate the failure-injection fixtures to unix`).
+    #[cfg(unix)]
+    #[test]
+    fn acquire_codex_desktop_login_lock_filesystem_error_omits_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(35u16).unwrap();
+
+        // No write permission on base_dir -> OpenOptions::create(true) on
+        // the lock file inside it fails with PermissionDenied.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = acquire_codex_desktop_login_lock(dir.path(), account);
+
+        // Restore write permission before the TempDir guard tries to clean
+        // up, regardless of what the assertions below find.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("acquire must fail against an unwritable base_dir"),
+        };
+        assert!(
+            err.contains("permission_denied"),
+            "error must carry the fixed-vocabulary tag: {err}"
+        );
+        assert!(err.contains("35"), "error must still name the slot: {err}");
+        assert!(
+            !err.contains(&dir.path().display().to_string()),
+            "error must not carry the lock file's path: {err}"
+        );
+        assert!(
+            !err.contains('/'),
+            "error must carry no path separator at all: {err}"
+        );
+    }
+
+    // ── codex_login_preconditions: base-dir check precedes the lock ──
+    //
+    // `AccountLoginLock::acquire` convenience-creates its base_dir via
+    // `create_dir_all`. Without an explicit `base.is_dir()` check
+    // BEFORE the lock acquire, a missing/bad base_dir would be
+    // silently created instead of rejected — the exact regression
+    // caught on this PR (the desktop convention, pinned by 49 sibling
+    // call sites incl. `acknowledge_codex_tos_rejects_missing_base_dir`
+    // / `list_codex_models_rejects_missing_base_dir` below, is reject
+    // not create).
+
+    #[test]
+    fn codex_login_preconditions_rejects_missing_base_dir() {
+        let err = match codex_login_preconditions("/nonexistent/csq-base", 1) {
+            Err(e) => e,
+            Ok(_) => panic!("must reject a nonexistent base_dir"),
+        };
+        // Assert on the SPECIFIC message, not merely `is_err()` — a
+        // regression that drops the explicit check still errors (the
+        // lock acquire creates the dir then succeeds, so the actual
+        // observed failure without this test's target fix is that the
+        // call SUCCEEDS: `is_err()` alone would not have caught it).
+        assert_eq!(
+            err, "base directory does not exist: /nonexistent/csq-base",
+            "got: {err}"
+        );
+        assert!(
+            !std::path::Path::new("/nonexistent/csq-base").exists(),
+            "the bad path must NOT have been created as a side effect"
+        );
+    }
+
+    #[test]
+    fn codex_login_preconditions_rejects_invalid_account() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = match codex_login_preconditions(&dir.path().to_string_lossy(), 0) {
+            Err(e) => e,
+            Ok(_) => panic!("must reject account 0"),
+        };
+        assert!(err.contains("invalid account"), "got: {err}");
+    }
+
+    #[test]
+    fn codex_login_preconditions_succeeds_and_holds_lock_for_valid_input() {
+        use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (account_num, base, guard) =
+            codex_login_preconditions(&dir.path().to_string_lossy(), 41).unwrap();
+        assert_eq!(account_num.get(), 41);
+        assert_eq!(base, dir.path());
+
+        // The returned guard genuinely holds the lock while alive.
+        match AccountLoginLock::acquire(dir.path(), account_num).unwrap() {
+            AcquireOutcome::Held { .. } => {}
+            AcquireOutcome::Acquired(_) => panic!("guard must still hold the lock while alive"),
+        }
+        drop(guard);
     }
 
     // ── list_providers ─────────────────────────────────────────
@@ -4159,7 +5717,7 @@ mod tests {
     fn bind_keyed_provider_refuses_oauth_slot_twin_parity() {
         // CLI/desktop twin parity (`discovery_codex_login_cli_desktop_twin_parity`):
         // the desktop 3P bind inherits the core surface-conflict guard, so the
-        // #995 clobber (silent OAuth override + orphaned by_slot) is unreachable
+        // an internal ticket clobber (silent OAuth override + orphaned by_slot) is unreachable
         // from the Tauri UI. Plant a post-M4-12 Anthropic OAuth slot (by_slot →
         // identity, NO legacy mirror) and assert the bind is refused.
         use csq_core::accounts::identity_store::{credentials_path_for, identity_path, IdentityId};
@@ -4342,6 +5900,116 @@ mod tests {
         assert!(!provider_cli_installed("codex; rm -rf /".into()));
     }
 
+    /// an internal journal entry W3-5: `kimi`/`grok` join the known-binary allowlist so
+    /// the Add Account modal's native-CLI pre-flight (mirroring the
+    /// codex/gemini `cli-missing` prompt) can probe them. Regression
+    /// mirrors `find_cli_binary_finds_codex_in_path` in
+    /// `csq_core::accounts::login`, exercised through the desktop wrapper.
+    #[cfg(unix)]
+    #[test]
+    fn provider_cli_installed_finds_kimi_and_grok_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["kimi", "grok"] {
+            let bin = dir.path().join(name);
+            std::fs::write(&bin, "#!/bin/sh").unwrap();
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        // testing.md Rule 6: env mutation MUST hold the workspace-shared
+        // test_env lock (cargo test is multi-threaded).
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let prev_path = std::env::var_os("PATH");
+        let prev_home = std::env::var_os("HOME");
+        let empty_home = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+            std::env::set_var("HOME", empty_home.path());
+        }
+
+        let kimi_found = provider_cli_installed("kimi".into());
+        let grok_found = provider_cli_installed("grok".into());
+
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(_shared_env_guard);
+
+        assert!(
+            kimi_found,
+            "kimi on PATH must be found through the allowlist gate"
+        );
+        assert!(
+            grok_found,
+            "grok on PATH must be found through the allowlist gate"
+        );
+    }
+
+    /// C6 (an internal journal entry issue 1) — regression for the known-install-dir
+    /// fallback gap. A self-managed kimi install lands at
+    /// `~/.kimi-code/bin/kimi` and is NOT symlinked onto `$PATH` (that's
+    /// exactly the shape `known_install_dirs` exists to catch — spec/13
+    /// §5). The old `find_cli_binary`-only resolver has no awareness of
+    /// that dir, so this test fails on the pre-fix code (empty PATH walk,
+    /// no known-dir fallback) and passes once `provider_cli_installed`
+    /// chains through `cli_deps::install_path::find_in_path`. Mirrors
+    /// `find_in_path_falls_back_to_known_kimi_dir` in
+    /// `csq_core::cli_deps::install_path`.
+    #[cfg(unix)]
+    #[test]
+    fn provider_cli_installed_finds_kimi_via_known_install_dir_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let bin_dir = home.path().join(".kimi-code").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("kimi");
+        std::fs::write(&bin, "#!/bin/sh").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let prev_path = std::env::var_os("PATH");
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            // Empty PATH — the walk must find nothing, forcing the
+            // known-install-dir fallback to be the ONLY path to a hit.
+            std::env::set_var("PATH", "");
+            std::env::set_var("HOME", home.path());
+        }
+
+        let found = provider_cli_installed("kimi".into());
+
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(_shared_env_guard);
+
+        assert!(
+            found,
+            "kimi installed at ~/.kimi-code/bin (not on PATH) must be found \
+             via the known-install-dir fallback"
+        );
+    }
+
     // ── rename_account validation ──────────────────────────────
 
     #[test]
@@ -4461,6 +6129,7 @@ mod tests {
             source: "anthropic".into(),
             surface: "claude-code".into(),
             has_credentials: true,
+            has_quota: false,
             five_hour_pct: 0.0,
             five_hour_resets_in: None,
             seven_day_pct: 0.0,
@@ -4508,6 +6177,10 @@ mod tests {
                 "expires_in_secs",
                 "last_refresh_error",
                 "provider_id",
+                // HIGH-1 (an internal ticket redteam): has_quota tells the renderer
+                // whether a quota row was actually found for this slot —
+                // a plain bool, no credential material.
+                "has_quota",
                 // Phase B (an internal journal entry): billing_mode is sent on
                 // every account so the renderer can branch on
                 // pay-per-token vs subscription vs local. Audited
@@ -4540,7 +6213,7 @@ mod tests {
         );
     }
 
-    /// #984 redteam (security M2): exercise the MUST-3 whitelist audit with
+    /// an internal ticket redteam (security M2): exercise the MUST-3 whitelist audit with
     /// `balance_display` POPULATED (`Some`). The None-case test above cannot
     /// gate the field because `skip_serializing_if=Option::is_none` drops it
     /// from the wire; this test proves the populated field is a single scalar
@@ -4553,6 +6226,7 @@ mod tests {
             source: "third_party".into(),
             surface: "claude-code".into(),
             has_credentials: true,
+            has_quota: false,
             five_hour_pct: 0.0,
             five_hour_resets_in: None,
             seven_day_pct: 0.0,
@@ -4594,6 +6268,7 @@ mod tests {
                 "expires_in_secs",
                 "last_refresh_error",
                 "provider_id",
+                "has_quota",
                 "billing_mode",
                 "quota_kind",
                 "balance_display",
@@ -4747,6 +6422,18 @@ mod tests {
         assert!(!view.tos_required);
     }
 
+    // GH an internal ticket retired `refuse_login_if_native_bound` and the three
+    // tests that lived here (`_refuses_kimi_bound_slot`,
+    // `_refuses_grok_bound_slot`, `_allows_unbound_slot`). Coverage for the
+    // new cleanup-not-refuse behavior lives at the layer that now performs
+    // it: `complete_login_clears_stale_{gemini,native}_marker_after_login`
+    // (`csq-core/src/providers/codex/desktop_login.rs`) for the Codex twin,
+    // and `finalize_login_clears_stale_{gemini,native}_marker`
+    // (`csq-core/src/accounts/login.rs`) for the Anthropic path every other
+    // former caller of this guard (`start_claude_login_race`,
+    // `start_claude_login_subprocess`, `start_claude_login`,
+    // `submit_oauth_code`) funnels through.
+
     // ── list_codex_models validation ──────────────────────────
 
     #[tokio::test]
@@ -4760,7 +6447,7 @@ mod tests {
     #[tokio::test]
     async fn list_codex_models_no_account_uses_cli_probe_or_bundled() {
         // No Codex account → HTTP fetch fails ("no codex account
-        // provisioned"). Without the codex-cli probe (PR-#312-fix /
+        // provisioned"). Without the codex-cli probe (PR-an internal ticket-fix /
         // /autonomize item 2), this would fall straight through to
         // bundled. With the probe, it falls through to codex-cli IF
         // installed in the test env, otherwise to bundled. Either
@@ -4787,6 +6474,7 @@ mod tests {
             source: "codex".into(),
             surface: "codex".into(),
             has_credentials: true,
+            has_quota: true,
             five_hour_pct: 10.0,
             five_hour_resets_in: Some(3600),
             seven_day_pct: 5.0,
@@ -4821,6 +6509,7 @@ mod tests {
             source: "manual".into(),
             surface: "gemini".into(),
             has_credentials: true,
+            has_quota: false,
             five_hour_pct: 0.0,
             five_hour_resets_in: None,
             seven_day_pct: 0.0,
@@ -4849,7 +6538,7 @@ mod tests {
         assert!(!json.contains("AIza"));
     }
 
-    // ── #367 — utilization quota surface-match gate ─────────────────
+    // ── an internal ticket — utilization quota surface-match gate ─────────────────
     //
     // Origin: an internal ticket + an internal journal entry H2. Codex slots (and any future
     // utilization-shape surface) MUST surface their own 5h/7d numbers
@@ -4906,7 +6595,7 @@ mod tests {
 
     /// Codex slot with a codex-surfaced quota row → IPC payload surfaces
     /// the 5h/7d numbers. This is the v2.7.0 user-visible gap closed by
-    /// #367.
+    /// an internal ticket.
     #[test]
     fn get_accounts_codex_slot_surfaces_codex_quota() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5182,6 +6871,344 @@ mod tests {
         assert!(v.seven_day_resets_in.is_none());
     }
 
+    // ── HIGH-1 (an internal ticket redteam) — Kimi desktop quota rendering ───────
+    //
+    // Kimi is the first surface where the account's OWN dispatch
+    // `Surface` never equals the persisted quota row's `surface` string
+    // for EITHER of its two shapes: the native-CLI slot writes
+    // "kimi-cli" (its Surface::Kimi.as_str() is "kimi"), and the 3P
+    // Bearer slot writes "kimi" (its dispatch Surface is ClaudeCode /
+    // "claude-code"). Both shapes previously fell through the bare
+    // `q.surface == a.surface.as_str()` gate and rendered no quota at
+    // all — these tests pin the fix.
+
+    /// 3P Bearer Kimi slot: quota row surface is "kimi", account surface
+    /// is "claude-code" (dispatch runs through the `claude` CLI). Must
+    /// still surface real 5h/7d bars, not the pay-per-token ledger the
+    /// catalog's `QuotaKind::Unknown` (a polling-dispatch flag) would
+    /// otherwise route it to.
+    #[test]
+    fn get_accounts_kimi_3p_slot_surfaces_utilization_quota() {
+        let dir = tempfile::TempDir::new().unwrap();
+        csq_core::accounts::third_party::bind_provider_to_slot(
+            dir.path(),
+            "kimi",
+            csq_core::types::AccountNum::try_from(13u16).unwrap(),
+            Some("sk-kimi-test-key"),
+            None,
+        )
+        .unwrap();
+        write_quota_file(dir.path(), &[(13, "kimi", 34.0, 12.0)]);
+
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 13)
+            .expect("kimi 3P slot 13 visible");
+        assert_eq!(v.source, "third_party");
+        assert_eq!(v.provider_id.as_deref(), Some("kimi"));
+        assert_eq!(
+            v.quota_kind, "utilization",
+            "kimi 3P slot must render bars, not the pay-per-token ledger \
+             (catalog quota_kind=Unknown is a polling-dispatch flag \
+             telling tick_3p to skip the probe, NOT a rendering flag)"
+        );
+        assert!(
+            v.has_quota,
+            "kimi 3P slot with a matching quota row must report has_quota=true"
+        );
+        assert_eq!(v.five_hour_pct, 34.0);
+        assert_eq!(v.seven_day_pct, 12.0);
+    }
+
+    /// Native Kimi CLI slot: quota row surface is "kimi-cli", account
+    /// surface is "kimi" (`Surface::Kimi.as_str()`). Must surface real
+    /// bars — the native session IS polled by the dedicated
+    /// `usage_poller::kimi`, unlike Grok's genuine vendor-managed
+    /// subscription with no csq quota endpoint.
+    #[test]
+    fn get_accounts_kimi_native_slot_surfaces_utilization_quota() {
+        let dir = tempfile::TempDir::new().unwrap();
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            csq_core::types::AccountNum::try_from(14u16).unwrap(),
+            csq_core::providers::catalog::Surface::Kimi,
+        )
+        .unwrap();
+        write_quota_file(dir.path(), &[(14, "kimi-cli", 55.0, 20.0)]);
+
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 14)
+            .expect("kimi native slot 14 visible");
+        assert_eq!(v.source, "native");
+        assert_eq!(v.surface, "kimi");
+        assert_eq!(
+            v.quota_kind, "utilization",
+            "native kimi slot must render bars, not the static \
+             'Subscription · vendor-managed' native-quota text"
+        );
+        assert!(
+            v.has_quota,
+            "native kimi slot with a matching 'kimi-cli' row must report has_quota=true"
+        );
+        assert_eq!(v.five_hour_pct, 55.0);
+        assert_eq!(v.seven_day_pct, 20.0);
+    }
+
+    /// Negative control: Grok has no dedicated poller and must keep the
+    /// "native" (vendor-managed subscription) rendering path unchanged
+    /// by the Kimi carve-out above.
+    #[test]
+    fn get_accounts_grok_native_slot_still_renders_native_quota_kind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            csq_core::types::AccountNum::try_from(15u16).unwrap(),
+            csq_core::providers::catalog::Surface::Grok,
+        )
+        .unwrap();
+
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 15)
+            .expect("grok native slot 15 visible");
+        // Round-8: was `"native"`. Grok is csq-polled now (this PR fixes
+        // `parse_grok_billing`), so it renders on the balance path even
+        // before its first row lands — exactly as a 3P balance provider
+        // does. `has_quota` stays false, which is what distinguishes
+        // "no row yet" from "measured zero".
+        assert_eq!(v.quota_kind, "balance");
+        assert!(!v.has_quota);
+    }
+
+    /// The case the maintainer actually hit: a Grok native slot WITH a
+    /// real balance row must render that balance, not the static
+    /// "Subscription · vendor-managed" string. Before this PR the row
+    /// never existed (the parser failed every tick) AND the desktop
+    /// routed the surface to "native", so the two defects masked each
+    /// other — fixing only the parser would have changed nothing visible.
+    #[test]
+    fn get_accounts_grok_native_slot_with_a_balance_row_renders_the_balance() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = csq_core::types::AccountNum::try_from(15u16).unwrap();
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            slot,
+            csq_core::providers::catalog::Surface::Grok,
+        )
+        .unwrap();
+
+        use csq_core::quota::{AccountQuota, BalanceInfo, QuotaFile};
+        let mut f = QuotaFile::empty();
+        f.schema_version = 2;
+        let q = AccountQuota {
+            surface: "grok".to_string(),
+            kind: "balance".to_string(),
+            balance: Some(BalanceInfo {
+                currency: "USD".to_string(),
+                remaining: 165.36,
+            }),
+            updated_at: 1_785_000_000.0,
+            ..AccountQuota::default()
+        };
+        f.set(15, q);
+        csq_core::quota::state::save_state(dir.path(), &f).unwrap();
+
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 15)
+            .expect("grok native slot 15 visible");
+        assert_eq!(
+            v.quota_kind, "balance",
+            "a polled Grok slot must render its balance, not vendor-managed"
+        );
+        assert!(
+            v.has_quota,
+            "a slot with a real balance row must report has_quota=true"
+        );
+    }
+
+    /// The maintainer's LIVE row, verbatim from `quota.json` slot 16 on
+    /// 2026-08-04: a weekly-credit Grok subscription writes BOTH a real
+    /// `seven_day` window (7% used) AND a `$0.00` on-demand balance,
+    /// because `on_demand_cap`/`on_demand_used` are 0 on that plan.
+    ///
+    /// The CLI renders "7% 2d20h" for this row; the desktop rendered
+    /// "Balance $0.00 remaining", hiding a live usage window behind a
+    /// zero. The cause was a display shape keyed on provider IDENTITY
+    /// (`Native { Grok } => "balance"`) rather than on the row — the
+    /// desktop twin of the CLI fix in 080430f0, which the desktop never
+    /// received (the `discovery_codex_login_cli_desktop_twin_parity`
+    /// class).
+    ///
+    /// Non-vacuity: with either gate reverted this test FAILS —
+    /// `quota_kind` returns to "balance" without the demotion, and
+    /// `balance_display` returns to `Some("$0.00")` without the filter.
+    /// Both are asserted because `AccountList.svelte`'s balance arm
+    /// fires on `quota_kind === 'balance' || account.balance_display`,
+    /// so either one alone still routes the slot to the wrong renderer.
+    #[test]
+    fn get_accounts_grok_slot_with_window_and_zero_balance_renders_the_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = csq_core::types::AccountNum::try_from(16u16).unwrap();
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            slot,
+            csq_core::providers::catalog::Surface::Grok,
+        )
+        .unwrap();
+
+        use csq_core::quota::{AccountQuota, BalanceInfo, QuotaFile, UsageWindow};
+        let mut f = QuotaFile::empty();
+        f.schema_version = 2;
+        let q = AccountQuota {
+            surface: "grok".to_string(),
+            // Deliberately the ADVERSARIAL tag, not the one the current
+            // poller writes. `usage_poller::grok` would write "utilization"
+            // for a windowed row, but the implementation under test never
+            // reads `kind` — it derives from `five_hour`/`seven_day`. With
+            // `kind: "utilization"` the fixture is INERT: the test would pass
+            // identically against a hypothetical `if q.kind == "utilization"`
+            // implementation, so it could not discriminate the two
+            // (`instrument-discipline.md` MUST-2).
+            //
+            // `"balance"` makes it discriminating AND is the more realistic
+            // adversarial shape: a row written before the poller's precedence
+            // landed, or by any future writer that tags from provider
+            // identity. The row is the authority; its tag is not.
+            kind: "balance".to_string(),
+            five_hour: None,
+            seven_day: Some(UsageWindow {
+                used_percentage: 7.0,
+                // 4_102_444_800 = 2100-01-01 (testing.md Rule 1). MUST stay far-future:
+                // this fixture round-trips through the loader, whose `clear_expired`
+                // NULLS a past window — the row then falls back to `balance` and the
+                // assertions below invert. A near-future literal here detonated on
+                // 2026-08-07T11:12:35Z and reddened every PR in flight.
+                resets_at: 4_102_444_800,
+            }),
+            // The on-demand allowance on a weekly-credit plan: present,
+            // and zero. Presence is NOT evidence of a pay-per-token plan.
+            balance: Some(BalanceInfo {
+                currency: "USD".to_string(),
+                remaining: 0.0,
+            }),
+            updated_at: 1_785_683_111.0,
+            ..AccountQuota::default()
+        };
+        f.set(16, q);
+        csq_core::quota::state::save_state(dir.path(), &f).unwrap();
+
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 16)
+            .expect("grok native slot 16 visible");
+
+        assert_eq!(
+            v.quota_kind, "utilization",
+            "a Grok row carrying a usage window must render bars, not a balance"
+        );
+        assert_eq!(
+            v.balance_display, None,
+            "a $0.00 on-demand allowance must not be rendered as the slot's balance \
+             while a real usage window exists"
+        );
+        assert_eq!(
+            v.seven_day_pct, 7.0,
+            "the window the balance was hiding must reach the frontend"
+        );
+        assert_eq!(
+            v.five_hour_pct, 0.0,
+            "the absent 5h window must not be fabricated from the 7d value"
+        );
+        assert!(v.has_quota, "a slot with a real row reports has_quota=true");
+    }
+
+    /// The gate is provider-agnostic BY DESIGN, and nothing else covered that.
+    ///
+    /// `balance_display` is filtered on the row alone — unlike the `quota_kind`
+    /// demotion, which is additionally conditioned on `quota_kind == "balance"`.
+    /// So a slot catalogued `utilization` (here a 3P bearer provider) whose row
+    /// carries BOTH a window and a balance must ALSO lose `balance_display`.
+    ///
+    /// Without this, such a slot reached the balance renderer through
+    /// `AccountList.svelte`'s `|| account.balance_display` disjunct and hid its
+    /// window — the same defect as grok-16, on a surface nobody had connected
+    /// to Grok. The class is per-PLAN, not per-provider; this test is what
+    /// stops a future reader from "tidying" the filter into a Grok-only check.
+    #[test]
+    fn get_accounts_balance_display_gate_is_provider_agnostic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        seed_claude_slot(&creds_dir, 9);
+
+        use csq_core::quota::{AccountQuota, BalanceInfo, QuotaFile, UsageWindow};
+        let mut f = QuotaFile::empty();
+        f.schema_version = 2;
+        let q = AccountQuota {
+            surface: "claude-code".to_string(),
+            kind: "utilization".to_string(),
+            five_hour: Some(UsageWindow {
+                used_percentage: 12.0,
+                resets_at: 4_102_444_800,
+            }),
+            seven_day: Some(UsageWindow {
+                used_percentage: 55.0,
+                resets_at: 4_102_444_800,
+            }),
+            balance: Some(BalanceInfo {
+                currency: "USD".to_string(),
+                remaining: 0.0,
+            }),
+            updated_at: 1_785_683_111.0,
+            ..AccountQuota::default()
+        };
+        f.set(9, q);
+        csq_core::quota::state::save_state(dir.path(), &f).unwrap();
+
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views.iter().find(|v| v.id == 9).expect("slot 9 visible");
+
+        assert_eq!(
+            v.balance_display, None,
+            "the balance filter is row-driven and provider-agnostic — a \
+             window-carrying row loses balance_display on EVERY surface, not \
+             just Grok"
+        );
+        assert_eq!(v.five_hour_pct, 12.0, "the 5h window must survive");
+        assert_eq!(v.seven_day_pct, 55.0, "the 7d window must survive");
+    }
+
+    /// `has_quota` distinguishes "no row yet" from "measured 0%" — a
+    /// freshly-added slot with no `quota.json` entry MUST report
+    /// `has_quota=false`, not merely the serialization-default 0.0
+    /// percentages.
+    #[test]
+    fn get_accounts_unpolled_slot_reports_has_quota_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let creds_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        seed_claude_slot(&creds_dir, 21);
+        // No quota.json written at all — the daemon hasn't polled yet.
+
+        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.id == 21)
+            .expect("fresh claude slot 21 visible");
+        assert!(
+            !v.has_quota,
+            "no quota row yet must report has_quota=false, not a bare 0.0"
+        );
+        assert_eq!(v.five_hour_pct, 0.0);
+    }
+
     // ── PR-C9a an internal journal entry — set_codex_slot_model surface verification ─
 
     /// an internal journal entry finding 9: `set_codex_slot_model` must refuse when
@@ -5444,6 +7471,30 @@ mod tests {
     }
 
     #[test]
+    fn gemini_provision_api_key_refuses_native_bound_slot() {
+        // redteam R2 MED-2: `detect_other_surface_binding` was blind to
+        // native (Kimi/Grok) bindings, so this desktop provision path would
+        // silently dual-bind a native-bound slot onto Gemini too.
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            slot,
+            csq_core::providers::catalog::Surface::Grok,
+        )
+        .unwrap();
+
+        let err = gemini_provision_api_key(
+            dir.path().to_string_lossy().into_owned(),
+            5,
+            "AIzaFAKETESTKEYDONOTUSE0000000000000000".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("Grok"), "got: {err}");
+        assert!(err.contains("csq logout"), "got: {err}");
+    }
+
+    #[test]
     fn gemini_provision_vertex_sa_rejects_relative_path() {
         let dir = tempfile::TempDir::new().unwrap();
         let err = gemini_provision_vertex_sa(
@@ -5464,6 +7515,87 @@ mod tests {
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
+    // ── an internal ticket — desktop Tauri commands MUST NOT leak raw
+    // filesystem paths (or the operator's username, which a $HOME
+    // prefix reveals) to the renderer over the error channel. Each
+    // test below deterministically triggers a path-bearing error
+    // from csq-core and asserts the returned `Err(String)` does not
+    // contain the operator's home directory.
+
+    /// Runs `f` with `$HOME` pointed at `home`, serialized against
+    /// sibling tests via the workspace-wide env-mutation mutex
+    /// (`rules/testing.md` §4/4b shared-env discipline).
+    fn with_mocked_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        let out = f();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gemini_provision_vertex_sa_error_does_not_leak_home_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let base = home.path().join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        // Block `write_binding`'s `create_dir_all(parent)` by putting a
+        // FILE where the `credentials/` directory must go — deterministically
+        // triggers `ProvisionError::Io { path: <credentials dir>, .. }`.
+        std::fs::write(base.join("credentials"), b"not a directory").unwrap();
+
+        let sa_path = home.path().join("sa.json");
+        std::fs::write(&sa_path, br#"{"type":"service_account"}"#).unwrap();
+
+        let err = with_mocked_home(home.path(), || {
+            gemini_provision_vertex_sa(
+                base.to_string_lossy().into_owned(),
+                5,
+                sa_path.to_string_lossy().into_owned(),
+            )
+            .unwrap_err()
+        });
+
+        let home_str = home.path().to_string_lossy().into_owned();
+        assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
+        assert!(err.contains('~'), "expected a redacted ~/ path: {err}");
+    }
+
+    #[test]
+    fn get_rotation_config_error_does_not_leak_home_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let base = home.path().join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        // Corrupt rotation.json so `rotation_config::load` returns
+        // `ConfigError::InvalidJson { path: <rotation.json>, .. }`.
+        std::fs::write(base.join("rotation.json"), b"{not valid json").unwrap();
+
+        let err = with_mocked_home(home.path(), || {
+            get_rotation_config(base.to_string_lossy().into_owned()).unwrap_err()
+        });
+
+        let home_str = home.path().to_string_lossy().into_owned();
+        assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
+        assert!(err.contains('~'), "expected a redacted ~/ path: {err}");
+    }
+
+    // `gemini_switch_model` takes an `AppHandle`, which — per the
+    // established convention two tests down
+    // (`gemini_switch_model_unknown_model_message_lists_canonical_ids`)
+    // — cannot be easily faked in a unit test here. The `Malformed`
+    // path it would hit via `set_model_name` -> `read_binding` is
+    // pinned directly against `ProvisionError::redacted_message` in
+    // `csq-core/src/providers/gemini/provisioning.rs`
+    // (`redacted_message_strips_path_on_malformed_variant`), which is
+    // the exact redaction call the command's `map_err` closure makes.
+
     #[test]
     fn gemini_provision_vertex_sa_refuses_codex_bound_slot() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5481,6 +7613,158 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Codex"), "got: {err}");
+    }
+
+    // ── cloud_claude_provision_{vertex,bedrock} boundary tests ────────────
+    //
+    // These pin the IPC-boundary validation that fires BEFORE the backend
+    // `bind_cloud_claude_backend_to_slot` call (slot range, non-empty
+    // fields, absolute SA path, control-char token, base-dir existence).
+    // The backend's own SSRF / SA-file / slot-conflict / residency guards
+    // are tested exhaustively in
+    // `csq_core::accounts::third_party` — not re-exercised here.
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_vertex_rejects_invalid_account() {
+        let err = cloud_claude_provision_vertex(
+            "/tmp".into(),
+            0,
+            "my-project".into(),
+            "us-east5".into(),
+            "/abs/sa.json".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid slot"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_vertex_rejects_empty_project() {
+        let err = cloud_claude_provision_vertex(
+            "/tmp".into(),
+            1,
+            "  ".into(),
+            "us-east5".into(),
+            "/abs/sa.json".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("project ID must not be empty"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_vertex_rejects_empty_region() {
+        let err = cloud_claude_provision_vertex(
+            "/tmp".into(),
+            1,
+            "my-project".into(),
+            "  ".into(),
+            "/abs/sa.json".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("region must not be empty"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_vertex_rejects_empty_sa_path() {
+        let err = cloud_claude_provision_vertex(
+            "/tmp".into(),
+            1,
+            "my-project".into(),
+            "us-east5".into(),
+            "   ".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("path must not be empty"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_vertex_rejects_relative_sa_path() {
+        let err = cloud_claude_provision_vertex(
+            "/tmp".into(),
+            1,
+            "my-project".into(),
+            "us-east5".into(),
+            "./relative/sa.json".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_vertex_rejects_missing_base_dir() {
+        let err = cloud_claude_provision_vertex(
+            "/nonexistent/csq-base".into(),
+            1,
+            "my-project".into(),
+            "us-east5".into(),
+            "/abs/sa.json".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_bedrock_rejects_invalid_account() {
+        let err = cloud_claude_provision_bedrock(
+            "/tmp".into(),
+            0,
+            "us-east-1".into(),
+            "bedrock-bearer-token".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid slot"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_bedrock_rejects_empty_region() {
+        let err = cloud_claude_provision_bedrock(
+            "/tmp".into(),
+            1,
+            "  ".into(),
+            "bedrock-bearer-token".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("region must not be empty"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_bedrock_rejects_empty_token() {
+        let err =
+            cloud_claude_provision_bedrock("/tmp".into(), 1, "us-east-1".into(), "   ".into())
+                .unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_bedrock_rejects_control_char_token() {
+        // ESC byte mid-paste — same truncation shape the Gemini API-key
+        // path guards against. Refuse at the boundary.
+        let token = "bedrock\x1btoken".to_string();
+        let err = cloud_claude_provision_bedrock("/tmp".into(), 1, "us-east-1".into(), token)
+            .unwrap_err();
+        assert!(err.contains("control characters"), "got: {err}");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_claude_provision_bedrock_rejects_missing_base_dir() {
+        let err = cloud_claude_provision_bedrock(
+            "/nonexistent/csq-base".into(),
+            1,
+            "us-east-1".into(),
+            "bedrock-bearer-token".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
     }
 
     // ── gemini_provision_oauth boundary tests ─────────────────────────────
@@ -5543,6 +7827,743 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.contains("Claude"), "got: {err}");
+    }
+
+    // ── acquire_gemini_desktop_login_lock: cross-process exclusion ──
+    //
+    // `gemini_provision_oauth` (the real Tauri command) needs no
+    // `AppHandle` / `State<'_, AppState>` (unlike `complete_codex_login`),
+    // so it is tested directly below via `block_on`. These tests target
+    // the extracted helper alone, mirroring the CLI's
+    // `acquire_login_lock` coverage and the codex desktop helper's
+    // shape.
+
+    #[test]
+    fn acquire_gemini_desktop_login_lock_refuses_when_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(51u16).unwrap();
+
+        // Hold the lock ourselves first. Same-process, second `open()`
+        // — flock is scoped to the open file description, not the
+        // process, so this genuinely reproduces cross-process
+        // contention (same pattern `login_lock.rs`'s own tests use).
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        let err = match acquire_gemini_desktop_login_lock(dir.path(), account) {
+            Err(e) => e,
+            Ok(_) => panic!("must refuse while another guard holds the account's lock"),
+        };
+        assert!(
+            err.contains("already in progress"),
+            "error must name the contention, not some other failure: {err}"
+        );
+        assert!(
+            err.contains("51"),
+            "error must name the contended slot: {err}"
+        );
+    }
+
+    #[test]
+    fn acquire_gemini_desktop_login_lock_succeeds_when_free() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(52u16).unwrap();
+
+        let guard = acquire_gemini_desktop_login_lock(dir.path(), account)
+            .expect("must succeed when nothing else holds the account's lock");
+
+        // Prove the returned guard genuinely HOLDS the flock (not a
+        // guard that already dropped, or a no-op stand-in): a second
+        // acquire attempt for the same account, while `guard` is
+        // still alive, must observe contention.
+        match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Held { .. } => {}
+            AcquireOutcome::Acquired(_) => {
+                panic!("returned guard must still hold the lock while alive")
+            }
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn acquire_gemini_desktop_login_lock_is_per_account() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let held_account = AccountNum::try_from(53u16).unwrap();
+        let other_account = AccountNum::try_from(54u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), held_account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        acquire_gemini_desktop_login_lock(dir.path(), other_account)
+            .expect("a different account's slot must not be blocked");
+    }
+
+    /// End-to-end: a genuine filesystem failure (base dir made unwritable)
+    /// reaches `acquire_gemini_desktop_login_lock`'s `Err(e)` arm, and the
+    /// resulting renderer-facing string names neither the tempdir nor any
+    /// path separator — only the fixed tag and the slot number. Unix-only:
+    /// directory-mode-based permission injection is not portable to Windows
+    /// (`test(login): gate the failure-injection fixtures to unix`).
+    #[cfg(unix)]
+    #[test]
+    fn acquire_gemini_desktop_login_lock_filesystem_error_omits_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(59u16).unwrap();
+
+        // No write permission on base_dir -> OpenOptions::create(true) on
+        // the lock file inside it fails with PermissionDenied.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = acquire_gemini_desktop_login_lock(dir.path(), account);
+
+        // Restore write permission before the TempDir guard tries to clean
+        // up, regardless of what the assertions below find.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("acquire must fail against an unwritable base_dir"),
+        };
+        assert!(
+            err.contains("permission_denied"),
+            "error must carry the fixed-vocabulary tag: {err}"
+        );
+        assert!(err.contains("59"), "error must still name the slot: {err}");
+        assert!(
+            !err.contains(&dir.path().display().to_string()),
+            "error must not carry the lock file's path: {err}"
+        );
+        assert!(
+            !err.contains('/'),
+            "error must carry no path separator at all: {err}"
+        );
+    }
+
+    // ── gemini_provision_oauth: cross-process lock is the FIRST thing
+    //    it does (after cheap input validation) ──
+    //
+    // `gemini_provision_oauth` acquires the login lock before the
+    // `spawn_blocking` call into `oauth_login::perform` (which drives
+    // the shared `~/.gemini/oauth_creds.json` read/OAuth-flow) — so a
+    // held-lock test never reaches any filesystem/network/browser
+    // activity and is safe (and fast) to run unattended.
+
+    #[test]
+    fn gemini_provision_oauth_refuses_when_login_lock_held_by_another_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(55u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        let err = block_on(gemini_provision_oauth(
+            dir.path().to_string_lossy().into_owned(),
+            55,
+        ))
+        .expect_err(
+            "gemini_provision_oauth must refuse when the account's login lock \
+             is held, not fall through to oauth_login::perform",
+        );
+        assert!(
+            err.contains("already in progress"),
+            "must be the lock-contention message: {err}"
+        );
+        assert!(err.contains("55"), "must name the contended slot: {err}");
+    }
+
+    #[test]
+    fn gemini_provision_oauth_lock_check_precedes_binding_guard_check() {
+        // Safe RED/GREEN discriminator that does NOT risk touching a
+        // live OAuth flow: pre-bind the slot to Claude (so
+        // `oauth_login::perform`'s OWN `binding_guard` check would
+        // fire with an "OtherSurfaceBound"/"Claude" error if the lock
+        // check were absent or came after it), then hold the account's
+        // login lock. Post-fix, the lock check runs FIRST and the
+        // error must be the lock-contention message, never the
+        // binding-guard one — proving the ordering, not just presence.
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(58u16).unwrap();
+        let creds = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(
+            creds.join("58.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"sk-ant-ort01-y","expiresAt":9999999999999,"scopes":[]}}"#,
+        )
+        .unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        let err = block_on(gemini_provision_oauth(
+            dir.path().to_string_lossy().into_owned(),
+            58,
+        ))
+        .expect_err("must refuse — either lock contention or Claude-bound, never Ok");
+        assert!(
+            err.contains("already in progress"),
+            "lock check must run BEFORE oauth_login::perform's binding_guard              check — got the wrong error, meaning the lock was bypassed or              checked too late: {err}"
+        );
+        assert!(
+            !err.contains("Claude"),
+            "must not have fallen through to perform()'s binding_guard check: {err}"
+        );
+    }
+
+    #[test]
+    fn gemini_provision_oauth_lock_is_per_account_not_global() {
+        // A held lock on account 56 must NOT block account 57 — the
+        // lock file is `.login-<N>.lock`, keyed by account number.
+        // Account 57 has no Gemini/Codex/Claude binding on disk, so
+        // if the lock were global this would still fail — but on
+        // a *different* error than lock contention.
+        let dir = tempfile::TempDir::new().unwrap();
+        let held_account = AccountNum::try_from(56u16).unwrap();
+        let other_account = AccountNum::try_from(57u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), held_account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        // acquire_gemini_desktop_login_lock alone (not the full
+        // `gemini_provision_oauth`, which would go on to
+        // `spawn_blocking` into the live OAuth flow for the "free"
+        // case — out of scope, and unsafe to exercise, in a unit test).
+        acquire_gemini_desktop_login_lock(dir.path(), other_account)
+            .expect("a different account's slot must not be blocked");
+    }
+
+    // ── list_native_clis ─────────────────────────────────────────
+
+    #[test]
+    fn list_native_clis_includes_kimi_and_grok() {
+        let clis = list_native_clis().unwrap();
+        let ids: Vec<&str> = clis.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"kimi-cli"), "got: {ids:?}");
+        assert!(ids.contains(&"grok"), "got: {ids:?}");
+        let kimi = clis.iter().find(|c| c.id == "kimi-cli").unwrap();
+        assert_eq!(kimi.surface, "kimi");
+        assert_eq!(kimi.binary, "kimi");
+        assert_eq!(kimi.display_name, "Kimi (native CLI)");
+        let grok = clis.iter().find(|c| c.id == "grok").unwrap();
+        assert_eq!(grok.surface, "grok");
+        assert_eq!(grok.binary, "grok");
+        // Pre-existing failure fixed in-session (zero-tolerance.md Rule 1):
+        // this assertion predates an internal journal entry Wave A's empirical finding
+        // that grok-cli's own default model is "grok-4.5" (native.rs::GROK
+        // — `descriptor_carries_wave_b_vendor_fields` pins the same value).
+        // The stale "" expectation was introduced by e0f85f79 (W3-7,
+        // pre-0135) and never updated when C1 landed the real default.
+        assert_eq!(grok.default_model, "grok-4.5");
+    }
+
+    // ── start_native_login (an internal journal entry C8) ────────────────────
+    //
+    // Validation parity with the retired `provision_native_cli`
+    // (an internal journal entry W3-5): unknown id / invalid slot / missing base dir
+    // / conflicting binding all reject through the SAME
+    // `resolve_native_login_request` helper `complete_native_login`
+    // shares — these tests exercise it via the cheaper, side-effect-free
+    // `start_native_login` entry point.
+
+    #[test]
+    fn start_native_login_rejects_unknown_id() {
+        let err = start_native_login("/tmp".into(), "not-a-native-cli".into(), 1).unwrap_err();
+        assert!(err.contains("unknown native CLI id"), "got: {err}");
+    }
+
+    #[test]
+    fn start_native_login_rejects_invalid_slot() {
+        let err = start_native_login("/tmp".into(), "kimi-cli".into(), 0).unwrap_err();
+        assert!(err.contains("invalid slot"), "got: {err}");
+    }
+
+    #[test]
+    fn start_native_login_rejects_missing_base_dir() {
+        let err =
+            start_native_login("/nonexistent/csq-base".into(), "kimi-cli".into(), 1).unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn start_native_login_refuses_codex_bound_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let creds = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(creds.join("codex-5.json"), b"{}").unwrap();
+
+        let err = start_native_login(
+            dir.path().to_string_lossy().into_owned(),
+            "kimi-cli".into(),
+            5,
+        )
+        .unwrap_err();
+        assert!(err.contains("Codex"), "got: {err}");
+        assert!(err.contains("csq logout"), "got: {err}");
+    }
+
+    #[test]
+    fn start_native_login_refuses_other_native_surface() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(7u16).unwrap();
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            slot,
+            csq_core::providers::catalog::Surface::Kimi,
+        )
+        .unwrap();
+
+        // Same slot, different native surface (Grok) — must refuse rather
+        // than silently permitting a later complete_native_login to
+        // clobber the Kimi binding.
+        let err = start_native_login(dir.path().to_string_lossy().into_owned(), "grok".into(), 7)
+            .unwrap_err();
+        assert!(err.contains("Kimi"), "got: {err}");
+        assert!(err.contains("csq logout"), "got: {err}");
+    }
+
+    #[test]
+    fn start_native_login_allows_idempotent_reprovision_same_surface() {
+        // Re-starting a login for a slot already bound to the SAME native
+        // surface must succeed (a real re-login refreshes the marker via
+        // `native::write_binding`'s idempotent overwrite) rather than
+        // refusing itself.
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().to_string_lossy().into_owned();
+        csq_core::providers::native::write_binding(
+            dir.path(),
+            AccountNum::try_from(9u16).unwrap(),
+            csq_core::providers::catalog::Surface::Kimi,
+        )
+        .unwrap();
+
+        // test-hermeticity.md MUST-1b: `start_native_login` transitively reads
+        // process-global PATH (via `find_cli_binary`/`find_in_path` to derive
+        // `cli_installed`, unasserted here but still evaluated on every call).
+        // This test doesn't care what PATH resolves to, but it must not race
+        // a concurrent PATH-mutating sibling — hold the shared lock for the
+        // read even though this test never sets PATH itself.
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let view = start_native_login(base, "kimi-cli".into(), 9).unwrap();
+        assert_eq!(view.native_id, "kimi-cli");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_native_login_reports_cli_installed_via_known_dir_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let bin_dir = home.path().join(".kimi-code").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("kimi");
+        std::fs::write(&bin, "#!/bin/sh").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let base_dir = tempfile::TempDir::new().unwrap();
+
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let prev_path = std::env::var_os("PATH");
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("PATH", "");
+            std::env::set_var("HOME", home.path());
+        }
+
+        let view = start_native_login(
+            base_dir.path().to_string_lossy().into_owned(),
+            "kimi-cli".into(),
+            1,
+        );
+
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(_shared_env_guard);
+
+        assert!(view.unwrap().cli_installed);
+    }
+
+    // ── cancel_native_login_from (an internal journal entry C8) ──────────────
+    //
+    // Unit-tested via the pure inner (mirrors `consume_prefs_recovery_from`)
+    // rather than the `#[tauri::command]` wrapper — avoids constructing a
+    // full `tauri::test::mock_app()` + `AppState` (8 fields, all
+    // irrelevant here except `native_login_children`) just to reach the
+    // id-resolution + kill contract.
+
+    #[test]
+    fn cancel_native_login_from_rejects_unknown_id() {
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        let err = cancel_native_login_from(&children, "not-a-native-cli").unwrap_err();
+        assert!(err.contains("unknown native CLI id"), "got: {err}");
+    }
+
+    #[test]
+    fn cancel_native_login_from_is_noop_when_nothing_running() {
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        assert!(cancel_native_login_from(&children, "grok").is_ok());
+        assert!(cancel_native_login_from(&children, "kimi-cli").is_ok());
+    }
+
+    // ── reserve_native_login_slot: the atomic TOCTOU guard (redteam R1 MED) ──
+
+    #[test]
+    fn reserve_native_login_slot_refuses_second_same_surface() {
+        use csq_core::providers::catalog::Surface;
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        assert!(reserve_native_login_slot(&children, Surface::Kimi, "Kimi").is_ok());
+        // A second reservation for the SAME surface is refused under the same
+        // lock the first acquired — the check-then-spawn TOCTOU is closed.
+        let err = reserve_native_login_slot(&children, Surface::Kimi, "Kimi").unwrap_err();
+        assert!(err.contains("already in progress"), "got: {err}");
+    }
+
+    #[test]
+    fn reserve_native_login_slot_allows_different_surface() {
+        use csq_core::providers::catalog::Surface;
+        // 0135 C8 design point: a Kimi login in flight must NOT block a
+        // concurrent Grok login — they are independent vendor binaries.
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        assert!(reserve_native_login_slot(&children, Surface::Kimi, "Kimi").is_ok());
+        assert!(reserve_native_login_slot(&children, Surface::Grok, "Grok").is_ok());
+    }
+
+    // ── NativeLoginReservationCleanup: belt-and-suspenders (redteam R2 LOW-1 + LOW-2) ──
+
+    #[test]
+    fn reservation_cleanup_removes_own_untouched_reservation_when_not_spawned() {
+        use csq_core::providers::catalog::Surface;
+        // The ordinary pre-spawn-error path: `spawned` stays false, so the
+        // guard's Drop must clear the (still-`None`) reservation it never
+        // got a chance to overwrite with a real child.
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        reserve_native_login_slot(&children, Surface::Kimi, "Kimi").unwrap();
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _cleanup = NativeLoginReservationCleanup {
+                children: children.clone(),
+                surface: Surface::Kimi,
+                spawned: spawned.clone(),
+            };
+            // Dropped at end of this block.
+        }
+        assert!(
+            !children.lock().unwrap().contains_key(&Surface::Kimi),
+            "an untouched (never-spawned) reservation must be cleared on drop"
+        );
+    }
+
+    #[test]
+    fn reservation_cleanup_does_not_clobber_a_second_reservation_after_spawn_and_wait_clear() {
+        use csq_core::providers::catalog::Surface;
+        // Reproduces the LOW-1 TOCTOU exactly: call A reserves, "spawns"
+        // (spawned=true) and its wait closure clears the entry (mirrors
+        // `spawn_native_device_auth_piped`'s wait closure post-wait
+        // `remove`) — all BEFORE call A's `NativeLoginReservationCleanup`
+        // drops. In the gap, call B reserves the SAME surface fresh. Call
+        // A's guard, dropping last, must NOT delete call B's reservation.
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+
+        // Call A: reserve, "spawn" (flag flips true), wait closure clears.
+        reserve_native_login_slot(&children, Surface::Kimi, "Kimi").unwrap();
+        let spawned_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_a = NativeLoginReservationCleanup {
+            children: children.clone(),
+            surface: Surface::Kimi,
+            spawned: spawned_a.clone(),
+        };
+        spawned_a.store(true, std::sync::atomic::Ordering::Release);
+        // Wait closure's post-wait clear (mirrors
+        // `spawn_native_device_auth_piped`'s `wait` closure).
+        children.lock().unwrap().remove(&Surface::Kimi);
+
+        // Call B: a fresh, independent login for the SAME surface races in
+        // during the gap between call A's wait-clear and its
+        // `NativeLoginReservationCleanup` drop.
+        reserve_native_login_slot(&children, Surface::Kimi, "Kimi").unwrap();
+        assert!(
+            children.lock().unwrap().contains_key(&Surface::Kimi),
+            "precondition: call B's reservation is present before call A's guard drops"
+        );
+
+        // Call A's guard now drops (end of scope). Because `spawned_a` is
+        // true, it must NOT touch the map — call B's fresh reservation
+        // must survive.
+        drop(cleanup_a);
+
+        assert!(
+            children.lock().unwrap().contains_key(&Surface::Kimi),
+            "call A's belt-and-suspenders cleanup must not clobber call B's \
+             fresh reservation for the same surface"
+        );
+    }
+
+    #[test]
+    fn reservation_cleanup_ignores_other_surfaces() {
+        use csq_core::providers::catalog::Surface;
+        // The guard is keyed to its OWN surface only — a reservation for a
+        // different surface must survive regardless of `spawned`.
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        reserve_native_login_slot(&children, Surface::Grok, "Grok").unwrap();
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _cleanup = NativeLoginReservationCleanup {
+                children: children.clone(),
+                surface: Surface::Kimi,
+                spawned,
+            };
+        }
+        assert!(
+            children.lock().unwrap().contains_key(&Surface::Grok),
+            "cleanup for Kimi must not touch a Grok reservation"
+        );
+    }
+
+    #[test]
+    fn reservation_cleanup_clears_on_panic_before_spawn() {
+        use csq_core::providers::catalog::Surface;
+        // LOW-2: a panic inside `login_native_with` (before spawn ever
+        // registers a real child) must still clear the reservation — Rust
+        // runs `Drop` impls during unwinding, so the guard fires even
+        // though no code after the panic point ever executes normally.
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        reserve_native_login_slot(&children, Surface::Grok, "Grok").unwrap();
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let children_for_closure = children.clone();
+        let spawned_for_closure = spawned.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = NativeLoginReservationCleanup {
+                children: children_for_closure,
+                surface: Surface::Grok,
+                spawned: spawned_for_closure,
+            };
+            panic!("simulated login_native_with panic before spawn");
+        }));
+
+        assert!(
+            result.is_err(),
+            "the panic must propagate — caught here only to observe the post-unwind state"
+        );
+        assert!(
+            !children.lock().unwrap().contains_key(&Surface::Grok),
+            "a pre-spawn panic must still clear the reservation via Drop-during-unwind"
+        );
+    }
+
+    #[test]
+    fn reservation_cleanup_leaves_entry_on_panic_after_spawn() {
+        use csq_core::providers::catalog::Surface;
+        // A panic AFTER a successful spawn (spawned == true) must NOT
+        // clear the entry — a real subprocess may still be running and
+        // `cancel_native_login` needs the map entry to reach it.
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        reserve_native_login_slot(&children, Surface::Grok, "Grok").unwrap();
+        children
+            .lock()
+            .unwrap()
+            .insert(Surface::Grok, None /* stand-in for Some(child_arc) */);
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let children_for_closure = children.clone();
+        let spawned_for_closure = spawned.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = NativeLoginReservationCleanup {
+                children: children_for_closure,
+                surface: Surface::Grok,
+                spawned: spawned_for_closure,
+            };
+            panic!("simulated login_native_with panic after spawn");
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            children.lock().unwrap().contains_key(&Surface::Grok),
+            "a post-spawn panic must NOT clear the entry — cancel_native_login \
+             still needs it to reach the (possibly still-running) child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_native_login_from_kills_registered_child() {
+        use csq_core::providers::catalog::Surface;
+        // A live child registered as a Grok login is killed by cancel. Uses a
+        // harmless `sleep` child rather than a real vendor binary.
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let handle = Arc::new(Mutex::new(child));
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        children
+            .lock()
+            .unwrap()
+            .insert(Surface::Grok, Some(handle.clone()));
+
+        assert!(cancel_native_login_from(&children, "grok").is_ok());
+
+        // The child was SIGKILLed — reaping it reports a non-success status.
+        let status = handle.lock().unwrap().wait().expect("wait killed child");
+        assert!(!status.success(), "killed child must not exit successfully");
+    }
+
+    // ── spawn_native_device_auth_piped argv/env (an internal journal entry C8) ──
+    //
+    // Confirms the production spawn closure builds the right argv + env
+    // for the vendor binary and registers/deregisters the child in the
+    // per-surface concurrency map — without requiring a real kimi/grok
+    // binary. Drives it through the SAME `login_native_with` entry point
+    // `complete_native_login` uses (rather than reaching into
+    // `SpawnedNativeLogin`'s private fields, which carry no test
+    // accessors by design — the DI seam IS the closure boundary). The
+    // stand-in script never writes a real vendor credential file, so
+    // `login_native_with`'s post-exit verification fails; that failure
+    // is expected and orthogonal to what this test pins (argv, env,
+    // and per-surface registration lifecycle). Mirrors
+    // `provider_cli_installed_finds_kimi_and_grok_on_path`'s PATH-stub
+    // technique.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_native_device_auth_piped_builds_argv_and_env_and_registers_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("grok");
+        // Writes its own argv + the isolation env var's VALUE into a
+        // file inside the home dir it was told to use, so the test can
+        // assert both without a real grok binary or private-field access.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"argv:$@ home_env:$GROK_HOME\" > \"$GROK_HOME/observed.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let prev_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+        }
+
+        let base = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(3u16).unwrap();
+        let surface = csq_core::providers::catalog::Surface::Grok;
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        let children_for_spawn = children.clone();
+        let registered_during_spawn = std::cell::Cell::new(false);
+        let spawned_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = csq_core::providers::native_login::login_native_with(
+            base.path(),
+            slot,
+            surface,
+            |home, binary, args, home_env| {
+                let spawned = spawn_native_device_auth_piped(
+                    home,
+                    binary,
+                    args,
+                    home_env,
+                    surface,
+                    &children_for_spawn,
+                    &spawned_flag,
+                );
+                registered_during_spawn
+                    .set(children_for_spawn.lock().unwrap().contains_key(&surface));
+                spawned
+            },
+            |_code| {},
+        );
+
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        drop(_shared_env_guard);
+
+        // Expected failure: the stand-in script never wrote grok's real
+        // credential file, so `finish_native_login`'s post-exit
+        // verification rejects it. This test pins argv/env/registration,
+        // not full login success (that's `native_login.rs`'s job).
+        assert!(
+            result.is_err(),
+            "expected finish_native_login to reject a missing credential file"
+        );
+        assert!(
+            registered_during_spawn.get(),
+            "child must be registered in the per-surface map while spawn is in flight"
+        );
+        assert!(
+            !children.lock().unwrap().contains_key(&surface),
+            "child must be deregistered once the wait closure reaps it"
+        );
+        assert!(
+            spawned_flag.load(std::sync::atomic::Ordering::Acquire),
+            "spawned flag must be set once the real child is registered (redteam R2 LOW-1)"
+        );
+
+        let home = csq_core::providers::native::native_home_path(base.path(), slot, surface);
+        let observed = std::fs::read_to_string(home.join("observed.txt"))
+            .expect("spawned script must have run inside its vendor home");
+        assert!(
+            observed.contains("argv:login --device-auth"),
+            "got: {observed:?}"
+        );
+        assert!(
+            observed.contains(&format!("home_env:{}", home.display())),
+            "got: {observed:?}"
+        );
+    }
+
+    /// Surface-dispatch rejection: `login_native_with` (and therefore
+    /// `complete_native_login`, which calls it) refuses a non-native
+    /// surface before ever invoking the spawn closure. Regression for
+    /// the 0135 C8 directive that the desktop layer never bypasses the
+    /// core surface gate.
+    #[test]
+    fn login_native_with_rejects_non_native_surface_before_spawning() {
+        let base = tempfile::TempDir::new().unwrap();
+        let spawn_called = std::cell::Cell::new(false);
+        let err = csq_core::providers::native_login::login_native_with(
+            base.path(),
+            AccountNum::try_from(1u16).unwrap(),
+            csq_core::providers::catalog::Surface::Codex,
+            |_home, _binary, _args, _home_env| {
+                spawn_called.set(true);
+                Err(std::io::Error::other("must not be reached"))
+            },
+            |_code| {},
+        )
+        .unwrap_err();
+        assert!(
+            !spawn_called.get(),
+            "spawn must not run for a non-native surface"
+        );
+        assert!(err.to_string().contains("not a native-CLI surface"));
     }
 
     // gemini_switch_model takes AppHandle so we test the shape via a
@@ -6062,7 +9083,7 @@ mod tests {
     /// on the empty file. On this cold cache the live-scan fall-through also
     /// yields zero (no transcripts), so the result is zero either way — this
     /// guards the empty-present-ledger INPUT, which no other read-path test
-    /// exercises, against a panic/regression. (#992 redteam R2 GAP-2.)
+    /// exercises, against a panic/regression. (an internal ticket redteam R2 GAP-2.)
     #[test]
     fn get_account_usage_empty_present_ledger_returns_zero() {
         let home_dir = tempfile::TempDir::new().unwrap();

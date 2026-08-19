@@ -37,6 +37,7 @@
 
 use crate::error::BrokerError;
 use serde::Deserialize;
+use std::fmt;
 
 /// OpenAI OAuth token endpoint. Same URL Codex-CLI targets.
 pub(crate) const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -60,7 +61,15 @@ pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// appreciable time. This layer does NOT wrap in `SecretString` because
 /// the immediate consumer (the refresher) needs to serialize them back
 /// to `~/.codex/auth.json` via the atomic-replace helper.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is hand-written, NOT derived: the derive renders every field
+/// verbatim, so a `tracing::debug!(?tokens)` — or a panic message that
+/// formats a struct containing one — would print the raw bearer token.
+/// The file-level sibling this feeds
+/// ([`crate::credentials::CodexTokensFile`]) already redacts; this is the
+/// wire-level type on the same path and MUST match it
+/// (`credential-type-hygiene.md` Rule 1).
+#[derive(Clone, Deserialize)]
 pub struct CodexTokens {
     pub access_token: String,
     /// Optional because OpenAI rotates refresh tokens on every refresh,
@@ -77,6 +86,28 @@ pub struct CodexTokens {
     pub token_type: Option<String>,
     #[serde(default)]
     pub expires_in: Option<u64>,
+}
+
+impl fmt::Debug for CodexTokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Mirrors `credentials::CodexTokensFile`'s impl field-for-field:
+        // all three token fields are JWT or JWT-like and carry claims
+        // with PII, so they render as `<redacted>` regardless of
+        // presence, and `account_id` is masked to presence-only. The
+        // non-secret discriminators (`token_type`, `expires_in`) render
+        // normally — they are what a debugging operator actually needs.
+        f.debug_struct("CodexTokens")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .field("account_id", &self.account_id.as_ref().map(|_| "<set>"))
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 /// A single rate-limit window (primary 5h OR secondary 7d per spec 05
@@ -525,6 +556,56 @@ fn classify_error(status: u16, code: Option<String>) -> CodexHttpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Debug redaction (credential-type-hygiene Rule 1) ─────────
+
+    #[test]
+    fn codex_tokens_debug_redacts_every_token_field() {
+        let body = br#"{"access_token":"sk-at-SECRET-ACCESS","refresh_token":"sk-rt-SECRET-REFRESH","id_token":"eyJ-SECRET-ID","account_id":"acct-SECRET-ID-VALUE","token_type":"bearer","expires_in":3600}"#;
+        let t = parse_refresh_response(200, body).expect("should parse");
+
+        // Guard the guard: if the fixture ever stopped carrying the
+        // secrets, the absence assertions below would pass vacuously.
+        assert_eq!(t.access_token, "sk-at-SECRET-ACCESS");
+        assert_eq!(t.refresh_token.as_deref(), Some("sk-rt-SECRET-REFRESH"));
+
+        let rendered = format!("{t:?}");
+        for secret in [
+            "sk-at-SECRET-ACCESS",
+            "sk-rt-SECRET-REFRESH",
+            "eyJ-SECRET-ID",
+            "acct-SECRET-ID-VALUE",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug leaked {secret}: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("<redacted>"),
+            "no redaction placeholder: {rendered}"
+        );
+        // Non-secret discriminators stay legible — a Debug line that
+        // redacts everything is useless and gets removed.
+        assert!(
+            rendered.contains("3600"),
+            "expires_in was masked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn codex_tokens_debug_distinguishes_absent_from_redacted() {
+        // A missing refresh token is a real diagnostic signal; blanket
+        // `<redacted>` on a None would erase it.
+        let body = br#"{"access_token":"sk-at-only","token_type":"bearer"}"#;
+        let t = parse_refresh_response(200, body).expect("should parse");
+        let rendered = format!("{t:?}");
+        assert!(
+            rendered.contains("refresh_token: None"),
+            "absent refresh_token should render None, got: {rendered}"
+        );
+        assert!(!rendered.contains("sk-at-only"), "leaked: {rendered}");
+    }
 
     // ── parse_refresh_response ───────────────────────────────────
 

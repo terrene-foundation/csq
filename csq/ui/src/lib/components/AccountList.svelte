@@ -11,8 +11,12 @@
     id: number;
     label: string;
     source: string;
-    /// "claude-code" | "codex" | "gemini" — the upstream CLI surface
-    /// the slot spawns. PR-C6 added codex; PR-G5 added gemini.
+    /// "claude-code" | "codex" | "gemini" | "kimi" | "grok" — the
+    /// upstream CLI surface the slot spawns. PR-C6 added codex; PR-G5
+    /// added gemini; an internal journal entry C5 added the native Kimi/Grok
+    /// surfaces (self-authenticating vendor binaries, Design B —
+    /// distinct from the 3P-bearer Kimi provider, which stays
+    /// `surface="claude-code"`).
     /// Distinct from `source` (the credential *origin*): a 3P
     /// provider slot has `source="third_party"` but
     /// `surface="claude-code"`.
@@ -20,8 +24,16 @@
     /// union so a missing-surface bug surfaces as a TS error rather
     /// than as a silently-missing badge. Origin: redteam round 1 M4
     /// (an internal journal entry).
-    surface: 'claude-code' | 'codex' | 'gemini';
+    surface: 'claude-code' | 'codex' | 'gemini' | 'kimi' | 'grok';
     has_credentials: boolean;
+    /// True when `quota.json` holds a row for this slot whose surface
+    /// matches the slot's own dispatch shape (HIGH-1, an internal ticket redteam).
+    /// `false` means no row has been polled yet — `five_hour_pct` /
+    /// `seven_day_pct` are `0.0` as a serialization default, NOT a
+    /// measured "0% used". Optional (backend always sends it; the `?`
+    /// only lets older test fixtures omit it and default to the
+    /// has-data rendering path).
+    has_quota?: boolean;
     five_hour_pct: number;
     five_hour_resets_in: number | null;
     seven_day_pct: number;
@@ -50,7 +62,7 @@
     /// "utilization" | "counter" | "unknown" | "balance". `unknown` slots
     /// render the tokens-and-cost-over-time ledger view; `balance` slots
     /// render the formatted balance string from `balance_display`.
-    quota_kind?: 'utilization' | 'counter' | 'unknown' | 'balance';
+    quota_kind?: 'utilization' | 'counter' | 'unknown' | 'balance' | 'native';
     /// Formatted remaining balance for pay-per-token providers (e.g. DeepSeek).
     /// Present when `quota_kind === "balance"`. Format: "$196.42" (USD) or
     /// "196.42 CNY" (other currencies). Absent (null/undefined) for every
@@ -118,9 +130,94 @@
     }
   }
 
+  // ── Quota staleness (F1) ─────────────────────────────────
+  //
+  // Matches `csq-core/src/quota/status.rs::STALE_THRESHOLD_SECS` (3600s)
+  // EXACTLY — per `account-terminal-separation.md` MUST Rule 4 (Anthropic
+  // utilization is the sole source of truth) and this fix's brief, the
+  // desktop card MUST reuse the CLI's canonical threshold rather than
+  // introduce a second, divergent one; an internal ticket (`csq doctor`'s
+  // stale_quota_slots diagnostic) reads the SAME constant via
+  // `AccountStatus::stale_secs`, so all three surfaces (status/doctor/
+  // desktop) now agree about whether a given quota row is stale.
+  //
+  // Derivation (`tooling-self-verification.md` Rule 3 — not re-derived
+  // here, only cited; see `status.rs`'s `STALE_THRESHOLD_SECS` doc
+  // comment for the full two-outcome derivation table):
+  //   - Healthy outcome: the daemon polls every 300s (Anthropic/Codex/
+  //     Gemini OAuth, `daemon::usage_poller::POLL_INTERVAL`) or 900s (3P
+  //     bearer + native-CLI billing, `POLL_INTERVAL_3P`) — 3600s clears
+  //     2+ consecutive missed cycles on every live cadence.
+  //   - Broken outcome: the incident this constant was sized against
+  //     (2026-08-02) was a dead native-CLI vendor token sitting stale for
+  //     15.6h = 56,160s — caught with enormous margin (56,160s vs the
+  //     3,600s trip point).
+  const STALE_THRESHOLD_SECS = 3600;
+
+  // Ticking wall-clock reference for the staleness computation below.
+  // Updated on its own interval (not tied to the fetch/poll cycle) so a
+  // card's age keeps advancing even while `get_accounts` itself is
+  // failing (F2) — staleness is exactly what should be visible then.
+  let nowSecs = $state(Math.floor(Date.now() / 1000));
+
+  // Age in seconds since the slot's quota row was last successfully
+  // polled, or `null` when there is no age to report — mirrors
+  // `PollFreshness::NeverPolled` in `status.rs`: a slot with
+  // `has_quota === false` (no row matched yet — see the doc comment on
+  // that field above) or an `updated_at` of `0`/negative has never been
+  // polled, so "stale" would misreport "was fresh, has gone stale" for a
+  // slot that was simply never measured. Negative ages (a clock-skewed
+  // `updated_at` briefly ahead of `nowSecs`) are also treated as "no age
+  // to report" rather than floored to 0, matching the honest-uncertainty
+  // posture of the CLI's `NeverPolled` classification.
+  function accountAgeSecs(account: AccountView): number | null {
+    if (account.has_quota === false) return null;
+    if (!account.updated_at || account.updated_at <= 0) return null;
+    const age = nowSecs - account.updated_at;
+    return age >= 0 ? age : null;
+  }
+
+  // Strict `>`, matching `status.rs::poll_freshness`'s classifier exactly
+  // — `age_secs === STALE_THRESHOLD_SECS` reads Fresh on both surfaces.
+  function isStale(account: AccountView): boolean {
+    const age = accountAgeSecs(account);
+    return age !== null && age > STALE_THRESHOLD_SECS;
+  }
+
+  // "1h14m" / "2h" / "45m" / "30s" — elapsed-time rendering for the
+  // staleness label. Deliberately separate from `formatResetTime` below
+  // (which renders a COUNTDOWN to a future reset, not elapsed age) even
+  // though the bucketing logic is similar — the two read misleadingly if
+  // merged into one "is this counting up or down?" function.
+  function formatAge(secs: number): string {
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    return m > 0 ? `${h}h${m}m` : `${h}h`;
+  }
+
   let accounts = $state<AccountView[]>([]);
-  let displayOrder = $state<number[]>([]);
-  let error = $state<string | null>(null);
+  // F2 (desktop account-list redteam): a poll failure (the 5s interval,
+  // or a post-action re-fetch after remove/move/rename) is TRANSIENT and
+  // MUST NOT blank the card list — the daemon may just be mid-restart.
+  // `pollError` drives a non-destructive banner ABOVE a still-rendered
+  // list (see the `{#if pollError}` block below `{:else}`). It is only
+  // rendered as a full-page replacement when there is nothing else to
+  // show (`accounts.length === 0` — e.g. the very first load fails and
+  // there is no cached list to fall back to).
+  let pollError = $state<string | null>(null);
+  // Inline remove-failure error (F2): rendered on the affected card only,
+  // following the `renameError` precedent already in this file — does
+  // NOT set `pollError`, so the rest of the card list stays visible.
+  // Scoped by id (not a boolean) since the error must attach to the
+  // specific card that failed, not whichever card is currently armed.
+  let removeError = $state<string | null>(null);
+  let removeErrorId = $state<number | null>(null);
+  // Inline move-failure error (F2): rendered inside the open renumber
+  // picker. Only one picker can be open at a time (`movingFromId`), so
+  // no separate id is needed — `movingFromId === account.id` scopes it.
+  let moveError = $state<string | null>(null);
   // Informational notice surfaced after a successful `csq move` when the
   // pre-rename scan found live processes bound to the source slot. Phase 3
   // (M3-6) replaced the `SLOT_IN_USE` refusal with `live_pids_bound`
@@ -177,27 +274,69 @@
     saveSortMode(mode);
   }
 
-  // ── Reorder ──────────────────────────────────────────────
+  // ── Ordering ─────────────────────────────────────────────
+  //
+  // "custom" is no longer a user-draggable order backed by its own
+  // localStorage-persisted array — that was a SECOND ordering with no
+  // relationship to the slot number, and nothing reconciled it when
+  // slots were renumbered (`csq move`), so it silently went stale and
+  // won over slot order. Slot number (`AccountView.id`) is now the
+  // single source of truth: "custom" means ascending by id. Manual
+  // reordering still exists — via the "#" renumber picker below, which
+  // performs a REAL `csq move` through `move_account` rather than a
+  // cosmetic, unreconciled local reorder. See the design note at the
+  // top of this file's PR description for the tradeoff.
 
-  function orderedAccounts(): AccountView[] {
-    if (displayOrder.length === 0) return accounts;
-    const byId = new Map(accounts.map(a => [a.id, a]));
-    const ordered: AccountView[] = [];
-    for (const id of displayOrder) {
-      const a = byId.get(id);
-      if (a) { ordered.push(a); byId.delete(id); }
-    }
-    for (const a of byId.values()) ordered.push(a);
-    return ordered;
+  // Provider identity used to group accounts for the 5h/7d reset-time
+  // sort modes. Order: Claude native -> Codex -> Kimi (both account
+  // shapes) -> Grok -> Z.AI -> MiniMax -> everything else. Derived from
+  // `surface` / `provider_id` / `source` — NEVER from slot id, which the
+  // maintainer is actively renumbering (18->11, 11->12, 12->15, ...).
+  function providerGroupRank(a: AccountView): number {
+    if (a.source === 'anthropic') return 1; // Claude native (Anthropic OAuth)
+    if (a.surface === 'codex') return 2;
+    // Kimi has two account shapes: a native self-authenticating CLI slot
+    // (surface === 'kimi') and a 3P Bearer-key slot that runs the
+    // `claude` CLI against Kimi's base URL (surface === 'claude-code',
+    // provider_id === 'kimi'). Both belong in the same group even though
+    // their `surface`/`method` differ.
+    if (a.surface === 'kimi' || a.provider_id === 'kimi') return 3;
+    if (a.surface === 'grok') return 4;
+    if (a.provider_id === 'zai') return 5;
+    if (a.provider_id === 'mm') return 6;
+    return 7; // everything else (Gemini, Ollama, manual, ...)
   }
 
-  // Final display list: custom order or sorted by reset time.
-  // Nulls sort to the bottom in both reset-time modes.
+  // True when the account carries a real usage WINDOW (a 5h and/or 7d
+  // reset time). Mirrors `csq-core/src/quota/status.rs::shows_window` —
+  // billing mode is per-PLAN, not per-provider (an internal ticket: "a usage
+  // window beats a balance"), so a "balance" provider like DeepSeek
+  // would sort WITH the subscriptions if it ever carried a real window
+  // (e.g. a DeepSeek subscription plan). Deliberately checks the
+  // `*_resets_in` fields (nullable, only populated when the underlying
+  // quota row actually has that window) rather than `*_pct` (always a
+  // number — `0.0` by wire-format default when no quota row exists yet,
+  // per the `has_quota` doc comment above).
+  function hasWindow(a: AccountView): boolean {
+    return a.five_hour_resets_in != null || a.seven_day_resets_in != null;
+  }
+
+  // Final display list. "custom" = ascending slot id. "5h"/"7d" = grouped
+  // by provider identity (balance-only accounts sort last within/after
+  // every group, since a reset-time sort is meaningless for them), then
+  // by reset time within each group. Nulls/invalid reset values sort to
+  // the bottom of their group.
   let displayedAccounts = $derived.by(() => {
-    const base = orderedAccounts();
-    if (sortMode === 'custom') return base;
+    if (sortMode === 'custom') {
+      return [...accounts].sort((a, b) => a.id - b.id);
+    }
     const key: keyof AccountView = sortMode === '5h' ? 'five_hour_resets_in' : 'seven_day_resets_in';
-    return [...base].sort((a, b) => {
+    return [...accounts].sort((a, b) => {
+      const aWindow = hasWindow(a);
+      const bWindow = hasWindow(b);
+      if (aWindow !== bWindow) return aWindow ? -1 : 1;
+      const groupDiff = providerGroupRank(a) - providerGroupRank(b);
+      if (groupDiff !== 0) return groupDiff;
       const av = a[key] as number | null;
       const bv = b[key] as number | null;
       const aValid = av != null && av > 0;
@@ -210,29 +349,6 @@
   });
 
   let justMovedId = $state<number | null>(null);
-
-  function moveCard(idx: number, direction: -1 | 1) {
-    const items = [...orderedAccounts()];
-    const newIdx = idx + direction;
-    if (newIdx < 0 || newIdx >= items.length) return;
-    const movedId = items[idx].id;
-    [items[idx], items[newIdx]] = [items[newIdx], items[idx]];
-    displayOrder = items.map(a => a.id);
-    saveOrder(displayOrder);
-    // Highlight the moved card briefly
-    justMovedId = movedId;
-    setTimeout(() => { justMovedId = null; }, 600);
-  }
-
-  function saveOrder(order: number[]) {
-    try { localStorage.setItem('csq-card-order', JSON.stringify(order)); } catch {}
-  }
-  function loadOrder(): number[] {
-    try {
-      const raw = localStorage.getItem('csq-card-order');
-      return raw ? JSON.parse(raw) : [];
-    } catch { return []; }
-  }
 
   // ── "Resets soonest" badge ───────────────────────────────
   //
@@ -301,17 +417,27 @@
     try {
       const baseDir = await getBaseDir();
       baseDirCached = baseDir;
-      accounts = await invoke<AccountView[]>('get_accounts', { baseDir });
-      error = null;
+      // Deliberately assign to a local first: if `invoke` rejects, the
+      // catch block below must NOT touch `accounts` — the whole point of
+      // F2 is that a poll failure leaves the last-known list rendered.
+      const fetched = await invoke<AccountView[]>('get_accounts', { baseDir });
+      accounts = fetched;
+      pollError = null;
     } catch (e) {
-      error = String(e);
+      // Non-destructive: `accounts` is left exactly as it was. The
+      // `{#if pollError}` banner (rendered above a still-visible list)
+      // is the only surface for this failure, UNLESS there is no cached
+      // list at all (`accounts.length === 0`), in which case the
+      // template falls back to a full-page error — there is nothing to
+      // preserve on a first-load failure.
+      pollError = String(e);
     } finally {
       loading = false;
       // The list is about to render in the next microtask — that's
       // the first moment the user sees either the rows or the
       // error banner. Log here so the measurement covers the full
       // IPC round-trip, not just component mount.
-      logFirstPaint(error ? 'error' : 'ready');
+      logFirstPaint(pollError ? 'error' : 'ready');
     }
   }
 
@@ -337,6 +463,9 @@
   function armRemove(accountId: number) {
     disarmRemove();
     armedRemoveId = accountId;
+    // A fresh attempt supersedes any error left over from a prior one.
+    removeError = null;
+    removeErrorId = null;
     // Auto-disarm after 4s if the user doesn't follow through.
     armedRemoveTimer = setTimeout(() => disarmRemove(), 4000);
   }
@@ -353,15 +482,18 @@
       await invoke('remove_account', { baseDir, account: accountId });
       await fetchAccounts();
     } catch (e) {
-      // Surface the typed error message to the banner. Backend
-      // returns prefixed tags like ACCOUNT_IN_USE / NOT_CONFIGURED
-      // so the user can self-diagnose.
+      // F2: surface the typed error message INLINE on the affected card
+      // (`removeError`/`removeErrorId`) rather than the global banner —
+      // this failure is specific to one account, not the whole list, and
+      // must not blank the other cards. Backend returns prefixed tags
+      // like ACCOUNT_IN_USE / NOT_CONFIGURED so the user can self-diagnose.
       const raw = String(e);
       if (raw.startsWith('ACCOUNT_IN_USE:')) {
-        error = `Cannot remove account ${accountId} — a Claude Code session is still running. Exit it first, then retry.`;
+        removeError = `Cannot remove account ${accountId} — a Claude Code session is still running. Exit it first, then retry.`;
       } else {
-        error = raw;
+        removeError = raw;
       }
+      removeErrorId = accountId;
     }
   }
 
@@ -392,6 +524,9 @@
     movingFromId = fromId;
     const free = freeMoveTargets(fromId);
     moveTargetId = free.length > 0 ? free[0] : null;
+    // A freshly opened picker supersedes any error left over from a
+    // prior failed attempt on this (or another) card.
+    moveError = null;
   }
 
   function cancelMove(e?: MouseEvent) {
@@ -399,6 +534,7 @@
     movingFromId = null;
     moveTargetId = null;
     moveBusy = false;
+    moveError = null;
   }
 
   async function submitMove(e: MouseEvent) {
@@ -407,6 +543,7 @@
     const from = movingFromId;
     const to = moveTargetId;
     moveBusy = true;
+    moveError = null;
     try {
       const baseDir = await getBaseDir();
       // Phase 3 (M3-6): `move_account` returns `MoveAccountSummary` with
@@ -435,17 +572,22 @@
 
       await fetchAccounts();
     } catch (e) {
+      // F2: surface the error INLINE inside the still-open renumber
+      // picker (`moveError`) rather than the global banner — the picker
+      // is deliberately NOT closed (no `cancelMove()` here) so the user
+      // can see the reason and retry or cancel manually, mirroring the
+      // `renameError` precedent (input stays open on failure).
       const raw = String(e);
       if (raw.startsWith('TARGET_EXISTS:')) {
-        error = `Slot ${to} is already configured. Pick an unused slot or remove slot ${to} first.`;
+        moveError = `Slot ${to} is already configured. Pick an unused slot or remove slot ${to} first.`;
       } else if (raw.startsWith('NOT_CONFIGURED:')) {
-        error = `Slot ${from} has no state to move.`;
+        moveError = `Slot ${from} has no state to move.`;
       } else if (raw.startsWith('SAME_SLOT:')) {
-        error = 'Source and target slots must be different.';
+        moveError = 'Source and target slots must be different.';
       } else {
-        error = raw;
+        moveError = raw;
       }
-      cancelMove();
+      moveBusy = false;
     }
   }
 
@@ -457,15 +599,30 @@
   // starts editing again or closes the rename field. The backend
   // returns descriptive strings (e.g. "name exceeds 256 characters
   // (got 300)", "name must not contain control characters") that are
-  // safe to display verbatim. Does NOT set the global `error` state
+  // safe to display verbatim. Does NOT set the global `pollError` state
   // so the rest of the card list remains visible during a failed rename.
   let renameError = $state<string | null>(null);
 
-  function startRename(account: AccountView, e: MouseEvent) {
+  // F5: accepts a keyboard event too — the label carries
+  // `role="button" tabindex="0"` (below) so it MUST support Enter/Space
+  // like any other interactive element reachable by Tab, not just the
+  // double-click that originally drove it.
+  function startRename(account: AccountView, e: MouseEvent | KeyboardEvent) {
     e.stopPropagation();
     editingId = account.id;
     editValue = account.label;
     renameError = null;
+  }
+
+  // F5: Enter/Space activation for `.account-label` (role="button",
+  // tabindex="0"). Space additionally MUST call `preventDefault` — the
+  // browser's default Space behavior scrolls the page, which a
+  // keyboard-only user does not expect from a focused "button".
+  function handleLabelKeydown(account: AccountView, e: KeyboardEvent) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      startRename(account, e);
+    }
   }
 
   async function saveRename(accountId: number) {
@@ -498,25 +655,56 @@
     if (e.key === 'Escape') { editingId = null; renameError = null; }
   }
 
-  // Initial fetch + 5-second poll + load saved order
+  // Initial fetch + 5-second poll. The `csq-card-order` localStorage key
+  // (the retired second-ordering array — see the "Ordering" design note
+  // above) is a one-time cleanup: it is no longer read anywhere, but a
+  // stale entry left on disk is dead weight for any future key reuse.
   $effect(() => {
-    displayOrder = loadOrder();
+    try { localStorage.removeItem('csq-card-order'); } catch {}
     fetchAccounts();
     const interval = setInterval(fetchAccounts, 5000);
-    return () => clearInterval(interval);
+    // F1: advances `nowSecs` independently of the fetch cycle so a
+    // card's staleness age keeps ticking forward even while
+    // `get_accounts` itself is failing (F2) — that is exactly the
+    // moment the age needs to be visible. This effect only WRITES
+    // `nowSecs`, never reads it, so it does not self-invalidate
+    // (`svelte-patterns.md` Rule 5 governs effects that both read AND
+    // write the same `$state`; this one does neither on `nowSecs`, it
+    // only writes, from inside an async interval callback rather than
+    // the effect body's synchronous execution).
+    const clockInterval = setInterval(() => {
+      nowSecs = Math.floor(Date.now() / 1000);
+    }, 15000);
+    return () => {
+      clearInterval(interval);
+      clearInterval(clockInterval);
+    };
   });
 </script>
 
 {#if loading}
   <div class="loading">Loading accounts...</div>
-{:else if error}
-  <div class="error">{error}</div>
+{:else if pollError && accounts.length === 0}
+  <!-- F2: a poll failure with NOTHING cached to fall back on (typically
+       the very first load) has no list to preserve — this is the only
+       remaining case that replaces the whole view with an error. -->
+  <div class="error">{pollError}</div>
 {:else if accounts.length === 0}
   <div class="empty">
     <p>No accounts configured.</p>
     <p class="hint">Run <code>csq login 1</code> to add your first account.</p>
   </div>
 {:else}
+  {#if pollError}
+    <!-- F2: a poll failure that DOES have a cached list is non-destructive
+         — the banner sits above the still-rendered cards instead of
+         replacing them. Card ages keep advancing via `nowSecs` (F1), so
+         the longer a refresh stays broken the more visibly stale the
+         bars become — the two fixes reinforce each other by design. -->
+    <div class="poll-error-banner" role="alert" data-testid="poll-error-banner">
+      Couldn't refresh — showing last known values. Retrying…
+    </div>
+  {/if}
   {#if moveNotice}
     <div class="info-notice" role="status">{moveNotice}</div>
   {/if}
@@ -538,13 +726,9 @@
     >7d reset</button>
   </div>
   <div class="account-list">
-    {#each displayedAccounts as account, idx (account.id)}
+    {#each displayedAccounts as account (account.id)}
       <div class="account-card" class:no-creds={!account.has_credentials} class:just-moved={justMovedId === account.id}>
         <div class="card-controls">
-          {#if sortMode === 'custom'}
-            <button class="move-btn" onclick={(e) => { e.stopPropagation(); moveCard(idx, -1); }} disabled={idx === 0} title="Move up">▲</button>
-            <button class="move-btn" onclick={(e) => { e.stopPropagation(); moveCard(idx, 1); }} disabled={idx === displayedAccounts.length - 1} title="Move down">▼</button>
-          {/if}
           <button
             class="renumber-btn"
             data-testid="renumber-btn"
@@ -583,6 +767,15 @@
                 disabled={moveBusy || moveTargetId == null}
               >{moveBusy ? 'Moving…' : 'Move'}</button>
               <button class="secondary" onclick={cancelMove} disabled={moveBusy}>Cancel</button>
+              {#if moveError}
+                <!--
+                  F2: inline move-failure error. The picker stays open
+                  (submitMove does NOT call cancelMove on failure) so the
+                  user can read the reason and retry/cancel — the same
+                  precedent as `.rename-error-msg` below.
+                -->
+                <div class="move-error-msg" data-testid="move-error" role="alert">{moveError}</div>
+              {/if}
             {/if}
           </div>
         {/if}
@@ -618,7 +811,21 @@
                 onclick={(e) => e.stopPropagation()}
               />
             {:else}
-              <span class="account-label" role="button" tabindex="0" ondblclick={(e) => startRename(account, e)} title="Double-click to rename">{account.label}</span>
+              <!-- F7: title carries the full label (a long email/identity
+                   string truncates visually via CSS below) AND keeps the
+                   "double-click to rename" affordance discoverable —
+                   both purposes share one tooltip since only one title
+                   attribute is allowed per element. F5: Enter/Space now
+                   activate rename, matching the element's own
+                   role="button" tabindex="0" contract. -->
+              <span
+                class="account-label"
+                role="button"
+                tabindex="0"
+                ondblclick={(e) => startRename(account, e)}
+                onkeydown={(e) => handleLabelKeydown(account, e)}
+                title={`${account.label} — double-click or press Enter to rename`}
+              >{account.label}</span>
             {/if}
             <!--
               Span with role="status" + tabindex=0: the badge is a
@@ -641,14 +848,21 @@
               (an internal journal entry). The new TS type literal-union prevents
               this at compile time; the runtime fallback covers any
               IPC-side patch that bypasses the typecheck.
+
+              an internal journal entry C5: kimi/grok added alongside claude-code/
+              codex/gemini — a native slot previously fell through to
+              the UNKNOWN badge (the account's identity label like
+              "kimi-14" was the only visible surface hint).
             -->
-            {#if account.surface === 'claude-code' || account.surface === 'codex' || account.surface === 'gemini'}
+            {#if account.surface === 'claude-code' || account.surface === 'codex' || account.surface === 'gemini' || account.surface === 'kimi' || account.surface === 'grok'}
               <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
               <span
                 class="surface-badge"
                 class:surface-claude={account.surface === 'claude-code'}
                 class:surface-codex={account.surface === 'codex'}
                 class:surface-gemini={account.surface === 'gemini'}
+                class:surface-kimi={account.surface === 'kimi'}
+                class:surface-grok={account.surface === 'grok'}
                 role="status"
                 tabindex="0"
                 aria-label={`Upstream surface: ${account.surface}`}
@@ -676,6 +890,14 @@
               the whole card list so the user can correct in-place.
             -->
             <div class="rename-error-msg" data-testid="rename-error" role="alert">{renameError}</div>
+          {/if}
+          {#if removeErrorId === account.id && removeError}
+            <!--
+              F2: inline remove-failure error — same precedent as
+              `.rename-error-msg` above. Rendered on THIS card only; the
+              rest of the list (and every other card) stays untouched.
+            -->
+            <div class="remove-error-msg" data-testid="remove-error" role="alert">{removeError}</div>
           {/if}
           {#if account.last_refresh_error}
             <div class="refresh-error" title="Most recent refresh failure tag from the daemon">
@@ -713,6 +935,50 @@
                 </span>
               {/if}
             </div>
+          {:else if account.quota_kind === 'native'}
+            {#if account.surface === 'kimi'}
+              <!--
+                Defense-in-depth (HIGH-1, an internal ticket redteam): the Rust
+                quota_kind mapping routes a native Kimi slot through
+                "utilization", not "native" — Kimi IS polled by the
+                dedicated usage_poller::kimi (unlike Grok's genuine
+                vendor-managed subscription with no csq quota endpoint).
+                This branch is unreachable for a Kimi slot on a
+                version-matched desktop/daemon pair; it exists only so a
+                stale backend that still tags a Kimi slot "native" during
+                a version-skew window renders bars instead of stranding
+                the slot behind the static subscription text below. Mirrors
+                the surface-match defense-in-depth pattern the Rust side
+                uses for the 5h/7d gate (commands/mod.rs).
+              -->
+              <div class="usage-bars">
+                <UsageBar label="5h" pct={account.five_hour_pct} stale={isStale(account)} />
+                <UsageBar label="7d" pct={account.seven_day_pct} stale={isStale(account)} />
+              </div>
+              {#if isStale(account)}
+                <!-- F1: the daemon may be stopped or this slot's poll
+                     may have silently frozen — the bars above are dimmed
+                     AND named explicitly stale, not just quietly old. -->
+                <div class="quota-stale-label" data-testid="quota-stale-label" title="Last successful quota poll — the daemon may be stopped">
+                  stale — as of {formatAge(accountAgeSecs(account) ?? 0)} ago
+                </div>
+              {/if}
+            {:else}
+              <!--
+                Native-CLI session surfaces — currently Grok (journals
+                0133/0135) — are vendor-managed SUBSCRIPTIONS: the vendor
+                CLI owns auth, refresh, and billing, and csq polls no
+                quota for it. Neither the pay-per-token ledger (would
+                read "$0 / 0 tokens") nor stuck-at-zero 5h/7d bars apply
+                — render a clean subscription state instead (0135 issue
+                3). Kimi's native session is polled (see the
+                `surface === 'kimi'` branch above) and no longer reaches
+                this arm on a version-matched pair.
+              -->
+              <div class="native-quota" data-testid="native-quota">
+                <span class="native-quota-label">Subscription · vendor-managed</span>
+              </div>
+            {/if}
           {:else if account.quota_kind === 'unknown'}
             <!--
               Phase B' (an internal journal entry D5): pay-per-token slots whose
@@ -740,17 +1006,47 @@
                   quota_kind is `balance` but the daemon hasn't polled
                   `/user/balance` yet (balance_display is null). Show a
                   checking state rather than a bare "—", which reads as a
-                  failure indistinguishable from a genuine error (redteam #984 F4).
+                  failure indistinguishable from a genuine error (redteam an internal ticket F4).
                 -->
                 <span class="balance-value balance-pending" data-testid="balance-display">checking…</span>
               {/if}
             </div>
             <BillingLedger account={account.id} baseDir={baseDirCached} hideWhenEmpty={true} />
+          {:else if account.has_quota === false}
+            <!--
+              HIGH-1 (an internal ticket redteam): `has_quota === false` means no
+              quota.json row has been matched for this slot yet — the
+              daemon hasn't polled it (fresh slot, or a poll cycle away).
+              `five_hour_pct`/`seven_day_pct` are `0.0` only because that
+              is the wire-format default, NOT a measured "0% used" — a
+              bare 0%-width bar here would be indistinguishable from
+              "quota exhausted" or "genuinely unused". Render an honest
+              pending state instead, matching the `balance-pending`
+              precedent above (redteam an internal ticket F4).
+            -->
+            <div class="usage-bars-pending" data-testid="usage-bars-pending">
+              <span class="quota-pending-label">Checking usage…</span>
+            </div>
           {:else}
             <div class="usage-bars">
-              <UsageBar label="5h" pct={account.five_hour_pct} />
-              <UsageBar label="7d" pct={account.seven_day_pct} />
+              <UsageBar label="5h" pct={account.five_hour_pct} stale={isStale(account)} />
+              <UsageBar label="7d" pct={account.seven_day_pct} stale={isStale(account)} />
             </div>
+            {#if isStale(account)}
+              <!-- F1 (CRITICAL): the #1 correctness defect this shard
+                   fixes. `get_accounts` reads `quota.json` from DISK — it
+                   never talks to the daemon — so when the daemon stops,
+                   this card keeps rendering the last-written percentages
+                   with full confidence. Past `STALE_THRESHOLD_SECS`
+                   (reused from `status.rs`, see the constant's doc
+                   comment above) the bars are dimmed (UsageBar's `stale`
+                   prop) AND explicitly named stale here, so an operator
+                   choosing which account to run against is told the
+                   truth instead of a confident-looking lie. -->
+              <div class="quota-stale-label" data-testid="quota-stale-label" title="Last successful quota poll — the daemon may be stopped">
+                stale — as of {formatAge(accountAgeSecs(account) ?? 0)} ago
+              </div>
+            {/if}
             {#if account.five_hour_resets_in || account.seven_day_resets_in}
               <div class="reset-info">
                 {#if account.five_hour_resets_in}
@@ -893,21 +1189,16 @@
     z-index: 3;
   }
   .account-card:hover .card-controls { opacity: 1; }
+  /* F5: renumber/remove are in the tab order at ALL times (they carry
+     no tabindex removal), painted at opacity 0 by default. Without this
+     rule a keyboard-only operator tabs through invisible controls —
+     including a destructive remove button — with zero visual feedback
+     about where focus is. `:focus-within` covers focus landing on
+     either child button. */
+  .account-card:focus-within .card-controls { opacity: 1; }
   /* Keep controls visible while the remove button is armed so the
      user can complete the second tap without re-hovering. */
   .account-card:has(.remove-btn.armed) .card-controls { opacity: 1; }
-  .move-btn {
-    background: var(--bg-tertiary);
-    border: none;
-    color: var(--text-secondary);
-    font-size: 0.55rem;
-    padding: 0.15rem 0.25rem;
-    cursor: pointer;
-    border-radius: 2px;
-    line-height: 1;
-  }
-  .move-btn:hover { color: var(--accent); }
-  .move-btn:disabled { opacity: 0.2; cursor: default; }
   .remove-btn {
     background: var(--bg-tertiary);
     border: none;
@@ -1043,9 +1334,27 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    /* F7: a flex container's children default to min-width:auto, which
+       ignores `overflow` on a shrinking child. Without this, a long
+       label pushes the surface/token badges out of the card instead of
+       truncating. */
+    min-width: 0;
   }
   .account-id { font-weight: 700; font-size: 0.85rem; color: var(--text-secondary); }
-  .account-label { flex: 1; font-weight: 500; cursor: text; }
+  /* F7: long identity strings (e.g. an email-shaped label) truncate
+     instead of pushing the surface/token badges out of the card. The
+     full label — plus the rename affordance — moves into `title`
+     (set on the element in the markup) since the visible text is now
+     potentially clipped. */
+  .account-label {
+    flex: 1;
+    min-width: 0;
+    font-weight: 500;
+    cursor: text;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .surface-badge {
     font-size: 0.65rem;
     font-weight: 600;
@@ -1082,6 +1391,21 @@
     color: #4285f4;
     border: 1px solid rgba(66, 133, 244, 0.4);
   }
+  /* an internal journal entry C5 — native Kimi/Grok badges. Distinct hues from the
+     three OAuth surfaces above AND from surface-unknown's amber (a
+     kimi/grok badge must never read as "unrecognized state"). */
+  .surface-badge.surface-kimi {
+    /* Moonshot AI violet. */
+    background: rgba(139, 92, 246, 0.15);
+    color: #8b5cf6;
+    border: 1px solid rgba(139, 92, 246, 0.4);
+  }
+  .surface-badge.surface-grok {
+    /* xAI rose — visibly distinct from every other surface tint. */
+    background: rgba(236, 72, 153, 0.15);
+    color: #ec4899;
+    border: 1px solid rgba(236, 72, 153, 0.4);
+  }
   .surface-badge.surface-unknown {
     /* Amber accent — visibly different from the three known-surface
        tints so an out-of-vocabulary surface value (failure mode the
@@ -1114,6 +1438,10 @@
     color: var(--text-tertiary);
     font-style: italic;
   }
+  .native-quota-label {
+    color: var(--text-tertiary);
+    font-size: 0.72rem;
+  }
   .gemini-downgrade {
     color: var(--orange, #d97706);
     font-size: 0.68rem;
@@ -1139,11 +1467,56 @@
     font-family: ui-monospace, monospace;
     margin-top: -0.1rem;
   }
+  /* F2: inline remove-failure error — same shape as .rename-error-msg,
+     scoped to the card whose remove_account call rejected. */
+  .remove-error-msg {
+    font-size: 0.72rem;
+    color: var(--red);
+    font-family: ui-monospace, monospace;
+    margin-top: -0.1rem;
+  }
+  /* F2: inline move-failure error, rendered inside the still-open
+     renumber picker. */
+  .move-error-msg {
+    flex-basis: 100%;
+    font-size: 0.72rem;
+    color: var(--red);
+    font-family: ui-monospace, monospace;
+  }
   .refresh-error {
     font-size: 0.72rem;
     color: var(--red);
     font-family: ui-monospace, monospace;
     margin-top: -0.15rem;
+  }
+  /* F1: staleness label paired with UsageBar's dimmed `stale` prop.
+     Reuses the `.balance-pending` / `.quota-pending-label` idiom
+     (italic, tertiary text) already established in this file for
+     "the number you're seeing may not mean what it looks like" states —
+     rather than inventing a fourth visual language for the same class
+     of honest-uncertainty message. */
+  .quota-stale-label {
+    color: var(--text-tertiary);
+    font-weight: 400;
+    font-style: italic;
+    font-size: 0.72rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-variant-numeric: tabular-nums;
+    margin-top: -0.1rem;
+  }
+  /* F2: non-destructive poll-failure banner — sits above a still-visible
+     card list (see the template). Amber/warning tone (matches
+     .gemini-rate-limit / .gemini-downgrade's `--orange` accent already
+     used elsewhere in this file) rather than the harder `--red` used for
+     the full-page .error state, since this is explicitly recoverable. */
+  .poll-error-banner {
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.5rem;
+    border-radius: 4px;
+    background: rgba(217, 119, 6, 0.1);
+    color: var(--orange, #d97706);
+    font-size: 0.85rem;
+    line-height: 1.3;
   }
   .balance-row {
     display: flex;
@@ -1168,6 +1541,20 @@
     font-style: italic;
   }
   .usage-bars { display: flex; gap: 1rem; }
+  /* HIGH-1 (an internal ticket redteam): honest "no row yet" state, styled like
+     .balance-pending so the two "checking…" idioms read as one pattern. */
+  .usage-bars-pending {
+    display: flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    font-size: 0.72rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+  }
+  .quota-pending-label {
+    color: var(--text-tertiary);
+    font-weight: 400;
+    font-style: italic;
+  }
   .reset-info {
     display: flex;
     gap: 1rem;
@@ -1175,6 +1562,9 @@
     color: var(--text-tertiary);
     font-family: var(--font-mono, ui-monospace, monospace);
     margin-top: -0.1rem;
+    /* F12: numbers scanned down 18 stacked cards must not jitter width
+       digit-to-digit ("1h" vs "24h" vs "1h1m"). */
+    font-variant-numeric: tabular-nums;
   }
   .loading, .error, .empty { padding: 2rem; text-align: center; }
   .error { color: var(--red); }

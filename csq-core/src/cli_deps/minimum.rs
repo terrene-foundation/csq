@@ -17,6 +17,17 @@ pub const CODEX_NPM_PACKAGE: &str = "@openai/codex";
 /// npm package name for Google Gemini CLI.
 pub const GEMINI_NPM_PACKAGE: &str = "@google/gemini-cli";
 
+// ── Self-managed CLI first-install commands (curl | bash `install.sh`) ─────────
+// Kimi and Grok are NOT package-manager CLIs. Their first install is the
+// vendor's `install.sh`; csq NEVER auto-executes these (no `sh -c curl|bash`
+// per spec/13 §10 + security.md) — it prints the string as a manual hint.
+// Upgrades use the CLIs' own subcommands (see `upgrade_command`).
+
+/// Vendor first-install hint for Moonshot Kimi Code.
+pub const KIMI_INSTALL_HINT: &str = "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash";
+/// Vendor first-install hint for xAI Grok CLI.
+pub const GROK_INSTALL_HINT: &str = "curl -fsSL https://x.ai/cli/install.sh | bash";
+
 /// Minimum acceptable version for each CLI surface.
 ///
 /// | CLI    | Floor  | Rationale (code-cited at HEAD)                                              |
@@ -24,11 +35,15 @@ pub const GEMINI_NPM_PACKAGE: &str = "@google/gemini-cli";
 /// | Claude | 2.0.0  | `claudeAiOauth` schema introduced in CC 2.x (spec 01, CC `storage.ts`).    |
 /// | Codex  | 0.40.0 | `--device-auth` landing version (`providers/codex/desktop_login.rs:1514`). |
 /// | Gemini | 0.41.2 | `oauth_login.rs:6` — rewritten for gemini-cli v0.41.2+.                    |
+/// | Kimi   | 0.27.0 | csq-integration baseline (Wave 0/2, 2026-07-18 — first shipped `kimi`).    |
+/// | Grok   | 0.2.0  | csq-integration baseline (Wave 0/2, 2026-07-18 — first shipped `grok`).    |
 pub fn min_version(cli: SurfaceCli) -> Version {
     match cli {
         SurfaceCli::Claude => Version::new(2, 0, 0),
         SurfaceCli::Codex => Version::new(0, 40, 0),
         SurfaceCli::Gemini => Version::new(0, 41, 2),
+        SurfaceCli::Kimi => Version::new(0, 27, 0),
+        SurfaceCli::Grok => Version::new(0, 2, 0),
     }
 }
 
@@ -40,7 +55,11 @@ pub fn min_version(cli: SurfaceCli) -> Version {
 pub fn required_prefix(cli: SurfaceCli) -> Option<&'static str> {
     match cli {
         SurfaceCli::Codex => Some("codex-cli "),
-        SurfaceCli::Claude | SurfaceCli::Gemini => None,
+        // Grok's `--version` prints `grok 0.2.103 (<hash>)`; the `"grok "`
+        // prefix distinguishes it from the unrelated Elastic `grok` tool.
+        SurfaceCli::Grok => Some("grok "),
+        // Kimi prints a bare semver (`0.27.0`); no prefix gate.
+        SurfaceCli::Claude | SurfaceCli::Gemini | SurfaceCli::Kimi => None,
     }
 }
 
@@ -52,7 +71,9 @@ pub fn required_prefix(cli: SurfaceCli) -> Option<&'static str> {
 pub fn install_path_blocklist(cli: SurfaceCli) -> &'static [&'static str] {
     match cli {
         SurfaceCli::Codex => &["/opt/homebrew/Cellar/codex/", "/usr/local/Cellar/codex/"],
-        SurfaceCli::Claude | SurfaceCli::Gemini => &[],
+        // Kimi/Grok resolve to their own vendor install dirs; the `"grok "`
+        // prefix gate already rejects a same-named foreign binary.
+        SurfaceCli::Claude | SurfaceCli::Gemini | SurfaceCli::Kimi | SurfaceCli::Grok => &[],
     }
 }
 
@@ -62,6 +83,8 @@ pub fn binary_name(cli: SurfaceCli) -> &'static str {
         SurfaceCli::Claude => "claude",
         SurfaceCli::Codex => "codex",
         SurfaceCli::Gemini => "gemini",
+        SurfaceCli::Kimi => "kimi",
+        SurfaceCli::Grok => "grok",
     }
 }
 
@@ -142,6 +165,14 @@ pub fn upgrade_command(cli: SurfaceCli, manager: InstallManager) -> Option<Vec<S
             "claude-code".into(),
         ]),
         (SurfaceCli::Claude, InstallManager::ClaudeNativeInstaller) => None,
+        // Self-managed CLIs update via their own subcommand — no curl-bash,
+        // no package manager. `kimi upgrade` / `grok update` (spec/13 §6).
+        (SurfaceCli::Kimi, InstallManager::SelfManaged) => {
+            Some(vec!["kimi".into(), "upgrade".into()])
+        }
+        (SurfaceCli::Grok, InstallManager::SelfManaged) => {
+            Some(vec!["grok".into(), "update".into()])
+        }
         (_, InstallManager::Unknown) => None,
         _ => None,
     }
@@ -253,5 +284,51 @@ mod tests {
         // Both must be non-None (spec/13 §6 symmetry rule)
         assert!(install_command(SurfaceCli::Gemini, InstallManager::BrewFormula).is_some());
         assert!(upgrade_command(SurfaceCli::Gemini, InstallManager::BrewFormula).is_some());
+    }
+
+    // ── Kimi / Grok (self-managed CLIs) ──────────────────────────────
+
+    #[test]
+    fn min_version_kimi_and_grok() {
+        assert_eq!(min_version(SurfaceCli::Kimi), Version::new(0, 27, 0));
+        assert_eq!(min_version(SurfaceCli::Grok), Version::new(0, 2, 0));
+    }
+
+    #[test]
+    fn binary_name_kimi_and_grok() {
+        assert_eq!(binary_name(SurfaceCli::Kimi), "kimi");
+        assert_eq!(binary_name(SurfaceCli::Grok), "grok");
+    }
+
+    #[test]
+    fn required_prefix_grok_gates_grok_space() {
+        // Grok prints `grok 0.2.103 (<hash>)`; the prefix rejects the unrelated
+        // Elastic `grok` tool. Kimi prints a bare semver — no prefix.
+        assert_eq!(required_prefix(SurfaceCli::Grok), Some("grok "));
+        assert_eq!(required_prefix(SurfaceCli::Kimi), None);
+    }
+
+    #[test]
+    fn upgrade_command_self_managed_uses_native_subcommand() {
+        // No curl-bash, no package manager — the CLI's own subcommand.
+        assert_eq!(
+            upgrade_command(SurfaceCli::Kimi, InstallManager::SelfManaged),
+            Some(vec!["kimi".into(), "upgrade".into()])
+        );
+        assert_eq!(
+            upgrade_command(SurfaceCli::Grok, InstallManager::SelfManaged),
+            Some(vec!["grok".into(), "update".into()])
+        );
+    }
+
+    #[test]
+    fn install_command_self_managed_is_none() {
+        // First install is the vendor `install.sh`; csq NEVER auto-runs it
+        // (no `sh -c curl|bash`). install_command → None → manual hint path.
+        assert!(install_command(SurfaceCli::Kimi, InstallManager::SelfManaged).is_none());
+        assert!(install_command(SurfaceCli::Grok, InstallManager::SelfManaged).is_none());
+        // Also None when probed-Missing (manager defaults to NpmGlobal).
+        assert!(install_command(SurfaceCli::Kimi, InstallManager::NpmGlobal).is_none());
+        assert!(install_command(SurfaceCli::Grok, InstallManager::NpmGlobal).is_none());
     }
 }

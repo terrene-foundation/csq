@@ -955,7 +955,7 @@ mod tests {
         );
     }
 
-    // ── Pass 3: store-token contamination heal (#955 / #61) ──
+    // ── Pass 3: store-token contamination heal (an internal ticket / #61) ──
 
     #[test]
     fn heal_outcome_io_error_blocks_success_even_on_partial_removal() {

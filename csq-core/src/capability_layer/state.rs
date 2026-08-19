@@ -80,7 +80,7 @@ pub struct PreSpawnState {
     /// (rules / agents / skills / commands), produced by the shared
     /// `coc::translate::flatten_artifacts` — the SAME flatten the
     /// scaffold's delivered prose (`scaffold`) is built from. CU1b (issue
-    /// #764) establishes this as the substrate CU3's native-materialization
+    /// an internal ticket) establishes this as the substrate CU3's native-materialization
     /// leg extends: today only the prose blob is DELIVERED, but the
     /// per-kind breakdown (with full artifact bodies) is recorded here so
     /// CU3 can add a native-emit variant without re-architecting the

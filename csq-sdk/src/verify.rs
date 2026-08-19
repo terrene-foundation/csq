@@ -44,7 +44,11 @@ fn u64_is_zero(n: &u64) -> bool {
 
 /// One entry in the `historical_key_gaps` array — the wire mirror of csq-core's
 /// internal `VerifyJsonKeyGap`.
+///
+/// `#[non_exhaustive]`: construct via [`VerifyKeyGap::new`] (all four fields are
+/// always present — no optional fields on this DTO).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct VerifyKeyGap {
     /// The `key_id` of the absent historical signing key.
     pub key_id: String,
@@ -56,6 +60,19 @@ pub struct VerifyKeyGap {
     pub count: u64,
 }
 
+impl VerifyKeyGap {
+    /// Build a `VerifyKeyGap` from its four always-present fields.
+    #[must_use]
+    pub fn new(key_id: impl Into<String>, first_seq: u64, last_seq: u64, count: u64) -> Self {
+        Self {
+            key_id: key_id.into(),
+            first_seq,
+            last_seq,
+            count,
+        }
+    }
+}
+
 /// Typed failure detail — the wire mirror of csq-core's internal `VerifyFailureDetail`.
 ///
 /// **Leak-safety invariant.** `message` crosses the operator stdout boundary. The
@@ -63,7 +80,11 @@ pub struct VerifyKeyGap {
 /// (`ed25519:<hex>` key ids, record ids, `u64` seqs) or already-redacted sub-fields —
 /// never a raw path or upstream body. This DTO is the wire shape; the invariant is
 /// enforced at the builder (`csq-core::audit::VerifyFailureDetail::from_ledger_error`).
+///
+/// `#[non_exhaustive]`: construct via [`VerifyFailureDetail::new`] (both fields are
+/// always present — no optional fields on this DTO).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct VerifyFailureDetail {
     /// One of: `"chain_broken"`, `"invalid_signature"`, `"key_not_found"`,
     /// `"keychain_unavailable"`, `"unsigned_record_after_cutoff"`, `"internal"`, … —
@@ -73,13 +94,30 @@ pub struct VerifyFailureDetail {
     pub message: String,
 }
 
+impl VerifyFailureDetail {
+    /// Build a `VerifyFailureDetail` from its two always-present fields.
+    #[must_use]
+    pub fn new(kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 /// The `csq.verify.v1` payload — the chain-integrity verdict plus the `edition`
 /// discriminant. Field shapes for `status`, the counts, `historical_key_gaps`,
 /// `failure_detail`, `trust_plane_grade`, and `verification_level_summary` are
 /// byte-identical to the pre-envelope `csq audit verify --json` (spec 12 §12.13.5); the
-/// envelope adds `schema` / `ok` around them and this DTO adds `edition`. Constructed by
-/// the csq-core builder (public fields; no method here).
+/// envelope adds `schema` / `ok` around them and this DTO adds `edition`.
+///
+/// `#[non_exhaustive]`: construct via [`VerifyPayload::new`] + the `with_*` methods
+/// below (fields stay `pub` for in-place mutation by the csq-core builder, e.g. the
+/// unlicensed-enterprise field suppression in `csq-core::sdk::verify::build_verify_envelope`
+/// — sealing blocks external struct-literal *construction*, not field assignment on
+/// an already-built value).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct VerifyPayload {
     /// `"ok"` | `"partial_historical"` | `"partial"` | `"integrity_failure"` — the
     /// verdict status.
@@ -121,6 +159,75 @@ pub struct VerifyPayload {
     /// The build edition (`"community"` | `"enterprise"`) — the discriminant that lets
     /// a consumer interpret an omitted enterprise-only field. Supplied by the app.
     pub edition: &'static str,
+}
+
+impl VerifyPayload {
+    /// Build a `VerifyPayload` from its four always-present fields
+    /// (`status`, `verified_count`, `skipped_v1_count`, `edition`). The six
+    /// optional fields start at their wire-omitted default (`0` / empty / `None`)
+    /// — attach them with the `with_*` methods below.
+    #[must_use]
+    pub fn new(
+        status: &'static str,
+        verified_count: u64,
+        skipped_v1_count: u64,
+        edition: &'static str,
+    ) -> Self {
+        Self {
+            status,
+            verified_count,
+            skipped_v1_count,
+            unknown_kind_count: 0,
+            historical_key_gaps: Vec::new(),
+            failure_detail: None,
+            trust_plane_grade: None,
+            verification_level_summary: None,
+            record_verification_level: None,
+            edition,
+        }
+    }
+
+    /// Set `unknown_kind_count` (omitted from the wire when `0`).
+    #[must_use]
+    pub fn with_unknown_kind_count(mut self, count: u64) -> Self {
+        self.unknown_kind_count = count;
+        self
+    }
+
+    /// Set `historical_key_gaps` (omitted from the wire when empty).
+    #[must_use]
+    pub fn with_historical_key_gaps(mut self, gaps: Vec<VerifyKeyGap>) -> Self {
+        self.historical_key_gaps = gaps;
+        self
+    }
+
+    /// Attach the typed failure detail for a negative verdict.
+    #[must_use]
+    pub fn with_failure_detail(mut self, detail: VerifyFailureDetail) -> Self {
+        self.failure_detail = Some(detail);
+        self
+    }
+
+    /// Attach the enterprise-only trust-plane grade.
+    #[must_use]
+    pub fn with_trust_plane_grade(mut self, grade: &'static str) -> Self {
+        self.trust_plane_grade = Some(grade);
+        self
+    }
+
+    /// Attach the enterprise-only per-level record-count summary.
+    #[must_use]
+    pub fn with_verification_level_summary(mut self, summary: BTreeMap<String, u64>) -> Self {
+        self.verification_level_summary = Some(summary);
+        self
+    }
+
+    /// Attach the per-record verification level looked up for `--record <id>`.
+    #[must_use]
+    pub fn with_record_verification_level(mut self, level: impl Into<String>) -> Self {
+        self.record_verification_level = Some(level.into());
+        self
+    }
 }
 
 #[cfg(test)]

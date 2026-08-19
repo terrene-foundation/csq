@@ -192,8 +192,17 @@ mod tests {
         assert!(m < z);
     }
 
+    /// NIT-1 (round-13 review): this loops a PURE function 30x in ONE
+    /// process — it can only fail if `translate` reads mutable global
+    /// state, which it does not by construction (no statics, no env, no
+    /// clock). It does NOT exercise FR-DISP-05's actual contract, which is
+    /// cross-PROCESS byte-identity (spec 10 §10.3.5) — that is covered by
+    /// `coc-eval/lib/delivery.py::run_csq_translate`, which shells out to a
+    /// fresh `csq translate` invocation per call. Renamed from
+    /// `deterministic_30_invocations` (which claimed the cross-process
+    /// contract) to name what this test actually proves.
     #[test]
-    fn deterministic_30_invocations() {
+    fn translate_is_pure_across_repeated_calls_same_process() {
         let set = build_set(
             vec![
                 rule("RULE-A", 5, &[Surface::ClaudeCode], "alpha"),

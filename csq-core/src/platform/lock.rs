@@ -26,6 +26,30 @@ pub fn try_lock_file(path: &Path) -> Result<Option<FileLockGuard>, PlatformError
     imp::try_lock_file(path)
 }
 
+/// Attempts to acquire an exclusive lock on `path`, retrying up to
+/// `attempts` times with `delay` between attempts.
+///
+/// Unlike calling [`try_lock_file`] in a caller-side loop, the
+/// underlying OS handle (file descriptor on Unix, mutex handle on
+/// Windows) is obtained EXACTLY ONCE — only the lock-acquisition
+/// attempt itself is retried. A caller-side loop around
+/// `try_lock_file` re-opens the lock file (a real `open(2)` syscall) on
+/// every attempt; on a slow filesystem (network home directory, FUSE
+/// mount) that re-open cost stacks on top of every retry's `delay` and
+/// makes a documented "`attempts * delay`" bound false — the real worst
+/// case becomes `attempts * (open latency + delay)`.
+///
+/// Returns `Ok(Some(guard))` if acquired within the budget, `Ok(None)`
+/// if every attempt failed to acquire (the lock was held by another
+/// process for the whole window).
+pub fn try_lock_file_bounded(
+    path: &Path,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Result<Option<FileLockGuard>, PlatformError> {
+    imp::try_lock_file_bounded(path, attempts, delay)
+}
+
 // ── Guard type ────────────────────────────────────────────────────────
 
 /// RAII guard that releases the lock on drop.
@@ -94,6 +118,33 @@ mod imp {
             .truncate(false)
             .open(path)
             .map_err(PlatformError::Io)
+    }
+
+    pub fn try_lock_file_bounded(
+        path: &Path,
+        attempts: u32,
+        delay: std::time::Duration,
+    ) -> Result<Option<FileLockGuard>, PlatformError> {
+        // Opened ONCE — every retry below re-attempts flock(2) on this
+        // SAME fd, never re-opening the file (see the public doc
+        // comment on `try_lock_file_bounded`).
+        let file = open_lock_file(path)?;
+        for attempt in 0..attempts {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return Ok(Some(FileLockGuard {
+                    _inner: InnerGuard { file },
+                }));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(PlatformError::Io(err));
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(delay);
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -168,9 +219,9 @@ mod imp {
     ///
     /// `use_global` selects the namespace:
     ///   * `true`  — `Global\csq-lock-{hash}` (visible across all
-    ///                 Terminal Services sessions on the machine)
+    ///     Terminal Services sessions on the machine)
     ///   * `false` — `csq-lock-{hash}` (implicit `Local\` — per-
-    ///                 session only)
+    ///     session only)
     ///
     /// The Global namespace requires `SeCreateGlobalPrivilege`,
     /// which standard (non-elevated) user accounts lack.  Attempts
@@ -301,6 +352,49 @@ mod imp {
     pub fn try_lock_file(path: &Path) -> Result<Option<FileLockGuard>, PlatformError> {
         let handle = create_mutex_with_fallback(path)?;
         let wait_result = unsafe { WaitForSingleObject(handle, 0) };
+        match wait_result {
+            WAIT_OBJECT_0 => Ok(Some(FileLockGuard {
+                _inner: InnerGuard { handle },
+            })),
+            WAIT_ABANDONED => {
+                warn!(
+                    path = %path.display(),
+                    "mutex acquired after WAIT_ABANDONED (previous holder crashed)"
+                );
+                Ok(Some(FileLockGuard {
+                    _inner: InnerGuard { handle },
+                }))
+            }
+            WAIT_TIMEOUT => {
+                unsafe { CloseHandle(handle) };
+                Ok(None)
+            }
+            _ => {
+                unsafe { CloseHandle(handle) };
+                Err(PlatformError::Win32 {
+                    code: wait_result,
+                    message: format!("WaitForSingleObject returned {wait_result:#x}"),
+                })
+            }
+        }
+    }
+
+    pub fn try_lock_file_bounded(
+        path: &Path,
+        attempts: u32,
+        delay: std::time::Duration,
+    ) -> Result<Option<FileLockGuard>, PlatformError> {
+        // The mutex handle is created ONCE; `WaitForSingleObject`
+        // natively supports a millisecond timeout, so the whole retry
+        // budget collapses into a SINGLE wait call rather than a poll
+        // loop (Unix has no equivalent timed-wait on `flock(2)`, hence
+        // the loop in that implementation).
+        let handle = create_mutex_with_fallback(path)?;
+        let timeout_ms = delay
+            .saturating_mul(attempts)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        let wait_result = unsafe { WaitForSingleObject(handle, timeout_ms) };
         match wait_result {
             WAIT_OBJECT_0 => Ok(Some(FileLockGuard {
                 _inner: InnerGuard { handle },

@@ -5,10 +5,14 @@
 //! (CocSet) + the FR-DISP-* family in
 //! `internal-design-docs`.
 //!
-//! Three translators exist (one per Surface):
+//! Five translators exist (one per Surface):
 //! - `cc`     — Claude Code: settings.json overlay + system-prompt-append
 //! - `codex`  — OpenAI Codex: config.toml overlay + sandbox mode + MCP filter
 //! - `gemini` — Google Gemini: settings.json overlay + approval mode + MCP filter
+//! - `kimi`   — Moonshot Kimi Code (native CLI): AGENTS.md (advisory) +
+//!   config.toml permission rules/hooks (hard-constraint channel)
+//! - `grok`   — xAI Grok (native CLI): AGENTS.md + config.toml/settings.json
+//!   + native `--json-schema` structured output
 //!
 //! All translators are PURE FUNCTIONS — same input produces byte-identical
 //! output across runs and across processes (FR-DISP-05). The pipeline
@@ -20,19 +24,24 @@ pub mod codex;
 pub mod codex_merge;
 pub mod flatten;
 pub mod gemini;
+pub mod grok;
+pub mod kimi;
+pub mod kimi_merge;
 pub mod materialize;
+mod provenance;
 pub mod types;
 
 pub use flatten::{
     flatten_artifacts, render_sections, surface_header, FlatArtifact, SurfaceArtifacts,
 };
 pub use materialize::{
-    emit_cc_plugin, emit_coc_rules, emit_codex_native, emit_gemini_native, MaterializedKind,
-    MaterializedManifest,
+    emit_cc_plugin, emit_coc_rules, emit_codex_native, emit_gemini_native, emit_grok_native,
+    emit_kimi_native, MaterializedKind, MaterializedManifest,
 };
 pub use types::{
-    ApprovalMode, ClaudeSpawnPayload, CodexSpawnPayload, GeminiSpawnPayload, HostContext,
-    McpFilter, SandboxMode, SpawnPayload,
+    ApprovalMode, ClaudeSpawnPayload, CodexSpawnPayload, GeminiSpawnPayload, GrokPermissionMode,
+    GrokSandboxProfile, GrokSpawnPayload, HostContext, KimiDecision, KimiHook, KimiHookEvent,
+    KimiPermissionRule, KimiScope, KimiSpawnPayload, McpFilter, SandboxMode, SpawnPayload,
 };
 
 use crate::providers::catalog::Surface;
@@ -40,7 +49,7 @@ use crate::providers::catalog::Surface;
 use super::types::CocSet;
 
 /// Dispatch a `CocSet` through the per-Surface translator. Returns
-/// `SpawnPayload` (a sum type over the three Surfaces).
+/// `SpawnPayload` (a sum type over the five Surfaces).
 ///
 /// `host_ctx` carries Surface-specific host context (round-3 R3-M3
 /// sum-type promotion). cc + codex translators ignore it (their
@@ -58,15 +67,26 @@ pub fn translate(coc_set: &CocSet, surface: Surface, host_ctx: &HostContext) -> 
             coc_set,
             host_ctx.as_gemini(),
         )),
+        // Native Kimi/Grok each get their own translator (workspace
+        // hermes-parity an internal journal entry + 0133 supersession). The prior
+        // Codex-aliasing route was inert in both directions: `codex::
+        // translate` emits a `CodexSpawnPayload.instructions` field destined
+        // for `~/.codex/config.toml::instructions`, a key Kimi's config
+        // schema does not have and Grok never reads at all (harness-
+        // decomposition reports 13 §5.1 / 14 §6.2). Neither vendor's actual
+        // read path — `<KIMI_CODE_HOME>/AGENTS.md` / `$GROK_HOME/AGENTS.md`
+        // — was ever written to.
+        Surface::Kimi => SpawnPayload::Kimi(kimi::translate(coc_set)),
+        Surface::Grok => SpawnPayload::Grok(grok::translate(coc_set)),
     }
 }
 
 /// FR-CL-01 system-prompt directive instructing the model to emit a
 /// `{"rule_id","decision","rationale"}` JSON envelope for compliance-class
-/// prompts. Surface-agnostic: same directive text reaches CC, Codex, and
-/// Gemini through their respective per-Surface delivery mechanisms (CC env
-/// var / Codex `instructions` block in config.toml / Gemini
-/// `system_instruction` field in settings.json).
+/// prompts. Surface-agnostic: same directive text reaches each Surface through its per-Surface
+/// delivery mechanism (CC env var / Codex `instructions` block in
+/// config.toml / Gemini `system_instruction` field in settings.json /
+/// Kimi `AGENTS.md` prose / Grok `--rules` flag).
 ///
 /// Pure function (no inputs); deterministic across calls. Phase 2a
 /// deviation per spec 10 §10.4.6: when csq doesn't own the API call, the
@@ -79,7 +99,7 @@ pub fn translate(coc_set: &CocSet, surface: Surface, host_ctx: &HostContext) -> 
 ///
 /// Origin: PR-CA7c (CC-only); promoted to module level in PR-CA8 commit 1a
 /// for cross-Surface use. Single source of truth for the directive text;
-/// all three translators (cc, codex, gemini) re-export from here.
+/// all five translators (cc, codex, gemini, kimi, grok) re-export from here.
 pub fn build_output_schema_directive() -> String {
     let mut s = String::new();
     s.push_str("\n## Structured citation format (compliance prompts)\n");
@@ -129,6 +149,31 @@ mod tests {
             SpawnPayload::Gemini(_) => (),
             other => panic!("expected Gemini payload, got {other:?}"),
         }
+        match translate(&set, Surface::Kimi, &no_host) {
+            SpawnPayload::Kimi(_) => (),
+            other => panic!("expected Kimi payload, got {other:?}"),
+        }
+        match translate(&set, Surface::Grok, &no_host) {
+            SpawnPayload::Grok(_) => (),
+            other => panic!("expected Grok payload, got {other:?}"),
+        }
+    }
+
+    /// Kimi/Grok are no longer aliased to the Codex translator (workspace
+    /// hermes-parity an internal journal entry) — each Surface now produces its OWN
+    /// payload variant, distinct from `SpawnPayload::Codex`.
+    #[test]
+    fn kimi_and_grok_no_longer_alias_codex_payload() {
+        let set = empty_set();
+        let no_host = HostContext::None;
+        assert!(!matches!(
+            translate(&set, Surface::Kimi, &no_host),
+            SpawnPayload::Codex(_)
+        ));
+        assert!(!matches!(
+            translate(&set, Surface::Grok, &no_host),
+            SpawnPayload::Codex(_)
+        ));
     }
 
     /// PR-CA8b R3-M3: HostContext default is `None` variant — used
@@ -208,16 +253,20 @@ mod tests {
     }
 
     /// PR-CA8 §11.5: the directive text is Surface-agnostic by construction.
-    /// All three translator re-exports point at the same module-level function;
-    /// this test pins byte-equivalence so a future translator-specific override
-    /// fails fast.
+    /// All five translator re-exports point at the same module-level
+    /// function; this test pins byte-equivalence so a future
+    /// translator-specific override fails fast.
     #[test]
     fn output_schema_directive_text_byte_identical_across_surfaces() {
         let cc = cc::build_output_schema_directive();
         let cdx = codex::build_output_schema_directive();
         let gem = gemini::build_output_schema_directive();
+        let kim = kimi::build_output_schema_directive();
+        let grk = grok::build_output_schema_directive();
         assert_eq!(cc, cdx, "cc vs codex directive text must be identical");
         assert_eq!(cdx, gem, "codex vs gemini directive text must be identical");
+        assert_eq!(gem, kim, "gemini vs kimi directive text must be identical");
+        assert_eq!(kim, grk, "kimi vs grok directive text must be identical");
         assert!(
             cc.contains("rule_id"),
             "directive must name the rule_id field"

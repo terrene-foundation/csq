@@ -6,7 +6,7 @@
   import { homeDir, join } from '@tauri-apps/api/path';
   import { tick } from 'svelte';
 
-  // Phase 2 of #389 — the Claude OAuth flow now shells out to
+  // Phase 2 of an internal ticket — the Claude OAuth flow now shells out to
   // `claude auth login` via `start_claude_login_subprocess`. CC is
   // the reference OAuth client; csq invokes it and waits. The race
   // flow's loopback `redirect_uri` (`http://127.0.0.1:<port>/callback`)
@@ -44,6 +44,18 @@
     default_model: string;
   }
 
+  // Wave 3 W3-5 (an internal journal entry) — native Kimi/Grok session-surface entries.
+  // Distinct from ProviderView: a native surface is a self-authenticating
+  // vendor binary csq dispatches sessions to but never stores credentials
+  // for. Rendered alongside `providers` in the same picker grid.
+  interface NativeCliView {
+    id: string;
+    display_name: string;
+    default_model: string;
+    surface: string;
+    binary: string;
+  }
+
   // PR-C8 — Codex device-auth flow types.
   // an internal journal entry / round-3 redteam HIGH-A — `device_auth_prereq_*` fields
   // carry the ChatGPT Security Settings prerequisite so the modal can
@@ -64,9 +76,25 @@
     verification_url: string;
   }
 
+  // Native Kimi/Grok device-auth flow types (an internal journal entry C8). Mirrors
+  // the Codex shapes above — `start_native_login` is the ToS-free
+  // analog of `start_codex_login` (id/slot/conflict validation +
+  // CLI-installed probe, no side effects); `native-device-code` carries
+  // `surface` so one listener serves both Kimi and Grok flows.
+  interface StartNativeLoginView {
+    native_id: string;
+    display_name: string;
+    cli_installed: boolean;
+  }
+  interface NativeDeviceCode {
+    surface: string;
+    user_code: string;
+    verification_url: string;
+  }
+
   // ── Local state ───────────────────────────────────────────
   //
-  // Claude OAuth — subprocess shell-out flow (#389 Phase 2):
+  // Claude OAuth — subprocess shell-out flow (an internal ticket Phase 2):
   //   1. `picker`                      — user picks a provider
   //   2. `claude-subprocess-running`   — `start_claude_login_subprocess`
   //                                      is awaiting `claude auth login`.
@@ -84,7 +112,7 @@
   //   2. `keyless-confirm` — info screen, Confirm binds slot
   type Step =
     | { kind: 'picker' }
-    // ── Claude subprocess flow (default since #389 Phase 2) ────
+    // ── Claude subprocess flow (default since an internal ticket Phase 2) ────
     /// Round-1 redteam HIGH-1 — monotonic `invocationId` disambiguates
     /// rapid-re-open-same-slot timing. The success/error guards check
     /// the id so a stale Promise from a prior invoke can't fire
@@ -111,6 +139,36 @@
         selectedModel: string;
         submitting: boolean;
         error: string | null;
+      }
+    // ── Native Kimi/Grok device-auth flow (an internal journal entry C8) ────
+    // Per-slot vendor-home login, mirroring the Codex device-auth flow:
+    // `start_native_login` pre-checks (id/slot/conflict + CLI-installed
+    // probe), then Confirm drives `complete_native_login` which spawns
+    // the vendor's own device-code sign-in into the slot's isolated
+    // vendor home and forwards `native-device-code` events.
+    | {
+        kind: 'native-cli-confirm';
+        cli: NativeCliView;
+        /// Whether `cli.binary` resolves (via `start_native_login`'s
+        /// `cli_installed` field). Populated asynchronously on step
+        /// entry; null while probing. `false` surfaces an inline
+        /// install-hint banner — it does NOT block the Confirm button,
+        /// since `complete_native_login` re-resolves the binary at
+        /// spawn time and errors cleanly if it's still missing.
+        binaryInstalled: boolean | null;
+        /// Set when `start_native_login` itself rejects the request
+        /// (unknown id, invalid slot, or — most commonly — the slot is
+        /// already bound to a conflicting surface). Distinct from a
+        /// missing-binary hint: this DOES block Confirm, since retrying
+        /// the device-auth spawn would hit the identical rejection.
+        error: string | null;
+      }
+    | {
+        kind: 'native-running';
+        cli: NativeCliView;
+        /// Populated by the `native-device-code` event when the
+        /// subprocess emits it; null until then.
+        deviceCode: NativeDeviceCode | null;
       }
     // ── Codex device-auth flow (PR-C8) ─────────────────────────
     | { kind: 'codex-tos'; account: number }
@@ -152,6 +210,31 @@
         submitting: boolean;
         error: string | null;
       }
+    // ── Cloud-Claude (Vertex / Bedrock) flow (an internal ticket PR-2) ──────
+    // Desktop parity for `csq setkey claude --backend vertex|bedrock`.
+    // Enterprise-only — the picker card that opens this step is gated
+    // on `get_build_edition() === 'enterprise'`, and the Tauri commands
+    // it invokes are absent from the community build. Two tabs mirror
+    // the two backends: Vertex (project + region + SA-file picker) and
+    // Bedrock (region + bearer-token paste). Fail-closed slot conflicts
+    // are enforced by the backend and surfaced in `error`.
+    | {
+        kind: 'cloud-claude-provision';
+        account: number;
+        /// "vertex" | "bedrock" — currently active tab.
+        mode: 'vertex' | 'bedrock';
+        /// GCP project id (Vertex only).
+        project: string;
+        /// GCP/AWS region (both backends).
+        region: string;
+        /// Vertex SA JSON absolute path — empty until the user picks one.
+        saPath: string;
+        /// AWS Bedrock bearer token paste buffer (Bedrock only). Never
+        /// echoed back over IPC.
+        bearerToken: string;
+        submitting: boolean;
+        error: string | null;
+      }
     | { kind: 'success'; message: string }
     /// UX-R2-03 / SEC-R2-01: dedicated recovery UI when the backend
     /// reports another csq process (CLI or desktop) holds the
@@ -183,6 +266,13 @@
   let step = $state<Step>({ kind: 'picker' });
   let providers = $state<ProviderView[]>([]);
   let providersError = $state<string | null>(null);
+  let nativeClis = $state<NativeCliView[]>([]);
+
+  // Build edition ('community' | 'enterprise'), from the compile-time
+  // crate::BUILD_EDITION const via `get_build_edition`. null until loaded.
+  // Gates the enterprise-only cloud-Claude (Vertex/Bedrock) picker card:
+  // its Tauri commands are absent from the community build (an internal ticket PR-2).
+  let edition = $state<string | null>(null);
 
   // Slot picker — the dashboard suggests `nextAccountId` as a
   // default, but the user can override (e.g. if they want to log
@@ -227,6 +317,30 @@
     }
   }
 
+  // Native Kimi/Grok session-surface catalog (Wave 3 W3-5). A load
+  // failure just means the native cards don't render this open — the
+  // bearer/OAuth/keyless picker still works, so this fails silently
+  // like `loadTakenSlots` rather than surfacing a blocking error banner.
+  async function loadNativeClis() {
+    try {
+      const result = await invoke<NativeCliView[]>('list_native_clis');
+      nativeClis = Array.isArray(result) ? result : [];
+    } catch {
+      nativeClis = [];
+    }
+  }
+
+  // Loads the build edition so the picker can gate the enterprise-only
+  // cloud-Claude card. A load failure leaves `edition` null, which hides
+  // the card — the safe default (community behavior).
+  async function loadEdition() {
+    try {
+      edition = await invoke<string>('get_build_edition');
+    } catch {
+      edition = null;
+    }
+  }
+
   // Loads the current account list so the slot picker can warn
   // before clobbering an existing slot.
   async function loadTakenSlots() {
@@ -255,7 +369,9 @@
       (async () => {
         if (!cancelled) {
           await loadProviders();
+          await loadNativeClis();
           await loadTakenSlots();
+          await loadEdition();
         }
       })();
       return () => { cancelled = true; };
@@ -330,7 +446,135 @@
     }
   }
 
-  // ── Claude OAuth — subprocess shell-out (#389 Phase 2) ────
+  // ── Native Kimi/Grok device-auth flow (an internal journal entry C8) ────
+  //
+  // Per-slot vendor-home login — the vendor CLI's OWN device-code sign-in
+  // runs into an isolated `native-homes/<surface>-<N>/` dir csq spawns it
+  // with, mirroring the Codex device-auth flow. Three backend calls:
+  //
+  // 1. `start_native_login` — pre-check: id/slot/conflict validation +
+  //    CLI-installed probe. No side effects.
+  // 2. `complete_native_login` — drives `kimi login` / `grok login
+  //    --device-auth`, emits `native-device-code` events as soon as the
+  //    vendor's own device code is visible (parsed EXCLUSIVELY inside
+  //    the backend's host-allowlisted parser — this component never
+  //    parses subprocess output), blocks until the process exits, and
+  //    writes the credential-less binding marker on success only.
+  // 3. `cancel_native_login` — best-effort kill on modal close.
+  //
+  // The `native-device-code` event carries `{ surface, user_code,
+  // verification_url }`; `surface` disambiguates Kimi vs Grok on the one
+  // shared listener.
+  function pickNativeCli(cli: NativeCliView) {
+    if (slotError) return;
+    step = {
+      kind: 'native-cli-confirm',
+      cli,
+      binaryInstalled: null,
+      error: null,
+    };
+    (async () => {
+      try {
+        const baseDir = await getBaseDir();
+        const view = await invoke<StartNativeLoginView>('start_native_login', {
+          baseDir,
+          nativeId: cli.id,
+          slot: chosenSlot,
+        });
+        if (step.kind === 'native-cli-confirm' && step.cli.id === cli.id) {
+          step = { ...step, binaryInstalled: view.cli_installed };
+        }
+      } catch (e) {
+        // Unlike the missing-binary hint (informational, non-blocking),
+        // a start_native_login rejection (unknown id / invalid slot /
+        // conflicting binding) DOES block Confirm — retrying the spawn
+        // would hit the identical rejection.
+        if (step.kind === 'native-cli-confirm' && step.cli.id === cli.id) {
+          step = { ...step, error: String(e) };
+        }
+      }
+    })();
+  }
+
+  // Re-runs the `start_native_login` pre-flight after the user has
+  // installed the vendor CLI manually. Mirrors `retryAfterInstall`'s
+  // Recheck pattern for codex/gemini — this is the safe in-scope
+  // affordance for the missing-CLI state: `csq cli install <name>`
+  // requires interactive TTY consent (spec/13 §10 non-TTY refusal) that
+  // a Tauri command context structurally cannot satisfy, so this modal
+  // cannot trigger the install itself. Recheck lets the user come back
+  // to this screen after installing in a terminal, without re-navigating
+  // from the picker.
+  function recheckNativeCli() {
+    if (step.kind !== 'native-cli-confirm') return;
+    pickNativeCli(step.cli);
+  }
+
+  let nativeDeviceCodeUnlisten: UnlistenFn | null = null;
+  // Mirrors `codexListenerClosed` (an internal journal entry finding 14): guards the
+  // listener-registration race where the modal closes while
+  // `await listen()` is still resolving.
+  let nativeListenerClosed = false;
+
+  async function runNativeLogin() {
+    if (step.kind !== 'native-cli-confirm' || step.error) return;
+    const cli = step.cli;
+    step = { kind: 'native-running', cli, deviceCode: null };
+    nativeListenerClosed = false;
+
+    // Subscribe BEFORE invoke so a fast backend cannot race the event
+    // listener registration (mirrors `runCodexLogin`).
+    if (nativeDeviceCodeUnlisten) {
+      nativeDeviceCodeUnlisten();
+      nativeDeviceCodeUnlisten = null;
+    }
+    const unlistenFn = await listen<NativeDeviceCode>(
+      'native-device-code',
+      async (e) => {
+        if (
+          step.kind === 'native-running' &&
+          step.cli.id === cli.id &&
+          e.payload.surface === cli.surface
+        ) {
+          step = { ...step, deviceCode: e.payload };
+          try {
+            await openUrl(e.payload.verification_url);
+          } catch (_) {
+            /* fall through — user can click the link in the UI */
+          }
+        }
+      },
+    );
+
+    if (nativeListenerClosed) {
+      unlistenFn();
+      return;
+    }
+    nativeDeviceCodeUnlisten = unlistenFn;
+
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('complete_native_login', {
+        baseDir,
+        nativeId: cli.id,
+        slot: chosenSlot,
+      });
+      onAccountAdded();
+      step = {
+        kind: 'success',
+        message: `${cli.display_name} bound to slot #${chosenSlot}.`,
+      };
+    } catch (e) {
+      step = { kind: 'error', message: String(e) };
+    } finally {
+      if (nativeDeviceCodeUnlisten) {
+        nativeDeviceCodeUnlisten();
+        nativeDeviceCodeUnlisten = null;
+      }
+    }
+  }
+
+  // ── Claude OAuth — subprocess shell-out (an internal ticket Phase 2) ────
   //
   // Delegates to CC's reference OAuth flow by spawning
   // `claude auth login` with `CLAUDE_CONFIG_DIR=<base>/config-<N>`.
@@ -964,6 +1208,125 @@
     }
   }
 
+  // ── Cloud-Claude (Vertex / Bedrock) flow (an internal ticket PR-2) ─────
+  //
+  // Desktop parity for `csq setkey claude --backend vertex|bedrock`.
+  // Opens a two-tab panel (Vertex SA-file picker / Bedrock token paste)
+  // and invokes the enterprise-only `cloud_claude_provision_*` commands,
+  // which delegate to `bind_cloud_claude_backend_to_slot`. The backend
+  // owns the fail-closed slot-conflict guard, so a slot already bound to
+  // Anthropic OAuth / Codex / Gemini / a real 3P key is refused there and
+  // surfaced in the panel's error banner.
+  function startCloudClaudeFlow(account: number) {
+    step = {
+      kind: 'cloud-claude-provision',
+      account,
+      mode: 'vertex',
+      project: '',
+      region: '',
+      saPath: '',
+      bearerToken: '',
+      submitting: false,
+      error: null,
+    };
+  }
+
+  function setCloudClaudeMode(mode: 'vertex' | 'bedrock') {
+    if (step.kind !== 'cloud-claude-provision') return;
+    step = { ...step, mode, error: null };
+  }
+
+  /// Opens the OS file picker scoped to JSON files for the Vertex SA.
+  /// Reuses the `dialog:allow-open` capability already granted for the
+  /// Gemini Vertex SA picker. Returns the absolute path, or leaves the
+  /// current path untouched on cancel.
+  async function pickCloudClaudeSaFile() {
+    if (step.kind !== 'cloud-claude-provision') return;
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: 'Vertex service account JSON', extensions: ['json'] }],
+      });
+      const path = typeof picked === 'string' ? picked : null;
+      if (path) {
+        step = { ...step, saPath: path, error: null };
+      }
+    } catch (e) {
+      step = { ...step, error: `File picker failed: ${e}` };
+    }
+  }
+
+  async function submitCloudClaudeVertex() {
+    if (step.kind !== 'cloud-claude-provision' || step.mode !== 'vertex') return;
+    const current = step;
+    const project = current.project.trim();
+    const region = current.region.trim();
+    const saPath = current.saPath.trim();
+    if (!project) {
+      step = { ...current, error: 'Enter the GCP project ID' };
+      return;
+    }
+    if (!region) {
+      step = { ...current, error: 'Enter the Vertex region' };
+      return;
+    }
+    if (!saPath) {
+      step = { ...current, error: 'Pick a Vertex service account JSON file' };
+      return;
+    }
+    step = { ...current, submitting: true, error: null };
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('cloud_claude_provision_vertex', {
+        baseDir,
+        slot: current.account,
+        project,
+        region,
+        saPath,
+      });
+      onAccountAdded();
+      step = {
+        kind: 'success',
+        message: `Claude slot ${current.account} provisioned via Google Vertex AI.`,
+      };
+    } catch (e) {
+      step = { ...current, submitting: false, error: String(e) };
+    }
+  }
+
+  async function submitCloudClaudeBedrock() {
+    if (step.kind !== 'cloud-claude-provision' || step.mode !== 'bedrock') return;
+    const current = step;
+    const region = current.region.trim();
+    const token = current.bearerToken.trim();
+    if (!region) {
+      step = { ...current, error: 'Enter the AWS region' };
+      return;
+    }
+    if (!token) {
+      step = { ...current, error: 'Paste the AWS Bedrock bearer token' };
+      return;
+    }
+    step = { ...current, submitting: true, error: null };
+    try {
+      const baseDir = await getBaseDir();
+      await invoke('cloud_claude_provision_bedrock', {
+        baseDir,
+        slot: current.account,
+        region,
+        bearerToken: token,
+      });
+      onAccountAdded();
+      step = {
+        kind: 'success',
+        message: `Claude slot ${current.account} provisioned via AWS Bedrock.`,
+      };
+    } catch (e) {
+      step = { ...current, submitting: false, error: String(e) };
+    }
+  }
+
   // ── Close behavior ────────────────────────────────────────
   async function handleClose() {
     // an internal journal entry finding 13 + 14: flag the listener as "closed"
@@ -972,6 +1335,8 @@
     // in `runCodexLogin` will see `codexListenerClosed` and drop
     // the handler immediately on its side.
     codexListenerClosed = true;
+    // Same race guard for the native (Kimi/Grok) device-code listener.
+    nativeListenerClosed = true;
 
     // Drop any in-flight Codex device-code subscription so a late
     // event from an aborted login cannot slam the modal back into
@@ -979,6 +1344,10 @@
     if (codexDeviceCodeUnlisten) {
       codexDeviceCodeUnlisten();
       codexDeviceCodeUnlisten = null;
+    }
+    if (nativeDeviceCodeUnlisten) {
+      nativeDeviceCodeUnlisten();
+      nativeDeviceCodeUnlisten = null;
     }
 
     // Claude OAuth has no event subscription to tear down — the
@@ -1002,6 +1371,19 @@
       /* best-effort — ignore */
     }
 
+    // an internal journal entry C8: kill any running native (Kimi/Grok) device-auth
+    // subprocess. `cancel_native_login` is per-surface, so both ids are
+    // called unconditionally — a no-op when nothing is running for that
+    // surface (mirrors the codex cancel above, generalized to two ids
+    // since Kimi and Grok can run concurrently).
+    for (const nativeId of ['kimi-cli', 'grok']) {
+      try {
+        await invoke('cancel_native_login', { nativeId });
+      } catch (_) {
+        /* best-effort — ignore */
+      }
+    }
+
     // an internal journal entry finding 13: reset `step` to 'picker' so a late
     // `codex-device-code` delivery (e.g. a Tauri event bus race)
     // does NOT satisfy the `step.kind === 'codex-running'` guard in
@@ -1016,6 +1398,84 @@
 
     onClose();
   }
+
+  // ── F4 (i-audit/i-harden) — Escape, focus trap, initial focus ──
+  // The prior implementation attached Escape to the *backdrop's* onkeydown,
+  // but keydown bubbles from the focused element upward, and `.modal`'s own
+  // onkeydown called `e.stopPropagation()` — so any focus inside the modal
+  // (every real interaction) never reached the backdrop handler. Escape was
+  // dead except in the unreachable case of focus sitting on the backdrop
+  // itself (tabindex="-1", never a real Tab target). Fixed by mirroring
+  // SettingsPopover.svelte's document-level keydown effect (this codebase's
+  // established correct pattern for dialog dismissal) instead of a
+  // bubble-dependent local handler, and extending it with a Tab focus trap
+  // + initial-focus move (svelte-patterns.md Rule 3: effect returns cleanup).
+  let modalEl: HTMLDivElement | undefined = $state();
+  let previouslyFocusedEl: HTMLElement | null = null;
+
+  function focusableElements(container: HTMLElement): HTMLElement[] {
+    // No `offsetParent`/visibility filter: every `step.kind` branch in this
+    // modal is a Svelte `{#if}` block, which REMOVES inactive-step markup
+    // from the DOM rather than hiding it via CSS — so anything this query
+    // finds is already visible. (A visibility filter would also be inert
+    // in jsdom, which has no layout engine and always reports
+    // `offsetParent === null`; do not reintroduce one without a real
+    // `display:none`-while-mounted case to defend against.)
+    return Array.from(
+      container.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea:not([disabled]), ' +
+          'input:not([disabled]), select:not([disabled]), ' +
+          '[tabindex]:not([tabindex="-1"])',
+      ),
+    );
+  }
+
+  $effect(() => {
+    if (!isOpen) return;
+
+    previouslyFocusedEl = document.activeElement as HTMLElement | null;
+    // Move focus into the dialog once it has rendered. `modalEl` carries
+    // `tabindex="-1"` so it accepts programmatic focus even with no
+    // focusable descendant yet (e.g. the picker's first render).
+    void tick().then(() => modalEl?.focus());
+
+    function handleKeydown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        handleClose();
+        return;
+      }
+      if (e.key !== 'Tab' || !modalEl) return;
+      const focusables = focusableElements(modalEl);
+      if (focusables.length === 0) {
+        // Nothing to cycle through — keep focus pinned on the dialog
+        // itself rather than letting Tab escape to the page behind it.
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      const outsideTrap = !active || !modalEl.contains(active);
+      if (e.shiftKey) {
+        if (active === first || outsideTrap) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || outsideTrap) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener('keydown', handleKeydown);
+    return () => {
+      document.removeEventListener('keydown', handleKeydown);
+      // Restore focus to whatever had it before the dialog opened —
+      // a11y parity with SettingsPopover's closePanelAndRestoreFocus.
+      previouslyFocusedEl?.focus();
+      previouslyFocusedEl = null;
+    };
+  });
 </script>
 
 {#if isOpen}
@@ -1023,15 +1483,31 @@
     class="backdrop"
     onclick={handleClose}
     onkeydown={(e) => {
-      if (e.key === 'Escape') handleClose();
+      // svelte a11y_click_events_have_key_events wants keyboard parity
+      // for the click-to-dismiss behavior — Enter/Space mirror the click.
+      // Escape is intentionally NOT handled here (see the document-level
+      // effect above): a bubble-phase handler on an ancestor of the
+      // focused element is exactly the pattern that made Escape dead
+      // before this fix (F4), so dismissal-by-Escape must not depend on
+      // where focus happens to be.
+      if (e.key === 'Enter' || e.key === ' ') handleClose();
     }}
     role="button"
     tabindex="-1"
   >
     <div
       class="modal"
+      bind:this={modalEl}
       onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
+      onkeydown={() => {
+        // Intentional no-op — present only to satisfy
+        // a11y_click_events_have_key_events for the sibling onclick
+        // (which exists solely to stop a click INSIDE the modal from
+        // bubbling to the backdrop's dismiss-on-click). Must NOT call
+        // stopPropagation: that was the F4 bug — it silently killed
+        // Escape (and would kill this Tab-trap effect's own listener)
+        // for any focus inside the modal, which is every real use.
+      }}
       role="dialog"
       aria-modal="true"
       aria-labelledby="add-account-title"
@@ -1107,6 +1583,45 @@
                 {/if}
               </button>
             {/each}
+            {#each nativeClis as cli (cli.id)}
+              <button
+                class="provider-card"
+                data-testid={`native-cli-card-${cli.id}`}
+                onclick={() => pickNativeCli(cli)}
+                disabled={slotError !== null}
+                title={slotError ?? ''}
+              >
+                <div class="provider-name">{cli.display_name}</div>
+                <div class="provider-meta">
+                  Native CLI → slot #{chosenSlot} (signs in separately)
+                </div>
+                {#if cli.default_model}
+                  <div class="provider-model">{cli.default_model}</div>
+                {/if}
+              </button>
+            {/each}
+            <!--
+              an internal ticket PR-2 — cloud-Claude (Vertex/Bedrock) card. Enterprise
+              only: the `cloud_claude_provision_*` commands are absent from
+              the community build, so the card renders only when the build
+              edition is enterprise. Binds the SAME slot picker as the OAuth
+              flows (writes config-N/settings.json).
+            -->
+            {#if edition === 'enterprise'}
+              <button
+                class="provider-card"
+                data-testid="cloud-claude-card"
+                onclick={() => { if (!slotError) startCloudClaudeFlow(chosenSlot); }}
+                disabled={slotError !== null}
+                title={slotError ?? ''}
+              >
+                <div class="provider-name">Claude via Cloud</div>
+                <div class="provider-meta">
+                  Google Vertex AI or AWS Bedrock → slot #{chosenSlot}
+                </div>
+                <div class="provider-model">enterprise</div>
+              </button>
+            {/if}
           </div>
         {:else if step.kind === 'claude-subprocess-running'}
           <p class="lede" data-testid="claude-subprocess-lede">
@@ -1179,6 +1694,120 @@
               {step.submitting ? 'Binding…' : `Bind to slot #${chosenSlot}`}
             </button>
           </div>
+        {:else if step.kind === 'native-cli-confirm'}
+          <p class="lede" data-testid="native-cli-confirm-lede">
+            Sign in to <strong>{step.cli.display_name}</strong> for slot #{chosenSlot}.
+          </p>
+          <p class="hint">
+            csq launches <code>{step.cli.binary}</code>'s own device-code sign-in
+            into an isolated home for this slot — enter the code shown on the
+            next screen at the vendor's verification page. Sessions on slot #{chosenSlot}
+            never touch any other slot's <code>{step.cli.binary}</code> sign-in.
+          </p>
+          {#if step.cli.default_model}
+            <p class="hint">
+              Default model: <code>{step.cli.default_model}</code> (the CLI
+              chooses its own model at runtime; csq does not pin it).
+            </p>
+          {/if}
+          {#if step.binaryInstalled === false}
+            <div class="cli-missing" data-testid="native-cli-missing-hint">
+              <p class="hint">
+                <code>{step.cli.binary}</code> isn't on your PATH yet. Install it, then
+                click Recheck.
+              </p>
+              <div class="install-cmd-row">
+                <code class="install-cmd">csq cli install {step.cli.binary}</code>
+                <button
+                  type="button"
+                  class="copy-code-btn"
+                  data-testid="copy-native-cli-install-cmd"
+                  title="Copy install command"
+                  aria-label="Copy install command"
+                  onclick={() =>
+                    copyText(
+                      step.kind === 'native-cli-confirm'
+                        ? `csq cli install ${step.cli.binary}`
+                        : '',
+                    )}
+                >{step.kind === 'native-cli-confirm' &&
+                  copiedText === `csq cli install ${step.cli.binary}`
+                    ? '✓ Copied'
+                    : '⧉ Copy'}</button>
+              </div>
+              <button
+                type="button"
+                class="secondary"
+                data-testid="native-cli-recheck"
+                onclick={recheckNativeCli}
+              >Recheck</button>
+            </div>
+          {/if}
+          {#if step.error}
+            <div class="error-banner">{step.error}</div>
+          {/if}
+          <div class="actions">
+            <button class="secondary" onclick={() => (step = { kind: 'picker' })}>
+              Back
+            </button>
+            <button
+              class="primary"
+              data-testid="native-cli-confirm-button"
+              onclick={runNativeLogin}
+              disabled={step.error !== null}
+            >
+              Sign in
+            </button>
+          </div>
+        {:else if step.kind === 'native-running'}
+          <p class="lede">
+            Signing in to {step.cli.display_name} — slot #{chosenSlot}…
+          </p>
+          {#if step.deviceCode}
+            <p class="hint">
+              Open the verification page and enter the code shown below:
+            </p>
+            <div class="device-code-panel">
+              <div class="device-code-row">
+                <div class="device-code">{step.deviceCode.user_code}</div>
+                <button
+                  type="button"
+                  class="copy-code-btn"
+                  data-testid="copy-native-device-code"
+                  title="Copy code to clipboard"
+                  aria-label="Copy code to clipboard"
+                  onclick={() =>
+                    copyText(
+                      step.kind === 'native-running' && step.deviceCode
+                        ? step.deviceCode.user_code
+                        : '',
+                    )}
+                >{step.kind === 'native-running' &&
+                  step.deviceCode &&
+                  copiedText === step.deviceCode.user_code
+                    ? '✓ Copied'
+                    : '⧉ Copy'}</button>
+              </div>
+              <a
+                class="device-code-url"
+                href={step.deviceCode.verification_url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >{step.deviceCode.verification_url}</a>
+            </div>
+            <p class="hint">
+              The browser should already be open. If not, click the URL above.
+            </p>
+          {:else}
+            <p class="hint">
+              Launching <code>{step.cli.binary}</code>'s sign-in… waiting for
+              the device code.
+            </p>
+          {/if}
+          <p class="hint">
+            Once you finish signing in, this window will update automatically.
+            Do not close it.
+          </p>
         {:else if step.kind === 'bearer-form'}
           <p class="lede">Paste your {step.provider.name} API key.</p>
           <label class="field">
@@ -1546,6 +2175,139 @@
               </button>
             </div>
           {/if}
+        {:else if step.kind === 'cloud-claude-provision'}
+          <p class="lede">Route Claude slot #{step.account} through cloud.</p>
+          <p class="hint">
+            Bind this slot so Claude Code talks to Anthropic Claude via your
+            own <strong>Google Vertex AI</strong> or <strong>AWS Bedrock</strong>
+            account instead of the direct API. csq writes the cloud settings
+            into the slot's config; Claude Code reads them on
+            <code>csq run {step.account}</code>.
+          </p>
+          <div class="gemini-tabs" role="tablist" aria-label="Cloud Claude backend">
+            <button
+              role="tab"
+              class="gemini-tab"
+              class:active={step.mode === 'vertex'}
+              aria-selected={step.mode === 'vertex'}
+              data-testid="cloud-claude-tab-vertex"
+              onclick={() => setCloudClaudeMode('vertex')}
+              disabled={step.submitting}
+            >Google Vertex AI</button>
+            <button
+              role="tab"
+              class="gemini-tab"
+              class:active={step.mode === 'bedrock'}
+              aria-selected={step.mode === 'bedrock'}
+              data-testid="cloud-claude-tab-bedrock"
+              onclick={() => setCloudClaudeMode('bedrock')}
+              disabled={step.submitting}
+            >AWS Bedrock</button>
+          </div>
+          {#if step.mode === 'vertex'}
+            <p class="hint">
+              Provide your GCP project, region, and a
+              <strong>service account JSON</strong> with Vertex AI access. csq
+              stores the absolute path (not the contents); Claude Code reads
+              the file at spawn time via
+              <code>GOOGLE_APPLICATION_CREDENTIALS</code>.
+            </p>
+            <label class="field">
+              <span>Project ID</span>
+              <input
+                type="text"
+                bind:value={step.project}
+                placeholder="my-gcp-project"
+                autocomplete="off"
+                spellcheck="false"
+                disabled={step.submitting}
+                data-testid="cloud-claude-vertex-project"
+              />
+            </label>
+            <label class="field">
+              <span>Region</span>
+              <input
+                type="text"
+                bind:value={step.region}
+                placeholder="us-east5"
+                autocomplete="off"
+                spellcheck="false"
+                disabled={step.submitting}
+                data-testid="cloud-claude-vertex-region"
+              />
+            </label>
+            <div class="vertex-pick">
+              <button
+                type="button"
+                class="secondary"
+                onclick={pickCloudClaudeSaFile}
+                disabled={step.submitting}
+                data-testid="cloud-claude-vertex-pick"
+              >Choose file…</button>
+              <code class="vertex-path" data-testid="cloud-claude-vertex-path">
+                {step.saPath || '(no file selected)'}
+              </code>
+            </div>
+            {#if step.error}
+              <div class="error-banner">{step.error}</div>
+            {/if}
+            <div class="actions">
+              <button class="secondary" onclick={() => (step = { kind: 'picker' })} disabled={step.submitting}>Back</button>
+              <button
+                class="primary"
+                onclick={submitCloudClaudeVertex}
+                disabled={step.submitting || !step.project.trim() || !step.region.trim() || !step.saPath.trim()}
+                data-testid="cloud-claude-vertex-submit"
+              >
+                {step.submitting ? 'Provisioning…' : 'Provision'}
+              </button>
+            </div>
+          {:else}
+            <p class="hint">
+              Provide your AWS region and a
+              <strong>Bedrock bearer token</strong>
+              (<code>AWS_BEARER_TOKEN_BEDROCK</code>). The token goes straight
+              into the slot's settings and is not echoed back over IPC.
+            </p>
+            <label class="field">
+              <span>Region</span>
+              <input
+                type="text"
+                bind:value={step.region}
+                placeholder="us-east-1"
+                autocomplete="off"
+                spellcheck="false"
+                disabled={step.submitting}
+                data-testid="cloud-claude-bedrock-region"
+              />
+            </label>
+            <label class="field">
+              <span>Bearer token</span>
+              <input
+                type="password"
+                bind:value={step.bearerToken}
+                placeholder="AWS Bedrock bearer token"
+                autocomplete="off"
+                spellcheck="false"
+                disabled={step.submitting}
+                data-testid="cloud-claude-bedrock-token"
+              />
+            </label>
+            {#if step.error}
+              <div class="error-banner">{step.error}</div>
+            {/if}
+            <div class="actions">
+              <button class="secondary" onclick={() => (step = { kind: 'picker' })} disabled={step.submitting}>Back</button>
+              <button
+                class="primary"
+                onclick={submitCloudClaudeBedrock}
+                disabled={step.submitting || !step.region.trim() || !step.bearerToken.trim()}
+                data-testid="cloud-claude-bedrock-submit"
+              >
+                {step.submitting ? 'Provisioning…' : 'Provision'}
+              </button>
+            </div>
+          {/if}
         {:else if step.kind === 'success'}
           <div class="success-banner">{step.message}</div>
           <div class="actions">
@@ -1830,7 +2592,10 @@
   .actions button.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: white;
+    /* F3 (i-audit/i-harden) — white-on-accent measured 2.21:1 in the
+       default dark theme. var(--bg-primary) flips per theme and clears
+       AA on both (dark 7.93:1, light 6.20:1) — see app.css for detail. */
+    color: var(--bg-primary);
   }
   .actions button.primary:disabled {
     opacity: 0.6;

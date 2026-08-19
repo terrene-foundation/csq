@@ -7,7 +7,7 @@
 //! `capability_layer::scaffold::build_scaffold` (the live-spawn path). CU1b
 //! collapses the artifact flatten onto this one module:
 //!
-//! - The three translators build their per-Surface text from
+//! - The five translators build their per-Surface text from
 //!   [`flatten_artifacts`] + [`render_sections`].
 //! - The live capability-layer scaffold stage renders the SAME text by
 //!   calling `render_sections(surface_header(surface), flatten_artifacts(..))`
@@ -99,8 +99,72 @@ impl SurfaceArtifacts {
 /// `coc-native-materialization` an internal journal entry gap where `paths` was consumed by
 /// no surface). codex/gemini have no per-file rule-scoping mechanism, so on
 /// those surfaces `paths` is still delivered but not file-scoped.
+///
+/// **Kimi/Grok share the Codex (`applies_to: codex`) scope as a
+/// compatibility fallback — NOT because they route through Codex's
+/// translator.** Each Surface has its own translator now (`kimi::translate`
+/// / `grok::translate`; workspace hermes-parity an internal journal entry supersedes
+/// an internal journal entry's Codex-aliasing). `mod.rs::translate` does NOT route
+/// `Surface::Kimi | Grok` through `codex::translate` in either direction —
+/// that routing was retired in this same change, so citing it as the
+/// reason for this fallback would be self-contradictory.
+///
+/// The REAL reason: spec 09 §9.2.2's `applies_to` frontmatter vocabulary
+/// predates native Kimi/Grok support — at the time it had no `kimi`/`grok`
+/// token, only `all`/`claude-code`/`codex`/`gemini` — so a `.coc/` author
+/// could only ever express "reaches the AGENTS.md-consuming CLIs" via
+/// `applies_to: [codex]`. Kimi/Grok's Surface-scope is therefore BORROWED
+/// from Codex's, not because their translators alias Codex's. Before this
+/// fallback existed, a rule scoped that way silently never reached a live
+/// `csq run` on a Kimi/Grok slot (`capability_layer::driver`/`scaffold`/
+/// `classifier` all call this predicate with the RAW `Surface::Kimi`/`::Grok`
+/// value, which is never equal to `Surface::Codex` under plain `BTreeSet`
+/// membership) — even though the identical rule reached Codex.
+///
+/// an internal ticket adds native `kimi`/`grok` `applies_to` tokens so an author can
+/// express native scope directly. This fallback STAYS after an internal ticket lands —
+/// it is the compatibility path for `.coc/` artifacts authored BEFORE
+/// those tokens existed (an `applies_to: [codex]` rule keeps reaching
+/// Kimi/Grok even once native tokens exist, so existing `.coc/` trees are
+/// not silently narrowed by the addition of new tokens).
 pub(crate) fn in_scope(applies_to: &BTreeSet<Surface>, surface: Surface) -> bool {
-    applies_to.is_empty() || applies_to.contains(&surface)
+    if applies_to.is_empty() || applies_to.contains(&surface) {
+        return true;
+    }
+    // Kimi/Grok fall back to the Codex scope — see doc comment above.
+    matches!(surface, Surface::Kimi | Surface::Grok) && applies_to.contains(&Surface::Codex)
+}
+
+/// True when `paths` expresses a REAL restriction narrower than "every file
+/// in the tree". The parser's `parse_paths` (spec 09 §9.2.2) defaults an
+/// OMITTED `paths` frontmatter field to `["**"]` — that is the "unscoped"
+/// representation, not a glob a translator should treat as a real scope. An
+/// explicit empty array carries no restriction either. Globs combine by
+/// UNION, so a `**` ANYWHERE in the list matches every file —
+/// `["**", "docs/**"]` is semantically identical to `["**"]` and is NOT a
+/// restriction (originally grok.rs round-4 D4-6: the old `len == 1` shape
+/// over-reported it as one, crying wolf in the broadened-disclosure
+/// channel). Anything else (`["src/**/*.rs"]`, `["docs/**"]`, …) is a
+/// genuine restriction that a prose-only Surface cannot honor
+/// per-directory and MUST report as broadened rather than silently drop the
+/// scope.
+///
+/// **Shared by every translator that flattens `paths`-scoped rules into
+/// flat prose** (round-13 review MED-2). CC materializes `paths` natively
+/// (S2b — see [`FlatArtifact::paths`]'s doc comment), so it does not need
+/// this predicate. Codex, Gemini, Kimi, and Grok all render every in-scope
+/// rule body into ONE flat instructions/system-prompt/AGENTS.md string
+/// regardless of `paths` — for those four, a path-scoped rule silently
+/// becomes global UNLESS the translator records the broadening via its own
+/// `unscoped_path_rules` field. This predicate used to live ONLY in
+/// `grok.rs`, which is why Kimi silently dropped the identical disclosure
+/// that Grok made — a rule scoped `paths: ["src/**"]` reached Grok's
+/// `unscoped_path_rules` but reached Kimi's `AGENTS.md` as unqualified
+/// global prose with nothing recording the loss. Moving the predicate here
+/// makes every consumer share ONE implementation, so the same fix (or the
+/// same future bug) cannot land in one translator and not its siblings.
+pub(crate) fn is_real_path_restriction(paths: &[String]) -> bool {
+    !(paths.is_empty() || paths.iter().any(|p| p == "**"))
 }
 
 /// The per-Surface system-prompt header — the single source for the
@@ -116,6 +180,13 @@ pub fn surface_header(surface: Surface) -> &'static str {
         Surface::ClaudeCode => "# csq capability layer (claude-code)\n",
         Surface::Codex => "# csq capability layer (codex)\n",
         Surface::Gemini => "# csq capability layer (gemini)\n",
+        // Kimi/Grok each have their own translator now (workspace
+        // hermes-parity an internal journal entry supersedes an internal journal entry's Codex
+        // aliasing) — own headers, own payload variants. The pinning test
+        // asserts these against `kimi::translate(empty)` /
+        // `grok::translate(empty)`, not `codex::translate(empty)`.
+        Surface::Kimi => "# csq capability layer (kimi)\n",
+        Surface::Grok => "# csq capability layer (grok)\n",
     }
 }
 
@@ -198,7 +269,7 @@ pub fn flatten_artifacts(coc_set: &CocSet, surface: Surface) -> SurfaceArtifacts
 }
 
 /// Append one `### {id} (precedence={p})\n{body}\n` section. Identical
-/// across all three Surfaces (was triplicated as
+/// across all five Surfaces (was triplicated as
 /// `push_artifact_section`/`push_section`). `body` is trimmed of trailing
 /// whitespace at render time.
 fn push_artifact_section(out: &mut String, art: &FlatArtifact) {
@@ -214,7 +285,7 @@ fn push_artifact_section(out: &mut String, art: &FlatArtifact) {
 
 /// Build the per-Surface system text from a Surface header + the flattened
 /// artifacts, returning the text AND the set of contributing artifact IDs.
-/// Shared by all three translators so their `## Rules / ## Agents / ##
+/// Shared by all five translators so their `## Rules / ## Agents / ##
 /// Skills / ## Commands` sections are byte-identical (only the header
 /// differs per Surface).
 pub fn render_sections(header: &str, arts: &SurfaceArtifacts) -> (String, BTreeSet<String>) {
@@ -352,6 +423,120 @@ mod tests {
         assert_eq!(codex.rules[0].id, "RULE-CODEX");
     }
 
+    /// Kimi/Grok share the Codex `applies_to` scope, not just the Codex
+    /// header — a rule scoped `applies_to: [codex]` MUST reach a live
+    /// Kimi/Grok flatten exactly like it reaches Codex (an internal journal entry intent;
+    /// see `in_scope`'s doc comment). Pre-fix this returned an EMPTY rule
+    /// list for Kimi/Grok — `{Surface::Codex}.contains(&Surface::Kimi)` is
+    /// `false` under plain `BTreeSet` membership.
+    #[test]
+    fn flatten_kimi_grok_share_codex_applies_to_scope() {
+        let mut set = CocSet::empty();
+        set.rules.insert(
+            RuleId("RULE-CODEX".into()),
+            rule("RULE-CODEX", 0, &[Surface::Codex], "codex only"),
+        );
+        // A rule scoped to claude-code ONLY must still be excluded — the
+        // Kimi/Grok fallback is Codex-specific, not "everything".
+        set.rules.insert(
+            RuleId("RULE-CC".into()),
+            rule("RULE-CC", 0, &[Surface::ClaudeCode], "cc only"),
+        );
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let arts = flatten_artifacts(&set, surface);
+            assert_eq!(
+                arts.rules.len(),
+                1,
+                "{surface} must see exactly the codex-scoped rule, got {:?}",
+                arts.rules.iter().map(|r| &r.id).collect::<Vec<_>>()
+            );
+            assert_eq!(arts.rules[0].id, "RULE-CODEX");
+        }
+        // Codex itself is unaffected by the new fallback clause.
+        let codex = flatten_artifacts(&set, Surface::Codex);
+        assert_eq!(codex.rules.len(), 1);
+        assert_eq!(codex.rules[0].id, "RULE-CODEX");
+    }
+
+    /// `in_scope`'s Kimi/Grok fallback applies to agents/skills/commands too
+    /// (the same predicate gates all four kinds in `flatten_artifacts`).
+    #[test]
+    fn flatten_kimi_grok_share_codex_scope_for_every_artifact_kind() {
+        use crate::coc::types::{AgentDef, AgentId, CommandDef, CommandId, SkillDef, SkillId};
+        let mut set = CocSet::empty();
+        let mut codex_only = BTreeSet::new();
+        codex_only.insert(Surface::Codex);
+        set.agents.insert(
+            AgentId("AGENT-CODEX".into()),
+            AgentDef {
+                id: AgentId("AGENT-CODEX".into()),
+                applies_to: codex_only.clone(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "codex agent".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        set.skills.insert(
+            SkillId("SKILL-CODEX".into()),
+            SkillDef {
+                id: SkillId("SKILL-CODEX".into()),
+                applies_to: codex_only.clone(),
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "codex skill".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        set.commands.insert(
+            CommandId("COMMAND-CODEX".into()),
+            CommandDef {
+                id: CommandId("COMMAND-CODEX".into()),
+                applies_to: codex_only,
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "codex command".into(),
+                unknowns: BTreeMap::new(),
+            },
+        );
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let arts = flatten_artifacts(&set, surface);
+            assert_eq!(arts.agents.len(), 1, "{surface} agents");
+            assert_eq!(arts.skills.len(), 1, "{surface} skills");
+            assert_eq!(arts.commands.len(), 1, "{surface} commands");
+        }
+    }
+
+    /// Non-vacuity pair for `is_real_path_restriction` (round-13 review
+    /// MED-2 — moved here from `grok.rs` so every prose-flattening
+    /// translator shares one implementation): proves the predicate
+    /// actually discriminates the parser's default `["**"]` (and an
+    /// explicit empty array) from a genuine glob restriction, rather than
+    /// e.g. always returning `false`.
+    #[test]
+    fn is_real_path_restriction_discriminates_wildcard_from_real_glob() {
+        assert!(
+            !is_real_path_restriction(&["**".to_string()]),
+            "parser default must read as unscoped"
+        );
+        assert!(
+            !is_real_path_restriction(&[]),
+            "explicit empty paths must read as unscoped"
+        );
+        assert!(
+            is_real_path_restriction(&["src/**/*.rs".to_string()]),
+            "a real glob must read as scoped"
+        );
+        assert!(
+            !is_real_path_restriction(&["**".to_string(), "docs/**".to_string()]),
+            "a `**` anywhere dominates under union semantics — unscoped, not a restriction"
+        );
+        assert!(
+            !is_real_path_restriction(&["docs/**".to_string(), "**".to_string()]),
+            "position-independent: wildcard last is still unscoped"
+        );
+    }
+
     #[test]
     fn flatten_sorts_precedence_desc_then_id_asc() {
         let mut set = CocSet::empty();
@@ -461,6 +646,16 @@ mod tests {
     /// live scaffold renders through (flattening once). This pins it against
     /// each translator's OWN header (empty set → header only) so the scaffold
     /// path and the `csq translate` path stay byte-identical and cannot drift.
+    ///
+    /// Kimi/Grok previously pinned against `codex::translate(empty)` (journal
+    /// 0133's Codex-aliasing). That pinning is REMOVED here, not weakened:
+    /// the aliasing it encoded was itself inert (harness-decomposition
+    /// reports 13 §5.1 / 14 §6.2) — `codex::translate` emits a
+    /// `CodexSpawnPayload.instructions` field destined for
+    /// `~/.codex/config.toml::instructions`, a key Kimi's config schema does
+    /// not have and Grok never reads at all. Kimi/Grok now each get their
+    /// own translator + header, pinned against their own empty output below
+    /// (workspace hermes-parity an internal journal entry).
     #[test]
     fn surface_header_matches_translator_empty_output() {
         let empty = CocSet::empty();
@@ -478,6 +673,16 @@ mod tests {
             surface_header(Surface::Gemini),
             super::super::gemini::translate(&empty).system_instruction,
             "gemini header drift"
+        );
+        assert_eq!(
+            surface_header(Surface::Kimi),
+            super::super::kimi::translate(&empty).agents_md,
+            "kimi header drift"
+        );
+        assert_eq!(
+            surface_header(Surface::Grok),
+            super::super::grok::translate(&empty).agents_md,
+            "grok header drift"
         );
     }
 }

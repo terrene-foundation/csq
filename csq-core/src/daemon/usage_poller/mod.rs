@@ -55,9 +55,20 @@ pub mod codex;
 pub mod deepseek;
 pub mod gemini;
 pub mod gemini_oauth;
+pub mod grok;
+pub mod kimi;
 pub mod minimax;
+mod poll_error;
 pub mod third_party;
 pub mod zai;
+
+// `poll_error` is a private module (round-7 redteam A-H1): only this
+// re-export is visible to sibling poller files, which keeps
+// `use super::{classify_transport_error, ..., PollError, ...}` working
+// unchanged everywhere while making `PollError::Transport`'s payload
+// (`poll_error::TransportErr`) unnameable — and therefore
+// unconstructible — outside `poll_error.rs`. See that file's module doc.
+pub(crate) use poll_error::{classify_transport_error, PollError};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -94,7 +105,10 @@ pub(crate) const RATELIMIT_PREFIX: &str = "anthropic-ratelimit-";
 
 /// HTTP transport closure for the usage GET. Takes `(url, bearer_token,
 /// extra_headers)` and returns `(status, body_bytes)`. Production
-/// callers pass `http::get_bearer`; tests pass a mock.
+/// callers pass `http::get_bearer_node` (Node.js subprocess transport —
+/// see `csq-core/src/http/mod.rs` module docs for why reqwest can't be
+/// used against Anthropic's Cloudflare-fronted endpoints); tests pass
+/// a mock.
 pub type HttpGetFn = Arc<
     dyn Fn(&str, &str, &[(&str, &str)]) -> Result<(u16, Vec<u8>), String> + Send + Sync + 'static,
 >;
@@ -113,18 +127,6 @@ pub type HttpPostProbeFn = Arc<
         + Sync
         + 'static,
 >;
-
-/// Error from a single usage poll.
-#[derive(Debug)]
-pub(crate) enum PollError {
-    #[allow(dead_code)]
-    Transport(String),
-    RateLimited,
-    Unauthorized,
-    HttpError(u16),
-    #[allow(dead_code)]
-    Parse(String),
-}
 
 /// Handle to a running usage poller task.
 pub struct PollerHandle {
@@ -172,8 +174,37 @@ pub fn spawn_with_config(
     let backoffs: Arc<Mutex<HashMap<u16, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     // Separate maps for 3P accounts so synthetic IDs (901, 902)
     // don't collide with Anthropic account IDs in the same range.
+    // Known bleed (R5 F5): tick_3p and kimi's 3P loop deliberately
+    // share this map, so a ≤10-min stale cooldown survives a same-slot
+    // provider rebind (MiniMax 429 at T → rebind to Kimi at T+2min →
+    // Kimi's first poll waits out the residual window). This delays
+    // WHEN the new provider's own row appears — it does NOT, by
+    // itself, cause wrong data to render: `bind_provider_to_slot`
+    // (accounts/third_party.rs, MED-2 an internal ticket redteam) clears the
+    // slot's `quota.json` row at bind time whenever the provider
+    // actually changes, so the delay window shows the honest
+    // "not yet polled" state (`has_quota=false`), not the PRIOR
+    // provider's stale number under the NEW provider's tag. (An
+    // earlier revision of this comment claimed "no wrong data" before
+    // that clearing existed — same comment-claim class as commit
+    // d70af845; the claim is true now because of the cited fix, not
+    // because the cooldown bleed was harmless on its own.)
     let cooldowns_3p: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let backoffs_3p: Arc<Mutex<HashMap<u16, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Native-CLI surfaces get their own cooldown maps, one per surface.
+    // Native slot ids share the 1..999 range with Anthropic slots, so a
+    // shared-with-Anthropic map would let a native 401 suppress an
+    // unrelated Anthropic poll at the same id (and vice versa) — the
+    // same rationale as the 3P split above. Grok and Kimi native slots
+    // ALSO get separate maps from each other: a slot dual-bound to both
+    // vendor homes (a `credentials/kimi-<N>.json` AND a
+    // `credentials/grok-<N>.json` marker — the login binding guard
+    // refuses this on current installs, so legacy/pre-guard state or
+    // manual surgery; R5 F3) must not let one surface's 401 suppress
+    // the other's poll (redteam R1 sec-NIT-3).
+    let cooldowns_native: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    let cooldowns_native_kimi: Arc<Mutex<HashMap<u16, Instant>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // Codex-surface circuit-breaker state lives per-account and is
     // independent of the Anthropic cooldown/backoff maps so codex's
     // 5-fail threshold cannot interfere with Anthropic's 429 handling.
@@ -202,6 +233,8 @@ pub fn spawn_with_config(
                 backoffs: Arc::clone(&backoffs),
                 cooldowns_3p: Arc::clone(&cooldowns_3p),
                 backoffs_3p: Arc::clone(&backoffs_3p),
+                cooldowns_native: Arc::clone(&cooldowns_native),
+                cooldowns_native_kimi: Arc::clone(&cooldowns_native_kimi),
                 codex_breakers: Arc::clone(&codex_breakers),
                 gemini_consumer: gemini_consumer.clone(),
                 gemini_oauth_project_cache: Arc::clone(&gemini_oauth_project_cache),
@@ -256,6 +289,12 @@ struct RunLoopConfig {
     /// prevent ID collision with Anthropic accounts in the same range.
     cooldowns_3p: Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs_3p: Arc<Mutex<HashMap<u16, u32>>>,
+    /// Cooldown map for native-CLI Grok slots, kept separate from the
+    /// Anthropic map because both use real slot ids in 1..999.
+    cooldowns_native: Arc<Mutex<HashMap<u16, Instant>>>,
+    /// Cooldown map for native-CLI Kimi slots, separate from Grok's so
+    /// a dual-bound slot's 401 on one surface cannot suppress the other.
+    cooldowns_native_kimi: Arc<Mutex<HashMap<u16, Instant>>>,
     /// Circuit-breaker state keyed per-Codex-account.
     codex_breakers: codex::BreakerMap,
     /// Shared dedup + quota-mutex state for the Gemini consumer.
@@ -329,6 +368,23 @@ async fn run_loop(cfg: RunLoopConfig) {
                 &cfg.backoffs_3p,
             )
             .await;
+            // Native-CLI billing (Grok) rides the 3P cadence: it is a
+            // monthly billing figure, not a fast-moving utilization
+            // window, so the 15-minute interval is ample.
+            grok::tick(&cfg.base_dir, &cfg.http_get, &cfg.cooldowns_native).await;
+            // Kimi (3P bearer + native kimi-code CLI) also rides the
+            // 3P cadence: the 5h window has 300-minute granularity so
+            // the 5-min Anthropic cadence would be wasted calls. Cooldown
+            // maps: 3P slots share the 3P map; native slots get their
+            // OWN map, distinct from Grok's, so a dual-bound slot's 401
+            // on one surface cannot suppress the other (R1 sec-NIT-3).
+            kimi::tick(
+                &cfg.base_dir,
+                &cfg.http_get,
+                &cfg.cooldowns_3p,
+                &cfg.cooldowns_native_kimi,
+            )
+            .await;
             last_3p_tick = Instant::now();
         }
 
@@ -389,3 +445,12 @@ pub(crate) fn clear_backoff(backoffs: &Arc<Mutex<HashMap<u16, u32>>>, account: u
     let mut guard = backoffs.lock().unwrap_or_else(|p| p.into_inner());
     guard.remove(&account);
 }
+
+// `PollError`, `classify_transport_error`, and their tests moved to
+// `poll_error.rs` (round-7 redteam A-H1) — see that file's module doc.
+// The former grep-based `no_poller_bypasses_classify_transport_error`
+// blacklist test (which matched two known-bad spellings of a direct
+// `PollError::Transport` construction) is DELETED, not migrated: it is
+// superseded by `poll_error::TransportErr`'s private field, which makes
+// every bypass shape fail to compile instead of needing a scanner kept
+// in sync with every new poller file.

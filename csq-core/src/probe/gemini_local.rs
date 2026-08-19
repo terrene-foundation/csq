@@ -503,7 +503,7 @@ mod tests {
         assert!(!looks_like_future_iso8601("2000-01-01T00:00:00Z"));
     }
 
-    /// #516 sibling: A7 VertexSa SA-file failures MUST NOT interpolate the
+    /// an internal ticket sibling: A7 VertexSa SA-file failures MUST NOT interpolate the
     /// operator-configured `sa_path.display()` into observed_shape OR hint
     /// — `security.md` §2 (no path-bearing detail in operator-facing
     /// strings). The path typically resolves to `/Users/<u>/...`; canonical

@@ -97,7 +97,7 @@ impl Vault for WindowsCredentialVault {
             Zeroizing::new(secret.expose_secret().as_bytes().to_vec());
 
         run_with_timeout("csq-vault-credman", move || {
-            let mut cred = CREDENTIALW {
+            let cred = CREDENTIALW {
                 Flags: 0,
                 Type: CRED_TYPE_GENERIC,
                 TargetName: target.as_ptr() as *mut u16,
@@ -118,7 +118,7 @@ impl Vault for WindowsCredentialVault {
             // the move closure; they outlive the call. CredWriteW
             // does NOT take ownership of any pointer — the API copies
             // into its own internal storage.
-            let ok = unsafe { CredWriteW(&mut cred, 0) };
+            let ok = unsafe { CredWriteW(&cred, 0) };
             if ok == 0 {
                 return Err(map_last_error("CredWriteW"));
             }

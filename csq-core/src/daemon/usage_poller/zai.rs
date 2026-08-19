@@ -3,10 +3,10 @@
 //! Polls `GET https://api.z.ai/api/monitor/usage/quota/limit`
 //! for authoritative usage data (5-hour and 7-day windows).
 
-use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+use crate::quota::{state as quota_state, AccountQuota, UsageWindow};
 use tracing::debug;
 
-use super::{HttpGetFn, PollError};
+use super::{classify_transport_error, HttpGetFn, PollError};
 
 /// Z.AI quota data parsed from `/api/monitor/usage/quota/limit`.
 ///
@@ -35,7 +35,8 @@ pub(crate) fn poll_zai_quota(api_key: &str, http_get: &HttpGetFn) -> Result<ZaiQ
     let url = "https://api.z.ai/api/monitor/usage/quota/limit";
     let extra_headers = [("Accept", "application/json")];
 
-    let (status, body) = http_get(url, api_key, &extra_headers).map_err(PollError::Transport)?;
+    let (status, body) =
+        http_get(url, api_key, &extra_headers).map_err(classify_transport_error)?;
 
     match status {
         429 => return Err(PollError::RateLimited),
@@ -93,7 +94,22 @@ pub(crate) fn write_zai_quota(
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
-    let mut quota = quota_state::load_state(base_dir).unwrap_or_else(|_| QuotaFile::empty());
+    // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
+    // falling back to QuotaFile::empty() — a load failure here must SKIP
+    // the write, not persist a one-row file that wipes every sibling
+    // account's row (mirrors usage_poller::gemini_oauth::write_quota).
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            tracing::warn!(
+                account = account_id,
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "Z.AI poller: quota.json unreadable, skipping write to avoid clobbering sibling rows"
+            );
+            return Ok(());
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -161,5 +177,44 @@ mod tests {
         });
         let result = poll_zai_quota("bad-key", &http);
         assert!(matches!(result, Err(PollError::Unauthorized)));
+    }
+
+    /// MED-1 (an internal ticket redteam): a schema-drifted `quota.json` must NOT
+    /// be clobbered by this write leg. Before the fix,
+    /// `load_state_or_warn`'s `QuotaFile::empty()` fallback let this
+    /// write persist a one-row file, wiping every sibling account's row.
+    #[test]
+    fn write_zai_quota_skips_on_poisoned_file_preserving_siblings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let poisoned = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        std::fs::write(quota_state::quota_path(dir.path()), poisoned).unwrap();
+
+        let zai = ZaiQuota {
+            five_hour: Some(UsageWindow {
+                used_percentage: 42.0,
+                resets_at: 4_102_444_800,
+            }),
+            seven_day: None,
+        };
+        let result = write_zai_quota(dir.path(), 3, &zai);
+        assert!(result.is_ok(), "skip must be Ok(()), not an error");
+
+        let raw = std::fs::read_to_string(quota_state::quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["accounts"]["1"]["five_hour"]["used_percentage"].as_f64(),
+            Some(50.0)
+        );
+        assert_eq!(
+            v["accounts"]["2"]["five_hour"]["used_percentage"].as_f64(),
+            Some(80.0)
+        );
+        assert!(v["accounts"].get("3").is_none());
     }
 }

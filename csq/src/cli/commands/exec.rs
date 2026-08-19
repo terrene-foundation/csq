@@ -4,7 +4,7 @@
 //! `csq exec` is a **spawn-capture** executor (SDK-plan corrected ground truth #1): it
 //! spawns the slot's provider CLI non-interactively — `claude --print
 //! --output-format json` (Claude/3P), `gemini --prompt … --output-format json`
-//! (Gemini), or `codex exec --json` (Codex, #950) — captures the child's stdout,
+//! (Gemini), or `codex exec --json` (Codex, an internal ticket) — captures the child's stdout,
 //! parses it through the matching adapter, and re-emits the result as a single
 //! [`csq_core::sdk`] envelope line. It is emphatically NOT the
 //! `csq run` path — `run` ends in `exec_or_spawn` → `Command::exec`, which REPLACES the
@@ -61,8 +61,6 @@ use csq_core::sdk::{
 };
 use csq_core::types::AccountNum;
 
-/// The provider tag for Claude surface completions.
-const CLAUDE_PROVIDER: &str = "claude";
 /// The provider tag for Gemini surface completions.
 const GEMINI_PROVIDER: &str = "gemini";
 /// The gemini-cli binary name. Mirrors the const in `csq_core::providers::gemini`
@@ -132,6 +130,12 @@ pub struct ExecArgs {
 
 /// Successful outcome of [`run_exec`]: the parsed completion plus per-stream
 /// truncation flags that must be surfaced in the envelope.
+///
+/// `Debug` is test-only-in-practice (needed by `Result::unwrap_err` in
+/// `run_exec`-level test assertions) but is not `#[cfg(test)]`-gated because
+/// deriving it unconditionally is zero-cost and avoids a cfg-gated derive
+/// drifting out of sync with non-test callers that may want it later.
+#[derive(Debug)]
 struct ExecResult {
     completion: Completion,
     stdout_truncated: bool,
@@ -194,7 +198,7 @@ pub fn handle_capabilities() -> Result<()> {
 /// license, so it denies — mirroring `cli::license_now_fail_closed`). Delegates the actual
 /// signature / expiry / revocation / liveness logic to
 /// [`csq_core::license::enforce_returning_advisory`], and surfaces the approaching-expiry
-/// soft-enforcement nudge (#968) to STDERR — never stdout, so the exec JSON envelope
+/// soft-enforcement nudge (an internal ticket) to STDERR — never stdout, so the exec JSON envelope
 /// (invariant R3) stays clean.
 #[cfg(feature = "enterprise")]
 fn enforce_license(base_dir: &Path) -> Result<(), SdkError> {
@@ -253,13 +257,46 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
                         ),
                     )
                 })?;
-            let handle_dir_abs =
-                std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+            // Security review 1386 M4: `canonicalize_for_keychain_sync` returns
+            // the usual non-canonical fallback for `handle_dir_abs` (still the
+            // right `CLAUDE_CONFIG_DIR` to spawn against), paired with whether
+            // canonicalize actually succeeded — the keychain write below MUST
+            // be skipped when it did not (see that function's doc for why).
+            let (handle_dir_abs, handle_dir_is_canonical) =
+                csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+
+            // Security review 1386 F10: `csq exec` has no daemon requirement,
+            // so an exec-only install (no `csq run`, no daemon) would never
+            // drain the keychain pending-clear queue (H1) otherwise. Same
+            // opportunistic sweep `run.rs` performs, same small dedicated
+            // budget (`sweep_pending_clears_opportunistic`, bounded ~37.5s
+            // worst case, NOT the daemon's ~187.5s one) — cheap when the queue
+            // is empty (one file read, no subprocess calls), bounded but not
+            // free when it isn't.
+            let _ = csq_core::credentials::keychain::sweep_pending_clears_opportunistic(base_dir);
 
             // CC reads OAuth keychain-first (memory discovery_cc_keychain_first_credential_read);
             // mirror the fresh token into the keychain item keyed by CLAUDE_CONFIG_DIR.
             // Best-effort — a keychain miss falls back to the symlinked file (SSH/non-macOS).
-            let _ = csq_core::credentials::keychain::sync_handle_dir(&handle_dir_abs);
+            //
+            // `_account_changed` variant, not the plain sweep one — this is a FRESH
+            // handle dir, and its canonicalized path can collide with a stale item
+            // left by a since-removed account (PID reuse, or an unconfirmed
+            // `csq logout` keychain clear — security review 1386 H2). The plain
+            // `sync_handle_dir` newer-than-keychain guard could otherwise PRESERVE
+            // that wrong-account item; `_account_changed` always overwrites/clears.
+            if handle_dir_is_canonical {
+                let _ = csq_core::credentials::keychain::sync_handle_dir_account_changed(
+                    &handle_dir_abs,
+                );
+            } else {
+                tracing::warn!(
+                    error_kind = "keychain_sync_canonicalize_failed",
+                    "csq exec: could not canonicalize this handle dir's path — \
+                     the keychain mirror was NOT written (non-fatal — exec \
+                     continues; CC falls back to the symlinked .credentials.json)"
+                );
+            }
 
             let outcome = spawn_capture(
                 &bin,
@@ -294,7 +331,14 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
             // ~/.gemini/oauth_creds.json (HOME-relative), not from the handle dir, so no
             // credential symlinks are needed here.
             let pid = std::process::id();
-            let handle_dir = create_gemini_handle_dir(base_dir, slot, pid).map_err(|e| {
+            let handle_dir = create_gemini_handle_dir(
+                base_dir,
+                slot,
+                pid,
+                args.model.as_deref(),
+                args.system.as_deref(),
+            )
+            .map_err(|e| {
                 SdkError::new(
                     SdkErrorCode::Internal,
                     format!(
@@ -308,7 +352,6 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
                 &bin,
                 &handle_dir,
                 &prompt,
-                args,
                 Duration::from_secs(args.timeout_secs),
             );
 
@@ -324,6 +367,27 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
             )
         }
         ExecSurface::Codex => {
+            // Fail-loud on --model / --system for Codex (issue: judge-calibration
+            // silent-drop). codex-cli's ONLY verified model-selection mechanism in
+            // this codebase is the slot's PERSISTENT `config.toml` `model` key
+            // (`providers::codex::surface::render_config_toml[_with_global]`),
+            // written once at provisioning time — there is no verified per-request
+            // override flag (`codex exec` takes no `-c`/`--model`/system-prompt
+            // argument anywhere in this codebase, including the proven enterprise
+            // `subscription_client.rs::build_codex_invocation`, which the argv here
+            // mirrors). Silently ignoring a caller-supplied `--model`/`--system` was
+            // the defect: `csq exec` returned `ok: true` with a completion from
+            // whatever model the slot's config.toml happened to pin, and the caller
+            // had no way to detect the mismatch. Reject explicitly instead.
+            if args.model.is_some() || args.system.is_some() {
+                return Err(SdkError::trusted(
+                    SdkErrorCode::Unsupported,
+                    "csq.exec.v1 does not support --model or --system on the Codex surface — \
+                     codex-cli has no verified per-request override; only the slot's \
+                     persistent config.toml model applies (run `csq login <N> --provider \
+                     codex` after changing the model, or omit --model/--system)",
+                ));
+            }
             // Pre-flight (redteam R2 MED-1): a partially-provisioned slot can pass
             // `slot_serves_codex` (has a codex credential) yet lack
             // `config-<N>/config.toml`, so codex-cli would launch against its own
@@ -451,36 +515,93 @@ fn resolve_slot(base_dir: &Path, args: &ExecArgs) -> Result<(AccountNum, ExecSur
             if slot_serves_codex(base_dir, slot) {
                 return Ok((slot, ExecSurface::Codex));
             }
+            // Native Kimi/Grok CLI sessions are checked BEFORE the slot_serves_claude
+            // fallthrough. slot_serves_claude excludes them (it returns false for a
+            // native-bound slot), so without this branch a native-bound slot would fall
+            // all the way through to the generic Unsupported error below with no
+            // indication of WHICH surface it is actually bound to — silently
+            // indistinguishable from a genuinely unbound slot. Naming the bound surface
+            // here is exactly the harness-unreachable / model-refused / parse-failed
+            // triage a judge runner depends on to not misattribute an availability gap
+            // as a calibration verdict.
+            if let Some(native_surface) =
+                csq_core::providers::native::native_surface_for_slot(base_dir, slot)
+            {
+                return Err(SdkError::trusted(
+                    SdkErrorCode::Unsupported,
+                    format!(
+                        "csq.exec.v1 does not support the native {native_surface} CLI surface \
+                         yet — slot {n} is bound to it (use `csq run {n}` for an interactive \
+                         session)"
+                    ),
+                ));
+            }
+            // slot_serves_claude ALSO covers env-transport 3P slots (DeepSeek/Kimi-bearer/
+            // Z.AI/MiniMax/Ollama, ANTHROPIC_BASE_URL pinned via config-N/settings.json) and
+            // cloud-Claude (Vertex/Bedrock) slots — see its doc comment. Both spawn `claude`,
+            // which reads the pinned env from CLAUDE_CONFIG_DIR/settings.json at its own
+            // startup, so no extra plumbing is needed here.
             if slot_serves_claude(base_dir, slot) {
                 return Ok((slot, ExecSurface::Claude));
             }
+            // Provably reachable only for a pathological dual-bound slot (both a Gemini
+            // AND a ClaudeCode credential file present on the same slot) — every
+            // well-formed slot resolves in one of the branches above.
             Err(SdkError::trusted(
                 SdkErrorCode::Unsupported,
-                "csq.exec.v1 supports Claude, Gemini, and Codex slots; this slot is 3P (deepseek/zai/minimax)",
+                format!(
+                    "csq.exec.v1 could not determine a supported CLI surface for slot {n} — no \
+                     Claude, Gemini, Codex, Kimi, or Grok binding was detected"
+                ),
             ))
         }
         (None, Some(provider)) => {
-            if provider.eq_ignore_ascii_case(GEMINI_PROVIDER) {
-                return resolve_healthy_gemini_slot(base_dir)
-                    .map(|slot| (slot, ExecSurface::Gemini));
+            // THE single source of the exec-routing decision — `csq-core`'s
+            // `registry::exec_route_for_provider_id`. This mirrors nothing by
+            // hand: `registry::exec_routable_provider_ids` (in turn `csq sdk
+            // capabilities --json`'s `features.exec.providers_routable`) is
+            // derived from the SAME function, so this match and that
+            // advertisement cannot disagree about which ids are routable
+            // without a change to `exec_route_for_provider_id` itself.
+            match csq_core::providers::registry::exec_route_for_provider_id(provider) {
+                Some(csq_core::providers::registry::ExecRoute::Gemini) => {
+                    resolve_healthy_gemini_slot(base_dir).map(|slot| (slot, ExecSurface::Gemini))
+                }
+                Some(csq_core::providers::registry::ExecRoute::Codex) => {
+                    resolve_healthy_codex_slot(base_dir).map(|slot| (slot, ExecSurface::Codex))
+                }
+                Some(csq_core::providers::registry::ExecRoute::Claude) => {
+                    resolve_healthy_claude_slot(base_dir).map(|slot| (slot, ExecSurface::Claude))
+                }
+                // 3P env-transport catalog ids (DeepSeek/Kimi-bearer/Z.AI/MiniMax/Ollama) —
+                // the SAME model-on-Claude-Code-harness contrast the coc-bench study runs
+                // on per-slot ANTHROPIC_BASE_URL pinning. `azure`/`vertex` (enterprise
+                // Phase-2b direct-API providers with NO `claude`-spawn passthrough) are
+                // excluded by `exec_route_for_provider_id` itself, not here.
+                Some(csq_core::providers::registry::ExecRoute::ThirdParty(id)) => {
+                    resolve_healthy_third_party_slot(base_dir, id)
+                        .map(|slot| (slot, ExecSurface::Claude))
+                }
+                None => Err(SdkError::trusted(
+                    SdkErrorCode::ProviderNotFound,
+                    "csq.exec.v1 supports --provider claude, gemini, codex, or a 3P catalog id \
+                     (deepseek, kimi, zai, mm, ollama)",
+                )),
             }
-            if provider.eq_ignore_ascii_case(CODEX_PROVIDER) {
-                return resolve_healthy_codex_slot(base_dir).map(|slot| (slot, ExecSurface::Codex));
-            }
-            if provider.eq_ignore_ascii_case(CLAUDE_PROVIDER) {
-                return resolve_healthy_claude_slot(base_dir)
-                    .map(|slot| (slot, ExecSurface::Claude));
-            }
-            Err(SdkError::trusted(
-                SdkErrorCode::ProviderNotFound,
-                "csq.exec.v1 supports --provider claude, gemini, or codex",
-            ))
         }
     }
 }
 
-/// True iff `slot` resolves to the Claude surface (not codex/gemini/3P). Mirrors
-/// `run::surface_cli_for_slot`'s classification without exposing that private helper.
+/// True iff `slot` resolves to the Claude surface — NOT codex/gemini, and NOT a
+/// native Kimi/Grok CLI session (Surface::Kimi/Surface::Grok, credential-less
+/// binding marker `credentials/{kimi,grok}-<N>.json`). Env-transport 3P slots
+/// (DeepSeek/Kimi-bearer/Z.AI/MiniMax/Ollama, `ANTHROPIC_BASE_URL` pinned via
+/// `config-<N>/settings.json`) and cloud-Claude (Vertex/Bedrock) slots are NOT
+/// excluded here — both spawn `claude`, which reads its pinned env from
+/// `CLAUDE_CONFIG_DIR/settings.json` at its own startup (see module docs
+/// "Claude/3P"), so they correctly fall through to `true`. Mirrors
+/// `run::surface_cli_for_slot`'s classification without exposing that private
+/// helper.
 fn slot_serves_claude(base_dir: &Path, slot: AccountNum) -> bool {
     use csq_core::providers::catalog::Surface;
     let codex = csq_core::credentials::file::canonical_path_for(base_dir, slot, Surface::Codex);
@@ -496,6 +617,17 @@ fn slot_serves_claude(base_dir: &Path, slot: AccountNum) -> bool {
     }
     let gemini = csq_core::credentials::file::canonical_path_for(base_dir, slot, Surface::Gemini);
     if std::fs::symlink_metadata(&gemini).is_ok() {
+        return false;
+    }
+    // Native Kimi/Grok CLI sessions are a THIRD exclusion. Without this check a
+    // slot bound to `csq login N --provider kimi-cli` (or `grok`) has neither a
+    // codex nor a gemini credential file, so the two checks above would fall
+    // through and this function would (incorrectly) report it as Claude-served —
+    // exec.rs would then spawn `claude` against a slot that has no Claude
+    // credentials at all. `resolve_slot` adds a specific, distinguishable
+    // Unsupported error for this case (checked before this function is called);
+    // this function only needs to say "not Claude."
+    if csq_core::providers::native::native_surface_for_slot(base_dir, slot).is_some() {
         return false;
     }
     true
@@ -515,6 +647,45 @@ fn resolve_healthy_claude_slot(base_dir: &Path) -> Result<AccountNum, SdkError> 
     Err(SdkError::trusted(
         SdkErrorCode::NoHealthySlot,
         "no healthy Claude slot available (all are logged out or broker-failed)",
+    ))
+}
+
+/// Pick the first healthy 3P (env-transport) slot bound to catalog id `provider_id`
+/// (e.g. `"deepseek"`, `"kimi"`, `"zai"`, `"mm"`, `"ollama"`) — not broker-failed.
+///
+/// Reuses [`csq_core::accounts::discovery::discover_per_slot_third_party`], the SAME
+/// per-slot 3P enumeration `csq run`'s host-isolation warning and `csq doctor`'s
+/// bearer-slot detector are built on, and
+/// [`csq_core::providers::catalog::id_from_display_name`] to map the discovered
+/// slot's display-name provider label (e.g. `"Kimi"`, `"DeepSeek"`) back to a
+/// catalog id — no duplicated classification logic
+/// (`account-terminal-separation.md` MUST Rule 4: diagnostic / dispatch surfaces
+/// read the same channel as production paths).
+fn resolve_healthy_third_party_slot(
+    base_dir: &Path,
+    provider_id: &str,
+) -> Result<AccountNum, SdkError> {
+    use csq_core::accounts::AccountSource;
+    for acc in csq_core::accounts::discovery::discover_per_slot_third_party(base_dir) {
+        let AccountSource::ThirdParty { provider } = &acc.source else {
+            continue;
+        };
+        if csq_core::providers::catalog::id_from_display_name(provider) != Some(provider_id) {
+            continue;
+        }
+        let Ok(slot) = AccountNum::try_from(acc.id) else {
+            continue;
+        };
+        if csq_core::refresh::sentinel::is_broker_failed(base_dir, slot) {
+            continue;
+        }
+        return Ok(slot);
+    }
+    Err(SdkError::trusted(
+        SdkErrorCode::NoHealthySlot,
+        format!(
+            "no healthy {provider_id} slot available (none are bound, or all are broker-failed)"
+        ),
     ))
 }
 
@@ -813,10 +984,24 @@ fn parse_outcome(
 ///   `<base_dir>/accounts/gemini-exec-<pid>/`  (contains `.csq-account` + `.gemini/`)
 /// gemini-cli reads OAuth creds from `~/.gemini/oauth_creds.json` (HOME-relative), so
 /// credential symlinks are not needed — only the GEMINI_CLI_HOME isolation boundary.
+///
+/// `model` / `system` (from `--model` / `--system`) flow into `settings.json`'s
+/// `model.name` / `system_instruction` fields via [`csq_core::providers::gemini::
+/// settings::render`] — the SAME mechanism the capability-layer spawn path
+/// (`providers::gemini::probe::reassert_settings_drift_with_system_instruction`,
+/// used by `csq run`'s with-layer arm) uses to inject a system prompt for
+/// gemini-cli. gemini-cli reads its config from `GEMINI_CLI_HOME/settings.json` at
+/// its own startup — there is no `--model`/`--system` argv flag; this settings-file
+/// injection point is gemini-cli's real mechanism (mirrors how a Claude 3P slot's
+/// `ANTHROPIC_BASE_URL` flows through `config-N/settings.json`, module docs
+/// "Claude/3P"). `model.unwrap_or("")` — `render` treats an empty model name as
+/// "omit the field" (gemini-cli's own default applies).
 fn create_gemini_handle_dir(
     base_dir: &Path,
     slot: AccountNum,
     pid: u32,
+    model: Option<&str>,
+    system: Option<&str>,
 ) -> Result<std::path::PathBuf, std::io::Error> {
     let handle_dir = base_dir.join("accounts").join(format!("gemini-exec-{pid}"));
     std::fs::create_dir_all(&handle_dir)?;
@@ -829,8 +1014,8 @@ fn create_gemini_handle_dir(
     // show the interactive auth picker on a fresh GEMINI_CLI_HOME.
     // Mirrors spawn.rs step-3 behavior. Reuses the community helper (no enterprise gate).
     let settings_json = csq_core::providers::gemini::settings::render(
-        "",
-        None,
+        model.unwrap_or(""),
+        system,
         Some(csq_core::providers::gemini::settings::SELECTED_TYPE_OAUTH_PERSONAL),
     );
     std::fs::write(
@@ -843,11 +1028,12 @@ fn create_gemini_handle_dir(
 /// Spawn `gemini -o json <prompt>`, capturing stdout+stderr, killing the child on
 /// `timeout` expiry. No `--tools` flag: gemini-cli plain-text mode only.
 /// GEMINI_CLI_HOME is set to the ephemeral handle dir; env is otherwise cleared.
+/// `--model` / `--system` are NOT argv here — gemini-cli has no such flags; they are
+/// injected via `create_gemini_handle_dir`'s settings.json write (see its docs).
 fn spawn_capture_gemini(
     bin: &Path,
     handle_dir: &Path,
     prompt: &str,
-    _args: &ExecArgs,
     timeout: Duration,
 ) -> Result<Captured, SdkError> {
     // AC1 — argv must include `-o json` and must NOT include `--tools`.
@@ -998,22 +1184,20 @@ fn parse_gemini_json(stdout: &[u8]) -> Result<Completion, SdkError> {
         let input = find_u64_by_key(stats, "promptTokenCount");
         let output = find_u64_by_key(stats, "candidatesTokenCount");
         let cache = find_u64_by_key(stats, "cachedContentTokenCount");
-        Usage {
-            input_tokens: input,
-            output_tokens: output,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: cache,
-        }
+        Usage::default()
+            .with_input_tokens(input)
+            .with_output_tokens(output)
+            .with_cache_read_input_tokens(cache)
     });
 
-    Ok(Completion {
-        text: response_text.to_owned(),
-        model: String::new(), // intentional gap: gemini-cli --output-format json does not expose the served model name
-        provider: GEMINI_PROVIDER.to_owned(),
-        usage,
-        finish_reason: FinishReason::Stop,
-        finish_reason_raw: None,
-    })
+    Ok(Completion::new(
+        response_text.to_owned(),
+        // intentional gap: gemini-cli --output-format json does not expose the served model name
+        String::new(),
+        GEMINI_PROVIDER.to_owned(),
+        FinishReason::Stop,
+    )
+    .with_usage(usage))
 }
 
 /// Recursively search a JSON value for the first field named `key` whose value is a
@@ -1249,14 +1433,19 @@ fn parse_codex_json(stdout: &[u8]) -> Result<Completion, SdkError> {
             }
             Some("turn.completed") => {
                 if let Some(u) = ev.get("usage") {
-                    usage = Some(Usage {
-                        input_tokens: u.get("input_tokens").and_then(serde_json::Value::as_u64),
-                        output_tokens: u.get("output_tokens").and_then(serde_json::Value::as_u64),
-                        cache_creation_input_tokens: None,
-                        cache_read_input_tokens: u
-                            .get("cached_input_tokens")
-                            .and_then(serde_json::Value::as_u64),
-                    });
+                    usage = Some(
+                        Usage::default()
+                            .with_input_tokens(
+                                u.get("input_tokens").and_then(serde_json::Value::as_u64),
+                            )
+                            .with_output_tokens(
+                                u.get("output_tokens").and_then(serde_json::Value::as_u64),
+                            )
+                            .with_cache_read_input_tokens(
+                                u.get("cached_input_tokens")
+                                    .and_then(serde_json::Value::as_u64),
+                            ),
+                    );
                 }
             }
             Some("error") => {
@@ -1286,16 +1475,15 @@ fn parse_codex_json(stdout: &[u8]) -> Result<Completion, SdkError> {
         }
     })?;
 
-    Ok(Completion {
-        text: response_text,
+    Ok(Completion::new(
+        response_text,
         // Intentional v1 gap (mirrors gemini): codex's --json stream does not
         // surface the served model name in the parsed events.
-        model: String::new(),
-        provider: CODEX_PROVIDER.to_owned(),
-        usage,
-        finish_reason: FinishReason::Stop,
-        finish_reason_raw: None,
-    })
+        String::new(),
+        CODEX_PROVIDER.to_owned(),
+        FinishReason::Stop,
+    )
+    .with_usage(usage))
 }
 
 /// Turn a Codex spawn outcome into a `(Completion, stdout_truncated,
@@ -1442,9 +1630,10 @@ mod tests {
         );
     }
 
-    /// #950 — `--provider codex` is a KNOWN provider: it reaches slot resolution
+    /// an internal ticket — `--provider codex` is a KNOWN provider: it reaches slot resolution
     /// (NoHealthySlot when no codex slot exists), NOT ProviderNotFound. Guards
-    /// against the `eq_ignore_ascii_case(CODEX_PROVIDER)` branch being dropped.
+    /// against `registry::exec_route_for_provider_id`'s `"codex" => Codex` arm
+    /// being dropped.
     #[test]
     fn codex_provider_routes_to_no_healthy_slot_not_provider_not_found() {
         let base = std::path::Path::new("/nonexistent");
@@ -1453,6 +1642,111 @@ mod tests {
             err.code,
             SdkErrorCode::NoHealthySlot,
             "codex is a known provider — should reach slot resolution, not ProviderNotFound"
+        );
+    }
+
+    // ── --model / --system fail-loud on Codex (judge-calibration silent-drop) ──
+    //
+    // Before this fix, `spawn_capture_codex` took no `ExecArgs` parameter at all —
+    // `--model` and `--system` were silently discarded and `csq exec` returned
+    // `ok: true` with a completion from whatever model the slot's config.toml
+    // happened to pin. A judge-calibration run measured this directly: 0/75
+    // usable Codex results, because the judge's rubric (delivered via `--system`)
+    // never reached the model, which then invented its own label vocabulary. Both
+    // tests below run `run_exec` directly (not just `resolve_slot`) so they
+    // exercise the SAME code path `csq exec`'s `handle()` calls — no live spawn:
+    // the check fires before any `Command::new(...)` for Codex.
+
+    /// `--model` on a Codex slot MUST fail loud, not silently drop the flag. Uses
+    /// a bare `credentials/codex-<N>.json` marker (existence-only check in
+    /// `slot_serves_codex`) — no config.toml, no real codex binary — because the
+    /// rejection fires BEFORE the config.toml pre-flight and before any spawn.
+    #[test]
+    fn codex_rejects_model_before_any_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("credentials")).unwrap();
+        std::fs::write(tmp.path().join("credentials").join("codex-5.json"), "{}").unwrap();
+        let mut a = args(Some("hi"), false, Some(5), None);
+        a.model = Some("gpt-5.6-sol".to_string());
+        let err = run_exec(tmp.path(), tmp.path(), &a).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::Unsupported);
+        assert!(
+            err.message.as_str().contains("--model") || err.message.as_str().contains("Codex"),
+            "error must name the rejected flag or surface; got: {}",
+            err.message.as_str()
+        );
+    }
+
+    /// `--system` on a Codex slot MUST fail loud, not silently drop the flag.
+    #[test]
+    fn codex_rejects_system_before_any_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("credentials")).unwrap();
+        std::fs::write(tmp.path().join("credentials").join("codex-6.json"), "{}").unwrap();
+        let mut a = args(Some("hi"), false, Some(6), None);
+        a.system = Some("You are a terse reviewer.".to_string());
+        let err = run_exec(tmp.path(), tmp.path(), &a).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::Unsupported);
+    }
+
+    /// Negative control: a Codex slot with NEITHER `--model` NOR `--system` set
+    /// must NOT hit the new rejection branch — it should proceed past it to the
+    /// config.toml pre-flight (which fails NoHealthySlot-style here because no
+    /// config.toml exists in this fixture — proving the rejection is scoped to
+    /// the two flags, not to Codex slots in general).
+    #[test]
+    fn codex_without_model_or_system_reaches_config_toml_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("credentials")).unwrap();
+        std::fs::write(tmp.path().join("credentials").join("codex-9.json"), "{}").unwrap();
+        let a = args(Some("hi"), false, Some(9), None);
+        let err = run_exec(tmp.path(), tmp.path(), &a).unwrap_err();
+        // NOT Unsupported (the model/system rejection) — this is the config.toml
+        // pre-flight's NoHealthySlot, proving the code advanced past the new check.
+        assert_eq!(err.code, SdkErrorCode::NoHealthySlot);
+        assert!(err.message.as_str().contains("config.toml"));
+    }
+
+    // ── --model / --system wiring on Gemini (via settings.json, not argv) ──
+
+    /// Non-vacuity target: `create_gemini_handle_dir` writes `--model` /
+    /// `--system` into `.gemini/settings.json`'s `model.name` /
+    /// `system_instruction` fields — the same mechanism the capability-layer
+    /// spawn path uses to inject a system prompt for gemini-cli.
+    #[test]
+    fn gemini_handle_dir_writes_model_and_system_into_settings_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(3u16).unwrap();
+        let handle_dir = create_gemini_handle_dir(
+            tmp.path(),
+            slot,
+            999_999,
+            Some("gemini-3-pro"),
+            Some("You are terse."),
+        )
+        .unwrap();
+        let settings =
+            std::fs::read_to_string(handle_dir.join(".gemini").join("settings.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        assert_eq!(v["model"]["name"], "gemini-3-pro");
+        assert_eq!(v["system_instruction"], "You are terse.");
+    }
+
+    /// Regression guard: when `--model`/`--system` are NOT supplied, the fields
+    /// stay absent (no spurious empty-string model, no phantom system prompt) —
+    /// the plain no-flags path is unchanged.
+    #[test]
+    fn gemini_handle_dir_omits_model_and_system_when_not_supplied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(4u16).unwrap();
+        let handle_dir = create_gemini_handle_dir(tmp.path(), slot, 999_998, None, None).unwrap();
+        let settings =
+            std::fs::read_to_string(handle_dir.join(".gemini").join("settings.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        assert!(v.get("model").is_none(), "settings.json: {settings}");
+        assert!(
+            v.get("system_instruction").is_none(),
+            "settings.json: {settings}"
         );
     }
 
@@ -1518,7 +1812,7 @@ mod tests {
         );
     }
 
-    // ── #950 codex-exec ────────────────────────────────────────────────
+    // ── an internal ticket codex-exec ────────────────────────────────────────────────
     #[test]
     fn codex_argv_uses_exec_json_no_tools() {
         let argv = codex_argv("ping");
@@ -1582,7 +1876,7 @@ mod tests {
 
     #[test]
     fn codex_parse_json_error_event_becomes_provider_error() {
-        // #950 R2: a codex `type:"error"` event with no agent_message surfaces
+        // an internal ticket R2: a codex `type:"error"` event with no agent_message surfaces
         // the real reason as ProviderError, not a generic OutputParseFailed.
         let fixture = b"{\"type\":\"error\",\"message\":\"unauthorized: token expired\"}\n";
         let err = parse_codex_json(fixture).unwrap_err();
@@ -1680,7 +1974,7 @@ mod tests {
     /// truncated, AND the child still exits — the drain-past-cap consumes the
     /// remainder so the writer never blocks on a full pipe. The other tests
     /// exercise the pure helper against in-memory readers; this is the only one
-    /// that exercises a genuine child + pipe end-to-end (the "live" leg #1051's
+    /// that exercises a genuine child + pipe end-to-end (the "live" leg an internal ticket's
     /// unit coverage otherwise lacks). Unix-only (spawns `sh`).
     #[cfg(unix)]
     #[test]
@@ -1846,5 +2140,162 @@ mod tests {
         let err = resolve_healthy_gemini_slot(&tmp).unwrap_err();
         assert_eq!(err.code, SdkErrorCode::NoHealthySlot);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── 3P slot reachability + native Kimi/Grok misrouting fix (coc-bench H-contrast) ──
+    //
+    // The coc-bench study's identifying contrast is "same model, different harness" —
+    // e.g. the Kimi model on the Claude Code harness (a 3P slot, ANTHROPIC_BASE_URL
+    // pinned) versus the Kimi model on Kimi's own native harness (a native-CLI slot).
+    // These tests establish and lock down exactly how `csq exec --slot N` classifies
+    // each of those two slot shapes today.
+
+    /// A slot with NO codex/gemini/native binding marker resolves to
+    /// ExecSurface::Claude — this is the mechanism that lets a 3P
+    /// (ANTHROPIC_BASE_URL-pinned) slot reach `csq exec --slot N` today: the
+    /// classification is negative (absence of codex/gemini/native markers), not
+    /// positive (presence of Claude credentials), so a slot whose settings.json pins
+    /// a 3P endpoint reaches the SAME `claude` spawn path as a real Anthropic OAuth
+    /// slot. `claude` itself reads the pinned env from
+    /// CLAUDE_CONFIG_DIR/settings.json at its own startup (module docs "Claude/3P").
+    #[test]
+    fn three_p_slot_via_slot_number_resolves_to_claude_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config-13");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.kimi.com/coding","ANTHROPIC_AUTH_TOKEN":"sk-kimi-x"}}"#,
+        )
+        .unwrap();
+        let (slot, surface) =
+            resolve_slot(tmp.path(), &args(Some("p"), false, Some(13), None)).unwrap();
+        assert_eq!(slot.get(), 13);
+        assert_eq!(surface, ExecSurface::Claude);
+    }
+
+    /// Non-vacuity companion to the above: a COMPLETELY EMPTY slot (no config-N dir
+    /// at all, no credentials of any kind) ALSO resolves to Claude — proving the
+    /// classification is exclusion-based (absence of codex/gemini/native markers),
+    /// not a positive check for Claude/3P credentials. Documents the actual
+    /// mechanism precisely rather than the (incorrect) "3P is Unsupported" framing
+    /// the removed error message implied.
+    #[test]
+    fn completely_unbound_slot_via_slot_number_also_resolves_to_claude_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deliberately: no config-N dir, no credentials/ dir, nothing at all.
+        let (slot, surface) =
+            resolve_slot(tmp.path(), &args(Some("p"), false, Some(41), None)).unwrap();
+        assert_eq!(slot.get(), 41);
+        assert_eq!(surface, ExecSurface::Claude);
+    }
+
+    /// A slot bound to the native Kimi CLI (credential-less binding marker,
+    /// `credentials/kimi-<N>.json`) MUST NOT be misrouted to ExecSurface::Claude —
+    /// exec.rs would otherwise spawn `claude` against a slot that has no Claude
+    /// credentials at all, and (before this fix) the caller could not distinguish
+    /// that from a genuinely unsupported/unbound slot.
+    #[test]
+    fn native_kimi_bound_slot_is_not_misrouted_to_claude_surface() {
+        use csq_core::providers::catalog::Surface;
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(7u16).unwrap();
+        csq_core::providers::native::write_binding(tmp.path(), slot, Surface::Kimi).unwrap();
+        let err = resolve_slot(tmp.path(), &args(Some("p"), false, Some(7), None)).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::Unsupported);
+        assert!(
+            err.message.as_str().contains("kimi"),
+            "error must name the bound native surface; got: {}",
+            err.message.as_str()
+        );
+    }
+
+    /// Same fix, Grok surface — guards the sibling native CLI.
+    #[test]
+    fn native_grok_bound_slot_is_not_misrouted_to_claude_surface() {
+        use csq_core::providers::catalog::Surface;
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(8u16).unwrap();
+        csq_core::providers::native::write_binding(tmp.path(), slot, Surface::Grok).unwrap();
+        let err = resolve_slot(tmp.path(), &args(Some("p"), false, Some(8), None)).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::Unsupported);
+        assert!(
+            err.message.as_str().contains("grok"),
+            "error must name the bound native surface; got: {}",
+            err.message.as_str()
+        );
+    }
+
+    /// Direct unit test on the exclusion predicate itself (not just its caller) — a
+    /// native-bound slot must not read as Claude-served.
+    #[test]
+    fn slot_serves_claude_is_false_for_native_bound_slot() {
+        use csq_core::providers::catalog::Surface;
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        csq_core::providers::native::write_binding(tmp.path(), slot, Surface::Grok).unwrap();
+        assert!(!slot_serves_claude(tmp.path(), slot));
+    }
+
+    /// `--provider deepseek` (a 3P catalog id) resolves to the slot whose
+    /// settings.json pins the DeepSeek endpoint, surfaced as ExecSurface::Claude.
+    #[test]
+    fn provider_deepseek_resolves_via_third_party_catalog_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config-21");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","ANTHROPIC_AUTH_TOKEN":"sk-x"}}"#,
+        )
+        .unwrap();
+        let (slot, surface) =
+            resolve_slot(tmp.path(), &args(Some("p"), false, None, Some("deepseek"))).unwrap();
+        assert_eq!(slot.get(), 21);
+        assert_eq!(surface, ExecSurface::Claude);
+    }
+
+    /// `--provider kimi` is the Bearer 3P catalog id (ClaudeCode surface,
+    /// ANTHROPIC_BASE_URL=api.kimi.com/coding) — must resolve distinctly from the
+    /// native `kimi-cli` surface, which `get_provider` does not recognise at all
+    /// (catalog id space and native-CLI id space are disjoint by design — see
+    /// `providers::native::descriptor_by_id`'s `"kimi-cli"` vs catalog `"kimi"`).
+    #[test]
+    fn provider_kimi_bearer_resolves_distinct_from_native_kimi_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config-22");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.kimi.com/coding","ANTHROPIC_AUTH_TOKEN":"sk-kimi-x"}}"#,
+        )
+        .unwrap();
+        let (slot, surface) =
+            resolve_slot(tmp.path(), &args(Some("p"), false, None, Some("kimi"))).unwrap();
+        assert_eq!(slot.get(), 22);
+        assert_eq!(surface, ExecSurface::Claude);
+    }
+
+    /// `--provider azure` (an enterprise Phase-2b direct-API provider with NO
+    /// `ANTHROPIC_BASE_URL` passthrough) MUST NOT resolve through the 3P branch — it
+    /// has no `claude`-spawn compatible endpoint, so routing it through
+    /// ExecSurface::Claude would silently spawn `claude` against a URL it cannot
+    /// talk to. Regression guard for the `base_url_env_var` filter.
+    #[test]
+    fn provider_azure_does_not_resolve_via_third_party_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err =
+            resolve_slot(tmp.path(), &args(Some("p"), false, None, Some("azure"))).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::ProviderNotFound);
+    }
+
+    /// `--provider deepseek` with no bound slot yields NoHealthySlot, not a panic or
+    /// a silent fallback to another surface.
+    #[test]
+    fn provider_deepseek_no_healthy_slot_when_unbound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err =
+            resolve_slot(tmp.path(), &args(Some("p"), false, None, Some("deepseek"))).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::NoHealthySlot);
     }
 }

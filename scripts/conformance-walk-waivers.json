@@ -1,0 +1,12 @@
+{
+  "_doc": "Units deliberately outside the CW denominator. Each waiver MUST name a reason and its authority. A waived unit reports Skipped, never Pass — it is visibly out of scope, not silently green. Removing a waiver re-arms the ratchet for that unit.",
+  "ipc-registration": {
+    "begin_claude_login": "Phase 2 of an internal ticket — legacy paste-code flow deliberately unregistered to narrow the IPC attack surface; zero renderer callers. Source deletion is Phase 3. See csq/src/desktop/mod.rs, the comment above `start_claude_login_subprocess` in the generate_handler! list.",
+    "submit_oauth_code": "Phase 2 of an internal ticket — legacy paste-code flow, deliberately unregistered. See csq/src/desktop/mod.rs generate_handler! comment.",
+    "cancel_login": "Phase 2 of an internal ticket — legacy paste-code flow, deliberately unregistered. See csq/src/desktop/mod.rs generate_handler! comment.",
+    "start_claude_login": "Phase 2 of an internal ticket — legacy paste-code flow, deliberately unregistered. See csq/src/desktop/mod.rs generate_handler! comment.",
+    "start_claude_login_race": "Phase 2 of an internal ticket — parallel-race flow, deliberately unregistered. See csq/src/desktop/mod.rs generate_handler! comment.",
+    "submit_paste_code": "Phase 2 of an internal ticket — parallel-race flow, deliberately unregistered. See csq/src/desktop/mod.rs generate_handler! comment.",
+    "cancel_race_login": "Phase 2 of an internal ticket — parallel-race flow, deliberately unregistered. See csq/src/desktop/mod.rs generate_handler! comment."
+  }
+}

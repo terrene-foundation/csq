@@ -11,7 +11,11 @@
 //! `--stdout <str>`        Print `str` to stdout (no trailing newline added unless `str` ends in `\n`).
 //! `--stderr <str>`        Print `str` to stderr.
 //! `--exit-code <N>`       Exit with code N (default 0).
-//! `--hang-ms <N>`         Sleep for N milliseconds before doing anything else.
+//! `--hang-ms <N>`         Sleep for N milliseconds BEFORE doing anything else.
+//! `--hang-after-ms <N>`   Sleep for N milliseconds AFTER writing stdout, while
+//!                         holding the stdout pipe open. Use to model a CLI that
+//!                         emits a partial line and then hangs: the reader must be
+//!                         able to short-circuit on the byte cap without waiting.
 //! `--emit-bytes <N>`      Write N bytes of `x` to stdout WITHOUT a trailing newline
 //!                         (use for the 8 KiB cap test).
 //! `--capture-argv <path>` Write all received argv (one per line, JSON-array format) to
@@ -37,6 +41,7 @@ fn main() {
     let mut stdout_str: Option<String> = None;
     let mut stderr_str: Option<String> = None;
     let mut hang_ms: u64 = 0;
+    let mut hang_after_ms: u64 = 0;
     let mut emit_bytes: usize = 0;
     let mut capture_argv_path: Option<String> = None;
 
@@ -61,6 +66,11 @@ fn main() {
             "--hang-ms" => {
                 if let Some(val) = iter.next() {
                     hang_ms = val.parse().unwrap_or(0);
+                }
+            }
+            "--hang-after-ms" => {
+                if let Some(val) = iter.next() {
+                    hang_after_ms = val.parse().unwrap_or(0);
                 }
             }
             "--emit-bytes" => {
@@ -150,6 +160,15 @@ fn main() {
     if let Some(ref s) = stderr_str {
         eprint!("{s}");
         let _ = std::io::stderr().flush();
+    }
+
+    // Sleep LAST, holding the stdout pipe open. This models a CLI that emits a
+    // partial (newline-less) line and then hangs: a reader that short-circuits
+    // on the byte cap returns immediately, while one that waits for EOF pays the
+    // whole sleep. The two outcomes are only distinguishable if this sleep is
+    // longer than the probe's own timeout — see the H-3 test.
+    if hang_after_ms > 0 {
+        std::thread::sleep(Duration::from_millis(hang_after_ms));
     }
 
     std::process::exit(exit_code);

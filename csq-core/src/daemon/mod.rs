@@ -14,7 +14,7 @@
 //! - `auto_rotate` — auto-rotation loop.
 //! - `cache` — in-memory TTL cache shared across pollers.
 //! - `startup_reconciler` — multi-pass on-disk reconciliation at boot.
-//! - `identity_mint` — UUID minting for identity-keyed storage (#292).
+//! - `identity_mint` — UUID minting for identity-keyed storage (an internal ticket).
 //! - `migrate_legacy_api_key_helper` — one-shot legacy migration.
 //! - `coc_cache_sweeper` — CC image-cache GC.
 //! - `detect` + `client` (unix) + `client_windows` — CLI-side detection
@@ -45,11 +45,29 @@ pub mod custodian;
 pub mod detect;
 pub mod identity_mint;
 pub mod lifecycle;
+/// Daemon rolling-log GC (#1a-2, daemon-auth-resilience Wave A2) — 14-day
+/// retention sweep over the persistent rolling file log written by the
+/// `csq` crate's `daemon_log` module. Mirrors `coc_cache_sweeper`'s
+/// spawn/tick idiom.
+pub mod log_gc;
 pub mod migrate_legacy_api_key_helper;
+/// Cross-platform daemon notify chokepoint (an internal ticket) — `POST
+/// /api/invalidate-cache` + the targeted `/api/slot-swap` per-slot
+/// invalidation, on both the Unix socket and the Windows named pipe. The
+/// single production home for the "tell the daemon its on-disk cache is
+/// stale" notification; CLI command handlers call `notify::cache_invalidation`
+/// / `notify::slot_swap` instead of inlining a per-platform copy.
+pub mod notify;
 pub mod paths;
 pub mod pid;
 pub mod refresher;
 pub mod startup_reconciler;
+/// Explicit-stop sentinel (an internal ticket) — makes `csq daemon stop` honest
+/// while a desktop-app in-process supervisor is cohabiting with the
+/// daemon. Read by [`supervise::run_forever`] before every re-acquire;
+/// set by `csq daemon stop`; cleared by every daemon-start entry point.
+pub mod stop_sentinel;
+pub mod supervise;
 pub mod usage_ledger_writer;
 pub mod usage_poller;
 
@@ -61,7 +79,7 @@ pub mod usage_poller;
 pub mod server;
 #[cfg(windows)]
 pub mod server_windows;
-/// Windows graceful-stop channel (#786) — a named kernel event object the
+/// Windows graceful-stop channel (an internal ticket) — a named kernel event object the
 /// daemon awaits and `csq daemon stop` fires. The Windows equivalent of the
 /// Unix `SIGTERM` path; keeps the drain semantics identical across platforms.
 #[cfg(windows)]
@@ -83,6 +101,7 @@ pub use refresher::{
     spawn as spawn_refresher, HttpPostFn, HttpPostFnCodex, RefreshStatus, RefresherHandle,
 };
 pub use startup_reconciler::{run_reconciler, ReconcileSummary};
+pub use stop_sentinel::{clear_stop_requested, is_stop_requested, set_stop_requested};
 pub use usage_ledger_writer::{
     spawn as spawn_usage_ledger_writer, WriterHandle as UsageLedgerWriterHandle,
 };

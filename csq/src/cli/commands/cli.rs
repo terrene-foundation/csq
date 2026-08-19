@@ -4,8 +4,8 @@
 //!
 //! ## Security properties (spec/13 §10)
 //!
-//! - Clap allowlist (`claude | codex | gemini`) enforced at the parser layer
-//!   before this handler is called.
+//! - Clap allowlist (`claude | codex | gemini | kimi | grok`) enforced at the
+//!   parser layer before this handler is called.
 //! - Hard-coded dispatch: `(surface, manager)` → argv. No user-supplied string
 //!   reaches argv.
 //! - No `sh -c`. Every spawn is `Command::new(arg0).args(rest)`.
@@ -39,7 +39,7 @@ use std::process::Command;
 
 /// Handle `csq cli install <name>`.
 ///
-/// The allowlist gate (`claude | codex | gemini`) is enforced at the clap
+/// The allowlist gate (`claude | codex | gemini | kimi | grok`) is enforced at the clap
 /// layer before this function is called.
 pub fn handle_install(name: &str) -> Result<()> {
     let surface = parse_surface(name)?;
@@ -93,7 +93,7 @@ pub fn handle_install(name: &str) -> Result<()> {
 
 /// Handle `csq cli upgrade <name>`.
 ///
-/// The allowlist gate (`claude | codex | gemini`) is enforced at the clap
+/// The allowlist gate (`claude | codex | gemini | kimi | grok`) is enforced at the clap
 /// layer before this function is called.
 pub fn handle_upgrade(name: &str) -> Result<()> {
     let surface = parse_surface(name)?;
@@ -126,14 +126,18 @@ pub fn handle_upgrade(name: &str) -> Result<()> {
 /// Parse `name` (already clap-validated) into a `SurfaceCli`.
 ///
 /// Clap's `value_parser` allowlist rejects everything except
-/// `"claude" | "codex" | "gemini"` before this function is called.
-/// This match is a defense-in-depth layer for callers in tests.
+/// `"claude" | "codex" | "gemini" | "kimi" | "grok"` before this function is
+/// called. This match is a defense-in-depth layer for callers in tests.
 fn parse_surface(name: &str) -> Result<SurfaceCli> {
     match name {
         "claude" => Ok(SurfaceCli::Claude),
         "codex" => Ok(SurfaceCli::Codex),
         "gemini" => Ok(SurfaceCli::Gemini),
-        other => bail!("unknown CLI surface: {other:?}; allowed: claude, codex, gemini"),
+        "kimi" => Ok(SurfaceCli::Kimi),
+        "grok" => Ok(SurfaceCli::Grok),
+        other => {
+            bail!("unknown CLI surface: {other:?}; allowed: claude, codex, gemini, kimi, grok")
+        }
     }
 }
 
@@ -166,12 +170,12 @@ fn is_ci_environment() -> bool {
 /// user in a production binary, while still allowing integration tests to
 /// exercise probe-state logic without a real TTY.
 #[cfg(feature = "test-utils")]
-fn check_test_bypass() -> bool {
+pub(crate) fn check_test_bypass() -> bool {
     std::env::var_os("CSQ_TEST_BYPASS_TTY").is_some()
 }
 
 #[cfg(not(feature = "test-utils"))]
-fn check_test_bypass() -> bool {
+pub(crate) fn check_test_bypass() -> bool {
     false
 }
 
@@ -307,9 +311,16 @@ fn run_install_or_upgrade(
         .args(&argv[1..])
         .output()
         .with_context(|| {
+            // Redact the resolved path in the spawn-ERROR: unlike the consent
+            // line above (a Rule-3 design-intent full-path disclosure the
+            // operator needs to authorize the exact binary), the error message
+            // does not require the full path, and SelfManaged CLIs resolve
+            // under $HOME (`~/.kimi-code/bin/kimi`) — leaking the username here
+            // is an operator-surface path leak (operator-surface-verification
+            // Rule 6; `csq cli` is not in the Rule-5 exempt set).
             format!(
                 "failed to spawn {}",
-                cli_deps::sanitize_for_display(&resolved)
+                cli_deps::sanitize::redact_path(std::path::Path::new(&resolved))
             )
         })?;
 
@@ -525,6 +536,28 @@ fn handle_no_command(
         );
         return Ok(());
     }
+    // Self-managed CLIs (Kimi/Grok): first install is the vendor `install.sh`.
+    // csq NEVER auto-runs a `curl | bash` (spec/13 §10) — it prints the command
+    // for the operator to run. Upgrades DO run automatically via the CLI's own
+    // subcommand, so this branch is reached only for first-install (Missing).
+    if matches!(surface, SurfaceCli::Kimi | SurfaceCli::Grok) {
+        // Reached on first-install (Missing → NpmGlobal default → no
+        // install_command) AND on the rare upgrade of a kimi/grok that
+        // resolved OUTSIDE its vendor dir (classified Unknown, not
+        // SelfManaged → no upgrade_command). Neutral "install or reinstall"
+        // wording is correct for both.
+        println!(
+            "csq does not auto-run vendor install scripts.\n\
+             Install or reinstall {name} with its official installer:\n  {hint}\n\n\
+             Once {name} is installed in its standard location, \
+             `csq cli upgrade {name}` self-updates it (via `{name}`'s own \
+             update subcommand).\n\
+             Docs: {url}",
+            hint = npm_install_hint(surface),
+            url = manual_install_url(surface),
+        );
+        return Ok(());
+    }
     // Unknown manager (or unhandled combination): print npm hint.
     println!(
         "No supported package manager detected for {name} on this platform.\n\n\
@@ -544,18 +577,24 @@ pub fn manual_install_url(surface: SurfaceCli) -> &'static str {
         SurfaceCli::Claude => "https://www.anthropic.com/claude-code",
         SurfaceCli::Codex => "https://www.npmjs.com/package/@openai/codex",
         SurfaceCli::Gemini => "https://www.npmjs.com/package/@google/gemini-cli",
+        SurfaceCli::Kimi => "https://moonshotai.github.io/kimi-code/",
+        SurfaceCli::Grok => "https://x.ai/cli",
         _ => "https://npmjs.com",
     }
 }
 
-/// Returns the npm manual-install command string for a surface CLI.
+/// Returns the manual first-install command string for a surface CLI.
 ///
 /// Used both in `handle_no_command` output and in consent-decline messages.
+/// For self-managed CLIs (Kimi/Grok) this is the vendor `install.sh` line —
+/// csq prints it but NEVER auto-runs it (no `sh -c curl|bash`, spec/13 §10).
 pub fn npm_install_hint(surface: SurfaceCli) -> &'static str {
     match surface {
         SurfaceCli::Codex => "npm i -g \"@openai/codex@>=0.40.0 <1.0.0\"",
         SurfaceCli::Gemini => "npm i -g \"@google/gemini-cli@>=0.41.2 <1.0.0\"",
         SurfaceCli::Claude => "npm i -g \"@anthropic-ai/claude-code@>=2.0.0 <3.0.0\"",
+        SurfaceCli::Kimi => csq_core::cli_deps::minimum::KIMI_INSTALL_HINT,
+        SurfaceCli::Grok => csq_core::cli_deps::minimum::GROK_INSTALL_HINT,
         _ => "npm i -g <package> (check upstream docs for the exact package name)",
     }
 }

@@ -27,7 +27,7 @@
 //! from [`super::paths::windows_username`] (`GetUserNameW`, NOT
 //! `%USERNAME%`) so the daemon and the `stop` side derive an identical
 //! name AND a same-session process cannot poison the name by mutating the
-//! `USERNAME` environment variable before the daemon starts (#786 redteam
+//! `USERNAME` environment variable before the daemon starts (an internal ticket redteam
 //! H1 — parity with the named-pipe derivation in `paths.rs`).
 //!
 //! # Security model (parity with the Unix `0o600` socket — do NOT "harden" to `Global\`)
@@ -77,7 +77,7 @@ const ERROR_ALREADY_EXISTS: i32 = 183;
 
 /// Returns the shutdown event's fully-qualified name for the current user,
 /// optionally namespaced by `scope` (empty in production; a per-process
-/// suffix in tests so a test never fires a real daemon's event — #786
+/// suffix in tests so a test never fires a real daemon's event — an internal ticket
 /// redteam MEDIUM test-isolation).
 ///
 /// `Local\csq-daemon-shutdown-{username}{scope}` — `{username}` from
@@ -153,7 +153,7 @@ pub fn create_shutdown_event() -> Result<ShutdownEvent, DaemonError> {
 /// Scoped variant of [`create_shutdown_event`] for test isolation — see
 /// [`shutdown_event_name_wide`]. Production always uses the empty scope via
 /// [`create_shutdown_event`]; tests pass a per-process suffix so they never
-/// create/fire the live daemon's event (#786 redteam MEDIUM).
+/// create/fire the live daemon's event (an internal ticket redteam MEDIUM).
 #[doc(hidden)]
 pub fn create_shutdown_event_scoped(scope: &str) -> Result<ShutdownEvent, DaemonError> {
     let name = shutdown_event_name_wide(scope);
@@ -177,7 +177,7 @@ pub fn create_shutdown_event_scoped(scope: &str) -> Result<ShutdownEvent, Daemon
     // ERROR_ALREADY_EXISTS: the named object pre-existed and we got a handle
     // to it rather than a fresh one. `PidFile::acquire` already prevents a
     // second daemon, so in production this signals an anomaly (a same-user
-    // process pre-created the object). Non-fatal — trace it (#786 redteam L1).
+    // process pre-created the object). Non-fatal — trace it (an internal ticket redteam L1).
     if io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS) {
         tracing::debug!(
             "shutdown event already existed at create — reusing (single-instance is PID-file-enforced)"
@@ -211,7 +211,7 @@ pub fn signal_shutdown(pid: u32) -> Result<(), DaemonError> {
 
 /// Scoped variant of [`signal_shutdown`] for test isolation — see
 /// [`shutdown_event_name_wide`]. Production always uses the empty scope via
-/// [`signal_shutdown`] (#786 redteam MEDIUM).
+/// [`signal_shutdown`] (an internal ticket redteam MEDIUM).
 #[doc(hidden)]
 pub fn signal_shutdown_scoped(scope: &str, pid: u32) -> Result<(), DaemonError> {
     let name = shutdown_event_name_wide(scope);

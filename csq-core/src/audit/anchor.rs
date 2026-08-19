@@ -470,11 +470,21 @@ pub fn append_local_outcome_record(
     payload: EventPayload,
     now_ts: &str,
 ) -> Result<(), String> {
-    let record = build_outcome_record(kind, payload, now_ts);
+    let mut record = build_outcome_record(kind, payload, now_ts);
     match load_signing_key_if_active(base_dir) {
-        Some(key) => write_record_v2_signed(record, Some(base_dir), &*key)
-            .map(|_| ())
-            .map_err(|e| e.fixed_tag().to_string()),
+        Some(key) => {
+            // Patch key_id BEFORE write_record_v2_signed so the stored record
+            // carries the real key_id. verify_chain Check 5 identifies unsigned
+            // records by checking if key_id == PLACEHOLDER_KEY_ID; without this
+            // patch the record would still be flagged as unsigned even if the
+            // signature itself is valid. Mirrors append_outcome_record_signed_inner
+            // (this function's sibling writer) — both build an outcome record via
+            // build_outcome_record, which always stamps the placeholder key_id.
+            record.key_id = key.key_id();
+            write_record_v2_signed(record, Some(base_dir), &*key)
+                .map(|_| ())
+                .map_err(|e| e.fixed_tag().to_string())
+        }
         None => write_record_v2(record, Some(base_dir)).map_err(|e| e.fixed_tag().to_string()),
     }
 }
@@ -823,7 +833,7 @@ pub fn default_cadence_high_impact(sink_name: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/audit/anchor — daemon-side signing entry point (#952 S3)
+// POST /api/audit/anchor — daemon-side signing entry point (an internal ticket S3)
 // ---------------------------------------------------------------------------
 
 /// Sign a v1 `AuditRecord` and append it to the Op chain, returning the
@@ -1042,11 +1052,139 @@ mod tests {
         }
     }
 
+    // ── Awaiting sink (Finding 1: a genuine .await before the write) ───────
+
+    /// A sink whose `append()` performs a genuine `.await` BEFORE
+    /// returning — unlike [`NoopSink`], which never yields. Simulates the
+    /// network round trip any real sink (e.g. a Rekor transparency-log
+    /// submission) necessarily performs.
+    ///
+    /// Signals `about_to_write` the instant `append()` is about to
+    /// return, i.e. the instant `anchor_head` is about to proceed to the
+    /// flock-bearing outcome-record write. `blocking_chain_write_survives_
+    /// an_awaiting_sink` uses this signal — NOT a fixed sleep — to know
+    /// exactly when to start its heartbeat race, so an arbitrary sink
+    /// latency ahead of the write can never pollute the measurement
+    /// window. See that test's doc comment for why this is load-bearing.
+    struct AwaitingSink {
+        name: SinkName,
+        about_to_write: tokio::sync::Notify,
+    }
+
+    impl AwaitingSink {
+        fn new() -> Self {
+            Self {
+                name: SinkName::try_new("awaiting-sink").unwrap(),
+                about_to_write: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LedgerSink for AwaitingSink {
+        fn name(&self) -> &str {
+            self.name.as_str()
+        }
+
+        async fn append(&self, record: &SignedRecord) -> Result<SinkReceipt, SinkError> {
+            // The genuine yield Finding 1 is about — NoopSink::append has
+            // no equivalent, which is why its ordering proof was an
+            // accident of shape rather than a demonstrated property.
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            // Fired AFTER the yield, BEFORE returning — the exact instant
+            // the caller is about to proceed to the flock-bearing write.
+            self.about_to_write.notify_one();
+            let sink_id = crate::audit::types::SinkId::try_new(format!("awaiting-{}", record.seq))
+                .map_err(|e| SinkError::Internal {
+                    message: RedactedString::from_trusted(e.to_string()),
+                })?;
+            Ok(SinkReceipt {
+                sink: self.name.clone(),
+                sink_id,
+                anchored_at: record.ts.clone(),
+                inclusion_proof: None,
+            })
+        }
+
+        async fn verify_at(&self, id: &RecordId) -> Result<SignedRecord, SinkError> {
+            Err(SinkError::NotFound {
+                record_id: id.clone(),
+            })
+        }
+    }
+
     // ── Helper: seed a chain with one CsqRun record ──
 
     fn seed_chain(base_dir: &Path) {
         let rec = sample_signed_record(0, "01JZ00000000000000000000R0");
         write_record_v2(rec, Some(base_dir)).expect("seed chain record");
+    }
+
+    // ── Hang watchdog (Finding 2: the in-runtime timeout is inert when the
+    // sole worker is the thing parked) ─────────────────────────────────────
+
+    /// Disarms the OS-thread hang watchdog on drop. Hold this for the
+    /// duration of a single-worker ordering-proof test; dropping it
+    /// (including via panic-driven unwind — Rust runs `Drop` for live
+    /// locals during unwind) disconnects the watchdog's channel, which the
+    /// watchdog thread observes as `Disconnected` rather than `Timeout`
+    /// and exits quietly.
+    struct WatchdogGuard {
+        done_tx: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.done_tx.take();
+        }
+    }
+
+    /// Arms an OS-thread hang watchdog for a single-worker ordering-proof
+    /// test.
+    ///
+    /// # Why an in-runtime `tokio::time::timeout` is not enough (Finding 2)
+    ///
+    /// `blocking_chain_write_does_not_park_tokio_worker` and its awaiting-
+    /// sink sibling both wrap their race in a `tokio::time::timeout` that
+    /// runs on the SAME single-worker runtime the race is measuring. If
+    /// that worker is genuinely PARKED — the exact N1 regression these
+    /// tests exist to catch, or any other in-runtime deadlock — nothing on
+    /// that runtime can be polled, INCLUDING the timeout's own internal
+    /// `Sleep`. The in-runtime guard is therefore inert in precisely the
+    /// case it is meant to catch, and the test would hang indefinitely
+    /// rather than report a clean diagnostic.
+    ///
+    /// This watchdog runs on an OS thread OUTSIDE the tokio runtime
+    /// entirely, so it is immune to that runtime's worker being parked. If
+    /// the test has not completed within `budget_ms`, it prints a message
+    /// naming the hang explicitly — distinct from an N1-regression
+    /// `assert!` failure, which always resolves once the background
+    /// thread releases its flock — and forcibly exits the process (there
+    /// is no way to fail the test from a foreign thread when the test's
+    /// own task is unresponsively stuck; this is the backstop of last
+    /// resort). For any hang where the worker remains schedulable, the
+    /// in-runtime timeout still fires first and reports the ordinary
+    /// "test hung" panic — this watchdog only fires when that mechanism
+    /// itself could not.
+    fn arm_hang_watchdog(budget_ms: u64) -> WatchdogGuard {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(budget_ms)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                eprintln!(
+                    "WATCHDOG: test did not complete within {budget_ms}ms — the sole \
+                     tokio worker is likely PARKED and unable to drive its own \
+                     in-runtime hang timeout (Finding 2). This is a HANG, distinct \
+                     from an N1-regression assertion failure."
+                );
+                std::process::exit(97);
+            }
+        });
+        WatchdogGuard {
+            done_tx: Some(done_tx),
+        }
     }
 
     // ── Tests ──────────────────────────────────────────────────────────────
@@ -1558,45 +1696,109 @@ mod tests {
     /// N1 regression (load-bearing): the blocking `flock` inside the anchor
     /// write path MUST NOT park a tokio worker thread.
     ///
-    /// # Why this construction is load-bearing
+    /// # Why this is an ORDERING proof, not a timing test
     ///
-    /// The test runs on a **single** tokio worker (`worker_threads = 1`).
-    /// A background OS thread acquires the chain `.chain-lock` for ~300 ms,
-    /// forcing any concurrent chain write to block in `flock(LOCK_EX)` during
-    /// that window.
+    /// An earlier version of this test compared one event's elapsed time
+    /// against a fixed wall-clock deadline (`timeout(250ms, sleep(80ms))`,
+    /// itself a widening of an even earlier `timeout(D, sleep(D))`). Both
+    /// were flaky: under CI CPU saturation a CORRECTLY FREE worker can fail
+    /// to resolve a short sleep inside its budget purely from scheduler /
+    /// timer-wheel jitter — a false failure with no code defect. Any
+    /// absolute-time budget has this problem; widening the margin only
+    /// moves the flake rate, it never removes it.
     ///
-    /// Concurrently on the single-worker runtime:
-    /// - Task A: `anchor_head` (flock-bearing write).  With `spawn_blocking`
-    ///   the flock-wait executes on the blocking thread-pool, so the worker
-    ///   stays free.
-    /// - Task B: heartbeat — fires after a 50 ms `tokio::time::sleep` and
-    ///   sets an `AtomicBool`.
+    /// The fix is to prove RELATIVE ORDER instead of elapsed time: race a
+    /// cheap heartbeat's completion against the anchor write's completion.
+    /// Both arms run on the same sole worker (`worker_threads = 1`), so
+    /// scheduling delay dilates them together — WHICH ONE finishes first is
+    /// stable even when WHEN either finishes is not:
     ///
-    /// **With `spawn_blocking` (correct):** the single worker handles both
-    /// tasks concurrently.  The heartbeat fires at ~50 ms, well within the
-    /// 300 ms lock-hold window.
+    /// - A background OS thread (immune to tokio worker starvation) holds
+    ///   the chain `.chain-lock` for `LOCK_HOLD_MS`, forcing any concurrent
+    ///   chain write to block in `flock(LOCK_EX)` during that window.
+    /// - Task A: `anchor_head` (flock-bearing write).
+    /// - Task B: heartbeat — a cheap `tokio::time::sleep(HEARTBEAT_MS)` with
+    ///   no flock involvement, signalling completion via a oneshot.
     ///
-    /// **Without `spawn_blocking` (regressed):** the single worker is parked
-    /// inside `flock` for ~300 ms.  The heartbeat cannot be scheduled, so the
-    /// `AtomicBool` remains unset when we check at ~100 ms — the assertion
-    /// fails (or the overall timeout fires).
+    /// **Worker FREE (`spawn_blocking` correct):** the flock wait runs on
+    /// the blocking thread-pool, so the worker is available to run the
+    /// heartbeat immediately. The heartbeat fires at ~`HEARTBEAT_MS`, long
+    /// before Task A can complete (still waiting on the background thread's
+    /// hold) → **heartbeat wins the race**.
+    ///
+    /// **Worker PARKED (N1 regression):** the flock call runs in-line on
+    /// the sole worker. Until that worker returns from the blocking
+    /// syscall at lock-release, nothing else on this runtime can be
+    /// driven — including registering or firing the heartbeat's timer.
+    /// Task A completes essentially immediately after the lock releases;
+    /// the heartbeat, only even starting its sleep at that point, fires
+    /// `HEARTBEAT_MS` later → **the anchor write wins the race**.
+    ///
+    /// `LOCK_HOLD_MS` only needs to exceed `HEARTBEAT_MS` by a margin wide
+    /// enough that the two scenarios above cannot be confused with each
+    /// other — it is not a deadline either side races against, and no
+    /// assertion below compares an elapsed duration to a constant. The
+    /// inner `timeout` is a hang watchdog only (e.g. a genuine deadlock
+    /// unrelated to N1); its expiry is reported as a distinct "test hung"
+    /// failure, never conflated with the N1 verdict — see the DO NOT
+    /// re-introduce a wall-clock decision here in any future edit.
+    ///
+    /// # The inner `timeout` cannot fire when the worker IS parked (Finding 2)
+    ///
+    /// The inner `timeout` above shares this test's single worker with the
+    /// very thing it is timing. If the worker is genuinely PARKED — the N1
+    /// regression itself, or an unrelated in-runtime deadlock — nothing on
+    /// this runtime can be polled, including the inner timeout's own
+    /// `Sleep`, so it can never fire in exactly the case it exists for.
+    /// `arm_hang_watchdog` below is the backstop: an OS thread OUTSIDE
+    /// this runtime that forcibly exits the process if the test has not
+    /// finished within a wider budget. It never interferes with a normal
+    /// pass, fail, or in-runtime-timeout outcome — it only fires when
+    /// those mechanisms themselves could not.
+    ///
+    /// # Non-vacuity depends on the sink never yielding before the write (Finding 1)
+    ///
+    /// This test's ordering proof is sound only because [`NoopSink::append`]
+    /// never yields — the ENTIRE regressed (inline, non-`spawn_blocking`)
+    /// write happens within the same, uninterrupted poll as the sink call,
+    /// so the heartbeat cannot even start until after that poll returns.
+    /// A sink with a genuine `.await` before the write (any real sink
+    /// doing a network round trip) breaks that property: see
+    /// `blocking_chain_write_survives_an_awaiting_sink` below, which races
+    /// from the instant such a sink is about to return rather than from
+    /// task-spawn time, and is therefore robust to the sink's await shape.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_chain_write_does_not_park_tokio_worker() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
+        use tokio::sync::oneshot;
         use tokio::time::{sleep, timeout, Duration};
 
-        // Timing constants (all in milliseconds).
-        // lock_hold_ms >> heartbeat_ms >> scheduling jitter (~5 ms).
-        const LOCK_HOLD_MS: u64 = 300;
-        const HEARTBEAT_MS: u64 = 50;
-        // We check the heartbeat at this point — must be inside the lock-hold
-        // window and well after the heartbeat delay.
-        const CHECK_DEADLINE_MS: u64 = 150;
-        // Total test budget — loose upper bound.
-        const TEST_BUDGET_MS: u64 = 2_000;
+        // Timing constants (milliseconds). Neither participates in a
+        // pass/fail comparison against a wall-clock deadline — only their
+        // RELATIVE order (via the `select!` race below) decides the
+        // verdict. `LOCK_HOLD_MS` need only exceed `HEARTBEAT_MS` with a
+        // margin comfortable enough that the free/parked scenarios can't be
+        // confused by scheduling noise.
+        // The release is signalled (see the bg thread below); this is the
+        // ceiling for when no signal can arrive. It MUST sit strictly between
+        // `HEARTBEAT_MS` and `TEST_BUDGET_MS`, and both bounds are load-bearing:
+        //
+        //  - above HEARTBEAT_MS, so a PARKED worker cannot finish the contended
+        //    write before the heartbeat would have fired — that ordering is the
+        //    regression signal.
+        //  - below TEST_BUDGET_MS, because in the parked case the signal can
+        //    NEVER arrive: the worker is blocked inside the write, so the main
+        //    task cannot run to send it. The ceiling is the only thing that
+        //    frees the lock, and if it fires after the budget the test reports
+        //    "test hung — investigate a deadlock" instead of the N1 verdict it
+        //    was built to produce.
+        const LOCK_HOLD_CEILING_MS: u64 = 1_500;
+        const HEARTBEAT_MS: u64 = 40;
+        // Hang watchdog only (see doc comment above) — not the N1 signal.
+        const TEST_BUDGET_MS: u64 = 3_000;
+        // External backstop budget (Finding 2) — comfortably wider than
+        // TEST_BUDGET_MS so the in-runtime timeout gets first crack at
+        // firing whenever the worker remains schedulable.
+        const WATCHDOG_BUDGET_MS: u64 = TEST_BUDGET_MS + 2_000;
 
         let dir = TempDir::new().unwrap();
         let base = dir.path().to_path_buf();
@@ -1614,59 +1816,443 @@ mod tests {
         // ── Background OS thread: hold the flock for LOCK_HOLD_MS ──────────
         // Acquire on a dedicated OS thread (not the tokio runtime).  The guard
         // is `!Send` (holds a raw fd), so we keep it on this thread and release
-        // via drop at the end of the closure.
+        // via drop at the end of the closure.  A panic here (e.g. `lock_file`
+        // failing) still runs the guard's `Drop` during unwind, so the flock
+        // is released either way; we surface the ORIGINAL panic via
+        // join()+resume_unwind below (rather than a generic "bg thread
+        // panicked" message) instead of leaving the test to hang, mirroring
+        // the pattern used for background-thread-holds-a-lock tests
+        // elsewhere in this crate (e.g. `daemon::identity_mint`,
+        // `daemon::startup_reconciler`).
+        // The bg thread SIGNALS once the flock is actually held, rather than us
+        // guessing with a sleep.  This is a precondition handshake, not a timing
+        // assumption: an unsynchronised "give it 20ms to acquire" bet was the last
+        // remaining flake trigger in this test.  If the bg thread lost that race,
+        // `anchor_head` ran UNCONTENDED and finished in single-digit ms — inside
+        // HEARTBEAT_MS — so the anchor won the race and the test reported an "N1
+        // regression" against correct code.  Worse, on that same input the older
+        // wall-clock version PASSED (vacuously: the worker was free anyway), so
+        // the ordering rewrite turned a benign vacuous pass into a hard red under
+        // exactly the CPU-saturation conditions it was written to survive.
         let lock_path_bg = lock_path.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        // Release is SIGNALLED, not timed. Holding for a fixed duration starts
+        // the clock at the acquisition signal, but the anchor write does not
+        // reach `flock` until the main task has returned from `recv_timeout`,
+        // cloned, `tokio::spawn`ed, and the worker has polled Task A through
+        // `read_chain_head` + `load_signing_key_if_active`. On a saturated
+        // runner that exceeds 400 ms; the lock is then already free,
+        // `anchor_head` runs uncontended and finishes inside `HEARTBEAT_MS`, and
+        // `select!` reports `AnchorFirst` — a false "N1 regression" against
+        // correct code. That is the exact false-verdict class this rewrite
+        // exists to remove, relocated one step later in the timeline. Holding
+        // until the race has RESOLVED takes wall-clock out of the verdict.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Signalled immediately before the race; see the bg thread below.
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
         let bg_thread = std::thread::spawn(move || {
             let _guard = crate::platform::lock::lock_file(&lock_path_bg)
                 .expect("bg thread: lock_file failed");
-            std::thread::sleep(std::time::Duration::from_millis(LOCK_HOLD_MS));
-            // _guard dropped here → flock released.
+            // Signal AFTER acquisition, while the guard is still alive.
+            held_tx
+                .send(())
+                .expect("bg thread: held-signal send failed");
+            // Wait until the main task is ABOUT TO ENTER THE RACE before the
+            // ceiling starts counting. Without this the clock starts here, at
+            // acquisition, and everything between acquisition and the race is
+            // charged against it — including, in the awaiting-sink test, a whole
+            // sanctioned `timeout(TEST_BUDGET_MS)` on `about_to_write`. That is
+            // how a 1 500 ms ceiling coexists with a 3 000 ms pre-flock phase:
+            // the lock can be long gone before the write reaches `flock`,
+            // leaving it uncontended and handing `select!` a false `AnchorFirst`.
+            let _ = armed_rx.recv_timeout(std::time::Duration::from_secs(10));
+            // Ok = the race resolved; Err = the main task panicked and dropped
+            // the sender, or the ceiling elapsed. All three release the lock.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_millis(LOCK_HOLD_CEILING_MS));
         });
 
-        // Give the background thread a moment to actually acquire the lock
-        // before we launch the anchor write.  A short OS-thread sleep is fine
-        // here because it runs on the std thread, not a tokio worker.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-
-        // ── Shared heartbeat flag ───────────────────────────────────────────
-        let heartbeat_fired = Arc::new(AtomicBool::new(false));
-        let hb_flag = Arc::clone(&heartbeat_fired);
+        // Block until the lock is genuinely held.  A timeout here is a PRECONDITION
+        // failure, reported as such — it is explicitly NOT an N1 verdict, because
+        // nothing about the worker has been observed yet.
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "PRECONDITION FAILED (not an N1 regression): the background thread \
+                 never acquired csq-runs/.chain-lock within 10s, so the anchor write \
+                 would not have contended on it and this test could not have \
+                 measured worker freedom.",
+            );
 
         // ── Task A: anchor write (will contend on flock) ────────────────────
         let base_a = base.clone();
-        let anchor_task = tokio::spawn(async move {
+        let mut anchor_task = tokio::spawn(async move {
             let sink = NoopSink::new("noop").unwrap();
             anchor_head(&sink, "2026-06-03T10:00:00Z", &base_a).await
         });
 
         // ── Task B: heartbeat (cheap async sleep, no flock involvement) ─────
+        // Signals completion via a oneshot so it can be raced directly
+        // against Task A's completion in `select!` below, rather than
+        // polled via a shared flag on a wall-clock schedule.
+        let (hb_tx, mut hb_rx) = oneshot::channel::<()>();
         let heartbeat_task = tokio::spawn(async move {
             sleep(Duration::from_millis(HEARTBEAT_MS)).await;
-            hb_flag.store(true, Ordering::SeqCst);
+            let _ = hb_tx.send(());
         });
 
-        // ── Check: heartbeat must fire while the lock is still held ─────────
-        // Sleep until CHECK_DEADLINE_MS on the tokio runtime.  With
-        // spawn_blocking the worker is free and this sleep resolves normally.
-        // Without it the worker is parked in flock and this sleep is blocked.
-        let check_result = timeout(Duration::from_millis(CHECK_DEADLINE_MS), async {
-            sleep(Duration::from_millis(CHECK_DEADLINE_MS)).await;
-        })
-        .await;
+        // ── Ordering proof: race the heartbeat against the anchor write ────
+        // See the doc comment above for the free-vs-parked reasoning. Only
+        // one of the two branches is ever polled to `Ready` in a given
+        // `select!` evaluation, so the losing branch's future (here always
+        // `anchor_task`, since `heartbeat_task`'s completion is consumed
+        // separately below) is left un-consumed and safe to `.await` again.
+        enum RaceOutcome {
+            HeartbeatFirst,
+            AnchorFirst,
+        }
 
-        let worker_was_free = check_result.is_ok() && heartbeat_fired.load(Ordering::SeqCst);
+        // The anchor arm BINDS its outcome rather than discarding it with `_`.
+        // `_ = &mut anchor_task` resolving is not by itself N1 evidence: it also
+        // resolves if `anchor_head` returned an error early WITHOUT ever touching
+        // .chain-lock (a drifted `seed_chain` giving EmptyChain, or an invalid sink
+        // name), or if the task PANICKED — a panicked JoinHandle yields
+        // Err(JoinError), which `_` silently accepts. All three would have printed
+        // "the blocking write ran on the worker thread", which is a false verdict
+        // pointing at the wrong subsystem. Distinguishing them also gives the test
+        // the positive control it otherwise lacks: we assert the write SUCCEEDED.
+        // The flock ceiling and the hang watchdog both start HERE, at the race,
+        // because the race is the only window either can speak to.
+        //
+        // The watchdog was originally armed at the top of the test with a
+        // 5 000 ms budget (`TEST_BUDGET_MS + 2_000`), ahead of a 10 s
+        // precondition wait — so a slow-but-correct lock acquisition tripped it
+        // and `std::process::exit(97)` killed the whole csq-core test binary,
+        // reporting a parked tokio worker that had not been observed at all.
+        // Moving it after that handshake fixed one test and left the other
+        // broken the same way: the awaiting-sink test has TWO sequential
+        // `timeout(TEST_BUDGET_MS)` phases, so a 5 000 ms budget covered 6 000 ms
+        // of legitimate waiting. Arming at the race makes the budget cover
+        // exactly one `TEST_BUDGET_MS` phase in both tests, which is what
+        // `TEST_BUDGET_MS + 2_000` was always sized for.
+        // The watchdog is SCOPED to the race, not held to function return.
+        // `WATCHDOG_BUDGET_MS` is `TEST_BUDGET_MS + 2_000`, i.e. sized for one
+        // race plus slack. Held to the end of the function it also covers the
+        // post-race drain — `anchor_task.await`, `heartbeat_task.await` and
+        // `bg_thread.join()` — so a race that legitimately consumed 2 900 ms
+        // leaves 2 100 ms for a drain that performs a signed chain write and a
+        // thread join. On a saturated runner that is not slack, and `exit(97)`
+        // would kill the binary during a drain the watchdog has nothing to say
+        // about. Scoping it to the race is the same principle as siting it
+        // there in the first place: cover exactly the window it can diagnose.
+        let _ = armed_tx.send(());
+        let race = {
+            let _watchdog = arm_hang_watchdog(WATCHDOG_BUDGET_MS);
+            timeout(Duration::from_millis(TEST_BUDGET_MS), async {
+                tokio::select! {
+                _ = &mut hb_rx => RaceOutcome::HeartbeatFirst,
+                joined = &mut anchor_task => match joined {
+                    Ok(AnchorOutcome::Succeeded { .. }) => RaceOutcome::AnchorFirst,
+                    Ok(other) => panic!(
+                        "PRECONDITION FAILED (not an N1 regression): anchor_head \
+                         returned {other:?} instead of Succeeded, so it did not \
+                         perform the flock-bearing write — the flock was never \
+                         contended and worker freedom was never exercised. Check \
+                         seed_chain and the sink name."
+                    ),
+                    Err(join_err) if join_err.is_panic() => {
+                        std::panic::resume_unwind(join_err.into_panic())
+                    }
+                    Err(join_err) => panic!(
+                        "PRECONDITION FAILED (not an N1 regression): the anchor task \
+                         failed to join ({join_err})."
+                    ),
+                },
+                }
+            })
+            .await
+        };
 
-        // Wait for both tasks to finish (within overall budget).
-        let _ = timeout(Duration::from_millis(TEST_BUDGET_MS), anchor_task).await;
+        // The race is decided; the flock has served its purpose. Release it now
+        // rather than on a timer, so no wall-clock quantity influenced the
+        // verdict above. A send failure means the bg thread already exited
+        // (ceiling elapsed) — harmless, and the lock is free either way.
+        let _ = release_tx.send(());
+
+        let worker_was_free = match race {
+            Ok(RaceOutcome::HeartbeatFirst) => true,
+            Ok(RaceOutcome::AnchorFirst) => false,
+            Err(_) => {
+                // Distinct failure mode from the N1 assertion below: the
+                // race never resolved at all within the hang watchdog. This
+                // is NOT wall-clock evidence of the N1 regression (which
+                // always resolves — the anchor write completes once the
+                // background thread releases the lock) — it means something
+                // else deadlocked and needs its own investigation.
+                panic!(
+                    "test hung: neither the heartbeat nor the anchor write completed \
+                     within {TEST_BUDGET_MS} ms. This is a HANG, not the N1 regression \
+                     signal — investigate a deadlock separately from the ordering proof."
+                );
+            }
+        };
+
+        // Drive every task + the background thread to completion regardless
+        // of which arm of the race fired, so nothing is left dangling.
+        if worker_was_free {
+            // `anchor_task` lost the race and was never polled to `Ready`
+            // by `select!` — still a valid, un-consumed `JoinHandle`.
+            let _ = anchor_task.await;
+        }
         let _ = heartbeat_task.await;
-        bg_thread.join().expect("bg thread panicked");
+        if let Err(panic) = bg_thread.join() {
+            std::panic::resume_unwind(panic);
+        }
 
         assert!(
             worker_was_free,
-            "N1 regression: the tokio worker was parked during the flock-hold window \
-             (heartbeat did not fire within {CHECK_DEADLINE_MS} ms). \
-             This means the blocking chain write ran on the worker thread \
-             instead of being offloaded to spawn_blocking."
+            "N1 regression: the anchor write completed before the heartbeat did, which \
+             means the tokio worker was parked inside the flock-hold window instead of \
+             running the heartbeat task concurrently. This means the blocking chain write \
+             ran on the worker thread instead of being offloaded to spawn_blocking."
+        );
+    }
+
+    /// Finding 1 (this session, following the N1 hardening above): the
+    /// ordering proof above is sound only because [`NoopSink::append`]
+    /// never yields before the flock-bearing write. A sink with a genuine
+    /// `.await` ahead of that write — which any real sink performing a
+    /// network round trip (e.g. a Rekor transparency-log submission)
+    /// necessarily has — gives the anchor task an EARLY yield point. If
+    /// the heartbeat were raced from task-spawn time (as the NoopSink test
+    /// does), that early yield would hand the worker to the heartbeat
+    /// regardless of whether the SUBSEQUENT write is offloaded, turning
+    /// the verdict into a coin flip (or a vacuous pass, if the sink's own
+    /// latency alone exceeds `HEARTBEAT_MS`).
+    ///
+    /// The fix is NOT a comment warning future readers to avoid awaiting
+    /// sinks, nor an assertion about `NoopSink`'s source — a future
+    /// `RekorSink` would be introduced elsewhere and neither would fire.
+    /// The fix is structural: [`AwaitingSink`] performs a genuine
+    /// `tokio::time::sleep` before returning from `append()`, and signals
+    /// `about_to_write` the instant it is about to return. This test races
+    /// the heartbeat starting from THAT signal — not from task-spawn time
+    /// — which is exactly the same measurement window
+    /// (sink-append-done → write-complete) the NoopSink test measures.
+    /// However long, or however many times, the sink itself yields before
+    /// that point no longer matters: the race only ever covers the
+    /// flock-bearing write itself.
+    ///
+    /// Mirrors `blocking_chain_write_does_not_park_tokio_worker` in every
+    /// other respect (background-thread flock hold + handshake, bound
+    /// anchor-outcome arm, hang watchdogs). See that test's doc comment
+    /// for the shared reasoning this one does not repeat.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_chain_write_survives_an_awaiting_sink() {
+        use tokio::sync::oneshot;
+        use tokio::time::{sleep, timeout, Duration};
+
+        // The release is signalled (see the bg thread below); this is the
+        // ceiling for when no signal can arrive. It MUST sit strictly between
+        // `HEARTBEAT_MS` and `TEST_BUDGET_MS`, and both bounds are load-bearing:
+        //
+        //  - above HEARTBEAT_MS, so a PARKED worker cannot finish the contended
+        //    write before the heartbeat would have fired — that ordering is the
+        //    regression signal.
+        //  - below TEST_BUDGET_MS, because in the parked case the signal can
+        //    NEVER arrive: the worker is blocked inside the write, so the main
+        //    task cannot run to send it. The ceiling is the only thing that
+        //    frees the lock, and if it fires after the budget the test reports
+        //    "test hung — investigate a deadlock" instead of the N1 verdict it
+        //    was built to produce.
+        const LOCK_HOLD_CEILING_MS: u64 = 1_500;
+        const HEARTBEAT_MS: u64 = 40;
+        // Hang watchdog only — not the N1 signal (see sibling test).
+        const TEST_BUDGET_MS: u64 = 3_000;
+        // External backstop budget (Finding 2) — comfortably wider than
+        // TEST_BUDGET_MS so the in-runtime timeout gets first crack at
+        // firing whenever the worker remains schedulable.
+        const WATCHDOG_BUDGET_MS: u64 = TEST_BUDGET_MS + 2_000;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        seed_chain(&base);
+
+        let lock_path = base.join("csq-runs").join(".chain-lock");
+
+        // ── Background OS thread: hold the flock for LOCK_HOLD_MS ──────────
+        // Identical handshake to the sibling test — see its doc comment for
+        // why an unsynchronised sleep is not acceptable here.
+        let lock_path_bg = lock_path.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        // Release is SIGNALLED, not timed. Holding for a fixed duration starts
+        // the clock at the acquisition signal, but the anchor write does not
+        // reach `flock` until the main task has returned from `recv_timeout`,
+        // cloned, `tokio::spawn`ed, and the worker has polled Task A through
+        // `read_chain_head` + `load_signing_key_if_active`. On a saturated
+        // runner that exceeds 400 ms; the lock is then already free,
+        // `anchor_head` runs uncontended and finishes inside `HEARTBEAT_MS`, and
+        // `select!` reports `AnchorFirst` — a false "N1 regression" against
+        // correct code. That is the exact false-verdict class this rewrite
+        // exists to remove, relocated one step later in the timeline. Holding
+        // until the race has RESOLVED takes wall-clock out of the verdict.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Signalled immediately before the race; see the bg thread below.
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
+        let bg_thread = std::thread::spawn(move || {
+            let _guard = crate::platform::lock::lock_file(&lock_path_bg)
+                .expect("bg thread: lock_file failed");
+            held_tx
+                .send(())
+                .expect("bg thread: held-signal send failed");
+            // Wait until the main task is ABOUT TO ENTER THE RACE before the
+            // ceiling starts counting. Without this the clock starts here, at
+            // acquisition, and everything between acquisition and the race is
+            // charged against it — including, in the awaiting-sink test, a whole
+            // sanctioned `timeout(TEST_BUDGET_MS)` on `about_to_write`. That is
+            // how a 1 500 ms ceiling coexists with a 3 000 ms pre-flock phase:
+            // the lock can be long gone before the write reaches `flock`,
+            // leaving it uncontended and handing `select!` a false `AnchorFirst`.
+            let _ = armed_rx.recv_timeout(std::time::Duration::from_secs(10));
+            // Ok = the race resolved; Err = the main task panicked and dropped
+            // the sender, or the ceiling elapsed. All three release the lock.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_millis(LOCK_HOLD_CEILING_MS));
+        });
+
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "PRECONDITION FAILED (not an N1 regression): the background thread \
+                 never acquired csq-runs/.chain-lock within 10s, so the anchor write \
+                 would not have contended on it and this test could not have \
+                 measured worker freedom.",
+            );
+
+        // ── Task A: anchor write via the AWAITING sink (Finding 1's leg) ────
+        let sink = std::sync::Arc::new(AwaitingSink::new());
+        let sink_for_task = std::sync::Arc::clone(&sink);
+        let base_a = base.clone();
+        let mut anchor_task = tokio::spawn(async move {
+            anchor_head(&*sink_for_task, "2026-06-03T10:00:00Z", &base_a).await
+        });
+
+        // Block until the sink signals it is about to return — i.e. until
+        // we are at the exact point the NoopSink test measures FROM. A
+        // timeout here is a PRECONDITION failure, explicitly not an N1
+        // verdict — nothing about the worker has been observed yet.
+        timeout(
+            Duration::from_millis(TEST_BUDGET_MS),
+            sink.about_to_write.notified(),
+        )
+        .await
+        .expect(
+            "PRECONDITION FAILED (not an N1 regression): the awaiting sink's \
+             append() never signalled about_to_write within the test budget — \
+             anchor_head did not reach the sink append call.",
+        );
+
+        // ── Task B: heartbeat, spawned ONLY NOW — exactly at the start of
+        // the same measurement window the NoopSink test uses from task-spawn
+        // time. This is the structural fix for Finding 1: however long the
+        // sink's own await took, it happened entirely BEFORE this point and
+        // is excluded from the race. ─────────────────────────────────────
+        let (hb_tx, mut hb_rx) = oneshot::channel::<()>();
+        let heartbeat_task = tokio::spawn(async move {
+            sleep(Duration::from_millis(HEARTBEAT_MS)).await;
+            let _ = hb_tx.send(());
+        });
+
+        enum RaceOutcome {
+            HeartbeatFirst,
+            AnchorFirst,
+        }
+
+        // Same bound-outcome reasoning as the sibling test: only
+        // `AnchorOutcome::Succeeded` counts as N1 evidence, a non-Succeeded
+        // outcome is a named precondition failure, and a panic is re-raised
+        // via `resume_unwind` rather than silently accepted by a `_` pattern.
+        // The flock ceiling and the hang watchdog both start HERE, at the race,
+        // because the race is the only window either can speak to.
+        //
+        // The watchdog was originally armed at the top of the test with a
+        // 5 000 ms budget (`TEST_BUDGET_MS + 2_000`), ahead of a 10 s
+        // precondition wait — so a slow-but-correct lock acquisition tripped it
+        // and `std::process::exit(97)` killed the whole csq-core test binary,
+        // reporting a parked tokio worker that had not been observed at all.
+        // Moving it after that handshake fixed one test and left the other
+        // broken the same way: the awaiting-sink test has TWO sequential
+        // `timeout(TEST_BUDGET_MS)` phases, so a 5 000 ms budget covered 6 000 ms
+        // of legitimate waiting. Arming at the race makes the budget cover
+        // exactly one `TEST_BUDGET_MS` phase in both tests, which is what
+        // `TEST_BUDGET_MS + 2_000` was always sized for.
+        // The watchdog is SCOPED to the race, not held to function return.
+        // `WATCHDOG_BUDGET_MS` is `TEST_BUDGET_MS + 2_000`, i.e. sized for one
+        // race plus slack. Held to the end of the function it also covers the
+        // post-race drain — `anchor_task.await`, `heartbeat_task.await` and
+        // `bg_thread.join()` — so a race that legitimately consumed 2 900 ms
+        // leaves 2 100 ms for a drain that performs a signed chain write and a
+        // thread join. On a saturated runner that is not slack, and `exit(97)`
+        // would kill the binary during a drain the watchdog has nothing to say
+        // about. Scoping it to the race is the same principle as siting it
+        // there in the first place: cover exactly the window it can diagnose.
+        let _ = armed_tx.send(());
+        let race = {
+            let _watchdog = arm_hang_watchdog(WATCHDOG_BUDGET_MS);
+            timeout(Duration::from_millis(TEST_BUDGET_MS), async {
+                tokio::select! {
+                _ = &mut hb_rx => RaceOutcome::HeartbeatFirst,
+                joined = &mut anchor_task => match joined {
+                    Ok(AnchorOutcome::Succeeded { .. }) => RaceOutcome::AnchorFirst,
+                    Ok(other) => panic!(
+                        "PRECONDITION FAILED (not an N1 regression): anchor_head \
+                         returned {other:?} instead of Succeeded, so it did not \
+                         perform the flock-bearing write — the flock was never \
+                         contended and worker freedom was never exercised."
+                    ),
+                    Err(join_err) if join_err.is_panic() => {
+                        std::panic::resume_unwind(join_err.into_panic())
+                    }
+                    Err(join_err) => panic!(
+                        "PRECONDITION FAILED (not an N1 regression): the anchor task \
+                         failed to join ({join_err})."
+                    ),
+                },
+                }
+            })
+            .await
+        };
+
+        // The race is decided; the flock has served its purpose. Release it now
+        // rather than on a timer, so no wall-clock quantity influenced the
+        // verdict above. A send failure means the bg thread already exited
+        // (ceiling elapsed) — harmless, and the lock is free either way.
+        let _ = release_tx.send(());
+
+        let worker_was_free = match race {
+            Ok(RaceOutcome::HeartbeatFirst) => true,
+            Ok(RaceOutcome::AnchorFirst) => false,
+            Err(_) => {
+                panic!(
+                    "test hung: neither the heartbeat nor the anchor write completed \
+                     within {TEST_BUDGET_MS} ms. This is a HANG, not the N1 regression \
+                     signal — investigate a deadlock separately from the ordering proof."
+                );
+            }
+        };
+
+        if worker_was_free {
+            let _ = anchor_task.await;
+        }
+        let _ = heartbeat_task.await;
+        if let Err(panic) = bg_thread.join() {
+            std::panic::resume_unwind(panic);
+        }
+
+        assert!(
+            worker_was_free,
+            "N1 regression (survives an awaiting sink): the anchor write completed \
+             before the heartbeat did, measured from the instant the sink was about \
+             to return — the blocking chain write is parking the tokio worker even \
+             though a preceding sink await gave it an early yield point."
         );
     }
 }

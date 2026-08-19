@@ -289,7 +289,7 @@ pub(crate) fn candidate_account_matches(
 ///
 /// The `candidate_email == None` case is split into `candidate_email_drift` (a
 /// PRESENT `.claude.json` the wrong-account gate can't read an email from — the
-/// #833 format drift) vs `candidate_email_absent` (absent/empty file — benign
+/// an internal ticket format drift) vs `candidate_email_absent` (absent/empty file — benign
 /// not-yet-populated), via [`crate::credentials::claude_json::classify_oauth_account`],
 /// so the daemon log carries the same drift-vs-fresh signal as the `csq doctor`
 /// custodian canary (redteam R1 F6 — cross-surface parity). Telemetry only: the
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn slot_ownership_contaminated_when_store_token_is_foreign() {
-        // The exact #955 scramble: slot 2 is bound to researchroom, but its STORE
+        // The exact an internal ticket scramble: slot 2 is bound to researchroom, but its STORE
         // token actually belongs to integrum → the detector MUST flag it.
         let dir = tempfile::TempDir::new().unwrap();
         let uuid = identity_store::IdentityId::new_v4();
@@ -1167,7 +1167,7 @@ mod tests {
     #[test]
     fn reason_candidate_drift_when_populated_no_oauth_account() {
         // Populated .claude.json without oauthAccount → classify FieldMissing →
-        // "candidate_email_drift" (the #833 degradation surfaced in the daemon log).
+        // "candidate_email_drift" (the an internal ticket degradation surfaced in the daemon log).
         let dir = tempfile::TempDir::new().unwrap();
         let handle = dir.path().join("term-1");
         std::fs::create_dir_all(&handle).unwrap();

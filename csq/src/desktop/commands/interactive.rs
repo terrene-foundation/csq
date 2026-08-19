@@ -1,5 +1,5 @@
 //! Tauri command wrappers for the M-IC interactive per-turn enforcement
-//! surface (#793).
+//! surface (an internal ticket).
 //!
 //! These thin commands let the desktop renderer drive the daemon's
 //! `/api/interactive/*` routes (open / submit / override / abandon / close)
@@ -74,7 +74,7 @@ pub struct InteractiveStateView {
 pub struct InteractiveOpenView {
     pub session_key: String,
     pub state: InteractiveStateView,
-    /// #793: the session's auth mode tag, captured once at open and rendered as a
+    /// an internal ticket: the session's auth mode tag, captured once at open and rendered as a
     /// badge in the Enforcement console. The daemon serializes
     /// `OpenSessionResponse.auth_mode` as the kebab strings `"subscription"` /
     /// `"direct-api"` (from `csq_core::phase2b::interactive::AuthMode`), or omits
@@ -85,7 +85,7 @@ pub struct InteractiveOpenView {
     pub auth_mode: Option<String>,
 }
 
-/// One selectable subscription account for the Enforcement-tab picker (#793,
+/// One selectable subscription account for the Enforcement-tab picker (an internal ticket,
 /// an internal journal entry §FD1). Flat mirror of the daemon's `CandidateSlot`
 /// (`{ slot, label, seven_day_pct }`). Carried renderer-side to populate the
 /// account dropdown; `seven_day_pct` (PR-3) lets the picker default to the lowest
@@ -100,7 +100,7 @@ pub struct InteractiveCandidateSlot {
 }
 
 /// Response of [`interactive_options`]: the gate's default provider plus the
-/// subscription accounts the operator may pick BEFORE opening a session (#793).
+/// subscription accounts the operator may pick BEFORE opening a session (an internal ticket).
 /// Mirror of the daemon's `SessionOptionsResponse`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InteractiveSessionOptions {
@@ -263,7 +263,7 @@ pub fn interactive_open(
     terminal_label: Option<String>,
     slot: Option<u16>,
 ) -> Result<InteractiveOpenView, String> {
-    // `slot` (#793 §FD1 escape hatch): the operator-picked subscription account.
+    // `slot` (an internal ticket §FD1 escape hatch): the operator-picked subscription account.
     // `None` → daemon default (lowest-with-creds). The daemon validates it is a
     // provider-matching account with credentials and rejects an arbitrary slot
     // (`session_config_invalid`); this wrapper just relays the choice.
@@ -283,7 +283,7 @@ pub fn interactive_open(
 }
 
 /// List the subscription accounts the operator may pick before opening a session,
-/// plus the gate's default provider (#793 Enforcement-tab picker, an internal journal entry
+/// plus the gate's default provider (an internal ticket Enforcement-tab picker, an internal journal entry
 /// §FD1). No session key required — this is a pre-open query.
 ///
 /// Returns `interactive_unavailable` when the activation gate is closed (the
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn open_view_captures_auth_mode_tag() {
-        // Daemon emits the kebab tag in the open-response (#793); the wrapper
+        // Daemon emits the kebab tag in the open-response (an internal ticket); the wrapper
         // carries it through verbatim for the console badge.
         let sub = serde_json::from_str::<InteractiveOpenView>(
             r#"{"session_key":"abc-123","state":{"state":"idle"},"auth_mode":"subscription"}"#,
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn session_options_parses_candidate_slots() {
-        // The daemon's /api/interactive/options body (#793 §FD1) deserializes into
+        // The daemon's /api/interactive/options body (an internal ticket §FD1) deserializes into
         // the renderer-facing mirror.
         // First candidate carries a 7d quota (PR-3); second omits it → None.
         let opts = serde_json::from_str::<InteractiveSessionOptions>(

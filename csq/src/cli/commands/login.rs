@@ -31,17 +31,20 @@ use csq_core::cli_deps::sanitize::redact_path;
 use csq_core::cli_deps::SurfaceCli;
 use csq_core::credentials::{self, file};
 use csq_core::oauth::{self, RaceResult};
+use csq_core::providers::catalog::Surface;
 use csq_core::types::AccountNum;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use csq_core::daemon::{self, DaemonClientError, DetectResult};
 use csq_core::providers::codex::desktop_login::extract_device_auth_url;
+#[cfg(unix)]
+use std::io::BufRead;
 
 /// Entry point invoked from `main.rs`. Dispatches on `provider`:
 ///
@@ -60,6 +63,8 @@ pub fn handle(
     non_interactive: bool,
     ignore_cli_version: bool,
     no_auto_update_cli: bool,
+    track_latest: bool,
+    json: bool,
 ) -> Result<()> {
     // R2/B80: `--reset-handle-dir` is handled first, before any OAuth
     // flow. It re-creates provider-specific artifacts without re-running
@@ -69,15 +74,82 @@ pub fn handle(
         return handle_reset_handle_dir(base_dir, account, provider, non_interactive);
     }
 
+    // GH an internal ticket: this dispatcher previously refused `csq login N
+    // --provider {codex,gemini,claude}` up-front when `N` was bound to a
+    // native (Kimi/Grok) marker (redteam R1 MED's reverse conflict guard).
+    // That refusal is RETIRED — it is now handled by silent cleanup deeper
+    // in the OAuth-login flow, mirroring the shipped 3P-unbind precedent:
+    //   * `claude`/`` (Anthropic) and `codex` REPLACE the slot's identity,
+    //     so a stale Gemini or native marker is now detected pre-mint
+    //     (`binding_guard::detect_stale_marker_binding`) and cleared on the
+    //     login's SUCCESS path (`binding_guard::clear_detected_marker_binding`)
+    //     — called from `accounts::login::finalize_login` and
+    //     `providers::codex::login::perform_with` respectively — rather than
+    //     refused here. Login "just works" and replaces cleanly instead of
+    //     forcing an explicit `csq logout` first. A login that fails
+    //     partway through leaves the prior binding untouched.
+    //   * `gemini` never needed this pre-check — `handle_gemini_oauth`'s own
+    //     `oauth_login::perform` already refuses ANY cross-surface binding
+    //     (not just native) via `binding_guard::conflicting_bound_surface`,
+    //     so this dispatch-level check was redundant for that arm.
+    // native→native and native→other-native are still guarded (refused, not
+    // cleaned — a login would orphan the vendor home) inside `handle_native`.
+
+    // NOTE: the an internal ticket drivability guard is NOT called here. It runs inside each
+    // provider handler, immediately AFTER that handler's
+    // `cli_deps_gate::enforce` — see those call sites for why the order is
+    // load-bearing.
+
     match provider {
-        "codex" => return handle_codex(base_dir, account, ignore_cli_version, no_auto_update_cli),
+        "codex" => {
+            return handle_codex(
+                base_dir,
+                account,
+                ignore_cli_version,
+                no_auto_update_cli,
+                track_latest,
+                json,
+            )
+        }
         // Stage 2 of an internal journal entry: Gemini has THREE auth paths today.
         // OAuth (Code Assist subscription) is the `csq login` entry;
         // AI Studio API keys and Vertex SA still go through `csq
         // setkey gemini` because those are non-OAuth credential paste
         // flows.
         "gemini" => {
-            return handle_gemini_oauth(base_dir, account, ignore_cli_version, no_auto_update_cli)
+            return handle_gemini_oauth(
+                base_dir,
+                account,
+                ignore_cli_version,
+                no_auto_update_cli,
+                track_latest,
+                json,
+            )
+        }
+        // Wave 3 (an internal journal entry): native, self-authenticating vendor CLIs.
+        // csq stores no credentials — only a credential-less binding marker
+        // (exactly the Gemini pattern). See `handle_native`.
+        "kimi-cli" => {
+            return handle_native(
+                base_dir,
+                account,
+                Surface::Kimi,
+                ignore_cli_version,
+                no_auto_update_cli,
+                track_latest,
+                json,
+            )
+        }
+        "grok" => {
+            return handle_native(
+                base_dir,
+                account,
+                Surface::Grok,
+                ignore_cli_version,
+                no_auto_update_cli,
+                track_latest,
+                json,
+            )
         }
         "claude" | "" => {
             // Claude OAuth shells out to `claude auth login` (CC is the
@@ -91,7 +163,7 @@ pub fn handle(
         }
         other => {
             return Err(anyhow!(
-                "unknown --provider {other:?} — supported: claude, codex, gemini"
+                "unknown --provider {other:?} — supported: claude, codex, gemini, kimi-cli, grok"
             ));
         }
     }
@@ -101,7 +173,53 @@ pub fn handle(
     // flow is no longer reachable from the CLI (see issue tracker for
     // its removal); desktop still wires it through `start_claude_login_race`.
     let _ = legacy_shell;
-    handle_direct(base_dir, account)
+    handle_direct(base_dir, account, json)
+}
+
+/// Single call site for the an internal ticket fail-fast guard (see the doc at its call
+/// site in [`handle`]). Resolves `provider` (defaulting the empty string to
+/// `"claude"`, matching `handle`'s own dispatch) against the registry, derives
+/// its [`csq_core::sdk::LoginFlow`], and refuses immediately when that flow
+/// needs an attended session absent one. An id `handle`'s own `match provider`
+/// arm will later reject as unknown (unreachable in practice — clap's
+/// `value_parser` on `--provider` already closes the set) is a no-op here,
+/// deferring to that existing error rather than duplicating it.
+fn guard_login_drivability(provider: &str, json: bool) -> Result<()> {
+    use csq_core::providers::{guard_attended_session, login_flow_for, registry};
+    use csq_core::sdk::{Envelope, SCHEMA_LOGIN_V1};
+    use std::io::IsTerminal;
+
+    let resolved_id = if provider.is_empty() {
+        "claude"
+    } else {
+        provider
+    };
+    let Some(descriptor) = registry::lookup(resolved_id) else {
+        return Ok(());
+    };
+    let flow = login_flow_for(&descriptor);
+    // Honour the repo's ESTABLISHED non-TTY bypass rather than reading the
+    // terminal raw. `cli::check_test_bypass` is compiled in ONLY under the
+    // `test-utils` feature (production builds use
+    // `--no-default-features --features cli`, where it is a `const false`), so
+    // the env var cannot weaken this guard for a real user.
+    //
+    // Reading `is_terminal()` alone made this guard fire in every integration
+    // test that drives `csq login` as a subprocess — 12 tests in
+    // `cli_deps_login_integration` refused before reaching the codex
+    // version-gate logic they exist to pin (26 passed on main, 14 passed here).
+    // Reusing the helper rather than re-deriving the bypass keeps ONE
+    // definition of "may this build skip the TTY requirement".
+    let has_tty = std::io::stdin().is_terminal() || super::cli::check_test_bypass();
+    if let Err(sdk_err) = guard_attended_session(flow, descriptor.id, has_tty) {
+        if json {
+            let code =
+                csq_core::sdk::emit(&Envelope::<()>::failure(SCHEMA_LOGIN_V1, None, sdk_err))?;
+            std::process::exit(code);
+        }
+        return Err(anyhow!("{}", sdk_err.message.as_str()));
+    }
+    Ok(())
 }
 
 /// Returns true if the credentials file at `path` is missing OR
@@ -186,15 +304,15 @@ fn handle_reset_handle_dir(
     provider: &str,
     non_interactive: bool,
 ) -> Result<()> {
-    use csq_core::providers::catalog::Surface;
-
     let surface = match provider {
         "codex" => Surface::Codex,
         "gemini" => Surface::Gemini,
+        "kimi-cli" => Surface::Kimi,
+        "grok" => Surface::Grok,
         "claude" | "" => Surface::ClaudeCode,
         other => {
             return Err(anyhow!(
-                "unknown --provider {other:?} — supported: claude, codex, gemini"
+                "unknown --provider {other:?} — supported: claude, codex, gemini, kimi-cli, grok"
             ));
         }
     };
@@ -205,6 +323,11 @@ fn handle_reset_handle_dir(
         Surface::ClaudeCode => {
             // CC: no-op — handle dirs are reconstructed on every `csq run`.
             eprintln!("info: --reset-handle-dir for claude is a no-op; handle dirs are created fresh on each `csq run`");
+        }
+        Surface::Kimi | Surface::Grok => {
+            // Native-CLI handle dirs are recreated fresh on each `csq run`
+            // (like Gemini/CC) — nothing persistent to reset.
+            eprintln!("info: --reset-handle-dir for native-CLI slots is a no-op; handle dirs are created fresh on each `csq run`");
         }
     }
 
@@ -229,7 +352,7 @@ fn handle_reset_handle_dir(
 /// (identified via the running process's `CLAUDE_CONFIG_DIR` env var).
 ///
 /// If `CLAUDE_CONFIG_DIR` is not set (no active session), only the
-/// canonical config-<N>/config.toml is verified to exist. Nothing is
+/// canonical `config-<N>/config.toml` is verified to exist. Nothing is
 /// written if there's no active handle dir to reset.
 fn reset_handle_dir_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
     let canonical = base_dir
@@ -367,7 +490,22 @@ fn reset_handle_dir_gemini(base_dir: &Path, account: AccountNum) -> Result<()> {
 /// UX-R1-H3 regression: two concurrent `csq login N` processes
 /// could both run an OAuth race and stomp `credentials/N.json`.
 /// Holding an exclusive flock around the entire login flow
-/// serializes them.
+/// serializes them. The lock is per-ACCOUNT, not per-provider — it
+/// also serializes a `csq login N --provider gemini` (or `codex`)
+/// against a concurrent Anthropic `csq login N` (or a desktop login
+/// for the same slot), which is exactly the shape that matters since
+/// every provider's login writes into the same `config-<N>/` +
+/// `profiles.json`.
+///
+/// `bypass_hint` names the flag (if any) that lets the caller route
+/// around the contention instead of waiting/killing the holder.
+/// `Some("--legacy-shell")` for the Claude paths (the in-process race
+/// flow ignores this lock entirely); `None` for providers with no
+/// such escape hatch — codex and gemini have no analogous flag, and
+/// suggesting `--legacy-shell` there would send the user down a dead
+/// end — neither `handle_codex` nor `handle_gemini_oauth` takes a
+/// `legacy_shell` parameter, so `handle()` never threads it into
+/// either dispatch branch.
 ///
 /// UX-R2-01: error messages include the platform-specific kill
 /// command for the holder PID so non-technical users have a concrete
@@ -375,7 +513,15 @@ fn reset_handle_dir_gemini(base_dir: &Path, account: AccountNum) -> Result<()> {
 /// SEC-R2-08: a stale-PID file (crashed prior holder) renders a
 /// distinct "stale lock" message rather than misdirecting the user
 /// at a dead PID.
-fn acquire_login_lock(base_dir: &Path, account: AccountNum) -> Result<AccountLoginLock> {
+fn acquire_login_lock(
+    base_dir: &Path,
+    account: AccountNum,
+    bypass_hint: Option<&str>,
+) -> Result<AccountLoginLock> {
+    let bypass_suffix = match bypass_hint {
+        Some(flag) => format!(", or use {flag} to bypass"),
+        None => String::new(),
+    };
     match AccountLoginLock::acquire(base_dir, account)
         .with_context(|| format!("create login lock file for account {account}"))?
     {
@@ -393,16 +539,16 @@ fn acquire_login_lock(base_dir: &Path, account: AccountNum) -> Result<AccountLog
             pid_alive: _,
         } => Err(anyhow!(
             "another csq login {account} is in progress (PID {pid}) — \
-             wait for it to finish, or run `{}` to terminate it, or \
-             use --legacy-shell to bypass",
-            kill_hint(pid)
+             wait for it to finish, or run `{}` to terminate it{}",
+            kill_hint(pid),
+            bypass_suffix
         )),
         AcquireOutcome::Held {
             pid: None,
             pid_alive: _,
         } => Err(anyhow!(
-            "another csq login {account} is in progress \
-             — wait or use --legacy-shell to bypass"
+            "another csq login {account} is in progress — wait{}",
+            bypass_suffix
         )),
     }
 }
@@ -435,7 +581,7 @@ fn handle_race(base_dir: &Path, account: AccountNum) -> Result<()> {
     // The guard is bound to a local so it lives until the function
     // returns (or panics) — at which point the kernel releases the
     // flock automatically.
-    let _lock = acquire_login_lock(base_dir, account)?;
+    let _lock = acquire_login_lock(base_dir, account, Some("--legacy-shell"))?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -665,12 +811,28 @@ fn handle_codex(
     account: AccountNum,
     ignore_cli_version: bool,
     no_auto_update_cli: bool,
+    track_latest: bool,
+    json: bool,
 ) -> Result<()> {
     use csq_core::providers::codex::desktop_login::parse_device_code_line;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    // UX-R1-H3 (lock symmetry, cross-provider): serialise this
+    // invocation against any other `csq login N` for the SAME
+    // account — CLI or desktop, any provider. `codex login
+    // --device-auth` shares `CODEX_HOME=config-<N>/` with a
+    // concurrent invocation for the same slot; without this lock two
+    // processes race the subprocess's own `auth.json` write (before
+    // either reaches `providers::codex::login::perform_with`'s
+    // `ProfilesFileLock`, which only serialises the identity-mint +
+    // canonical-save step, not the codex-cli subprocess itself).
+    // Acquired FIRST, before the interactive ToS-prerequisite prompt,
+    // so contention is reported immediately rather than after the
+    // user has already read the prerequisite and pressed Enter.
+    let _lock = acquire_login_lock(base_dir, account, None)?;
 
     const SETTINGS_URL: &str = "https://chatgpt.com/#settings/Security";
 
@@ -728,8 +890,26 @@ fn handle_codex(
         SurfaceCli::Codex,
         ignore_cli_version,
         no_auto_update_cli,
+        track_latest,
+        base_dir,
         &format!("csq login {account} --provider codex"),
     )?;
+
+    // Fail-FAST drivability guard (an internal ticket) — a provider whose login flow needs an
+    // attended session (a TTY to block a confirmation read on, or a local browser
+    // its subprocess drives) refuses IMMEDIATELY rather than proceeding into a
+    // wait an unattended host can never satisfy.
+    //
+    // ORDER IS LOAD-BEARING: this runs AFTER `cli_deps_gate::enforce` above, not
+    // before the dispatch. Placing it earlier pre-empted the version gate, so a
+    // headless operator whose vendor CLI was outdated/missing was told to find a
+    // TTY instead of being told their CLI is unusable — they would fix the wrong
+    // thing first, then hit the real problem. The vendor-CLI state is the more
+    // fundamental and more actionable failure, and it must be reported first.
+    // (Caught by `cli_deps_login_integration`: 26 pass on main, 14 with the guard
+    // hoisted ahead of the gate.) The gate is itself timeout-bounded, so running
+    // it first preserves an internal ticket's no-hang property.
+    guard_login_drivability("codex", json)?;
     // ─────────────────────────────────────────────────────────────────────
 
     // Custom spawn function: pipe codex-cli's stdout, tee to terminal,
@@ -835,7 +1015,25 @@ fn handle_gemini_oauth(
     account: AccountNum,
     ignore_cli_version: bool,
     no_auto_update_cli: bool,
+    track_latest: bool,
+    json: bool,
 ) -> Result<()> {
+    // UX-R1-H3 (lock symmetry, cross-provider): serialise this
+    // invocation against any other `csq login N` for the SAME
+    // account — CLI or desktop, any provider. Two concurrent
+    // `csq login N --provider gemini` processes both race
+    // `oauth_login::perform`'s OAuth-flow-then-verify sequence
+    // against the SAME shared `~/.gemini/oauth_creds.json` (gemini-cli
+    // has no per-slot credential store — see the `oauth_login` module
+    // doc for the design), and both write the same per-slot
+    // `profiles.json` + identity marker on completion. Without this
+    // lock the last writer wins silently. Acquired FIRST, before the
+    // pre-flight CLI-version probe (which itself spawns
+    // `gemini --version`), so contention is reported before any
+    // subprocess or the interactive browser-OAuth wait inside
+    // `perform`.
+    let _lock = acquire_login_lock(base_dir, account, None)?;
+
     // ── Pre-flight probe (PR-MCD2, spec/13 §3, R1-C2) ────────────────────
     // Probe is spawn-adjacent: placed IMMEDIATELY before the gemini
     // credential-check invocation to close the TOCTOU window. Probe-disabled
@@ -845,8 +1043,26 @@ fn handle_gemini_oauth(
         SurfaceCli::Gemini,
         ignore_cli_version,
         no_auto_update_cli,
+        track_latest,
+        base_dir,
         &format!("csq login {account} --provider gemini"),
     )?;
+
+    // Fail-FAST drivability guard (an internal ticket) — a provider whose login flow needs an
+    // attended session (a TTY to block a confirmation read on, or a local browser
+    // its subprocess drives) refuses IMMEDIATELY rather than proceeding into a
+    // wait an unattended host can never satisfy.
+    //
+    // ORDER IS LOAD-BEARING: this runs AFTER `cli_deps_gate::enforce` above, not
+    // before the dispatch. Placing it earlier pre-empted the version gate, so a
+    // headless operator whose vendor CLI was outdated/missing was told to find a
+    // TTY instead of being told their CLI is unusable — they would fix the wrong
+    // thing first, then hit the real problem. The vendor-CLI state is the more
+    // fundamental and more actionable failure, and it must be reported first.
+    // (Caught by `cli_deps_login_integration`: 26 pass on main, 14 with the guard
+    // hoisted ahead of the gate.) The gate is itself timeout-bounded, so running
+    // it first preserves an internal ticket's no-hang property.
+    guard_login_drivability("gemini", json)?;
     // ─────────────────────────────────────────────────────────────────────
 
     // Redact at the IPC / process boundary: defense-in-depth in
@@ -869,6 +1085,162 @@ fn handle_gemini_oauth(
 
 // pre_flight_check moved to super::cli_deps_gate::enforce (H4 extraction, R1 redteam).
 // Both handle_codex and handle_gemini_oauth now delegate to that shared function.
+
+/// `csq login N --provider kimi-cli|grok` (Wave B, an internal journal entry) — binds a
+/// slot to a native, self-authenticating vendor CLI via a **per-slot vendor
+/// home** (`native::native_home_path`), the `CODEX_HOME` isolation pattern
+/// without codex's UUID/symlink/relocation machinery (native surfaces
+/// self-refresh in place; csq never centrally rotates their tokens). Two
+/// slots on the same provider get distinct homes, so a provider supports
+/// multiple independent accounts. csq still writes NO credentials of its
+/// own — only the credential-less binding marker
+/// ([`csq_core::providers::native::write_binding`]) — but the marker is now
+/// written **only after** a real vendor login succeeds and its credential
+/// file is confirmed present ([`csq_core::providers::native::has_credentials`]),
+/// superseding the 0133 marker-only design (a marker used to mean "slot
+/// wants this surface"; it now means "slot has a working native login").
+///
+/// Steps:
+/// 1. **Pre-flight probe** ([`super::cli_deps_gate::enforce`]) — the same
+///    binary-presence + version-floor gate every other surface's login uses.
+///    `Missing` bails unconditionally (spec/13 §3); `Outdated` /
+///    `UnrecognizedVersion` downgrade to WARN under `--ignore-cli-version`.
+/// 2. **Run the vendor's own device-auth login**
+///    ([`csq_core::providers::native_login::login_native_cli`]) — spawns
+///    `kimi login` / `grok login --device-auth` with stdio inherited (the
+///    user sees the vendor's own device-code prompt directly) and
+///    `<HOME_ENV>` set to this slot's isolated vendor home. On exit 0,
+///    verifies the vendor's credential file landed under that home before
+///    writing the binding marker; on spawn failure, non-zero exit, or a
+///    missing credential file, returns `Err` with NO marker written.
+/// 3. **Record `by_slot_identity[N]`** = `"kimi-<N>"` / `"grok-<N>"`
+///    (mirrors [`csq_core::providers::gemini::provisioning::gemini_identity_label`]).
+///    Non-fatal on failure — unlike Gemini's daemon backfill, native surfaces
+///    have no backfill pass yet (tracked: an internal journal entry W3-6); the binding
+///    marker written in step 2 remains the sole authority for "is this slot
+///    bound", so a failed identity write leaves the slot fully usable.
+/// 4. **Invalidate the daemon's discovery cache** (symmetric with every other
+///    login surface).
+fn handle_native(
+    base_dir: &Path,
+    account: AccountNum,
+    surface: Surface,
+    ignore_cli_version: bool,
+    no_auto_update_cli: bool,
+    track_latest: bool,
+    json: bool,
+) -> Result<()> {
+    use csq_core::providers::native;
+    use csq_core::providers::native_login;
+
+    let descriptor = native::descriptor(surface).ok_or_else(|| {
+        anyhow!("internal error: {surface} is not a native-CLI surface (handle_native misrouted)")
+    })?;
+
+    // Cross-surface conflict guard — parity with the desktop provision twin
+    // (`provision_native_cli`) and `csq setkey` (redteam HIGH-2). Refuse if the
+    // slot is already bound to another surface (Codex / Claude / Gemini / 3P /
+    // the other native) so `csq login N --provider kimi-cli|grok` cannot
+    // silently write a second binding marker that `csq run N` then mis-dispatches
+    // (native is the lowest dispatch precedence) or the collision guard rejects.
+    // Use the `BoundSurface`-returning guard directly (not the `Option<Surface>`
+    // delegate) so a 3P-bearer conflict is labeled "a third-party provider", not
+    // mislabeled "Claude (Anthropic OAuth)" via the `ThirdPartyBearer→ClaudeCode`
+    // wire collapse (redteam R1 MEDIUM-1).
+    if let Some(existing) =
+        csq_core::accounts::binding_guard::conflicting_bound_surface(base_dir, account, surface)
+    {
+        return Err(anyhow!(
+            "slot {account} is bound to {} — run `csq logout {account}` to rebind",
+            existing.label()
+        ));
+    }
+
+    // ── Pre-flight probe — same gate every surface's login uses ─────────────
+    super::cli_deps_gate::enforce(
+        descriptor.surface_cli,
+        ignore_cli_version,
+        no_auto_update_cli,
+        track_latest,
+        base_dir,
+        &format!("csq login {account} --provider {}", descriptor.id),
+    )?;
+
+    // Fail-FAST drivability guard (an internal ticket) — a provider whose login flow needs an
+    // attended session (a TTY to block a confirmation read on, or a local browser
+    // its subprocess drives) refuses IMMEDIATELY rather than proceeding into a
+    // wait an unattended host can never satisfy.
+    //
+    // ORDER IS LOAD-BEARING: this runs AFTER `cli_deps_gate::enforce` above, not
+    // before the dispatch. Placing it earlier pre-empted the version gate, so a
+    // headless operator whose vendor CLI was outdated/missing was told to find a
+    // TTY instead of being told their CLI is unusable — they would fix the wrong
+    // thing first, then hit the real problem. The vendor-CLI state is the more
+    // fundamental and more actionable failure, and it must be reported first.
+    // (Caught by `cli_deps_login_integration`: 26 pass on main, 14 with the guard
+    // hoisted ahead of the gate.) The gate is itself timeout-bounded, so running
+    // it first preserves an internal ticket's no-hang property.
+    guard_login_drivability(descriptor.id, json)?;
+    // ─────────────────────────────────────────────────────────────────────
+
+    eprintln!(
+        "Starting {} device-auth login for slot {account}...",
+        descriptor.display_name
+    );
+    eprintln!(
+        "{} will display a device code and verification URL below — this account \
+         is isolated to slot {account}; other slots on the same provider are unaffected.",
+        descriptor.binary
+    );
+
+    // Wave B (0135): runs the vendor's own device-auth login into this
+    // slot's isolated vendor home, then verifies + writes the marker.
+    // `login_native_cli` owns the marker write — no separate
+    // `native::write_binding` call here (unlike the retired 0133 flow).
+    native_login::login_native_cli(base_dir, account, surface)?;
+
+    // by_slot_identity[N] = "kimi-<N>" / "grok-<N>" — mirrors
+    // `gemini::provisioning::write_gemini_identity`'s type-witnessed lock
+    // acquisition. Non-fatal (see docstring above): the binding marker
+    // already committed above is the sole authority for slot binding.
+    let label = format!("{}-{account}", surface.as_str());
+    match csq_core::accounts::profiles_lock::ProfilesFileLock::acquire(base_dir) {
+        Ok(lock) => {
+            if let Err(e) = csq_core::accounts::profiles::set_slot_identity(
+                &lock,
+                base_dir,
+                account.get(),
+                &label,
+            ) {
+                tracing::warn!(
+                    error_kind = "native_identity_write_failed",
+                    surface = surface.as_str(),
+                    account = account.get(),
+                    "by_slot_identity[{account}] write failed (slot usable; \
+                     no backfill pass exists yet for native surfaces): {e}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error_kind = "native_identity_lock_failed",
+                surface = surface.as_str(),
+                account = account.get(),
+                "profiles lock unavailable while writing by_slot_identity[{account}] \
+                 (slot usable): {e}"
+            );
+        }
+    }
+
+    // Symmetric with handle_codex / handle_gemini_oauth — invalidate daemon
+    // discovery_cache + refresh-status cache on every successful login surface.
+    notify_daemon_cache_invalidation(base_dir);
+    eprintln!(
+        "info: slot {account} bound to {} ({}). Run `csq run {account}` to start a session.",
+        descriptor.display_name, descriptor.binary
+    );
+    Ok(())
+}
 
 // `which_claude` was inlined and replaced by
 // `csq_core::accounts::login::find_claude_binary`, which also walks
@@ -902,7 +1274,7 @@ fn handle_paste_code(base_dir: &Path, account: AccountNum) -> Result<()> {
     // UX-R1-H3: same lock as handle_race for symmetry. The
     // daemon-delegated path also stomps credentials/N.json on the
     // last writer, so it benefits from the same serialisation.
-    let _lock = acquire_login_lock(base_dir, account)?;
+    let _lock = acquire_login_lock(base_dir, account, Some("--legacy-shell"))?;
 
     // Step 1: detect the daemon.
     let socket_path = match daemon::detect_daemon(base_dir) {
@@ -1164,9 +1536,15 @@ fn open_in_browser(url: &str) -> Result<()> {
 /// Spawns `claude auth login` with an isolated `CLAUDE_CONFIG_DIR`
 /// and captures credentials from the keychain or the
 /// `.credentials.json` file.
-fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
+fn handle_direct(base_dir: &Path, account: AccountNum, json: bool) -> Result<()> {
+    // an internal ticket drivability guard. Claude is the ONE provider with no
+    // `cli_deps_gate::enforce` of its own (it shells out to `claude auth
+    // login`, whose availability is not version-gated here), so there is no
+    // earlier gate to order behind — the guard runs first thing instead.
+    guard_login_drivability("claude", json)?;
+
     // UX-R1-H3 (lock symmetry): serialise concurrent invocations.
-    let _lock = acquire_login_lock(base_dir, account)?;
+    let _lock = acquire_login_lock(base_dir, account, Some("--legacy-shell"))?;
 
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)?;
@@ -1179,7 +1557,7 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
     // hitting $PATH alone. The latter fails on minimal shells (non-interactive
     // SSH, GUI Tauri spawn, cron jobs) where `~/.local/bin` is not in PATH
     // even though the binary is installed there. The Phase 1 Tauri subprocess
-    // command (#390) already follows this pattern.
+    // command (an internal ticket) already follows this pattern.
     let claude_bin = csq_core::accounts::login::find_claude_binary().ok_or_else(|| {
         anyhow!(
             "claude binary not found on PATH or well-known locations \
@@ -1189,15 +1567,75 @@ fn handle_direct(base_dir: &Path, account: AccountNum) -> Result<()> {
         )
     })?;
 
-    // Invoke `claude auth login` with isolated config dir
-    let status = Command::new(&claude_bin)
+    // Invoke `claude auth login` with isolated config dir.
+    //
+    // Spawn + poll-with-watchdog instead of a blocking `.status()`. `claude
+    // auth login` delegates to Claude Code's own OAuth loopback flow; when that
+    // flow's browser callback never completes (e.g. the redirect lands on a
+    // localhost URL Claude Code's server 404s), the child never exits and a
+    // plain `.status()` blocks this process — AND the login lock (`_lock`
+    // above) — forever. The watchdog converts that indefinite hang into an
+    // actionable error and terminates the stuck child so the lock releases on
+    // return. `spawn()` inherits stdio exactly like `.status()` did, so the
+    // interactive prompt/browser flow is unchanged.
+    let mut child = Command::new(&claude_bin)
         .args(["auth", "login"])
         .env("CLAUDE_CONFIG_DIR", &config_dir)
-        .status()
+        .spawn()
         .context("failed to spawn `claude auth login`")?;
+
+    let timeout = login_subprocess_timeout();
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child
+            .try_wait()
+            .context("failed to poll `claude auth login`")?
+        {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!(
+                        "`claude auth login` did not complete within {}s and was \
+                         terminated — the browser OAuth callback never returned \
+                         (this happens when the redirect lands on a page that 404s). \
+                         Re-run `csq login {account}`, or use the desktop app's \
+                         Add Account flow, which uses a different callback path. \
+                         Set CSQ_LOGIN_TIMEOUT_SECS to change the timeout.",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
 
     handle_direct_post_subprocess(base_dir, account, &config_dir, status.success())?;
     finalize(base_dir, account)
+}
+
+/// Watchdog timeout for the interactive `claude auth login` subprocess.
+///
+/// Default 300s (5 min) — comfortably longer than a normal human OAuth flow
+/// (open browser → authorize → redirect), but finite so a hung callback cannot
+/// block the login (and its lock) indefinitely. Overridable via
+/// `CSQ_LOGIN_TIMEOUT_SECS`; a non-numeric or zero value falls back to the
+/// default (zero would kill every login instantly).
+fn login_subprocess_timeout() -> Duration {
+    parse_login_timeout(std::env::var("CSQ_LOGIN_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Pure parse of the `CSQ_LOGIN_TIMEOUT_SECS` value (split out for hermetic
+/// testing — no env mutation). A non-numeric, empty, or zero value falls back
+/// to the 300s default (zero would kill every login instantly).
+fn parse_login_timeout(raw: Option<&str>) -> Duration {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 /// Post-subprocess work for [`handle_direct`]: capture credentials
@@ -1287,25 +1725,13 @@ fn finalize(base_dir: &Path, account: AccountNum) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+/// Best-effort cache invalidation: notify the daemon (Unix socket or
+/// Windows named pipe) that on-disk account state changed. Routes through
+/// the single cross-platform chokepoint — see `csq_core::daemon::notify`
+/// (an internal ticket), which already logs a `tracing::warn!` on a reachable-
+/// but-failing daemon.
 fn notify_daemon_cache_invalidation(base_dir: &Path) {
-    let sock = csq_core::daemon::socket_path(base_dir);
-    if !sock.exists() {
-        return;
-    }
-    if let Err(e) = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache") {
-        tracing::warn!(
-            error_kind = "daemon_cache_invalidate_failed",
-            error = %e,
-            "failed to notify daemon of cache invalidation; \
-             daemon will pick up changes at next periodic tick"
-        );
-    }
-}
-
-#[cfg(not(unix))]
-fn notify_daemon_cache_invalidation(_base_dir: &Path) {
-    // Windows named-pipe invalidation is not yet implemented (M8-03).
+    csq_core::daemon::notify::cache_invalidation(base_dir);
 }
 
 // `get_email_from_cc` and `update_profile` were extracted to
@@ -1359,6 +1785,28 @@ mod tests {
         assert!(err.to_string().contains("valid JSON"));
     }
 
+    // ── login subprocess watchdog timeout parsing (hermetic; no env) ──
+
+    #[test]
+    fn parse_login_timeout_defaults_to_300s() {
+        assert_eq!(parse_login_timeout(None), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_login_timeout_honors_valid_override() {
+        assert_eq!(parse_login_timeout(Some("600")), Duration::from_secs(600));
+        assert_eq!(parse_login_timeout(Some(" 120 ")), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn parse_login_timeout_rejects_zero_and_garbage_falling_back_to_default() {
+        // Zero would kill every login instantly; garbage/empty are user error.
+        assert_eq!(parse_login_timeout(Some("0")), Duration::from_secs(300));
+        assert_eq!(parse_login_timeout(Some("abc")), Duration::from_secs(300));
+        assert_eq!(parse_login_timeout(Some("")), Duration::from_secs(300));
+        assert_eq!(parse_login_timeout(Some("-5")), Duration::from_secs(300));
+    }
+
     // ── Race-flow regression tests ─────────────────────────────────
 
     #[test]
@@ -1378,6 +1826,138 @@ mod tests {
         // failure here, not in a downstream race test.
         let _r: oauth::PasteResolver = stdin_paste_resolver();
     }
+
+    // GH an internal ticket retired the dispatch-level reverse conflict guard that
+    // used to live here (`login_non_native_provider_refuses_native_bound_slot`
+    // — redteam R1 MED): `csq login N --provider codex` onto a native-bound
+    // slot no longer refuses in `handle()`'s dispatch; it now proceeds and
+    // `providers::codex::login::perform_with` detects the stale native
+    // marker pre-mint and clears it on the login's success path. That
+    // behavior is covered where it now lives:
+    // `perform_with_clears_stale_native_marker_after_login` (codex/login.rs)
+    // and `finalize_login_clears_stale_native_marker` (accounts/login.rs) for
+    // the Anthropic side, plus `detect_stale_marker_binding` /
+    // `clear_detected_marker_binding`'s own unit tests
+    // (accounts/binding_guard.rs) — including
+    // `finalize_login_failure_preserves_prior_gemini_binding`, the
+    // failed-login-must-not-destroy-the-prior-binding regression.
+
+    // ── Forward guard (redteam R3 H1/M2): handle_native onto a bound slot ──
+
+    #[test]
+    fn handle_native_refuses_and_labels_3p_bearer_slot() {
+        // redteam R3 H1/M2: `csq login N --provider kimi-cli` onto a slot bound
+        // to a 3P-bearer provider must refuse in `handle_native`'s forward guard
+        // (the R1 mislabel-fix site) and label it "a third-party provider" — NOT
+        // the pre-fix "Claude (Anthropic OAuth)" that the ThirdPartyBearer→
+        // ClaudeCode wire collapse would have produced.
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(9u16).unwrap();
+        csq_core::accounts::third_party::bind_provider_to_slot(
+            dir.path(),
+            "deepseek",
+            account,
+            Some("sk-deepseek-xxxxxxxx"),
+            None,
+        )
+        .unwrap();
+
+        let err = handle(
+            dir.path(),
+            account,
+            "kimi-cli",
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // json
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("a third-party provider"),
+            "3P slot must be labeled accurately, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Claude (Anthropic OAuth)"),
+            "must NOT mislabel a 3P slot as Anthropic, got: {msg}"
+        );
+    }
+
+    // ── an internal ticket: fail-fast login-drivability guard ────────────────────
+
+    /// `cargo test`'s harness stdin is never a TTY, so `handle(..., "codex",
+    /// ...)` on a clean slot (past the reverse-conflict guard, which these two
+    /// tests already prove fires independently) must refuse IMMEDIATELY at the
+    /// new guard — WITHOUT printing the device-auth banner, opening a browser,
+    /// or blocking on the `Enter` confirmation read `handle_codex` would
+    /// otherwise perform. A regression here would hang this very test.
+    #[test]
+    fn handle_codex_refuses_fast_without_a_tty() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(9u16).unwrap();
+
+        let err = handle(
+            dir.path(),
+            account,
+            "codex",
+            false, // legacy_shell
+            false, // reset_handle_dir
+            false, // non_interactive
+            false, // ignore_cli_version
+            false, // no_auto_update_cli
+            false, // track_latest
+            false, // json
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("attended session") || msg.contains("TTY"),
+            "expected an interaction-required refusal, got: {msg}"
+        );
+    }
+
+    /// Same property for the default (`claude`) provider — `handle_direct`
+    /// spawns `claude auth login`, which manages its own browser + loopback
+    /// callback; the guard must refuse before that spawn, not after a
+    /// `CSQ_LOGIN_TIMEOUT_SECS` wait.
+    #[test]
+    fn handle_claude_default_refuses_fast_without_a_tty() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(9u16).unwrap();
+
+        let err = handle(
+            dir.path(),
+            account,
+            "", // default provider, mirrors real CLI default_value = "claude"
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // json
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("attended session") || msg.contains("TTY"),
+            "expected an interaction-required refusal, got: {msg}"
+        );
+    }
+
+    // Non-headless-guard exemption for gemini (`ExternalPrerequisite`) and the
+    // native device-code providers is covered at the unit level in
+    // `csq_core::providers::login_capability::tests` (`guard_never_gates_
+    // device_code_or_external_prerequisite`) rather than here: `handle_gemini_
+    // oauth`/`handle_native` go on to read REAL `~/.gemini/oauth_creds.json` /
+    // spawn a real vendor binary once past the guard, which would make an
+    // end-to-end `handle()` test here environment-dependent.
 
     // ── REV-R1-02 / M8: marker-write ordering regression ───────────
 
@@ -1552,6 +2132,140 @@ mod tests {
         }
     }
 
+    // ── acquire_login_lock: real acquisition, bypass_hint wiring ──
+    //
+    // The tests above assert on hand-composed strings, never calling
+    // the real function. These call it, proving the bypass_hint
+    // parameter (added when the codex path was wired onto the same
+    // lock, and reused unchanged by gemini) actually changes the
+    // rendered message rather than being a dead parameter. The lock
+    // itself is per-account, not per-provider (see the docstring
+    // above), so these tests exercise `acquire_login_lock` directly
+    // rather than through any one provider's `handle_*` entry point.
+
+    #[test]
+    fn acquire_login_lock_with_bypass_hint_mentions_it_when_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(21u16).unwrap();
+
+        // Hold the lock ourselves first (same process, second `open()`
+        // — flock is scoped to the open file description, not the
+        // process, so this genuinely reproduces contention; see
+        // `login_lock.rs`'s own same-process tests for the same
+        // pattern).
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        let msg = match acquire_login_lock(dir.path(), account, Some("--legacy-shell")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("second acquire must fail while the first guard is alive"),
+        };
+        assert!(
+            msg.contains("--legacy-shell"),
+            "Some(bypass_hint) must be rendered into the held-lock message: {msg}"
+        );
+        assert!(msg.contains("in progress"), "message: {msg}");
+    }
+
+    #[test]
+    fn acquire_login_lock_without_bypass_hint_omits_it_when_held() {
+        // Both the codex and gemini call sites pass `None` — neither
+        // provider has a `--legacy-shell`-style escape hatch, so
+        // suggesting it would send the user down a dead end.
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(22u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        let msg = match acquire_login_lock(dir.path(), account, None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("second acquire must fail while the first guard is alive"),
+        };
+        assert!(
+            !msg.contains("--legacy-shell"),
+            "None bypass_hint must NOT mention --legacy-shell (neither codex nor \
+             gemini has such an escape hatch): {msg}"
+        );
+        assert!(msg.contains("in progress"), "message: {msg}");
+    }
+
+    #[test]
+    fn acquire_login_lock_succeeds_once_prior_guard_drops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(23u16).unwrap();
+
+        let held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+        drop(held);
+
+        acquire_login_lock(dir.path(), account, None)
+            .expect("acquire must succeed once the holder drops");
+    }
+
+    // ── handle_codex: cross-process lock is the FIRST thing it does ──
+    //
+    // `handle_codex` acquires the login lock before touching stdin,
+    // opening a browser, or spawning `codex login --device-auth` — so
+    // a held-lock test never reaches any of the interactive/subprocess
+    // parts and is safe (and fast) to run unattended.
+
+    #[test]
+    fn handle_codex_refuses_when_login_lock_held_by_another_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(24u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        // false x4 (ignore_cli_version, no_auto_update_cli, track_latest, json):
+        // no version-ignore or output-format flags are relevant here —
+        // the lock check runs before the cli_deps_gate probe too.
+        let result = handle_codex(dir.path(), account, false, false, false, false);
+        let err = result.expect_err(
+            "handle_codex must refuse when the account's login lock is held, \
+             not fall through to the interactive ToS prompt / stdin read",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("in progress"),
+            "handle_codex's Err must be the lock-contention message, not e.g. \
+             a stdin-EOF or cli_deps_gate error: {msg}"
+        );
+        assert!(
+            !msg.contains("--legacy-shell"),
+            "codex has no --legacy-shell escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn handle_codex_lock_is_per_account_not_global() {
+        // A held lock on account 25 must NOT block account 26 — the
+        // lock file is `.login-<N>.lock`, keyed by account number.
+        let dir = tempfile::TempDir::new().unwrap();
+        let held_account = AccountNum::try_from(25u16).unwrap();
+        let other_account = AccountNum::try_from(26u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), held_account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        // acquire_login_lock alone (not the full handle_codex, which
+        // would go on to prompt stdin / spawn codex-cli for the
+        // "free" case — out of scope for this lock-scoping check).
+        acquire_login_lock(dir.path(), other_account, None)
+            .expect("a different account's slot must not be blocked");
+    }
+
     #[test]
     fn handle_direct_does_not_write_marker_when_credentials_missing() {
         // Subprocess succeeded but no credentials were captured
@@ -1686,4 +2400,65 @@ mod tests {
     // Tests for `extract_device_auth_url` + `strip_ansi_escapes` live with
     // their canonical implementation in
     // `csq-core/src/providers/codex/desktop_login.rs`.
+
+    // ── handle_gemini_oauth: cross-process lock is the FIRST thing it does ──
+    //
+    // `handle_gemini_oauth` acquires the login lock before the
+    // pre-flight CLI-version probe (which spawns `gemini --version`)
+    // or `oauth_login::perform`'s browser-OAuth wait — so a held-lock
+    // test never reaches any subprocess or interactive part, and is
+    // safe (and fast) to run unattended, even without `gemini-cli`
+    // installed in the test environment.
+
+    #[test]
+    fn handle_gemini_oauth_refuses_when_login_lock_held_by_another_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(44u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        let result = handle_gemini_oauth(dir.path(), account, false, false, false, false);
+        let err = result.expect_err(
+            "handle_gemini_oauth must refuse when the account's login lock is \
+             held, not fall through to the CLI-version probe / OAuth flow",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("in progress"),
+            "handle_gemini_oauth's Err must be the lock-contention message, \
+             not e.g. a gemini-cli-not-installed error from the version probe: {msg}"
+        );
+        assert!(
+            !msg.contains("--legacy-shell"),
+            "gemini has no --legacy-shell escape hatch: {msg}"
+        );
+        assert!(
+            !msg.contains("not installed"),
+            "must not have fallen through to the cli_deps_gate probe, which \
+             would spawn `gemini --version`: {msg}"
+        );
+    }
+
+    #[test]
+    fn handle_gemini_oauth_lock_is_per_account_not_global() {
+        // A held lock on account 45 must NOT block account 46 — the
+        // lock file is `.login-<N>.lock`, keyed by account number.
+        let dir = tempfile::TempDir::new().unwrap();
+        let held_account = AccountNum::try_from(45u16).unwrap();
+        let other_account = AccountNum::try_from(46u16).unwrap();
+
+        let _held = match AccountLoginLock::acquire(dir.path(), held_account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
+        };
+
+        // acquire_login_lock alone (not the full handle_gemini_oauth,
+        // which would go on to the CLI-version probe / OAuth flow for
+        // the "free" case — out of scope for this lock-scoping check).
+        acquire_login_lock(dir.path(), other_account, None)
+            .expect("a different account's slot must not be blocked");
+    }
 }

@@ -252,6 +252,22 @@ where
         .map(|s| s.to_owned());
     let canonical = CredentialFile::Codex(codex_creds);
 
+    // GH an internal ticket: CAPTURE (do not act on) any stale ADDITIVE marker
+    // binding (Gemini / native Kimi-Grok) BEFORE the identity mint below.
+    // Symmetric with the CLI codex login path (`login::perform_with`) — see
+    // that call site's comment for why the ordering (before, not after, the
+    // mint) is load-bearing: `detect_bound_surface`'s fixed precedence would
+    // report the freshly-minted Codex identity ahead of a stale marker once
+    // `by_slot[account]` resolves to it.
+    //
+    // Security review (GH an internal ticket): the ACTION is deferred to just after
+    // `update_profile` succeeds below (symmetric with `login::perform_with`)
+    // so a login that fails partway through never destroys the prior
+    // binding it did not actually replace. `detect_stale_marker_binding` is
+    // pure — nothing is deleted by this call.
+    let stale_marker_binding =
+        crate::accounts::binding_guard::detect_stale_marker_binding(base_dir, account);
+
     // Mint a `by_slot` UUID for this slot BEFORE the fail-closed
     // `save_canonical_for`. Symmetric with the CLI codex login path
     // (`login::perform_with`): daemon Pass 0 only mints UUIDs for Anthropic
@@ -357,6 +373,15 @@ where
     let label = format_label(account, account_id_hint.as_deref());
     update_profile(base_dir, account, &label)
         .with_context(|| "update profiles.json with the new Codex account entry")?;
+
+    // GH an internal ticket (CLOSED, shipped): ACT on the marker binding captured
+    // earlier — left un-acted until this point — before the mint above.
+    // This is the point right after the LAST fallible
+    // step (`update_profile`'s `?`) in this function — everything remaining
+    // below is non-fatal. Symmetric with `login::perform_with`.
+    if let Some(surface) = stale_marker_binding {
+        crate::accounts::binding_guard::clear_detected_marker_binding(base_dir, account, surface);
+    }
 
     // M4-2: pair `identities/<UUID>/settings.json` when a UUID mapping exists
     // for this slot. Symmetric to the CLI codex login path in
@@ -670,7 +695,7 @@ fn strip_ansi_escapes(s: &str) -> String {
 /// (e.g. `Visit https://evil.example.com/codex/device and enter ABCD-EFGH`)
 /// would be returned through this shortcut while
 /// [`DeviceCodeAccumulator`]'s cross-line path correctly rejected it.
-/// Origin: redteam round-N follow-up to PRs #335-#337 (LOW finding —
+/// Origin: redteam round-N follow-up to PRs an internal ticket-an internal ticket (LOW finding —
 /// same-line allowlist gap).
 pub fn parse_device_code_line(line: &str) -> Option<DeviceCodeInfo> {
     let url = extract_codex_url(line, /* require_device_path = */ false)?;
@@ -829,6 +854,7 @@ fn update_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_env::with_in_memory_secret_backend;
     use std::cell::RefCell;
     use tempfile::TempDir;
 
@@ -1015,6 +1041,153 @@ mod tests {
         );
         assert!(dir.path().join("config-3/.csq-account").exists());
         assert!(dir.path().join("config-3/codex-sessions").is_dir());
+    }
+
+    #[test]
+    fn complete_login_clears_stale_gemini_marker_after_login() {
+        // GH an internal ticket: desktop twin of
+        // `codex::login::perform_with_clears_stale_gemini_marker_after_login`.
+        use crate::providers::gemini::provisioning::{
+            write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        tos::acknowledge(base).unwrap();
+        let account = acc(30);
+        provision_uuid_for_account(base, 30);
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(crate::providers::gemini::provisioning::is_gemini_bound_slot(base, account));
+
+        // Pin the vault backend: `clear_detected_marker_binding` deletes the
+        // Gemini vault entry BEFORE the marker and is fail-closed on any
+        // vault-step failure, so an ambient-resolved vault makes this test
+        // platform-dependent — GREEN on macOS/Windows (their vaults always
+        // open) and RED on a bus-less Linux CI runner, where the marker is
+        // deliberately left in place. See
+        // `platform::test_env::with_in_memory_secret_backend`.
+        with_in_memory_secret_backend(|| {
+            complete_login(
+                base,
+                account,
+                false,
+                || Ok(false),
+                |config_dir, _| {
+                    stub_codex_auth_json(config_dir, "acct-uuid-gemini-desktop");
+                    Ok(fake_success())
+                },
+                |_| {},
+            )
+        })
+        .expect("codex desktop login should succeed");
+
+        assert!(
+            !crate::providers::gemini::provisioning::is_gemini_bound_slot(base, account),
+            "the stale Gemini marker must be removed after the desktop Codex login"
+        );
+    }
+
+    /// Security review regression (GH an internal ticket): desktop twin of
+    /// `codex::login::tests::perform_with_failure_preserves_prior_gemini_binding`.
+    // UNIX-ONLY FIXTURE, not a unix-only property. The failure this test needs
+    // is injected by creating `.profiles.lock` as a DIRECTORY, so that
+    // `ProfilesFileLock::acquire`'s `OpenOptions::write(true).open(path)` fails
+    // EISDIR. Windows does not share those semantics — the open does not fail
+    // the same way, so `finalize_login` SUCCEEDS and the fixture never creates
+    // the condition under test (CI: `Rust tests (windows-latest)`, 4 tests, all
+    // on the `result.is_err()` assertion).
+    //
+    // The behaviour being pinned — a login that fails must not destroy a
+    // binding it never replaced — is platform-independent and lives in
+    // ordinary control flow. Only the failure INJECTION is Unix-specific, so
+    // the test is gated rather than weakened into something that passes
+    // everywhere by asserting less.
+    #[cfg(unix)]
+    #[test]
+    fn complete_login_failure_preserves_prior_gemini_binding() {
+        use crate::providers::gemini::provisioning::{
+            is_gemini_bound_slot, write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        tos::acknowledge(base).unwrap();
+        let account = acc(32);
+        provision_uuid_for_account(base, 32);
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "pre: slot must be Gemini-bound before the desktop Codex login attempt"
+        );
+
+        // Force the mint's ProfilesFileLock::acquire to fail (EISDIR).
+        std::fs::create_dir_all(base.join(".profiles.lock")).unwrap();
+
+        // Pinned for the same reason as the sibling cleanup test, and for one
+        // more: with an ambient vault that cannot open, the cleanup is blocked
+        // by the environment rather than by the capture/act split, so the
+        // survival assertion would hold even if that split regressed.
+        let result = with_in_memory_secret_backend(|| {
+            complete_login(
+                base,
+                account,
+                false,
+                || Ok(false),
+                |config_dir, _| {
+                    stub_codex_auth_json(config_dir, "acct-uuid-gemini-desktop-failure");
+                    Ok(fake_success())
+                },
+                |_| {},
+            )
+        });
+
+        assert!(
+            result.is_err(),
+            "complete_login must fail when the profiles lock cannot be acquired: {result:?}"
+        );
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "the Gemini marker must SURVIVE a complete_login that fails after the \
+             detect point — a failed login must not destroy a binding it never \
+             actually replaced"
+        );
+    }
+
+    #[test]
+    fn complete_login_clears_stale_native_marker_after_login() {
+        // GH an internal ticket: desktop twin of
+        // `codex::login::perform_with_clears_stale_native_marker_after_login`.
+        use crate::providers::catalog::Surface;
+        use crate::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        tos::acknowledge(base).unwrap();
+        let account = acc(31);
+        provision_uuid_for_account(base, 31);
+
+        native::write_binding(base, account, Surface::Grok).unwrap();
+        assert!(native::marker_exists(base, account, Surface::Grok));
+
+        complete_login(
+            base,
+            account,
+            false,
+            || Ok(false),
+            |config_dir, _| {
+                stub_codex_auth_json(config_dir, "acct-uuid-native-desktop");
+                Ok(fake_success())
+            },
+            |_| {},
+        )
+        .expect("codex desktop login should succeed");
+
+        assert!(
+            !native::marker_exists(base, account, Surface::Grok),
+            "the stale native marker must be removed after the desktop Codex login"
+        );
     }
 
     /// Regression for the desktop codex re-auth write failure (slot 12):
@@ -1511,7 +1684,7 @@ mod tests {
     /// token would otherwise be returned via the shortcut while
     /// `DeviceCodeAccumulator`'s cross-line path (which routes
     /// through `extract_device_auth_url`) correctly rejected it.
-    /// Origin: redteam follow-up to PRs #335-#337.
+    /// Origin: redteam follow-up to PRs an internal ticket-an internal ticket.
     #[test]
     fn parse_device_code_line_rejects_off_allowlist_url() {
         let line = "Visit https://evil.example.com/codex/device and enter ABCD-EFGH";

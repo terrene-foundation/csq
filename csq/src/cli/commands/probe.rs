@@ -36,7 +36,7 @@ pub fn handle(base_dir: &Path, slot: Option<u16>, json: bool) -> Result<()> {
     // footgun if the operator runs probe from inside a directory that
     // happens to contain `.gemini/`. Fail loud instead.
     //
-    // Post-#534: Codex no longer requires HOME — the codex probe now
+    // Post-an internal ticket: Codex no longer requires HOME — the codex probe now
     // reads per-identity creds at `identities/<UUID>/credentials-codex.json`
     // (or legacy `credentials/codex-<N>.json` fallback), via the SAME
     // channel the daemon's production paths use
@@ -79,24 +79,24 @@ pub fn handle(base_dir: &Path, slot: Option<u16>, json: bool) -> Result<()> {
 
 /// Discover every provisioned slot and return one [`ProbeRecord`] per slot.
 ///
-/// The returned set is the union of three sources (issues #514, #515, #520):
+/// The returned set is the union of three sources (issues an internal ticket, an internal ticket, an internal ticket):
 ///
 /// 1. **`discover_all`** — Anthropic OAuth slots + healthy Codex/Gemini/3P
 ///    slots whose credential files parse correctly.
-/// 2. **`is_gemini_corrupt_bound` scan** (issues #514) — corrupt Gemini
+/// 2. **`is_gemini_corrupt_bound` scan** (issues an internal ticket) — corrupt Gemini
 ///    credential files whose parse fails; `discover_gemini` drops them, so
 ///    this scan is their only channel into `probe --all` output. LOAD-BEARING.
-/// 3. **`is_codex_corrupt_bound` scan** (#515) — corrupt Codex credential
+/// 3. **`is_codex_corrupt_bound` scan** (an internal ticket) — corrupt Codex credential
 ///    files. `discover_codex` emits these via its `Err` branch
 ///    (`has_credentials=false`), so this scan is idempotent with
 ///    `discover_all`; it is belt-and-braces.
-/// 4. **`is_codex_wrong_variant_bound` scan** (#520) — Codex credential
+/// 4. **`is_codex_wrong_variant_bound` scan** (an internal ticket) — Codex credential
 ///    files that parse successfully but carry the Anthropic variant instead
 ///    of the Codex variant (operator pasted `claudeAiOauth` payload at a
 ///    `codex-<N>.json` path). `discover_codex` **`continue`s** wrong-variant
 ///    slots (`discovery.rs:539`), so this scan is the **ONLY channel** by
 ///    which wrong-variant slots appear in `probe --all` output. LOAD-BEARING.
-///    Removing this scan silently un-fixes #520; pinned by AC-6.
+///    Removing this scan silently un-fixes an internal ticket; pinned by AC-6.
 ///
 /// The `BTreeSet<u16>` union deduplicates slot ids from all sources, so each
 /// slot is probed exactly once regardless of how many scans match it.
@@ -105,7 +105,7 @@ fn probe_all_slots(base_dir: &Path, home: &Path) -> Result<Vec<ProbeRecord>> {
 
     // Collect corrupt-Gemini slot ids to merge into the main id set.
     // `discover_gemini` drops corrupt markers (valid-entries-only contract);
-    // this scan recovers them so they appear in the probe report (FM-2, #514).
+    // this scan recovers them so they appear in the probe report (FM-2, an internal ticket).
     // Mutual exclusivity of Ok/Err is proven — a slot is in `discover_all`
     // only if `read_binding == Ok`; in the corrupt scan only if `Err`.
     // The merged `all_ids` BTreeSet dedups any Anthropic-shadows-corrupt-
@@ -120,7 +120,7 @@ fn probe_all_slots(base_dir: &Path, home: &Path) -> Result<Vec<ProbeRecord>> {
         .map(|s| s.get())
         .collect();
 
-    // #515: same defensive shape as the Gemini corrupt scan above. Today
+    // an internal ticket: same defensive shape as the Gemini corrupt scan above. Today
     // `discover_codex` already emits corrupt slots with `has_credentials=false`,
     // so this scan is structurally idempotent with discover_all; it is
     // load-bearing only if `discover_codex`'s emission contract ever
@@ -132,10 +132,10 @@ fn probe_all_slots(base_dir: &Path, home: &Path) -> Result<Vec<ProbeRecord>> {
         .map(|s| s.get())
         .collect();
 
-    // #520 LOAD-BEARING: `discover_codex` `continue`s wrong-variant slots
+    // an internal ticket LOAD-BEARING: `discover_codex` `continue`s wrong-variant slots
     // (`discovery.rs:539`), so this scan is the ONLY channel by which they
     // appear in `probe --all` output. Removing this scan silently un-fixes
-    // #520. Pinned by AC-6 (`probe_all_includes_wrong_variant_codex_slot_via_scan_only`).
+    // an internal ticket. Pinned by AC-6 (`probe_all_includes_wrong_variant_codex_slot_via_scan_only`).
     let wrong_variant_codex_slot_ids: std::collections::BTreeSet<u16> = (1
         ..=csq_core::types::MAX_ACCOUNTS)
         .filter_map(|n| AccountNum::try_from(n).ok())
@@ -150,8 +150,8 @@ fn probe_all_slots(base_dir: &Path, home: &Path) -> Result<Vec<ProbeRecord>> {
     // Sorted ascending per spec 11 §11.3 default-output ordering.
     let mut all_ids: std::collections::BTreeSet<u16> = entries.iter().map(|e| e.id).collect();
     all_ids.extend(corrupt_gemini_slot_ids);
-    all_ids.extend(corrupt_codex_slot_ids); // #515
-    all_ids.extend(wrong_variant_codex_slot_ids); // #520 — load-bearing (only channel)
+    all_ids.extend(corrupt_codex_slot_ids); // an internal ticket
+    all_ids.extend(wrong_variant_codex_slot_ids); // an internal ticket — load-bearing (only channel)
 
     if all_ids.is_empty() {
         return Err(anyhow!(
@@ -284,7 +284,7 @@ mod tests {
     ///
     /// A base dir with 1 healthy Anthropic slot plus 1 corrupt Codex marker
     /// must produce a record set where the corrupt slot appears exactly once
-    /// classified as `codex-corrupt-binding` (no double-listing). (#515 M4)
+    /// classified as `codex-corrupt-binding` (no double-listing). (an internal ticket M4)
     #[test]
     fn probe_all_includes_corrupt_codex_slot() {
         let base = tempfile::tempdir().unwrap();
@@ -332,18 +332,18 @@ mod tests {
         );
     }
 
-    /// AC-6 (#520): `probe_all_slots` includes wrong-variant Codex slots via
+    /// AC-6 (an internal ticket): `probe_all_slots` includes wrong-variant Codex slots via
     /// the load-bearing `is_codex_wrong_variant_bound` scan.
     ///
     /// **Why this test is the structural regression pin:**
     /// `discover_codex` `continue`s wrong-variant slots (`discovery.rs:539`),
     /// so the `is_codex_wrong_variant_bound` scan added to `probe_all_slots`
     /// in M4 is the **ONLY channel** by which these slots appear in
-    /// `probe --all` output. Unlike #515's `is_codex_corrupt_bound` scan
+    /// `probe --all` output. Unlike an internal ticket's `is_codex_corrupt_bound` scan
     /// (idempotent with `discover_all`, which already emits corrupt slots via
     /// its `Err` branch), this scan is truly load-bearing: remove it and
     /// wrong-variant slots silently disappear from probe output, un-fixing
-    /// #520. This test pins that claim by asserting BOTH:
+    /// an internal ticket. This test pins that claim by asserting BOTH:
     ///   1. `discover_all` does NOT contain slot 7 (the wrong-variant slot),
     ///   2. `probe_all_slots` DOES contain exactly one record for slot 7
     ///      classified as `codex-wrong-variant-binding`.
@@ -353,7 +353,7 @@ mod tests {
     fn probe_all_includes_wrong_variant_codex_slot_via_scan_only() {
         // Per AC-6 (post-R1-deep-3): pins that the
         // is_codex_wrong_variant_bound scan is the LOAD-BEARING channel
-        // (unlike #515 where the scan was idempotent). A base-dir
+        // (unlike an internal ticket where the scan was idempotent). A base-dir
         // containing ONLY a wrong-variant codex-7.json — no profiles.json
         // entry, no Gemini binding, no 3P settings — produces:
         //   - discover_all(): does NOT contain slot 7 (continue at
@@ -378,7 +378,7 @@ mod tests {
         .unwrap();
 
         // ── Assertion 1: discover_all OMITS the wrong-variant slot ──────────
-        // This is the silent-omission failure mode that #520 closes. The slot
+        // This is the silent-omission failure mode that an internal ticket closes. The slot
         // is absent from discover_all because discover_codex `continue`s it.
         let discovered = csq_core::accounts::discovery::discover_all(base.path());
         let slot_7_discovered: Vec<_> = discovered.iter().filter(|a| a.id == 7).collect();

@@ -140,7 +140,11 @@
   }
 
   .edition.enterprise {
-    color: #fff;
+    /* F3 (i-audit/i-harden) — white-on-accent measured 2.21:1 in the
+       default dark theme (AA needs 4.5:1). var(--bg-primary) flips per
+       theme (#1A1918 dark / #FFFFFF light) and clears AA on both:
+       dark 7.93:1, light 6.20:1. See app.css for the full rationale. */
+    color: var(--bg-primary, #1a1918);
     background: var(--accent, #6366f1);
     border-color: var(--accent, #6366f1);
   }

@@ -34,6 +34,7 @@ use tempfile::TempDir;
 // Probe has a 2s timeout per spec/13 §8. Under heavy test parallelism, CPU
 // saturation can delay the stub spawn past the deadline (an internal journal entry RISK).
 // Tests that touch PATH / probe must serialize.
+#[cfg(unix)]
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Binary helpers ─────────────────────────────────────────────────────────────
@@ -51,6 +52,7 @@ fn csq_bin() -> PathBuf {
         .join("csq")
 }
 
+#[cfg(unix)]
 fn stub_cli_bin() -> PathBuf {
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_stub-cli") {
         return PathBuf::from(p);
@@ -173,6 +175,7 @@ fn make_stub_npm_dir(
 /// This function strips: argv[0] (stub binary path), plus any known stub-cli
 /// flags and their values (`--capture-argv`, `--exit-code`, `--stderr`,
 /// `--hang-ms`, `--emit-bytes`), leaving only the passthrough args.
+#[cfg(unix)]
 fn read_captured_argv(capture_file: &std::path::Path) -> Vec<String> {
     let raw = std::fs::read_to_string(capture_file).unwrap_or_default();
     // Parse a minimal JSON array by hand (stdlib-only per independence.md Rule 3).

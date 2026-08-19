@@ -26,7 +26,7 @@ pub fn is_codex_bound_slot(base_dir: &Path, slot: AccountNum) -> bool {
 /// (`is_codex_bound_slot`) whose payload does NOT parse via
 /// `credentials::file::load` (corrupt JSON, IO error, or other
 /// `CredentialError` variant). Single definition shared by
-/// `csq probe --all` (#515 / mirror #514). NOT called from
+/// `csq probe --all` (an internal ticket / mirror an internal ticket). NOT called from
 /// `probe_slot` — that path reads the credential once and matches the
 /// Result directly (read-once invariant; see synthesis §"Note on
 /// read-once invariant").
@@ -43,7 +43,7 @@ pub fn is_codex_corrupt_bound(base_dir: &Path, slot: AccountNum) -> bool {
 /// Distinguishes the **wrong-variant** case (operator wrote an
 /// Anthropic-shape `claudeAiOauth` payload to a Codex-prefixed
 /// path; an internal ticket) from the **corrupt** case (`is_codex_corrupt_bound`;
-/// #515). Today's `CredentialFile` parser is 2-variant untagged
+/// an internal ticket). Today's `CredentialFile` parser is 2-variant untagged
 /// (Anthropic + Codex) at `csq-core/src/credentials/mod.rs:38-48`;
 /// a wrong-variant `Ok(cf)` therefore always means `cf` is the
 /// Anthropic variant. The two predicates are mutually exclusive

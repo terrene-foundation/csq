@@ -28,6 +28,7 @@ pub fn probe(base_dir: &Path, slot: AccountNum, provider_id: &str) -> Option<Pro
         "mm" | "minimax" => Cell::Minimax,
         "zai" => Cell::Zai,
         "deepseek" => Cell::Deepseek,
+        "kimi" => Cell::Kimi,
         _ => return None,
     };
     let started = Instant::now();
@@ -51,6 +52,7 @@ pub fn probe(base_dir: &Path, slot: AccountNum, provider_id: &str) -> Option<Pro
         Cell::Minimax => minimax::probe(slot, &bearer, started, elapsed_setup),
         Cell::Zai => zai::probe(slot, &bearer, started, elapsed_setup),
         Cell::Deepseek => deepseek::probe(slot, &bearer, started),
+        Cell::Kimi => kimi::probe(slot, &bearer, started),
     })
 }
 
@@ -59,6 +61,7 @@ enum Cell {
     Minimax,
     Zai,
     Deepseek,
+    Kimi,
 }
 
 fn prereq_skip(
@@ -95,6 +98,7 @@ impl Cell {
             Cell::Minimax => ("minimax-bearer", "05§5.3", 5),
             Cell::Zai => ("zai-bearer", "05§5.4", 6),
             Cell::Deepseek => ("deepseek-bearer", "05§5.4a", 3),
+            Cell::Kimi => ("kimi-bearer", "05§5.4b", 2),
         }
     }
 }
@@ -659,6 +663,125 @@ mod deepseek {
     }
 }
 
+/// Cell — Kimi coding subscription (`https://api.kimi.com/coding`). Kimi's catalog
+/// entry is `QuotaKind::Unknown` (the coding endpoint exposes no quota / balance /
+/// rate-limit endpoint), so — unlike the MiniMax/Z.AI cells — there is no quota
+/// shape to assert. This cell is a **reachability + auth** probe: it confirms the
+/// endpoint is up AND the per-slot bearer (the `sk-kimi-` subscription key)
+/// authenticates, which is the actionable operator signal for a keyed 3P slot with
+/// no quota API. It makes NO claim about response headers (the coding endpoint's
+/// success-case header set is unverified — the negative header assertion the
+/// DeepSeek cell makes was grounded in a live probe; Kimi's was not).
+mod kimi {
+    use super::*;
+
+    const URL: &str = "https://api.kimi.com/coding/v1/messages";
+    const CELL_NAME: &str = "kimi-bearer";
+    const SPEC_ANCHOR: &str = "05§5.4b";
+
+    pub fn probe(slot: AccountNum, bearer: &str, started: Instant) -> ProbeRecord {
+        // Minimal Anthropic-shaped request — max_tokens=1 + a one-char message.
+        // We only inspect the HTTP status; the body is never surfaced.
+        let body = serde_json::json!({
+            "model": "kimi-k3[1m]",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "."}],
+        })
+        .to_string();
+        let headers = vec![
+            ("Authorization".to_string(), format!("Bearer {bearer}")),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ];
+        let elapsed_ms = || started.elapsed().as_millis() as u64;
+
+        // A1: transport reached the endpoint.
+        let (status, _headers, _body) = match http::post_json_with_headers(URL, &headers, &body) {
+            Ok(triple) => triple,
+            Err(e) => {
+                return fail(
+                    slot,
+                    elapsed_ms(),
+                    0,
+                    "A1: request reached the Kimi coding endpoint",
+                    "transport failure",
+                    &e,
+                );
+            }
+        };
+
+        // A2: the per-slot bearer authenticated. 200/400 prove the endpoint is up
+        // AND the key is accepted (400 = malformed minimal request, still auth-OK).
+        // 401/403 is the actionable failure — the key is invalid/expired, or it is a
+        // pay-per-token Moonshot key (which 401s the coding-subscription endpoint).
+        if status == 401 || status == 403 {
+            return fail(
+                slot,
+                elapsed_ms(),
+                1,
+                "A2: per-slot bearer authenticates against api.kimi.com/coding",
+                &format!("HTTP {status} (invalid authentication)"),
+                "re-key the slot: `csq setkey kimi --slot <N>` with a valid Kimi coding-subscription key (`sk-kimi-…`). A pay-per-token Moonshot (`api.moonshot.ai`) key will 401 against the coding endpoint.",
+            );
+        }
+        if status != 200 && status != 400 {
+            return fail(
+                slot,
+                elapsed_ms(),
+                1,
+                "A2: Kimi coding endpoint reachable (HTTP 200/400)",
+                &format!("HTTP {status}"),
+                "non-2xx/4xx status means the Kimi coding endpoint is unreachable or erroring.",
+            );
+        }
+        ok(slot, elapsed_ms())
+    }
+
+    fn ok(slot: AccountNum, elapsed_ms: u64) -> ProbeRecord {
+        ProbeRecord {
+            schema_version: SCHEMA_VERSION,
+            slot: slot.get(),
+            cell: CELL_NAME,
+            spec_anchor: SPEC_ANCHOR,
+            status: ProbeStatus::Ok,
+            endpoint: URL.to_string(),
+            elapsed_ms,
+            assertions_passed: 2,
+            assertions_total: 2,
+            diagnostic: None,
+            redacted_response_excerpt: None,
+        }
+    }
+
+    // Asserts on HTTP status only — never surfaces a response body (no leak).
+    fn fail(
+        slot: AccountNum,
+        elapsed_ms: u64,
+        passed: u32,
+        failed: &str,
+        observed: &str,
+        hint: &str,
+    ) -> ProbeRecord {
+        ProbeRecord {
+            schema_version: SCHEMA_VERSION,
+            slot: slot.get(),
+            cell: CELL_NAME,
+            spec_anchor: SPEC_ANCHOR,
+            status: ProbeStatus::Fail,
+            endpoint: URL.to_string(),
+            elapsed_ms,
+            assertions_passed: passed,
+            assertions_total: 2,
+            diagnostic: Some(ProbeDiagnostic {
+                failed_assertion: failed.to_string(),
+                observed_shape: observed.to_string(),
+                hint: hint.to_string(),
+            }),
+            redacted_response_excerpt: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,10 +793,23 @@ mod tests {
         names.insert(Cell::Minimax.metadata().0);
         names.insert(Cell::Zai.metadata().0);
         names.insert(Cell::Deepseek.metadata().0);
-        assert_eq!(names.len(), 3);
+        names.insert(Cell::Kimi.metadata().0);
+        assert_eq!(names.len(), 4);
         assert!(names.contains("minimax-bearer"));
         assert!(names.contains("zai-bearer"));
         assert!(names.contains("deepseek-bearer"));
+        assert!(names.contains("kimi-bearer"));
+    }
+
+    #[test]
+    fn probe_dispatch_recognizes_kimi() {
+        // A kimi slot with no key present routes to Cell::Kimi and returns a
+        // prereq-skip (NOT None, which would mean "unknown provider" → the
+        // misleading "not yet implemented" fallback the redteam flagged).
+        let dir = tempfile::tempdir().unwrap();
+        let rec = probe(dir.path(), AccountNum::try_from(1).unwrap(), "kimi");
+        let rec = rec.expect("kimi must be a recognized bearer cell");
+        assert_eq!(rec.cell, "kimi-bearer");
     }
 
     #[test]

@@ -35,12 +35,16 @@
 //! the exit cause.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
 use tempfile::TempDir;
 
 // Workspace-local serial mutex (an internal journal entry): cli_deps probe has a 2s
 // timeout that races under cargo's parallel test load. All tests serialize
 // on this mutex to prevent CPU-saturation flakes.
+#[cfg(unix)]
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Binary path ──────────────────────────────────────────────────────────────
@@ -64,6 +68,7 @@ fn csq_bin() -> PathBuf {
 /// process, so production paths that read `HOME` directly (`~/.codex`,
 /// `~/.gemini`, redaction helper, keychain prefix) resolve inside the sandbox
 /// instead of the operator's real home. See `rules/test-hermeticity.md` MUST 2.
+#[cfg(unix)]
 fn sandbox_home() -> std::path::PathBuf {
     static H: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
     H.get_or_init(|| TempDir::new().expect("sandbox home"))
@@ -74,12 +79,28 @@ fn sandbox_home() -> std::path::PathBuf {
 /// Env-cleared command builder per `rules/testing.md` Rule 4a +
 /// `rules/test-hermeticity.md` MUST 2 (sandbox HOME + CLAUDE_HOME, never parent).
 /// Mirrors the pattern in `cli_deps_doctor_integration.rs`.
+#[cfg(unix)]
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
     // Hermetic: the spawned `csq` binary must NOT shell `security` against the
     // operator's real login keychain (rules/test-hermeticity.md).
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
+    // These tests drive `csq login` as a subprocess with piped stdin against
+    // MOCKED vendor binaries — there is no real TTY and none is needed, because
+    // the mock completes immediately rather than opening a browser or blocking
+    // on a confirmation read.
+    //
+    // `csq login` gained a an internal ticket drivability guard that refuses an attended-only
+    // flow (claude = browser_subprocess, codex = tty_required) when stdin is not
+    // a terminal. Correct in production; here it would refuse before the
+    // cli-deps gating these tests exist to pin. `CSQ_TEST_BYPASS_TTY` is the
+    // repo's existing mechanism for exactly this
+    // (`cli.rs::check_test_bypass`) and is compiled OUT of production builds
+    // (`--no-default-features --features cli`), so it cannot weaken the guard
+    // for a real user. The guard's own behaviour is covered by unit tests in
+    // `csq_core::providers::login_capability`, not here.
+    cmd.env("CSQ_TEST_BYPASS_TTY", "1");
     // Sandbox HOME and CLAUDE_HOME — never re-inject the parent's live values.
     // Callers may still override CLAUDE_HOME per-test via `.env("CLAUDE_HOME", ...)`.
     cmd.env("HOME", sandbox_home());
@@ -134,6 +155,7 @@ fn write_hang_stub(stub_dir: &std::path::Path, name: &str, hang_secs: u64) -> Pa
 }
 
 /// Write a minimal Codex credential file (authenticated slot).
+#[cfg(unix)]
 fn write_codex_cred(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -142,6 +164,7 @@ fn write_codex_cred(base: &std::path::Path, n: u16) {
 }
 
 /// Write a minimal Gemini credential file (authenticated slot).
+#[cfg(unix)]
 fn write_gemini_cred(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -159,6 +182,7 @@ fn write_gemini_cred(base: &std::path::Path, n: u16) {
 /// prose-regex semantic check — `expected_fragment` MUST be a literal
 /// fragment of the error message produced by `pre_flight_check`, not a
 /// vague keyword.
+#[cfg(unix)]
 fn assert_probe_bail(output: &std::process::Output, expected_fragment: &str, test_name: &str) {
     assert_ne!(
         output.status.code(),
@@ -184,6 +208,7 @@ fn assert_probe_bail(output: &std::process::Output, expected_fragment: &str, tes
 /// We cannot assert "exit 0" because downstream (OAuth, gemini credentials)
 /// will also fail in our isolated tempdir. We instead assert that the
 /// probe-bail fragment is ABSENT, confirming the probe gate was passed.
+#[cfg(unix)]
 fn assert_no_probe_bail(output: &std::process::Output, absence_fragment: &str, test_name: &str) {
     let combined = format!(
         "{}{}",
@@ -1124,7 +1149,7 @@ fn test_gemini_22_ok_with_ignore_no_warn() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// handle_direct (Anthropic) end-to-end fresh-install test (#633)
+// handle_direct (Anthropic) end-to-end fresh-install test (an internal ticket)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Write a stub `claude` binary that simulates `claude auth login`: on
@@ -1162,7 +1187,7 @@ fn write_claude_auth_stub(stub_dir: &std::path::Path, creds_json: &str, email: &
     path
 }
 
-/// (25) #633 regression — the originating bug: on a FRESH install (empty
+/// (25) an internal ticket regression — the originating bug: on a FRESH install (empty
 /// profiles.json, no `by_slot` mapping), the first `csq login N` (Anthropic)
 /// must complete and persist credentials. Before the fix, `save_canonical_for`
 /// fail-closed on the absent UUID (M4-12) because the mint ran only in
@@ -1221,20 +1246,20 @@ fn test_anthropic_25_fresh_install_login_mints_uuid_and_persists_creds() {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "#633: fresh-install `csq login 1` must exit 0; got {:?}\noutput:\n{combined}",
+        "an internal ticket: fresh-install `csq login 1` must exit 0; got {:?}\noutput:\n{combined}",
         output.status.code()
     );
 
     // 2. The slot's UUID must be minted into profiles.json::by_slot.
     let profiles_path = base.path().join("profiles.json");
     let profiles_raw = std::fs::read_to_string(&profiles_path)
-        .expect("#633: profiles.json must exist after login");
+        .expect("an internal ticket: profiles.json must exist after login");
     let profiles: serde_json::Value = serde_json::from_str(&profiles_raw).unwrap();
     let uuid = profiles
         .get("by_slot")
         .and_then(|m| m.get("1"))
         .and_then(|v| v.as_str())
-        .expect("#633: by_slot[\"1\"] must hold a minted UUID after fresh login");
+        .expect("an internal ticket: by_slot[\"1\"] must hold a minted UUID after fresh login");
 
     // 3. The canonical credential file must exist at the UUID-keyed path —
     //    proving save_canonical_for ran (it would have fail-closed pre-fix).
@@ -1245,7 +1270,7 @@ fn test_anthropic_25_fresh_install_login_mints_uuid_and_persists_creds() {
         .join("credentials.json");
     assert!(
         uuid_creds.exists(),
-        "#633: identities/{uuid}/credentials.json must exist after login;\noutput:\n{combined}"
+        "an internal ticket: identities/{uuid}/credentials.json must exist after login;\noutput:\n{combined}"
     );
 }
 

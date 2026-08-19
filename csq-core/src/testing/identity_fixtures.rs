@@ -108,6 +108,49 @@ pub fn fixture_uuid_for_slot(slot: u16) -> IdentityId {
     IdentityId::from(Uuid::from_bytes(bytes))
 }
 
+/// Provisions `profiles.json::by_slot[slot] = uuid` (merging with any
+/// existing profiles.json — additive, never destructive) and writes
+/// `config_dir/.csq-account` as the UUID content, i.e. the M4-7 writer
+/// shape (`markers::write_csq_account`) rather than the legacy decimal
+/// shape (`markers::write_csq_account_legacy`).
+///
+/// Every fixture in the swap / auto-rotate / backsync test suites wrote the
+/// decimal marker exclusively before this helper existed — which is why the
+/// narrow-marker-reader defect (`guard-reader-writer-parity.md`,
+/// `account-terminal-separation.md` MUST NOT Rule 3) went undetected across
+/// multiple `/redteam` rounds: the fixtures matched a marker shape
+/// production had already stopped writing after M4-7. New tests exercising
+/// the UUID-marker-reader path (`markers::resolve_marker_to_slot`) MUST use
+/// this helper instead of `write_csq_account_legacy`, so the fixture matches
+/// what `csq run` / `accounts::login::finalize_login` actually produce on a
+/// modern install.
+///
+/// Returns the deterministic UUID (`fixture_uuid_for_slot(slot)`) so callers
+/// can assert against it directly.
+///
+/// # Panics
+///
+/// Panics on filesystem or profiles-file failure — fixture helper; test
+/// setup fails loudly rather than silently producing an inconsistent fixture.
+pub fn write_uuid_account_marker(base: &Path, config_dir: &Path, slot: u16) -> IdentityId {
+    let uuid = fixture_uuid_for_slot(slot);
+
+    let profiles_path = profiles::profiles_path(base);
+    let mut pf = if profiles_path.exists() {
+        profiles::load(&profiles_path).unwrap_or_else(|_| ProfilesFile::empty())
+    } else {
+        ProfilesFile::empty()
+    };
+    pf.by_slot.insert(slot.to_string(), uuid);
+    profiles::save(&profiles_path, &pf)
+        .unwrap_or_else(|e| panic!("fixture: profiles::save: {e:?}"));
+
+    crate::accounts::markers::write_csq_account(config_dir, uuid)
+        .unwrap_or_else(|e| panic!("fixture: write_csq_account: {e:?}"));
+
+    uuid
+}
+
 // ─── M12: NonOauthKind ───────────────────────────────────────────────────────
 
 /// Classification of non-OAuth slot kind for the daemon-refreshed-only fixture.

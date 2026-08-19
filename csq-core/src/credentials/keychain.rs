@@ -65,6 +65,34 @@ pub(crate) fn keychain_mirror_disabled() -> bool {
         || std::env::var_os("CSQ_DISABLE_KEYCHAIN_MIRROR").is_some()
 }
 
+/// Resolves `handle_dir` for a keychain-sync call site (`csq run` / `csq
+/// exec` / the Phase-2b headless-turn builder). Returns `(handle_dir_abs,
+/// keychain_write_allowed)`: `handle_dir_abs` falls back to the raw,
+/// non-canonical path when canonicalize fails — still the right
+/// `CLAUDE_CONFIG_DIR` to launch/spawn against, since CC authenticates via
+/// that dir's symlinked `.credentials.json` when its own keychain lookup
+/// misses. `keychain_write_allowed` is `false` in exactly that failure case;
+/// callers MUST skip the keychain write when it is `false`.
+///
+/// Security review 1386 M4: a canonicalize failure MUST NOT feed the
+/// non-canonical path into a keychain WRITE. [`service_name`] hashes
+/// whatever path string it is given, with no internal canonicalization of
+/// its own — so a mirror written under the non-canonical key hashes to a
+/// DIFFERENT service name than the one CC (which hashes its own
+/// canonicalized `CLAUDE_CONFIG_DIR`) will ever look up.
+/// `logout::clear_bound_keychain_items` and the handle-dir reaper
+/// (`session::handle_dir`) both already refuse that identical fallback on
+/// the CLEARING side (security review 1386 M1); a writer that used it
+/// created a keychain item neither clearer could ever locate — a permanent
+/// orphan holding a real OAuth token (`guard-reader-writer-parity.md`
+/// MUST-1: the clearer recognises fewer forms than the writer produces).
+pub fn canonicalize_for_keychain_sync(handle_dir: &Path) -> (PathBuf, bool) {
+    let canonicalized = std::fs::canonicalize(handle_dir);
+    let keychain_write_allowed = canonicalized.is_ok();
+    let handle_dir_abs = canonicalized.unwrap_or_else(|_| handle_dir.to_path_buf());
+    (handle_dir_abs, keychain_write_allowed)
+}
+
 /// Derives the keychain service name CC uses for a given config
 /// directory.
 ///
@@ -530,7 +558,7 @@ pub struct HarvestCandidate {
 /// THIS is the lock that provides the A4a exclusion — NOT the `.swap.lock` (dot)
 /// rename lock inside `repoint_handle_dir`, which is a separate defense-in-depth
 /// serializer held UNDER this guard (they must stay distinct files or a same-fd
-/// re-`flock` self-deadlocks — see `handle_dir::repoint_handle_dir` and #928).
+/// re-`flock` self-deadlocks — see `handle_dir::repoint_handle_dir` and an internal ticket).
 ///
 /// Callers MUST pass a canonicalized `config_dir` (all three sites — swap,
 /// auto_rotate, harvest — do), so this lock and the inner `.swap.lock` rename
@@ -572,6 +600,983 @@ pub fn clear_handle_dir(config_dir: &Path) {
 /// Non-macOS: CC reads the file directly; nothing to clear.
 #[cfg(not(target_os = "macos"))]
 pub fn clear_handle_dir(_config_dir: &Path) {}
+
+/// Marker error for [`clear_handle_dir_reporting`]: the `security`
+/// subprocess could not be confirmed to run (timed out against a locked /
+/// unreachable keychain, or failed to spawn). Carries no data — callers
+/// only need to know the clear could not be confirmed, never the item's
+/// fate, which is genuinely unknown in this case; see the function's doc
+/// for the required caller behavior (surface it, never treat as success).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeychainClearUnconfirmed;
+
+/// Clear the keychain item for `config_dir` and report whether the attempt
+/// could be CONFIRMED to run — distinct from [`clear_handle_dir`], whose
+/// existing callers (`csq swap`, `auto_rotate`) are mid-TRANSITION steps
+/// that write a fresh token into the same item moments later regardless of
+/// whether this clear itself succeeded, so fire-and-forget is correct
+/// there. `csq logout` is a TERMINAL step — nothing downstream retries this
+/// clear — so its caller needs a real signal (`zero-tolerance.md` Rule 3:
+/// no silent fallback on a credential path).
+///
+/// `Ok(true)`: [`drain_service`] confirmed no item survives for this
+/// service — see its doc for exactly what that requires (reaching
+/// [`SECURITY_ITEM_NOT_FOUND`], not merely "a delete call completed").
+/// `Ok(false)`:
+/// the call was a structural no-op — non-macOS, or the keychain mirror is
+/// disabled (`cfg(test)` / `test-utils` feature / `CSQ_DISABLE_KEYCHAIN_MIRROR`)
+/// — never touches the real keychain in test builds, same guard as every
+/// other writer in this module. `Err(KeychainClearUnconfirmed)`: EITHER the
+/// `security` subprocess itself could not be confirmed to run (timed out
+/// against a locked / unreachable keychain, or failed to spawn), OR it ran
+/// and exited with a code that does NOT confirm the item is gone (permission
+/// denied, auth failed, or any other refusal) — in both cases the item's
+/// fate is UNKNOWN, so the caller MUST treat this as a possible failure to
+/// clear, not as success.
+///
+/// **This predicate answers "does this ONE `security` call need a retry?",
+/// NOT "does no item survive for this service?" (security review 1386,
+/// N1 naming correction — sec-1386/team-lead).** Exit `0` means "one item
+/// was deleted"; it says NOTHING about whether a duplicate sibling remains
+/// (`security` removes exactly one matching item per call — confirmed live
+/// by team-lead's probe: two items under one service, one delete call
+/// reports success while a sibling survives). The property callers actually
+/// need — "no item with this service name survives" — is established ONLY
+/// by [`drain_service`] reaching [`SECURITY_ITEM_NOT_FOUND`], which is why
+/// `drain_service` does NOT call this function for its own confirmation
+/// decision; it matches the raw exit code directly. This function's sole
+/// remaining use is inside [`delete_service_retrying`]: deciding whether an
+/// individual attempt is "settled enough to stop retrying it" (true for
+/// BOTH exit `0` and `SECURITY_ITEM_NOT_FOUND` — both are terminal outcomes
+/// for THAT call), which is a narrower question than service-wide absence.
+///
+/// Security review 1386 F1 (history — the property this predicate protects
+/// against misreading): the pre-F1 version of the CALLER treated ANY
+/// completed subprocess as confirmation, regardless of exit status. That
+/// silently scored a keychain REFUSING the delete (a prompt non-zero exit —
+/// e.g. `errSecInteractionNotAllowed` / `errSecAuthFailed`) as a successful
+/// clear, which both skipped queuing it for retry AND reported
+/// `keychain_cleared = true` while the item survived as the sole remaining
+/// copy of the credential — H1's exact failure, reached by a different
+/// door. It also defeated the queue at the OTHER end: an entry correctly
+/// queued while the keychain was HANGING would be dropped by
+/// `sweep_pending_clears` the moment the same locked keychain started
+/// REFUSING instead — same operator condition, opposite `Ok`/`Err` verdict,
+/// because only a hang produced `None`.
+///
+/// **Measured on an isolated, throwaway probe keychain** (never the
+/// operator's real login keychain — verified unaffected afterward):
+///
+/// | case                        | exit | note                              |
+/// |------------------------------|------|-----------------------------------|
+/// | unlocked, item EXISTS         | `0`  | deleted                          |
+/// | unlocked, item ABSENT         | `44` | not found                        |
+/// | **LOCKED**, item EXISTS       | `0`  | deleted anyway, ~0.27s — did NOT refuse or hang |
+/// | LOCKED, item ABSENT           | `44` | not found                        |
+///
+/// The locked+existing row is why `44` is safe to treat as CONFIRMED: the
+/// worry was that a locked keychain might report `44` for an item that
+/// actually still exists, which would mask a live credential behind
+/// "nothing to clear." It does not — a locked-but-present item was
+/// genuinely deleted, never reported not-found.
+///
+/// **The genuine REFUSAL case — `securityd` denying under a Background /
+/// headless session with no Aqua session, csq's documented condition for
+/// this class — was NOT reproduced.** A file-backed probe keychain does not
+/// behave that way, so that exit code is unknown. This does not block the
+/// fix: whatever it is, it is not `0` or `44` (the only two rows this
+/// predicate accepts), so it falls into `Err(KeychainClearUnconfirmed)` by
+/// construction and is queued/retried like any other unconfirmed result.
+///
+/// **Rejected alternative: confirm only on `success()`, queue every
+/// non-zero exit.** Safer-looking (never under-queues), but wrong in
+/// practice — a not-found item exits `44` on EVERY attempt forever; treated
+/// as unconfirmed it would never drain, and combined with the deliberate
+/// no-give-up backoff (`PENDING_CLEARS_BACKOFF_MAX_SECS`) it would
+/// accumulate toward `PENDING_CLEARS_MAX`, at which point FIFO eviction
+/// starts discarding REAL entries — queue poisoning, the round-2 HIGH by a
+/// different route. The measured table is the reason `44` is trusted
+/// instead of falling back to this alternative.
+///
+/// `pub(crate)` (fix/sweep-dead-handles-clears-keychain): `session::handle_dir`'s
+/// dead-handle reaper drives this SAME classification directly in its own
+/// tests (constructed exit statuses, no subprocess) rather than re-deriving
+/// which codes confirm — so a future change to this set is caught on both
+/// call sites, not just this module's. Kept in sync with this module's own
+/// rename (`security_delete_confirmed` -> `security_delete_call_resolved`).
+#[cfg(target_os = "macos")]
+pub(crate) fn security_delete_call_resolved(output: &std::process::Output) -> bool {
+    matches!(
+        output.status.code(),
+        Some(0) | Some(SECURITY_ITEM_NOT_FOUND)
+    )
+}
+
+/// `security`'s exit code for "no matching keychain item" (`errSecItemNotFound`).
+/// Measured, not recalled from memory — see the probe table on
+/// [`security_delete_call_resolved`]. It is the only exit code besides `0` that
+/// function treats as "no item survives".
+///
+/// `pub(crate)`: shared with `session::handle_dir`'s reaper-side exit-code
+/// test so neither module hardcodes `44` independently.
+#[cfg(target_os = "macos")]
+pub(crate) const SECURITY_ITEM_NOT_FOUND: i32 = 44;
+
+/// One retry on an unconfirmed `security` call, for the pending-clear queue
+/// and for [`clear_handle_dir_reporting`]'s first attempt — but ONLY when
+/// the first attempt failed FAST (a transient spawn hiccup or a momentary
+/// refusal that might not repeat). Security review 1386 F5(a): retrying a
+/// GENUINE TIMEOUT (the keychain hung for the full `KEYCHAIN_OP_TIMEOUT`) is
+/// unlikely to help — a keychain that did not answer in 5s rarely answers in
+/// the next 5s — and doubles the worst-case latency for no real gain. The
+/// elapsed-time check distinguishes the two without needing
+/// `run_security_bounded` to report WHY it returned `None`/an unconfirmed
+/// status: a spawn failure or a fast refusal completes in milliseconds, a
+/// timeout takes ~`KEYCHAIN_OP_TIMEOUT`, and the `/ 2` threshold sits with
+/// ample margin on both sides of that gap.
+#[cfg(target_os = "macos")]
+fn delete_service_retrying(svc: &str) -> Option<std::process::Output> {
+    let start = std::time::Instant::now();
+    let first = run_security_bounded(&["delete-generic-password", "-s", svc]);
+    if let Some(out) = &first {
+        if security_delete_call_resolved(out) {
+            return first;
+        }
+    }
+    if start.elapsed() < KEYCHAIN_OP_TIMEOUT / 2 {
+        run_security_bounded(&["delete-generic-password", "-s", svc])
+    } else {
+        first // a genuine timeout — do not retry, return the (unconfirmed) result as-is
+    }
+}
+
+/// Bound on repeated single-item deletes when draining possible DUPLICATE
+/// items under one service name (security review 1386 N1 — confirmed live
+/// by team-lead's probe: two items added under the same service, one
+/// `delete-generic-password` call exits 0 while a sibling survives; a
+/// second call then drains it). `security delete-generic-password` removes
+/// exactly ONE matching item per call — this module's own [`write_raw`]
+/// already loops for exactly this reason ("a SHADOWING sibling with the
+/// old token... observed in testing: a stale sibling re-introduced the
+/// 401"), and [`delete_keychain_item`]'s single-shot delete is explicitly
+/// justified there by "the next account-changed write's delete-loop clears
+/// the rest" — a premise that holds for `csq swap`/`auto_rotate` (which
+/// write again moments later) and does NOT hold for logout, which is
+/// terminal. [`drain_service`] closes that gap for the pending-clear path.
+///
+/// `write_raw`'s own loop is unbounded because it always terminates in a
+/// CREATE regardless of how many iterations the delete loop takes; this
+/// loop's callers are logout-adjacent and terminal, so an unbounded loop
+/// against a pathological keychain state could spin forever. `write_raw`'s
+/// own delete loop is now bounded to the SAME value for consistency
+/// (security review 1386, sec-1386's request).
+///
+/// **Why duplicates arise at all (team-lead): `write_raw` is
+/// delete-all-then-create-one, so N CONCURRENT `write_raw` calls
+/// interleaving can leave up to N items** — the delete-all half of each
+/// call can race another call's create. This module names three writers
+/// (`csq run`, `csq keychain-sync`, the daemon sweep) plus CC itself writes
+/// on login and auto-refresh, so a plausible max is ~4 concurrent writers;
+/// 5 is a 2x margin above that, not an arbitrary round number — and above
+/// the observed case of 2 (team-lead's probe).
+///
+/// **The bound on WORST-CASE TIME is the enforced limit on
+/// [`delete_service_retrying`] (the function each iteration actually
+/// calls) — `KEYCHAIN_OP_TIMEOUT/2 + KEYCHAIN_OP_TIMEOUT` ≈ 7.5s — NOT
+/// `KEYCHAIN_OP_TIMEOUT` alone, and NOT a measured typical
+/// (doc-property-claims.md MUST-2, corrected TWICE in this doc: first from
+/// "~0.2-0.3s measured" to "`KEYCHAIN_OP_TIMEOUT` per iteration", which was
+/// STILL a wrong unit — `drain_service_inner` calls `delete_service_retrying`,
+/// not `run_security_bounded` directly, so its own internal fast-retry can
+/// make one iteration cost up to 7.5s, not 5s, and STILL return `Some(0)`
+/// — "continue" — rather than stopping).** So the true worst case for THIS
+/// loop alone is `5 (this constant) * 7.5s` ≈ **37.5s**, not the near-instant
+/// figure the "fast confirmed delete" framing originally implied and not
+/// the 25s the first correction understated. The latency consequence is
+/// handled at the CALLER level — see [`sweep_pending_clears`] (daemon/periodic — tolerates a slow tick) vs the
+/// opportunistic budget used by `csq run`/`csq exec` (bounded far tighter,
+/// since that path is synchronous and interactive).
+///
+/// `pub(crate)` (fix/sweep-dead-handles-clears-keychain): `session::handle_dir`'s
+/// dead-handle reaper scripts a cap-exhaustion case against this exact
+/// constant rather than a bare literal, so the two stay in sync across any
+/// future re-derivation of the value.
+#[cfg(target_os = "macos")]
+pub(crate) const MAX_DUPLICATE_DELETE_ITERATIONS: u32 = 5;
+
+/// Repeatedly delete the service until [`SECURITY_ITEM_NOT_FOUND`] confirms
+/// nothing remains, up to [`MAX_DUPLICATE_DELETE_ITERATIONS`]. `Ok(true)`
+/// iff a confirmed not-found was reached (every duplicate drained, or none
+/// ever existed). `Err(KeychainClearUnconfirmed)` on any unconfirmed
+/// attempt (stops immediately — does NOT keep looping into a possibly
+/// worse state) OR on exhausting the iteration budget without reaching
+/// not-found (fails toward "might still have an item", never toward
+/// success).
+#[cfg(target_os = "macos")]
+fn drain_service(svc: &str) -> Result<bool, KeychainClearUnconfirmed> {
+    drain_service_inner(svc, &mut |s| {
+        delete_service_retrying(s).and_then(|o| o.status.code())
+    })
+}
+
+/// Test seam for [`drain_service`]: `delete_fn` is injectable so a test can
+/// script a SEQUENCE of exit codes across iterations (e.g. "0, 0, 44" for
+/// two duplicates then confirmed-empty) without any real `security`
+/// subprocess or keychain. Production's only caller passes a closure over
+/// [`delete_service_retrying`].
+///
+/// `pub(crate)` (fix/sweep-dead-handles-clears-keychain): the dead-handle
+/// reaper's test drives this SAME loop with a scripted `delete_fn` to
+/// compute the correct end-to-end verdict for each exit-code sequence,
+/// rather than re-deriving the loop's decision logic (continue on `0`,
+/// confirm on `SECURITY_ITEM_NOT_FOUND`, stop-unconfirmed on anything else
+/// or cap exhaustion) independently — the two would otherwise drift the
+/// moment this loop's shape changes.
+#[cfg(target_os = "macos")]
+pub(crate) fn drain_service_inner(
+    svc: &str,
+    delete_fn: &mut impl FnMut(&str) -> Option<i32>,
+) -> Result<bool, KeychainClearUnconfirmed> {
+    for _ in 0..MAX_DUPLICATE_DELETE_ITERATIONS {
+        match delete_fn(svc) {
+            Some(0) => continue, // one item deleted — a sibling may remain
+            Some(SECURITY_ITEM_NOT_FOUND) => return Ok(true), // confirmed: nothing left
+            _ => return Err(KeychainClearUnconfirmed), // unconfirmed — stop, do not guess
+        }
+    }
+    // Iteration budget exhausted without a confirmed not-found. Not
+    // expected to trigger against the duplicate counts this module's
+    // writers produce (observed: 2), but "not expected" is not "cannot
+    // happen" — fail toward unconfirmed rather than assuming success.
+    Err(KeychainClearUnconfirmed)
+}
+
+/// `Ok(true)`/`Ok(false)`/`Err` per [`clear_handle_dir_reporting`]'s doc.
+/// Distinct from `clear_handle_dir_reporting` itself so the pending-clear
+/// queue ([`sweep_pending_clears`]) can retry a bare service-name string
+/// (recovered from disk after the handle dir that produced it is long
+/// gone) without re-deriving a `config_dir` path that no longer exists.
+#[cfg(target_os = "macos")]
+fn clear_service_reporting(svc: &str) -> Result<bool, KeychainClearUnconfirmed> {
+    if keychain_mirror_disabled() {
+        return Ok(false);
+    }
+    drain_service(svc)
+}
+
+#[cfg(target_os = "macos")]
+pub fn clear_handle_dir_reporting(config_dir: &Path) -> Result<bool, KeychainClearUnconfirmed> {
+    if keychain_mirror_disabled() {
+        return Ok(false);
+    }
+    clear_service_reporting(&service_name(config_dir))
+}
+
+/// Non-macOS: CC reads `.credentials.json` directly there, so there is no
+/// keychain item to clear — structural no-op, always `Ok(false)` (never a
+/// failure) so callers don't spuriously warn on Linux/Windows.
+#[cfg(not(target_os = "macos"))]
+pub fn clear_handle_dir_reporting(_config_dir: &Path) -> Result<bool, KeychainClearUnconfirmed> {
+    Ok(false)
+}
+
+// ── Pending-clear queue (security review 1386 H1) ──────────────────────
+//
+// `clear_handle_dir_reporting`'s `Err` case means the item's fate is
+// UNKNOWN — on a locked/unreachable keychain, that item can end up as the
+// ONLY surviving copy of a credential for an account `csq logout` just
+// removed every other trace of (the file copies this mirrors are deleted
+// by the SAME `logout_account` call, moments later). A durable, retried
+// queue is the compensating mechanism: the service name (a
+// `Claude Code-credentials-{8 hex}` string — NOT a secret, derived from a
+// path hash, already logged unredacted elsewhere in this module) is
+// recorded to disk, and retried opportunistically by the daemon's periodic
+// handle-dir sweep AND by `csq run` (so a headless install with no daemon
+// running still converges eventually).
+
+/// Filename for the pending-clear queue, directly under `base_dir`. Not a
+/// credential file — contains only keychain SERVICE NAME strings, never
+/// token bytes — so it does not need `security.md` credential-file
+/// permissions, but is still written atomically to avoid a torn read
+/// racing a concurrent recorder/sweeper.
+///
+/// The pending-clear queue machinery below (this const through
+/// [`save_pending_clears`]) is `#[cfg(target_os = "macos")]` — every
+/// caller reaching it is already macOS-gated ([`record_pending_clear`],
+/// [`sweep_pending_clears`], [`sweep_pending_clears_opportunistic`] all
+/// have no-op non-macOS twins), so on Linux/Windows none of it is
+/// reachable and leaving it ungated is dead code under `-D warnings`.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_FILENAME: &str = "keychain-pending-clears.json";
+
+/// Sibling lock file serializing every read-modify-write cycle on the queue
+/// (`record_pending_clear`'s insert, and the removal half of
+/// `sweep_pending_clears`). Security review 1386 (round 2): without this,
+/// `sweep_pending_clears` holding an in-memory snapshot across up to
+/// `PENDING_CLEARS_SWEEP_BUDGET * 2 * KEYCHAIN_OP_TIMEOUT` (~50s) of
+/// subprocess calls raced a concurrent `record_pending_clear`, and the
+/// sweep's blind overwrite on completion silently dropped the concurrently-
+/// recorded entry — a lost update on the exact durability mechanism H1
+/// exists to provide, in precisely the persistently-locked-keychain
+/// environment where the queue is non-empty (and therefore the sweep is in
+/// its long path) on almost every tick. Mirrors `remove_quota_entry`'s
+/// `lock_file` pattern in `accounts/logout.rs`.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_LOCK_FILENAME: &str = "keychain-pending-clears.lock";
+
+/// Hard cap on the queue length. `record_pending_clear` evicts the OLDEST
+/// entry when full (FIFO) rather than growing unbounded.
+///
+/// **The FIFO rationale is corrected here (security review 1386 F3 —
+/// pendq-analysis): an entry leaves the queue ONLY on a confirmed clear, so
+/// a SURVIVING old entry is the LONGEST-UNRESOLVED one, not a stale or
+/// irrelevant one** — the opposite of what an earlier version of this
+/// comment claimed. Eviction genuinely discards a possibly-live credential's
+/// only remaining retry path, which is exactly why it is logged (not
+/// silent) — the WARN is the mitigation, not the FIFO ordering.
+///
+/// **200 is a pragmatic cap, not a derived bound (F6 — the derivation this
+/// admits is stated, not invented).** The queue is expected to hold 0-1
+/// entries in real operation (one per logout that hit an unconfirmed
+/// keychain clear); 200 is a generous multiple of that — enough to absorb a
+/// burst of logouts during an extended keychain-unreachable window (e.g. a
+/// headless install accumulating failures across days) without unbounded
+/// growth, while the file itself stays small (a `PendingClearEntry` is
+/// under 100 bytes serialized, so 200 of them is a few KB). There is no
+/// hard ceiling this number is verified against on the other side (a
+/// smaller cap would evict sooner; this file does not claim 200 is
+/// optimal) — but the eviction WARN means reaching it is now visible to an
+/// operator well before it silently degrades further.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_MAX: usize = 200;
+
+/// How many DUE entries the DAEMON's periodic sweep
+/// ([`sweep_pending_clears`]) attempts per tick. This budget is for the
+/// BACKGROUND path only — see [`PENDING_CLEARS_OPPORTUNISTIC_BUDGET`] for
+/// the separate, much tighter budget used by synchronous/interactive
+/// callers (`csq run`, `csq exec`), which MUST NOT inherit this number.
+///
+/// **The worst-case bound, derived from ENFORCED limits, not a measurement
+/// (doc-property-claims.md MUST-2 — this figure has been corrected TWICE:
+/// first from "does not multiply" reasoning off a MEASURED typical
+/// (~0.2-0.3s per successful delete), to "~125s" using `KEYCHAIN_OP_TIMEOUT`
+/// as the per-iteration unit — which was STILL wrong, because each drain
+/// iteration calls [`delete_service_retrying`], not `run_security_bounded`
+/// directly, and that function's OWN internal fast-retry makes its worst
+/// case `KEYCHAIN_OP_TIMEOUT/2 + KEYCHAIN_OP_TIMEOUT` ≈ 7.5s, not 5s, while
+/// STILL returning `Some(0)` — "continue" — rather than stopping):**
+///
+/// `worst case = PENDING_CLEARS_SWEEP_BUDGET * MAX_DUPLICATE_DELETE_ITERATIONS
+///   * (KEYCHAIN_OP_TIMEOUT/2 + KEYCHAIN_OP_TIMEOUT) = 5 * 5 * 7.5s = 187.5s`.
+///
+/// That is the number this constant is actually sized against — a slow
+/// daemon TICK (delaying the next `sweep_dead_handles` pass and this
+/// queue's own next retry by up to ~187.5s in the pathological case), not a
+/// number an interactive command can tolerate. It is acceptable HERE
+/// specifically because this path is the daemon's own background loop,
+/// never awaited by a user.
+///
+/// **Backoff decay (not "near zero after one failure" — stated precisely):**
+/// after N consecutive failures an entry's `next_attempt_unix_secs` sits
+/// `N * PENDING_CLEARS_BACKOFF_STEP_SECS` (capped) in the future, so it is
+/// SKIPPED (no `security` call, doesn't count against this budget) on ticks
+/// before that. The skip window grows roughly linearly with N until it
+/// reaches `PENDING_CLEARS_BACKOFF_MAX_SECS` (3600s) after ~60 consecutive
+/// failures (~an hour of a hanging/locked keychain) — from there sustained
+/// cost is at most one `security` call per entry per hour, not per tick.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_SWEEP_BUDGET: usize = 5;
+
+/// Budget for the OPPORTUNISTIC sweep called synchronously and inline from
+/// `csq run`/`csq exec`/the phase2b subscription client, BEFORE they spawn
+/// the CLI or exec-replace the process. Deliberately `1`, NOT
+/// `PENDING_CLEARS_SWEEP_BUDGET` — this path is interactive: its caller is
+/// a user waiting on a terminal, not a background loop nobody watches.
+///
+/// Worst case here (security review 1386 C3 — the unit corrected: each
+/// drain iteration calls [`delete_service_retrying`], whose own worst case
+/// is `KEYCHAIN_OP_TIMEOUT/2 + KEYCHAIN_OP_TIMEOUT` ≈ 7.5s, not
+/// `KEYCHAIN_OP_TIMEOUT` alone):
+/// `1 * MAX_DUPLICATE_DELETE_ITERATIONS * 7.5s` = `1 * 5 * 7.5s` = **37.5s**
+/// added to an interactive launch, in the pathological case (queue
+/// non-empty AND the one due entry hits every iteration's worst case).
+/// That is still not free, but it is bounded and
+/// it only fires when the queue is non-empty — the common case (queue
+/// empty) costs one file read. A background thread was considered and
+/// REJECTED: `csq run`'s Unix path calls `exec()` moments later, which
+/// terminates every OTHER thread in the process — a sweep still mid-flight
+/// (potentially holding [`pending_clears_lock_path`]'s `flock`) would be
+/// silently abandoned by the exec, and depending on `CLOEXEC` on the lock
+/// fd, could leak the lock into the exec'd `claude` process indefinitely.
+/// A small synchronous budget is the correct trade, not a background
+/// dispatch that trades a bounded latency cost for an unbounded lock-leak
+/// risk.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_OPPORTUNISTIC_BUDGET: usize = 1;
+
+/// Backoff step (security review 1386 MEDIUM): a permanently-unreachable
+/// keychain (headless install, no Aqua session — ever) means every entry
+/// fails every sweep, forever, at full `security`-subprocess cost. Each
+/// failure pushes `next_attempt_unix_secs` out by
+/// `attempts * PENDING_CLEARS_BACKOFF_STEP_SECS`, capped at
+/// `PENDING_CLEARS_BACKOFF_MAX_SECS` — the entry is NEVER dropped for
+/// giving up (that would silently reintroduce H1's permanent-orphan risk
+/// one layer up), only retried less often once it has failed repeatedly.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_BACKOFF_STEP_SECS: u64 = 60;
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_BACKOFF_MAX_SECS: u64 = 3600;
+
+#[cfg(target_os = "macos")]
+fn pending_clears_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PendingClearEntry {
+    service: String,
+    /// Failed-attempt count, driving the backoff below. `0` on first insert.
+    #[serde(default)]
+    attempts: u32,
+    /// Unix seconds before which [`sweep_pending_clears`] MUST NOT retry
+    /// this entry. `0` (the serde default for an old/hand-written file) is
+    /// always due — never a reason to skip.
+    #[serde(default)]
+    next_attempt_unix_secs: u64,
+    /// Monotonic counter bumped every time `record_pending_clear` resets an
+    /// EXISTING entry (security review 1386, sec-1386's retracted-then-
+    /// reinstated finding). Exists so a sweep's removal/backoff-bump step
+    /// can tell "the entry I attempted" apart from "a DIFFERENT clear
+    /// request that happens to share the same service name, recorded after
+    /// my snapshot but before my locked write" — resetting `attempts`/
+    /// `next_attempt_unix_secs` to `(0, 0)` alone is NOT enough, because a
+    /// never-yet-attempted entry already has exactly `(0, 0)`, making a
+    /// reset indistinguishable from "was never touched". Without this,
+    /// a concurrent re-record for the same service between a sweep's read
+    /// and its locked removal is silently discarded by the removal's
+    /// service-name-only match — a second lost-update route to the same
+    /// H1 failure the round-2 lock closed for the non-racing case.
+    #[serde(default)]
+    generation: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PendingClears {
+    #[serde(default)]
+    services: Vec<PendingClearEntry>,
+}
+
+/// Identity comparison for [`PendingClearEntry`] — `(service, generation)`
+/// ONLY, deliberately NOT full-struct `PartialEq` (security review 1386
+/// C1(c)). `attempts`/`next_attempt_unix_secs` are mutated by
+/// [`load_pending_clears`]'s N5 backward-clock-jump clamp on EVERY load,
+/// including the two loads one sweep performs (the pre-attempt snapshot and
+/// the post-attempt locked reload) — so those two fields can legitimately
+/// differ between them even for what is conceptually "the same" queue
+/// entry. A full-struct comparison would then find a confirmed-cleared
+/// entry unequal to its own later reload and silently fail to remove it —
+/// the item deleted from the keychain, but its queue entry retried forever.
+/// `generation` is the only field this module treats as an IDENTITY
+/// discriminator (bumped exclusively by `record_pending_clear`'s re-record
+/// path); everything else is mutable STATE on that identity.
+#[cfg(target_os = "macos")]
+fn identity_matches(a: &PendingClearEntry, b: &PendingClearEntry) -> bool {
+    a.service == b.service && a.generation == b.generation
+}
+
+#[cfg(target_os = "macos")]
+fn pending_clears_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(PENDING_CLEARS_FILENAME)
+}
+
+#[cfg(target_os = "macos")]
+fn pending_clears_lock_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(PENDING_CLEARS_LOCK_FILENAME)
+}
+
+/// Security review 1386 LOW: a corrupt/unparseable queue file previously
+/// degraded to an empty queue with no signal — every entry silently
+/// discarded, on the one file whose job is to not forget. `Err` from
+/// `read_to_string` (the normal absent-file case) stays silent; only a
+/// parse failure on an EXISTING file warns.
+///
+/// Security review 1386 F8 (pendq-analysis, LOW/hardening): every entry's
+/// `service` is validated against [`is_well_formed_service_name`] before it
+/// is trusted — a value passed to `security`'s argv is not a shell-injection
+/// risk (no shell is invoked, `security.md` clean), but a string beginning
+/// with `-` would be parsed as an OPTION rather than the service argument.
+/// Malformed entries are dropped (never passed to `security`, never
+/// silently kept) with a WARN naming the count — never the content, which
+/// could be attacker-influenced by construction. This also gives F7's
+/// corrupt-file case partial recovery: a file with some malformed JSON
+/// VALUES (not malformed JSON SYNTAX) keeps its well-formed entries instead
+/// of the whole file being discarded.
+#[cfg(target_os = "macos")]
+fn load_pending_clears(base_dir: &Path) -> PendingClears {
+    let mut clears = match std::fs::read_to_string(pending_clears_path(base_dir)) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| {
+            warn!(
+                error_kind = "keychain_pending_clears_corrupt",
+                "the keychain pending-clear queue file could not be parsed — \
+                 treating as empty (its prior contents, if any, are lost; this \
+                 is a bug if it recurs, not an expected condition)"
+            );
+            PendingClears::default()
+        }),
+        Err(_) => PendingClears::default(), // absent / unreadable — empty queue, no signal needed
+    };
+    let before = clears.services.len();
+    clears
+        .services
+        .retain(|e| is_well_formed_service_name(&e.service));
+    let dropped = before - clears.services.len();
+    if dropped > 0 {
+        warn!(
+            error_kind = "keychain_pending_clears_malformed_entry",
+            dropped,
+            "dropped malformed keychain pending-clear queue entries (not the \
+             expected `Claude Code-credentials-<8 hex>` shape) — never passed \
+             to a `security` subprocess"
+        );
+    }
+    // Security review 1386 N5: clamp against a BACKWARD clock jump (NTP
+    // correction, VM resume/suspend). Without this, an entry's
+    // `next_attempt_unix_secs` — computed as `now + backoff` before the
+    // jump — could sit arbitrarily far into a "future" that no longer
+    // matches wall-clock time, stalling it far beyond
+    // `PENDING_CLEARS_BACKOFF_MAX_SECS` with no other bound. Clamping on
+    // every load re-derives the bound from CURRENT time each time, so the
+    // entry is never stalled longer than the backoff cap from whenever it
+    // is next observed, regardless of how far the clock jumped.
+    let ceiling = pending_clears_now_secs().saturating_add(PENDING_CLEARS_BACKOFF_MAX_SECS);
+    for e in &mut clears.services {
+        if e.next_attempt_unix_secs > ceiling {
+            e.next_attempt_unix_secs = ceiling;
+        }
+    }
+    clears
+}
+
+/// `true` iff `s` is `"Claude Code-credentials-"` followed by exactly 8 hex
+/// characters. Anything else — including, load-bearing, anything starting
+/// with `-` that `security`'s argv parser would treat as an option — is
+/// rejected.
+///
+/// Deliberately WIDER than [`service_name`]'s actual output (security
+/// review 1386, sec-1386): `hex::encode` always produces LOWERCASE, but
+/// `is_ascii_hexdigit()` accepts both cases — the validator accepts a
+/// strict superset of what the producer emits. Safe by construction (the
+/// producer's actual output is always a subset of what's accepted), not
+/// merely "true in the cases tested". [`is_well_formed_service_name_matches_real_producer`]
+/// pins the producer/validator agreement so a future edit to either one
+/// that breaks it is caught immediately rather than surfacing as a
+/// `keychain_pending_clears_malformed_entry` WARN that reads like
+/// unrelated file corruption.
+#[cfg(target_os = "macos")]
+fn is_well_formed_service_name(s: &str) -> bool {
+    const PREFIX: &str = "Claude Code-credentials-";
+    match s.strip_prefix(PREFIX) {
+        Some(suffix) => suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+/// Best-effort atomic write. A failure here is logged (never silently
+/// dropped, `zero-tolerance.md` Rule 3) but MUST NOT fail the caller — the
+/// caller is itself a best-effort compensating step, not the primary path.
+///
+/// `context` names WHAT was being persisted when the write failed —
+/// security review 1386 F9: a single fixed message ("this logout's
+/// unconfirmed item will not be auto-retried") was wrong on the sweep path,
+/// where there is no logout and the actual consequence is different
+/// (already-queued entries simply keep their stale on-disk state and get
+/// re-attempted next sweep — benign, but not what the old message said).
+#[cfg(target_os = "macos")]
+fn save_pending_clears(base_dir: &Path, clears: &PendingClears, context: &str) {
+    let path = pending_clears_path(base_dir);
+    let tmp = crate::platform::fs::unique_tmp_path(&path);
+    let json = match serde_json::to_string(clears) {
+        Ok(j) => j,
+        Err(_) => return, // unreachable for this shape; nothing to persist
+    };
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(
+            error_kind = "keychain_pending_clears_write_failed",
+            context, "failed to persist the keychain pending-clear queue (non-fatal)"
+        );
+        return;
+    }
+    if crate::platform::fs::atomic_replace(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(
+            error_kind = "keychain_pending_clears_write_failed",
+            context, "failed to persist the keychain pending-clear queue (non-fatal)"
+        );
+    }
+}
+
+/// Record `service` as needing a retried clear. No duplicate entries — a
+/// SECOND record for a service already queued does NOT insert again, it
+/// RESETS that entry's backoff to due-now (security review 1386 N3), since
+/// a fresh logout recording the same service is new evidence the item
+/// still matters. Best-effort (a failure to persist, or to acquire the
+/// lock, is logged, never silently dropped, and never propagated — see
+/// [`save_pending_clears`]).
+///
+/// Serialized under [`pending_clears_lock_path`] (security review 1386
+/// HIGH — round 2) against both a concurrent `record_pending_clear` and the
+/// removal half of `sweep_pending_clears`, so an insert can never be lost
+/// to a racing sweep's blind overwrite. Load+dedupe+push+save is fast (one
+/// small file), so this lock is held only briefly — never across a
+/// `security` subprocess call.
+///
+/// Pure file I/O against `base_dir` — no `security` subprocess, so unlike
+/// every OTHER writer in this module this is NOT gated on
+/// `keychain_mirror_disabled()`. That guard exists to keep unit tests off
+/// the operator's REAL login keychain; `base_dir` here is always the
+/// caller's own (a `TempDir` in every test), so there is nothing to guard
+/// and gating it would make the queue itself untestable.
+#[cfg(target_os = "macos")]
+pub fn record_pending_clear(base_dir: &Path, service: &str) {
+    let _guard = match crate::platform::lock::lock_file(&pending_clears_lock_path(base_dir)) {
+        Ok(g) => g,
+        Err(_) => {
+            warn!(
+                error_kind = "keychain_pending_clears_lock_failed",
+                "could not lock the keychain pending-clear queue — this logout's \
+                 unconfirmed item was NOT queued for auto-retry (non-fatal)"
+            );
+            return;
+        }
+    };
+    debug_assert!(
+        is_well_formed_service_name(service),
+        "record_pending_clear called with a malformed service name: {service:?} — \
+         every production caller derives this from keychain::service_name() \
+         (security review 1386 N4)"
+    );
+
+    let mut clears = load_pending_clears(base_dir);
+    if let Some(existing) = clears.services.iter_mut().find(|e| e.service == service) {
+        // Security review 1386 N3 + the generation fix: a fresh logout
+        // recording the SAME service (reachable via PID recycling hashing
+        // back to the same keychain service name) is new evidence the item
+        // still matters — reset backoff to due-now rather than leaving it
+        // waiting out a window computed for the STALE reason it was
+        // originally queued. `generation` MUST also bump: resetting
+        // attempts/next_attempt alone is indistinguishable from "never
+        // attempted" (which is already `(0, 0)`), so a concurrent sweep
+        // holding a snapshot of the PRE-reset entry could not tell its
+        // attempted copy apart from this fresh one without it — see the
+        // field's doc on `PendingClearEntry`.
+        existing.attempts = 0;
+        existing.next_attempt_unix_secs = 0;
+        existing.generation = existing.generation.wrapping_add(1);
+        save_pending_clears(base_dir, &clears, "record_pending_clear");
+        return;
+    }
+    if clears.services.len() >= PENDING_CLEARS_MAX {
+        let evicted = clears.services.remove(0); // evict oldest (FIFO)
+        warn!(
+            error_kind = "keychain_pending_clears_evicted",
+            "the keychain pending-clear queue is full ({PENDING_CLEARS_MAX} entries) — \
+             evicted the oldest queued entry to make room; that item's keychain \
+             clear will NOT be auto-retried and may remain an orphan"
+        );
+        let _ = evicted; // service name only — nothing further to log (no secret)
+    }
+    clears.services.push(PendingClearEntry {
+        service: service.to_string(),
+        attempts: 0,
+        next_attempt_unix_secs: 0,
+        generation: 0,
+    });
+    save_pending_clears(base_dir, &clears, "record_pending_clear");
+}
+
+/// Non-macOS: no keychain, so no pending-clear queue is ever populated —
+/// structural no-op.
+#[cfg(not(target_os = "macos"))]
+pub fn record_pending_clear(_base_dir: &Path, _service: &str) {}
+
+/// Retry up to [`PENDING_CLEARS_SWEEP_BUDGET`] due entries from the
+/// pending-clear queue. Returns `(cleared, remaining)`. Called from the
+/// daemon's periodic handle-dir sweep (`session::handle_dir::spawn_sweep`)
+/// and opportunistically from `csq run`, so both a running-daemon install
+/// and a headless daemon-less one eventually converge. Cheap when the queue
+/// is empty (one file read, no subprocess calls, no lock).
+///
+/// **Concurrency (security review 1386 HIGH — round 2).** The `security`
+/// subprocess attempts run WITHOUT holding [`pending_clears_lock_path`] —
+/// up to ~187.5s (see [`PENDING_CLEARS_SWEEP_BUDGET`]'s doc for the current
+/// derivation, ENFORCED-limit based, not a measurement) would otherwise
+/// block a concurrent `record_pending_clear` for the whole sweep. Only the
+/// final REMOVAL is locked, and it removes by [`identity_matches`]
+/// (`service` + `generation` ONLY — deliberately NOT full entry equality,
+/// see that function's doc for why [`load_pending_clears`]'s N5 clamp
+/// makes `attempts`/`next_attempt_unix_secs` unsafe to compare) against a
+/// FRESH re-load of the current file — never a blind overwrite of the
+/// pre-attempt snapshot, and never a service-NAME-only match either
+/// (security review 1386, sec-1386's generation-counter finding): a
+/// service name alone cannot tell "the entry I attempted" apart from "a
+/// DIFFERENT clear request recorded for the same service between my
+/// snapshot and my locked write" — see `generation`'s doc on
+/// [`PendingClearEntry`]. This makes the operation safe regardless of what
+/// happened concurrently: an entry recorded (or reset) during the attempt
+/// phase gets a new `generation` and no longer identity-matches the
+/// snapshot copy, surviving untouched; an entry removed by a concurrent
+/// sweep is already absent and the `retain` is a no-op.
+///
+/// **Backoff (security review 1386 MEDIUM).** An entry whose
+/// `next_attempt_unix_secs` is still in the future is skipped without a
+/// `security` call — so a permanently-unreachable keychain converges to at
+/// most one attempt per `PENDING_CLEARS_BACKOFF_MAX_SECS` per entry, never
+/// zero (the entry is NEVER dropped for repeated failure).
+///
+/// No function-level `keychain_mirror_disabled()` gate here either — the
+/// only `security`-touching call in this loop is [`clear_service_reporting`],
+/// which already carries that guard internally (returns `Ok(false)` under
+/// test, so every entry stays queued and no real keychain is ever touched
+/// from a test), which is what lets THIS function's file-I/O half (load,
+/// budget, persist) be exercised directly by a unit test.
+#[cfg(target_os = "macos")]
+pub fn sweep_pending_clears(base_dir: &Path) -> (usize, usize) {
+    sweep_pending_clears_inner(
+        base_dir,
+        pending_clears_now_secs(),
+        PENDING_CLEARS_SWEEP_BUDGET,
+        &mut clear_service_reporting,
+    )
+}
+
+/// Opportunistic variant for SYNCHRONOUS, INTERACTIVE callers (`csq run`,
+/// `csq exec`, the phase2b subscription client) — see
+/// [`PENDING_CLEARS_OPPORTUNISTIC_BUDGET`]'s doc for why this is a
+/// separate, much smaller budget rather than reusing
+/// [`sweep_pending_clears`]'s daemon-sized one.
+#[cfg(target_os = "macos")]
+pub fn sweep_pending_clears_opportunistic(base_dir: &Path) -> (usize, usize) {
+    sweep_pending_clears_inner(
+        base_dir,
+        pending_clears_now_secs(),
+        PENDING_CLEARS_OPPORTUNISTIC_BUDGET,
+        &mut clear_service_reporting,
+    )
+}
+
+/// Test seam for [`sweep_pending_clears`]/[`sweep_pending_clears_opportunistic`]
+/// (security review 1386 F5(b) — pendq-analysis): `clear_fn` is the
+/// per-entry clear call, injectable so a test can prove only `budget`
+/// entries are ATTEMPTED (not merely that the final counts are consistent
+/// with either a real or a no-op budget, which `clear_service_reporting`'s
+/// test-mode `Ok(false)` makes indistinguishable from "no budget at all" —
+/// the exact gap the reviewer named). Mirrors the `sweep_dead_handles`/
+/// `sweep_dead_handles_inner` seam pattern in `session::handle_dir.rs`
+/// (an internal ticket). `now` is ALSO injectable (security review 1386 N5) so backoff
+/// due/not-due decisions are testable without depending on wall-clock time.
+/// `budget` is injectable so the daemon and opportunistic callers can share
+/// this one implementation with different worst-case latency ceilings.
+#[cfg(target_os = "macos")]
+fn sweep_pending_clears_inner(
+    base_dir: &Path,
+    now: u64,
+    budget: usize,
+    clear_fn: &mut impl FnMut(&str) -> Result<bool, KeychainClearUnconfirmed>,
+) -> (usize, usize) {
+    let snapshot = load_pending_clears(base_dir);
+    if snapshot.services.is_empty() {
+        return (0, 0);
+    }
+    // Security review 1386, sec-1386's generation-counter finding: track the
+    // FULL snapshot entry (not just its service-name string) for both the
+    // cleared set and the backoff-update set. NOT for exact equality against
+    // a fresh reload (pendq-r2, round 3 — that design was replaced by
+    // `identity_matches` below): both sets need the snapshot entry's
+    // `generation` (identity, alongside `service`) and, for the backoff set,
+    // its pre-attempt `attempts`. Matching by (service, generation) rather
+    // than full-struct equality is deliberate — the remaining fields
+    // (`next_attempt_unix_secs`, `attempts` on the CURRENT entry) are
+    // mutable state that load-time normalization may legitimately change
+    // between this snapshot and the fresh reload the removal/backoff-apply
+    // steps below read.
+    let mut cleared_entries: Vec<PendingClearEntry> = Vec::new();
+    let mut backoff_updates: Vec<(PendingClearEntry, PendingClearEntry)> = Vec::new();
+    let mut attempted = 0usize;
+    for entry in &snapshot.services {
+        if attempted >= budget {
+            break; // over budget this tick — remainder retried next sweep
+        }
+        if entry.next_attempt_unix_secs > now {
+            continue; // backed off — not due yet, no subprocess call
+        }
+        match clear_fn(&entry.service) {
+            // Security review 1386 C4 (pendq-r2 + team-lead): `attempted`
+            // (the BUDGET counter) is incremented ONLY on `Ok(true)`/`Err` —
+            // outcomes that reflect a REAL attempt. `Ok(false)` is a
+            // STRUCTURAL NO-OP (keychain mirror disabled — test build /
+            // `CSQ_DISABLE_KEYCHAIN_MIRROR`): no subprocess ran, so it costs
+            // nothing to keep iterating past it, and counting it against the
+            // budget caused head-of-line starvation — with the mirror
+            // disabled, the first `budget` entries would consume the WHOLE
+            // budget every tick while changing no state, so entries beyond
+            // `budget` were never attempted at all until the mirror was
+            // re-enabled.
+            Ok(true) => {
+                attempted += 1;
+                cleared_entries.push(entry.clone());
+            }
+            // Security review 1386 N2: `Ok(false)` must NOT count as a
+            // failed attempt or receive a backoff bump either — see above
+            // for why it is a structural no-op. The prior version shared
+            // this arm with `Err`, so an operator running with the mirror
+            // disabled would accumulate every entry's backoff toward the
+            // 3600s cap on attempts that never happened; re-enabling the
+            // mirror then left each waiting up to an hour for its first
+            // REAL try.
+            Ok(false) => {}
+            Err(KeychainClearUnconfirmed) => {
+                attempted += 1;
+                let attempts = entry.attempts.saturating_add(1);
+                let backoff = (attempts as u64).saturating_mul(PENDING_CLEARS_BACKOFF_STEP_SECS);
+                let updated = PendingClearEntry {
+                    service: entry.service.clone(),
+                    attempts,
+                    next_attempt_unix_secs: now + backoff.min(PENDING_CLEARS_BACKOFF_MAX_SECS),
+                    generation: entry.generation,
+                };
+                backoff_updates.push((entry.clone(), updated));
+            }
+        }
+    }
+    let cleared = cleared_entries.len();
+
+    let remaining = {
+        let _guard = match crate::platform::lock::lock_file(&pending_clears_lock_path(base_dir)) {
+            Ok(g) => g,
+            Err(_) => return (0, snapshot.services.len()), // couldn't lock — remove NOTHING; retry next tick
+        };
+        let mut current = load_pending_clears(base_dir);
+        // Remove exactly the SNAPSHOT entries THIS sweep confirmed cleared —
+        // keyed on (service, generation) ONLY, not full entry equality
+        // (security review 1386, C1(c) — pendq-r2 + team-lead, independently
+        // converging before and after this code existed). `load_pending_clears`
+        // clamps `next_attempt_unix_secs` (N5) against the REAL wall clock on
+        // EVERY call, including this one and the earlier snapshot read —
+        // regardless of the `now` this function was given. If those two
+        // clamps landed on different wall-clock seconds, a full-struct
+        // comparison would find the "same" entry unequal to itself and skip
+        // removing it — a keychain item confirmed deleted, but its queue
+        // entry retried forever. `generation` is bumped ONLY by
+        // `record_pending_clear`'s re-record path, so (service, generation)
+        // is the correct identity: unaffected by any load-time
+        // normalization, present or future.
+        current
+            .services
+            .retain(|e| !cleared_entries.iter().any(|c| identity_matches(c, e)));
+        // Apply the backoff bump ONLY where the current entry still has the
+        // SAME (service, generation) as the snapshot entry this sweep
+        // attempted — if it changed (re-recorded concurrently, generation
+        // bumped), skip the bump rather than re-impose backoff on a clear
+        // that was just freshly requested. Same identity key as the removal
+        // above, for the same reason.
+        for (original, updated) in &backoff_updates {
+            if let Some(e) = current
+                .services
+                .iter_mut()
+                .find(|e| identity_matches(original, e))
+            {
+                e.attempts = updated.attempts;
+                e.next_attempt_unix_secs = updated.next_attempt_unix_secs;
+            }
+        }
+        let n = current.services.len();
+        // This save is UNCONDITIONAL — even when `retain` removed nothing —
+        // and that is LOAD-BEARING (security review 1386, team-lead,
+        // corrected once already: an earlier version of this comment cited
+        // the N5 clamp, which stopped being the reason once `identity_matches`
+        // decoupled removal correctness from `next_attempt_unix_secs`; the
+        // REAL dependency is below).
+        //
+        // `backoff_updates` is applied to `current` PURELY IN MEMORY a few
+        // lines up — this save is its ONLY persistence point. On the
+        // COMMON failing-keychain tick — the dominant case backoff exists
+        // for — `cleared_entries` is EMPTY (nothing confirmed) while
+        // `backoff_updates` is NOT. Guard this save on "a removal
+        // happened" and every backoff bump on that tick is silently
+        // discarded: `attempts`/`next_attempt_unix_secs` never reach disk,
+        // and the queue returns to full-rate retry every 60s forever,
+        // defeating backoff entirely for the exact install (permanently
+        // unreachable keychain) this whole mechanism targets. Do not add
+        // an early-return / no-op skip here without re-establishing that
+        // persistence for the zero-removals-nonzero-bumps case.
+        save_pending_clears(base_dir, &current, "sweep_pending_clears");
+        n
+    };
+    // Security review 1386 F4: the compensating mechanism had zero
+    // observability — both callers discard the return value. A non-empty
+    // queue after a sweep means live keychain items are STILL uncleared;
+    // that must be visible somewhere, not only inferable from a returned
+    // tuple nobody reads.
+    if remaining > 0 {
+        warn!(
+            error_kind = "keychain_pending_clears_remaining",
+            cleared,
+            remaining,
+            "keychain pending-clear queue still has unconfirmed entries after this \
+             sweep (non-fatal — retried on the next sweep, with backoff for \
+             repeatedly-failing entries)"
+        );
+    }
+    (cleared, remaining)
+}
+
+/// Non-macOS: nothing was ever queued — structural no-op.
+#[cfg(not(target_os = "macos"))]
+pub fn sweep_pending_clears(_base_dir: &Path) -> (usize, usize) {
+    (0, 0)
+}
+
+/// Non-macOS: nothing was ever queued — structural no-op. Callers (`csq
+/// run`/`csq exec`/subscription_client) call this unconditionally, so the
+/// stub MUST exist here regardless of platform.
+#[cfg(not(target_os = "macos"))]
+pub fn sweep_pending_clears_opportunistic(_base_dir: &Path) -> (usize, usize) {
+    (0, 0)
+}
+
+/// Cheap, filesystem-only predicate for callers deciding whether a keychain
+/// CLEAR call ([`clear_handle_dir_reporting`], a `security` subprocess) is
+/// worth issuing at all for `handle_dir`. Cross-platform and free of any
+/// keychain access — a single `read_to_string` following the
+/// `.credentials.json` symlink, the same read [`sync_handle_dir_inner`]
+/// already performs to decide whether to WRITE.
+///
+/// Sound, not merely convenient: the only writer of an Anthropic keychain
+/// item for a handle dir is [`sync_handle_dir_inner`] (via `csq run` /
+/// `auto_rotate`), and it gates on this EXACT shape check
+/// (`raw.contains("\"claudeAiOauth\"")`) before ever touching the keychain.
+/// So a dir whose `.credentials.json` does not have this shape RIGHT NOW
+/// could only carry an orphaned item from an EARLIER Anthropic binding that
+/// has since been swapped away — and `csq swap`'s `account_changed=true`
+/// path (`sync_handle_dir_account_changed`) already clears or overwrites
+/// that old item at the moment of the swap itself (`SyncAction::ClearStale`
+/// / `Write`), so this predicate does not miss that case. A dir whose
+/// `.credentials.json` is absent, dangling, or non-Anthropic today therefore
+/// never has a *surviving* Anthropic keychain item to reap.
+///
+/// Returns `false` (skip) on any read failure — absent file, dangling
+/// symlink, or a mid-creation race — never panics.
+pub(crate) fn handle_dir_might_have_anthropic_keychain_item(handle_dir: &Path) -> bool {
+    std::fs::read_to_string(handle_dir.join(".credentials.json"))
+        .map(|raw| raw.contains("\"claudeAiOauth\""))
+        .unwrap_or(false)
+}
 
 /// Thin wrapper over [`harvest_account_candidates`] returning only the freshest.
 #[cfg(target_os = "macos")]
@@ -916,7 +1921,34 @@ pub fn write_raw(config_dir: &Path, raw_json: &str) -> Result<(), PlatformError>
     // the write forever otherwise, hanging `csq run` / the daemon tick. On
     // timeout the bounded helper SIGKILLs the child and returns None → we treat
     // it as "keychain unavailable" and fail best-effort (the caller swallows it).
-    loop {
+    //
+    // Bounded at `MAX_DUPLICATE_DELETE_ITERATIONS` (security review 1386,
+    // sec-1386's request — this loop is [`drain_service`]'s sibling and
+    // shares its rationale: nothing in `security`'s behavior GUARANTEES this
+    // terminates quickly, only that duplicate counts are small in practice).
+    // Unlike `drain_service`'s callers, THIS loop's caller (`csq run`/
+    // `auto_rotate`) still proceeds to the CREATE below regardless of how
+    // the loop ends — hitting the bound here does not fail the write, it
+    // just stops chasing possible further duplicates.
+    //
+    // **What exhausting the bound actually costs (security review 1386,
+    // team-lead — connecting this to the consequence named 15 lines
+    // above): if MORE than `MAX_DUPLICATE_DELETE_ITERATIONS` duplicates
+    // somehow exist, this loop stops draining before they're gone, and the
+    // CREATE below then runs against a service that still has undrained
+    // siblings — the exact "SHADOWING sibling with the old token that CC
+    // reads instead (observed in testing: a stale sibling re-introduced
+    // the 401)" state this whole delete-then-create sequence exists to
+    // prevent.** Reachability is genuinely low (needs ≥`MAX_DUPLICATE_DELETE_ITERATIONS`
+    // partial-failure write_raw interleavings with no healthy write in
+    // between — see [`MAX_DUPLICATE_DELETE_ITERATIONS`]'s own doc for why
+    // that count is bounded well below this constant in practice) and it
+    // self-heals: the NEXT successful `write_raw` call deletes-all again
+    // from a lower starting count. Not treated as a hard failure here for
+    // that reason — but a future reader raising or lowering this constant
+    // should know this is the failure mode being traded off, not merely
+    // "the write proceeds anyway".
+    for _ in 0..MAX_DUPLICATE_DELETE_ITERATIONS {
         let deleted = run_security_bounded(&["delete-generic-password", "-s", &svc])
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -984,6 +2016,982 @@ mod tests {
         let svc = service_name(Path::new("/Users/test/.claude/accounts/config-1"));
         assert!(svc.starts_with("Claude Code-credentials-"));
         assert_eq!(svc.len(), "Claude Code-credentials-".len() + 8);
+    }
+
+    /// Security review 1386 M4 regression: a handle dir whose path DOES
+    /// canonicalize gets the canonical form back, WITH the keychain write
+    /// permitted — the common case, unaffected by the guard.
+    #[test]
+    fn canonicalize_for_keychain_sync_permits_write_when_canonicalizable() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+
+        let (handle_dir_abs, keychain_write_allowed) = canonicalize_for_keychain_sync(dir.path());
+
+        assert_eq!(handle_dir_abs, expected);
+        assert!(
+            keychain_write_allowed,
+            "a canonicalizable dir must permit the keychain write"
+        );
+    }
+
+    /// Security review 1386 M4: a handle dir whose path CANNOT be
+    /// canonicalized (dangling — parent does not exist) must NOT permit a
+    /// keychain write. Before the fix, the three writer call sites
+    /// (`csq run`, `csq exec`, the Phase-2b headless-turn builder) fell back
+    /// to this same raw path for the keychain mirror — [`service_name`]
+    /// hashes whatever string it is given, so the item would land under a
+    /// DIFFERENT service name than the one CC (which hashes the
+    /// canonicalized `CLAUDE_CONFIG_DIR`) or either clearer
+    /// (`logout::clear_bound_keychain_items`, the handle-dir reaper) can
+    /// ever compute — a permanent orphan holding a real OAuth token.
+    ///
+    /// The raw path is still returned as `handle_dir_abs` — callers still
+    /// need SOME path to launch/spawn against — only `keychain_write_allowed`
+    /// distinguishes the two cases.
+    #[test]
+    fn canonicalize_for_keychain_sync_refuses_write_when_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("does-not-exist").join("term-1");
+        assert!(
+            std::fs::canonicalize(&dangling).is_err(),
+            "fixture must actually fail to canonicalize"
+        );
+
+        let (handle_dir_abs, keychain_write_allowed) = canonicalize_for_keychain_sync(&dangling);
+
+        assert_eq!(
+            handle_dir_abs, dangling,
+            "raw path is still returned for launch/spawn purposes"
+        );
+        assert!(
+            !keychain_write_allowed,
+            "a non-canonicalizable dir must NOT permit the keychain write \
+             (M4 — the write would land under a service name no clearer can \
+             ever compute)"
+        );
+    }
+
+    /// `clear_handle_dir_reporting` MUST short-circuit to `Ok(false)` under
+    /// the test-mode guard (`cfg!(test)` is unconditionally true in this
+    /// module's own tests) — never reaching `run_security_bounded`, so this
+    /// is safe on every platform / every CI runner without touching a real
+    /// keychain. Pins the "disabled" contract callers (`logout_account`)
+    /// rely on to distinguish a structural no-op from a real failure.
+    #[test]
+    fn clear_handle_dir_reporting_is_ok_false_under_test_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(clear_handle_dir_reporting(dir.path()), Ok(false));
+    }
+
+    // ── security review 1386 F1: exit-status classification ──────────────
+    // `security_delete_call_resolved` is pure over a constructed `Output` — no
+    // subprocess, no keychain, safe on every CI runner.
+
+    #[cfg(target_os = "macos")]
+    fn fake_output(code: i32) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            // Raw wait-status encoding for "exited normally with `code`":
+            // low byte 0 (WIFEXITED true), next byte = WEXITSTATUS.
+            status: std::process::ExitStatus::from_raw((code & 0xff) << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_delete_call_resolved_true_on_success_and_not_found() {
+        assert!(
+            security_delete_call_resolved(&fake_output(0)),
+            "exit 0 (deleted) must be confirmed"
+        );
+        assert!(
+            security_delete_call_resolved(&fake_output(SECURITY_ITEM_NOT_FOUND)),
+            "exit 44 (errSecItemNotFound — live-verified) must be confirmed"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_delete_call_resolved_false_on_any_other_exit() {
+        // In practice `security` reports small positive codes, but the
+        // function must reject ANY code that is neither 0 nor
+        // SECURITY_ITEM_NOT_FOUND — this is the F1 fix's whole point: do
+        // not generalize "completed" to "confirmed". 255 pins the upper
+        // edge of what `fake_output` can represent: `ExitStatus::from_raw`
+        // only carries a single WEXITSTATUS byte (0-255), so a genuinely
+        // negative i32 passed to `fake_output` truncates through `& 0xff`
+        // before construction rather than surviving as a negative code —
+        // sec-1386's correction — so this set sticks to values the
+        // constructor can actually represent, not ones that silently alias.
+        for code in [1, 2, 44 + 1, 100, 255] {
+            assert!(
+                !security_delete_call_resolved(&fake_output(code)),
+                "exit {code} must NOT be confirmed (only 0 and {SECURITY_ITEM_NOT_FOUND} are)"
+            );
+        }
+    }
+
+    // ── security review 1386 N1: duplicate keychain item draining ────────
+    // `drain_service_inner`'s injected `delete_fn` scripts a SEQUENCE of
+    // exit codes across iterations — no real `security` subprocess, no
+    // keychain, safe on every CI runner. Live-confirmed by team-lead's
+    // probe: `security delete-generic-password` removes exactly ONE
+    // matching item per call, so a single-shot delete against a service
+    // with duplicates reports success (exit 0) while a sibling survives.
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drain_service_inner_confirms_immediately_when_no_item_exists() {
+        let mut calls = 0u32;
+        let mut delete_fn = |_svc: &str| -> Option<i32> {
+            calls += 1;
+            Some(SECURITY_ITEM_NOT_FOUND)
+        };
+        assert_eq!(drain_service_inner("svc", &mut delete_fn), Ok(true));
+        assert_eq!(
+            calls, 1,
+            "a not-found on the FIRST call must not loop further"
+        );
+    }
+
+    /// The N1 regression itself: TWO duplicate items under one service.
+    /// The naive single-shot delete (what shipped before N1) would have
+    /// reported `Ok(true)` after exactly the first `Some(0)` — this test
+    /// pins that draining CONTINUES past a single success and does not
+    /// stop until a confirmed not-found.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drain_service_inner_drains_multiple_duplicates_before_confirming() {
+        let mut codes = vec![0, 0, SECURITY_ITEM_NOT_FOUND].into_iter();
+        let mut calls = 0u32;
+        let mut delete_fn = |_svc: &str| -> Option<i32> {
+            calls += 1;
+            codes.next()
+        };
+        assert_eq!(drain_service_inner("svc", &mut delete_fn), Ok(true));
+        assert_eq!(
+            calls, 3,
+            "must keep draining past the first (and second) successful \
+             delete — a single Ok(true) after ONE call is the N1 defect"
+        );
+    }
+
+    /// A stop-immediately failure mid-drain must NOT keep looping into a
+    /// possibly worse state, and must report unconfirmed — not success,
+    /// even though earlier iterations in the same call DID delete items.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drain_service_inner_stops_on_first_unconfirmed_result() {
+        let mut codes = vec![Some(0), Some(1) /* unconfirmed */, Some(0)].into_iter();
+        let mut calls = 0u32;
+        let mut delete_fn = |_svc: &str| -> Option<i32> {
+            calls += 1;
+            codes.next().flatten()
+        };
+        assert_eq!(
+            drain_service_inner("svc", &mut delete_fn),
+            Err(KeychainClearUnconfirmed)
+        );
+        assert_eq!(
+            calls, 2,
+            "must stop at the FIRST unconfirmed result, never reach the third code"
+        );
+    }
+
+    /// The iteration bound: an adversarial/pathological service that
+    /// NEVER reaches confirmed-not-found must not loop forever — bounded
+    /// at `MAX_DUPLICATE_DELETE_ITERATIONS`, and reports UNCONFIRMED (never
+    /// success) on exhaustion.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drain_service_inner_bounded_and_unconfirmed_on_budget_exhaustion() {
+        let mut calls = 0u32;
+        let mut delete_fn = |_svc: &str| -> Option<i32> {
+            calls += 1;
+            Some(0) // always reports "one deleted" — never confirms not-found
+        };
+        assert_eq!(
+            drain_service_inner("svc", &mut delete_fn),
+            Err(KeychainClearUnconfirmed)
+        );
+        assert_eq!(calls, MAX_DUPLICATE_DELETE_ITERATIONS);
+    }
+
+    // ── pending-clear queue (security review 1386 H1) ────────────────────
+    // Pure file I/O against a TempDir — no `keychain_mirror_disabled()` gate
+    // on `record_pending_clear`/`sweep_pending_clears` themselves (see their
+    // doc comments), so these exercise the real functions, not a stub.
+    // macOS-only: the queue is a no-op stub on other platforms (nothing was
+    // ever populated there), matching `swap_lock_blocks_harvest_try_lock_then_releases`'s
+    // platform gating above.
+
+    /// The queue's own `service` accessor for assertions below — the schema
+    /// carries `attempts`/`next_attempt_unix_secs` too, which most tests
+    /// don't care about.
+    #[cfg(target_os = "macos")]
+    fn service_names(clears: &PendingClears) -> Vec<String> {
+        clears.services.iter().map(|e| e.service.clone()).collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn record_pending_clear_persists_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        record_pending_clear(dir.path(), "Claude Code-credentials-aaaaaaaa");
+        record_pending_clear(dir.path(), "Claude Code-credentials-aaaaaaaa"); // duplicate
+
+        let clears = load_pending_clears(dir.path());
+        assert_eq!(
+            service_names(&clears),
+            vec!["Claude Code-credentials-aaaaaaaa".to_string()],
+            "recording the same service twice must not duplicate the entry"
+        );
+        assert_eq!(
+            clears.services[0].attempts, 0,
+            "a freshly-recorded entry has never been attempted"
+        );
+    }
+
+    /// Well-formed synthetic service names for tests — `is_well_formed_service_name`
+    /// (F8) now filters anything else out at load time, so test fixtures must
+    /// match the real `service_name()` shape (`Claude Code-credentials-<8 hex>`).
+    #[cfg(target_os = "macos")]
+    fn fake_service(n: u32) -> String {
+        format!("Claude Code-credentials-{n:08x}")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn record_pending_clear_evicts_oldest_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..PENDING_CLEARS_MAX as u32 {
+            record_pending_clear(dir.path(), &fake_service(i));
+        }
+        // Queue is now exactly full at PENDING_CLEARS_MAX with fake_service(0..MAX).
+        let overflow = fake_service(0xeeee_eeee);
+        record_pending_clear(dir.path(), &overflow);
+
+        let clears = load_pending_clears(dir.path());
+        assert_eq!(
+            clears.services.len(),
+            PENDING_CLEARS_MAX,
+            "the queue must stay bounded at PENDING_CLEARS_MAX, never grow past it"
+        );
+        let names = service_names(&clears);
+        assert!(
+            !names.contains(&fake_service(0)),
+            "the OLDEST entry must be evicted (FIFO) to make room"
+        );
+        assert!(
+            names.contains(&overflow),
+            "the new entry must be present after eviction"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn is_well_formed_service_name_accepts_real_shape_rejects_junk() {
+        assert!(is_well_formed_service_name(
+            "Claude Code-credentials-cfdcc24b"
+        ));
+        // Security review 1386 F8's whole point: a string starting with `-`
+        // must never reach `security`'s argv as a bare "-s" value would be
+        // parsed as an option, not a service name.
+        assert!(!is_well_formed_service_name("-w"));
+        assert!(!is_well_formed_service_name(
+            "-a evil Claude Code-credentials-aaaaaaaa"
+        ));
+        assert!(!is_well_formed_service_name("Claude Code-credentials-"));
+        assert!(!is_well_formed_service_name(
+            "Claude Code-credentials-zzzzzzzz" // not hex
+        ));
+        assert!(!is_well_formed_service_name(
+            "Claude Code-credentials-aaaaaaaaa" // 9 chars, not 8
+        ));
+        assert!(!is_well_formed_service_name(""));
+    }
+
+    /// Security review 1386 sec-1386: `is_well_formed_service_name`'s
+    /// `PREFIX` const is retyped independently of [`service_name`]'s format
+    /// string — they agree today only by construction, not by any shared
+    /// source. If a future edit changes `service_name`'s output shape
+    /// without updating the validator, `load_pending_clears` would silently
+    /// `retain` every real entry away, surfacing as a
+    /// `keychain_pending_clears_malformed_entry` WARN that reads like file
+    /// corruption rather than a producer/validator drift bug (the round-2
+    /// HIGH by a third route). This pins the two together so that drift
+    /// fails a TEST, not silently in production.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn is_well_formed_service_name_matches_real_producer() {
+        let real = service_name(Path::new("/Users/test/.claude/accounts/config-1"));
+        assert!(
+            is_well_formed_service_name(&real),
+            "service_name()'s actual output must validate — got {real:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_pending_clears_drops_malformed_entries_keeps_well_formed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hand-write the queue file directly (simulating a corrupted / tampered
+        // entry, or a pre-F8 file) with one malformed and one well-formed entry.
+        let raw = serde_json::json!({
+            "services": [
+                {"service": "-w", "attempts": 0, "next_attempt_unix_secs": 0},
+                {"service": "Claude Code-credentials-deadbeef", "attempts": 0, "next_attempt_unix_secs": 0},
+            ]
+        });
+        std::fs::write(
+            pending_clears_path(dir.path()),
+            serde_json::to_string(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let clears = load_pending_clears(dir.path());
+        assert_eq!(
+            service_names(&clears),
+            vec!["Claude Code-credentials-deadbeef".to_string()],
+            "the malformed entry must be dropped; the well-formed one must survive"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_pending_clears_empty_queue_is_zero_zero_no_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(sweep_pending_clears(dir.path()), (0, 0));
+        assert!(
+            !pending_clears_path(dir.path()).exists(),
+            "an empty-queue sweep must not write a file — cheap-when-empty contract"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_pending_clears_under_test_mode_keeps_entries_queued() {
+        // `clear_service_reporting` short-circuits to `Ok(false)` under
+        // `keychain_mirror_disabled()` (cfg!(test) is unconditionally true
+        // here), so a sweep in this test process can NEVER report a real
+        // clear — this pins that: entries survive a sweep untouched rather
+        // than being silently dropped (which would be a same-shape bug to
+        // the one `sweep_pending_clears`'s budget logic must avoid: losing
+        // queued entries on a call that could not act on them).
+        let dir = tempfile::tempdir().unwrap();
+        record_pending_clear(dir.path(), "Claude Code-credentials-bbbbbbbb");
+
+        let (cleared, remaining) = sweep_pending_clears(dir.path());
+        assert_eq!(cleared, 0, "test mode never confirms a real clear");
+        assert_eq!(remaining, 1, "the entry must remain queued, not be dropped");
+
+        let clears = load_pending_clears(dir.path());
+        assert_eq!(
+            service_names(&clears),
+            vec!["Claude Code-credentials-bbbbbbbb".to_string()]
+        );
+        // Security review 1386 N2: `Ok(false)` (test mode) is a structural
+        // no-op — it must NOT be treated as a failed attempt for backoff
+        // purposes, unlike a genuine `Err(KeychainClearUnconfirmed)`.
+        assert_eq!(
+            clears.services[0].attempts, 0,
+            "a structural no-op (mirror disabled) must not bump attempts/backoff"
+        );
+    }
+
+    /// Security review 1386 HIGH (round 2), non-vacuity target: a sweep's
+    /// removal step MUST NOT blindly overwrite the queue with its own
+    /// pre-attempt snapshot — it must remove only the SPECIFIC entries it
+    /// confirmed cleared, against a FRESH re-load. This test simulates the
+    /// race directly (no thread timing dependency): record A, take a
+    /// snapshot-shaped read the way the sweep does, THEN record B
+    /// "concurrently" (between the sweep's read and its locked removal),
+    /// then perform the same removal the sweep performs, and assert B
+    /// survives.
+    ///
+    /// **Drift note (security review 1386, team-lead): this replicates
+    /// production's removal logic inline rather than calling
+    /// `sweep_pending_clears_inner` directly, so it CAN drift from
+    /// production if the removal changes again — this exact drift already
+    /// happened once (this test used a bare service-name match through
+    /// several rounds after production moved to `identity_matches`, and
+    /// kept passing because A and B are different services here, so
+    /// name-only and identity-based matching agree by coincidence). Now
+    /// uses [`identity_matches`] — the SAME function production calls —
+    /// rather than reimplementing the comparison, so the comparison LOGIC
+    /// specifically cannot drift even though the surrounding lock/load/save
+    /// structure is still hand-replicated.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_removal_does_not_drop_a_concurrently_recorded_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc_a = fake_service(0xaaaa_0001);
+        let svc_b = fake_service(0xbbbb_0002);
+        record_pending_clear(dir.path(), &svc_a);
+
+        // Simulate the sweep's pre-attempt snapshot + a confirmed clear of A.
+        let snapshot = load_pending_clears(dir.path());
+        assert_eq!(service_names(&snapshot), vec![svc_a.clone()]);
+        let cleared_entries = snapshot.services.clone();
+
+        // "Concurrently" (between the sweep's read and its locked removal),
+        // another logout records B.
+        record_pending_clear(dir.path(), &svc_b);
+
+        // The removal step itself: locked, fresh re-load, identity-matched
+        // (service + generation) — same comparison production uses.
+        {
+            let _guard =
+                crate::platform::lock::lock_file(&pending_clears_lock_path(dir.path())).unwrap();
+            let mut current = load_pending_clears(dir.path());
+            current
+                .services
+                .retain(|e| !cleared_entries.iter().any(|c| identity_matches(c, e)));
+            save_pending_clears(dir.path(), &current, "test");
+        }
+
+        let clears = load_pending_clears(dir.path());
+        assert_eq!(
+            service_names(&clears),
+            vec![svc_b],
+            "B must survive a removal step that only knew about A at read time — \
+             a naive overwrite-with-snapshot would have dropped B (the HIGH this test pins)"
+        );
+    }
+
+    /// Non-vacuity for the above: a NAIVE removal (overwrite with the
+    /// pre-attempt snapshot minus cleared entries, ignoring what was
+    /// recorded in between) DOES drop the concurrently-recorded entry —
+    /// proving the test discriminates and the real function's fresh-reload
+    /// discipline is load-bearing, not incidental.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn naive_snapshot_overwrite_would_have_dropped_the_concurrent_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc_a = fake_service(0xaaaa_0003);
+        let svc_b = fake_service(0xbbbb_0004);
+        record_pending_clear(dir.path(), &svc_a);
+        let snapshot = load_pending_clears(dir.path());
+        record_pending_clear(dir.path(), &svc_b); // concurrent insert
+
+        // Naive: overwrite with (snapshot minus cleared), never re-reading.
+        let mut naive = snapshot;
+        naive.services.retain(|e| e.service != svc_a);
+        save_pending_clears(dir.path(), &naive, "test");
+
+        let clears = load_pending_clears(dir.path());
+        assert!(
+            service_names(&clears).is_empty(),
+            "the naive overwrite silently drops B — this is the bug the locked, \
+             fresh-reload removal in sweep_pending_clears exists to avoid"
+        );
+    }
+
+    /// The DEEPER race sec-1386 identified (retracted-then-reinstated, and
+    /// the reason `generation` exists): the SAME service, not two
+    /// different ones. A sweep attempts X, confirms it cleared, and takes
+    /// its `cleared_entries` snapshot. Before the sweep's locked removal
+    /// runs, a NEW logout for the SAME service (e.g. a recycled PID
+    /// hashing to the same keychain service name) re-records X — which
+    /// resets attempts/next_attempt to `(0, 0)`. If removal matched by
+    /// SERVICE NAME alone, this fresh request would be silently deleted by
+    /// the stale confirmation, even though it represents a DIFFERENT clear
+    /// that has not actually been attempted yet.
+    ///
+    /// Critically, resetting attempts/next_attempt alone does NOT save
+    /// this case: a never-yet-attempted entry is ALREADY `(0, 0)`, so the
+    /// snapshot's original copy of X (before the sweep ever touched it)
+    /// and the freshly re-recorded copy would be IDENTICAL without
+    /// `generation` — only the generation bump makes them distinguishable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_removal_does_not_drop_a_same_service_re_recorded_after_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = fake_service(0xf00d_dead);
+        record_pending_clear(dir.path(), &svc); // generation 0, never attempted: (0,0)
+
+        // Sweep's pre-attempt snapshot — captures X at generation 0.
+        let snapshot = load_pending_clears(dir.path());
+        assert_eq!(snapshot.services[0].generation, 0);
+        let cleared_entries = snapshot.services.clone(); // "confirmed cleared" this tick
+
+        // "Concurrently" (between the sweep's read and its locked removal),
+        // a NEW logout re-records the SAME service — generation bumps to 1,
+        // but attempts/next_attempt reset to the SAME (0,0) the original had.
+        record_pending_clear(dir.path(), &svc);
+        let after_rerecord = load_pending_clears(dir.path());
+        assert_eq!(after_rerecord.services[0].generation, 1);
+        assert_eq!(after_rerecord.services[0].attempts, 0);
+        assert_eq!(after_rerecord.services[0].next_attempt_unix_secs, 0);
+
+        // The removal step itself: locked, fresh re-load, identity-matched
+        // (service + generation — [`identity_matches`], the SAME function
+        // production calls, not a reimplemented comparison — security
+        // review 1386, team-lead's drift finding: an earlier version of
+        // this test hand-rolled full-struct equality, which happened to
+        // still pass here since a generation-1 entry is unequal to its
+        // generation-0 snapshot either way, but the test's own claim to be
+        // "exactly" production's logic was already false by then).
+        {
+            let _guard =
+                crate::platform::lock::lock_file(&pending_clears_lock_path(dir.path())).unwrap();
+            let mut current = load_pending_clears(dir.path());
+            current
+                .services
+                .retain(|e| !cleared_entries.iter().any(|c| identity_matches(c, e)));
+            save_pending_clears(dir.path(), &current, "test");
+        }
+
+        let clears = load_pending_clears(dir.path());
+        assert_eq!(
+            clears.services.len(),
+            1,
+            "the freshly re-recorded (generation 1) entry must survive — a \
+             service-name-only removal would have dropped it despite it \
+             representing a NEW, unattempted clear request"
+        );
+        assert_eq!(clears.services[0].generation, 1);
+    }
+
+    /// Non-vacuity for the above: WITHOUT `generation` in the equality
+    /// check (i.e. matching by service name alone, as the pre-fix code
+    /// did), the re-recorded entry IS dropped — proving the test
+    /// discriminates and `generation` is load-bearing, not decorative.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn naive_service_name_only_removal_would_have_dropped_the_re_recorded_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = fake_service(0xf00d_beef);
+        record_pending_clear(dir.path(), &svc);
+        let snapshot = load_pending_clears(dir.path());
+        let cleared_names: Vec<String> = snapshot
+            .services
+            .iter()
+            .map(|e| e.service.clone())
+            .collect();
+
+        record_pending_clear(dir.path(), &svc); // concurrent re-record, generation bumps
+
+        // Naive: remove by SERVICE NAME only, ignoring generation.
+        let mut naive = load_pending_clears(dir.path());
+        naive
+            .services
+            .retain(|e| !cleared_names.contains(&e.service));
+        save_pending_clears(dir.path(), &naive, "test");
+
+        let clears = load_pending_clears(dir.path());
+        assert!(
+            clears.services.is_empty(),
+            "a service-name-only removal silently drops the re-recorded entry — \
+             this is the bug the (service, generation) identity removal in \
+             sweep_pending_clears_inner exists to avoid. Identity is NOT \
+             full-struct equality: attempts/next_attempt_unix_secs are mutable \
+             state load-time normalization may change between snapshot and \
+             reload"
+        );
+    }
+
+    /// Security review 1386 C1(c) (pendq-r2, confirmed live by team-lead
+    /// against the actual code): a FULL-entry-equality removal — the shape
+    /// this module shipped between the generation fix landing and this
+    /// test — is ITSELF broken, because `load_pending_clears`'s N5 clamp
+    /// mutates `attempts`/`next_attempt_unix_secs` on every load. Simulates
+    /// that exact scenario directly: the snapshot entry (as the sweep
+    /// captured it) and the on-disk entry at removal time have the SAME
+    /// `(service, generation)` but DIFFERENT `attempts`/`next_attempt_unix_secs`
+    /// (as a clamp landing on a different wall-clock second would produce)
+    /// — and asserts the entry is STILL removed, because `identity_matches`
+    /// ignores those fields entirely.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn identity_matches_removal_survives_a_clamp_induced_state_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = fake_service(0xc1a4_0001);
+        record_pending_clear(dir.path(), &svc);
+
+        // The sweep's snapshot: what it read and (hypothetically) confirmed
+        // cleared. generation = 0, attempts = 0, next_attempt = 0 (fresh).
+        let snapshot_entry = load_pending_clears(dir.path()).services[0].clone();
+        let cleared_entries = [snapshot_entry.clone()];
+
+        // Simulate the clamp/backoff machinery producing a DIFFERENT
+        // attempts/next_attempt on the ON-DISK copy by the time removal
+        // runs — same identity (service, generation), different state.
+        // A full-struct comparison would find these UNEQUAL.
+        let mut on_disk = load_pending_clears(dir.path());
+        on_disk.services[0].attempts = 3;
+        on_disk.services[0].next_attempt_unix_secs = 999_999;
+        assert_ne!(
+            on_disk.services[0], snapshot_entry,
+            "precondition: the two copies must differ on non-identity fields \
+             for this test to exercise anything"
+        );
+        save_pending_clears(dir.path(), &on_disk, "test");
+
+        // The removal step itself, exactly as sweep_pending_clears_inner
+        // performs it: identity_matches, not full equality.
+        {
+            let _guard =
+                crate::platform::lock::lock_file(&pending_clears_lock_path(dir.path())).unwrap();
+            let mut current = load_pending_clears(dir.path());
+            current
+                .services
+                .retain(|e| !cleared_entries.iter().any(|c| identity_matches(c, e)));
+            save_pending_clears(dir.path(), &current, "test");
+        }
+
+        let clears = load_pending_clears(dir.path());
+        assert!(
+            clears.services.is_empty(),
+            "identity-based removal must succeed even when attempts/next_attempt \
+             differ between the snapshot and the on-disk copy — a full-struct \
+             comparison would have left this confirmed-cleared entry stuck in \
+             the queue forever"
+        );
+    }
+
+    /// Security review 1386 MEDIUM: an UNCONFIRMED attempt (`Err`, what a
+    /// real refusal/timeout produces) bumps `attempts` and pushes
+    /// `next_attempt_unix_secs` into the future, so the NEXT sweep (within
+    /// the backoff window) skips it without a subprocess call — while the
+    /// entry is NEVER dropped. Uses the injectable seam with an `Err` spy —
+    /// the public `sweep_pending_clears` always sees `Ok(false)` under test
+    /// mode, which (security review 1386 N2) is a structural no-op that
+    /// must NOT bump backoff; that distinct behavior is pinned separately
+    /// by `sweep_pending_clears_under_test_mode_keeps_entries_queued`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_pending_clears_applies_backoff_after_a_failed_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        record_pending_clear(dir.path(), "Claude Code-credentials-cccccccc");
+
+        let mut spy = |_svc: &str| -> Result<bool, KeychainClearUnconfirmed> {
+            Err(KeychainClearUnconfirmed)
+        };
+        let now = pending_clears_now_secs();
+        let (cleared, remaining) =
+            sweep_pending_clears_inner(dir.path(), now, PENDING_CLEARS_SWEEP_BUDGET, &mut spy);
+        assert_eq!((cleared, remaining), (0, 1));
+
+        let clears = load_pending_clears(dir.path());
+        let entry = &clears.services[0];
+        assert_eq!(entry.attempts, 1, "one failed attempt must be recorded");
+        assert!(
+            entry.next_attempt_unix_secs > now,
+            "a failed attempt must push next_attempt_unix_secs into the future \
+             so the entry is not retried on the very next tick"
+        );
+    }
+
+    /// A due entry (never attempted, or whose backoff window has already
+    /// elapsed) IS attempted — the backoff gate does not skip everything.
+    /// Uses the injectable seam so "attempted" is observed directly (a
+    /// call-count spy), rather than inferred from the `attempts` field —
+    /// which, after security review 1386 N2, no longer increments for a
+    /// structural no-op (`Ok(false)`), only for a genuine `Err`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_pending_clears_attempts_a_due_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        record_pending_clear(dir.path(), "Claude Code-credentials-dddddddd");
+        // A freshly-recorded entry has next_attempt_unix_secs == 0, always due.
+        let mut attempted = false;
+        let mut spy = |_svc: &str| -> Result<bool, KeychainClearUnconfirmed> {
+            attempted = true;
+            Err(KeychainClearUnconfirmed)
+        };
+        let (cleared, remaining) = sweep_pending_clears_inner(
+            dir.path(),
+            pending_clears_now_secs(),
+            PENDING_CLEARS_SWEEP_BUDGET,
+            &mut spy,
+        );
+        assert_eq!((cleared, remaining), (0, 1));
+        assert!(attempted, "a due entry must be attempted, not skipped");
+    }
+
+    /// Security review 1386 F5(b) (pendq-analysis): under `clear_service_reporting`,
+    /// `Ok(false)` (test mode) and "over budget, never attempted" are
+    /// indistinguishable by their effect on the queue — both leave the entry
+    /// pending. This test uses the injectable seam to prove EXACTLY
+    /// `PENDING_CLEARS_SWEEP_BUDGET` entries are attempted out of a queue of
+    /// `PENDING_CLEARS_SWEEP_BUDGET + 3`, which no test against the public
+    /// `sweep_pending_clears` (bound to `clear_service_reporting`) could show.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_pending_clears_inner_attempts_exactly_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let total = PENDING_CLEARS_SWEEP_BUDGET + 3;
+        for i in 0..total as u32 {
+            record_pending_clear(dir.path(), &fake_service(0xcafe_0000 + i));
+        }
+
+        let mut attempts = 0usize;
+        let mut spy = |_svc: &str| -> Result<bool, KeychainClearUnconfirmed> {
+            attempts += 1;
+            Err(KeychainClearUnconfirmed) // never confirms — every entry stays queued
+        };
+        let (cleared, remaining) = sweep_pending_clears_inner(
+            dir.path(),
+            pending_clears_now_secs(),
+            PENDING_CLEARS_SWEEP_BUDGET,
+            &mut spy,
+        );
+
+        assert_eq!(
+            attempts, PENDING_CLEARS_SWEEP_BUDGET,
+            "exactly the budget must be ATTEMPTED, not merely consistent with it"
+        );
+        assert_eq!(cleared, 0);
+        assert_eq!(remaining, total);
+    }
+
+    /// F1's "both ends" proof, complement to the test above: a REFUSAL
+    /// (`Err(KeychainClearUnconfirmed)`, what a completed-but-non-zero-exit
+    /// `security` call now correctly produces via `security_delete_call_resolved`)
+    /// must leave the entry queued — proven above. This is the other half:
+    /// a genuinely CONFIRMED clear (`Ok(true)`) must REMOVE the entry.
+    /// Together they show the sweep-time predicate result is what decides
+    /// removal, not merely "the subprocess returned" — the exact defect F1
+    /// fixed (`Ok(true)` on ANY completed subprocess would have made THIS
+    /// test indistinguishable from the refusal test above by construction).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_pending_clears_inner_removes_entries_the_predicate_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        record_pending_clear(dir.path(), &fake_service(0xf00d_0001));
+        record_pending_clear(dir.path(), &fake_service(0xf00d_0002));
+
+        let mut spy = |_svc: &str| -> Result<bool, KeychainClearUnconfirmed> { Ok(true) };
+        let (cleared, remaining) = sweep_pending_clears_inner(
+            dir.path(),
+            pending_clears_now_secs(),
+            PENDING_CLEARS_SWEEP_BUDGET,
+            &mut spy,
+        );
+
+        assert_eq!((cleared, remaining), (2, 0));
+        assert!(
+            load_pending_clears(dir.path()).services.is_empty(),
+            "a confirmed clear must remove the entry from the persisted queue"
+        );
+    }
+
+    /// Security review 1386 N5: `now` is injectable so backoff due/not-due
+    /// decisions are testable deterministically, without depending on
+    /// wall-clock time or a real failed attempt to establish a non-zero
+    /// `next_attempt_unix_secs`.
+    ///
+    /// **Correction (pendq-r2 C1(a)/(b)): the year-2100 constant is NOT
+    /// itself load-bearing.** `load_pending_clears`'s N5 clamp runs on
+    /// REAL wall-clock time on every load — including the snapshot read
+    /// inside `sweep_pending_clears_inner`, regardless of the `now` THIS
+    /// function is given — so the manually-set `4_102_444_800` is reduced
+    /// to `real_now + PENDING_CLEARS_BACKOFF_MAX_SECS` before the loop's
+    /// skip-check ever sees it. What this test actually proves is the
+    /// SKIP-CHECK comparison itself (`next_attempt_unix_secs > now`) against
+    /// a small injected `now`, using whatever value the clamp leaves behind
+    /// — which is still far larger than `1_000`, so the assertion holds,
+    /// just not for the reason a literal reading of "year 2100" would
+    /// suggest. The removal step's own correctness no longer depends on
+    /// this field surviving intact across reloads (`identity_matches`
+    /// compares `(service, generation)` only — see its doc), so the clamp's
+    /// interference here is a documentation-precision issue, not a
+    /// correctness one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_pending_clears_inner_skips_entries_not_yet_due_under_injected_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = fake_service(0xdead_0003);
+        record_pending_clear(dir.path(), &svc);
+        // Hand-set a future backoff window directly (simulating a prior
+        // failed attempt) rather than depending on wall-clock time.
+        let mut clears = load_pending_clears(dir.path());
+        clears.services[0].attempts = 1;
+        clears.services[0].next_attempt_unix_secs = 4_102_444_800; // year 2100
+        save_pending_clears(dir.path(), &clears, "test");
+
+        // `now` well before the entry's backoff window — must be skipped.
+        let mut attempted_early = false;
+        let mut spy_early = |_svc: &str| -> Result<bool, KeychainClearUnconfirmed> {
+            attempted_early = true;
+            Ok(true)
+        };
+        let (cleared, remaining) = sweep_pending_clears_inner(
+            dir.path(),
+            1_000,
+            PENDING_CLEARS_SWEEP_BUDGET,
+            &mut spy_early,
+        );
+        assert!(
+            !attempted_early,
+            "an entry not yet due must not be attempted"
+        );
+        assert_eq!((cleared, remaining), (0, 1));
+
+        // Now inject a `now` AT the entry's due time — must be attempted.
+        let mut attempted_due = false;
+        let mut spy_due = |_svc: &str| -> Result<bool, KeychainClearUnconfirmed> {
+            attempted_due = true;
+            Ok(true)
+        };
+        let (cleared2, remaining2) = sweep_pending_clears_inner(
+            dir.path(),
+            4_102_444_800,
+            PENDING_CLEARS_SWEEP_BUDGET,
+            &mut spy_due,
+        );
+        assert!(attempted_due, "an entry AT its due time must be attempted");
+        assert_eq!((cleared2, remaining2), (1, 0));
+    }
+
+    /// Concurrency test for [`pending_clears_lock_path`] (security review
+    /// 1386 HIGH, round 2/3 — the lock underlying BOTH `record_pending_clear`
+    /// and the removal half of `sweep_pending_clears`). Channels only — no
+    /// sleeps, no spin-loops.
+    ///
+    /// **What this DOES prove:** both `record_pending_clear` and the
+    /// removal step genuinely call `lock_file` on the same path (not a
+    /// no-op, not a different path) — thread B's `lock_file` call is
+    /// observed to return only AFTER thread A's guard has dropped, in every
+    /// run. **What this does NOT prove (sec-1386, naming correction):**
+    /// the test cannot discriminate "the lock genuinely serializes" from
+    /// "flock happens to be exclusive" — without a forced interleave it
+    /// would pass even with the lock call REMOVED (both threads would
+    /// merely race, and this specific assertion sequence is what `flock`
+    /// guarantees, not something this test's CONSTRUCTION forces). It is
+    /// therefore an ACQUISITION check on `platform::lock`'s own semantics,
+    /// not a mutation-provable claim about this module's code. The thing
+    /// that actually closed the round-2 HIGH — the sweep's re-load-and-
+    /// subtract removal, which DOES have a mutation-proven negative control
+    /// (`naive_snapshot_overwrite_would_have_dropped_the_concurrent_entry`)
+    /// — is the right instrument for that claim; this test is a weaker,
+    /// complementary sanity check that both writers reach the SAME lock.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clears_lock_is_acquired_by_both_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = pending_clears_lock_path(dir.path());
+
+        let (order_tx, order_rx) = std::sync::mpsc::channel::<&'static str>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let lock_path_a = lock_path.clone();
+        let order_tx_a = order_tx.clone();
+        let handle_a = std::thread::spawn(move || {
+            let _guard = crate::platform::lock::lock_file(&lock_path_a).unwrap();
+            order_tx_a.send("A-locked").unwrap();
+            release_rx.recv().unwrap(); // held open until the main thread says go
+            order_tx_a.send("A-about-to-release").unwrap();
+            // `_guard` drops here, at the end of this closure — releasing the
+            // lock STRICTLY AFTER the send above (same thread, sequential).
+        });
+
+        // Block here (channel recv, not a sleep) until A confirms it holds
+        // the lock, so B is spawned into a genuinely contended state.
+        assert_eq!(order_rx.recv().unwrap(), "A-locked");
+
+        let lock_path_b = lock_path.clone();
+        let order_tx_b = order_tx;
+        let handle_b = std::thread::spawn(move || {
+            // Blocking acquire: cannot return until A's guard is dropped.
+            let _guard = crate::platform::lock::lock_file(&lock_path_b).unwrap();
+            order_tx_b.send("B-locked").unwrap();
+        });
+
+        // Let A proceed to release. Whether B's flock() call has already
+        // fired or fires later, it cannot succeed before A's drop — so the
+        // next two messages on the shared channel are DETERMINED in order,
+        // not raced for.
+        release_tx.send(()).unwrap();
+
+        let second = order_rx.recv().unwrap();
+        let third = order_rx.recv().unwrap();
+
+        handle_a
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        handle_b
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+
+        assert_eq!(
+            (second, third),
+            ("A-about-to-release", "B-locked"),
+            "B must never observe the lock as free until A's guard has \
+             dropped — any other order means the lock is not exclusive"
+        );
+    }
+
+    /// Security review 1386 LOW: a corrupt queue file logs a WARN rather
+    /// than silently discarding its contents. Non-vacuity: assert the
+    /// corrupt-file case still returns a usable (empty) queue rather than
+    /// panicking — the WARN itself is asserted by inspection of this
+    /// function's structure (fixed error_kind, no secret content), matching
+    /// this module's existing convention for keychain-error logging (no
+    /// dedicated log-capture harness in this crate).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_pending_clears_corrupt_file_degrades_to_empty_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(pending_clears_path(dir.path()), b"not valid json{{{").unwrap();
+        let clears = load_pending_clears(dir.path());
+        assert!(clears.services.is_empty());
+    }
+
+    // ── dead-handle reaper cost predicate ───────────────────────────────
+    // `handle_dir_might_have_anthropic_keychain_item` gates whether
+    // `session::handle_dir::sweep_dead_handles` bothers with a keychain
+    // CLEAR call at all for a dying `term-<pid>` dir. Pure filesystem
+    // logic — no keychain access — so these run on every platform.
+
+    #[test]
+    fn predicate_true_for_anthropic_shaped_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+        assert!(handle_dir_might_have_anthropic_keychain_item(dir.path()));
+    }
+
+    #[test]
+    fn predicate_false_for_non_anthropic_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"openaiAuth":{"token":"x"}}"#,
+        )
+        .unwrap();
+        assert!(!handle_dir_might_have_anthropic_keychain_item(dir.path()));
+    }
+
+    #[test]
+    fn predicate_false_for_missing_credential_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!handle_dir_might_have_anthropic_keychain_item(dir.path()));
+    }
+
+    #[test]
+    fn predicate_false_for_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            dir.path().join("nonexistent-target.json"),
+            dir.path().join(".credentials.json"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(
+            dir.path().join("nonexistent-target.json"),
+            dir.path().join(".credentials.json"),
+        )
+        .unwrap();
+        assert!(!handle_dir_might_have_anthropic_keychain_item(dir.path()));
     }
 
     #[test]

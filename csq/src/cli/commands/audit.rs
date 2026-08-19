@@ -197,7 +197,7 @@ pub(crate) fn emit_eatp_genesis(base_dir: &Path, service: &str) -> Result<()> {
             attestation_ts,
             kailash_canonical_hash: Some(kailash_canonical_hash),
             metadata_json: Some(metadata_json),
-            // #980: side-band witnessed-transparency field, terrene#40-gated;
+            // an internal ticket: side-band witnessed-transparency field, terrene#40-gated;
             // the genesis builder does not populate it.
             subject_hash: None,
         }),
@@ -658,7 +658,7 @@ pub fn handle_compliance_report(base_dir: &Path, html: bool, out: Option<&Path>)
     }
 }
 
-/// Handle `csq audit intent [on|off]` (M6 #909 shard C).
+/// Handle `csq audit intent [on|off]` (M6 an internal ticket shard C).
 ///
 /// Declares or clears the durable **attestation-intent** marker, or (no arg)
 /// prints the current state plus any pre-init queued-decision count. When intent
@@ -737,7 +737,7 @@ fn count_outbox_json(dir: &Path) -> usize {
         .count()
 }
 
-// ── csq audit anchor (#952 S3, an internal ticket) ───────────────────────────────────
+// ── csq audit anchor (an internal ticket S3, an internal ticket) ───────────────────────────────────
 
 /// Handle `csq audit anchor [--json]` — enterprise-only.
 ///
@@ -747,9 +747,9 @@ fn count_outbox_json(dir: &Path) -> usize {
 /// daemon-assigned `canonical_hash`, `chain_id`, `seq`, and
 /// `verification_level`.
 ///
-/// The CLI NEVER computes `canonical_hash` client-side (DIRECTIVE-1, #1057).
+/// The CLI NEVER computes `canonical_hash` client-side (DIRECTIVE-1, an internal ticket).
 ///
-/// Error handling (#952 S3): daemon-response failures are surfaced with
+/// Error handling (an internal ticket S3): daemon-response failures are surfaced with
 /// fixed-vocabulary messages; the untrusted daemon response body is NEVER
 /// interpolated into the error (security.md §2), so no token/path leak is
 /// possible and no redaction step is required.
@@ -1080,7 +1080,7 @@ pub fn handle_verify(
     #[cfg(not(feature = "enterprise"))]
     let enterprise_licensed = true;
 
-    // S4 (#952): look up per-record VerificationLevel when `--record <id>` is supplied.
+    // S4 (an internal ticket): look up per-record VerificationLevel when `--record <id>` is supplied.
     // Delegates to the extracted production fn — NOT an inline duplicate.
     // Community field — NOT enterprise-gated.
     let record_verification_level = lookup_record_verification_level(base_dir, record_id);
@@ -1433,7 +1433,7 @@ mod intent_tests {
     }
 }
 
-/// Tests for the S4 `--record <id>` per-record VerificationLevel lookup (#952).
+/// Tests for the S4 `--record <id>` per-record VerificationLevel lookup (an internal ticket).
 ///
 /// These tests call the PRODUCTION function `lookup_record_verification_level`
 /// directly — no local duplicate. A regression in the production fn fails them.

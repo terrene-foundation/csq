@@ -68,7 +68,7 @@ pub enum SkipReason {
     /// operator-facing output (`security.md` §2). Slot number is available
     /// on `ProbeRecord.slot` — callers do not need to embed it here.
     NoCredentials,
-    /// #534: codex slot has neither identity-store creds (resolved via
+    /// an internal ticket: codex slot has neither identity-store creds (resolved via
     /// `profiles.json::by_slot` → `credentials_codex_path_for`) nor the
     /// legacy `credentials/codex-<N>.json` fallback. Distinct from
     /// `NoCredentials` (which covers Anthropic identity-store absence)
@@ -82,8 +82,8 @@ pub enum SkipReason {
     /// Slot has a spawn-admissible binding marker whose JSON does not
     /// parse (corrupt / written by a newer csq / EACCES). The daemon WILL
     /// attempt a spawn for this slot (Gemini) or the probe would
-    /// mis-route (Codex — pre-#534 the codex-oauth cell read a shared
-    /// user-global file; post-#534 it reads per-identity creds via
+    /// mis-route (Codex — pre-an internal ticket the codex-oauth cell read a shared
+    /// user-global file; post-an internal ticket it reads per-identity creds via
     /// `credentials_codex_path_for`, but the corrupt-binding check
     /// remains load-bearing to surface the legacy file's parse failure
     /// to the operator). Payload uses a fixed-vocabulary `&'static str`
@@ -101,7 +101,7 @@ pub enum SkipReason {
         surface: crate::providers::catalog::Surface,
         kind: &'static str,
     },
-    /// #520: per-slot credential file parses but does not carry the
+    /// an internal ticket: per-slot credential file parses but does not carry the
     /// expected surface variant (specifically: Anthropic-shape
     /// `claudeAiOauth` payload at a `codex-<N>.json` path). The
     /// `observed_kind` field is a fixed-vocabulary tag returned by
@@ -156,13 +156,22 @@ impl SkipReason {
                     ),
                     hint: "fix with `csq logout <N>` then `csq login <N> --provider codex`".into(),
                 },
+                crate::providers::catalog::Surface::Kimi
+                | crate::providers::catalog::Surface::Grok => ProbeDiagnostic {
+                    failed_assertion: "prerequisite: native binding marker parses".into(),
+                    observed_shape: format!(
+                        "native binding marker present but does not parse (corrupt or written by a newer csq); kind: {kind}"
+                    ),
+                    hint: "fix with `csq logout <N>` then `csq login <N> --provider <kimi-cli|grok>`"
+                        .into(),
+                },
                 crate::providers::catalog::Surface::ClaudeCode => unreachable!(
-                    "CorruptBinding is only constructed for Gemini and Codex surfaces"
+                    "CorruptBinding is only constructed for Gemini, Codex, and native surfaces"
                 ),
             },
             // MIRROR the existing CorruptBinding arm above:
             // surface-specific literal strings, `unreachable!()` for non-wired
-            // surfaces. #520 wires Codex only — the `surface` field on
+            // surfaces. an internal ticket wires Codex only — the `surface` field on
             // WrongVariantBinding is forward-compatible per ADR-3, but the dispatch
             // arm is wired ONLY for `Surface::Codex` in this PR. A future Gemini
             // wrong-variant PR MUST add the `Surface::Gemini` arm with Gemini-specific
@@ -176,7 +185,7 @@ impl SkipReason {
                     hint: "fix with `csq logout <N>` then `csq login <N> --provider codex`".into(),
                 },
                 other => unreachable!(
-                    "WrongVariantBinding is only constructed for Codex surface in #520; got {other:?}"
+                    "WrongVariantBinding is only constructed for Codex surface in an internal ticket; got {other:?}"
                 ),
             },
         }
@@ -208,7 +217,7 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
     let bound = is_gemini_bound_slot(base_dir, slot);
     let binding_res = read_binding(base_dir, slot);
 
-    // #515 M3: Codex per-slot signals (read-once invariant).
+    // an internal ticket M3: Codex per-slot signals (read-once invariant).
     // F-int-2 amendment: conditional bind avoids one ENOENT per unbound slot
     // per probe — only loads the credential file when the slot is actually
     // Codex-bound (mirrors the Gemini `binding_res` at line 149 above).
@@ -254,7 +263,7 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
     // §Decided design step 2). Covers: FM-3 (corrupt Gemini + valid
     // Anthropic), FM-5 (corrupt Gemini + corrupt Anthropic), valid Gemini
     // + any credential file at the UUID path. Also covers: corrupt Codex +
-    // valid Anthropic, and valid Codex + valid Anthropic (#515 F1 widening —
+    // valid Anthropic, and valid Codex + valid Anthropic (an internal ticket F1 widening —
     // intentional behaviour change; valid Codex + valid Anthropic now FAILs
     // ambiguous-binding). Placed before the 3P/Codex `discover_all` walks
     // so corrupt slots short-circuit.
@@ -320,16 +329,16 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
     // remain invisible — Step 5 dispatches via `discovery_codex_match`
     // which scans BOTH the legacy `credentials/codex-<N>.json` (Pass 1)
     // AND the identity-store `identities/<UUID>/credentials-codex.json`
-    // (Pass 2). Step 5 routes to `codex_oauth::probe` which post-#534
+    // (Pass 2). Step 5 routes to `codex_oauth::probe` which post-an internal ticket
     // reads per-identity creds; the corrupt legacy file would be
     // silently masked by the healthy identity-store creds, hiding the
     // misconfiguration from the operator. Step 3.5 surfaces the
     // legacy-file failure explicitly so the operator can repair it.
     //
     // Two structurally mutually-exclusive error cases on the same
-    // `codex_load_res` (see synthesis §"Asymmetry with #515"):
-    //   - Some(Err(_))                         → #515 corrupt-binding
-    //   - Some(Ok(cf)) if cf.codex().is_none() → #520 wrong-variant-binding
+    // `codex_load_res` (see synthesis §"Asymmetry with an internal ticket"):
+    //   - Some(Err(_))                         → an internal ticket corrupt-binding
+    //   - Some(Ok(cf)) if cf.codex().is_none() → an internal ticket wrong-variant-binding
     //
     // Both prerequisite-class → exit 64. C2 (Step 2) already short-circuited
     // the `&& anthropic_present` cases for either error class via presence-presence
@@ -397,7 +406,7 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
             "05§5",
             "n/a",
             SkipReason::UnsupportedCell(format!(
-                "3P provider {provider_id} not yet implemented (cells 04-06 cover mm/zai/deepseek; cell 10 covers ollama)"
+                "3P provider {provider_id} not yet implemented (cells 04-06 cover mm/zai/deepseek; kimi-bearer covers kimi; cell 10 covers ollama)"
             )),
         );
     }
@@ -412,12 +421,12 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
             // Try Codex OAuth before giving up — Codex slots are not
             // stored under the Anthropic identity path; the codex-oauth
             // cell resolves its own credential path via the identity
-            // store (post-#534) or legacy `credentials/codex-<N>.json`
+            // store (post-an internal ticket) or legacy `credentials/codex-<N>.json`
             // fallback (pre-A++). The dispatcher's gate is
             // `discovery_codex_match` ALONE — the prior
             // `codex_slot_present(home_dir)` conjunct read
             // `~/.codex/auth.json` which is not csq-managed and was
-            // retired in #534 per `account-terminal-separation.md`
+            // retired in an internal ticket per `account-terminal-separation.md`
             // MUST Rule 4 (diagnostic-daemon parity).
             if discovery_codex_match(base_dir, slot) {
                 return codex_oauth::probe(base_dir, slot);
@@ -508,7 +517,7 @@ pub(super) fn skipped(
 /// file at the resolved UUID path cannot be probed safely; either probe
 /// would surface a misleading result.
 ///
-/// **In-scope leak fix (#514):** the previous version accepted an
+/// **In-scope leak fix (an internal ticket):** the previous version accepted an
 /// `anthropic_path: &Path` argument and interpolated it into
 /// `observed_shape` — a `/Users/<user>/…` path leak (`security.md` §2).
 /// The C2 predicate rewrite makes this branch fire more often; the path
@@ -1066,7 +1075,7 @@ mod tests {
         provision_code_assist_oauth(base, slot).unwrap();
     }
 
-    // ── #515 M3 Codex test helpers ────────────────────────────────────────────
+    // ── an internal ticket M3 Codex test helpers ────────────────────────────────────────────
 
     /// Write a corrupt (unparseable) Codex credential file at
     /// `credentials/codex-<N>.json`. Makes `is_codex_bound_slot` return true
@@ -1118,7 +1127,7 @@ mod tests {
         path
     }
 
-    // ── #520 M3 test helper ───────────────────────────────────────────────────
+    // ── an internal ticket M3 test helper ───────────────────────────────────────────────────
 
     /// Write a wrong-variant (Anthropic-shape `claudeAiOauth`) credential file
     /// at `credentials/codex-<N>.json`. Makes `is_codex_bound_slot` return true
@@ -1137,9 +1146,9 @@ mod tests {
         .unwrap();
     }
 
-    // ── #520 M3 tests — Codex wrong-variant-binding ───────────────────────────
+    // ── an internal ticket M3 tests — Codex wrong-variant-binding ───────────────────────────
 
-    /// AC-1 (#520): canonical Anthropic-shape `credentials/codex-<N>.json` →
+    /// AC-1 (an internal ticket): canonical Anthropic-shape `credentials/codex-<N>.json` →
     /// `codex-wrong-variant-binding` skip, exit 64.
     ///
     /// Fixture: `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"rt",
@@ -1166,7 +1175,7 @@ mod tests {
         assert_eq!(exit_code_for(&[r]), 64);
     }
 
-    /// AC-2 (#520): variant Anthropic-shape `credentials/codex-<N>.json` →
+    /// AC-2 (an internal ticket): variant Anthropic-shape `credentials/codex-<N>.json` →
     /// same `codex-wrong-variant-binding` classification as AC-1.
     ///
     /// Fixture differs from AC-1 in accessToken + scopes, confirming that
@@ -1205,7 +1214,7 @@ mod tests {
         assert_eq!(exit_code_for(&[r]), 64);
     }
 
-    /// AC-9 (#520): wrong-variant Codex + valid Anthropic identity →
+    /// AC-9 (an internal ticket): wrong-variant Codex + valid Anthropic identity →
     /// C2 `ambiguous-binding` Fail (Step 2 fires before Step 3.5).
     ///
     /// `bound_codex == true` (the wrong-variant file exists at the Codex path
@@ -1231,7 +1240,7 @@ mod tests {
         assert_eq!(exit_code_for(&[r]), 1);
     }
 
-    /// AC-10 (#520): wrong-variant Codex + 3P provider settings.json →
+    /// AC-10 (an internal ticket): wrong-variant Codex + 3P provider settings.json →
     /// `codex-wrong-variant-binding` wins (Step 3.5 precedes Step 5).
     ///
     /// Step 3.5 fires on the wrong-variant arm before the Step 5
@@ -1256,7 +1265,7 @@ mod tests {
         assert_eq!(exit_code_for(&[r]), 64);
     }
 
-    /// AC-11 (#520): wrong-variant Codex + corrupt Gemini →
+    /// AC-11 (an internal ticket): wrong-variant Codex + corrupt Gemini →
     /// `gemini-corrupt-binding` wins (Step 3 precedes Step 3.5).
     ///
     /// Step 3 (Gemini corrupt-binding) fires before Step 3.5, so the
@@ -1281,7 +1290,7 @@ mod tests {
         assert_eq!(exit_code_for(&[r]), 64);
     }
 
-    /// AC-12 (#520): wrong-variant Codex + valid Gemini (no Anthropic) →
+    /// AC-12 (an internal ticket): wrong-variant Codex + valid Gemini (no Anthropic) →
     /// valid Gemini dispatch wins (Step 4 precedes Step 3.5).
     ///
     /// Step 4 (valid Gemini binding dispatch) fires before Step 3.5, so the
@@ -1317,7 +1326,7 @@ mod tests {
         );
     }
 
-    // ── #515 M3 tests — Codex corrupt-binding ────────────────────────────────
+    // ── an internal ticket M3 tests — Codex corrupt-binding ────────────────────────────────
 
     /// AC-1 (Codex): malformed JSON `credentials/codex-<N>.json` →
     /// `codex-corrupt-binding` skip, exit 64.
@@ -1416,7 +1425,7 @@ mod tests {
     }
 
     /// AC-8 (Codex): valid Codex credential slot still dispatches to
-    /// `codex_oauth::probe` (Step 5 fall-through). Post-#534 the cell
+    /// `codex_oauth::probe` (Step 5 fall-through). Post-an internal ticket the cell
     /// reads identity-store creds (or legacy `credentials/codex-<N>.json`
     /// via `binding_path` fallback), NOT `~/.codex/auth.json`. The
     /// `stage_valid_codex_credential` helper writes the legacy file at
@@ -1424,7 +1433,7 @@ mod tests {
     /// loads when `resolve_slot_to_uuid` returns None (no by_slot mapping
     /// staged here).
     ///
-    /// **Also covers AC-F2** (#534 pre-A++ legacy fallback through the
+    /// **Also covers AC-F2** (an internal ticket pre-A++ legacy fallback through the
     /// dispatcher). The fixture intentionally stages ONLY the legacy
     /// `credentials/codex-23.json` — no `profiles.json`, no identity-store
     /// `identities/<UUID>/credentials-codex.json`. This is exactly the
@@ -1483,7 +1492,7 @@ mod tests {
 
     /// AC-9b (Codex F1 widening PIN): valid Codex + valid Anthropic →
     /// C2 `ambiguous-binding` Fail. This is an INTENTIONAL behaviour change
-    /// introduced by #515 M3 (presence-presence guard).
+    /// introduced by an internal ticket M3 (presence-presence guard).
     #[test]
     fn valid_codex_plus_valid_anthropic_is_ambiguous() {
         let base = tempfile::tempdir().unwrap();
@@ -1527,7 +1536,7 @@ mod tests {
     }
 
     /// AC-11 (Codex): corrupt Codex + corrupt Gemini → `gemini-corrupt-binding`
-    /// (Step 3 precedes Step 3.5; #514 Gemini precedence preserved).
+    /// (Step 3 precedes Step 3.5; an internal ticket Gemini precedence preserved).
     #[test]
     fn corrupt_codex_plus_corrupt_gemini_is_gemini_corrupt_binding() {
         let base = tempfile::tempdir().unwrap();
@@ -1628,7 +1637,7 @@ mod tests {
         );
     }
 
-    // ── #514 M3 tests — Gemini corrupt-binding ────────────────────────────────
+    // ── an internal ticket M3 tests — Gemini corrupt-binding ────────────────────────────────
 
     /// AC-1: a malformed Gemini marker (garbage JSON) → gemini-corrupt-binding
     /// skip, exit 64.
@@ -1740,9 +1749,9 @@ mod tests {
         );
     }
 
-    /// #516 regression: `SkipReason::NoCredentials` `observed_shape` MUST NOT contain
+    /// an internal ticket regression: `SkipReason::NoCredentials` `observed_shape` MUST NOT contain
     /// any absolute path, OS username, home-dir layout, or UUID-bearing identity-store
-    /// fragment (`security.md` §2). The sibling fix for `ambiguous_binding` (#514) is
+    /// fragment (`security.md` §2). The sibling fix for `ambiguous_binding` (an internal ticket) is
     /// the template — slot number is on `ProbeRecord.slot`; `observed_shape` is
     /// path-free. This test is the AC-1 requirement from an internal ticket.
     ///
@@ -1813,7 +1822,7 @@ mod tests {
         );
     }
 
-    /// #516 regression (UUID-resolved branch): when `profiles.json::by_slot[N]` is
+    /// an internal ticket regression (UUID-resolved branch): when `profiles.json::by_slot[N]` is
     /// populated (UUID resolved) but the identity-store credential file is absent,
     /// the OLD code interpolated the resolved `/Users/<u>/.claude/accounts/identities/
     /// <uuid>/credentials.json` path into `observed_shape` — the actual load-bearing
@@ -2056,7 +2065,7 @@ mod tests {
 
     /// AC-15: corrupt Gemini marker + Codex discovery-matched → gemini-corrupt-binding
     /// (corrupt-binding outranks Codex walk; step 3 precedes discovery_codex_match).
-    /// Post-#534: no longer stages `~/.codex/auth.json` — the retired
+    /// Post-an internal ticket: no longer stages `~/.codex/auth.json` — the retired
     /// `codex_slot_present(home_dir)` gate is gone; the codex discovery
     /// match alone is what could route to Step 5's codex dispatch (which
     /// Step 3 corrupt-Gemini correctly preempts).
@@ -2201,7 +2210,7 @@ mod tests {
         assert_eq!(r.status, ProbeStatus::Fail);
     }
 
-    // ── #534 staging helpers ──────────────────────────────────────────────────
+    // ── an internal ticket staging helpers ──────────────────────────────────────────────────
 
     /// Stage a valid Codex slot with BOTH the legacy + identity-store
     /// credential files. Mirrors what `csq login N --provider codex`
@@ -2250,11 +2259,11 @@ mod tests {
         std::fs::write(&cred_path, json).unwrap();
     }
 
-    // ── #534 M3 tests ─────────────────────────────────────────────────────────
+    // ── an internal ticket M3 tests ─────────────────────────────────────────────────────────
 
     /// M3-2 (F1 + F6): `probe --all` across slots 12 / 16 / 17 (the user's
     /// empirical slot triple from an internal journal entry) routed through different
-    /// cells PER SLOT, derived from per-slot credential state. Pre-#534 all
+    /// cells PER SLOT, derived from per-slot credential state. Pre-an internal ticket all
     /// three slots probed against the shared `~/.codex/auth.json` and
     /// returned IDENTICAL records (only `slot` differed). This test pins
     /// the multi-slot attribution invariant + the F6 mixed-cell pairing:
@@ -2306,7 +2315,7 @@ mod tests {
             r17.cell
         );
 
-        // F1 (negative): the three records would have been IDENTICAL pre-#534
+        // F1 (negative): the three records would have been IDENTICAL pre-an internal ticket
         // (same `~/.codex/auth.json` for all). Now they differ in `cell`.
         // The structural invariant: no two slots share the same cell here.
         assert_ne!(r12.cell, r16.cell);
@@ -2354,7 +2363,7 @@ mod tests {
     }
 
     /// M3-4a (F4): corrupt-binding slot routes to `codex-corrupt-binding`
-    /// cell post-#534, NOT to the new codex-oauth cell. Sibling-compatibility
+    /// cell post-an internal ticket, NOT to the new codex-oauth cell. Sibling-compatibility
     /// pin: the Step 3.5 dispatcher ordering invariant survives the M2-1
     /// refactor.
     #[test]
@@ -2379,7 +2388,7 @@ mod tests {
     }
 
     /// M3-4b (F4): wrong-variant slot routes to `codex-wrong-variant-binding`
-    /// cell post-#534, NOT to the new codex-oauth cell.
+    /// cell post-an internal ticket, NOT to the new codex-oauth cell.
     #[test]
     fn wrong_variant_codex_binding_routes_to_wrong_variant_cell_after_refactor() {
         let base = tempfile::tempdir().unwrap();
@@ -2443,7 +2452,7 @@ mod tests {
     ///
     /// Direct call to `codex_oauth::probe` — the dispatcher's Step 5 gate
     /// requires `discovery_codex_match` which won't fire when neither
-    /// channel parses. Per #534 the cell's resilience is the load-bearing
+    /// channel parses. Per an internal ticket the cell's resilience is the load-bearing
     /// invariant being pinned.
     ///
     /// **Mutation-resistance note:** this test does NOT stage a

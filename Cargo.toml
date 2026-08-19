@@ -109,7 +109,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.2"
 security-framework = "3"
 # `zeroize` pins the SigningKey seed-scrub-on-drop guarantee that M-DEK's seat

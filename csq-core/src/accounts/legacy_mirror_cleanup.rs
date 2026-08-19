@@ -8,7 +8,7 @@
 //! from pre-M4-12 builds on disk. They are inert (no daemon path reads them
 //! when `by_slot[N]` resolves) but trip the `LegacyCanonicalCredentialsFile*`
 //! bridge detectors in `csq doctor`, blocking WINDOW-CLOSE P1 from clearing
-//! and gating RN1-F (gh #292) structurally.
+//! and gating RN1-F (gh an internal ticket) structurally.
 //!
 //! This module ships `prune_legacy_credential_mirrors` — the paired
 //! reconciler-cleanup half of the M4-12 retirement contract.
@@ -222,10 +222,13 @@ fn classify_mirror(
     let identity_path = match surface {
         Surface::ClaudeCode => credentials_path_for(base_dir, uuid),
         Surface::Codex => credentials_codex_path_for(base_dir, uuid),
-        // Gemini is rejected at `classify_filename` (filename pattern). The
-        // arm here is unreachable in practice; matching it explicitly keeps
-        // the compiler check on the Surface enum if a future variant lands.
-        Surface::Gemini => return Action::Keep(KeptReason::NoBySlotMapping),
+        // Gemini + native-CLI surfaces (Kimi/Grok) are rejected at
+        // `classify_filename` (filename pattern) and have no legacy numeric
+        // mirror. Unreachable in practice; the explicit arm keeps the compiler
+        // check on the Surface enum.
+        Surface::Gemini | Surface::Kimi | Surface::Grok => {
+            return Action::Keep(KeptReason::NoBySlotMapping)
+        }
     };
 
     // arm (b2): identity file absent → KEEP. The Phase-4 gate refuses

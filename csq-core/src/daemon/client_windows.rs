@@ -143,18 +143,35 @@ pub async fn http_get_pipe_with_timeout(
 }
 
 /// Issues a `POST path_and_query` with an empty body against the
-/// daemon's named pipe.
+/// daemon's named pipe, with an empty body.
 ///
-/// Currently has NO production callers: the non-unix
-/// `notify_daemon_cache_invalidation` paths in `swap`/`logout`/`login` are
-/// still explicit no-ops, so `csq swap` never calls this on any platform.
-/// The Windows named-pipe daemon itself IS wired end to end (#786 — start /
-/// stop / status round-trip); wiring these cache-invalidation notify
-/// callers onto `http_post_pipe` is a separate follow-up. Re-exported from
-/// `daemon::mod` as the client primitive for that work.
+/// Production caller: `csq_core::daemon::notify::cache_invalidation` (issue
+/// an internal ticket) bridges this async fn onto the sync CLI notify chokepoint via a
+/// short-lived current-thread tokio runtime.
 pub async fn http_post_pipe(
     pipe_path: &Path,
     path_and_query: &str,
+) -> Result<DaemonResponse, DaemonClientError> {
+    http_post_pipe_impl(pipe_path, path_and_query, None).await
+}
+
+/// Issues a `POST path_and_query` with a JSON body against the daemon's
+/// named pipe. The Windows counterpart of `client::http_post_unix_json`.
+///
+/// Production caller: `csq_core::daemon::notify::slot_swap` (an internal ticket),
+/// which sends `POST /api/slot-swap {"from":N,"to":M}`.
+pub async fn http_post_pipe_json(
+    pipe_path: &Path,
+    path_and_query: &str,
+    json_body: &str,
+) -> Result<DaemonResponse, DaemonClientError> {
+    http_post_pipe_impl(pipe_path, path_and_query, Some(json_body)).await
+}
+
+async fn http_post_pipe_impl(
+    pipe_path: &Path,
+    path_and_query: &str,
+    json_body: Option<&str>,
 ) -> Result<DaemonResponse, DaemonClientError> {
     validate_path_and_query(path_and_query)?;
 
@@ -165,13 +182,25 @@ pub async fn http_post_pipe(
         .open(pipe_path)
         .map_err(DaemonClientError::Connect)?;
 
-    let request = format!(
-        "POST {path_and_query} HTTP/1.1\r\n\
-         Host: localhost\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\
-         \r\n"
-    );
+    let request = match json_body {
+        Some(body) => format!(
+            "POST {path_and_query} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            len = body.len(),
+        ),
+        None => format!(
+            "POST {path_and_query} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\
+             \r\n"
+        ),
+    };
 
     tokio::time::timeout(DEFAULT_TIMEOUT, client.write_all(request.as_bytes()))
         .await

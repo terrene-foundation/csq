@@ -8,7 +8,14 @@
   --bg-tertiary: #3A3835;
   --text-primary: #E0DDD8;
   --text-secondary: #9A958F;
-  --text-tertiary: #6B6358;
+  /* F3 (i-audit/i-harden) — #6B6358 measured 2.61-2.66:1 on --bg-secondary,
+     well under the 4.5:1 AA floor. Lightness raised, hue/saturation held —
+     #938A7C measures 4.62:1 on #242320. This token drives TokenBadge's
+     "No token" state, .quota-pending-label, .balance-label,
+     .native-quota-label, .gemini-quota-na, .reset-info countdowns, and the
+     inactive .sort-pill (all consume var(--text-tertiary), so this single
+     edit covers every callsite). */
+  --text-tertiary: #938A7C;
   --border: #3A3835;
   --accent: #D9A55C;
   --accent-hover: #E8C48A;
@@ -30,7 +37,9 @@
     --bg-tertiary: #D5D0C8;
     --text-primary: #2E2E2C;
     --text-secondary: #6B6358;
-    --text-tertiary: #9E968E;
+    /* F3 — #9E968E measured 2.47-2.50:1 on --bg-secondary. Lightness
+       lowered, hue/saturation held — #706860 measures 4.64:1 on #EFECE7. */
+    --text-tertiary: #706860;
     --border: #D5D0C8;
     --accent: #805A10;
     --accent-hover: #6B4C0D;
@@ -59,3 +68,45 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/* F6 (i-audit/i-harden) — prefers-reduced-motion was honored in exactly 1 of
+   15 components (AddAccountModal's liveness spinner) before this rule.
+   Global floor: every animation/transition in the app collapses to a single
+   frame for users who have this OS preference set, including UsageBar's
+   `width 0.3s ease` (fires on every poll-driven quota update) and every
+   other component this codebase ships. Near-zero duration (not `0s`/`none`)
+   so animationend/transitionend listeners still fire — components that key
+   state changes off those events (e.g. a "just saved" flash) keep working. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* F3 — white-on-accent (dark theme #D9A55C: 2.21:1) and white-on-red (dark
+   theme #E8675C: 3.25:1) both fail AA. Rather than darken --accent/--red
+   globally (28+ other callsites use var(--accent) as TEXT on dark
+   backgrounds, where darkening would REDUCE their contrast), the fix is
+   per-callsite: swap the hardcoded `color: white` / `color: #fff` foreground
+   for `color: var(--bg-primary)`. --bg-primary already flips per theme
+   (#1A1918 dark / #FFFFFF light), so one substitution passes both themes
+   without a new token:
+     dark:  var(--bg-primary) #1A1918 on accent #D9A55C = 7.93:1
+     light: var(--bg-primary) #FFFFFF on accent #805A10 = 6.20:1
+     dark:  var(--bg-primary) #1A1918 on red    #E8675C = 5.46:1
+     light: var(--bg-primary) #FFFFFF on red    #B5443A = 5.45:1
+   Applied in Header.svelte (.edition.enterprise) and AddAccountModal.svelte
+   (`.actions button.primary` — the submit/continue/retry/done action shared
+   across every step of the modal). UpdateBanner.svelte already used
+   this exact pattern (`color: var(--bg-primary)`) before this fix — this
+   generalizes an existing correct pattern rather than inventing a new one.
+   AccountList.svelte's `.renumber-picker .primary` and `.remove-btn.armed`
+   (owned by a sibling shard) and ChangeModelModal.svelte / PolicyConsole.svelte
+   / InteractiveConsole.svelte (out of this shard's file ownership) hardcode
+   the same `color: white` / `color: #fff` on var(--accent) and need the
+   identical one-line swap — NOT done here; flagged for follow-up. */

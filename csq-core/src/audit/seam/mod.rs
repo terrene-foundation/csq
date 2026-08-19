@@ -41,8 +41,8 @@ pub mod registry;
 
 // Public API surface re-exported from seam.
 pub use capture_matrix::{
-    build_capture_matrix, emit_matrix_record, matrix_content_hash, read_last_hash,
-    sidecar_dedup_key, write_last_hash,
+    build_capture_matrix, emit_matrix_record, emit_startup_capture_matrix, matrix_content_hash,
+    read_last_hash, sidecar_dedup_key, write_last_hash,
 };
 pub use error::{RejectReason, SeamError};
 pub use frontier::ValidatedEnvelope;

@@ -108,10 +108,10 @@ struct SeedEntryPayload {
     /// The `KeyId` of the signing key bound to this cutoff.
     /// Used by `verify_chain` to detect `chain.json` tampering.
     signing_key_id: String,
-    /// Keychain-anchored copy of `chain.json::roster_version_floor` (#694
+    /// Keychain-anchored copy of `chain.json::roster_version_floor` (an internal ticket
     /// item 2). Additive-optional: entries written before this field exist
     /// parse as `None` (`serde(default)`), and the field is omitted when
-    /// `None` so pre-#694 binaries' `deny_unknown_fields` readers are only
+    /// `None` so pre-an internal ticket binaries' `deny_unknown_fields` readers are only
     /// affected AFTER a roster install writes the floor (documented rollback
     /// caveat in spec 12 §12.16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1342,7 +1342,7 @@ mod tests {
     /// `roster_version_floor: None` — backward compatibility.
     #[test]
     fn embedded_cutoff_legacy_json_no_floor_returns_none() {
-        // Arrange — JSON as written by pre-#694 code (no roster_version_floor key).
+        // Arrange — JSON as written by pre-an internal ticket code (no roster_version_floor key).
         let legacy = r#"{
             "signing_active_since_seq": 0,
             "signing_key_id": "key-abc123",
@@ -1357,7 +1357,7 @@ mod tests {
         let ec = result.expect("must parse").expect("must be Some");
         assert_eq!(
             ec.roster_version_floor, None,
-            "pre-#694 JSON must yield None floor"
+            "pre-an internal ticket JSON must yield None floor"
         );
         assert_eq!(ec.signing_key_id, "key-abc123");
         assert_eq!(ec.signing_active_since_seq, 0);
@@ -1366,7 +1366,7 @@ mod tests {
     /// JSON with `roster_version_floor` set parses the value correctly.
     #[test]
     fn embedded_cutoff_with_floor_parses_correctly() {
-        // Arrange — JSON as written by post-#694 roster-install.
+        // Arrange — JSON as written by post-an internal ticket roster-install.
         let with_floor = r#"{
             "signing_active_since_seq": 5,
             "signing_key_id": "key-def456",

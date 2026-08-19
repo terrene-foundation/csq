@@ -202,7 +202,7 @@ pub fn http_post_unix_json(
 /// Issues a `POST path_and_query` with a JSON body AND caller-supplied
 /// extra request headers against the daemon's Unix socket.
 ///
-/// Used by the interactive per-turn enforcement client (#793) to carry the
+/// Used by the interactive per-turn enforcement client (an internal ticket) to carry the
 /// daemon-minted `X-CSQ-Session-Key` capability header on
 /// `/api/interactive/{submit,override,abandon,close}` calls.
 ///
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn validate_header_field_rejects_crlf() {
         // CR, LF, and a full CRLF-injection payload must all be rejected so a
-        // client-echoed session key cannot smuggle extra headers (#793).
+        // client-echoed session key cannot smuggle extra headers (an internal ticket).
         assert!(validate_header_field("ok\rval").is_err());
         assert!(validate_header_field("ok\nval").is_err());
         let err = validate_header_field("key\r\nEvil-Header: value").unwrap_err();

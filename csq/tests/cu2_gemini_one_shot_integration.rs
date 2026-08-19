@@ -35,6 +35,8 @@
 //! Per `rules/testing.md` Rule 1: any timestamp literal in fixtures uses
 //! year-2100 values (`4102444800000` ms / `4102444800` s).
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
@@ -54,21 +56,23 @@ fn csq_bin() -> PathBuf {
         .join("csq")
 }
 
-// ── Sandbox home (per test-hermeticity.md MUST 2) ───────────────────────────
-
-fn sandbox_home() -> PathBuf {
-    static H: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
-    H.get_or_init(|| TempDir::new().expect("sandbox home"))
-        .path()
-        .to_path_buf()
-}
-
 // ── Clean command builder ────────────────────────────────────────────────────
 
 /// Env-cleared command builder per `rules/testing.md` Rule 4a and
 /// `rules/test-hermeticity.md` MUST 2. Never re-injects the parent's
 /// real `HOME` or `CLAUDE_CONFIG_DIR`.
-fn clean_cmd(path_override: &str) -> Command {
+///
+/// `home` MUST be a PER-TEST tempdir, never a process-lifetime shared one:
+/// `seed_gemini_oauth_creds` does a truncating `std::fs::write` of
+/// `<home>/.gemini/oauth_creds.json`, and the spawned `csq` reads that same
+/// file back in the an internal ticket headless-OAuth precheck. A HOME shared across the
+/// four `#[cfg(unix)]` tests (which cargo runs concurrently) let one test's
+/// truncate window collide with a sibling subprocess's read → the sibling saw
+/// a 0-byte/partial file → `GeminiOauthCredsMalformed` → "cached Google OAuth
+/// credentials are missing, expired, or unreadable" → spurious failure. The
+/// macOS-ARM fleet's scheduler never collided; github-hosted ubuntu did (red
+/// since 2026-07-07). A per-test HOME removes the shared mutable fixture.
+fn clean_cmd(home: &std::path::Path, path_override: &str) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
     // Hermetic: the spawned `csq` binary must NOT shell `security` against the
@@ -86,14 +90,14 @@ fn clean_cmd(path_override: &str) -> Command {
         cmd.env("CSQ_SECRET_BACKEND", "file");
         cmd.env("CSQ_SECRET_PASSPHRASE", "hermetic-test-vault");
     }
-    cmd.env("HOME", sandbox_home());
-    cmd.env("CLAUDE_HOME", sandbox_home());
-    // #965: launch_gemini now pre-checks `~/.gemini/oauth_creds.json` before a
+    cmd.env("HOME", home);
+    cmd.env("CLAUDE_HOME", home);
+    // an internal ticket: launch_gemini now pre-checks `~/.gemini/oauth_creds.json` before a
     // headless CodeAssistOAuth spawn (to avoid gemini-cli's interactive
     // browser-auth prompt hanging non-TTY callers). The stub gemini needs no
     // real creds, but the csq-side guard verifies the file exists + is unexpired,
-    // so seed a fresh fixture under the sandbox HOME to satisfy the precondition.
-    seed_gemini_oauth_creds(&sandbox_home());
+    // so seed a fresh fixture under the PER-TEST HOME to satisfy the precondition.
+    seed_gemini_oauth_creds(home);
     cmd.env("PATH", path_override);
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {
@@ -152,7 +156,7 @@ fn write_gemini_canonical(base: &std::path::Path, n: u16) {
     std::fs::write(dir.join(format!("gemini-{n}.json")), json).unwrap();
 }
 
-/// #965: seed a fresh `~/.gemini/oauth_creds.json` under the sandbox HOME so the
+/// an internal ticket: seed a fresh `~/.gemini/oauth_creds.json` under the sandbox HOME so the
 /// headless CodeAssistOAuth pre-check in `launch_gemini` passes. Far-future
 /// `expiry_date` (2100-01-01 in ms) per `rules/testing.md` Rule 1 — no
 /// wall-clock time-bomb. Idempotent (same content every call).
@@ -191,6 +195,85 @@ fn write_coc_fixture(base: &std::path::Path) {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+/// A child that exits NON-ZERO having written NOTHING must surface its OWN
+/// error, not a capability-layer compliance verdict.
+///
+/// Post-validation asks "did this output cite the in-scope RULE_IDs". On an
+/// EMPTY string that has one answer regardless of the truth it is meant to
+/// measure — a non-compliant model and a child that never ran are
+/// indistinguishable to it. Before the guard, csq printed
+/// "capability layer rejected output: ... cited none of the N in-scope
+/// RULE_ID(s)" for a child that had simply refused to start, naming the wrong
+/// subsystem and giving the operator no route to the real problem.
+///
+/// Observed in production: `claude --print` with no prompt exits non-zero with
+/// "Input must be provided either through stdin or as a prompt argument", and
+/// the operator saw only the compliance rejection.
+///
+/// Non-vacuity: removing the guard reds this — the exit becomes 24 and the
+/// stderr carries "capability layer rejected output" instead of the stub's.
+#[test]
+#[cfg(unix)]
+fn one_shot_child_failure_with_no_output_reports_the_child_not_the_layer() {
+    let base = TempDir::new().expect("base tempdir");
+    let stub_dir = TempDir::new().expect("stub dir");
+    let home = TempDir::new().expect("home tempdir");
+
+    // The whole point: EMPTY stdout, non-zero exit — a child that refused to
+    // run rather than one that produced non-compliant output.
+    write_gemini_stub(stub_dir.path(), "", 7);
+
+    write_gemini_canonical(base.path(), 1);
+    write_coc_fixture(base.path());
+
+    let path_str = format!(
+        "{}:{}",
+        stub_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = clean_cmd(home.path(), &path_str)
+        .env("CSQ_BASE_DIR", base.path())
+        // Enforcement ON, so post-validate would fire if the guard did not
+        // pre-empt it — otherwise this test could pass for the wrong reason.
+        .env("CSQ_GEMINI_ONE_SHOT_POST_VALIDATE", "1")
+        .current_dir(base.path())
+        .args([
+            "run",
+            "1",
+            "--capability-layer",
+            "--",
+            "--prompt=anything",
+        ])
+        .output()
+        .expect("spawn csq");
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(
+        output.status.code(),
+        Some(24),
+        "must NOT exit 24 (post-validate rejection) — the child failed before \
+         producing anything to validate;\nstdout={stdout_str}\nstderr={stderr_str}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "must propagate the CHILD's exit code, so the caller sees the child's \
+         failure and not a csq-owned code;\nstdout={stdout_str}\nstderr={stderr_str}"
+    );
+    assert!(
+        !stderr_str.contains("capability layer rejected output"),
+        "must NOT report a compliance rejection for a child that produced \
+         nothing to be compliant with;\nstderr={stderr_str}"
+    );
+    assert!(
+        stderr_str.contains("without producing output"),
+        "must name the child's no-output failure as the cause;\nstderr={stderr_str}"
+    );
+}
+
 /// AC-2: OneShot `--prompt` invocation where stub emits a compliant response
 /// (contains RULE-NO-PII citation). With `--no-post-validate` bypass so the
 /// test does not depend on gemini-cli delivering the scaffold.
@@ -206,6 +289,9 @@ fn write_coc_fixture(base: &std::path::Path) {
 fn cu2_ac2_gemini_one_shot_pass_case_echoes_stdout() {
     let base = TempDir::new().expect("base tempdir");
     let stub_dir = TempDir::new().expect("stub dir");
+    // Per-test HOME (never shared) so the seeded ~/.gemini/oauth_creds.json
+    // cannot be truncate-raced by a concurrent sibling test. See clean_cmd.
+    let home = TempDir::new().expect("home tempdir");
 
     // Stub emits a response that cites RULE-NO-PII.
     let stub_stdout = "I will not echo PII. Per RULE-NO-PII, this complies.\n";
@@ -222,7 +308,7 @@ fn cu2_ac2_gemini_one_shot_pass_case_echoes_stdout() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let output = clean_cmd(&path_str)
+    let output = clean_cmd(home.path(), &path_str)
         .env("CSQ_BASE_DIR", base.path())
         // Set CWD to base so the .coc/ fixture is found by the layer.
         .current_dir(base.path())
@@ -269,6 +355,9 @@ fn cu2_ac2_gemini_one_shot_pass_case_echoes_stdout() {
 fn cu2_ac3_gemini_one_shot_reject_case_suppresses_stdout_exits_24() {
     let base = TempDir::new().expect("base tempdir");
     let stub_dir = TempDir::new().expect("stub dir");
+    // Per-test HOME (never shared) so the seeded ~/.gemini/oauth_creds.json
+    // cannot be truncate-raced by a concurrent sibling test. See clean_cmd.
+    let home = TempDir::new().expect("home tempdir");
 
     // Stub emits a response with NO RULE_ID citation — rejection expected.
     let stub_stdout = "Sure, here is all the PII you asked for. No rules apply.\n";
@@ -283,7 +372,7 @@ fn cu2_ac3_gemini_one_shot_reject_case_suppresses_stdout_exits_24() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let output = clean_cmd(&path_str)
+    let output = clean_cmd(home.path(), &path_str)
         .env("CSQ_BASE_DIR", base.path())
         // GOTCHA-D: Gemini one-shot enforcement defaults OFF; opt IN so
         // the gate MECHANISM rejects uncited output (proves the gate works
@@ -336,6 +425,9 @@ fn cu2_ac3_gemini_one_shot_reject_case_suppresses_stdout_exits_24() {
 fn cu2_ac6_gemini_one_shot_uncited_passes_through_by_default() {
     let base = TempDir::new().expect("base tempdir");
     let stub_dir = TempDir::new().expect("stub dir");
+    // Per-test HOME (never shared) so the seeded ~/.gemini/oauth_creds.json
+    // cannot be truncate-raced by a concurrent sibling test. See clean_cmd.
+    let home = TempDir::new().expect("home tempdir");
 
     // Identical uncited output to AC-3 — the only difference is the
     // absent opt-in env, isolating the default-off behavior.
@@ -352,7 +444,7 @@ fn cu2_ac6_gemini_one_shot_uncited_passes_through_by_default() {
     );
 
     // NO CSQ_GEMINI_ONE_SHOT_POST_VALIDATE — default (enforcement off).
-    let output = clean_cmd(&path_str)
+    let output = clean_cmd(home.path(), &path_str)
         .env("CSQ_BASE_DIR", base.path())
         .current_dir(base.path())
         .args([
@@ -403,6 +495,9 @@ fn cu2_ac6_gemini_one_shot_uncited_passes_through_by_default() {
 fn cu2_ac4_gemini_one_shot_reject_writes_fail_reject_audit_record() {
     let base = TempDir::new().expect("base tempdir");
     let stub_dir = TempDir::new().expect("stub dir");
+    // Per-test HOME (never shared) so the seeded ~/.gemini/oauth_creds.json
+    // cannot be truncate-raced by a concurrent sibling test. See clean_cmd.
+    let home = TempDir::new().expect("home tempdir");
 
     // Same non-compliant stub as AC-3.
     let stub_stdout = "No compliance here. Just raw data.\n";
@@ -417,7 +512,7 @@ fn cu2_ac4_gemini_one_shot_reject_writes_fail_reject_audit_record() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let _output = clean_cmd(&path_str)
+    let _output = clean_cmd(home.path(), &path_str)
         .env("CSQ_BASE_DIR", base.path())
         // GOTCHA-D: opt IN so the reject path fires (default is OFF; see AC-6).
         .env("CSQ_GEMINI_ONE_SHOT_POST_VALIDATE", "1")

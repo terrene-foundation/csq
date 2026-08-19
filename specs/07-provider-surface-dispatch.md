@@ -1,6 +1,6 @@
 # 07 Provider Surface Dispatch
 
-Spec version: 1.6.0 | Status: DRAFT | Governs: per-surface on-disk layout, spawn command, login flow, quota dispatch, model-config key, cross-surface operations
+Spec version: 1.8.0 | Status: DRAFT | Governs: per-surface on-disk layout, spawn command, login flow, quota dispatch, model-config key, cross-surface operations
 
 ---
 
@@ -29,6 +29,8 @@ pub enum Surface {
     ClaudeCode,
     Codex,
     Gemini,
+    Kimi,   // native-CLI session surface (self-authenticating; §7.2.4)
+    Grok,   // native-CLI session surface (self-authenticating; §7.2.4)
 }
 
 pub struct Provider {
@@ -47,6 +49,8 @@ pub enum ModelConfigTarget {
     SettingsModelName,      // Gemini: model.name in .gemini/settings.json
 }
 ```
+
+`Surface::Kimi` (`kimi`) and `Surface::Grok` (`grok`) are **native-CLI session surfaces**: self-authenticating vendor binaries csq dispatches sessions to but whose credentials it NEVER stores. `Surface::is_native_cli()` is the single predicate every launch/detection consumer branches on. They do NOT populate the `Provider` fields above and are NOT entries in `catalog::PROVIDERS` (Design B — isolation); they carry a dedicated descriptor (`csq-core/src/providers/native.rs`) and share ONLY the `Surface` dispatch axis. See §7.2.4.
 
 ### 7.1.2 Dispatch tables
 
@@ -286,7 +290,7 @@ When the capability layer engages on a Gemini slot AND the parent env carries pr
 
 #### 7.2.2.2 Codex statusline (`tui.status_line`) injection
 
-Codex renders a native TUI footer (the `/statusline` feature; openai/codex an internal ticket, in codex-cli ≥ the Feb-2026 release — verified against 0.142.3) from an ordered array of built-in item IDs at `[tui] status_line` in `config.toml`. This is NOT an external-command hook: codex never invokes a command and pipes no JSON, so csq cannot inject a csq-rendered line the way `csq statusline` does for `Surface::ClaudeCode` (that would require the unshipped openai/codex #17827).
+Codex renders a native TUI footer (the `/statusline` feature; openai/codex an internal ticket, in codex-cli ≥ the Feb-2026 release — verified against 0.142.3) from an ordered array of built-in item IDs at `[tui] status_line` in `config.toml`. This is NOT an external-command hook: codex never invokes a command and pipes no JSON, so csq cannot inject a csq-rendered line the way `csq statusline` does for `Surface::ClaudeCode` (that would require the unshipped openai/codex an internal ticket).
 
 `render_config_toml_with_global` therefore injects csq's curated default into the slot's `config.toml` when the user has not configured one:
 
@@ -332,6 +336,64 @@ On Unix, the re-stat window is **microseconds** (post `rename(2)`). On Windows, 
 
 - `csq-core/src/coc/translate/codex_merge.rs` — pure data merge.
 - `csq/src/cli/commands/run.rs::materialize_handle_config_toml_with_instructions` + `verify_codex_handle_config_toml_is_regular_file` — orchestration.
+
+### 7.2.4 `Surface::Kimi` / `Surface::Grok` (native-CLI session surfaces)
+
+Kimi (`kimi`) and Grok (`grok`) are **native-CLI session surfaces**: self-authenticating vendor binaries csq dispatches sessions to but whose credentials it **never stores**. They are additive beyond the original three spawn-model surfaces (§7.0) and are the exact structural analog of the Gemini Code Assist OAuth slot (§7.3.4 Path C) — a credential-less binding marker keys the slot; the vendor CLI owns the real auth.
+
+**Design B — isolated from the `PROVIDERS` machinery.** Native surfaces are NOT entries in `catalog::PROVIDERS` (the Bearer/OAuth catalog) and do NOT populate the §7.1.2 Provider dispatch tables (`home_env_var`, `home_subdir`, `ModelConfigTarget`, `QuotaKind`). They share ONLY the `Surface` dispatch axis. Their static descriptor lives in `csq-core/src/providers/native.rs` — `NativeCli` with the two instances `KIMI` + `GROK` and the ordered `NATIVE_CLIS` slice — carrying `{surface, id, binary, display_name, default_model, surface_cli}`.
+
+| Surface         | id (`--provider` / picker) | binary | vendor auth home              | default_model (display-only) |
+| --------------- | -------------------------- | ------ | ----------------------------- | ---------------------------- |
+| `Surface::Kimi` | `kimi-cli`                 | `kimi` | `~/.kimi-code/` (device-code) | `kimi-for-coding`            |
+| `Surface::Grok` | `grok`                     | `grok` | `~/.grok/auth.json` (OIDC)    | (vendor-selected; none)      |
+
+The `kimi-cli` id is deliberately distinct from the Bearer 3P provider `id="kimi"` (which runs `claude` with `ANTHROPIC_BASE_URL=api.kimi.com` and classifies as `Surface::ClaudeCode`). csq neither pins nor reliably knows the model the vendor CLI selects at runtime — `default_model` is display-only for the picker.
+
+**On-disk layout — credential-less binding marker only.**
+
+```
+credentials/kimi-<N>.json     (binding marker; 0600; NO secret)
+credentials/grok-<N>.json     (binding marker; 0600; NO secret)
+term-<pid>/                    (ephemeral; minimal — only .csq-account)
+└── .csq-account              (the slot number)
+
+# NO config-<N>/ is created. NO credential file is written. The vendor CLI's own
+# home (~/.kimi-code/, ~/.grok/) holds the real auth end-to-end; csq never reads,
+# writes, refreshes, or fans it out.
+```
+
+Marker schema (`NativeBinding`, `native.rs`; `NATIVE_BINDING_SCHEMA_VERSION = 1`):
+
+```json
+{ "v": 1, "surface": "kimi", "created_unix_secs": 1752000000 }
+```
+
+- `v` — schema version; `read_binding` refuses an unknown value (the slot is then treated as unbound, mirroring the Gemini marker reader).
+- `surface` — `"kimi"` / `"grok"`, matching `Surface::as_str`.
+- `created_unix_secs` — provisioning timestamp; diagnostic only (nothing in csq compares against it).
+
+The marker path is `credentials/{kimi,grok}-<N>.json`, resolved by `credentials::file::canonical_path_for(base, slot, surface)` (same shape as the Gemini / Codex binding markers). The marker's **existence** is the entire signal — it carries no payload.
+
+**INV-P02 inversion (§7.5).** Native surfaces are the non-refreshable class: like Gemini API-key slots, `csq run N` on a native slot does NOT require the daemon, performs NO token refresh, NO credential fanout, and creates NO `config-<N>/`. Launch mirrors the Gemini template: build the host-isolation context (surfaced per §7.2.3.3), run the capability-layer pre-flight, assert the binding marker exists, create the minimal `term-<pid>` handle dir (only `.csq-account`), then `exec` the vendor binary (`kimi` / `grok`) inheriting the parent environment + cwd. The vendor binary self-authenticates against its own home.
+
+**Binary resolution.** The `kimi` / `grok` binary is resolved via `$PATH` first, then the fixed per-user fallback `~/.kimi-code/bin` (kimi) / `~/.grok/bin` (grok) — `csq-core/src/cli_deps/install_path.rs::known_install_dirs`. The fallback exists because these CLIs add their bin dir to the interactive-shell PATH via a profile edit that a csq subprocess under a minimal PATH may not inherit.
+
+**Capability-layer routing.** Native kimi/grok auto-load `AGENTS.md` (the Codex baseline file), so their `.coc/` capability-layer translation routes through the **Codex (AGENTS.md) translator** — the same native-materialization shape as `Surface::Codex` (§7.2.2.1). Agents/commands/rules that codex delivers as prose are delivered the same way here.
+
+**Audit tag.** A native session records `surface = "kimi"` / `"grok"` in the run audit record (matching `Surface::as_str`).
+
+**Discovery visibility.** csq's account discovery lists a native slot when its binding marker exists — `providers::native::native_surface_for_slot(base, slot)` is the detection primitive — surfaced in the OAuth-first discovery band alongside Gemini bindings, so a native slot appears in `csq ls` / the desktop dashboard by marker existence, never by a guessed name (`account-terminal-separation.md` MUST-4).
+
+**Conflict guard.** A native provision refuses to clobber a slot already bound to another surface: `providers::native::conflicting_bound_surface(base, slot, target)` returns the existing surface (Codex / Anthropic OAuth / Gemini / a 3P-bearer slot / the OTHER native surface) or `None` when the slot is free or already bound to `target` (an idempotent re-provision).
+
+**Cross-references.**
+
+- `csq-core/src/providers/native.rs` — descriptor + marker lifecycle (`write_binding` / `read_binding` / `marker_path` / `native_surface_for_slot` / `conflicting_bound_surface`).
+- `csq-core/src/providers/catalog.rs::Surface::{Kimi, Grok, is_native_cli, as_str}` — dispatch axis.
+- `csq-core/src/cli_deps/install_path.rs::known_install_dirs` — binary-resolution fallback.
+- §7.3.4 Path C — the Gemini credential-less-marker analog this design mirrors.
+- §7.5 INV-P02 — the daemon-independence inversion native surfaces inherit.
 
 ## 7.3 Per-surface login and setup
 
@@ -409,6 +471,23 @@ After this prerequisite, `~/.gemini/oauth_creds.json` exists with shape `{access
 (Every Path C user is "manual" in the sense that they run `gemini` interactively outside csq. The desktop and CLI commands above are the binding-recording verbs.)
 
 **Convention:** `csq login` is the verb for all OAuth (browser-driven) provisioning — Claude Max OAuth (`csq login N`, default), Codex device-auth (`csq login N --provider codex`), and Gemini Code Assist (`csq login N --provider gemini`). `csq setkey` is for non-OAuth credential paths — paste-a-key (Claude direct API, AI Studio, MiniMax/Z.AI/DeepSeek Bearer) or pick-a-file (Vertex SA), plus keyless (Ollama). API-key + Vertex SA Gemini paths stay on `setkey`; OAuth Gemini moves to `login`.
+
+### 7.3.5 `Surface::Kimi` / `Surface::Grok` (native CLI)
+
+Native surfaces are provisioned by RECORDING a binding, never by capturing a credential — the vendor CLI owns its own sign-in.
+
+`csq login N --provider kimi-cli|grok`:
+
+1. Assert the vendor CLI is present + authenticated out-of-band (kimi: device-code sign-in completed, creds under `~/.kimi-code/`; grok: OIDC done, `~/.grok/auth.json` present). csq does NOT drive the vendor sign-in — the user runs the vendor CLI's own login first, exactly as Gemini Path C requires a prior interactive `gemini`.
+2. Conflict-guard: `providers::native::conflicting_bound_surface(base, N, target)` MUST return `None` (slot free, or an idempotent same-surface re-provision) — otherwise login refuses rather than clobber an existing Codex / Anthropic / Gemini / 3P / other-native binding.
+3. Write the credential-less marker `credentials/{kimi,grok}-<N>.json` via `providers::native::write_binding` (atomic, `0600`, no secret) and record the slot-identity label `by_slot_identity[N] = "kimi-<N>"` / `"grok-<N>"` (marker-first / identity-last, mirroring the Gemini provision order).
+4. Fire the daemon invalidate-cache so the new slot is visible without a daemon restart.
+
+No API key is captured; no `config-<N>/` is created; the vault is untouched. Both the CLI verb and the desktop provision command go through the SAME `providers::native::write_binding` chokepoint, so the two paths stay byte-identical.
+
+`csq logout N` sweeps the marker (`credentials/{kimi,grok}-<N>.json` removed); the slot returns to unbound. The vendor CLI's own home (`~/.kimi-code/`, `~/.grok/`) is NOT touched — csq never owned those credentials.
+
+**Convention.** `csq login` is the provisioning verb for native surfaces even though no browser flow runs inside csq — consistent with Gemini Code Assist (`csq login N --provider gemini`), which is also verify-and-record. `csq setkey` does not apply (native surfaces have no csq-held key).
 
 ## 7.4 Per-surface quota dispatch
 
@@ -727,5 +806,6 @@ These are items that MUST be resolved (verified or decided) before the first Cod
 - 1.4.0 — Gemini `by_slot_identity` writer. §7.2.3 gains the "FM — Gemini `by_slot_identity` label stability" note: the channel now carries `gemini-<N>/{apikey,vertex,codeassist}` (mode-class derived from the binding marker's `AuthMode` via the shared `gemini_identity_label`), written synchronously by all 3 `provision_*` paths (marker-FIRST/identity-LAST) + the daemon backfill arm. Stability contract is the INVERSE of §7.2.2 FM-6 (Codex): Gemini is class-stable AND value-stable-within-a-mode; a value change signals a legitimate operator mode re-provision, not re-auth ambiguity. Forward-compat: binding-schema bumps must coordinate the `by_slot_identity` backfill.
 - 1.5.0 — Spec-accuracy wave: §7.2.3.1 socket-path helper citation corrected to `csq_core::daemon::paths::socket_path(base_dir)` (daemon/paths.rs). §7.2.3.2 bench-reset citation corrected to the shipped inline removal at `csq/src/cli/commands/login.rs::reset_handle_dir_gemini`. All `csq-cli/src/commands/` paths migrated to `csq/src/cli/commands/` (crate merge). No contract change.
 - 1.5.1 — Split-state purge: INV-P01 contingency bullet rewritten present-state — the interposition design is recorded as a conditional contingency, not a tracked follow-up. No shipped behavior changed.
-- 1.6.0 — Codex statusline configuration. New §7.2.2.2: `render_config_toml_with_global` injects a curated default `[tui] status_line` (`model-with-reasoning` / `context-remaining` / `git-branch` / `current-dir`) into the slot `config.toml` when the user has not set one — codex renders its native footer from it (openai/codex an internal ticket; no external-command hook exists, so a csq-rendered codex line awaits the unshipped openai/codex #17827). §7.3.3 step 2 references the full render. User-wins-if-present; table-aware merge preserves sibling `[tui]` keys; non-table `tui` left untouched. Verified against codex-cli 0.142.3.
+- 1.6.0 — Codex statusline configuration. New §7.2.2.2: `render_config_toml_with_global` injects a curated default `[tui] status_line` (`model-with-reasoning` / `context-remaining` / `git-branch` / `current-dir`) into the slot `config.toml` when the user has not set one — codex renders its native footer from it (openai/codex an internal ticket; no external-command hook exists, so a csq-rendered codex line awaits the unshipped openai/codex an internal ticket). §7.3.3 step 2 references the full render. User-wins-if-present; table-aware merge preserves sibling `[tui]` keys; non-table `tui` left untouched. Verified against codex-cli 0.142.3.
+- 1.8.0 — Native-CLI session surfaces. New `Surface::Kimi` / `Surface::Grok` (§7.1.1 enum + `is_native_cli()` predicate); new §7.2.4 documents the credential-less binding-marker layout (`credentials/{kimi,grok}-<N>.json`, schema `{v, surface, created_unix_secs}`, no `config-<N>/`, vendor CLI owns the real auth under `~/.kimi-code/` / `~/.grok/`), the INV-P02 daemon-independence inversion (mirrors Gemini), Codex (AGENTS.md) capability-layer routing, `kimi`/`grok` audit tags, marker-existence discovery via `native_surface_for_slot`, the `conflicting_bound_surface` guard, and binary resolution via PATH + `~/.kimi-code/bin` / `~/.grok/bin`; new §7.3.5 documents `csq login N --provider kimi-cli|grok` (conflict-guarded marker write; vendor CLI self-authenticates) + `csq logout` marker sweep. Native surfaces are isolated from the `PROVIDERS` / dispatch-table machinery (a dedicated `providers::native` descriptor, sharing only the `Surface` axis). Header version corrected 1.6.0 → 1.8.0.
 - 1.7.0 — Codex model de-pin (CC-parity). `model` REMOVED from the csq-controlled key set (§7.2.2 categories + §7.3.3 step 2): csq no longer forces a model at login; a user-global `~/.codex` `model` propagates and, absent that, codex uses its built-in default. `render_config_toml_with_global` / `write_config_toml` / `regenerate_slot_config` take `model: Option<&str>`; login/spawn/reconciler pass `None`, explicit `csq models set codex <id> --slot N` passes `Some(m)` (durable per-slot override). The model value is toml-serialized to prevent injection. Also: `csq run` no longer injects the flattened `.coc/` scaffold into a native CLI when that surface's native artifacts (`.claude/`/`.codex/`/`.gemini/` or `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`) are present at cwd-or-ancestor — the native CLI loads its own; `CSQ_COC_PARITY_TEST=1` forces injection.

@@ -14,8 +14,16 @@ use crate::error::SdkError;
 /// Every op maps its provider's raw stop token onto exactly one of these; the raw
 /// token is preserved separately in [`Completion::finish_reason_raw`] so no
 /// information is lost while the normalized field stays a stable, matchable set.
+///
+/// `#[non_exhaustive]`: this is a closed vocabulary at any given crate version, but
+/// is expected to gain members over time (a new provider-reported stop condition).
+/// Sealing forces an external `match` to carry a `_ =>` fallback so a future variant
+/// degrades gracefully instead of failing to compile. Unit-variant construction
+/// (`FinishReason::Stop`) is unaffected by `#[non_exhaustive]` on the enum itself —
+/// only exhaustive matching is restricted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FinishReason {
     /// The model stopped at a natural end of turn.
     Stop,
@@ -35,7 +43,13 @@ pub enum FinishReason {
 /// exposing a derived cost would be a fabricated number (plan / deep-analyst MED-3).
 /// A consumer that wants cost multiplies these counts by its own price table.
 /// Every field is optional because not every surface reports every counter.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `#[non_exhaustive]`: every field here is already optional, so the ergonomic
+/// external constructor is `Usage::default()` (all `None`, via the derived
+/// [`Default`] — a normal function call, unaffected by sealing) followed by the
+/// `with_*` builder methods below.
+#[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct Usage {
     /// Prompt (input) tokens billed for this completion.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -51,13 +65,53 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
+impl Usage {
+    /// Set `input_tokens`. Accepts `u64` (⇒ `Some`) or `Option<u64>` directly, so a
+    /// caller with an already-optional count (`stats.get(..).and_then(as_u64)`)
+    /// does not need to unwrap first.
+    #[must_use]
+    pub fn with_input_tokens(mut self, tokens: impl Into<Option<u64>>) -> Self {
+        self.input_tokens = tokens.into();
+        self
+    }
+
+    /// Set `output_tokens`. Same `Into<Option<u64>>` flexibility as
+    /// [`Self::with_input_tokens`].
+    #[must_use]
+    pub fn with_output_tokens(mut self, tokens: impl Into<Option<u64>>) -> Self {
+        self.output_tokens = tokens.into();
+        self
+    }
+
+    /// Set `cache_creation_input_tokens`. Same `Into<Option<u64>>` flexibility as
+    /// [`Self::with_input_tokens`].
+    #[must_use]
+    pub fn with_cache_creation_input_tokens(mut self, tokens: impl Into<Option<u64>>) -> Self {
+        self.cache_creation_input_tokens = tokens.into();
+        self
+    }
+
+    /// Set `cache_read_input_tokens`. Same `Into<Option<u64>>` flexibility as
+    /// [`Self::with_input_tokens`].
+    #[must_use]
+    pub fn with_cache_read_input_tokens(mut self, tokens: impl Into<Option<u64>>) -> Self {
+        self.cache_read_input_tokens = tokens.into();
+        self
+    }
+}
+
 /// The reusable completion body embedded verbatim by `csq.exec.v1` (and, in S4, by
 /// `csq.eval.v1`).
 ///
 /// Factored as its own struct (plan deep-analyst C2 / requirements ADR-1) so that a
 /// later op which also returns a model completion reuses this shape rather than
 /// re-declaring a parallel one that can drift.
+///
+/// `#[non_exhaustive]`: construct via [`Completion::new`] (the four
+/// always-present fields) then [`Completion::with_usage`] /
+/// [`Completion::with_finish_reason_raw`] for the two optional ones.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Completion {
     /// The model's output text. **R5:** caller-owned, NOT redacted (redacting legit
     /// output would corrupt it) — but only ever written through [`emit`].
@@ -76,6 +130,45 @@ pub struct Completion {
     /// The provider's raw stop token, preserved for debugging / forward-compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason_raw: Option<String>,
+}
+
+impl Completion {
+    /// Build a `Completion` from its four always-present fields; `usage` and
+    /// `finish_reason_raw` start `None` — attach them with [`Self::with_usage`] /
+    /// [`Self::with_finish_reason_raw`] when the surface reported them.
+    #[must_use]
+    pub fn new(
+        text: impl Into<String>,
+        model: impl Into<String>,
+        provider: impl Into<String>,
+        finish_reason: FinishReason,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            model: model.into(),
+            provider: provider.into(),
+            usage: None,
+            finish_reason,
+            finish_reason_raw: None,
+        }
+    }
+
+    /// Attach token usage. Accepts `Usage` (⇒ `Some`) or `Option<Usage>` directly,
+    /// so a caller that only sometimes has usage (e.g. absent `stats` object) does
+    /// not need to unwrap first.
+    #[must_use]
+    pub fn with_usage(mut self, usage: impl Into<Option<Usage>>) -> Self {
+        self.usage = usage.into();
+        self
+    }
+
+    /// Attach the provider's raw stop token. Accepts a bare string (⇒ `Some`) or
+    /// `Option<String>` directly, same flexibility as [`Self::with_usage`].
+    #[must_use]
+    pub fn with_finish_reason_raw(mut self, raw: impl Into<Option<String>>) -> Self {
+        self.finish_reason_raw = raw.into();
+        self
+    }
 }
 
 /// The stdout envelope wrapping every op's result.
@@ -101,6 +194,7 @@ pub struct Completion {
 /// or [`Envelope::verdict`] (verdict + payload); each takes the op's compile-time
 /// `schema` constant so the wire `schema` value cannot drift from the op.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Envelope<T: Serialize> {
     /// The op's stable schema string (e.g. [`super::SCHEMA_EXEC_V1`]).
     pub schema: &'static str,

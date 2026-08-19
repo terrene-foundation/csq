@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "csq-core",
   "csq",                      # Single-binary csq (an internal ticket).
-  "csq-merkle",              # #980 RFC 6962 Merkle verifier leaf (dep of BOTH csq-ledger AND csq-core; breaks the csq-core↔csq-ledger cycle).
+  "csq-merkle",              # an internal ticket RFC 6962 Merkle verifier leaf (dep of BOTH csq-ledger AND csq-core; breaks the csq-core↔csq-ledger cycle).
   "csq-redact",              # W1 community leaf: token redaction + RedactedString (dep of csq-sdk).
   "csq-sdk",                 # W2 public wire contract: SDK envelope/error/adapter + payload DTOs.
   "csq-ledger",              # M10 Foundation-owned transparency-log server.
@@ -34,7 +34,7 @@ csq-redact = { path = "csq-redact", version = "2.18.0" }
 # alongside `path` for the same publishability reason as csq-redact above; the same
 # `version_pins_match_workspace` guard covers this literal.
 csq-sdk = { path = "csq-sdk", version = "2.18.0" }
-# csq-merkle — #980 RFC 6962 Merkle verifier leaf crate (publish=false). Both
+# csq-merkle — an internal ticket RFC 6962 Merkle verifier leaf crate (publish=false). Both
 # csq-ledger AND csq-core depend on it; no `version` alongside `path` is needed
 # because it is not published and no publishable (OPEN) crate depends on it — it
 # is PROPRIETARY (publish=false) reached only by PROPRIETARY crates, the allowed
@@ -67,6 +67,14 @@ tracing = "0.1"
 # re-enable the other defaults we actually use) to keep the two
 # systems separate.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "registry", "std", "ansi", "smallvec"] }
+# tracing-appender — the daemon's persistent rolling-file log (#1a-2,
+# daemon-auth-resilience Wave A2). Default features ONLY: unlike
+# tracing-subscriber (see the comment above), tracing-appender's own
+# dependency graph is crossbeam-channel + time + a small file-rolling
+# helper — it does NOT pull in tracing-log itself. Verified per-PR via
+# `cargo tree -p csq -i tracing-log` (must show no NEW path through this
+# crate); the pre-existing disabled path stays disabled.
+tracing-appender = "0.2"
 hex = "0.4"
 sha2 = "0.10"
 # HKDF (RFC 5869) over SHA-256 — RustCrypto family, consistent with the existing

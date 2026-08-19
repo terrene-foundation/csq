@@ -38,9 +38,7 @@
 //! CLI handler (`csq login N --provider gemini`) call into [`perform`]
 //! so the verification + binding-write sequence stays in one place.
 
-use super::provisioning::{
-    detect_other_surface_binding, provision_code_assist_oauth, BoundSurface, ProvisionError,
-};
+use super::provisioning::{provision_code_assist_oauth, ProvisionError};
 use super::spawn::{pre_spawn_dotenv_scan, DotenvScanResult};
 use crate::types::AccountNum;
 use std::path::{Path, PathBuf};
@@ -152,6 +150,43 @@ pub enum OauthLoginError {
     OauthFlowFailed(#[from] super::oauth_flow::OauthFlowError),
 }
 
+impl OauthLoginError {
+    /// User-actionable message with filesystem paths redacted, for
+    /// the desktop Tauri IPC boundary (`gemini_provision_oauth`).
+    /// `GeminiOauthCredsMalformed`/`Unreadable` and `BaseDirMissing`
+    /// carry a `path`/`PathBuf` field directly; `BindingWriteFailed`
+    /// wraps a [`crate::providers::gemini::provisioning::ProvisionError`]
+    /// which is itself redacted via
+    /// [`crate::providers::gemini::provisioning::ProvisionError::redacted_message`].
+    /// Every other variant's `Display` is already path-free (see each
+    /// variant's doc comment — `ShadowAuthInDotenv` in particular
+    /// deliberately surfaces only the `.env` basename, never the full
+    /// path, by construction of its `#[error(...)]` string).
+    /// `rules/tauri-commands.md` MUST-3, an internal ticket.
+    pub fn redacted_message(&self) -> String {
+        use crate::cli_deps::sanitize::redact_path;
+        match self {
+            OauthLoginError::GeminiOauthCredsMalformed { path, reason } => format!(
+                "gemini-cli oauth_creds.json is malformed at {}: {reason} — \
+                 re-run `gemini` interactively to regenerate",
+                redact_path(path)
+            ),
+            OauthLoginError::GeminiOauthCredsUnreadable { path, reason } => format!(
+                "gemini-cli oauth_creds.json is unreadable at {}: {reason} — \
+                 check file permissions (expected mode 0600) or remove + run `gemini` to regenerate",
+                redact_path(path)
+            ),
+            OauthLoginError::BindingWriteFailed(e) => {
+                format!("provision oauth binding: {}", e.redacted_message())
+            }
+            OauthLoginError::BaseDirMissing(p) => {
+                format!("base directory does not exist: {}", redact_path(p))
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Verifies the user's prior interactive gemini-cli OAuth state and
 /// writes a Code Assist OAuth binding marker for the slot.
 ///
@@ -182,14 +217,20 @@ pub fn perform(base_dir: &Path, slot: AccountNum) -> Result<(), OauthLoginError>
         return Err(OauthLoginError::BaseDirMissing(base_dir.to_path_buf()));
     }
 
-    if let Some(existing) = detect_other_surface_binding(base_dir, slot) {
-        let surface = match existing {
-            BoundSurface::Codex => "Codex",
-            BoundSurface::ClaudeCode => "Claude (Anthropic OAuth)",
-        };
+    // Unified pre-bind conflict guard (an internal journal entry FD#1): detection flows
+    // through the single `binding_guard::detect_bound_surface` union detector,
+    // so this Gemini login can never be blind to a surface. Re-binding Gemini
+    // onto an already-Gemini slot is idempotent (returns `None`); every OTHER
+    // surface — Codex / Anthropic OAuth / native Kimi-Grok / 3P bearer — is
+    // refused.
+    if let Some(existing) = crate::accounts::binding_guard::conflicting_bound_surface(
+        base_dir,
+        slot,
+        crate::providers::catalog::Surface::Gemini,
+    ) {
         return Err(OauthLoginError::OtherSurfaceBound {
             slot: slot.get(),
-            surface,
+            surface: existing.label(),
         });
     }
 
@@ -329,7 +370,7 @@ fn verify_oauth_creds(path: &Path, slot: AccountNum) -> Result<(), OauthLoginErr
 }
 
 /// Pre-flight for a HEADLESS (`-p` / non-interactive) `csq run` against a
-/// Code Assist OAuth Gemini slot (#965).
+/// Code Assist OAuth Gemini slot (an internal ticket).
 ///
 /// gemini-cli v0.41.2+ has NO non-interactive auth surface: when it
 /// auto-discovers a missing or stale `~/.gemini/oauth_creds.json` it prints
@@ -390,6 +431,56 @@ mod tests {
         }
     }
 
+    fn with_home<R>(home: &str, f: impl FnOnce() -> R) -> R {
+        let _g = crate::platform::test_env::lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        let out = f();
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        out
+    }
+
+    #[test]
+    fn redacted_message_strips_path_on_base_dir_missing() {
+        with_home("/Users/jack", || {
+            let err =
+                OauthLoginError::BaseDirMissing(PathBuf::from("/Users/jack/.claude/accounts"));
+            let msg = err.redacted_message();
+            assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+            assert!(msg.contains("~/.claude/accounts"));
+        });
+    }
+
+    #[test]
+    fn redacted_message_strips_path_on_creds_malformed() {
+        with_home("/Users/jack", || {
+            let err = OauthLoginError::GeminiOauthCredsMalformed {
+                path: PathBuf::from("/Users/jack/.gemini/oauth_creds.json"),
+                reason: "missing access_token".to_string(),
+            };
+            let msg = err.redacted_message();
+            assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+            assert!(msg.contains("~/.gemini/oauth_creds.json"));
+        });
+    }
+
+    #[test]
+    fn redacted_message_strips_path_through_binding_write_failed() {
+        with_home("/Users/jack", || {
+            let inner = crate::providers::gemini::provisioning::ProvisionError::Io {
+                path: PathBuf::from("/Users/jack/.claude/accounts/credentials/gemini-2.json"),
+                source: std::io::Error::other("disk full"),
+            };
+            let err = OauthLoginError::BindingWriteFailed(inner);
+            let msg = err.redacted_message();
+            assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+            assert!(msg.contains("~/.claude/accounts/credentials/gemini-2.json"));
+        });
+    }
+
     #[test]
     fn refuses_when_slot_bound_to_codex() {
         let dir = TempDir::new().unwrap();
@@ -425,6 +516,57 @@ mod tests {
                 surface: "Claude (Anthropic OAuth)",
             } => {}
             other => panic!("expected OtherSurfaceBound{{Claude}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_when_slot_bound_to_native() {
+        // redteam R2 MED-2: `detect_other_surface_binding` was blind to
+        // native (Kimi/Grok) bindings — `perform` (the shared entry both
+        // `csq login N --provider gemini` and the desktop
+        // `gemini_provision_oauth` command route through) would silently
+        // dual-bind a native-bound slot onto Gemini too.
+        let dir = TempDir::new().unwrap();
+        crate::providers::native::write_binding(
+            dir.path(),
+            slot(9),
+            crate::providers::catalog::Surface::Grok,
+        )
+        .unwrap();
+
+        let err = perform(dir.path(), slot(9)).unwrap_err();
+        match err {
+            OauthLoginError::OtherSurfaceBound {
+                slot: 9,
+                surface: "Grok (native CLI)",
+            } => {}
+            other => panic!("expected OtherSurfaceBound{{Grok}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_when_slot_bound_to_third_party() {
+        // redteam R3 M1: the NEW gemini-onto-3P-bearer refusal, asserted at the
+        // `perform` delivery point (not just in binding_guard's own tests). The
+        // pre-refactor `detect_other_surface_binding` never checked 3P at all —
+        // a Gemini login onto a 3P slot silently dual-bound it.
+        let dir = TempDir::new().unwrap();
+        crate::accounts::third_party::bind_provider_to_slot(
+            dir.path(),
+            "deepseek",
+            slot(9),
+            Some("sk-deepseek-xxxxxxxx"),
+            None,
+        )
+        .unwrap();
+
+        let err = perform(dir.path(), slot(9)).unwrap_err();
+        match err {
+            OauthLoginError::OtherSurfaceBound {
+                slot: 9,
+                surface: "a third-party provider",
+            } => {}
+            other => panic!("expected OtherSurfaceBound{{third-party}}, got {other:?}"),
         }
     }
 
@@ -529,7 +671,7 @@ mod tests {
         }
     }
 
-    // #965 headless pre-flight — reuses verify_oauth_creds against
+    // an internal ticket headless pre-flight — reuses verify_oauth_creds against
     // ~/.gemini/oauth_creds.json resolved from an injected HOME.
     #[test]
     fn check_headless_oauth_ready_ok_on_fresh() {
@@ -554,7 +696,7 @@ mod tests {
     #[test]
     fn check_headless_oauth_ready_not_found_when_absent() {
         // Empty HOME with no ~/.gemini/oauth_creds.json → typed NotFound,
-        // NOT a hang. This is the #965 headless contract.
+        // NOT a hang. This is the an internal ticket headless contract.
         let home = TempDir::new().unwrap();
         let err = check_headless_oauth_ready(Some(home.path()), slot(10)).unwrap_err();
         match err {

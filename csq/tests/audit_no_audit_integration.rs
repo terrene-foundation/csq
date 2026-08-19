@@ -79,6 +79,7 @@ fn clean_cmd(path_override: Option<&str>) -> Command {
 /// Write a minimal Codex canonical credential file so `csq run N` dispatches
 /// to the Codex surface (existence check only). Mirrors the sibling suite's
 /// `write_codex_canonical`.
+#[cfg(unix)]
 fn write_codex_canonical(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -99,6 +100,7 @@ fn write_codex_canonical(base: &std::path::Path, n: u16) {
 ///
 /// No `broker_failed` sentinel is written, so `is_broker_failed` is false and
 /// the launch is not short-circuited into the LOGIN-NEEDED branch.
+#[cfg(unix)]
 fn stage_anthropic_identity_slot(base: &std::path::Path, n: u16) {
     use csq_core::accounts::{identity_store, profiles};
     use csq_core::testing::identity_fixtures::fixture_uuid_for_slot;

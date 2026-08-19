@@ -7,16 +7,16 @@
 
 use crate::accounts::{discovery, AccountSource};
 use crate::providers::settings::load_settings;
-use crate::quota::{state as quota_state, AccountQuota, QuotaFile, RateLimitData, UsageWindow};
+use crate::quota::{state as quota_state, AccountQuota, RateLimitData, UsageWindow};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::{
-    clear_backoff, clear_cooldown, in_cooldown, increase_backoff, set_cooldown,
-    set_cooldown_with_backoff, HttpGetFn, HttpPostProbeFn, PollError, CALL_TIMEOUT,
-    RATELIMIT_PREFIX,
+    classify_transport_error, clear_backoff, clear_cooldown, in_cooldown, increase_backoff,
+    set_cooldown, set_cooldown_with_backoff, HttpGetFn, HttpPostProbeFn, PollError, CALL_TIMEOUT,
+    MAX_ACCOUNTS_PER_TICK, RATELIMIT_PREFIX,
 };
 use crate::daemon::usage_poller::deepseek::{poll_deepseek_balance, write_deepseek_balance};
 use crate::daemon::usage_poller::minimax::{poll_minimax_quota, write_minimax_quota, MiniMaxQuota};
@@ -69,6 +69,10 @@ pub(crate) async fn tick_3p(
     let accounts: Vec<_> = discovery::discover_all(base_dir)
         .into_iter()
         .filter(|a| matches!(a.source, AccountSource::ThirdParty { .. }))
+        // Bound the per-tick HTTP fan-out (see `kimi::tick` for the rationale).
+        // This loop fans out across every 3P provider, so it is the widest
+        // enumeration of the set — one vendor call per slot per tick.
+        .take(MAX_ACCOUNTS_PER_TICK)
         .collect();
 
     let mut polled = 0usize;
@@ -297,6 +301,19 @@ pub(crate) async fn tick_3p(
                 debug!(account = info.id, "3P poller: transport error");
                 set_cooldown(cooldowns, info.id);
             }
+            Ok(Err(PollError::BadUrl(_))) => {
+                // Operator misconfiguration (e.g. MINIMAX_GROUP_ID
+                // tripped the outbound char guard), not a network
+                // failure — WARN so it's visible by default, distinct
+                // from the generic "transport error" debug! above.
+                warn!(
+                    account = info.id,
+                    provider = provider_id,
+                    error_kind = "3p_poll_bad_url",
+                    "3P poller: outbound url rejected — check the slot's provider settings"
+                );
+                set_cooldown(cooldowns, info.id);
+            }
             Ok(Err(PollError::Parse(_))) => {
                 debug!(account = info.id, "3P poller: parse error");
                 set_cooldown(cooldowns, info.id);
@@ -460,6 +477,18 @@ pub(crate) fn load_3p_env_string_for_slot(
 /// `model` is the provider's configured model (from the catalog's
 /// `default_model` field). It is injected here so the probe body is
 /// never hardcoded in source and survives model-ID deprecations.
+///
+/// `url` is built from the provider's operator-configurable base URL
+/// (round-2 redteam H2/R6-rust followup): the production
+/// `HttpPostProbeFn` (`http::post_json_with_headers`) now rejects a
+/// userinfo-carrying or unparseable `url` pre-flight, so this call site
+/// MUST route the error through `classify_transport_error` — as of
+/// round-7 redteam A-H1 this is a compile-time property
+/// (`poll_error::TransportErr`'s private field), not merely a scanner
+/// (`no_poller_bypasses_classify_transport_error`, deleted) — a direct
+/// `PollError::Transport` construction that mis-classified the
+/// `HttpGetFn` callers would otherwise silently downgrade an operator
+/// misconfiguration here too.
 pub(crate) fn poll_3p_usage(
     url: &str,
     api_key: &str,
@@ -478,7 +507,7 @@ pub(crate) fn poll_3p_usage(
 
     let probe_body = build_probe_body(model);
     let (status, resp_headers, _body) =
-        http_post(url, &headers, &probe_body).map_err(PollError::Transport)?;
+        http_post(url, &headers, &probe_body).map_err(classify_transport_error)?;
 
     // Extract rate-limit headers even on non-200 responses
     let rate_limits = extract_rate_limit_headers(&resp_headers);
@@ -525,7 +554,22 @@ pub(crate) fn write_3p_usage_to_quota(
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
-    let mut quota = quota_state::load_state(base_dir).unwrap_or_else(|_| QuotaFile::empty());
+    // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
+    // falling back to QuotaFile::empty() — a load failure here must SKIP
+    // the write, not persist a one-row file that wipes every sibling
+    // account's row (mirrors usage_poller::gemini_oauth::write_quota).
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            warn!(
+                account = account_id,
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "3P usage poller: quota.json unreadable, skipping write to avoid clobbering sibling rows"
+            );
+            return Ok(());
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -995,6 +1039,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tick_3p_bad_url_sets_cooldown_without_quota_write() {
+        // MED (round-2 redteam, code-review lens): `PollError::BadUrl` at
+        // `:300`'s `Ok(Err(PollError::BadUrl(_)))` arm is production-
+        // reachable — `tick_3p` → `poll_minimax_quota` → `classify_transport_error`
+        // (a misconfigured per-slot MINIMAX_GROUP_ID genuinely reaches this
+        // arm in production, per `poll_minimax_quota`'s doc comment on the
+        // per-slot query-string interpolation) — and was completely
+        // untested (grep for "bad_url\|BadUrl\|disallowed characters" in
+        // this file previously returned only the two production lines,
+        // zero test hits). Mocks the transport to return the guard's exact
+        // rejection literal — `classify_transport_error` routes it to
+        // BadUrl regardless of the URL's actual content — and asserts the
+        // arm's two effects: cooldown set, and (unlike a successful poll)
+        // NO quota row written for the slot.
+        let dir = TempDir::new().unwrap();
+        install_3p_account(dir.path(), "mm", "test-api-key");
+
+        let http_get: HttpGetFn =
+            Arc::new(|_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+                Err(crate::http::ERR_URL_UNSAFE_CHARS.to_string())
+            });
+        let http_post = mock_3p_success(Arc::new(AtomicU32::new(0)));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick_3p(dir.path(), &http_get, &http_post, &cooldowns, &backoffs).await;
+
+        assert!(
+            in_cooldown(&cooldowns, 902),
+            "BadUrl must set cooldown, same as any other poll failure"
+        );
+
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        assert!(
+            quota.get(902).is_none(),
+            "BadUrl must not write a quota row for the rejected slot"
+        );
+    }
+
+    #[tokio::test]
     async fn tick_3p_no_accounts_does_nothing() {
         let dir = TempDir::new().unwrap();
         let counter = Arc::new(AtomicU32::new(0));
@@ -1179,5 +1263,45 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_slot_settings_with_model(tmp.path(), 10, "glm-5.1");
         assert_eq!(load_3p_model_for_slot(tmp.path(), 10).unwrap(), "glm-5.1");
+    }
+
+    /// MED-1 (an internal ticket redteam): a schema-drifted `quota.json` must NOT
+    /// be clobbered by this write leg. Before the fix,
+    /// `load_state_or_warn`'s `QuotaFile::empty()` fallback let this
+    /// write persist a one-row file, wiping every sibling account's row.
+    #[test]
+    fn write_3p_usage_to_quota_skips_on_poisoned_file_preserving_siblings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let poisoned = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        std::fs::write(quota_state::quota_path(dir.path()), poisoned).unwrap();
+
+        let rl = RateLimitData {
+            requests_limit: Some(100),
+            requests_remaining: Some(50),
+            tokens_limit: None,
+            tokens_remaining: None,
+            input_tokens_limit: None,
+            output_tokens_limit: None,
+        };
+        let result = write_3p_usage_to_quota(dir.path(), 3, &rl);
+        assert!(result.is_ok(), "skip must be Ok(()), not an error");
+
+        let raw = std::fs::read_to_string(quota_state::quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["accounts"]["1"]["five_hour"]["used_percentage"].as_f64(),
+            Some(50.0)
+        );
+        assert_eq!(
+            v["accounts"]["2"]["five_hour"]["used_percentage"].as_f64(),
+            Some(80.0)
+        );
+        assert!(v["accounts"].get("3").is_none());
     }
 }

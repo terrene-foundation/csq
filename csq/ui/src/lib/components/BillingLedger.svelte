@@ -88,7 +88,7 @@
   <!--
     Balance card (hideWhenEmpty) with no recorded usage: render NOTHING —
     not even the wrapper div — so no empty padded box paints below the
-    balance row (redteam #984 L2). The balance row already carries the signal.
+    balance row (redteam an internal ticket L2). The balance row already carries the signal.
     The `loadError == null` guard keeps a future poll error surfacing through
     the inner {#if loadError} branch rather than being swallowed by this gate
     (forward-looking: today load() fires once per mount, so unreachable).

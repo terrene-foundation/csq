@@ -92,7 +92,7 @@ pub mod verify;
 pub use edition::{resolve_edition, resolve_policy, Edition, MultiSigPolicy};
 pub use error::MultiSigError;
 pub use gate::{authorize_op, InMemorySignerSet, SignerSet};
-/// GH #910 — forward-compat opaque multi-sig verification (pure-M11 inner
+/// GH an internal ticket — forward-compat opaque multi-sig verification (pure-M11 inner
 /// threshold for a record whose `EventKind` this binary does not know).
 pub(crate) use verify::verify_opaque_multi_sig;
 pub use verify::verify_record_multi_sig;

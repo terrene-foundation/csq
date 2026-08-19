@@ -72,7 +72,10 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     let _ = sync::backsync(&config_dir, base_dir);
 
     // ── Gather account + quota state ──
-    let quota = state::load_state(base_dir).unwrap_or_else(|_| csq_core::quota::QuotaFile::empty());
+    // an internal ticket: salvage per-row. Statusline is read-only by
+    // `account-terminal-separation.md` MUST-2, so salvaging cannot write a
+    // truncated file back; one bad row costs one row.
+    let quota = state::load_state_salvage(base_dir);
     let account_quota = quota.get(account.get());
     let label = account_label(base_dir, account);
     // M3-7 fix-wave R1 M2-DA: `is_swap_stuck` is retired (no production
@@ -275,7 +278,7 @@ mod tests {
     /// test's `EnvVarGuard::set` and its `detect_source_handle` call
     /// made the swap test observe statusline's value and return the
     /// wrong error variant. macOS-only by CI thread-scheduling luck
-    /// (green on an internal ticket macOS + #473 ubuntu/windows, red on #473
+    /// (green on an internal ticket macOS + an internal ticket ubuntu/windows, red on an internal ticket
     /// macOS). Root-caused + fixed per `zero-tolerance.md` Rule 1
     /// during the v2.8.0-rc.1 cut; see an internal journal entry
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {

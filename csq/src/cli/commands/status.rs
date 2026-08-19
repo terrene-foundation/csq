@@ -22,7 +22,9 @@
 use anyhow::Result;
 use csq_core::accounts::snapshot;
 use csq_core::quota::status::{render_status_table, show_status, AccountStatus};
+use csq_core::sdk::{self, Envelope, SCHEMA_STATUS_V1};
 use csq_core::types::AccountNum;
+use serde::Serialize;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -31,6 +33,17 @@ use csq_core::accounts::AccountInfo;
 use csq_core::daemon::{self, DetectResult};
 #[cfg(unix)]
 use csq_core::quota::status::compose_status;
+
+/// `csq.status.v1` payload (an internal ticket Track B). **R1** — hand-authored, explicit
+/// field: `data` carries the pre-existing `Vec<AccountStatus>` rows UNCHANGED. Before
+/// this schema existed `csq status --json` emitted a BARE top-level array, so a host
+/// had nothing to feature-detect against. Migration for an existing consumer is a
+/// one-line jq change: `.[0].id` -> `.data[0].id` (workspace `sdk-surface`
+/// LAUNCH-LEDGER 2026-08-09-wave3 Track B).
+#[derive(Debug, Serialize)]
+struct StatusPayload {
+    data: Vec<AccountStatus>,
+}
 
 pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     // Resolve active account authority-first (workspace
@@ -44,7 +57,12 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     let accounts = resolve_accounts(base_dir, active);
 
     if json {
-        println!("{}", serde_json::to_string(&accounts)?);
+        // R3: emit() is the only stdout writer for the enveloped surface.
+        sdk::emit(&Envelope::success(
+            SCHEMA_STATUS_V1,
+            None,
+            StatusPayload { data: accounts },
+        ))?;
         return Ok(());
     }
 
@@ -149,5 +167,83 @@ fn try_daemon_accounts(base_dir: &Path) -> Option<Vec<AccountInfo>> {
             tracing::debug!(error = %e, "csq status: could not deserialize accounts array");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use csq_core::accounts::{AccountSource, Backend};
+    use csq_core::providers::catalog::Surface;
+
+    fn sample_row() -> AccountStatus {
+        AccountStatus {
+            id: 1,
+            label: "user@example.com".into(),
+            is_active: true,
+            five_hour_pct: Some(42.5),
+            five_hour_resets_in: Some(3600),
+            seven_day_pct: None,
+            seven_day_resets_in: None,
+            source: AccountSource::Anthropic,
+            surface: Surface::ClaudeCode,
+            method: "oauth".into(),
+            balance: None,
+            backend: Backend::Direct,
+            stale_secs: None,
+        }
+    }
+
+    /// Golden fixture (an internal ticket Track B): every pre-existing `AccountStatus`
+    /// row field, unchanged, now lives at `data[N].<field>` under the
+    /// `csq.status.v1` envelope. A rename or retype of ANY field asserted here
+    /// REDS this test — that non-vacuity is the entire point of versioning the
+    /// schema (verified by hand: renaming `StatusPayload.data` to `.rows` fails
+    /// this test with "missing field `data`" / a null `data[0]` lookup).
+    #[test]
+    fn status_json_envelope_matches_golden_shape() {
+        let payload = StatusPayload {
+            data: vec![sample_row()],
+        };
+        let env = Envelope::success(SCHEMA_STATUS_V1, None, payload);
+        let line = env.to_line().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(v["schema"], "csq.status.v1");
+        assert_eq!(v["ok"], true);
+        assert!(
+            v.get("error").is_none(),
+            "success envelope carries no error"
+        );
+
+        let row = &v["data"][0];
+        assert_eq!(row["id"], 1);
+        assert_eq!(row["label"], "user@example.com");
+        assert_eq!(row["is_active"], true);
+        assert_eq!(row["five_hour_pct"], 42.5);
+        assert_eq!(row["five_hour_resets_in"], 3600);
+        assert!(row["seven_day_pct"].is_null());
+        assert!(row["seven_day_resets_in"].is_null());
+        assert_eq!(row["source"], "Anthropic");
+        assert_eq!(row["surface"], "claude-code");
+        assert_eq!(row["method"], "oauth");
+        assert_eq!(row["backend"], "direct");
+        // Optional, skip_serializing_if fields stay ABSENT (not null) when None —
+        // the pre-existing `AccountStatus` wire behavior, unchanged by the envelope.
+        assert!(row.get("balance").is_none());
+        assert!(row.get("stale_secs").is_none());
+    }
+
+    #[test]
+    fn status_json_envelope_is_a_single_line() {
+        let env = Envelope::success(
+            SCHEMA_STATUS_V1,
+            None,
+            StatusPayload {
+                data: vec![sample_row()],
+            },
+        );
+        let line = env.to_line().unwrap();
+        assert_eq!(line.matches('\n').count(), 0);
     }
 }

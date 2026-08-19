@@ -20,7 +20,7 @@
   // live sessions to show — Sessions would render the empty state
   // on first launch and feel broken.
   //
-  // The Enforcement tab (#793 — M-IC interactive per-turn enforcement
+  // The Enforcement tab (an internal ticket — M-IC interactive per-turn enforcement
   // console) is enterprise-only: the daemon routes it drives are stripped
   // from the community build, so the tab renders only when the binary
   // reports the enterprise edition.

@@ -210,6 +210,28 @@ impl CredentialError {
             CredentialError::NoCredentials(_) => "credentials_none",
         }
     }
+
+    /// User-actionable message with filesystem paths redacted via
+    /// [`crate::cli_deps::sanitize::redact_path`]. `NotFound`,
+    /// `Corrupt`, and `Io` all carry a `path: PathBuf` field that
+    /// otherwise reaches the (potentially adversarial) renderer
+    /// verbatim over Tauri IPC (`rules/tauri-commands.md` MUST-3,
+    /// an internal ticket).
+    pub fn redacted_message(&self) -> String {
+        use crate::cli_deps::sanitize::redact_path;
+        match self {
+            CredentialError::NotFound { path } => {
+                format!("credential file not found: {}", redact_path(path))
+            }
+            CredentialError::Corrupt { path, reason } => {
+                format!("corrupt credential file {}: {reason}", redact_path(path))
+            }
+            CredentialError::Io { path, source } => {
+                format!("io error on {}: {source}", redact_path(path))
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -400,7 +422,7 @@ pub enum DaemonError {
     /// A Win32 kernel call on the Windows graceful-stop path failed
     /// (`CreateEventW` / `OpenEventW` / `SetEvent`). Distinct from
     /// [`IpcTimeout`](DaemonError::IpcTimeout) so the message names the real
-    /// cause instead of a misleading "0ms" timeout (#786 redteam LOW; the event
+    /// cause instead of a misleading "0ms" timeout (an internal ticket redteam LOW; the event
     /// path is name-addressed, never SIGTERM/timeout). `context` names the
     /// failing syscall for operator diagnostics.
     #[error(
@@ -451,9 +473,74 @@ pub enum ConfigError {
     SlotSurfaceConflict { slot: u16, bound_surface: String },
 }
 
+impl ConfigError {
+    /// User-actionable message with filesystem paths redacted via
+    /// [`crate::cli_deps::sanitize::redact_path`]. Desktop Tauri
+    /// commands (and any other renderer-facing IPC boundary) MUST
+    /// route a `ConfigError` through this instead of the bare
+    /// `Display`/`ToString` impl — `InvalidJson` carries a
+    /// `path: PathBuf` field that otherwise reaches the (potentially
+    /// adversarial) renderer verbatim (`rules/tauri-commands.md`
+    /// MUST-3, an internal ticket).
+    pub fn redacted_message(&self) -> String {
+        match self {
+            ConfigError::InvalidJson { path, reason } => format!(
+                "invalid JSON in {}: {reason}",
+                crate::cli_deps::sanitize::redact_path(path)
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_error_redacted_message_strips_home_prefix_from_invalid_json_path() {
+        let _g = crate::platform::test_env::lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/Users/jack");
+        let err = ConfigError::InvalidJson {
+            path: std::path::PathBuf::from("/Users/jack/.claude/accounts/rotation.json"),
+            reason: "unexpected EOF".to_string(),
+        };
+        let msg = err.redacted_message();
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+        assert!(msg.contains("~/.claude/accounts/rotation.json"), "{msg}");
+        assert!(msg.contains("unexpected EOF"), "{msg}");
+    }
+
+    #[test]
+    fn credential_error_redacted_message_strips_home_prefix() {
+        let _g = crate::platform::test_env::lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/Users/jack");
+        let err = CredentialError::Corrupt {
+            path: std::path::PathBuf::from("/Users/jack/.claude/accounts/credentials/2.json"),
+            reason: "invalid JSON".to_string(),
+        };
+        let msg = err.redacted_message();
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(!msg.contains("/Users/jack"), "path leaked: {msg}");
+        assert!(msg.contains("~/.claude/accounts/credentials/2.json"));
+    }
+
+    #[test]
+    fn config_error_redacted_message_passes_through_non_path_variants() {
+        let err = ConfigError::ProfileNotFound {
+            name: "zai".to_string(),
+        };
+        assert_eq!(err.redacted_message(), "profile not found: zai");
+    }
 
     #[test]
     fn csq_error_display() {

@@ -3,6 +3,7 @@
 //! Resolves which account a CC session is using, discovers all configured
 //! accounts, and manages `profiles.json` for email/method mapping.
 
+pub mod binding_guard;
 pub mod discovery;
 // M4-3 (an internal ticket Phase 4): `accounts::identity` retired. Its three
 // fallback paths (marker → dir-name → `claude auth status`) violated
@@ -128,6 +129,88 @@ impl std::fmt::Display for BillingMode {
     }
 }
 
+/// Cloud-Claude routing backend for a `Surface::ClaudeCode` slot (an internal ticket).
+///
+/// A routing dimension ORTHOGONAL to `Surface` and to the 3P provider axis: it
+/// selects WHICH Anthropic-Claude backend the spawned `claude` CLI talks to.
+///
+/// - [`Backend::Direct`] (default): the ordinary path — Anthropic subscription
+///   OAuth, an Anthropic API key, or a 3P base-URL override. No cloud routing.
+/// - [`Backend::Vertex`]: Anthropic Claude served via **Google Vertex AI**. The
+///   slot's `settings.json` env block carries `CLAUDE_CODE_USE_VERTEX=1` +
+///   `ANTHROPIC_VERTEX_PROJECT_ID` + `CLOUD_ML_REGION` (+ GCP ADC creds via
+///   `GOOGLE_APPLICATION_CREDENTIALS`); the spawned `claude` authenticates to
+///   GCP itself.
+/// - [`Backend::Bedrock`]: Anthropic Claude served via **AWS Bedrock**. The
+///   slot's `settings.json` env block carries `CLAUDE_CODE_USE_BEDROCK=1` +
+///   `AWS_REGION` (+ AWS creds); the spawned `claude` authenticates to AWS
+///   itself.
+///
+/// **This is NOT the `vertex` PROVIDER** (Gemini-on-Vertex via the native
+/// Google-`generateContent` client, `providers::catalog` id `"vertex"`). That
+/// provider is a distinct entry on the same `ClaudeCode` surface and is never
+/// overloaded by this axis (an internal ticket Constraint 2).
+///
+/// **Not stored on [`AccountInfo`].** The `settings.json` env block is the sole
+/// source of truth for what the spawned `claude` will do, so csq DERIVES the
+/// backend from it ([`crate::providers::settings::backend_for_slot`]) rather
+/// than persisting a duplicate field that could drift from the env block. A
+/// non-`Direct` backend is fail-closed-refused at provisioning time on any slot
+/// that is not a bare `ClaudeCode` slot with the matching cloud creds (issue
+/// an internal ticket Constraint 1).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+pub enum Backend {
+    /// Ordinary Anthropic/3P path — no cloud routing. Default for backward
+    /// compatibility and for every slot that has not been provisioned as a
+    /// cloud-Claude slot.
+    #[default]
+    #[serde(rename = "direct")]
+    Direct,
+    /// Anthropic Claude via Google Vertex AI (`CLAUDE_CODE_USE_VERTEX`).
+    #[serde(rename = "vertex")]
+    Vertex,
+    /// Anthropic Claude via AWS Bedrock (`CLAUDE_CODE_USE_BEDROCK`).
+    #[serde(rename = "bedrock")]
+    Bedrock,
+}
+
+impl Backend {
+    /// Stable string representation matching the `serde rename` tag.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Backend::Direct => "direct",
+            Backend::Vertex => "vertex",
+            Backend::Bedrock => "bedrock",
+        }
+    }
+
+    /// True for a cloud-routed backend (Vertex / Bedrock) — the axis that
+    /// requires matching cloud credentials and fail-closed provisioning.
+    pub const fn is_cloud(&self) -> bool {
+        matches!(self, Backend::Vertex | Backend::Bedrock)
+    }
+
+    /// Parses a CLI-facing backend token (`direct` | `vertex` | `bedrock`),
+    /// case-insensitively. Returns `None` for any other token so callers
+    /// fail closed rather than silently defaulting.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "direct" => Some(Backend::Direct),
+            "vertex" => Some(Backend::Vertex),
+            "bedrock" => Some(Backend::Bedrock),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +248,44 @@ mod tests {
         let info: AccountInfo =
             serde_json::from_str(legacy).expect("legacy JSON must parse without billing_mode");
         assert_eq!(info.billing_mode, BillingMode::Subscription);
+    }
+
+    /// an internal ticket: `Backend` serde tags, parse, defaults, and `is_cloud`.
+    #[test]
+    fn backend_serde_parse_and_helpers() {
+        // serde rename tags
+        assert_eq!(
+            serde_json::to_string(&Backend::Direct).unwrap(),
+            "\"direct\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Backend::Vertex).unwrap(),
+            "\"vertex\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Backend::Bedrock).unwrap(),
+            "\"bedrock\""
+        );
+        // round-trip
+        for b in [Backend::Direct, Backend::Vertex, Backend::Bedrock] {
+            let s = serde_json::to_string(&b).unwrap();
+            assert_eq!(serde_json::from_str::<Backend>(&s).unwrap(), b);
+            assert_eq!(Backend::parse(b.as_str()), Some(b));
+        }
+        // default + missing-field deserialize
+        assert_eq!(Backend::default(), Backend::Direct);
+        assert_eq!(
+            serde_json::from_str::<Backend>("\"direct\"").unwrap(),
+            Backend::Direct
+        );
+        // parse is case-insensitive + trims; unknown fails closed
+        assert_eq!(Backend::parse("  VERTEX "), Some(Backend::Vertex));
+        assert_eq!(Backend::parse("azure"), None);
+        assert_eq!(Backend::parse(""), None);
+        // is_cloud
+        assert!(!Backend::Direct.is_cloud());
+        assert!(Backend::Vertex.is_cloud());
+        assert!(Backend::Bedrock.is_cloud());
     }
 
     /// BillingMode serializes via its kebab-case tag.
@@ -223,6 +344,47 @@ mod tests {
             "expected kebab-case surface tag in JSON: {json}"
         );
     }
+
+    // ── AccountSource::Native (Wave 3, an internal journal entry) ──────────────
+
+    /// `Native` is never oauth-refreshed — the vendor CLI (Kimi/Grok)
+    /// owns its own auth lifecycle entirely outside csq's daemon.
+    #[test]
+    fn account_source_native_is_not_oauth_refreshed() {
+        assert!(!AccountSource::Native {
+            surface: Surface::Kimi
+        }
+        .has_oauth_refresh());
+        assert!(!AccountSource::Native {
+            surface: Surface::Grok
+        }
+        .has_oauth_refresh());
+        // Sanity: the two sources that ARE oauth-refreshed still are.
+        assert!(AccountSource::Anthropic.has_oauth_refresh());
+        assert!(AccountSource::Codex.has_oauth_refresh());
+    }
+
+    /// `is_native()` is true only for `AccountSource::Native`, false for
+    /// every other variant.
+    #[test]
+    fn account_source_is_native_true_only_for_native() {
+        assert!(AccountSource::Native {
+            surface: Surface::Kimi
+        }
+        .is_native());
+        assert!(AccountSource::Native {
+            surface: Surface::Grok
+        }
+        .is_native());
+        assert!(!AccountSource::Anthropic.is_native());
+        assert!(!AccountSource::Codex.is_native());
+        assert!(!AccountSource::Gemini.is_native());
+        assert!(!AccountSource::Manual.is_native());
+        assert!(!AccountSource::ThirdParty {
+            provider: "MiniMax".into()
+        }
+        .is_native());
+    }
 }
 
 /// Where an account was discovered from.
@@ -246,14 +408,40 @@ pub enum AccountSource {
     ThirdParty { provider: String },
     /// Manually configured (`dashboard-accounts.json`).
     Manual,
+    /// Native-CLI session surface (Kimi, Grok) — Wave 3 (an internal journal entry).
+    ///
+    /// A native slot is keyed by the credential-less binding marker at
+    /// `credentials/{kimi,grok}-<N>.json`
+    /// ([`crate::providers::native::marker_path`]). csq stores NO secret
+    /// for these slots — the vendor CLI (`kimi` / `grok`) self-
+    /// authenticates against its own home directory. `has_credentials`
+    /// on the [`AccountInfo`] this source attaches to reflects marker
+    /// existence, not credential validity (there is no credential to
+    /// validate).
+    Native { surface: Surface },
 }
 
 impl AccountSource {
     /// Whether the source implies the daemon's OAuth refresher owns
     /// token-rotation cadence for this account. Used by the refresher
     /// to filter out non-refreshable accounts (3P API keys, manually
-    /// configured rows, Gemini bindings) — spec 07 INV-P01.
+    /// configured rows, Gemini bindings, native-CLI bindings) — spec 07
+    /// INV-P01.
+    ///
+    /// `Native` is never oauth-refreshed: the vendor CLI owns its own
+    /// auth lifecycle (Kimi device-code, Grok OIDC) entirely outside
+    /// csq's daemon.
     pub fn has_oauth_refresh(&self) -> bool {
         matches!(self, AccountSource::Anthropic | AccountSource::Codex)
+    }
+
+    /// True for the native-CLI session-surface source (Kimi/Grok). Used
+    /// by callers that need to skip usage polling, token refresh, and
+    /// quota-window rendering for a source that carries no credentials
+    /// of csq's own and no OAuth lifecycle — the Wave 3 analogue of
+    /// `has_oauth_refresh` for the "definitely not oauth, definitely
+    /// not bearer-key" case.
+    pub fn is_native(&self) -> bool {
+        matches!(self, AccountSource::Native { .. })
     }
 }

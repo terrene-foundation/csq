@@ -20,6 +20,13 @@ pub enum DaemonStatus {
     /// PID file exists but references a dead PID (crash recovery
     /// territory — caller can safely clean up).
     Stale { pid: u32 },
+    /// PID file exists and its PID is **alive**, but that process is not
+    /// csq — the OS recycled a dead daemon's PID (see
+    /// [`process::is_pid_foreign`]). No daemon is running. Distinct from
+    /// [`DaemonStatus::Stale`] because the operator-facing wording
+    /// differs: "references a dead PID" is a lie here, and the PID MUST
+    /// NOT be signalled.
+    PidReused { pid: u32 },
     /// No PID file, no running daemon.
     NotRunning,
 }
@@ -38,7 +45,17 @@ pub fn status_of(pid_path: &Path) -> DaemonStatus {
             // stale so the caller cleans it up on next start.
             DaemonStatus::Stale { pid: 0 }
         }
-        Some(pid) if process::is_pid_alive(pid) => DaemonStatus::Running { pid },
+        // A live PID is only OUR daemon if the process is actually csq.
+        // Without the identity check a recycled PID reports `Running`
+        // and `csq daemon status` names an unrelated program as the
+        // daemon (observed: a Microsoft Teams helper).
+        Some(pid) if process::is_pid_alive(pid) => {
+            if process::is_pid_foreign(pid) {
+                DaemonStatus::PidReused { pid }
+            } else {
+                DaemonStatus::Running { pid }
+            }
+        }
         Some(pid) => DaemonStatus::Stale { pid },
     }
 }
@@ -52,7 +69,7 @@ pub fn status_of(pid_path: &Path) -> DaemonStatus {
 /// 2. If PID is dead, cleans up stale files and returns
 ///    [`DaemonError::StalePidFile`].
 /// 3. Sends SIGTERM (Unix) or fires the per-user named shutdown event
-///    (Windows — see the `shutdown_windows` module, #786). Both drive the
+///    (Windows — see the `shutdown_windows` module, an internal ticket). Both drive the
 ///    daemon's shared `CancellationToken` so every subsystem drains.
 /// 4. Polls [`process::is_pid_alive`] every 100ms until the PID
 ///    exits or the 5-second deadline passes.
@@ -66,12 +83,24 @@ pub fn status_of(pid_path: &Path) -> DaemonStatus {
 /// # Safety
 ///
 /// On Unix, `libc::kill` is unsafe because it can affect other
-/// processes. We guard this by only sending to the PID read from
-/// our own PID file, which we wrote ourselves. In the worst case
-/// where the OS has recycled the PID to an unrelated process, we'd
-/// SIGTERM that process — but this window is very narrow (typical
-/// kernels don't recycle PIDs for several seconds) and the file
-/// would have been cleaned up on daemon exit anyway.
+/// processes. Reading the PID from our own PID file is NOT sufficient
+/// to make the signal safe: when a daemon dies without running its
+/// `Drop` (SIGKILL, panic-abort, OOM, a reaped tmpdir) the PID file
+/// outlives it, and the kernel is free to reissue that PID to an
+/// unrelated program — after which SIGTERM would terminate a stranger.
+/// An earlier revision of this doc-comment claimed the window was "very
+/// narrow (typical kernels don't recycle PIDs for several seconds)" and
+/// that "the file would have been cleaned up on daemon exit anyway";
+/// both premises fail in exactly the case that matters. Observed on a
+/// maintainer host: a PID file written at 07:54 still named PID 1754 at
+/// 13:00, by which point 1754 was a Microsoft Teams helper — a ~5-hour
+/// window, and `csq daemon stop` was the remediation csq itself printed.
+///
+/// So the signal is now gated on process IDENTITY
+/// ([`process::is_pid_foreign`]): a positively-foreign PID is reported
+/// as [`DaemonError::StalePidFile`] and its PID file removed, WITHOUT
+/// signalling. The check fails open, so an unreadable command still
+/// takes the signal path — it never refuses to stop a real daemon.
 pub fn stop_daemon(pid_path: &Path) -> Result<u32, DaemonError> {
     if !pid_path.exists() {
         return Err(DaemonError::NotRunning {
@@ -84,6 +113,14 @@ pub fn stop_daemon(pid_path: &Path) -> Result<u32, DaemonError> {
     })?;
 
     if !process::is_pid_alive(pid) {
+        let _ = std::fs::remove_file(pid_path);
+        return Err(DaemonError::StalePidFile { pid });
+    }
+
+    // The PID is alive — but is it OURS? A recycled PID must never be
+    // signalled. Remove the stale file so the next `daemon start`
+    // acquires cleanly, and report stale rather than stopped.
+    if process::is_pid_foreign(pid) {
         let _ = std::fs::remove_file(pid_path);
         return Err(DaemonError::StalePidFile { pid });
     }
@@ -113,7 +150,7 @@ pub fn stop_daemon(pid_path: &Path) -> Result<u32, DaemonError> {
 ///
 /// Without the PID-file check, `csq daemon stop` against a desktop daemon would
 /// poll the still-alive app PID for the full 5s deadline and then falsely report
-/// the daemon as "stuck" (#786 redteam HIGH-2).
+/// the daemon as "stuck" (an internal ticket redteam HIGH-2).
 fn daemon_has_stopped(pid: u32, pid_path: &Path) -> bool {
     !process::is_pid_alive(pid) || !pid_path.exists()
 }
@@ -145,7 +182,7 @@ fn send_shutdown_signal(pid: u32) -> Result<(), DaemonError> {
     // Windows has no per-process SIGTERM. The daemon creates a per-user
     // named event at startup and blocks on it; firing that event is the
     // graceful equivalent of SIGTERM — the daemon's `CancellationToken`
-    // fires and every subsystem drains exactly as on Unix (#786).
+    // fires and every subsystem drains exactly as on Unix (an internal ticket).
     //
     // `StalePidFile` is returned when the event does not exist: the PID
     // is alive per the caller's pre-check but is not a listening csq
@@ -201,6 +238,77 @@ mod tests {
         assert_eq!(status_of(&p), DaemonStatus::Stale { pid: 0 });
     }
 
+    /// Regression: `csq daemon status` must not report an unrelated
+    /// program as the running daemon. Pre-fix it printed
+    /// `running / PID: 1754` where 1754 was a Microsoft Teams helper.
+    #[cfg(unix)]
+    #[test]
+    fn status_of_live_but_foreign_pid_is_pid_reused() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("csq-daemon.pid");
+        let mut foreign = crate::platform::process::spawn_foreign_test_process();
+        let foreign_pid = foreign.id();
+        fs::write(&p, format!("{foreign_pid}\n")).unwrap();
+
+        let status = status_of(&p);
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+
+        // Specifically NOT `Stale` — that variant's operator string says
+        // "references a dead PID", which is false for a live stranger.
+        assert_eq!(status, DaemonStatus::PidReused { pid: foreign_pid });
+    }
+
+    /// Regression — the safety-critical one: `stop_daemon` MUST NOT
+    /// signal a process it did not start.
+    ///
+    /// Pre-fix, `stop_daemon` read the PID from csq's own PID file,
+    /// confirmed only that *something* held it, and called
+    /// `libc::kill(pid, SIGTERM)`. On the originating host that PID
+    /// belonged to a Microsoft Teams helper — and `csq daemon stop` was
+    /// the remediation csq's own error message told the user to run.
+    ///
+    /// The load-bearing assertion is that the foreign process is STILL
+    /// ALIVE after the call. Asserting only the `StalePidFile` return
+    /// would pass even if the signal had been delivered.
+    #[cfg(unix)]
+    #[test]
+    fn stop_daemon_refuses_to_signal_a_foreign_pid() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("csq-daemon.pid");
+        let mut foreign = crate::platform::process::spawn_foreign_test_process();
+        let foreign_pid = foreign.id();
+        fs::write(&p, format!("{foreign_pid}\n")).unwrap();
+
+        let result = stop_daemon(&p);
+
+        // Read liveness BEFORE reaping so the observation is meaningful.
+        // `try_wait` returning None means the child has not exited: it was
+        // not signalled. (`is_pid_alive` would also be true for an
+        // unreaped zombie, so it cannot distinguish killed-from-alive
+        // here — the exit-status channel can.)
+        let still_running = foreign.try_wait().expect("try_wait").is_none();
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+
+        assert!(
+            still_running,
+            "stop_daemon signalled a process that is not csq — the recycled-PID \
+             bug this guard exists to prevent"
+        );
+        match result {
+            Err(DaemonError::StalePidFile { pid }) => {
+                assert_eq!(pid, foreign_pid);
+                // The stale file must be gone so the next `daemon start`
+                // acquires cleanly instead of wedging on AlreadyRunning.
+                assert!(!p.exists(), "stale PID file should have been removed");
+            }
+            other => panic!("expected StalePidFile, got {other:?}"),
+        }
+    }
+
     #[test]
     fn stop_daemon_missing_file_returns_not_running() {
         let dir = TempDir::new().unwrap();
@@ -230,7 +338,7 @@ mod tests {
 
     #[test]
     fn daemon_has_stopped_detects_pid_file_release_of_a_live_host() {
-        // #786 HIGH-2: a desktop-supervised daemon's PID file holds the app's
+        // an internal ticket HIGH-2: a desktop-supervised daemon's PID file holds the app's
         // PID, which stays alive after the daemon task stops. The PID-file
         // release — not PID death — is the "stopped" signal that lets
         // `stop_daemon` return Ok instead of falsely reporting "stuck".
@@ -261,5 +369,5 @@ mod tests {
     // because it requires spawning a real child process that blocks
     // on signal — doable but noisy in unit tests. The Windows
     // graceful-stop round trip is exercised by the integration test
-    // `tests/daemon_windows_graceful_stop.rs` (#786).
+    // `tests/daemon_windows_graceful_stop.rs` (an internal ticket).
 }

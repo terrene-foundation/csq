@@ -88,7 +88,9 @@ pub struct AccountQuota {
     // -- v2 mandatory-with-default -------------------------------------------
     /// Surface that produced this quota record.
     /// Defaults to "claude-code" on v1 files (field absent).
-    /// Allowed: "claude-code" | "codex" | "gemini".
+    /// Informational open set — known writers emit "claude-code" |
+    /// "codex" | "gemini" | "grok" | "kimi" | "kimi-cli" | per-provider
+    /// 3P tags. Nothing validates membership; new pollers add their own.
     #[serde(default = "default_surface")]
     pub surface: String,
     /// Quota kind: "utilization" (Anthropic/Codex) | "counter" (Gemini)
@@ -107,6 +109,19 @@ pub struct AccountQuota {
     /// `None` for subscription-based or rate-limited providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceInfo>,
+    /// Epoch-seconds of the last successful poll (or event, for
+    /// event-driven surfaces). `0.0` is the v2 default sentinel for
+    /// "never polled" (`quota::status::PollFreshness::NeverPolled`).
+    /// `#[serde(default)]`: a `quota.json` row missing this field (a
+    /// hand-edited file, a future writer that omits it, or any other
+    /// drift) MUST deserialize to the same `0.0` sentinel rather than
+    /// fail the WHOLE file's deserialization — every neighbouring field
+    /// on this struct already carries `#[serde(default, ...)]`; this
+    /// field lacked it until 2026-08-02, so a row missing `updated_at`
+    /// made `load_state` error, which `compose_status` (status.rs)
+    /// silently downgrades to `QuotaFile::empty()` — dropping every
+    /// OTHER slot's quota data along with it.
+    #[serde(default)]
     pub updated_at: f64,
 
     // -- v2 Gemini-reserved counter fields (all optional, nested structs) ----
@@ -202,20 +217,73 @@ impl AccountQuota {
         }
     }
 
-    /// Returns the 5-hour usage percentage (0-100), or 0 if no data.
+    /// Returns the 5-hour usage percentage (0-100), **or 0 if there is no
+    /// window at all**.
+    ///
+    /// The `unwrap_or(0.0)` makes "no data" indistinguishable from "measured
+    /// 0% used". That is acceptable ONLY where the caller has already
+    /// established a window exists (e.g. behind [`Self::shows_window`]) or
+    /// where a numeric default is genuinely wanted.
+    ///
+    /// **If the value is going to be RENDERED, use [`Self::five_hour_pct_opt`]
+    /// instead.** A fabricated `0%` reads to an operator as "quota healthy,
+    /// look elsewhere" — a confident wrong answer, which is worse than a
+    /// blank. Balance-metered slots (DeepSeek) and weekly-only slots (Grok)
+    /// have no 5-hour window at all, so this returns 0.0 for them forever.
     pub fn five_hour_pct(&self) -> f64 {
-        self.five_hour
-            .as_ref()
-            .map(|w| w.used_percentage)
-            .unwrap_or(0.0)
+        self.five_hour_pct_opt().unwrap_or(0.0)
     }
 
-    /// Returns the 7-day usage percentage (0-100), or 0 if no data.
+    /// Returns the 7-day usage percentage (0-100), **or 0 if there is no
+    /// window at all**. See [`Self::five_hour_pct`] — same caveat, same
+    /// guidance: prefer [`Self::seven_day_pct_opt`] for anything rendered.
     pub fn seven_day_pct(&self) -> f64 {
-        self.seven_day
-            .as_ref()
-            .map(|w| w.used_percentage)
-            .unwrap_or(0.0)
+        self.seven_day_pct_opt().unwrap_or(0.0)
+    }
+
+    /// The 5-hour usage percentage, or `None` when this row carries no
+    /// 5-hour window.
+    ///
+    /// This is the accessor that keeps "not measured" distinguishable from
+    /// "measured zero". Every RENDERING caller should use it and decide
+    /// explicitly what an absent window looks like (`n/a`, `—`, a pending
+    /// state) rather than inheriting a `0.0` that reads as a measurement.
+    pub fn five_hour_pct_opt(&self) -> Option<f64> {
+        self.five_hour.as_ref().map(|w| w.used_percentage)
+    }
+
+    /// The 7-day usage percentage, or `None` when this row carries no 7-day
+    /// window. See [`Self::five_hour_pct_opt`].
+    pub fn seven_day_pct_opt(&self) -> Option<f64> {
+        self.seven_day.as_ref().map(|w| w.used_percentage)
+    }
+
+    /// Whether this row carries a usage window at all.
+    ///
+    /// **A usage window BEATS a balance.** Billing shape is per-PLAN, not
+    /// per-provider, and a single row can legitimately carry both: a Grok
+    /// weekly-credit subscription writes a real `seven_day` window AND a
+    /// `$0.00` on-demand balance (its `on_demand_cap`/`on_demand_used` are 0
+    /// on that plan). So a present `balance` is NOT evidence of a
+    /// pay-per-token plan, and every renderer that picks between a window
+    /// and a balance MUST decide from THIS predicate — the observed row —
+    /// never from provider identity, a catalog `QuotaKind`, an
+    /// `AccountSource` variant, or the row's own `kind` tag.
+    ///
+    /// The same rule was rediscovered and re-implemented independently on
+    /// three surfaces, each time only after it shipped wrong:
+    /// `usage_poller::grok` (which picks `kind` on exactly this precedence),
+    /// the CLI status table (`status::quota_suffix`, commit 080430f0 — "grok-17
+    /// hid its 7% behind $0.00"), and then the desktop and the statusline.
+    /// This is the shared predicate so the fourth surface does not have to
+    /// rediscover it a fourth time.
+    ///
+    /// Note the deliberate asymmetry with `AccountStatus::shows_window`:
+    /// that one lives on the already-composed status view, whose percentages
+    /// are `Option<f64>`. This one answers the same question about the raw
+    /// row, which is what a renderer holds before composition.
+    pub fn shows_window(&self) -> bool {
+        self.five_hour.is_some() || self.seven_day.is_some()
     }
 }
 
@@ -425,6 +493,42 @@ mod tests {
         assert!(account.mismatch_count_today.is_none());
         assert!(account.is_downgrade.is_none());
         assert!(account.extras.is_none());
+    }
+
+    /// 2026-08-02 (second redteam lens, `quota/status.rs` stale-row
+    /// diagnostic): every other neighbouring field on `AccountQuota`
+    /// carries `#[serde(default, ...)]`, but `updated_at` did not — a
+    /// `quota.json` row missing the field failed to deserialize, which
+    /// made `load_state` error, which `status::compose_status` silently
+    /// downgraded to `QuotaFile::empty()`, dropping EVERY slot's quota
+    /// data. This pins the fix: a row with no `updated_at` key at all
+    /// MUST still parse, defaulting to the same `0.0` "never polled"
+    /// sentinel `AccountQuota::default()` already uses.
+    #[test]
+    fn parses_row_missing_updated_at_field_defaults_to_never_polled_sentinel() {
+        // Arrange -- updated_at key entirely absent (not merely null).
+        let json = r#"{
+            "schema_version": 2,
+            "accounts": {
+                "1": {
+                    "surface": "claude-code",
+                    "kind": "utilization",
+                    "five_hour": {"used_percentage": 42.0, "resets_at": 4102444800}
+                }
+            }
+        }"#;
+
+        // Act
+        let qf: QuotaFile =
+            serde_json::from_str(json).expect("row missing updated_at must still deserialize");
+
+        // Assert
+        let account = qf.accounts.get("1").expect("account 1 must parse");
+        assert_eq!(
+            account.updated_at, 0.0,
+            "missing updated_at must default to the 0.0 never-polled sentinel"
+        );
+        assert_eq!(account.five_hour.as_ref().unwrap().used_percentage, 42.0);
     }
 
     /// 2. Parse v2 file with Claude-only accounts -- migrated v1 with explicit fields.

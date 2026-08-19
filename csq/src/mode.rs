@@ -1,4 +1,4 @@
-//! Runtime mode dispatcher for the merged csq binary (#295 Option F2).
+//! Runtime mode dispatcher for the merged csq binary (an internal ticket Option F2).
 //!
 //! Detects whether the binary is running as a CLI tool or as the Tauri
 //! desktop app, then dispatches accordingly. Detection order:

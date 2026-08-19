@@ -19,11 +19,11 @@ csq-redact.workspace = true
 # supplies the app-side builders (EDITION + audit->DTO mapping). Non-optional: the
 # `csq exec/audit verify/sdk capabilities --json` surfaces are edition-uniform.
 csq-sdk.workspace = true
-# csq-merkle — #980 RFC 6962 Merkle verifier leaf. Non-optional: the
+# csq-merkle — an internal ticket RFC 6962 Merkle verifier leaf. Non-optional: the
 # `CsqLedgerSink` (feature `csq-ledger-sink`) and the EATP anchor-witness path
 # VERIFY the inclusion proof the ledger returns via `csq_merkle::verify_inclusion`
 # before trusting it. Zero-dep leaf (sha2 only), so it adds no moat surface; both
-# editions compile it. Depending on it here is the whole point of the #980
+# editions compile it. Depending on it here is the whole point of the an internal ticket
 # extraction — csq-core can reach the verifier WITHOUT a csq-core→csq-ledger
 # cycle (csq-ledger already depends on csq-core).
 csq-merkle.workspace = true

@@ -305,6 +305,8 @@ fn model_provider_family(model: &str) -> Option<&'static str> {
         Some("claude")
     } else if lc.contains("deepseek") {
         Some("deepseek")
+    } else if lc.contains("kimi") {
+        Some("kimi")
     } else if lc.contains("glm") {
         Some("zai")
     } else if lc.contains("minimax")
@@ -353,6 +355,14 @@ fn provider_family_for_source(source: &crate::accounts::AccountSource) -> Option
         // Display name (`"DeepSeek"`/`"MiniMax"`/`"Z.AI"`/`"Ollama"`) → catalog id.
         S::ThirdParty { provider } => crate::providers::catalog::id_from_display_name(provider),
         S::Manual => None,
+        // Native-CLI session surfaces (Wave 3, an internal journal entry) — `kimi` / `grok`.
+        // In practice this arm is inert for attribution: `kimi`/`grok` are
+        // vendor binaries, NOT `claude`, so they write no CC-shaped JSONL
+        // transcript for `attribute_session` to scan in the first place. The
+        // mapping is filled for exhaustiveness + symmetry with the 3P Kimi
+        // bearer id ("kimi", matched by `model_provider_family`'s
+        // `contains("kimi")` arm above).
+        S::Native { surface } => Some(surface.as_str()),
     }
 }
 
@@ -459,38 +469,53 @@ where
 /// If the resolved model is unknown to the rate table, `cost_usd_estimate` is
 /// `None` and the UI shows "n/a" for the cost column.
 ///
-/// COST NOTE (#992): for Anthropic Claude models the estimate now bills cache
-/// tokens in addition to `input_tokens` + `output_tokens` — cache-write
-/// (`cache_creation_tokens`) and cache-read (`cache_read_tokens`) via
-/// [`super::cost_rates::CostRate::estimate_usd_with_cache`] at Anthropic's
-/// published prompt-caching multipliers (1.25× / 0.10× of the base input rate).
-/// Non-Anthropic providers (rate rows with `cache_eligible == false`) bill cache
-/// at $0 — their cache pricing is not yet verified and csq does not guess (#992
-/// follow-up). Sessions with zero cache tokens bill identically to before on
-/// every provider (no cost regression).
+/// COST NOTE (an internal ticket): the estimate bills cache tokens — cache-write
+/// (`cache_creation_tokens`) and cache-read (`cache_read_tokens`) — in addition
+/// to `input_tokens` + `output_tokens`, via
+/// [`super::cost_rates::CostRate::estimate_usd_with_cache`], at each rate row's
+/// OWN stored cache prices. A row with no verified price for a dimension bills
+/// that dimension at $0, so csq never applies one vendor's cache economics to
+/// another's row.
+///
+/// Today that means: Anthropic Claude rows bill both cache dimensions;
+/// DeepSeek rows bill cache-READ at DeepSeek's published per-tier price and
+/// cache-WRITE at $0 (DeepSeek publishes no write price — see
+/// `TIME_VARYING_RATES`); every other provider bills both at $0.
+///
+/// Sessions with zero cache tokens bill identically on every provider, so no
+/// cost regresses. DeepSeek sessions WITH cache reads become more expensive
+/// than they previously reported — that is the an internal ticket under-report being
+/// corrected, not a rate change.
 pub fn attributed_session_to_event(
     attributed: &AttributedSession,
     fallback_model: &str,
 ) -> UsageEvent {
     let session = &attributed.session;
     let model = session.model.as_deref().unwrap_or(fallback_model);
-    let cost = super::cost_rates::rate_for_model(model).map(|r| {
-        if r.cache_eligible {
-            // Anthropic Claude rows only: bill cache-write at 1.25× and
-            // cache-read at 0.10× of the base input rate (Anthropic's published
-            // prices). Non-Claude rows are `cache_eligible == false` and fall to
-            // the input+output-only estimate below — their cache pricing differs
-            // materially and is not yet verified, so csq does not guess (the
-            // fail-loud contract). #992 follow-up for per-provider cache rates.
-            r.estimate_usd_with_cache(
-                session.input_tokens,
-                session.output_tokens,
-                session.cache_creation_tokens,
-                session.cache_read_tokens,
-            )
-        } else {
-            r.estimate_usd(session.input_tokens, session.output_tokens)
-        }
+    // Price at the instant the SESSION ran, not wall-clock now (an internal ticket): a
+    // DeepSeek session's rate depends on whether it predates the 2026-08-16
+    // peak/off-peak cutover and, after it, which UTC window it started in.
+    // `start_time` is the session's own earliest transcript timestamp, so a
+    // historical ledger entry keeps pricing at the rate that was charged then.
+    // An unparseable timestamp yields `None`, which the rate table treats as
+    // "cannot select a tier" — flat rows still resolve, time-varying rows
+    // render `n/a` rather than guessing (fail-loud contract).
+    let at = DateTime::parse_from_rfc3339(&session.start_time)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc));
+    // Unconditional since an internal ticket: each rate row carries its OWN cache prices, and
+    // a row with no verified price contributes exactly $0 for that dimension, so
+    // `estimate_usd_with_cache` reduces to `estimate_usd` on such a row for any
+    // token counts. The former `if r.cache_eligible` branch existed only to keep
+    // Anthropic's multipliers off non-Anthropic rows; with prices stored per row
+    // there is no longer a wrong multiplier to guard against.
+    let cost = super::cost_rates::rate_for_model_at(model, at).map(|r| {
+        r.estimate_usd_with_cache(
+            session.input_tokens,
+            session.output_tokens,
+            session.cache_creation_tokens,
+            session.cache_read_tokens,
+        )
     });
     UsageEvent {
         ts: session.start_time.clone(),
@@ -838,6 +863,76 @@ mod tests {
         );
     }
 
+    /// an internal ticket end-to-end: the DeepSeek rate is selected by the SESSION's own
+    /// timestamp, so three otherwise-identical sessions differing only in when
+    /// they ran get three different bills — and a July session keeps pricing at
+    /// July's rate no matter when the aggregator runs.
+    #[test]
+    fn attributed_session_to_event_prices_deepseek_by_session_time() {
+        // 1M in + 1M out @ deepseek-v4-pro, at three fixed instants.
+        for (ts, expected, label) in [
+            (
+                "2026-07-04T02:30:00Z",
+                1.305,
+                "pre-cutover flat (0.435 + 0.87)",
+            ),
+            (
+                "2026-08-20T02:30:00Z",
+                5.28,
+                "post-cutover PEAK (1.32 + 3.96)",
+            ),
+            (
+                "2026-08-20T12:30:00Z",
+                2.64,
+                "post-cutover OFF-PEAK (0.66 + 1.98)",
+            ),
+        ] {
+            let mut session = scanned(ts, "/repo/a", 1_000_000, 1_000_000);
+            session.model = Some("deepseek-v4-pro".into());
+            let attr = AttributedSession {
+                slot: slot(7),
+                session,
+            };
+            let event = attributed_session_to_event(&attr, "deepseek-v4-pro");
+            let cost = event.cost_usd_estimate.expect("v4-pro is a rated model");
+            assert!(
+                (cost - expected).abs() < 0.001,
+                "{ts} ({label}): expected ~${expected}, got ${cost}"
+            );
+        }
+    }
+
+    /// an internal ticket fail-loud: a session whose timestamp will not parse cannot select
+    /// a DeepSeek tier, so the cost renders `n/a` rather than guessing one of
+    /// two rates that differ by 2×. A time-invariant model is unaffected.
+    #[test]
+    fn attributed_session_to_event_unparseable_ts_yields_na_for_deepseek_only() {
+        let mut session = scanned("not-a-timestamp", "/repo/a", 1_000_000, 1_000_000);
+        session.model = Some("deepseek-v4-pro".into());
+        let attr = AttributedSession {
+            slot: slot(7),
+            session,
+        };
+        assert!(
+            attributed_session_to_event(&attr, "deepseek-v4-pro")
+                .cost_usd_estimate
+                .is_none(),
+            "unparseable timestamp must render n/a, never a guessed tier"
+        );
+
+        // Claude's rate does not depend on when → still priced.
+        let mut session = scanned("not-a-timestamp", "/repo/a", 100_000, 50_000);
+        session.model = Some("claude-sonnet-4-6".into());
+        let attr = AttributedSession {
+            slot: slot(1),
+            session,
+        };
+        let cost = attributed_session_to_event(&attr, "claude-sonnet-4-6")
+            .cost_usd_estimate
+            .expect("time-invariant rows must not regress to n/a");
+        assert!((cost - 1.05).abs() < 0.001, "expected ~$1.05, got ${cost}");
+    }
+
     #[test]
     fn attributed_session_to_event_unknown_model_returns_none_cost() {
         let attr = AttributedSession {
@@ -863,7 +958,7 @@ mod tests {
         // Cache tokens are captured on the event.
         assert_eq!(event.cache_creation_tokens, 930_906);
         assert_eq!(event.cache_read_tokens, 8_839_479);
-        // #992: cost now bills input + output + cache-write(1.25×) + cache-read(0.10×)
+        // an internal ticket: cost now bills input + output + cache-write(1.25×) + cache-read(0.10×)
         // at claude-opus input rate ($15/1M).
         let cost = event.cost_usd_estimate.unwrap();
         let expected = 100.0 * 15.0 / 1e6            // input
@@ -877,9 +972,14 @@ mod tests {
     }
 
     #[test]
-    fn attributed_session_to_event_non_anthropic_excludes_cache_from_cost() {
-        // #992: a non-Anthropic model (deepseek) with cache tokens present bills
-        // cache at $0 — cost is input+output only. The tokens are still captured.
+    fn attributed_session_to_event_bills_deepseek_cache_read_but_not_write() {
+        // an internal ticket: DeepSeek publishes a cache-HIT price, so cache reads now bill
+        // at that row's own per-tier price — this is the under-report being
+        // corrected. Cache WRITES stay at $0 because DeepSeek publishes no
+        // write price and csq does not guess one (guessing would OVER-bill).
+        //
+        // This assertion previously read "non-Anthropic cache must be $0" and
+        // was correct only while csq had no DeepSeek cache price at all.
         let mut session = scanned("2026-05-06T11:30:00Z", "/repo/a", 1_000, 500);
         session.model = Some("deepseek-v4-pro".into());
         session.cache_creation_tokens = 5_000_000;
@@ -891,12 +991,15 @@ mod tests {
         let event = attributed_session_to_event(&attr, "claude-sonnet-4-6");
         assert_eq!(event.cache_creation_tokens, 5_000_000);
         assert_eq!(event.cache_read_tokens, 20_000_000);
-        // deepseek-v4-pro: $0.435/1M input, $0.87/1M output; cache NOT billed.
+        // Pre-cutover v4-pro: $0.435/1M in, $0.87/1M out, $0.003625/1M cache-hit.
+        // Cache WRITE contributes exactly nothing despite 5M write tokens.
         let cost = event.cost_usd_estimate.unwrap();
-        let expected = 1_000.0 * 0.435 / 1e6 + 500.0 * 0.87 / 1e6;
+        let expected = 1_000.0 * 0.435 / 1e6          // input
+            + 500.0 * 0.87 / 1e6                       // output
+            + 20_000_000.0 * 0.003625 / 1e6; // cache read (write = $0)
         assert!(
             (cost - expected).abs() < 1e-12,
-            "non-Anthropic cache must be $0: expected ${expected}, got ${cost}"
+            "deepseek cache-read must bill, cache-write must not: expected ${expected}, got ${cost}"
         );
     }
 

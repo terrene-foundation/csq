@@ -9,12 +9,12 @@
 //! MCP gating is performed csq-side at the prompt-edit boundary by the
 //! capability layer (spec 10 §10.8.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coc::types::CocSet;
 use crate::providers::catalog::Surface;
 
-use super::flatten::{flatten_artifacts, render_sections};
+use super::flatten::{flatten_artifacts, is_real_path_restriction, render_sections};
 use super::types::{CodexSpawnPayload, McpFilter, SandboxMode};
 
 /// FR-CL-01 system-prompt directive — re-exported from
@@ -32,6 +32,19 @@ pub fn translate(coc_set: &CocSet) -> CodexSpawnPayload {
     let arts = flatten_artifacts(coc_set, Surface::Codex);
     let (instructions, contributing_ids) = render_sections(SURFACE_HEADER, &arts);
 
+    // MED-2 (round-13 review): Codex has no per-file rule-scoping mechanism
+    // — every in-scope rule reaches `instructions` as flat global prose
+    // regardless of `paths`. Record the broadening via the shared
+    // predicate so the loss is disclosed, not silent (this was the
+    // identical pre-existing gap Kimi had — see
+    // `CodexSpawnPayload::unscoped_path_rules`'s doc comment).
+    let unscoped_path_rules: BTreeSet<String> = arts
+        .rules
+        .iter()
+        .filter(|r| is_real_path_restriction(&r.paths))
+        .map(|r| r.id.clone())
+        .collect();
+
     CodexSpawnPayload {
         config_toml_overlay: BTreeMap::new(),
         instructions,
@@ -44,6 +57,7 @@ pub fn translate(coc_set: &CocSet) -> CodexSpawnPayload {
         // commit 2; renamed from _with_instructions in M6 T6.2 Shard 3a
         // when the MCP-proxy rewrite transform was composed in).
         output_schema_directive: Some(build_output_schema_directive()),
+        unscoped_path_rules,
     }
 }
 
@@ -64,6 +78,18 @@ mod tests {
             paths: vec!["**".to_string()],
             applies_to,
             precedence,
+            disable: std::collections::BTreeSet::new(),
+            body: body.to_string(),
+            unknowns: BTreeMap::new(),
+        }
+    }
+
+    fn scoped_rule(id: &str, paths: &[&str], body: &str) -> RuleDef {
+        RuleDef {
+            id: RuleId(id.to_string()),
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            applies_to: std::collections::BTreeSet::new(),
+            precedence: 0,
             disable: std::collections::BTreeSet::new(),
             body: body.to_string(),
             unknowns: BTreeMap::new(),
@@ -101,6 +127,32 @@ mod tests {
         assert_eq!(payload.instructions, SURFACE_HEADER);
         assert_eq!(payload.sandbox_mode, SandboxMode::ReadOnly);
         assert!(payload.mcp_filter.is_empty());
+        assert!(payload.unscoped_path_rules.is_empty());
+    }
+
+    /// MED-2 (round-13 review) non-vacuity: a rule carrying real path scope
+    /// MUST be reported as broadened, not silently dropped or silently
+    /// treated as still-scoped — Codex has the identical pre-existing gap
+    /// Kimi had, now closed via the shared predicate.
+    #[test]
+    fn path_scoped_rule_is_recorded_as_unscoped_and_still_reaches_prose() {
+        let set = build_set(vec![scoped_rule(
+            "RULE-SCOPED",
+            &["src/**/*.rs"],
+            "only for rust files",
+        )]);
+        let payload = translate(&set);
+        assert!(payload.unscoped_path_rules.contains("RULE-SCOPED"));
+        assert!(payload.instructions.contains("only for rust files"));
+    }
+
+    /// An unscoped rule (default `paths: ["**"]` from the parser) is NOT
+    /// recorded — only rules that actually declared a narrower scope are.
+    #[test]
+    fn wildcard_path_rule_is_not_recorded_as_unscoped() {
+        let set = build_set(vec![rule("RULE-WILD", 0, &[], "applies everywhere")]);
+        let payload = translate(&set);
+        assert!(!payload.unscoped_path_rules.contains("RULE-WILD"));
     }
 
     #[test]
@@ -140,8 +192,17 @@ mod tests {
         assert!(h < l);
     }
 
+    /// NIT-1 (round-13 review): this loops a PURE function 30x in ONE
+    /// process — it can only fail if `translate` reads mutable global
+    /// state, which it does not by construction. It does NOT exercise
+    /// FR-DISP-05's actual contract, which is cross-PROCESS byte-identity
+    /// (spec 10 §10.3.5) — that is covered by
+    /// `coc-eval/lib/delivery.py::run_csq_translate`, which shells out to a
+    /// fresh `csq translate` invocation per call. Renamed from
+    /// `deterministic_30_invocations` (which claimed the cross-process
+    /// contract) to name what this test actually proves.
     #[test]
-    fn deterministic_30_invocations() {
+    fn translate_is_pure_across_repeated_calls_same_process() {
         let set = build_set(vec![
             rule("RULE-A", 5, &[Surface::Codex], "alpha"),
             rule("RULE-B", 0, &[Surface::Codex], "beta"),

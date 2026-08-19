@@ -79,14 +79,15 @@ pub const LIVE_FETCH_TIMEOUT_MS: u64 = 1_500;
 /// dynamic source of truth so this drift is bounded by "what a fresh
 /// install with no codex-cli sees on day 1."
 ///
-/// Last refreshed 2026-05-11 from upstream tooltip ("GPT-5.5 is now available
-/// in Codex... our strongest agentic coding model yet"). The 2026-05-07
-/// refresh against codex-cli 0.128.0 had 5.4 as default; OpenAI promoted 5.5
-/// to default between then and now. v2.7.1 patch.
+/// Last refreshed 2026-07-19 against codex-cli 0.144.4, whose built-in default
+/// is `gpt-5.6-sol` (verified live from `~/.codex/config.toml`). Earlier
+/// refreshes: 2026-05-11 had 5.5 as default, 2026-05-07 (codex-cli 0.128.0) had
+/// 5.4. OpenAI promotes the default forward across releases; the bundled lead
+/// tracks it so the cold-start dropdown pre-selects the current default.
 pub const BUNDLED_MODELS: &[(&str, &str)] = &[
-    ("gpt-5.5", "GPT-5.5 (default)"),
+    ("gpt-5.6-sol", "GPT-5.6 (default)"),
+    ("gpt-5.5", "GPT-5.5"),
     ("gpt-5.4", "GPT-5.4"),
-    ("gpt-5.3-codex", "gpt-5.3-codex"),
 ];
 
 /// One row in the UI picker. Small on purpose — anything more than
@@ -350,11 +351,11 @@ mod tests {
 
     #[test]
     fn bundled_leads_with_provider_default() {
-        // The catalog's `default_model` is `gpt-5.5` (v2.7.1+) — the bundled
-        // list's first entry must match so users see the default
+        // The catalog's `default_model` is `gpt-5.6-sol` (2026-07-19) — the
+        // bundled list's first entry must match so users see the default
         // pre-selected in the dropdown.
         let b = bundled();
-        assert_eq!(b.models[0].id, "gpt-5.5");
+        assert_eq!(b.models[0].id, "gpt-5.6-sol");
         let default_model = crate::providers::get_provider("codex")
             .unwrap()
             .default_model;

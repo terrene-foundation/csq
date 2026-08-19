@@ -1,5 +1,5 @@
 <script lang="ts">
-  // ── Policy Bundle Admin Console (#787 AC#3) ──────────────────────────
+  // ── Policy Bundle Admin Console (an internal ticket AC#3) ──────────────────────────
   //
   // Compliance-admin surface for managing EU AI Act / GDPR policy bundles.
   // Enterprise-only: this component is only mounted when `isEnterprise` is
@@ -1015,7 +1015,11 @@
   button.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
+    /* i-audit sweep — white-on-accent measured 2.21:1 in the default
+       dark theme (WCAG AA needs 4.5:1). var(--bg-primary) flips per
+       theme and clears AA on both (dark 7.93:1, light 6.20:1) — same
+       fix as an internal ticket's AddAccountModal .actions button.primary. */
+    color: var(--bg-primary);
   }
 
   button.secondary {

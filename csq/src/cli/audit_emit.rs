@@ -237,6 +237,28 @@ impl AuditEmitter {
         }
     }
 
+    /// Record citations on a path where **FR-CL-04 repair did not run** —
+    /// `after_repair` is by definition identical to `original`, so
+    /// `rule_ids_dropped_invalid_format` is 0.
+    ///
+    /// Use this on every post-validate-PASS path. Calling
+    /// [`set_rule_ids`](Self::set_rule_ids) with `(cited, vec![])` there is
+    /// the bug this method exists to make unrepresentable: the internal
+    /// `original.len() - after_repair.len()` derivation faithfully turns that
+    /// caller pair into `dropped == cited.len()`, i.e. a durable record
+    /// asserting that *every* rule the model cited was discarded as
+    /// malformed — on the exact path that just certified the output
+    /// well-formed.
+    ///
+    /// The derivation (PR-CA10c R1 redteam MEDIUM fix) closed the half of
+    /// the door where a caller passes an inconsistent *count*. It could not
+    /// close the half where a caller passes an inconsistent *pair*, because
+    /// `(cited, vec![])` is indistinguishable from a genuine
+    /// repair-dropped-everything outcome. Intent has to be in the signature.
+    pub fn set_rule_ids_unrepaired(&mut self, cited: Vec<String>) {
+        self.set_rule_ids(cited.clone(), cited);
+    }
+
     /// Overwrite `score_delta_vs_baseline` in the held record.
     #[allow(dead_code)]
     pub fn set_score_delta(&mut self, delta: Option<f64>) {
@@ -297,7 +319,7 @@ impl AuditEmitter {
     /// paths rely on it). The primary `csq run` flow uses
     /// [`AuditEmitter::try_flush_now`] so the loss is surfaced fail-loud.
     /// Retained only for the Drop-becomes-no-op invariant test.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn flush_now(&mut self) {
         // Take the record so Drop is a no-op.
         let record = match self.record.take() {
@@ -632,11 +654,14 @@ fn write_pending(pending_dir: &Path, run_id: &str, bytes: &[u8]) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use csq_core::audit::{Decision, ResultState, Surface};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     fn sample_record(run_id: &str) -> AuditRecord {
         AuditRecord {
             schema_version: "1".to_string(),
@@ -943,6 +968,47 @@ mod tests {
             parsed.rule_ids_dropped_invalid_format, 1,
             "dropped_count must be derived from len(original) - len(after_repair) = 3 - 2"
         );
+
+        // Guard the inverse: on a post-validate-PASS path, repair did NOT
+        // run, so `after_repair == original` and NOTHING was dropped. The
+        // pre-fix `run.rs` callsite passed `(cited, vec![])` here, which the
+        // internal derivation faithfully turned into
+        // `dropped == cited.len()` — a durable record asserting every
+        // citation was discarded as malformed, on the path that had just
+        // certified the output well-formed.
+        {
+            let run_id_pass = "00000000-0000-4000-a000-0000000000aa";
+            let mut pass_emitter = AuditEmitter::new(
+                sample_record(run_id_pass),
+                dir.path().join("csq.sock"),
+                pending_dir.clone(),
+                "csq run account 13".to_string(),
+            );
+            pass_emitter.set_result(ResultState::Pass, Decision::Accept);
+            let cited = vec!["RULE-A".to_string(), "RULE-B".to_string()];
+            pass_emitter.set_rule_ids_unrepaired(cited.clone());
+            pass_emitter.flush_now();
+
+            let pass_path = pending_dir.join(format!("{run_id_pass}.jsonl"));
+            let pass_parsed: csq_core::audit::AuditRecord =
+                serde_json::from_str(&std::fs::read_to_string(&pass_path).unwrap()).unwrap();
+
+            assert_eq!(
+                pass_parsed.rule_ids_cited_original, cited,
+                "unrepaired path must record the cited set verbatim"
+            );
+            assert_eq!(
+                pass_parsed.rule_ids_cited_after_repair, cited,
+                "repair did not run, so after_repair MUST equal original — \
+                 an empty after_repair here is the false-record bug"
+            );
+            assert_eq!(
+                pass_parsed.rule_ids_dropped_invalid_format, 0,
+                "a post-validate PASS dropped NOTHING; any non-zero count \
+                 here claims the model's citations were malformed on the \
+                 exact path that certified them well-formed"
+            );
+        }
 
         // Verify flush_now made Drop a no-op: construct a second emitter
         // pointing at a distinct run_id file, call flush_now, then drop —

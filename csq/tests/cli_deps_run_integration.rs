@@ -32,11 +32,13 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
 use tempfile::TempDir;
 
 // Workspace-local serial mutex (an internal journal entry): cli_deps probe has a 2s
 // timeout that races under cargo's parallel test load. All tests serialize
 // on this mutex to prevent CPU-saturation flakes.
+#[cfg(unix)]
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Binary path ──────────────────────────────────────────────────────────────
@@ -60,6 +62,7 @@ fn csq_bin() -> PathBuf {
 /// process, so production paths that read `HOME` directly (`~/.codex`,
 /// `~/.gemini`, redaction helper, keychain prefix) resolve inside the sandbox
 /// instead of the operator's real home. See `rules/test-hermeticity.md` MUST 2.
+#[cfg(unix)]
 fn sandbox_home() -> std::path::PathBuf {
     static H: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
     H.get_or_init(|| TempDir::new().expect("sandbox home"))
@@ -69,6 +72,7 @@ fn sandbox_home() -> std::path::PathBuf {
 
 /// Env-cleared command builder per `rules/testing.md` Rule 4a +
 /// `rules/test-hermeticity.md` MUST 2 (sandbox HOME + CLAUDE_HOME, never parent).
+#[cfg(unix)]
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
@@ -131,6 +135,7 @@ fn write_hang_stub(stub_dir: &std::path::Path, name: &str, hang_secs: u64) -> Pa
 /// Write a minimal Codex canonical credential file so `csq run` dispatches
 /// to the Codex path. The file content just needs to exist (symlink_metadata
 /// checks existence only, not content validity).
+#[cfg(unix)]
 fn write_codex_canonical(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -140,6 +145,7 @@ fn write_codex_canonical(base: &std::path::Path, n: u16) {
 
 /// Write a minimal Gemini canonical credential file so `surface_cli_for_slot`
 /// returns Some(Gemini). Mirrors `write_codex_canonical` for the Gemini surface.
+#[cfg(unix)]
 fn write_gemini_canonical(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -150,6 +156,7 @@ fn write_gemini_canonical(base: &std::path::Path, n: u16) {
 
 /// Write a minimal Claude canonical credential file so `csq run` dispatches
 /// to the Claude/Anthropic path.
+#[cfg(unix)]
 fn write_claude_canonical(base: &std::path::Path, n: u16) {
     let dir = base.join("credentials");
     std::fs::create_dir_all(&dir).unwrap();
@@ -161,6 +168,7 @@ fn write_claude_canonical(base: &std::path::Path, n: u16) {
 
 /// Write config-N/settings.json with ANTHROPIC_BASE_URL pointing at localhost
 /// (Ollama pattern) so `discover_per_slot_third_party` classifies it as 3P.
+#[cfg(unix)]
 fn write_third_party_settings(base: &std::path::Path, n: u16) {
     let config_dir = base.join(format!("config-{n}"));
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -173,6 +181,7 @@ fn write_third_party_settings(base: &std::path::Path, n: u16) {
 // ── Assertion helpers ────────────────────────────────────────────────────────
 
 /// Assert that a `csq run` invocation bailed due to the pre-flight probe.
+#[cfg(unix)]
 fn assert_probe_bail(output: &std::process::Output, expected_fragment: &str, test_name: &str) {
     assert_ne!(
         output.status.code(),
@@ -197,6 +206,7 @@ fn assert_probe_bail(output: &std::process::Output, expected_fragment: &str, tes
 ///
 /// We cannot assert exit 0 because downstream errors (daemon not running,
 /// missing credentials, etc.) will cause non-zero exit even when probe passes.
+#[cfg(unix)]
 fn assert_no_probe_bail(output: &std::process::Output, absence_fragment: &str, test_name: &str) {
     let combined = format!(
         "{}{}",
@@ -487,6 +497,71 @@ fn test_run_r08_claude_slot_ok_version_no_bail() {
         "run_r08_claude_ok",
     );
     assert_no_probe_bail(&output, "claude-cli is not installed", "run_r08_claude_ok");
+}
+
+/// Regression for an internal ticket: `csq run <N>` against a slot with NO identity
+/// record anywhere (no `config-N/`, no `credentials/N.json`, no
+/// `profiles.json` `by_slot` entry — i.e. a deleted/never-configured slot)
+/// MUST refuse with the "no identity record" error AND MUST NOT create
+/// `config-N/` as a side effect of the refusal.
+///
+/// Pre-fix, `handle()` unconditionally ran `create_dir_all(config_dir)` +
+/// wrote `.csq-account` / `.current-account` + called
+/// `session::mark_onboarding_complete` (which writes a 36-byte
+/// `.claude.json`) BEFORE checking `resolve_slot_to_uuid`, so this exact
+/// invocation silently resurrected a byte-identical phantom `config-N/`
+/// directory even though the command correctly refused to launch. The probe
+/// (claude version check) passes first — via the stub below — so this test
+/// reaches the identity gate under test rather than bailing earlier.
+#[test]
+#[cfg(unix)]
+fn test_run_r08b_claude_slot_orphaned_no_identity_creates_no_config_dir() {
+    let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+        SERIAL.clear_poison();
+        p.into_inner()
+    });
+    let base = TempDir::new().unwrap();
+    let stubs = TempDir::new().unwrap();
+
+    // Deliberately NOT calling write_claude_canonical / any config-N setup —
+    // slot 99 has zero footprint anywhere under `base`.
+    write_stub(stubs.path(), "claude", "2.1.138 (Claude Code)");
+
+    let config_dir = base.path().join("config-99");
+    assert!(
+        !config_dir.exists(),
+        "precondition: config-99 must not exist before the run"
+    );
+
+    let output = clean_cmd(Some(stubs.path().to_str().unwrap()))
+        .env("CSQ_BASE_DIR", base.path())
+        .args(["run", "99"])
+        .output()
+        .expect("failed to spawn csq run");
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "run_r08b: expected non-zero exit for an orphaned slot"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("no identity record for account 99"),
+        "run_r08b: expected the no-identity-record refusal; got:\n{combined}"
+    );
+
+    // The regression assertion: the refusal MUST NOT have created config-99
+    // or any of the three phantom files (`.claude.json`, `.csq-account`,
+    // `.current-account`) as a side effect.
+    assert!(
+        !config_dir.exists(),
+        "run_r08b: config-99 was created despite the identity gate refusing \
+         to launch — the pre-an internal ticket-fix phantom-slot bug has regressed"
+    );
 }
 
 /// (R09) csq run on 3P slot → SKIPS pre-flight entirely (no probe spawn).

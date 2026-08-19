@@ -54,7 +54,7 @@ pub const MCP_GATE_OUTBOX_SUBDIR: &str = ".pending-mcp-gate";
 pub const SEAM_PROVENANCE_SUBDIR: &str = ".pending/provenance";
 
 /// File under `csq-runs/` holding the daemon's last outbox-drain-cycle time as
-/// decimal Unix epoch seconds (M6 #909 shard B).
+/// decimal Unix epoch seconds (M6 an internal ticket shard B).
 ///
 /// The daemon stamps this at the END of every drain cycle — startup reconciler,
 /// the periodic refresher-tick backstop, AND the event-driven live-path-recovery
@@ -118,7 +118,7 @@ pub fn read_outbox_drain_stamp(base: &Path) -> Option<u64> {
 }
 
 /// File under `csq-runs/` whose PRESENCE is the durable **attestation-intent**
-/// marker (M6 #909 shard C).
+/// marker (M6 an internal ticket shard C).
 ///
 /// The root-cause problem decision 1 solves: at gate-decision time the live path
 /// cannot distinguish a *non-audit host* (a chain will never exist — pre-init

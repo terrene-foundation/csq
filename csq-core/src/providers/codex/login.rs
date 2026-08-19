@@ -379,6 +379,24 @@ where
         .map(|s| s.to_owned());
     let canonical_creds = CredentialFile::Codex(codex_creds);
 
+    // GH an internal ticket: CAPTURE (do not act on) any stale ADDITIVE marker
+    // binding (Gemini / native Kimi-Grok) BEFORE the identity mint below.
+    // `detect_stale_marker_binding` sources detection directly from the
+    // Gemini/native marker predicates (an internal ticket regression fix — see its doc
+    // comment) rather than `detect_bound_surface`'s precedence-ordered union
+    // detector, so this call is not ordering-sensitive relative to
+    // `mint_for_codex_login`. It stays here, ahead of the mint, to mirror the
+    // CLI Anthropic path's `finalize_login` layout.
+    //
+    // Security review (GH an internal ticket): the ACTION is deferred to just after
+    // `update_profile` succeeds below — the last fallible step in this
+    // function — so a login that fails partway through (mint, save,
+    // marker/profile write) never destroys the prior binding it did not
+    // actually replace. `detect_stale_marker_binding` is pure — nothing is
+    // deleted by this call.
+    let stale_marker_binding =
+        crate::accounts::binding_guard::detect_stale_marker_binding(base_dir, account);
+
     // Task 2: Mint a UUID for this slot when none exists.
     //
     // Root-cause fix for the slot-12 `refresh_token_reused` bug: daemon
@@ -515,6 +533,18 @@ where
     let label = format_label(account, account_id_hint.as_deref());
     update_profile(base_dir, account, &label)
         .with_context(|| "update profiles.json with the new Codex account entry")?;
+
+    // GH an internal ticket (CLOSED, shipped): ACT on the marker binding captured
+    // earlier — left un-acted until this point — before the mint above.
+    // This is the point right after the LAST fallible
+    // step (`update_profile`'s `?`) in this function — everything remaining
+    // below is non-fatal. Acting here rather than at detection time means a
+    // login that fails earlier (mint, save_canonical_for, marker/profile
+    // write) leaves the prior Gemini/native binding untouched, exactly like
+    // the pre-fix refuse behaviour did on failure.
+    if let Some(surface) = stale_marker_binding {
+        crate::accounts::binding_guard::clear_detected_marker_binding(base_dir, account, surface);
+    }
 
     // M4-2: pair `identities/<UUID>/settings.json` when a UUID mapping exists
     // for this slot. Codex does NOT use `config-<N>/settings.json` (Codex's
@@ -670,6 +700,7 @@ fn spawn_codex_device_auth(config_dir: &Path) -> Result<ExitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_env::with_in_memory_secret_backend;
     use std::io::Cursor;
     use tempfile::TempDir;
 
@@ -797,6 +828,173 @@ mod tests {
         assert!(!base.join("config-2/auth.json").exists());
         // Label carries the account-id prefix.
         assert_eq!(outcome.label, "codex-2/acct");
+    }
+
+    #[test]
+    fn perform_with_clears_stale_gemini_marker_after_login() {
+        // GH an internal ticket: a slot previously bound to Gemini that then logs
+        // in as Codex must not carry BOTH bindings afterward.
+        use crate::providers::gemini::provisioning::{
+            write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(20);
+        provision_uuid_for_account(base, 20);
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(
+            crate::providers::gemini::provisioning::is_gemini_bound_slot(base, account),
+            "pre: slot must be Gemini-bound before the Codex login"
+        );
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        // Pin the vault backend: `clear_detected_marker_binding` deletes the
+        // Gemini vault entry BEFORE the marker and is fail-closed on any
+        // vault-step failure, so an ambient-resolved vault makes this test
+        // platform-dependent — GREEN on macOS/Windows (their vaults always
+        // open) and RED on a bus-less Linux CI runner, where the marker is
+        // deliberately left in place. See
+        // `platform::test_env::with_in_memory_secret_backend`.
+        with_in_memory_secret_backend(|| {
+            perform_with(
+                base,
+                account,
+                &mut reader,
+                &mut writer,
+                || ProbeResult::Absent,
+                || Ok(false),
+                |config_dir| {
+                    stub_codex_auth_json(config_dir, "acct-uuid-gemini-cleanup");
+                    Ok(fake_success())
+                },
+            )
+        })
+        .expect("codex login should succeed");
+
+        assert!(
+            !crate::providers::gemini::provisioning::is_gemini_bound_slot(base, account),
+            "the stale Gemini marker must be removed after the Codex login replaces the slot"
+        );
+        assert!(
+            crate::accounts::identity_store::is_codex_bound_slot_identity_aware(base, account),
+            "the slot must now read as Codex-bound"
+        );
+    }
+
+    /// Security review regression (GH an internal ticket): a `perform_with` that
+    /// FAILS after the stale-marker DETECTION point must NOT have deleted the
+    /// prior Gemini binding. `.profiles.lock` pre-created as a DIRECTORY
+    /// makes the mint's `ProfilesFileLock::acquire` fail deterministically —
+    /// mirrors `accounts::login::tests::finalize_login_failure_preserves_prior_gemini_binding`.
+    // UNIX-ONLY FIXTURE, not a unix-only property. The failure this test needs
+    // is injected by creating `.profiles.lock` as a DIRECTORY, so that
+    // `ProfilesFileLock::acquire`'s `OpenOptions::write(true).open(path)` fails
+    // EISDIR. Windows does not share those semantics — the open does not fail
+    // the same way, so `finalize_login` SUCCEEDS and the fixture never creates
+    // the condition under test (CI: `Rust tests (windows-latest)`, 4 tests, all
+    // on the `result.is_err()` assertion).
+    //
+    // The behaviour being pinned — a login that fails must not destroy a
+    // binding it never replaced — is platform-independent and lives in
+    // ordinary control flow. Only the failure INJECTION is Unix-specific, so
+    // the test is gated rather than weakened into something that passes
+    // everywhere by asserting less.
+    #[cfg(unix)]
+    #[test]
+    fn perform_with_failure_preserves_prior_gemini_binding() {
+        use crate::providers::gemini::provisioning::{
+            is_gemini_bound_slot, write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(22);
+        provision_uuid_for_account(base, 22);
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "pre: slot must be Gemini-bound before the Codex login attempt"
+        );
+
+        // Force the mint's ProfilesFileLock::acquire to fail (EISDIR).
+        std::fs::create_dir_all(base.join(".profiles.lock")).unwrap();
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        // Pinned for the same reason as the sibling cleanup test, and for one
+        // more: with an ambient vault that cannot open, the cleanup is blocked
+        // by the environment rather than by the capture/act split, so the
+        // survival assertion would hold even if that split regressed.
+        let result = with_in_memory_secret_backend(|| {
+            perform_with(
+                base,
+                account,
+                &mut reader,
+                &mut writer,
+                || ProbeResult::Absent,
+                || Ok(false),
+                |config_dir| {
+                    stub_codex_auth_json(config_dir, "acct-uuid-gemini-failure");
+                    Ok(fake_success())
+                },
+            )
+        });
+
+        assert!(
+            result.is_err(),
+            "perform_with must fail when the profiles lock cannot be acquired: {result:?}"
+        );
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "the Gemini marker must SURVIVE a perform_with that fails after the \
+             detect point — a failed login must not destroy a binding it never \
+             actually replaced"
+        );
+    }
+
+    #[test]
+    fn perform_with_clears_stale_native_marker_after_login() {
+        // GH an internal ticket: a slot previously bound to a native CLI (Kimi/Grok)
+        // that then logs in as Codex must not carry BOTH bindings afterward.
+        use crate::providers::catalog::Surface;
+        use crate::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(21);
+        provision_uuid_for_account(base, 21);
+
+        native::write_binding(base, account, Surface::Kimi).unwrap();
+        assert!(native::marker_exists(base, account, Surface::Kimi));
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "acct-uuid-native-cleanup");
+                Ok(fake_success())
+            },
+        )
+        .expect("codex login should succeed");
+
+        assert!(
+            !native::marker_exists(base, account, Surface::Kimi),
+            "the stale native marker must be removed after the Codex login replaces the slot"
+        );
+        assert!(
+            crate::accounts::identity_store::is_codex_bound_slot_identity_aware(base, account),
+            "the slot must now read as Codex-bound"
+        );
     }
 
     #[test]

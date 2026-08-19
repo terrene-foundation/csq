@@ -852,6 +852,42 @@ mod tests {
             !codex.contains("RULE-CC-ONLY"),
             "cc-specific must NOT apply to codex"
         );
+
+        // Kimi/Grok share the Codex citation scope, not just its header
+        // (an internal journal entry) — a codex-scoped rule must be citation-required for
+        // Kimi/Grok exactly like it is for Codex, and the cc-only rule must
+        // stay excluded. Add a codex-scoped rule to prove the positive case
+        // (the two rules above only prove universal + cc-exclusion).
+        let id_codex = RuleId::parse("RULE-CODEX-ONLY").unwrap();
+        let mut codex_applies = BTreeSet::new();
+        codex_applies.insert(Surface::Codex);
+        set.rules.insert(
+            id_codex.clone(),
+            RuleDef {
+                id: id_codex,
+                paths: Vec::new(),
+                applies_to: codex_applies,
+                precedence: 0,
+                disable: BTreeSet::new(),
+                body: "codex-only body".into(),
+                unknowns: std::collections::BTreeMap::new(),
+            },
+        );
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let scoped = extract_rule_ids_in_scope(&set, surface);
+            assert!(
+                scoped.contains("RULE-UNIVERSAL"),
+                "{surface}: universal must apply"
+            );
+            assert!(
+                scoped.contains("RULE-CODEX-ONLY"),
+                "{surface}: codex-scoped rule must apply (an internal journal entry fallback)"
+            );
+            assert!(
+                !scoped.contains("RULE-CC-ONLY"),
+                "{surface}: cc-only rule must NOT apply"
+            );
+        }
     }
 
     /// PR-CA7b1: `LayerOutcome::Enabled` carries the classifier

@@ -38,26 +38,56 @@ pub fn sanitize_for_display(raw: &str) -> String {
 /// images) by canonicalizing it away before comparing prefixes —
 /// otherwise `redact_home_prefix("/root/.nvm/node")` against
 /// `$HOME=/root/` would emit `~.nvm/node` (missing the separator).
+/// `\` is a path separator on Windows ONLY. On Unix it is a legal filename
+/// character, so treating it as a separator there would collapse
+/// `/Users/jack\weird` (a file named `jack\weird` under `/Users`) into
+/// `~/weird` — a DIFFERENT path. The `cfg!` gate is load-bearing, not
+/// defensive.
+fn is_path_sep(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
 pub fn redact_home_prefix(p: &str) -> String {
-    let Some(home) = std::env::var_os("HOME") else {
+    // Windows has no `HOME`; the home directory is `USERPROFILE`. `HOME` is
+    // present under git-bash/MSYS, so check it first (a deliberately-set HOME still
+    // wins) and fall back only on Windows — adding a USERPROFILE fallback on Unix
+    // would redact against a variable Unix does not define as home.
+    //
+    // This comment previously asserted `HOME` is also present "on GitHub's windows
+    // runners". Measured 2026-08-19 on windows-latest: it is `NotPresent`. The
+    // fallback below is therefore load-bearing on CI, not just belt-and-braces —
+    // which is exactly why the claim mattered enough to correct rather than drop.
+    let home = std::env::var_os("HOME").or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+        } else {
+            None
+        }
+    });
+    let Some(home) = home else {
         return p.to_string();
     };
     let Some(home_str) = home.to_str() else {
         return p.to_string();
     };
-    let home_trimmed = home_str.trim_end_matches('/');
+    let home_trimmed = home_str.trim_end_matches(is_path_sep);
     if home_trimmed.is_empty() {
         return p.to_string();
     }
     if let Some(rest) = p.strip_prefix(home_trimmed) {
-        // `rest` either starts with `/` (the natural separator) or is empty
-        // (input == $HOME exactly). Anything else means the prefix matched
-        // a parent directory whose name happens to be a prefix of $HOME's
-        // last component — bail out and return the input unchanged.
+        // `rest` either starts with a separator or is empty (input == $HOME
+        // exactly). Anything else means the prefix matched a parent directory
+        // whose name happens to be a prefix of $HOME's last component — bail
+        // out and return the input unchanged.
         if rest.is_empty() {
             return "~".to_string();
         }
-        if let Some(rest) = rest.strip_prefix('/') {
+        // Only the LEADING separator is normalised to `/`, so the redaction
+        // marker is always `~/` on every platform; the remainder keeps its
+        // native separators. Real Windows paths mix them — the leak that
+        // found this was `C:\Users\runneradmin\.tmpXXXX\skills/SKILL-BLOCKED`,
+        // backslashes from `Path::join` and a forward slash from a literal.
+        if let Some(rest) = rest.strip_prefix(is_path_sep) {
             return format!("~/{rest}");
         }
     }
@@ -85,6 +115,80 @@ pub fn redact_home_prefix(p: &str) -> String {
 /// ```
 pub fn redact_path(p: &std::path::Path) -> String {
     redact_home_prefix(&p.display().to_string())
+}
+
+/// Redacts every occurrence of the operator's `$HOME` prefix found
+/// ANYWHERE within `s`, not just at position 0. Generalizes
+/// [`redact_home_prefix`] (which only strips a match at the START of
+/// the string) for callers formatting an error whose `Display` chain
+/// embeds a path mid-sentence — e.g. `ConfigError::InvalidJson`'s
+/// `"invalid JSON in {path}: {reason}"`, or a hand-built
+/// `std::io::Error::new(kind, format!("... {}", path.display()))`
+/// (confirmed in `providers::codex::tos::acknowledge_at`, whose
+/// `io::Error` cannot be pattern-matched by variant to reach a `path`
+/// field directly).
+///
+/// Per `rules/operator-surface-verification.md` Rule 1 / `tauri-commands.md`
+/// MUST-3. Returns the input unchanged when `$HOME` is unset or empty.
+pub fn redact_home_anywhere(s: &str) -> String {
+    let home = std::env::var_os("HOME").or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+        } else {
+            None
+        }
+    });
+    let Some(home) = home else {
+        return s.to_string();
+    };
+    let Some(home_str) = home.to_str() else {
+        return s.to_string();
+    };
+    let home_trimmed = home_str.trim_end_matches(is_path_sep);
+    if home_trimmed.is_empty() {
+        return s.to_string();
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(home_trimmed) {
+        let (before, after_match) = rest.split_at(idx);
+        let after = &after_match[home_trimmed.len()..];
+        out.push_str(before);
+        if after.is_empty() {
+            out.push('~');
+            rest = after;
+            break;
+        }
+        if after.starts_with(is_path_sep) {
+            // `is_path_sep` chars are single-byte ASCII, so slicing at [1..]
+            // never splits a multi-byte codepoint.
+            out.push_str("~/");
+            rest = &after[1..];
+        } else {
+            // Not a real boundary (e.g. the match is a prefix of a longer
+            // component like `/Users/jackson`) — keep the literal text and
+            // resume scanning right after it so we make forward progress.
+            out.push_str(home_trimmed);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Renders any `Display` value for the IPC / operator boundary with
+/// BOTH filesystem-path AND token/secret redaction applied. Use where
+/// the concrete error type's `Display` cannot be pattern-matched
+/// per-variant to route a `path` field through [`redact_path`]
+/// directly (`std::io::Error`, a `tokio::task::JoinError`, or any
+/// error type reached generically through a bound). Composes
+/// [`redact_home_anywhere`] with [`crate::error::redact_tokens`] so a
+/// single call covers both leak classes.
+///
+/// `rules/tauri-commands.md` MUST-3; `rules/security.md` MUST-2.
+pub fn redact_display<E: std::fmt::Display>(e: E) -> String {
+    crate::error::redact_tokens(&redact_home_anywhere(&e.to_string()))
 }
 
 #[cfg(test)]
@@ -294,6 +398,165 @@ mod tests {
         // pinning so future refactors don't emit `~/` (extra slash).
         with_home(Some("/Users/jack"), || {
             assert_eq!(redact_home_prefix("/Users/jack"), "~");
+        });
+    }
+
+    /// Every test above is written with `/`, so on Windows they exercise a
+    /// shape the platform never produces — and the redaction was silently
+    /// inert there. `Path::join` builds `\`, so `$HOME`-rooted paths never
+    /// matched the `strip_prefix('/')` guard and the RAW home path was
+    /// returned. This built the fixture from real `Path` joins so it asserts
+    /// the invariant in the platform's own separator on both.
+    ///
+    /// Caught by CI, not by review: `materialize_error_display_never_leaks_
+    /// raw_home_path` failed on `windows-latest` with the leak quoted in
+    /// full — `C:\Users\runneradmin\.tmpoWBNxz\skills/SKILL-BLOCKED`.
+    #[test]
+    fn redact_home_prefix_handles_the_platform_native_separator() {
+        let home = std::path::Path::new(if cfg!(windows) {
+            r"C:\Users\jack"
+        } else {
+            "/Users/jack"
+        });
+        let nested = home.join(".config").join("csq").join("token.json");
+        // Non-negotiable precondition: on Windows this string MUST contain a
+        // backslash, else the test is asserting the Unix shape again and
+        // proves nothing about the bug it exists for.
+        assert_eq!(
+            nested.to_str().unwrap().contains('\\'),
+            cfg!(windows),
+            "fixture did not use the native separator: {}",
+            nested.display()
+        );
+        with_home(Some(home.to_str().unwrap()), || {
+            let out = redact_home_prefix(nested.to_str().unwrap());
+            assert!(
+                out.starts_with("~/"),
+                "expected the `~/` marker on every platform, got {out:?}"
+            );
+            assert!(
+                !out.contains("jack"),
+                "raw home path survived redaction: {out:?}"
+            );
+        });
+    }
+
+    /// The prefix-collision guard (`/Users/jack` must NOT match
+    /// `/Users/jackdaw/...`) has to survive the separator widening — a
+    /// `strip_prefix` that accepted "any separator OR nothing" would collapse
+    /// a sibling directory into `~`.
+    #[test]
+    fn redact_home_prefix_collision_guard_holds_on_native_separator() {
+        let home = std::path::Path::new(if cfg!(windows) {
+            r"C:\Users\jack"
+        } else {
+            "/Users/jack"
+        });
+        let sibling = std::path::Path::new(if cfg!(windows) {
+            r"C:\Users\jackdaw\work\file"
+        } else {
+            "/Users/jackdaw/work/file"
+        });
+        with_home(Some(home.to_str().unwrap()), || {
+            assert_eq!(
+                redact_home_prefix(sibling.to_str().unwrap()),
+                sibling.to_str().unwrap(),
+                "a sibling whose name merely starts with $HOME's last \
+                 component must pass through untouched"
+            );
+        });
+    }
+
+    /// On Unix `\` is a legal FILENAME character, so it must NOT be treated as
+    /// a separator there: `/Users/jack\weird` is a file named `jack\weird`
+    /// under `/Users`, a different path from `$HOME/weird`. Pins the `cfg!`
+    /// gate in `is_path_sep` so a future "simplification" to an unconditional
+    /// `c == '/' || c == '\\'` fails here.
+    #[cfg(unix)]
+    #[test]
+    fn redact_home_prefix_does_not_treat_backslash_as_separator_on_unix() {
+        with_home(Some("/Users/jack"), || {
+            assert_eq!(
+                redact_home_prefix(r"/Users/jack\weird"),
+                r"/Users/jack\weird"
+            );
+        });
+    }
+
+    #[test]
+    fn redact_home_anywhere_redacts_mid_sentence_path() {
+        with_home(Some("/Users/jack"), || {
+            assert_eq!(
+                redact_home_anywhere(
+                    "invalid JSON in /Users/jack/.claude/accounts/rotation.json: unexpected EOF"
+                ),
+                "invalid JSON in ~/.claude/accounts/rotation.json: unexpected EOF"
+            );
+        });
+    }
+
+    #[test]
+    fn redact_home_anywhere_redacts_multiple_occurrences() {
+        with_home(Some("/Users/jack"), || {
+            assert_eq!(
+                redact_home_anywhere(
+                    "atomic replace at /Users/jack/.claude/a: rename /Users/jack/.claude/a.tmp -> /Users/jack/.claude/a failed"
+                ),
+                "atomic replace at ~/.claude/a: rename ~/.claude/a.tmp -> ~/.claude/a failed"
+            );
+        });
+    }
+
+    #[test]
+    fn redact_home_anywhere_does_not_match_prefix_collision() {
+        with_home(Some("/Users/jack"), || {
+            assert_eq!(
+                redact_home_anywhere("base dir does not exist: /Users/jackson/.claude/accounts"),
+                "base dir does not exist: /Users/jackson/.claude/accounts"
+            );
+        });
+    }
+
+    #[test]
+    fn redact_home_anywhere_returns_input_when_home_unset() {
+        with_home(None, || {
+            assert_eq!(
+                redact_home_anywhere(
+                    "invalid JSON in /Users/jack/.claude/accounts/rotation.json: x"
+                ),
+                "invalid JSON in /Users/jack/.claude/accounts/rotation.json: x"
+            );
+        });
+    }
+
+    #[test]
+    fn redact_home_anywhere_passes_through_clean_message() {
+        with_home(Some("/Users/jack"), || {
+            assert_eq!(
+                redact_home_anywhere("key too short (need at least 30 bytes)"),
+                "key too short (need at least 30 bytes)"
+            );
+        });
+    }
+
+    #[test]
+    fn redact_home_anywhere_exact_home_at_end_of_string() {
+        with_home(Some("/Users/jack"), || {
+            assert_eq!(
+                redact_home_anywhere("base directory does not exist: /Users/jack"),
+                "base directory does not exist: ~"
+            );
+        });
+    }
+
+    #[test]
+    fn redact_display_redacts_both_path_and_token() {
+        with_home(Some("/Users/jack"), || {
+            let msg = "invalid JSON in /Users/jack/.claude/accounts/rotation.json: \
+                       token=sk-ant-oat01-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+            let out = redact_display(msg);
+            assert!(!out.contains("/Users/jack"), "path leaked: {out}");
+            assert!(!out.contains("sk-ant-oat01"), "token leaked: {out}");
         });
     }
 }

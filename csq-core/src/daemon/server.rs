@@ -9,7 +9,7 @@
 //! The Unix-socket bind/accept loop in this module is `cfg(unix)`; the
 //! router, `RouterState`, and handlers are cross-platform and shared with
 //! the Windows named-pipe listener (`server_windows.rs`), which is wired
-//! end to end as of #786.
+//! end to end as of an internal ticket.
 //!
 //! # Security model
 //!
@@ -92,7 +92,7 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
-// #783 / #794 — interactive per-turn enforcement surface (enterprise-only). The
+// an internal ticket / an internal ticket — interactive per-turn enforcement surface (enterprise-only). The
 // dispatch registry + request/response types live in the enterprise-gated
 // `interactive_ipc` module; `server.rs` registers the routes + holds the live
 // registry behind the same feature gate. The community build compiles none of it.
@@ -147,7 +147,7 @@ pub struct RouterState {
     /// Other subsystems (token-refresh, usage-poller, IPC server itself)
     /// are NEVER gated on this — see spec 12 §12.13.5.
     pub audit_health: crate::audit::AuditHealth,
-    /// #783 — the interactive per-turn enforcement session registry
+    /// an internal ticket — the interactive per-turn enforcement session registry
     /// (enterprise-only). Seeded at daemon startup by
     /// `crate::daemon::interactive_live::seed_registry`: a LIVE registry when the
     /// fail-closed activation gate (`<base_dir>/.phase2b-interactive-gate.json`)
@@ -157,8 +157,8 @@ pub struct RouterState {
     /// §10.5.1) — the activation signal is operator-owned go-live authorization.
     #[cfg(feature = "enterprise")]
     pub interactive: Arc<InteractiveSessionRegistry>,
-    /// Active transparency-log sink for `POST /api/audit/anchor` (#952 S3 /
-    /// #1060). `None` in the default local-only build — either no external sink
+    /// Active transparency-log sink for `POST /api/audit/anchor` (an internal ticket S3 /
+    /// an internal ticket). `None` in the default local-only build — either no external sink
     /// is configured (`audit-sink.json` `sink = "none"`) or the requested sink's
     /// feature was not compiled in, in which case `resolve_anchor_sink` returns
     /// `None`. When `Some`, the anchor handler appends the freshly-signed record
@@ -171,7 +171,7 @@ pub struct RouterState {
     ///
     /// Resolved UNCONDITIONALLY at daemon startup (independent of `audit_health`);
     /// the operative protection when the chain is not operational is the anchor
-    /// handler's own 503 gate, not the absence of a resolved sink (#1060 redteam).
+    /// handler's own 503 gate, not the absence of a resolved sink (an internal ticket redteam).
     pub anchor_sink: Option<Arc<dyn crate::audit::LedgerSink>>,
 }
 
@@ -224,7 +224,7 @@ pub struct HealthResponse {
 /// - `POST /api/oauth/exchange` — submit the paste-code and exchange it
 /// - `POST /api/invalidate-cache` — clear all caches (M8-10c)
 ///
-/// `#[cfg(feature = "enterprise")]` also mounts (spec 21 §21.7, #783/#794):
+/// `#[cfg(feature = "enterprise")]` also mounts (spec 21 §21.7, an internal ticket/an internal ticket):
 /// - `POST /api/interactive/open` — open a new governed session → `OpenSessionResponse`
 /// - `POST /api/interactive/submit` — submit one governed turn (key via header)
 /// - `POST /api/interactive/override` — authorize a blocked turn (key via header)
@@ -252,7 +252,7 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/audit/anchor", post(audit_anchor_handler))
         .route("/api/provenance/anchor", post(provenance_anchor_handler));
 
-    // #783/#794 — interactive per-turn enforcement routes (enterprise-only,
+    // an internal ticket/an internal ticket — interactive per-turn enforcement routes (enterprise-only,
     // spec 21 §21.7). Registered in the enterprise build; the seeded registry is
     // fail-closed (empty → 503) unless the §10.5 activation gate is present. The
     // SO_PEERCRED same-UID socket auth + 1 MiB body cap apply to these routes too
@@ -308,7 +308,7 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
-/// Fixed-vocabulary error body for the `/api/interactive/*` routes (#783).
+/// Fixed-vocabulary error body for the `/api/interactive/*` routes (an internal ticket).
 ///
 /// The `error` field carries ONLY the stable `InteractiveIpcError::tag()` or a
 /// deserialize tag — never the request body or an upstream payload
@@ -361,7 +361,7 @@ fn extract_session_key(
     SessionKey::try_from_client(raw).map_err(interactive_err_response)
 }
 
-/// `POST /api/interactive/open` — open a new governed session (#794).
+/// `POST /api/interactive/open` — open a new governed session (an internal ticket).
 ///
 /// Body: `SessionOpenParams` (all fields optional; unset → gate template values).
 /// Returns `OpenSessionResponse { session_key, state: Idle }`.  The client MUST
@@ -401,7 +401,7 @@ async fn interactive_open_handler(
         .map_err(interactive_err_response)
 }
 
-/// `POST /api/interactive/submit` — submit one user input turn (#783/#794).
+/// `POST /api/interactive/submit` — submit one user input turn (an internal ticket/an internal ticket).
 ///
 /// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
 /// Body: `SubmitInputRequest { input }`. Drives one governed turn end-to-end
@@ -431,7 +431,7 @@ async fn interactive_submit_handler(
         .map_err(interactive_err_response)
 }
 
-/// `POST /api/interactive/override` — authorize a blocked turn (#783/#794).
+/// `POST /api/interactive/override` — authorize a blocked turn (an internal ticket/an internal ticket).
 ///
 /// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
 /// Body: `AuthorizeOverrideRequest { justification }`. The override event is
@@ -461,7 +461,7 @@ async fn interactive_override_handler(
 }
 
 /// `POST /api/interactive/abandon` — abandon a blocked turn; session returns to
-/// `Idle` (#783/#794).
+/// `Idle` (an internal ticket/an internal ticket).
 ///
 /// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
 /// No request body.
@@ -479,7 +479,7 @@ async fn interactive_abandon_handler(
         .map_err(interactive_err_response)
 }
 
-/// `POST /api/interactive/close` — close a session and free its slot (#794).
+/// `POST /api/interactive/close` — close a session and free its slot (an internal ticket).
 ///
 /// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
 /// No request body. On success returns `Idle` state view. Does NOT emit any
@@ -578,7 +578,7 @@ async fn interactive_audit_proof_handler(
 }
 
 /// `POST /api/interactive/options` — list the subscription accounts the operator
-/// may pick BEFORE opening a session, plus the gate's default provider (#793
+/// may pick BEFORE opening a session, plus the gate's default provider (an internal ticket
 /// Enforcement-tab picker, an internal journal entry §FD1).
 ///
 /// Fail-closed: returns `503 interactive_unavailable` when the activation gate is
@@ -921,7 +921,7 @@ async fn oauth_exchange_handler(
     // daemon Pass-0 having already minted `by_slot[N]`. If this route is ever
     // made the live first-login path for fresh installs, mint the UUID from the
     // exchanged `credential`'s `oauthAccount.emailAddress` BEFORE this save, or
-    // it reintroduces the #633 "no credentials configured" fail-closed.
+    // it reintroduces the an internal ticket "no credentials configured" fail-closed.
     let base_dir = Arc::clone(&state.base_dir);
     let save_result = tokio::task::spawn_blocking(move || {
         credentials::save_canonical_for(&base_dir, account, &credential)
@@ -1501,8 +1501,8 @@ async fn mcp_gate_handler(
         // NOT on chain), and the uninitialised-chain case. Classify via the
         // authoritative dedup-index confirmation so the route honors the SAME
         // "204 ⟺ actually on the chain" contract the outbox drain enforces
-        // (redteam #909 R3). Without this a cutoff-skip returns a false 204 and the
-        // decision is lost with no fallback — the daemon-UP twin of the gap #909
+        // (redteam an internal ticket R3). Without this a cutoff-skip returns a false 204 and the
+        // decision is lost with no fallback — the daemon-UP twin of the gap an internal ticket
         // closes on the daemon-down path.
         Ok(_) => {
             use crate::audit::mcp_gate_floor::McpGateConfirm;
@@ -1511,7 +1511,7 @@ async fn mcp_gate_handler(
                 &req.session_nonce,
                 req.record_seq,
             ) {
-                // On chain (appended or confirmed Duplicate): 204. M6 #909 shard B —
+                // On chain (appended or confirmed Duplicate): 204. M6 an internal ticket shard B —
                 // the live path is confirmed healthy, so fire an event-driven drain
                 // of any backlog queued during a prior outage/cutoff. The cheap
                 // relaxed maybe-dirty load is a fast-path filter: the common
@@ -1542,7 +1542,7 @@ async fn mcp_gate_handler(
                     }
                     Ok(StatusCode::NO_CONTENT)
                 }
-                // No chain to record to (uninitialised). M6 #909 shard C
+                // No chain to record to (uninitialised). M6 an internal ticket shard C
                 // (decision 1): whether this decision is DROPPED or PRESERVED
                 // depends on the durable attestation-intent marker —
                 //   - intent SET (`csq audit intent on`): the operator will run
@@ -1555,7 +1555,7 @@ async fn mcp_gate_handler(
                 //     recurring deferred-drain WARN + `csq doctor`, never
                 //     silently dropped).
                 //   - intent UNSET (default — non-audit host): 204, drop as the
-                //     pre-#909 uninit contract, so a host that will never init a
+                //     pre-an internal ticket uninit contract, so a host that will never init a
                 //     chain does not accumulate an unbounded outbox.
                 // A drain is NOT triggered here regardless: an uninitialised chain
                 // is not appendable, so a drain would only defer.
@@ -1857,7 +1857,7 @@ struct AuditAnchorError {
     error: &'static str,
 }
 
-/// Minimal request body for `POST /api/audit/anchor` (#952 S3).
+/// Minimal request body for `POST /api/audit/anchor` (an internal ticket S3).
 ///
 /// Only `run_id` is required — all other fields are metadata that the daemon
 /// reconstructs into a `CsqRun` audit record before signing.  Unknown fields
@@ -1869,7 +1869,7 @@ struct AuditAnchorRequest {
     run_id: String,
 }
 
-/// Handler for `POST /api/audit/anchor` (#952 S3, an internal ticket).
+/// Handler for `POST /api/audit/anchor` (an internal ticket S3, an internal ticket).
 ///
 /// **DAEMON IS SOLE SIGNER** per `account-terminal-separation.md` MUST Rule 1:
 /// the CLI MUST NOT compute `canonical_hash` client-side. This handler accepts
@@ -1890,7 +1890,7 @@ struct AuditAnchorRequest {
 ///
 /// The `inclusion_proof` field is `null` when no external transparency-log sink
 /// is active ([`RouterState::anchor_sink`] is `None` — the default local-only
-/// build). When a `csq-ledger` sink IS configured (#1060), the handler appends
+/// build). When a `csq-ledger` sink IS configured (an internal ticket), the handler appends
 /// the freshly-signed record to it and projects the returned structured
 /// [`crate::audit::types::LedgerInclusionProof`] (`leaf_index`/`tree_size`/
 /// `audit_path`) into this field. Append is best-effort / fail-open: a sink
@@ -2009,7 +2009,7 @@ async fn audit_anchor_handler(
         .map(|v| v.as_canonical_str().to_string())
         .unwrap_or_else(|| "AUTO_APPROVED".to_string());
 
-    // #1060 — when an external transparency-log sink is active, append the
+    // an internal ticket — when an external transparency-log sink is active, append the
     // freshly-signed record and project its structured Merkle inclusion proof
     // into the AnchorPayload. Best-effort / fail-open: the local chain append
     // (sign_audit_record_v1 above) already succeeded and is authoritative, so a
@@ -2032,18 +2032,18 @@ async fn audit_anchor_handler(
 }
 
 /// Appends `signed` to `sink` and projects the receipt's structured Merkle proof
-/// into a JSON value for the `AnchorPayload.inclusion_proof` field (#1060).
+/// into a JSON value for the `AnchorPayload.inclusion_proof` field (an internal ticket).
 ///
 /// Fail-open: any sink error, a receipt with no proof, a proof string that does
 /// not parse as [`crate::audit::types::LedgerInclusionProof`], OR a proof that is
-/// not structurally sound (#1060 redteam F1/F2 — see
+/// not structurally sound (an internal ticket redteam F1/F2 — see
 /// [`inclusion_proof_is_structurally_sound`]) yields [`serde_json::Value::Null`]
 /// (the local chain append is authoritative — the external witness is additive,
 /// not load-bearing for the op's success). Fixed-vocabulary WARN tags only — no
 /// `{e}` interpolation per `security.md` §2 (a sink error body could echo a
 /// request field).
 ///
-/// NOTE (#1060 redteam F3): the projected proof is the sink's returned proof
+/// NOTE (an internal ticket redteam F3): the projected proof is the sink's returned proof
 /// FORWARDED VERBATIM after a structural-soundness check — it is NOT re-verified
 /// against `signed.canonical_hash` (no Merkle-root recomputation). The trust
 /// model is out-of-band server pinning (see `csq_ledger_sink` module note);
@@ -2093,7 +2093,7 @@ async fn project_inclusion_proof(
 }
 
 /// Structural-soundness gate for a ledger [`crate::audit::types::LedgerInclusionProof`]
-/// before it is surfaced in an `AnchorPayload` (#1060 redteam F1/F2 + security-LOW).
+/// before it is surfaced in an `AnchorPayload` (an internal ticket redteam F1/F2 + security-LOW).
 ///
 /// This is a CHEAP, conservative RFC6962 shape check — NOT a cryptographic
 /// verification (the audit path is not replayed against a root). It rejects the
@@ -2772,7 +2772,7 @@ mod tests {
         (status_line, body)
     }
 
-    // ── #783/#794 interactive route integration (enterprise-only) ─────────────
+    // ── an internal ticket/an internal ticket interactive route integration (enterprise-only) ─────────────
     //
     // These exercise the FULL production path: the registered `/api/interactive/*`
     // routes → `RouterState::interactive` registry → `InteractiveSession::run_turn`
@@ -2909,7 +2909,7 @@ mod tests {
     #[tokio::test]
     async fn interactive_route_options_fail_closed_503_on_empty_registry() {
         // Default `test_state` seeds an EMPTY registry (gate closed). The options
-        // pre-open query is fail-closed identically to the keyed routes (#793).
+        // pre-open query is fail-closed identically to the keyed routes (an internal ticket).
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("csq-it-opt-fc.sock");
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
@@ -2933,7 +2933,7 @@ mod tests {
     async fn interactive_route_options_lists_candidate_slots() {
         // Full path: write a valid gate (provider=claude) + stage two credentialed
         // Anthropic accounts, seed a LIVE registry, then the options route returns
-        // the provider + both slots lowest-first (#793 §FD1).
+        // the provider + both slots lowest-first (an internal ticket §FD1).
         use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
@@ -4065,7 +4065,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 
-    // ── POST /api/audit/anchor tests (#952 S3, an internal ticket) ─────────────────
+    // ── POST /api/audit/anchor tests (an internal ticket S3, an internal ticket) ─────────────────
 
     /// Helper: initialise a chain in `base_dir` via the file-store path (no
     /// OS keychain prompt). Mirrors `seed_chain` from anchor tests but also
@@ -4135,7 +4135,7 @@ mod tests {
 
     /// A test `LedgerSink` whose `append` returns a receipt carrying a fixed
     /// structured [`crate::audit::types::LedgerInclusionProof`] — the substrate
-    /// for `anchor_proof_present_with_sink` (#1060). It exercises the handler's
+    /// for `anchor_proof_present_with_sink` (an internal ticket). It exercises the handler's
     /// receipt→AnchorPayload projection without needing the `csq-ledger-sink`
     /// feature or a live ledger server.
     struct StructuredProofSink;
@@ -4173,7 +4173,7 @@ mod tests {
         }
     }
 
-    // T1b (#1060): success path WITH an active sink — the AnchorPayload's
+    // T1b (an internal ticket): success path WITH an active sink — the AnchorPayload's
     // `inclusion_proof` is the structured `{leaf_index, tree_size, audit_path}`
     // read back from the sink receipt (NOT null, NOT client-computed).
     #[tokio::test]
@@ -4222,7 +4222,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 
-    // T1c (#1060): a sink that errors on append MUST fail open — the op still
+    // T1c (an internal ticket): a sink that errors on append MUST fail open — the op still
     // returns 200 with a null proof (the local chain append is authoritative).
     #[tokio::test]
     async fn anchor_proof_null_when_sink_append_fails() {
@@ -4279,7 +4279,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 
-    // T1d (#1060 redteam F1/F2): a sink returning a PARSEABLE but structurally
+    // T1d (an internal ticket redteam F1/F2): a sink returning a PARSEABLE but structurally
     // impossible proof (leaf_index >= tree_size, empty path for a multi-leaf
     // tree) must be nulled at the daemon boundary, not surfaced as valid.
     #[tokio::test]
@@ -4336,7 +4336,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 
-    // Unit coverage for the structural-soundness gate (#1060 redteam F1/F2).
+    // Unit coverage for the structural-soundness gate (an internal ticket redteam F1/F2).
     #[test]
     fn inclusion_proof_soundness_accepts_valid_and_rejects_impossible() {
         use crate::audit::types::LedgerInclusionProof;

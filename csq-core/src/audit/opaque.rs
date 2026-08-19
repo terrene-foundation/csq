@@ -1,6 +1,6 @@
 //! Forward-compatibility: opaque representation of a signed chain record whose
 //! [`EventKind`](crate::audit::types::EventKind) is not known to THIS binary
-//! (GH #910).
+//! (GH an internal ticket).
 //!
 //! # The problem this solves
 //!

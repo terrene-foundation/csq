@@ -73,6 +73,7 @@ use crate::credentials::file::canonical_path_for;
 use crate::platform::fs::secure_file;
 use crate::platform::lock::{try_lock_file, FileLockGuard};
 use crate::providers::catalog::Surface;
+use crate::providers::native;
 use crate::types::AccountNum;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -307,11 +308,32 @@ pub fn move_account(
     let to_canonical_codex = canonical_path_for(base_dir, to, Surface::Codex);
     let to_canonical_gemini = canonical_path_for(base_dir, to, Surface::Gemini);
 
+    // Native follow-on to FM-2 (an internal journal entry): native Kimi/Grok slots are
+    // keyed by the SAME credential-less binding-marker shape as Gemini
+    // (`credentials/{kimi,grok}-<N>.json`, via `native::marker_path` — a
+    // thin wrapper over the same `canonical_path_for`). This file was
+    // never taught about the native surface pair (zero kimi/grok refs
+    // pre-fix), so a native-only slot (marker + `native-homes/<surface>-N/`,
+    // no config dir, no cc/codex/gemini creds) was judged unconfigured by
+    // Step 2, and Step 3 judged a native-occupied target slot FREE — the
+    // identical FM-2 gap, now extended to Kimi + Grok.
+    let native_from_markers: Vec<(Surface, PathBuf)> = native::NATIVE_CLIS
+        .iter()
+        .copied()
+        .map(|nc| (nc.surface, native::marker_path(base_dir, from, nc.surface)))
+        .collect();
+    let native_to_markers: Vec<(Surface, PathBuf)> = native::NATIVE_CLIS
+        .iter()
+        .copied()
+        .map(|nc| (nc.surface, native::marker_path(base_dir, to, nc.surface)))
+        .collect();
+
     // Step 2: source must exist.
     if !from_config.exists()
         && !from_canonical_cc.exists()
         && !from_canonical_codex.exists()
         && !from_canonical_gemini.exists()
+        && !native_from_markers.iter().any(|(_, p)| p.exists())
     {
         return Err(MoveError::NotConfigured { from });
     }
@@ -321,6 +343,7 @@ pub fn move_account(
         || to_canonical_cc.exists()
         || to_canonical_codex.exists()
         || to_canonical_gemini.exists()
+        || native_to_markers.iter().any(|(_, p)| p.exists())
     {
         return Err(MoveError::TargetExists { to });
     }
@@ -488,6 +511,56 @@ pub fn move_account(
                 });
             }
             canonical_creds_moved.push(surface);
+        }
+    }
+
+    // Step 7b: rename native-CLI binding markers + their vendor homes
+    // (an internal journal entry native follow-on to FM-2). Each native slot carries
+    // TWO artifacts that must move together: the credential-less binding
+    // marker (renamed like Gemini's canonical marker above) AND the
+    // per-slot vendor home dir `native-homes/<surface>-<N>/` where the
+    // vendor CLI itself persists its real login. Moving only the marker
+    // would leave the vendor home orphaned at the OLD slot number — the
+    // renumbered slot would carry a marker claiming a working native
+    // login with no vendor home behind it, so `csq run <to>` would launch
+    // a fresh, unauthenticated vendor CLI instead of the moved account.
+    for (surface, from_marker) in &native_from_markers {
+        let to_marker = native_to_markers
+            .iter()
+            .find(|(s, _)| s == surface)
+            .map(|(_, p)| p)
+            .expect(
+                "native_to_markers is built from the same NATIVE_CLIS iteration \
+                 as native_from_markers — every surface in one has a match in the other",
+            );
+        if !from_marker.exists() {
+            continue;
+        }
+        if let Some(parent) = to_marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::rename(from_marker, to_marker) {
+            emit_failed(&format!("native binding marker rename failed: {e}"));
+            return Err(MoveError::Io {
+                path: from_marker.clone(),
+                source: e,
+            });
+        }
+        canonical_creds_moved.push(*surface);
+
+        let from_home = native::native_home_path(base_dir, from, *surface);
+        let to_home = native::native_home_path(base_dir, to, *surface);
+        if from_home.exists() {
+            if let Some(parent) = to_home.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::rename(&from_home, &to_home) {
+                emit_failed(&format!("native vendor home rename failed: {e}"));
+                return Err(MoveError::Io {
+                    path: from_home,
+                    source: e,
+                });
+            }
         }
     }
 
@@ -928,6 +1001,101 @@ mod tests {
         let summary = move_account(dir.path(), from, to).unwrap();
         assert!(summary.canonical_creds_moved.contains(&Surface::Gemini));
         assert!(creds_dir.join("gemini-8.json").exists());
+    }
+
+    // ── Native Kimi/Grok follow-on to FM-2 (an internal journal entry) ─────────────────
+
+    /// Native follow-on to FM-2: a native-ONLY slot (no config dir, no
+    /// cc/codex/gemini creds — just the credential-less binding marker) is
+    /// movable. Before the fix, Step 2's "source must exist" check did not
+    /// consider `credentials/{kimi,grok}-<N>.json`, so `csq move` on a
+    /// marker-only native slot returned `NotConfigured` even though
+    /// `csq run <N>` worked. Mirrors `move_gemini_only_slot_is_not_rejected_as_unconfigured`.
+    #[test]
+    fn move_native_only_slot_is_not_rejected_as_unconfigured() {
+        let dir = TempDir::new().unwrap();
+        let from = AccountNum::try_from(3u16).unwrap();
+        let to = AccountNum::try_from(8u16).unwrap();
+
+        native::write_binding(dir.path(), from, Surface::Kimi).unwrap();
+
+        let summary = move_account(dir.path(), from, to).unwrap();
+        assert!(summary.canonical_creds_moved.contains(&Surface::Kimi));
+        assert!(native::marker_exists(dir.path(), to, Surface::Kimi));
+        assert!(!native::marker_exists(dir.path(), from, Surface::Kimi));
+    }
+
+    /// Native follow-on to FM-2: `csq move` must relocate BOTH the
+    /// credential-less binding marker AND the per-slot vendor home dir
+    /// (`native-homes/<surface>-<N>/`) so the renumbered slot still logs
+    /// the vendor in. Before the fix, the Step 7 canonical-rename loop
+    /// iterated only `[ClaudeCode, Codex, Gemini]` — a moved native slot
+    /// kept its marker at the OLD number and its vendor home was never
+    /// touched at all. Covers BOTH native surfaces (Kimi, Grok).
+    #[test]
+    fn move_renames_native_marker_and_vendor_home() {
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let dir = TempDir::new().unwrap();
+            let from = AccountNum::try_from(3u16).unwrap();
+            let to = AccountNum::try_from(8u16).unwrap();
+
+            native::write_binding(dir.path(), from, surface).unwrap();
+            let from_home = native::native_home_path(dir.path(), from, surface);
+            std::fs::create_dir_all(&from_home).unwrap();
+            std::fs::write(from_home.join("marker.txt"), "vendor state").unwrap();
+
+            let summary = move_account(dir.path(), from, to).unwrap();
+            assert!(
+                summary.canonical_creds_moved.contains(&surface),
+                "{surface:?}: marker move must be recorded in canonical_creds_moved"
+            );
+
+            // Binding marker follows the slot to the target.
+            assert!(
+                native::marker_exists(dir.path(), to, surface),
+                "{surface:?}: binding marker must exist at the target slot"
+            );
+            assert!(
+                !native::marker_exists(dir.path(), from, surface),
+                "{surface:?}: binding marker must be gone from the source slot"
+            );
+
+            // Vendor home follows the slot to the target.
+            let to_home = native::native_home_path(dir.path(), to, surface);
+            assert!(
+                to_home.join("marker.txt").exists(),
+                "{surface:?}: vendor home content must follow the slot to the target"
+            );
+            assert!(
+                !from_home.exists(),
+                "{surface:?}: source vendor home must be gone after move"
+            );
+        }
+    }
+
+    /// Native follow-on to FM-2: moving a normal slot ONTO a slot number
+    /// already occupied by a native surface must be refused. Before the
+    /// fix, Step 3's "target must NOT exist" check did not consider the
+    /// native marker, so the move proceeded and created a dual-bind
+    /// (migrated Anthropic `config-N`/`credentials/N.json` alongside the
+    /// stale native marker and its orphaned vendor home) — which then
+    /// double-lists in `csq ls`.
+    #[test]
+    fn move_onto_native_occupied_target_is_refused() {
+        let dir = TempDir::new().unwrap();
+        make_slot(dir.path(), 5);
+        let from = AccountNum::try_from(5u16).unwrap();
+        let to = AccountNum::try_from(9u16).unwrap();
+
+        native::write_binding(dir.path(), to, Surface::Grok).unwrap();
+
+        let err = move_account(dir.path(), from, to).unwrap_err();
+        assert!(matches!(err, MoveError::TargetExists { .. }));
+
+        // No dual-bind was created: source config dir is untouched, and the
+        // native marker at the target slot is intact (not clobbered).
+        assert!(dir.path().join("config-5").exists());
+        assert!(native::marker_exists(dir.path(), to, Surface::Grok));
     }
 
     #[test]

@@ -116,7 +116,27 @@ pub fn statusline_str(
         // by the poller atomically with the balance) OR a present balance, so a
         // balance slot NEVER falls through to the 5h/7d arm and renders the
         // spurious `5h:0% 7d:0%` that #52 set out to kill.
-        Some(q) if q.kind == "balance" || q.balance.is_some() => {
+        //
+        // ...but ONLY when the row has no usage window. A usage window BEATS a
+        // balance: billing shape is per-PLAN, not per-provider, and a row can
+        // legitimately carry both. A Grok weekly-credit subscription writes a
+        // real `seven_day` window AND a `$0.00` on-demand balance (its
+        // `on_demand_cap`/`on_demand_used` are 0 on that plan), so the
+        // un-gated guard matched on `balance.is_some()` and rendered
+        // `#16:grok $0.00` over a live 7%-used window.
+        //
+        // The guard above was written one-directionally — it asked only "can a
+        // balance slot fall through to the window arm?" and never the reverse.
+        // Both the daemon (`usage_poller::grok`, which picks `kind` on exactly
+        // this precedence) and the CLI table (`status.rs::quota_suffix`,
+        // 080430f0) already resolve it from the ROW; this was the third
+        // surface and the last one still deciding from the row's `kind` tag
+        // and balance presence alone.
+        //
+        // `kind` is checked but NOT trusted over an observed window: a stale
+        // or mis-written `kind: "balance"` on a row that has a window also
+        // renders the window now.
+        Some(q) if (q.kind == "balance" || q.balance.is_some()) && !q.shows_window() => {
             let body = match q.balance.as_ref() {
                 Some(b) => fmt_balance(b),
                 // kind=balance but no successful poll yet — show a pending
@@ -665,7 +685,7 @@ mod tests {
 
     #[test]
     fn statusline_str_balance_kind_without_balance_shows_pending_not_5h7d() {
-        // #984 redteam (intermediate M1): a balance-kind record whose balance
+        // an internal ticket redteam (intermediate M1): a balance-kind record whose balance
         // hasn't been polled yet must NOT fall through to the 5h/7d arm and
         // render the spurious `5h:0% 7d:0%`. It shows a pending marker instead.
         let q = AccountQuota {
@@ -684,8 +704,81 @@ mod tests {
     }
 
     #[test]
+    fn statusline_str_usage_window_beats_a_zero_balance() {
+        // The maintainer's LIVE row, verbatim from `quota.json` slot 16 on
+        // 2026-08-04. A Grok weekly-credit subscription carries BOTH a real
+        // `seven_day` window (7% used) AND a `$0.00` on-demand balance,
+        // because `on_demand_cap`/`on_demand_used` are 0 on that plan.
+        //
+        // The balance arm's guard matched on `balance.is_some()` alone, so the
+        // statusline rendered `#16:grok $0.00` and hid a live usage window
+        // behind a zero. Billing shape is per-PLAN, not per-provider: a
+        // present balance is NOT evidence of a pay-per-token plan.
+        //
+        // Non-vacuity: drop the two `is_none()` conjuncts from the guard and
+        // this asserts `$0.00`, the exact string the operator saw.
+        let q = AccountQuota {
+            surface: "grok".into(),
+            kind: "utilization".into(),
+            five_hour: None,
+            seven_day: Some(crate::quota::UsageWindow {
+                used_percentage: 7.0,
+                // 4_102_444_800 = 2100-01-01 (testing.md Rule 1). MUST stay far-future:
+                // this fixture round-trips through the loader, whose `clear_expired`
+                // NULLS a past window — the row then falls back to `balance` and the
+                // assertions below invert. A near-future literal here detonated on
+                // 2026-08-07T11:12:35Z and reddened every PR in flight.
+                resets_at: 4_102_444_800,
+            }),
+            balance: Some(crate::quota::BalanceInfo {
+                currency: "USD".into(),
+                remaining: 0.0,
+            }),
+            ..Default::default()
+        };
+        let s = statusline_str(
+            AccountNum::try_from(16u16).unwrap(),
+            "grok",
+            Some(&q),
+            false,
+        );
+        assert_eq!(s, "#16:grok 5h:0% 7d:7%");
+        assert!(
+            !s.contains('$'),
+            "a $0.00 on-demand allowance must not mask a live usage window: {s}"
+        );
+    }
+
+    #[test]
+    fn statusline_str_stale_balance_kind_does_not_mask_an_observed_window() {
+        // `kind` is checked but not TRUSTED over an observed window. A row
+        // mis-tagged `kind: "balance"` that nonetheless carries a window
+        // renders the window — the row is the authority, not its tag.
+        let q = AccountQuota {
+            kind: "balance".into(),
+            seven_day: Some(crate::quota::UsageWindow {
+                used_percentage: 42.0,
+                resets_at: 4_102_444_800,
+            }),
+            balance: None,
+            ..Default::default()
+        };
+        let s = statusline_str(
+            AccountNum::try_from(16u16).unwrap(),
+            "grok",
+            Some(&q),
+            false,
+        );
+        assert_eq!(s, "#16:grok 5h:0% 7d:42%");
+        assert!(
+            !s.contains("balance n/a"),
+            "a stale balance tag must not mask an observed window: {s}"
+        );
+    }
+
+    #[test]
     fn fmt_balance_strips_control_chars_in_currency() {
-        // #984 redteam (security M1): the currency string comes from a remote
+        // an internal ticket redteam (security M1): the currency string comes from a remote
         // API and must be control-char-stripped on the terminal render path.
         let b = crate::quota::BalanceInfo {
             currency: "CNY\x1b[2J\n".into(),
@@ -714,7 +807,7 @@ mod tests {
 
     #[test]
     fn rich_statusline_clamps_ctx_recompute_at_100pct() {
-        // #984 redteam (deep-analyst F3): for a model whose TRUE window is
+        // an internal ticket redteam (deep-analyst F3): for a model whose TRUE window is
         // SMALLER than CC's ~200k assumption (deepseek-v4-flash = 128k), a
         // large context makes tokens/window exceed 100% — it must clamp, not
         // render ">100%".

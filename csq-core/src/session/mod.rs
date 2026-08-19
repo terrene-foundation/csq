@@ -9,11 +9,12 @@ pub mod isolation;
 pub mod merge;
 pub mod settings;
 pub mod setup;
+pub mod share_audit;
 
 pub use handle_dir::{
     create_handle_dir, create_handle_dir_codex, create_handle_dir_codex_named,
     create_handle_dir_named, materialize_handle_settings, repoint_handle_dir, spawn_sweep,
-    sweep_dead_handles, SweepHandle,
+    sweep_dead_handles, SweepHandle, EXEC_CODEX_DIR_PREFIX, EXEC_GEMINI_DIR_PREFIX,
 };
 pub use isolation::isolate_config_dir;
 pub use merge::merge_settings;

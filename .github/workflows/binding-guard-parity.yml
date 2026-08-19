@@ -1,0 +1,44 @@
+name: binding-guard parity
+
+# Enforces the single-detector invariant for slot-binding conflict guards.
+# (This file ships to the public community repo — keep it to the technical
+# contract; internal journal/PR references do not resolve there.)
+#
+# Every per-surface detection predicate
+# (is_anthropic_bound_slot / is_codex_bound_slot_identity_aware /
+# is_gemini_bound_slot / native_surface_for_slot / discover_per_slot_third_party)
+# is called ONLY from the unified `binding_guard::detect_bound_surface` union
+# detector or an explicitly-allowlisted non-guard display/dispatch/diagnostic
+# consumer. A new hand-rolled conflict guard that re-opens the reverse-clobber
+# "guard blindness" class trips this gate. Pure Python gate (no toolchain, no
+# build, no secrets) — runs on every Rust-touching PR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "scripts/check-binding-guard-parity.py"
+      - ".github/workflows/binding-guard-parity.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "scripts/check-binding-guard-parity.py"
+      - ".github/workflows/binding-guard-parity.yml"
+
+# Cancel a superseded run on the same ref — same self-hosted-fleet
+# CONTENTION rationale as test.yml (see that file's comment). `main` is
+# excluded: a push to main must produce a verdict for every commit.
+concurrency:
+  group: binding-guard-parity-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  binding-guard-parity:
+    name: slot-binding detection flows through one detector
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Gate — no hand-rolled surface detection outside binding_guard
+        run: python3 scripts/check-binding-guard-parity.py

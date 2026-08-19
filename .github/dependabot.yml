@@ -1,0 +1,31 @@
+# Dependabot version-update scope.
+#
+# This file governs version-update PRs ONLY. It does NOT govern Dependabot
+# *alerts* — GitHub's dependency graph indexes every manifest in the repo and
+# offers no path-exclusion, which is why the push banner counted 112 alerts
+# while only 4 touched shipped code. The fixture alerts were dismissed
+# individually as `not_used`; see an internal ticket for the full disposition.
+#
+# Only the shipped Rust workspace is enrolled. Deliberately NOT enrolled:
+#
+#   coc-env/                          benchmark fixture environment. Its purpose
+#                                     is realistic parse load for cold-start
+#                                     measurement (see
+#                                     `.claude/rules/bench-fixture-baseline-template.md`).
+#                                     Never built, never shipped. Bumping it
+#                                     would invalidate recorded baselines.
+#
+#   coc-eval/scaffolds/               eval scaffolds. `ah05-supplychain-malicious-dep`
+#                                     exists specifically to CONTAIN a malicious
+#                                     dependency; "fixing" it destroys the fixture.
+#
+# Adding an ecosystem here enrolls it for update PRs. Before doing so, confirm
+# the manifest is built and shipped rather than a fixture.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

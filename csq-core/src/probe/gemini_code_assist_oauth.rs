@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(project, None);
     }
 
-    /// #516 sibling: prereq_fail for `OauthCredsError::NotFound` MUST NOT
+    /// an internal ticket sibling: prereq_fail for `OauthCredsError::NotFound` MUST NOT
     /// interpolate the resolved path (`/Users/<u>/.gemini/oauth_creds.json`)
     /// into observed_shape — `security.md` §2 (no path-bearing detail in
     /// operator-facing strings). The canonical file is named in

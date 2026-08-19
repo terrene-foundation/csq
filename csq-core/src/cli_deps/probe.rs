@@ -119,7 +119,29 @@ pub fn probe(cli: SurfaceCli) -> CliStatus {
 
 /// Core probe logic (not cached). Spawns the subprocess and classifies
 /// the result.
+///
+/// Thin wrapper over [`run_probe_within`] that always supplies the production
+/// per-surface budget. Every production caller reaches the subprocess through
+/// here, so [`probe_timeout`]'s spec/13 §8 launch-latency contract has exactly
+/// one enforcement point.
 fn run_probe(cli: SurfaceCli) -> CliStatus {
+    run_probe_within(cli, probe_timeout(cli))
+}
+
+/// [`run_probe`], parameterised on the probe's wall-clock budget.
+///
+/// Production callers MUST go through [`probe`] / [`run_probe`], which always
+/// pass [`probe_timeout`]. That per-surface value is a deliberate launch-latency
+/// contract (spec/13 §8) and MUST NOT be widened to accommodate a test.
+///
+/// The parameter exists so the genuine deadline-kill arm below (`recv_timeout`
+/// expiring, then the process-group kill + `wait` + reader `join`) can be
+/// exercised against a stub that outlives the test harness's own cap — see
+/// `csq-core/tests/cli_deps_integration.rs`. Without an injectable budget the
+/// only way to reach that arm is a stub that outlives the 30 s `test-utils`
+/// budget, which costs 30 s of wall clock per test and holds the suite's
+/// `PATH_MUTEX` for all of it.
+fn run_probe_within(cli: SurfaceCli, timeout: Duration) -> CliStatus {
     let name = binary_name(cli);
 
     // Single canonicalize per probe (spec/13 §8).
@@ -157,12 +179,8 @@ fn run_probe(cli: SurfaceCli) -> CliStatus {
     let manager = classify_install_manager(&canonical_path);
     let spawn_start = Instant::now();
 
-    let (stdout_bytes, elapsed_ms, timed_out) = spawn_version_subprocess(
-        &canonical_path,
-        child_path_env,
-        spawn_start,
-        probe_timeout(cli),
-    );
+    let (stdout_bytes, elapsed_ms, timed_out) =
+        spawn_version_subprocess(&canonical_path, child_path_env, spawn_start, timeout);
 
     if timed_out {
         return CliStatus::ProbeTimedOut {
@@ -173,6 +191,28 @@ fn run_probe(cli: SurfaceCli) -> CliStatus {
 
     // ── Parse stdout ─────────────────────────────────────────────────
     classify_output(stdout_bytes, canonical_path, manager, cli, elapsed_ms)
+}
+
+/// Test-only: run the probe with an explicit wall-clock budget, bypassing the
+/// process-lifetime [`CACHE`] entirely.
+///
+/// The cache key is `SurfaceCli` alone — it carries no timeout — so a
+/// short-budget probe must neither read nor write it. Writing would poison the
+/// entry that every sibling test in the binary observes through
+/// `probe(cli)` / `invalidate(cli)`; reading would return some other test's
+/// result and skip the subprocess this function exists to spawn.
+///
+/// Gated on `feature = "test-utils"` rather than `cfg(test)` because the
+/// integration-test binary links `csq-core` as an ordinary library dependency
+/// and never compiles under this crate's own `cfg(test)` — the same reason
+/// [`probe_timeout`]'s test-budget override is gated that way.
+///
+/// Unlike [`probe`], this does NOT honour `CSQ_CLI_DEPS_PROBE_DISABLE`: a test
+/// that asks for the subprocess path wants the subprocess path, and must not be
+/// silently short-circuited into `CliStatus::Ok` by a sibling test's env var.
+#[cfg(feature = "test-utils")]
+pub fn probe_within(cli: SurfaceCli, timeout: Duration) -> CliStatus {
+    run_probe_within(cli, timeout)
 }
 
 /// Spawn `<canonical_path> --version`, capturing up to `STDOUT_CAP_BYTES` of stdout.
@@ -214,7 +254,11 @@ fn run_probe(cli: SurfaceCli) -> CliStatus {
 pub(crate) fn probe_timeout(cli: SurfaceCli) -> Duration {
     match cli {
         SurfaceCli::Claude => Duration::from_secs(2),
-        SurfaceCli::Codex | SurfaceCli::Gemini => Duration::from_secs(6),
+        // Kimi is a Node program; Grok's `--version` starts a heavier binary.
+        // Both share the Codex/Gemini 6s budget rather than the 2s Claude floor.
+        SurfaceCli::Codex | SurfaceCli::Gemini | SurfaceCli::Kimi | SurfaceCli::Grok => {
+            Duration::from_secs(6)
+        }
     }
 }
 
@@ -235,10 +279,48 @@ fn spawn_version_subprocess(
 
     let mut cmd = Command::new(canonical_path);
     cmd.arg("--version")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Some(path_val) = child_path_env {
         cmd.env("PATH", path_val);
+    }
+
+    // Unix: give the child its own process group so the kill below reaches the
+    // whole tree.
+    //
+    // `Child::kill` signals ONLY the direct child. If the resolved binary is a
+    // wrapper that SPAWNS rather than `exec`s — a version-manager shim, or any
+    // CLI that forks a helper — the grandchild inherits the stdout write end
+    // and keeps it open after the wrapper dies. The reader thread then stays
+    // blocked in `read()`, and `reader_handle.join()` below (which has no
+    // deadline, and must not grow one: joining is what H-4's FD guarantee
+    // rests on) blocks for the grandchild's whole lifetime — in front of a user
+    // launch, past the 2 s/6 s budget this function exists to enforce
+    // (spec/13 §8).
+    //
+    // `setsid()` makes the child a session and process-group leader, so
+    // `kill(-pid)` terminates every descendant, every write end closes, the
+    // reader's `read()` returns 0, and the join is prompt again. It also drops
+    // the controlling terminal, which together with `Stdio::null()` on stdin
+    // means a `--version` invocation can neither block on a prompt nor read a
+    // tty. Windows keeps the direct-child kill; the same hardening there needs
+    // a Job Object and is not attempted here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs post-fork, pre-exec, where only
+        // async-signal-safe, allocation-free calls are permitted. `setsid` is
+        // both. `Error::last_os_error` allocates nothing on the success path
+        // and is only reached when the spawn is already failing.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     let mut child = match cmd.spawn() {
@@ -305,6 +387,23 @@ fn spawn_version_subprocess(
     // written exactly 8KiB ending with '\n', sent its result, and then
     // hung waiting for a consumer that never arrives — the bare wait()
     // would block forever in that case.
+    //
+    // On unix the group is killed FIRST (see the `setsid` note at spawn): the
+    // direct child may already have exited while a grandchild still holds the
+    // stdout write end, and only the group signal reaches that grandchild.
+    // Without it the `join()` below has nothing to wait on but the
+    // grandchild's own lifetime.
+    #[cfg(unix)]
+    {
+        // SAFETY: `child.id()` is the pid of a process this call spawned and
+        // has not yet reaped, and `setsid` above made it its own group leader,
+        // so the negated pid names exactly that group and cannot alias another.
+        // An error (ESRCH — every member already gone) is the success case.
+        let pgid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 
@@ -427,7 +526,13 @@ mod tests {
         // non-test-build constant documented on `probe_timeout` + spec/13 §8; it
         // is only observable against the shipped binary (a slow codex probe that
         // now completes instead of timing out — user-path verification).
-        for cli in [SurfaceCli::Claude, SurfaceCli::Codex, SurfaceCli::Gemini] {
+        for cli in [
+            SurfaceCli::Claude,
+            SurfaceCli::Codex,
+            SurfaceCli::Gemini,
+            SurfaceCli::Kimi,
+            SurfaceCli::Grok,
+        ] {
             assert!(
                 probe_timeout(cli) >= Duration::from_secs(2),
                 "{cli:?} must get at least the Claude floor"

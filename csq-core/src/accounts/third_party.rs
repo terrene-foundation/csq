@@ -74,9 +74,9 @@ pub fn validate_key_shape(key: &str) -> Result<(), ConfigError> {
 
 /// Validates an operator-supplied endpoint component that is interpolated into
 /// a native provider's request URL — Azure `resource`/`deployment`/`api-version`
-/// and Vertex `project`/`region` (#962).
+/// and Vertex `project`/`region` (an internal ticket).
 ///
-/// # Why this exists (security review #962 H1 — credential-redirection defense)
+/// # Why this exists (security review an internal ticket H1 — credential-redirection defense)
 ///
 /// These values are interpolated into
 /// `https://{resource}.openai.azure.com/openai/deployments/{deployment}/…` and
@@ -207,22 +207,8 @@ pub fn conflicting_bound_surface(
     slot: AccountNum,
     provider: &providers::Provider,
 ) -> Option<Surface> {
-    use crate::accounts::identity_store;
-
-    if identity_store::is_codex_bound_slot_identity_aware(base_dir, slot)
-        && provider.surface != Surface::Codex
-    {
-        return Some(Surface::Codex);
-    }
-    if crate::providers::gemini::provisioning::is_gemini_bound_slot(base_dir, slot)
-        && provider.surface != Surface::Gemini
-    {
-        return Some(Surface::Gemini);
-    }
-    if identity_store::is_anthropic_bound_slot(base_dir, slot) {
-        return Some(Surface::ClaudeCode);
-    }
-    None
+    crate::accounts::binding_guard::conflicting_bound_surface_for_provider(base_dir, slot, provider)
+        .map(|bound| bound.to_surface())
 }
 
 /// Human-facing label for a conflicting bound surface, used in the
@@ -232,6 +218,8 @@ pub fn bound_surface_label(surface: Surface) -> &'static str {
         Surface::ClaudeCode => "Claude (Anthropic OAuth)",
         Surface::Codex => "Codex",
         Surface::Gemini => "Gemini",
+        Surface::Kimi => "Kimi (native CLI)",
+        Surface::Grok => "Grok (native CLI)",
     }
 }
 
@@ -340,7 +328,7 @@ pub fn bind_provider_to_slot(
     // Surface-conflict guard (identity-store-aware) — refuse to clobber a slot
     // bound to Codex / Anthropic OAuth / Gemini. This is the STRUCTURAL backstop
     // shared by the CLI `setkey` pre-flight AND the desktop
-    // `bind_keyed_provider` / `bind_keyless_provider` commands, so the #995
+    // `bind_keyed_provider` / `bind_keyless_provider` commands, so the an internal ticket
     // 3P-clobber (silent OAuth override + orphaned `by_slot`) cannot reach the
     // write path from any surface. Checked UNDER the profiles lock so a
     // concurrent `csq logout` cannot open a check→write TOCTOU. The CLI keeps a
@@ -431,6 +419,37 @@ pub fn bind_provider_to_slot(
     // MiniMax invocation. Mirrors the same purge in
     // unbind_provider_from_slot. Code review HIGH-1.
     purge_previous_provider_extras(env);
+    // Also purge stale cloud-Claude routing keys (an internal ticket, redteam H1): binding a
+    // 3P/direct-key provider over a slot previously provisioned for Vertex/Bedrock
+    // must not leave CLAUDE_CODE_USE_* / GOOGLE_APPLICATION_CREDENTIALS /
+    // AWS_BEARER_TOKEN_BEDROCK behind (retained live cloud cred + backend_for_slot
+    // misclassification). Shared helper — reverse-cleanup parity.
+    purge_cloud_claude_env_keys(env);
+
+    // MED-2 (an internal ticket redteam): a rebind to a DIFFERENT provider must not
+    // leave the PRIOR provider's `quota.json` row rendering under the NEW
+    // provider's tag. Most 3P pollers write `surface: "claude-code"` (the
+    // AccountQuota default — third_party.rs / minimax.rs / zai.rs /
+    // deepseek.rs never override it), so a consumer's surface-match gate
+    // cannot tell "MiniMax's row" from "Z.AI's row" — both look identical.
+    // Concretely: slot 9 is MiniMax at 88%, MiniMax 429s (shared-cooldown
+    // bleed, R5 F5 above), operator runs `csq setkey kimi --slot 9` —
+    // without this, the stale MiniMax row renders under the Kimi tag for
+    // up to ~25 min (residual cooldown + one 15-min poll cadence) before
+    // Kimi's own poll overwrites it. That is wrong data, not a delayed
+    // render — resolved by clearing the row here, at bind time, so the
+    // honest "not yet polled" state (has_quota=false) shows immediately.
+    // Same resolution `purge_previous_provider_extras` above uses to find
+    // the PRIOR provider (read BEFORE the base_url overlay below); a bare
+    // slot with no prior provider is `None` and this is a no-op.
+    let previous_provider_id = env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .and_then(crate::accounts::discovery::provider_from_base_url)
+        .and_then(providers::id_from_display_name);
+    if previous_provider_id.is_some_and(|prev| prev != provider_id) {
+        crate::accounts::logout::remove_quota_entry(base_dir, slot);
+    }
 
     // Overlay the 3P-specific env keys. Any key already present is
     // overwritten (e.g. rebinding with a new API key updates the
@@ -530,6 +549,262 @@ pub fn bind_provider_to_slot(
     // content is the legacy decimal slot id. Identity-keyed marker
     // content is reserved for OAuth slots whose `by_slot` entry resolves
     // to a UUID in `profiles.json`.
+    markers::write_csq_account_legacy(&config_dir, slot).map_err(|e| ConfigError::InvalidJson {
+        path: config_dir.join(".csq-account"),
+        reason: format!("write marker: {e}"),
+    })?;
+
+    Ok(())
+}
+
+/// Backend-specific provisioning input for [`bind_cloud_claude_backend_to_slot`]
+/// (an internal ticket). Enterprise-only — cloud-Claude routing is an enterprise
+/// entitlement (Vertex/Bedrock Claude access), gated exactly like the Azure /
+/// Vertex native providers.
+#[cfg(feature = "enterprise")]
+pub enum CloudClaudeBackendSpec<'a> {
+    /// Anthropic Claude via Google Vertex AI. `sa_path` is the GCP
+    /// service-account JSON (validated: regular file, ≤ 64 KiB, not a symlink,
+    /// canonicalised); `project`/`region` are DNS-label-validated.
+    Vertex {
+        project: &'a str,
+        region: &'a str,
+        sa_path: &'a std::path::Path,
+    },
+    /// Anthropic Claude via AWS Bedrock. `region` is DNS-label-validated;
+    /// `bearer_token` is the `AWS_BEARER_TOKEN_BEDROCK` value.
+    Bedrock {
+        region: &'a str,
+        bearer_token: &'a str,
+    },
+}
+
+/// Every cloud-Claude routing env key (an internal ticket). Purged on EVERY transition that
+/// re-binds a slot — cloud→cloud re-provision ([`bind_cloud_claude_backend_to_slot`]),
+/// 3P/direct-key re-bind ([`bind_provider_to_slot`]), and unbind /
+/// `csq login`-back-to-OAuth ([`unbind_provider_from_slot`]) — so a stale
+/// `CLAUDE_CODE_USE_*` flag, or a live `GOOGLE_APPLICATION_CREDENTIALS` /
+/// `AWS_BEARER_TOKEN_BEDROCK`, can NEVER survive a re-bind and be read by
+/// `backend_for_slot` or retained on disk after the slot's binding changed
+/// (`reconciler-cleanup-parity.md` Rule 6; secret-retention guard, redteam H1).
+///
+/// NOT edition-gated: a stale cloud flag must be purged in the community build
+/// too (e.g. an enterprise→community downgrade leaving a slot's cloud env), and
+/// the reverse-path purge sites are themselves edition-uniform.
+const CLOUD_CLAUDE_ENV_KEYS: &[&str] = &[
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AWS_REGION",
+    "AWS_BEARER_TOKEN_BEDROCK",
+];
+
+/// Removes every [`CLOUD_CLAUDE_ENV_KEYS`] entry from a settings `env` block —
+/// but ONLY when the slot actually carries a cloud-Claude flag
+/// (`CLAUDE_CODE_USE_VERTEX`/`_BEDROCK`). Returns whether anything was removed.
+/// Shared by all three re-bind paths so the reverse-cleanup parity is structural
+/// (redteam H1).
+///
+/// The cloud-flag gate (redteam R2 LOW-3): two of the seven keys (`AWS_REGION`,
+/// `GOOGLE_APPLICATION_CREDENTIALS`) are generically named and a user might set
+/// them on a NON-cloud (3P/OAuth) slot for unrelated tooling. Purging
+/// unconditionally would delete those user keys on every 3P bind/unbind. Gating on
+/// a `CLAUDE_CODE_USE_*` flag means the purge fires exactly when the slot was a
+/// cloud slot (which always carries the flag), and never touches a plain slot.
+fn purge_cloud_claude_env_keys(env: &mut Map<String, Value>) -> bool {
+    let has_cloud_flag =
+        env.contains_key("CLAUDE_CODE_USE_VERTEX") || env.contains_key("CLAUDE_CODE_USE_BEDROCK");
+    if !has_cloud_flag {
+        return false;
+    }
+    let mut removed = false;
+    for key in CLOUD_CLAUDE_ENV_KEYS {
+        removed |= env.remove(*key).is_some();
+    }
+    removed
+}
+
+/// Provisions a `ClaudeCode` slot to route through Google Vertex AI / AWS
+/// Bedrock (an internal ticket). Writes the cloud env block CC reads on startup into
+/// the per-slot `config-<N>/settings.json` — csq injects nothing at spawn time;
+/// the existing `launch_third_party` path spawns `claude` with `CLAUDE_CONFIG_DIR`
+/// and CC applies the settings env itself.
+///
+/// **Fail-closed (Constraint 1).** The backend axis is valid ONLY on a bare slot
+/// or an existing cloud-Claude slot (idempotent re-provision). Binding a cloud
+/// backend over an Anthropic OAuth/subscription slot, a Codex/Gemini/native slot,
+/// or a real 3P-bearer slot is REFUSED — a cloud OAuth token cannot auth to
+/// Vertex/Bedrock, and clobbering another binding's creds is never intended.
+///
+/// **Lock ordering.** `ProfilesFileLock` FIRST, then the `settings.json` flock —
+/// identical to [`bind_provider_to_slot`], so the two paths serialize against
+/// each other and against logout / identity writes.
+#[cfg(feature = "enterprise")]
+pub fn bind_cloud_claude_backend_to_slot(
+    base_dir: &Path,
+    slot: AccountNum,
+    spec: &CloudClaudeBackendSpec,
+) -> Result<(), ConfigError> {
+    use crate::accounts::binding_guard::{detect_bound_surface, BoundSurface};
+
+    // 1. Validate inputs BEFORE any fs mutation. project/region are interpolated
+    //    into the GCP/AWS endpoints CC builds, so they get the same
+    //    credential-redirection (SSRF) allowlist defense as the native providers.
+    let (provider_id, env_pairs): (&str, Vec<(&str, String)>) = match spec {
+        CloudClaudeBackendSpec::Vertex {
+            project,
+            region,
+            sa_path,
+        } => {
+            validate_endpoint_component(project, "--project", is_dns_label_char, 30)?;
+            validate_endpoint_component(region, "--region", is_dns_label_char, 40)?;
+            let abs = crate::providers::gemini::provisioning::validate_vertex_sa_path(sa_path)
+                .map_err(|_| ConfigError::MergeConflict {
+                    key: "--sa-file rejected (must be a regular, non-symlink JSON file ≤ 64 KiB)"
+                        .into(),
+                })?;
+            (
+                "claude-vertex",
+                vec![
+                    ("CLAUDE_CODE_USE_VERTEX", "1".to_string()),
+                    ("ANTHROPIC_VERTEX_PROJECT_ID", (*project).to_string()),
+                    ("CLOUD_ML_REGION", (*region).to_string()),
+                    (
+                        "GOOGLE_APPLICATION_CREDENTIALS",
+                        abs.to_string_lossy().to_string(),
+                    ),
+                ],
+            )
+        }
+        CloudClaudeBackendSpec::Bedrock {
+            region,
+            bearer_token,
+        } => {
+            validate_endpoint_component(region, "--region", is_dns_label_char, 40)?;
+            validate_key_shape(bearer_token)?;
+            (
+                "claude-bedrock",
+                vec![
+                    ("CLAUDE_CODE_USE_BEDROCK", "1".to_string()),
+                    ("AWS_REGION", (*region).to_string()),
+                    ("AWS_BEARER_TOKEN_BEDROCK", (*bearer_token).to_string()),
+                ],
+            )
+        }
+    };
+
+    // 2. Residency gate: cloud-Claude routes prompt data to a GCP/AWS region —
+    //    refuse if the operating envelope's residency policy forbids that provider.
+    crate::phase2b::residency::enforce_provider_write(base_dir, provider_id)?;
+
+    // 3. Profiles lock FIRST (ordering: ProfilesFileLock → settings.json lock).
+    let _profiles_lock =
+        ProfilesFileLock::acquire(base_dir).map_err(|e| ConfigError::InvalidJson {
+            path: base_dir.join(".profiles.lock"),
+            reason: format!("profiles lock: {e}"),
+        })?;
+
+    // 4. Fail-closed conflict guard (Constraint 1), checked UNDER the profiles lock
+    //    so a concurrent bind/logout cannot open a check→write TOCTOU. A cloud slot
+    //    and a real 3P slot BOTH read as `ThirdPartyBearer`; `backend_for_slot`
+    //    distinguishes them — a real 3P slot has `ANTHROPIC_BASE_URL` → `Direct`.
+    match detect_bound_surface(base_dir, slot) {
+        None => {}
+        Some(BoundSurface::ThirdPartyBearer)
+            if crate::providers::settings::backend_for_slot(base_dir, slot.get()).is_cloud() => {}
+        Some(bound) => {
+            return Err(ConfigError::SlotSurfaceConflict {
+                slot: slot.get(),
+                bound_surface: bound.label().to_string(),
+            });
+        }
+    }
+
+    // 5. RMW config-N/settings.json under the settings flock. Purge prior
+    //    cloud/3P routing keys, overlay the new backend's, preserve every other
+    //    field. Mirrors bind_provider_to_slot (incl. §5a tmp cleanup on failure).
+    let config_dir = base_dir.join(format!("config-{}", slot));
+    std::fs::create_dir_all(&config_dir).map_err(|e| ConfigError::InvalidJson {
+        path: config_dir.clone(),
+        reason: format!("create_dir_all: {e}"),
+    })?;
+    let settings_path = config_dir.join("settings.json");
+    let settings_lock_path = settings_path.with_extension("lock");
+    let _settings_lock = crate::platform::lock::lock_file(&settings_lock_path).map_err(|e| {
+        ConfigError::InvalidJson {
+            path: settings_lock_path.clone(),
+            reason: format!("lock: {e}"),
+        }
+    })?;
+
+    let mut settings_value: Value = match std::fs::read_to_string(&settings_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            serde_json::from_str(&content).unwrap_or_else(|_| Value::Object(Map::new()))
+        }
+        _ => Value::Object(Map::new()),
+    };
+    if !settings_value.is_object() {
+        settings_value = Value::Object(Map::new());
+    }
+    let settings_obj = settings_value
+        .as_object_mut()
+        .expect("ensured object above");
+    let env_value = settings_obj
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !env_value.is_object() {
+        *env_value = Value::Object(Map::new());
+    }
+    let env = env_value.as_object_mut().expect("ensured object above");
+
+    // Purge any prior cloud routing keys (vertex↔bedrock switch) AND a prior 3P
+    // ANTHROPIC_BASE_URL/_AUTH_TOKEN — a cloud slot must carry neither the other
+    // backend's flags nor a 3P passthrough (the conflict guard already refused a
+    // *clean* 3P slot; this defends a stale-flagged one).
+    purge_cloud_claude_env_keys(env);
+    env.remove("ANTHROPIC_BASE_URL");
+    env.remove("ANTHROPIC_AUTH_TOKEN");
+    for (k, v) in &env_pairs {
+        env.insert((*k).to_string(), Value::String(v.clone()));
+    }
+
+    // SECURITY: fixed reason string — the JSON value carries the Bedrock bearer
+    // token; a future serialize impl echoing the value could not leak it here.
+    let json =
+        serde_json::to_string_pretty(&settings_value).map_err(|_| ConfigError::InvalidJson {
+            path: settings_path.clone(),
+            reason: "settings serialize failed".into(),
+        })?;
+    let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("write: {e}"),
+        });
+    }
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: tmp.clone(),
+            reason: format!("secure_file: {e}"),
+        });
+    }
+    if let Err(e) = atomic_replace(&tmp, &settings_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::InvalidJson {
+            path: settings_path.clone(),
+            reason: format!("atomic replace: {e}"),
+        });
+    }
+
+    // 6. Non-OAuth identity label + legacy marker, in the same lock window —
+    //    mirrors the 3P `apikey:<provider>` convention so `get_email` /
+    //    identity backfill treat a cloud slot exactly like a 3P bearer slot.
+    let identity_label = format!("apikey:{provider_id}");
+    profiles::set_slot_identity(&_profiles_lock, base_dir, slot.get(), &identity_label)?;
     markers::write_csq_account_legacy(&config_dir, slot).map_err(|e| ConfigError::InvalidJson {
         path: config_dir.join(".csq-account"),
         reason: format!("write marker: {e}"),
@@ -638,6 +913,12 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
     for key in MODEL_KEYS {
         removed |= env.remove(*key).is_some();
     }
+    // Purge stale cloud-Claude routing keys too (an internal ticket, redteam H1): `csq login N`
+    // runs this via finalize_login, so moving a Vertex/Bedrock slot back to OAuth
+    // must strip CLAUDE_CODE_USE_* + the live GOOGLE_APPLICATION_CREDENTIALS /
+    // AWS_BEARER_TOKEN_BEDROCK — else the OAuth slot retains a live cloud cred on
+    // disk and backend_for_slot still reports [vertex]/[bedrock].
+    removed |= purge_cloud_claude_env_keys(env);
 
     if !removed {
         return Ok(false);
@@ -704,7 +985,7 @@ mod tests {
     use crate::accounts::discovery;
     use tempfile::TempDir;
 
-    // ── #962 H1: endpoint-component allowlist validator ──────────────────────
+    // ── an internal ticket H1: endpoint-component allowlist validator ──────────────────────
 
     #[test]
     fn validate_endpoint_component_accepts_valid_values() {
@@ -761,7 +1042,7 @@ mod tests {
     /// Plant the post-M4-12 host shape: `by_slot` → `identities/<uuid>/` with the
     /// given provider + matching credential, and NO legacy mirror. This is the
     /// state a current login leaves; the pre-fix legacy-mirror guards were blind
-    /// to it (the #995 class this shard closes).
+    /// to it (the an internal ticket class this shard closes).
     fn bind_identity_oauth(base: &Path, slot: u16, provider: &str) {
         use crate::accounts::identity_store::{
             credentials_codex_path_for, credentials_path_for, identity_path, IdentityId,
@@ -876,8 +1157,22 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_bound_surface_detects_native_binding() {
+        // redteam MED-1 (reverse): a `csq setkey` onto a slot already bound to
+        // a native-CLI surface (Kimi/Grok marker) must be refused, naming the
+        // native surface — not silently create a dual-bind.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(6u16).unwrap();
+        crate::providers::native::write_binding(dir.path(), slot, Surface::Grok).unwrap();
+        assert_eq!(
+            conflicting_bound_surface(dir.path(), slot, prov("mm")),
+            Some(Surface::Grok),
+        );
+    }
+
+    #[test]
     fn bind_provider_to_slot_refuses_identity_only_anthropic_slot() {
-        // THE #995 origin, now blocked at the core write path (covers CLI setkey
+        // THE an internal ticket origin, now blocked at the core write path (covers CLI setkey
         // AND desktop bind_keyed/keyless).
         let dir = TempDir::new().unwrap();
         bind_identity_oauth(dir.path(), 3, "anthropic");
@@ -995,6 +1290,347 @@ mod tests {
         bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None)
             .expect("bind succeeds with no residency policy");
         assert!(dir.path().join("config-9/settings.json").exists());
+    }
+
+    // ── Cloud-Claude backend provisioning (an internal ticket PR-1) ──────────────────
+
+    /// Writes a valid fake GCP service-account JSON and returns its path.
+    #[cfg(feature = "enterprise")]
+    fn write_fake_sa(dir: &Path) -> std::path::PathBuf {
+        let p = dir.join("sa.json");
+        std::fs::write(&p, br#"{"type":"service_account","project_id":"x"}"#).unwrap();
+        p
+    }
+
+    /// Reads a slot's `settings.json` `env` object for assertions.
+    #[cfg(feature = "enterprise")]
+    fn slot_env(base: &Path, slot: u16) -> serde_json::Map<String, Value> {
+        let s = std::fs::read_to_string(base.join(format!("config-{slot}/settings.json"))).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        v.get("env").and_then(|e| e.as_object()).cloned().unwrap()
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_vertex_writes_settings_and_discovers() {
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(7u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "my-proj",
+                region: "us-east5",
+                sa_path: &sa,
+            },
+        )
+        .expect("vertex provision succeeds on a fresh slot");
+
+        let env = slot_env(dir.path(), 7);
+        assert_eq!(env.get("CLAUDE_CODE_USE_VERTEX").unwrap(), "1");
+        assert_eq!(env.get("ANTHROPIC_VERTEX_PROJECT_ID").unwrap(), "my-proj");
+        assert_eq!(env.get("CLOUD_ML_REGION").unwrap(), "us-east5");
+        assert!(env
+            .get("GOOGLE_APPLICATION_CREDENTIALS")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .ends_with("sa.json"));
+
+        // Derived backend + unified discovery both see it as a cloud slot.
+        assert_eq!(
+            crate::providers::settings::backend_for_slot(dir.path(), 7),
+            crate::accounts::Backend::Vertex
+        );
+        let found = crate::accounts::discovery::discover_per_slot_third_party(dir.path());
+        assert!(found.iter().any(|a| a.id == 7
+            && matches!(&a.source, crate::accounts::AccountSource::ThirdParty { provider } if provider == "claude-vertex")));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_bedrock_writes_settings() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(8u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Bedrock {
+                region: "us-east-1",
+                bearer_token: "aws-bearer-token-value-1234567890",
+            },
+        )
+        .expect("bedrock provision succeeds");
+        let env = slot_env(dir.path(), 8);
+        assert_eq!(env.get("CLAUDE_CODE_USE_BEDROCK").unwrap(), "1");
+        assert_eq!(env.get("AWS_REGION").unwrap(), "us-east-1");
+        assert!(env.get("AWS_BEARER_TOKEN_BEDROCK").is_some());
+        assert_eq!(
+            crate::providers::settings::backend_for_slot(dir.path(), 8),
+            crate::accounts::Backend::Bedrock
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_refuses_oauth_slot() {
+        // Constraint 1: a cloud backend on an Anthropic OAuth/subscription slot
+        // is fail-closed-refused (the OAuth token cannot auth to Vertex/Bedrock).
+        let dir = TempDir::new().unwrap();
+        bind_identity_oauth(dir.path(), 3, "anthropic");
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(3u16).unwrap();
+        let err = bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "p",
+                region: "r",
+                sa_path: &sa,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SlotSurfaceConflict { slot: 3, .. }),
+            "expected SlotSurfaceConflict on an OAuth slot, got {err:?}"
+        );
+        assert!(
+            !dir.path().join("config-3/settings.json").exists()
+                || slot_env(dir.path(), 3)
+                    .get("CLAUDE_CODE_USE_VERTEX")
+                    .is_none(),
+            "fail-closed: no cloud flag written to the OAuth slot"
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_refuses_real_3p_slot() {
+        // A real 3P bearer slot (ANTHROPIC_BASE_URL) must NOT be clobbered by a
+        // cloud bind — `backend_for_slot` returns Direct for it, so the guard fires.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
+        let sa = write_fake_sa(dir.path());
+        let err = bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "p",
+                region: "r",
+                sa_path: &sa,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::SlotSurfaceConflict { slot: 9, .. }
+        ));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_reprovision_switches_backend_no_stale_keys() {
+        // Idempotent re-provision: vertex → bedrock on the same slot succeeds and
+        // leaves NO stale vertex keys (else CC would still see CLAUDE_CODE_USE_VERTEX).
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(6u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "p",
+                region: "r",
+                sa_path: &sa,
+            },
+        )
+        .unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Bedrock {
+                region: "eu-west-1",
+                bearer_token: "aws-bearer-token-value-1234567890",
+            },
+        )
+        .expect("re-provision to bedrock succeeds");
+        let env = slot_env(dir.path(), 6);
+        assert_eq!(env.get("CLAUDE_CODE_USE_BEDROCK").unwrap(), "1");
+        assert!(
+            env.get("CLAUDE_CODE_USE_VERTEX").is_none(),
+            "stale vertex flag must be purged on switch"
+        );
+        assert!(env.get("ANTHROPIC_VERTEX_PROJECT_ID").is_none());
+        assert!(env.get("GOOGLE_APPLICATION_CREDENTIALS").is_none());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_vertex_rejects_bad_project() {
+        // Credential-redirection defense: a `/`-bearing project is rejected before
+        // any write (would otherwise reach the GCP endpoint format).
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(4u16).unwrap();
+        let err = bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "evil.example.com/",
+                region: "r",
+                sa_path: &sa,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::MergeConflict { .. }));
+        assert!(!dir.path().join("config-4/settings.json").exists());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_vertex_rejects_symlink_sa() {
+        // Confused-deputy defense: a symlinked SA path is rejected.
+        let dir = TempDir::new().unwrap();
+        let real = write_fake_sa(dir.path());
+        let link = dir.path().join("sa-link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        let err = bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "p",
+                region: "r",
+                sa_path: &link,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::MergeConflict { .. }));
+    }
+
+    // ── redteam R2 LOW-3: purge gates on a cloud flag (preserve user keys) ──
+
+    #[test]
+    fn purge_cloud_keys_gated_on_cloud_flag() {
+        // No cloud flag → a user's generically-named AWS_REGION /
+        // GOOGLE_APPLICATION_CREDENTIALS (unrelated tooling on a 3P slot) survive.
+        let mut env = Map::new();
+        env.insert("AWS_REGION".into(), Value::String("us-west-2".into()));
+        env.insert(
+            "GOOGLE_APPLICATION_CREDENTIALS".into(),
+            Value::String("/user/creds.json".into()),
+        );
+        env.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            Value::String("https://api.minimax.io/anthropic".into()),
+        );
+        assert!(
+            !purge_cloud_claude_env_keys(&mut env),
+            "no cloud flag → no purge"
+        );
+        assert!(env.contains_key("AWS_REGION"));
+        assert!(env.contains_key("GOOGLE_APPLICATION_CREDENTIALS"));
+
+        // Cloud flag present → full purge (the H1 hygiene case).
+        let mut env2 = Map::new();
+        env2.insert("CLAUDE_CODE_USE_BEDROCK".into(), Value::String("1".into()));
+        env2.insert("AWS_REGION".into(), Value::String("us-east-1".into()));
+        env2.insert(
+            "AWS_BEARER_TOKEN_BEDROCK".into(),
+            Value::String("live-token".into()),
+        );
+        assert!(
+            purge_cloud_claude_env_keys(&mut env2),
+            "cloud flag → purge fires"
+        );
+        assert!(env2.is_empty(), "all cloud keys removed");
+    }
+
+    // ── redteam H1: reverse-cleanup parity (no stale cloud key / retained cred) ──
+
+    /// Community-buildable: a slot carrying stale cloud keys is cleaned by
+    /// `unbind_provider_from_slot` (the path `csq login N` runs via finalize_login).
+    #[test]
+    fn unbind_purges_stale_cloud_keys() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("config-7");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1","AWS_BEARER_TOKEN_BEDROCK":"live-token","KEEP_ME":"x"}}"#,
+        )
+        .unwrap();
+        let slot = AccountNum::try_from(7u16).unwrap();
+        let removed = unbind_provider_from_slot(dir.path(), slot).unwrap();
+        assert!(removed, "cloud keys present → unbind reports removal");
+        // The non-cloud `KEEP_ME` key survives (env not empty, file rewritten);
+        // confirm no cloud cred survives and the backend is no longer misclassified.
+        assert_eq!(
+            crate::providers::settings::backend_for_slot(dir.path(), 7),
+            crate::accounts::Backend::Direct
+        );
+        let leftover = std::fs::read_to_string(cfg.join("settings.json")).unwrap_or_default();
+        assert!(
+            !leftover.contains("AWS_BEARER_TOKEN_BEDROCK")
+                && !leftover.contains("CLAUDE_CODE_USE_BEDROCK"),
+            "no live cloud cred / flag may survive unbind; got: {leftover}"
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn cloud_to_oauth_via_unbind_purges_cloud_keys() {
+        // Provision Vertex, then run the unbind finalize_login performs → the slot
+        // must retain NO cloud flag or live SA path.
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(6u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "p",
+                region: "r",
+                sa_path: &sa,
+            },
+        )
+        .unwrap();
+        unbind_provider_from_slot(dir.path(), slot).unwrap();
+        assert_eq!(
+            crate::providers::settings::backend_for_slot(dir.path(), 6),
+            crate::accounts::Backend::Direct
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_3p_over_cloud_slot_purges_cloud_keys() {
+        // Binding a real 3P provider over a cloud slot (via bind_provider_to_slot)
+        // must strip the cloud flags — else backend_for_slot stays is_cloud() and a
+        // later cloud re-provision would silently clobber the 3P token.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(8u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Bedrock {
+                region: "us-east-1",
+                bearer_token: "aws-bearer-token-value-1234567890",
+            },
+        )
+        .unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
+        let env = slot_env(dir.path(), 8);
+        assert!(env.get("CLAUDE_CODE_USE_BEDROCK").is_none());
+        assert!(env.get("AWS_BEARER_TOKEN_BEDROCK").is_none());
+        assert_eq!(
+            crate::providers::settings::backend_for_slot(dir.path(), 8),
+            crate::accounts::Backend::Direct
+        );
+        // The MiniMax bind is intact.
+        assert!(env.get("ANTHROPIC_BASE_URL").is_some());
     }
 
     /// `csq setkey claude --slot N --key sk-ant-...` binds the slot
@@ -1198,6 +1834,63 @@ mod tests {
         );
     }
 
+    /// Kimi analog of the DeepSeek extras-purge guard. Kimi carries FOUR
+    /// `extra_env` keys (ENABLE_TOOL_SEARCH, CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+    /// CLAUDE_CODE_EFFORT_LEVEL, CLAUDE_CODE_SUBAGENT_MODEL). Without a
+    /// `kimi.com` arm in `provider_from_base_url`, `purge_previous_provider_extras`
+    /// classified a kimi slot's base URL to None → purged nothing → those four
+    /// keys leaked into whatever provider the slot was rebound to. This locks
+    /// the discovery-classifier fix. (Wave-1 completeness redteam HIGH.)
+    #[test]
+    fn rebind_from_kimi_to_mm_purges_kimi_extras() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(6u16).unwrap();
+
+        // Step 1: bind Kimi (writes the 4 docs-mandated extras).
+        bind_provider_to_slot(
+            dir.path(),
+            "kimi",
+            slot,
+            Some("sk-test-kimi-12345678"),
+            None,
+        )
+        .unwrap();
+        let path = dir.path().join("config-6/settings.json");
+        let after_kimi: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after_kimi
+                .get("env")
+                .unwrap()
+                .get("ENABLE_TOOL_SEARCH")
+                .unwrap(),
+            "false"
+        );
+
+        // Step 2: rebind to MiniMax (empty extra_env). Kimi's four extras must
+        // NOT survive into the MiniMax-bound slot's env block.
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-mm-12345678"), None).unwrap();
+        let after_mm: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let env = after_mm.get("env").unwrap();
+
+        for leaked in [
+            "ENABLE_TOOL_SEARCH",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            assert!(
+                env.get(leaked).is_none(),
+                "Kimi's {leaked} must be purged on rebind to MiniMax"
+            );
+        }
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap(),
+            "https://api.minimax.io/anthropic"
+        );
+    }
+
     /// Inverse of `rebind_from_deepseek_to_mm_purges_deepseek_extras`:
     /// rebinding from MiniMax (no extras) to DeepSeek (3 extras) must
     /// land DeepSeek's extras cleanly. Round 2 LOW-1.
@@ -1227,6 +1920,97 @@ mod tests {
             "deepseek-v4-flash"
         );
         assert_eq!(env.get("CLAUDE_CODE_EFFORT_LEVEL").unwrap(), "max");
+    }
+
+    /// MED-2 (an internal ticket redteam): rebinding a slot to a DIFFERENT provider
+    /// must clear the slot's `quota.json` row so the prior provider's
+    /// stale number cannot render under the new provider's tag. Most 3P
+    /// pollers write `surface: "claude-code"` (the default), so a
+    /// surface-match gate alone cannot distinguish "MiniMax's row" from
+    /// "Kimi's row" — the row must be removed at bind time.
+    #[test]
+    fn rebind_to_different_provider_clears_stale_quota_row() {
+        use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-mm-12345678"), None).unwrap();
+
+        // Simulate the daemon's MiniMax poll having already written a row.
+        let mut qf = QuotaFile::empty();
+        qf.set(
+            9,
+            AccountQuota {
+                five_hour: Some(UsageWindow {
+                    used_percentage: 88.0,
+                    resets_at: 4_102_444_800,
+                }),
+                ..Default::default()
+            },
+        );
+        quota_state::save_state(dir.path(), &qf).unwrap();
+        assert!(
+            quota_state::load_state(dir.path())
+                .unwrap()
+                .get(9)
+                .is_some(),
+            "sanity: MiniMax row present before rebind"
+        );
+
+        // Rebind slot 9 to Kimi — a DIFFERENT provider.
+        bind_provider_to_slot(
+            dir.path(),
+            "kimi",
+            slot,
+            Some("sk-test-kimi-12345678"),
+            None,
+        )
+        .unwrap();
+
+        let after = quota_state::load_state(dir.path()).unwrap();
+        assert!(
+            after.get(9).is_none(),
+            "MiniMax's stale row must be cleared on rebind to Kimi, not \
+             left to render 88% under the Kimi tag"
+        );
+    }
+
+    /// Negative control: rebinding to the SAME provider (e.g. rotating
+    /// the API key) must NOT clear the quota row — there is no stale
+    /// cross-provider data to guard against, and blanking a correct
+    /// number on every routine re-key would be a UX regression.
+    #[test]
+    fn rebind_to_same_provider_preserves_quota_row() {
+        use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-mm-12345678"), None).unwrap();
+
+        let mut qf = QuotaFile::empty();
+        qf.set(
+            9,
+            AccountQuota {
+                five_hour: Some(UsageWindow {
+                    used_percentage: 55.0,
+                    resets_at: 4_102_444_800,
+                }),
+                ..Default::default()
+            },
+        );
+        quota_state::save_state(dir.path(), &qf).unwrap();
+
+        // Re-key the SAME provider (MiniMax again, new token).
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-mm-rotated-key"), None)
+            .unwrap();
+
+        let after = quota_state::load_state(dir.path()).unwrap();
+        let row = after
+            .get(9)
+            .expect("same-provider re-key must preserve the quota row");
+        assert_eq!(row.five_hour_pct(), 55.0);
     }
 
     /// Regression: unbind MUST also remove `provider.extra_env` keys

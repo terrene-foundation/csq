@@ -97,12 +97,43 @@ journal/*-data/
 # scheduler. Recreated on every session; has no diff value.
 **/.claude/scheduled_tasks.lock
 
+# Operator identity — .claude/operator-id holds a GPG verified_id fingerprint,
+# written by .claude/hooks/lib/operator-id.js on session start. It is
+# operator-local disclosure, not source, and this repo is the upstream of a
+# PUBLIC community fork — an accidental commit publishes a maintainer's key
+# fingerprint irreversibly (`security.md` "No secrets in logs or errors").
+# Upstream kailash-coc-rs ignores it for the same reason.
+.claude/operator-id
+**/.claude/operator-id
+
+# Per-operator session-notes layout, produced by the SessionStart hook when it
+# splits a legacy monolithic .session-notes
+# (.claude/hooks/lib/session-notes-layout.js). Ephemeral + per-machine, same
+# class as the workspaces/**/.session-notes entry below.
+.session-notes.d/
+**/.session-notes.d/
+.session-notes.shared.md
+**/.session-notes.shared.md
+.session-notes.migrated
+**/.session-notes.migrated
+
 # IDE settings
 .vscode/
 **/.vscode/
 
 # Session notes (ephemeral, per-machine)
 workspaces/**/.session-notes
+
+# Per-workspace journal-skip audit log, appended by the SessionEnd hook
+# (written by a session-end hook). Machine-
+# generated, append-only, session-local — and per-machine, since which commits a
+# given operator's session skipped is not a property of the repo. That writer's
+# own doc comment asserted this file was already ignored "(workspaces/* is
+# gitignored at the repo root)", which was never true: only the .session-notes
+# entry above is. So the log sat untracked and surfaced as `git status` noise in
+# every /sweep from 2026-08-04 on. Same class as .session-notes; ignored here,
+# and the false comment corrected at the writer.
+workspaces/**/.journal-skipped.log
 
 # COC eval environment — durable code (lib/, schemas/, tests/, fixtures/,
 # suites/, conftest.py, run.py) is tracked. Only ephemeral run state is
@@ -138,3 +169,16 @@ coc-eval/bench/stubs/gemini
 # (mktemp "THIRD-PARTY-LICENSES.md.XXXXXX"; trap-cleaned on every exit, this is
 # defense-in-depth against a SIGKILL leaving one staged).
 THIRD-PARTY-LICENSES.md.*
+
+# Research scratch — intermediate retrieval artefacts (base64-encoded PDFs for
+# tool transport, page dumps, grep-context extracts). Every finding drawn from
+# these is distilled into the tracked tree WITH its primary-source citation, so
+# the scratch is regenerable and must not be committed. Large base64 artefacts
+# in particular: files over 10 MB must never be committed, and git never
+# forgets. (Incident history is in the journal, not here — `.gitignore` is not
+# stripped by the community extraction, so it must carry no internal narrative.)
+/*_b64.txt
+/*_ctx.txt
+/helm-safety.yml
+
+

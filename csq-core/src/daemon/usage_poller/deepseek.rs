@@ -6,10 +6,10 @@
 //! `anthropic-ratelimit-*` headers. This endpoint returns a remaining USD
 //! balance that csq renders in place of a usage bar.
 
-use crate::quota::{state as quota_state, AccountQuota, BalanceInfo, QuotaFile};
+use crate::quota::{state as quota_state, AccountQuota, BalanceInfo};
 use tracing::debug;
 
-use super::{HttpGetFn, PollError};
+use super::{classify_transport_error, HttpGetFn, PollError};
 
 /// DeepSeek balance endpoint — hardcoded because it is NOT the Anthropic-bridge
 /// base URL stored in per-slot settings (that is `api.deepseek.com/anthropic`).
@@ -46,7 +46,7 @@ pub(crate) fn poll_deepseek_balance(
     let extra_headers = [("Accept", "application/json")];
 
     let (status, body) =
-        http_get(BALANCE_URL, api_key, &extra_headers).map_err(PollError::Transport)?;
+        http_get(BALANCE_URL, api_key, &extra_headers).map_err(classify_transport_error)?;
 
     match status {
         429 => return Err(PollError::RateLimited),
@@ -86,7 +86,7 @@ pub(crate) fn poll_deepseek_balance(
 
     // Reject non-finite balances at the boundary. `str::parse::<f64>` accepts
     // "NaN"/"inf"/"infinity"; a garbled response must not persist a value that
-    // renders as "$NaN" / "$inf" in the statusline and desktop card (#984
+    // renders as "$NaN" / "$inf" in the statusline and desktop card (an internal ticket
     // redteam L1). Validate here so quota.json never holds a non-finite balance.
     if !remaining.is_finite() {
         return Err(PollError::Parse(format!(
@@ -108,7 +108,22 @@ pub(crate) fn write_deepseek_balance(
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
-    let mut quota = quota_state::load_state(base_dir).unwrap_or_else(|_| QuotaFile::empty());
+    // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
+    // falling back to QuotaFile::empty() — a load failure here must SKIP
+    // the write, not persist a one-row file that wipes every sibling
+    // account's row (mirrors usage_poller::gemini_oauth::write_quota).
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            tracing::warn!(
+                account = account_id,
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "DeepSeek poller: quota.json unreadable, skipping write to avoid clobbering sibling rows"
+            );
+            return Ok(());
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -202,7 +217,7 @@ mod tests {
         );
     }
 
-    // #984 redteam L1: a non-finite total_balance ("NaN"/"inf") is rejected at
+    // an internal ticket redteam L1: a non-finite total_balance ("NaN"/"inf") is rejected at
     // the boundary so quota.json never holds a value that renders as "$NaN".
     #[test]
     fn poll_deepseek_balance_rejects_non_finite() {
@@ -274,5 +289,41 @@ mod tests {
         let stored = q.balance.as_ref().expect("balance field must be present");
         assert_eq!(stored.currency, "USD");
         assert!((stored.remaining - 197.15).abs() < 1e-9);
+    }
+
+    /// MED-1 (an internal ticket redteam): a schema-drifted `quota.json` must NOT
+    /// be clobbered by this write leg. Before the fix,
+    /// `load_state_or_warn`'s `QuotaFile::empty()` fallback let this
+    /// write persist a one-row file, wiping every sibling account's row.
+    #[test]
+    fn write_deepseek_balance_skips_on_poisoned_file_preserving_siblings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let poisoned = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        std::fs::write(quota_state::quota_path(dir.path()), poisoned).unwrap();
+
+        let balance = BalanceInfo {
+            currency: "USD".to_string(),
+            remaining: 42.0,
+        };
+        let result = write_deepseek_balance(dir.path(), 3, &balance);
+        assert!(result.is_ok(), "skip must be Ok(()), not an error");
+
+        let raw = std::fs::read_to_string(quota_state::quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["accounts"]["1"]["five_hour"]["used_percentage"].as_f64(),
+            Some(50.0)
+        );
+        assert_eq!(
+            v["accounts"]["2"]["five_hour"]["used_percentage"].as_f64(),
+            Some(80.0)
+        );
+        assert!(v["accounts"].get("3").is_none());
     }
 }

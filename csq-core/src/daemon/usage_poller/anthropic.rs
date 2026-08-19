@@ -5,7 +5,7 @@
 
 use crate::accounts::{discovery, AccountSource};
 use crate::credentials::{self, file as cred_file};
-use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+use crate::quota::{state as quota_state, AccountQuota, UsageWindow};
 use crate::types::AccountNum;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -13,8 +13,9 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::{
-    clear_backoff, clear_cooldown, in_cooldown, increase_backoff, set_cooldown,
-    set_cooldown_with_backoff, HttpGetFn, PollError, CALL_TIMEOUT, MAX_ACCOUNTS_PER_TICK,
+    classify_transport_error, clear_backoff, clear_cooldown, in_cooldown, increase_backoff,
+    set_cooldown, set_cooldown_with_backoff, HttpGetFn, PollError, CALL_TIMEOUT,
+    MAX_ACCOUNTS_PER_TICK,
 };
 
 /// Anthropic base URL for OAuth usage.
@@ -132,6 +133,31 @@ pub(crate) async fn tick(
                 debug!(account = info.id, "usage poller: transport error");
                 set_cooldown(cooldowns, info.id);
             }
+            Ok(Err(PollError::BadUrl(_))) => {
+                // Reachable for TWO distinct reasons (round-2 redteam
+                // R6-rust corrected this comment — it previously claimed
+                // "unreachable in practice"): (1) this poller's own URL is
+                // the fixed `ANTHROPIC_BASE_URL` constant, so the outbound
+                // char/https/userinfo/unparseable guards can never reject
+                // it — that half of the original reasoning still holds;
+                // but (2) the TOKEN guard (`ERR_TOKEN_UNSAFE_CHARS`) and
+                // the process-wide `ERR_NO_JS_RUNTIME` /
+                // `ERR_ENCODE_FAILED` pre-flight failures check the
+                // credential and the runtime environment, NOT the URL —
+                // now that this call site routes through
+                // `classify_transport_error`, a corrupted stored access
+                // token trips this arm too. WARN is correct for both: a
+                // malformed fixed URL means the constant itself somehow
+                // became corrupted; a malformed token means the account's
+                // stored credential needs re-login — neither is a
+                // transient network blip.
+                warn!(
+                    account = info.id,
+                    error_kind = "anthropic_poll_bad_url",
+                    "usage poller: outbound url or token rejected pre-flight — check the account's stored credentials"
+                );
+                set_cooldown(cooldowns, info.id);
+            }
             Ok(Err(PollError::Parse(_))) => {
                 debug!(account = info.id, "usage poller: parse error");
                 set_cooldown(cooldowns, info.id);
@@ -165,7 +191,7 @@ pub(crate) fn poll_anthropic_usage(
     let url = format!("{ANTHROPIC_BASE_URL}/api/oauth/usage");
     let extra_headers = [("Anthropic-Beta", ANTHROPIC_BETA_HEADER)];
 
-    let (status, body) = http_get(&url, token, &extra_headers).map_err(PollError::Transport)?;
+    let (status, body) = http_get(&url, token, &extra_headers).map_err(classify_transport_error)?;
 
     match status {
         200 => {}
@@ -210,14 +236,57 @@ fn parse_window(json: &serde_json::Value, key: &str) -> Option<UsageWindow> {
     })
 }
 
-/// Minimal RFC 3339 parser: `YYYY-MM-DDTHH:MM:SSZ` → epoch seconds.
+/// Minimal RFC 3339 parser: `YYYY-MM-DDTHH:MM:SS` + timezone → epoch
+/// seconds.
 ///
-/// Accepts only UTC timestamps (trailing `Z` or `+00:00`). This is
-/// sufficient for the Anthropic usage API which always returns UTC.
+/// Accepts a trailing `Z` (UTC) or a numeric `±HH:MM` offset. The
+/// Anthropic usage API always returns UTC (`Z`/`+00:00`); the Kimi
+/// usages API is China-based, so a `+08:00` contract drift must not
+/// make BOTH windows unparseable → perpetual cooldown (redteam R1).
 /// No `chrono` or `time` dependency needed.
 pub(crate) fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
-    // Strip trailing Z or +00:00
-    let s = s.strip_suffix('Z').or_else(|| s.strip_suffix("+00:00"))?;
+    // RFC 3339 timestamps are pure ASCII. Reject anything else up front
+    // so the fixed-offset slicing below can never land on a non-char
+    // boundary — a 19-byte input containing a multi-byte char panicked
+    // the byte-slicing parser (redteam R1 sec-NIT-1).
+    if !s.is_ascii() {
+        return None;
+    }
+
+    // Split the timezone designator: trailing `Z`, or `±HH:MM`.
+    let (s, offset_secs): (&str, i64) = if let Some(r) = s.strip_suffix('Z') {
+        (r, 0)
+    } else if s.len() >= 6 {
+        let (body, tz) = s.split_at(s.len() - 6);
+        let tz_bytes = tz.as_bytes();
+        let sign: i64 = match tz_bytes[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if tz_bytes[3] != b':' {
+            return None;
+        }
+        // RFC 3339 time-numoffset is `±2DIGIT:2DIGIT` — Rust's i64
+        // FromStr accepts a sign, so "+-8:00" would otherwise parse as
+        // −08:00 (a silently INVERTED offset) and "++8:00" as +08:00.
+        // Fail closed on any non-digit (R4 NIT).
+        if !tz_bytes[1].is_ascii_digit()
+            || !tz_bytes[2].is_ascii_digit()
+            || !tz_bytes[4].is_ascii_digit()
+            || !tz_bytes[5].is_ascii_digit()
+        {
+            return None;
+        }
+        let off_hour: i64 = tz[1..3].parse().ok()?;
+        let off_min: i64 = tz[4..6].parse().ok()?;
+        if off_hour > 23 || off_min > 59 {
+            return None;
+        }
+        (body, sign * (off_hour * 3600 + off_min * 60))
+    } else {
+        return None;
+    };
 
     // Accept both "YYYY-MM-DDTHH:MM:SS" and "YYYY-MM-DDTHH:MM:SS.fff"
     let s = match s.find('.') {
@@ -244,6 +313,13 @@ pub(crate) fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
     {
         return None;
     }
+    // `365 * (year - 1970)` below would underflow u64 for a pre-epoch
+    // year — reject it rather than panic (same containment class as
+    // the ASCII guard above; the parser runs inside spawn_blocking,
+    // but a panic there still costs a cooldown cycle).
+    if year < 1970 {
+        return None;
+    }
 
     // Days before each month (non-leap).
     const MONTH_DAYS: [u64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
@@ -262,7 +338,11 @@ pub(crate) fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
     }
     days += day - 1;
 
-    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+    let naive = days * 86400 + hour * 3600 + minute * 60 + second;
+    // RFC 3339: local = UTC + offset → UTC = local − offset. Clamp at
+    // 0: a pre-1970 local time at a positive offset has no u64 epoch.
+    let epoch = (naive as i64 - offset_secs).max(0);
+    Some(epoch as u64)
 }
 
 fn is_leap_year(y: u64) -> bool {
@@ -280,7 +360,22 @@ pub(crate) fn write_usage_to_quota(
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
-    let mut quota = quota_state::load_state(base_dir).unwrap_or_else(|_| QuotaFile::empty());
+    // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
+    // falling back to QuotaFile::empty() — a load failure here must SKIP
+    // the write, not persist a one-row file that wipes every sibling
+    // account's row (mirrors usage_poller::gemini_oauth::write_quota).
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            warn!(
+                account = account.get(),
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "usage poller: quota.json unreadable, skipping write to avoid clobbering sibling rows"
+            );
+            return Ok(());
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -459,8 +554,65 @@ mod tests {
     }
 
     #[test]
-    fn iso8601_rejects_non_utc() {
-        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00+05:30").is_none());
+    fn iso8601_applies_positive_numeric_offset() {
+        // 2000-01-01T08:00:00 at +08:00 == 2000-01-01T00:00:00Z.
+        let epoch = parse_iso8601_to_epoch("2000-01-01T08:00:00+08:00").unwrap();
+        assert_eq!(epoch, 946684800);
+        // 2000-01-01T00:00:00 at +05:30 == 946684800 − 19800.
+        let epoch = parse_iso8601_to_epoch("2000-01-01T00:00:00+05:30").unwrap();
+        assert_eq!(epoch, 946684800 - 19800);
+    }
+
+    #[test]
+    fn iso8601_applies_negative_numeric_offset() {
+        // 1999-12-31T19:00:00 at −05:00 == 2000-01-01T00:00:00Z.
+        let epoch = parse_iso8601_to_epoch("1999-12-31T19:00:00-05:00").unwrap();
+        assert_eq!(epoch, 946684800);
+    }
+
+    #[test]
+    fn iso8601_rejects_invalid_offsets_and_missing_timezone() {
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00+24:00").is_none());
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00+05:60").is_none());
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00").is_none());
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00+0500").is_none());
+        // Malformed signs must fail closed, never invert (R4 NIT):
+        // "+-8:00" would otherwise parse as −08:00.
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00+-8:00").is_none());
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00++8:00").is_none());
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00+0a:00").is_none());
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00+08:b0").is_none());
+    }
+
+    #[test]
+    fn iso8601_multibyte_input_returns_none_not_panic() {
+        // 19 bytes after the Z-strip but containing a multi-byte char —
+        // the byte-slicing parser panicked on this shape (R1 sec-NIT-1).
+        assert!(parse_iso8601_to_epoch("202é-01-01T00:00:0Z").is_none());
+        assert!(parse_iso8601_to_epoch("2026-04-10T15:30:00±08:00").is_none());
+    }
+
+    #[test]
+    fn iso8601_pre_epoch_year_rejected_not_underflow() {
+        assert!(parse_iso8601_to_epoch("1960-01-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn iso8601_positive_offset_past_epoch_clamps_to_zero() {
+        // naive 1800 − offset 3600 would go negative; the contract is
+        // clamp-to-zero (an instantly-expired window), never a wrap or
+        // panic (R3 NIT — pin the chosen behavior).
+        let epoch = parse_iso8601_to_epoch("1970-01-01T00:30:00+01:00").unwrap();
+        assert_eq!(epoch, 0);
+    }
+
+    #[test]
+    fn iso8601_fractional_seconds_with_numeric_offset() {
+        // The tz split happens BEFORE the dot truncation, so a
+        // fractional+offset timestamp (plausible China-region drift —
+        // the case the offset arm was added for) parses correctly.
+        let epoch = parse_iso8601_to_epoch("2000-01-01T08:00:00.841665+08:00").unwrap();
+        assert_eq!(epoch, 946684800);
     }
 
     #[test]
@@ -662,5 +814,52 @@ mod tests {
         tick(dir.path(), &http, &cooldowns, &backoffs).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(!in_cooldown(&cooldowns, 1));
+    }
+
+    /// MED-1 (an internal ticket redteam): a schema-drifted `quota.json` (from a
+    /// newer csq build) must NOT be clobbered by this write leg. Before
+    /// the fix, `load_state_or_warn`'s `QuotaFile::empty()` fallback let
+    /// `write_usage_to_quota` persist a ONE-row file for slot 3, wiping
+    /// slots 1 and 2. The fixed `load_state_or_skip` path returns `Ok(())`
+    /// without touching the file at all.
+    #[test]
+    fn write_usage_to_quota_skips_on_poisoned_file_preserving_siblings() {
+        let dir = TempDir::new().unwrap();
+        let poisoned = r#"{
+            "schema_version": 99,
+            "accounts": {
+                "1": {"five_hour": {"used_percentage": 50.0, "resets_at": 4102444800}, "updated_at": 1.0},
+                "2": {"five_hour": {"used_percentage": 80.0, "resets_at": 4102444800}, "updated_at": 1.0}
+            }
+        }"#;
+        std::fs::write(quota_state::quota_path(dir.path()), poisoned).unwrap();
+
+        let account = AccountNum::try_from(3u16).unwrap();
+        let usage = UsageData {
+            five_hour: Some(crate::quota::UsageWindow {
+                used_percentage: 12.0,
+                resets_at: 4_102_444_800,
+            }),
+            seven_day: None,
+        };
+        let result = write_usage_to_quota(dir.path(), account, &usage);
+        assert!(result.is_ok(), "skip must be Ok(()), not an error");
+
+        let raw = std::fs::read_to_string(quota_state::quota_path(dir.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["accounts"]["1"]["five_hour"]["used_percentage"].as_f64(),
+            Some(50.0),
+            "slot 1 must survive untouched"
+        );
+        assert_eq!(
+            v["accounts"]["2"]["five_hour"]["used_percentage"].as_f64(),
+            Some(80.0),
+            "slot 2 must survive untouched"
+        );
+        assert!(
+            v["accounts"].get("3").is_none(),
+            "slot 3 write must have been skipped entirely, not persisted"
+        );
     }
 }

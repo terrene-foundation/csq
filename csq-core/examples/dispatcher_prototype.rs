@@ -78,6 +78,11 @@ fn check_bundle_sentinel() -> Option<Mode> {
         return Some(Mode::Desktop);
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    if check_bundle_sentinel_platform(&exe) {
+        return Some(Mode::Desktop);
+    }
+
     None
 }
 

@@ -8,15 +8,24 @@
 //!
 //! Mode 0o600. Each line is a [`UsageEvent`].
 //!
-//! CURRENT (an internal ticket): the desktop `get_account_usage` command computes the
-//! summary live from CC's transcripts via [`super::aggregator`] (behind a
-//! background-refresh cache) and this NDJSON ledger's [`append`]/[`read_all`]
-//! path is the persistence layer a future daemon writer will use. The intended
-//! end state (follow-up, tracked in #992) is a daemon-written ledger that
-//! terminals READ via [`read_all`] + [`summarize`] — per
-//! `rules/account-terminal-separation.md` Rule 1 (extended for billing
-//! telemetry): only the daemon writes; terminals read. That daemon writer is
-//! not built yet.
+//! CURRENT (an internal ticket, superseded by the ledger-first design below): the
+//! desktop `get_account_usage` command computes the summary live from CC's
+//! transcripts via [`super::aggregator`] (behind a background-refresh cache)
+//! and this NDJSON ledger's [`append`]/[`read_all`] path is the persistence
+//! layer the daemon writer publishes to. The end state described by an internal ticket
+//! (a daemon-written ledger that terminals READ via [`read_all`] +
+//! [`summarize`] — per `rules/account-terminal-separation.md` Rule 1,
+//! extended for billing telemetry: only the daemon writes; terminals read)
+//! IS BUILT: [`crate::daemon::usage_ledger_writer`], spawned by both the CLI
+//! and desktop daemon startup paths, periodically re-derives usage from
+//! transcripts and atomically publishes it here. `get_account_usage` reads
+//! this ledger FIRST and falls back to the live-scan cache above only as a
+//! cold-start path (before the writer's first tick). an internal ticket is CLOSED — its
+//! own scope shipped; the citation was stale prose, re-verified 2026-08-12
+//! against `csq/src/desktop/commands/mod.rs`'s `get_account_usage` and both
+//! daemon startup wirings, not a repointed tracker (nothing here is still
+//! open — see `scripts/verify/todo-closed-issue.sh` for the sibling
+//! citations that WERE still-open work and were repointed to an internal ticket).
 
 use crate::accounts::identity_store::usage_ledger_path_for;
 use crate::accounts::profiles;
@@ -84,20 +93,22 @@ pub struct UsageEvent {
     /// Cache-write tokens (`cache_creation_input_tokens`) summed across the
     /// session. Captured from the transcript (an internal ticket). For Anthropic Claude
     /// models these are billed into `cost_usd_estimate` at 1.25× the base input
-    /// rate (#992); non-Anthropic providers bill cache at $0 pending verified
-    /// per-provider rates. `#[serde(default)]` keeps older ledger lines readable.
+    /// rate; non-Anthropic providers bill cache at $0 pending verified
+    /// per-provider rates (tracked by an internal ticket).
+    /// The prior citation pointed at closed an internal ticket and was re-pointed 2026-08-12.
+    /// `#[serde(default)]` keeps older ledger lines readable.
     #[serde(default)]
     pub cache_creation_tokens: u64,
     /// Cache-read tokens (`cache_read_input_tokens`) summed across the session.
-    /// Billed at 0.10× the base input rate for Claude models only (#992; see
-    /// `cache_creation_tokens`).
+    /// Billed at 0.10× the base input rate for Claude models only (see
+    /// `cache_creation_tokens` for the per-provider tracking issue, an internal ticket).
     #[serde(default)]
     pub cache_read_tokens: u64,
     /// USD cost estimate computed via [`super::cost_rates`]. `None` if the
     /// model name was unrecognized (table miss → fail-loud rather than guess).
     /// Bills `input_tokens` + `output_tokens`, plus cache tokens for Anthropic
-    /// Claude models (#992; other providers bill cache at $0 — see
-    /// `cache_creation_tokens`).
+    /// Claude models (other providers bill cache at $0 — see
+    /// `cache_creation_tokens` for the per-provider tracking issue, an internal ticket).
     pub cost_usd_estimate: Option<f64>,
     /// Where this event was sourced from.
     pub source: UsageSource,
@@ -630,7 +641,7 @@ not-json
     // ── M2-5 acceptance-criteria tests ──────────────────────────────────────
 
     /// Structural guard: the `save_state`/`save_quota` callsite count in
-    /// csq-core/src (excluding `quota/state.rs` itself) MUST stay at 23
+    /// csq-core/src (excluding `quota/state.rs` itself) MUST stay at 28
     /// (cross-phase invariant — `rules/account-terminal-separation.md`
     /// MUST Rule 1). This test enforces that no new callsite was added
     /// accidentally; any intentional change re-runs the Rule 1 channel
@@ -638,16 +649,86 @@ not-json
     ///
     /// Count composition (the line-level scan does NOT exclude `#[cfg(test)]`
     /// modules — the `#[cfg(test)]` check below only skips lines that carry
-    /// the attribute text themselves): 13 genuine production callsites,
-    /// 9 callsites inside test modules, and 1 self-referential match (this
+    /// the attribute text themselves): 15 genuine production callsites,
+    /// 12 callsites inside test modules, and 1 self-referential match (this
     /// test's own `contains("save_state(")` line). The tripwire value is the
     /// invariant; the per-channel audit lives in the rule's grep primitive.
+    ///
+    /// The 10th and 11th test-module callsites (2026-07-30, MED-2 an internal ticket
+    /// redteam) are `accounts::third_party::tests::
+    /// rebind_to_different_provider_clears_stale_quota_row` and
+    /// `rebind_to_same_provider_preserves_quota_row` — each seeds a
+    /// pre-existing quota row via `quota_state::save_state` directly (a
+    /// hardcoded literal slot id in a tempdir fixture), not a production
+    /// writer. No Rule 1 channel classification applies to test fixtures.
     ///
     /// The 13th production callsite (2026-07-06) is the DeepSeek balance writer
     /// `usage_poller::deepseek::write_deepseek_balance` — an AUTHORIZED writer
     /// per Rule 1 channel (a): its slot id comes from `info.id` in the 3P poll
     /// loop's per-slot iteration state, exactly like MiniMax/Z.AI. NOT a
     /// terminal-derived slot. See an internal ticket.
+    ///
+    /// The 14th production callsite (2026-07-28) is the Grok billing writer
+    /// `usage_poller::grok::write_grok_billing` — an AUTHORIZED writer per
+    /// Rule 1 channel (a): its `account_id` comes from the per-slot iteration
+    /// state of `usage_poller::grok::tick`, whose slot list is built by
+    /// `accounts::discovery::discover_native` (the `credentials/grok-<N>.json`
+    /// binding-marker enumeration — a slot-lifecycle channel). Each slot is
+    /// polled with the token from its OWN per-slot vendor home
+    /// (`native-homes/grok-<N>/auth.json`), never the user-global
+    /// `~/.grok/auth.json`, so neither the slot id nor the credential is
+    /// terminal-derived. NOT a `CLAUDE_CONFIG_DIR` / marker-fallback /
+    /// CC-`rate_limits` derivation.
+    ///
+    /// The 15th production callsite (2026-07-29) is the Kimi usages writer
+    /// `usage_poller::kimi::write_kimi_usages` — an AUTHORIZED writer per
+    /// Rule 1 channel (a): its `account_id` comes from the per-slot
+    /// iteration state of `usage_poller::kimi::tick`, whose slot list is
+    /// built by `accounts::discovery::discover_all` (for the 3P bearer
+    /// `kimi` provider) and `accounts::discovery::discover_native` (for
+    /// the `credentials/kimi-<N>.json` binding-marker enumeration) —
+    /// both slot-lifecycle channels. Each slot is polled with its OWN
+    /// credential: the 3P slot with the `sk-kimi-…` key from
+    /// `config-<N>/settings.json` (via
+    /// `third_party::load_3p_api_key_for_slot`, the same channel the
+    /// existing MiniMax/Z.AI/DeepSeek writers use), the native slot
+    /// with the OAuth `access_token` from its OWN per-slot vendor home
+    /// (`native-homes/kimi-<N>/credentials/kimi-code.json`). Neither the
+    /// slot id nor the credential is terminal-derived. NOT a
+    /// `CLAUDE_CONFIG_DIR` / marker-fallback / CC-`rate_limits`
+    /// derivation.
+    ///
+    /// The 12th test-module callsite (2026-08-02, `quota/status.rs` stale
+    /// quota-row diagnostic) is `quota::status::tests::setup_with_updated_at`
+    /// — a test fixture that seeds a quota row with a caller-supplied
+    /// `updated_at` (a hardcoded literal slot id from the `account: u16`
+    /// test parameter, in a tempdir fixture), not a production writer. No
+    /// Rule 1 channel classification applies to test fixtures.
+    ///
+    /// The 13th test-module callsite (2026-08-02 redteam fix wave, same
+    /// diagnostic) is `quota::status::tests::setup_quota_row` — a test
+    /// fixture that writes an arbitrary caller-supplied `AccountQuota` row
+    /// (used by the event-driven-Gemini and native-Grok-balance staleness
+    /// regression tests), likewise a hardcoded literal slot id in a
+    /// tempdir fixture, not a production writer. No Rule 1 channel
+    /// classification applies to test fixtures.
+    ///
+    /// The 14th test-module callsite (2026-08-02 redteam round 2) is
+    /// `providers::gemini::provisioning::tests::seed_oauth_shaped_quota_row`
+    /// — a test fixture seeding an OAuth-shaped row (`surface: "gemini"`,
+    /// `kind: "utilization"`) so the regime-change tests can prove
+    /// `write_binding` clears it. Hardcoded literal slot id from the
+    /// `n: u16` test parameter, in a tempdir fixture; not a production
+    /// writer. No Rule 1 channel classification applies to test fixtures.
+    ///
+    /// NOTE on the PRODUCTION side of that same change: `write_binding`
+    /// now REMOVES a slot's quota row on a polling-regime change, via
+    /// `accounts::logout::remove_quota_entry`. That is a remover, not a
+    /// `save_state` writer, so it does not appear in this count — and its
+    /// slot id is the `slot: AccountNum` parameter of a slot-lifecycle
+    /// operation (Rule 1 channel (c)), the same channel
+    /// `accounts::third_party::bind_provider_to_slot` uses for the
+    /// identical purpose. Nothing terminal-derived.
     ///
     /// Implementation: a runtime grep against the source tree at
     /// `CARGO_MANIFEST_DIR`. The test only runs when the manifest dir env
@@ -700,8 +781,8 @@ not-json
         walk_and_count(&src_root, &mut count);
 
         assert_eq!(
-            count, 23,
-            "save_state production callsite count changed: expected 23, got {count}. \
+            count, 30,
+            "save_state production callsite count changed: expected 30, got {count}. \
              A new quota writer MUST source its slot id from an authoritative channel \
              (per-slot poller state / IPC event / slot-lifecycle param) per \
              rules/account-terminal-separation.md MUST Rule 1 — classify the channel \

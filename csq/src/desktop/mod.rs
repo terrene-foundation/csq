@@ -10,8 +10,11 @@ use csq_core::credentials::{self, file as cred_file};
 use csq_core::oauth::OAuthStateStore;
 use csq_core::quota::{state as quota_state, QuotaFile};
 use csq_core::types::AccountNum;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use tracing_subscriber::layer::SubscriberExt;
 
 use preferences::PrefsLock;
 use tauri::image::Image;
@@ -159,6 +162,19 @@ pub struct AppState {
     /// UI's modal-close must kill the subprocess so it does not
     /// orphan for the minutes-long codex-cli device-auth window.
     pub codex_login_child: Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
+    /// Running native-CLI (Kimi/Grok) login children, keyed by native
+    /// [`csq_core::providers::catalog::Surface`]. Mirrors
+    /// `codex_login_child`'s `Arc<Mutex<Option<...>>>` shape but is a
+    /// per-surface map — an internal journal entry C8: Kimi and Grok are independent
+    /// vendor binaries with independent vendor homes, so a Kimi login in
+    /// flight must not block a concurrent Grok login (unlike Codex,
+    /// which refuses ANY concurrent login regardless of slot). A second
+    /// login for the SAME surface is still refused while an entry is
+    /// present. Populated for the duration of a live native device-auth
+    /// spawn (`commands::spawn_native_device_auth_piped`); cleared on
+    /// exit (success or failure) so `commands::cancel_native_login`
+    /// never targets a reaped child.
+    pub native_login_children: commands::NativeLoginChildren,
     /// Typed serialization lock for `<base>/desktop-prefs.json`.
     ///
     /// The `PrefsLock` newtype is the compile-time witness for "the
@@ -195,10 +211,20 @@ const MAX_LABEL_LEN: usize = 64;
 
 /// Returns the base directory for csq state — `~/.claude/accounts`.
 ///
-/// Honors the `CSQ_BASE_DIR` environment variable for testing.
+/// Honors the `CSQ_BASE_DIR` environment variable for testing. The override
+/// must be a non-empty absolute path; an empty or relative value resolves
+/// against the process CWD, which for a Finder-launched app is `/`. Rejecting
+/// it yields `None`, which every caller already treats as "cannot resolve" —
+/// the same validation the CLI twin applies in
+/// `cli::commands::validated_env_override`.
 fn base_dir() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("CSQ_BASE_DIR") {
-        return Some(PathBuf::from(override_path));
+        let path = PathBuf::from(&override_path);
+        if override_path.is_empty() || !path.is_absolute() {
+            log::warn!("CSQ_BASE_DIR must be a non-empty absolute path; ignoring override");
+            return None;
+        }
+        return Some(path);
     }
     let home = dirs::home_dir()?;
     Some(home.join(".claude").join("accounts"))
@@ -353,6 +379,43 @@ pub(crate) fn apply_and_persist_dashboard_at_launch(
 /// signal to choose. Account rows are status-only (disabled
 /// `info:` items): swap is a per-terminal action (`csq swap N`
 /// inside the terminal), so the tray offers no swap affordance.
+/// Renders the quota portion of a tray menu row from what the row ACTUALLY
+/// carries.
+///
+/// The previous inline version printed an unconditional `5h:{}%  7d:{}%` from
+/// `unwrap_or(0.0)` defaults, so every DeepSeek slot read `5h:0%  7d:0%` and
+/// every Grok slot fabricated a `5h:0%` beside its real 7d figure. That is the
+/// spurious `5h:0% 7d:0%` an internal ticket set out to kill — the tray never received
+/// the fix the statusline did.
+///
+/// Precedence mirrors the CLI status table: render each window that exists and
+/// elide the ones that do not; a balance with NO window renders as the balance.
+/// Extracted from the menu builder purely so it is testable — the `MenuItem`
+/// construction around it is not.
+fn format_tray_quota(q: Option<&csq_core::quota::AccountQuota>) -> String {
+    let Some(q) = q else {
+        // No row at all: the daemon has not polled this slot yet. Distinct
+        // from "polled, no window" below — this one resolves on its own.
+        return "checking…".to_string();
+    };
+    let windows: Vec<String> = [
+        q.five_hour_pct_opt().map(|p| format!("5h:{p:.0}%")),
+        q.seven_day_pct_opt().map(|p| format!("7d:{p:.0}%")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !windows.is_empty() {
+        windows.join("  ")
+    } else if let Some(b) = q.balance.as_ref() {
+        // No window, but a balance — a genuine pay-per-token slot.
+        csq_core::quota::format::fmt_balance(b)
+    } else {
+        // Polled, but nothing measurable. Never render this as 0%.
+        "no quota data".to_string()
+    }
+}
+
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let mut builder = MenuBuilder::new(app);
 
@@ -362,8 +425,8 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     if let Some(base) = base_dir() {
         if base.is_dir() {
             let accounts = discovery::discover_all(&base);
-            let quota = csq_core::quota::state::load_state(&base)
-                .unwrap_or_else(|_| csq_core::quota::QuotaFile::empty());
+            // an internal ticket: salvage per-row — tray menu is display-only.
+            let quota = csq_core::quota::state::load_state_salvage(&base);
             let mut had_any = false;
             for a in &accounts {
                 if !a.has_credentials {
@@ -371,14 +434,11 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 }
                 had_any = true;
                 let q = quota.get(a.id);
-                let fh = q.map(|q| q.five_hour_pct()).unwrap_or(0.0);
-                let sd = q.map(|q| q.seven_day_pct()).unwrap_or(0.0);
                 let label = format!(
-                    "#{} {}  5h:{:.0}%  7d:{:.0}%",
+                    "#{} {}  {}",
                     a.id,
                     sanitize_label(&a.label),
-                    fh,
-                    sd,
+                    format_tray_quota(q)
                 );
                 // Use "info:" prefix so click handler knows this is status-only
                 let id = format!("info:{}", a.id);
@@ -624,7 +684,8 @@ impl TrayStatus {
 /// developer's machine.
 fn compute_tray_status(base: &Path) -> TrayStatus {
     let accounts = discovery::discover_anthropic(base);
-    let quota: QuotaFile = quota_state::load_state(base).unwrap_or_else(|_| QuotaFile::empty());
+    // an internal ticket: salvage per-row — tray status is display-only.
+    let quota: QuotaFile = quota_state::load_state_salvage(base);
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -671,7 +732,23 @@ fn compute_tray_status(base: &Path) -> TrayStatus {
         }
 
         if let Some(q) = quota.get(info.id) {
-            if q.five_hour_pct() >= 100.0 {
+            // Count a slot as out-of-quota when ANY window it actually has
+            // is exhausted. Testing only `five_hour_pct()` made this
+            // structurally blind to every weekly-only surface: a Grok slot
+            // at 100% of its WEEKLY window has no 5-hour window at all, so
+            // `five_hour_pct()` returned the `unwrap_or(0.0)` default and
+            // the slot was never counted. Fails in the safe direction
+            // (under-reporting), which is exactly why it went unnoticed.
+            //
+            // Balance-only slots contribute nothing here by construction —
+            // both accessors are `None` — which is correct: a pay-per-token
+            // slot is not "out of quota", it is out of credit, and that is
+            // a different signal this counter does not claim to carry.
+            let exhausted = [q.five_hour_pct_opt(), q.seven_day_pct_opt()]
+                .into_iter()
+                .flatten()
+                .any(|p| p >= 100.0);
+            if exhausted {
                 out_of_quota += 1;
             }
         }
@@ -707,6 +784,14 @@ pub(crate) fn community_auto_update_enabled() -> bool {
     crate::BUILD_EDITION != "enterprise"
 }
 
+/// Production probe budget for [`installed_cli_is_enterprise`]. Deliberately
+/// short: the probe gates a CLI-shim refresh at desktop launch and must
+/// never block it behind a wedged/hung binary. Tests MUST NOT depend on
+/// this constant's wall-clock value — they call
+/// [`installed_cli_is_enterprise_within`] with a budget generous enough to
+/// survive host contention (see that function's doc comment).
+const CLI_ENTERPRISE_PROBE_TIMEOUT_SECS: u64 = 3;
+
 /// Best-effort: does the CLI already installed at `cli_path` report the
 /// ENTERPRISE edition? Runs `<cli> --version` with a short timeout — the CLI
 /// prints its edition-suffixed version line (`X.Y.Z (enterprise)`) and exits
@@ -717,6 +802,27 @@ pub(crate) fn community_auto_update_enabled() -> bool {
 /// protected from a community downgrade. The probe thread is detached so a hung
 /// binary can never block launch.
 fn installed_cli_is_enterprise(cli_path: &std::path::Path) -> bool {
+    installed_cli_is_enterprise_within(
+        cli_path,
+        std::time::Duration::from_secs(CLI_ENTERPRISE_PROBE_TIMEOUT_SECS),
+    )
+}
+
+/// [`installed_cli_is_enterprise`], parameterized on the probe's
+/// `recv_timeout` budget. The production entry point above always passes
+/// [`CLI_ENTERPRISE_PROBE_TIMEOUT_SECS`] — that value is a deliberate
+/// launch-latency UX choice and MUST NOT be raised to accommodate tests.
+/// Tests call this function directly with a budget generous enough that
+/// host contention (csq's macOS CI runner is self-hosted and shares the
+/// box with concurrent cargo builds/other agents — see
+/// `discovery_macos_ci_runner_is_self_hosted_local`) cannot produce a false
+/// negative, while still bounding a genuine hang so the suite cannot wedge
+/// forever. Same defect class as an internal ticket: a test must not assert a
+/// wall-clock deadline it never actually exercises.
+fn installed_cli_is_enterprise_within(
+    cli_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> bool {
     use std::process::{Command, Stdio};
     // Reject a SYMLINK target without spawning: `mode::detect` canonicalizes
     // `current_exe()`, so a symlink at the CLI path pointing into
@@ -743,12 +849,25 @@ fn installed_cli_is_enterprise(cli_path: &std::path::Path) -> bool {
             .output();
         let _ = tx.send(out);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+    match rx.recv_timeout(timeout) {
         Ok(Ok(output)) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).contains("(enterprise)")
+            version_output_is_enterprise(&String::from_utf8_lossy(&output.stdout))
         }
         _ => false,
     }
+}
+
+/// Decides whether a `csq --version` stdout names the enterprise edition.
+///
+/// Split out of [`installed_cli_is_enterprise_within`] so the DECISION is
+/// testable without spawning a subprocess or racing any wall-clock budget —
+/// see `version_output_is_enterprise_accepts_and_rejects` below. Ported from
+/// commit `6e646188` (originally landed on the sibling PR fixing this same
+/// flake by a different mechanism; that commit was dropped from its branch
+/// after a cross-PR collision in this file, but this extraction was judged
+/// the one genuinely-good thing to keep and port here).
+fn version_output_is_enterprise(stdout: &str) -> bool {
+    stdout.contains("(enterprise)")
 }
 
 /// Interval between background update checks (30 minutes).
@@ -1096,11 +1215,24 @@ fn augment_subprocess_path() {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn augment_subprocess_path() {}
 
-/// Initialise the `tracing` subscriber (stderr, filtered by `CSQ_LOG`).
+/// Resolves `base_dir` for the logging subscriber's rolling-file layer.
 ///
-/// # Why this is factored out — #1011 / #1010 SIGABRT-on-launch guard
+/// Reuses the same helper the desktop daemon supervisor uses ([`base_dir`]),
+/// falling back to the OS temp directory in the exceedingly rare case where
+/// `$HOME` cannot be resolved — the file layer is best-effort and non-fatal
+/// (`daemon_log::make_writer` returns `None` if directory creation fails),
+/// so a temp-dir fallback merely relocates where that best-effort log lives
+/// rather than writing into an arbitrary process cwd.
+fn resolved_base_dir_for_logging() -> PathBuf {
+    base_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// Initialise the `tracing` subscriber (stderr + rolling-file, filtered by
+/// `CSQ_LOG`).
 ///
-/// The #1010 crash was a `log`-facade collision: when `tracing-subscriber`'s
+/// # Why this is factored out — an internal ticket / an internal ticket SIGABRT-on-launch guard
+///
+/// The an internal ticket crash was a `log`-facade collision: when `tracing-subscriber`'s
 /// `tracing-log` feature is active (pulled in transitively by
 /// `kailash-core → tracing-opentelemetry` on the `native-harness` build),
 /// calling `.try_init()` installs a `LogTracer` as the global `log` logger,
@@ -1111,28 +1243,52 @@ fn augment_subprocess_path() {}
 ///
 /// Factoring the subscriber init here (instead of inlining it in `.setup()`)
 /// lets the self-test path (`CSQ_DESKTOP_SELFTEST=1`) exercise the EXACT same
-/// code that SIGABRTed in #1010, not a stripped-down copy.  If this function
-/// ever regresses back to `try_init()`, the self-test's `log::set_boxed_logger`
-/// probe (see `run()`) returns `Err` and the self-test exits non-zero — the
-/// build gate then fails closed before the SIGABRT can ship.
+/// code that SIGABRTed in an internal ticket, not a stripped-down copy.  If this function
+/// ever regresses back to `try_init()`/`.init()`, the self-test's
+/// `log::set_boxed_logger` probe (see `run()`) returns `Err` and the self-test
+/// exits non-zero — the build gate then fails closed before the SIGABRT can
+/// ship.
 ///
 /// Called from two sites:
 /// - `run()` self-test path (before Tauri builder, exits 0 on success)
 /// - `.setup()` closure (real launch, in the same position as before)
-fn init_logging_subscriber() {
+///
+/// # Rolling-file layer (#1a-2, daemon-auth-resilience Wave A2)
+///
+/// The desktop app ALWAYS hosts the in-process daemon supervisor, so it
+/// ALWAYS gets the persistent rolling-file layer (unlike the CLI, which
+/// only adds it for `csq daemon` — see `cli::run`'s subscriber init).
+/// Non-fatal: `daemon_log::make_writer` returns `None` on a directory-create
+/// failure and the app still runs with only the stderr layer.
+fn init_logging_subscriber(base_dir: &Path) {
     let filter = tracing_subscriber::EnvFilter::try_from_env("CSQ_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .finish();
-    // `set_global_default` — NOT `try_init()`.  See doc comment above.
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let (file_layer, guard) = match crate::daemon_log::make_writer(base_dir) {
+        Some((nb, guard)) => (
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(nb),
+            ),
+            Some(guard),
+        ),
+        None => (None, None),
+    };
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer);
+    // `set_global_default` — NOT `try_init()`/`.init()`.  See doc comment above.
     let _ = tracing::subscriber::set_global_default(subscriber);
+    if let Some(g) = guard {
+        crate::daemon_log::store_guard(g);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // ── Headless self-test mode (#1011) ──────────────────────────────────────
+    // ── Headless self-test mode (an internal ticket) ──────────────────────────────────────
     //
     // When `CSQ_DESKTOP_SELFTEST=1` is set (or `--self-test` is the sole arg),
     // exercise the crash-prone startup surface — logging subscriber bind +
@@ -1142,7 +1298,7 @@ pub fn run() {
     // Design choice: we run `init_logging_subscriber()` standalone rather than
     // driving the full Tauri builder into `.setup()`.  Reasoning:
     //
-    //   • The SIGABRT in #1010 happened at the `set_global_default` /
+    //   • The SIGABRT in an internal ticket happened at the `set_global_default` /
     //     `tauri-plugin-log` registration step — specifically because `try_init()`
     //     had already claimed the `log` facade before `tauri-plugin-log` tried to.
     //     `init_logging_subscriber()` exercises that exact call without the GUI.
@@ -1158,8 +1314,8 @@ pub fn run() {
     //     `init_logging_subscriber()`, the global `log` facade must still be free
     //     (see the regression probe below).
     //
-    // Regression detection (why this CATCHES the #1010 SIGABRT):
-    //   #1010 aborted at `tauri-plugin-log`'s `set_boxed_logger` because a prior
+    // Regression detection (why this CATCHES the an internal ticket SIGABRT):
+    //   an internal ticket aborted at `tauri-plugin-log`'s `set_boxed_logger` because a prior
     //   `try_init()` had installed `LogTracer` as the global `log` logger.  We
     //   cannot reach `tauri-plugin-log` registration headlessly, but we can probe
     //   the precise condition it requires: immediately after
@@ -1177,8 +1333,8 @@ pub fn run() {
         || (argv.len() == 2 && argv[1] == "--self-test");
     if self_test {
         // Run the exact logging init path the real launch runs.
-        init_logging_subscriber();
-        // Probe the #1010 invariant: the global `log` facade must still be
+        init_logging_subscriber(&resolved_base_dir_for_logging());
+        // Probe the an internal ticket invariant: the global `log` facade must still be
         // claimable after our tracing init. A `try_init()` regression installs a
         // LogTracer, so this call would return Err — the same condition that
         // SIGABRTs tauri-plugin-log at startup.
@@ -1194,7 +1350,7 @@ pub fn run() {
             eprintln!(
                 "csq-desktop self-test FAILED: the global `log` facade is already \
                  claimed after init_logging_subscriber() — a try_init() regression \
-                 would SIGABRT tauri-plugin-log at startup (#1010/#1011)."
+                 would SIGABRT tauri-plugin-log at startup (an internal ticket/an internal ticket)."
             );
             std::process::exit(1);
         }
@@ -1285,7 +1441,7 @@ pub fn run() {
             commands::get_capability_layer_toggles,
             commands::set_capability_layer_toggles,
             commands::get_daemon_status,
-            // #793 — M-IC interactive per-turn enforcement console. Thin
+            // an internal ticket — M-IC interactive per-turn enforcement console. Thin
             // wrappers driving the daemon's enterprise-only /api/interactive/*
             // routes; the renderer relays input + displays the redacted verdict,
             // never deciding enforcement itself (R1-S7).
@@ -1296,7 +1452,7 @@ pub fn run() {
             commands::interactive::interactive_close,
             commands::interactive::interactive_options,
             commands::list_providers,
-            // Phase 2 of #389 — the renderer's Claude OAuth path now
+            // Phase 2 of an internal ticket — the renderer's Claude OAuth path now
             // shells out to `claude auth login` via
             // `start_claude_login_subprocess`. The legacy paste-code
             // flow (`begin_claude_login` / `submit_oauth_code` /
@@ -1333,6 +1489,14 @@ pub fn run() {
             commands::gemini_provision_vertex_sa,
             commands::gemini_provision_oauth,
             commands::gemini_switch_model,
+            // Native Kimi/Grok session-surface desktop UI. an internal journal entry C8
+            // redesigned the bind flow to a real per-slot device-code
+            // login (mirroring PR-C8's Codex twin) — the marker-only
+            // `provision_native_cli` (an internal journal entry W3-5) is retired.
+            commands::list_native_clis,
+            commands::start_native_login,
+            commands::complete_native_login,
+            commands::cancel_native_login,
             commands::list_sessions,
             commands::get_autostart_enabled,
             commands::set_autostart_enabled,
@@ -1348,7 +1512,7 @@ pub fn run() {
             // renderers — fills the gap where setup() emits before
             // the WebView mounts and the Svelte listen() registers.
             commands::consume_prefs_recovery,
-            // #787 AC#3 — policy-bundle admin console. Enterprise-only:
+            // an internal ticket AC#3 — policy-bundle admin console. Enterprise-only:
             // the phase2b seam is moat-stripped in the community edition.
             // `generate_handler!` preserves the `#[cfg]` attribute on the
             // match arm, so these entries are absent from the community
@@ -1362,6 +1526,14 @@ pub fn run() {
             commands::policy::policy_create_unsigned,
             #[cfg(feature = "enterprise")]
             commands::policy::policy_keygen,
+            // an internal ticket PR-2 — cloud-Claude (Vertex/Bedrock) desktop provisioning.
+            // Enterprise-only: `bind_cloud_claude_backend_to_slot` is
+            // `#[cfg(feature = "enterprise")]`, so these arms are absent from
+            // the community build's match statement (same pattern as policy::*).
+            #[cfg(feature = "enterprise")]
+            commands::cloud_claude_provision_vertex,
+            #[cfg(feature = "enterprise")]
+            commands::cloud_claude_provision_bedrock,
         ])
         .setup(|app| {
             // ── Logging ────────────────────────────────────────
@@ -1382,8 +1554,13 @@ pub fn run() {
             // for the full explanation of why `set_global_default` is used instead
             // of `try_init()`. The self-test path (`CSQ_DESKTOP_SELFTEST=1`) calls
             // the same function so any regression here is caught by the build gate
-            // added in #1011.
-            init_logging_subscriber();
+            // added in an internal ticket.
+            //
+            // #1a-2 — resolve base_dir via the same helper the daemon supervisor
+            // uses so the rolling-file log layer lands in the same
+            // `csq-runs/.daemon-log/` directory the supervisor's spawned
+            // `log_gc` task GCs.
+            init_logging_subscriber(&resolved_base_dir_for_logging());
 
             // ── CLI shim refresh (#1) ──────────────────────────
             //
@@ -1451,6 +1628,60 @@ pub fn run() {
                 _ => tracing::warn!(
                     "cli shim refresh skipped: could not resolve current exe or target"
                 ),
+            }
+
+            // ── Managed background daemon plist (Wave B) ────────
+            //
+            // Install / repair the launchd-managed daemon plist AFTER the
+            // shim refresh, so its `ProgramArguments[0]` (the shim,
+            // resolved by `resolve_managed_daemon_exe`) points at a
+            // freshly-copied real-file `~/.local/bin/csq`. The managed
+            // daemon (`csq daemon start --supervised` under
+            // `KeepAlive={SuccessfulExit:false}`) keeps the token refresher
+            // alive whether or not this desktop app is open — the
+            // structural fix for the mass-token-expiry incident
+            // (daemon-auth-resilience an internal journal entry). Best-effort +
+            // NON-FATAL: a launchctl hiccup must never block launch. The
+            // in-process supervisor above is the cohabiting backup; the
+            // PidFile guard ensures exactly one owner.
+            //
+            // macOS only — Linux's systemd unit already auto-restarts
+            // (`Restart=on-failure`) and has no bundle-misdetection issue.
+            //
+            // Edition coherence: NEVER launchd-manage a daemon of a
+            // different edition than this app. The shim-refresh above
+            // refuses to downgrade an enterprise CLI to community, so a
+            // COMMUNITY app on a box with an enterprise `~/.local/bin/csq`
+            // leaves the shim enterprise — and a plist pointing at it would
+            // run the enterprise daemon whose license gate refuses → no
+            // refresh → Wave B silently defeated on exactly that
+            // mixed-edition (maintainer dev-box) machine. Skip the install
+            // in that case, mirroring the shim-refresh downgrade guard.
+            #[cfg(target_os = "macos")]
+            {
+                let target = csq_core::cli_deps::cli_shim::resolve_shim_target();
+                let edition_incoherent = crate::BUILD_EDITION == "community"
+                    && target
+                        .as_ref()
+                        .is_some_and(|t| installed_cli_is_enterprise(t));
+                if edition_incoherent {
+                    tracing::warn!(
+                        "managed daemon plist SKIPPED: installed CLI is enterprise \
+                         but this is a community app; refusing to launchd-manage a \
+                         mismatched-edition daemon. Reinstall a coherent edition to \
+                         enable the always-on managed daemon."
+                    );
+                } else {
+                    match crate::cli::commands::daemon::ensure_managed_daemon_plist() {
+                        Ok(outcome) => {
+                            tracing::info!(?outcome, "managed daemon plist ensured")
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "managed daemon plist install/repair failed (non-fatal)"
+                        ),
+                    }
+                }
             }
             });
 
@@ -1520,6 +1751,7 @@ pub fn run() {
                 update_cache: Mutex::new(None),
                 ollama_pull_child: Arc::new(Mutex::new(None)),
                 codex_login_child: Arc::new(Mutex::new(None)),
+                native_login_children: Arc::new(Mutex::new(HashMap::new())),
                 desktop_prefs_lock: Arc::new(PrefsLock::new()),
                 prefs_recovery: Mutex::new(None),
             });
@@ -1769,6 +2001,86 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    // ── tray quota label: an absent window is not 0% ──────────────────────
+
+    fn tray_row(
+        five: Option<f64>,
+        seven: Option<f64>,
+        balance: Option<f64>,
+    ) -> csq_core::quota::AccountQuota {
+        use csq_core::quota::{AccountQuota, BalanceInfo, UsageWindow};
+        AccountQuota {
+            five_hour: five.map(|p| UsageWindow {
+                used_percentage: p,
+                // 4_102_444_800 = 2100-01-01 (testing.md Rule 1). MUST stay far-future:
+                // this fixture round-trips through the loader, whose `clear_expired`
+                // NULLS a past window — the row then falls back to `balance` and the
+                // assertions below invert. A near-future literal here detonated on
+                // 2026-08-07T11:12:35Z and reddened every PR in flight.
+                resets_at: 4_102_444_800,
+            }),
+            seven_day: seven.map(|p| UsageWindow {
+                used_percentage: p,
+                resets_at: 4_102_444_800,
+            }),
+            balance: balance.map(|remaining| BalanceInfo {
+                currency: "USD".to_string(),
+                remaining,
+            }),
+            ..AccountQuota::default()
+        }
+    }
+
+    /// A balance-metered slot (DeepSeek) has no usage window at all. The tray
+    /// rendered `5h:0%  7d:0%` for it — two fabricated measurements.
+    #[test]
+    fn tray_quota_balance_only_slot_renders_the_balance_not_two_zeroes() {
+        let q = tray_row(None, None, Some(165.32));
+        let s = format_tray_quota(Some(&q));
+        assert_eq!(s, "$165.32");
+        assert!(!s.contains("5h:"), "must not fabricate a 5h window: {s}");
+        assert!(!s.contains("7d:"), "must not fabricate a 7d window: {s}");
+    }
+
+    /// The grok-16 shape: a real weekly window plus a `$0.00` on-demand
+    /// allowance. The 5h window does not exist, so it must be elided rather
+    /// than printed as `5h:0%` beside the genuine 7d figure — and the window
+    /// beats the balance.
+    #[test]
+    fn tray_quota_weekly_only_slot_elides_the_absent_five_hour_window() {
+        let q = tray_row(None, Some(7.0), Some(0.0));
+        let s = format_tray_quota(Some(&q));
+        assert_eq!(s, "7d:7%");
+        assert!(!s.contains("5h:"), "absent 5h must be elided, not 0%: {s}");
+        assert!(!s.contains('$'), "a window beats a balance: {s}");
+    }
+
+    /// The ordinary Anthropic shape must be unchanged by the fix.
+    #[test]
+    fn tray_quota_both_windows_render_as_before() {
+        let q = tray_row(Some(12.0), Some(55.0), None);
+        assert_eq!(format_tray_quota(Some(&q)), "5h:12%  7d:55%");
+    }
+
+    /// A measured 0% is a REAL reading and must still render as `0%` — the
+    /// fix must not suppress genuine zeroes along with fabricated ones.
+    /// This is the assertion that stops "elide absent windows" from
+    /// degenerating into "elide anything that looks like zero".
+    #[test]
+    fn tray_quota_measured_zero_is_still_rendered() {
+        let q = tray_row(Some(0.0), Some(0.0), None);
+        assert_eq!(format_tray_quota(Some(&q)), "5h:0%  7d:0%");
+    }
+
+    /// No row yet vs. a polled row with nothing measurable are different
+    /// states and must read differently: the first resolves on its own.
+    #[test]
+    fn tray_quota_distinguishes_unpolled_from_unmeasurable() {
+        assert_eq!(format_tray_quota(None), "checking…");
+        let q = tray_row(None, None, None);
+        assert_eq!(format_tray_quota(Some(&q)), "no quota data");
+    }
+
     // ── edition-gated auto-update (edition independence) ─────
 
     // Concrete per-edition assertions (not a tautology against the definition):
@@ -1799,17 +2111,78 @@ mod tests {
         path
     }
 
+    /// Deterministic coverage of the actual decision — no subprocess, no
+    /// wall-clock budget. The spawn-based tests below exercise the plumbing;
+    /// THIS is what pins the predicate, so a contended CI runner can no
+    /// longer turn a string check into a failure. Ported from commit
+    /// `6e646188` (see `version_output_is_enterprise`'s doc comment).
+    #[test]
+    fn version_output_is_enterprise_accepts_and_rejects() {
+        // Accept boundary — the real shape `csq --version` prints.
+        assert!(version_output_is_enterprise("csq 2.18.0 (enterprise)"));
+        assert!(version_output_is_enterprise("csq 2.18.0 (enterprise)\n"));
+        // Reject boundary — community is the OTHER shipped edition, and the
+        // whole point of the probe is telling the two apart.
+        assert!(!version_output_is_enterprise("csq 2.18.0 (community)"));
+        assert!(!version_output_is_enterprise(""));
+        assert!(!version_output_is_enterprise("csq 2.18.0"));
+        // Near-misses: the marker is parenthesised and lowercase by
+        // construction; neither variant should be accepted.
+        assert!(!version_output_is_enterprise("csq 2.18.0 enterprise"));
+        assert!(!version_output_is_enterprise("csq 2.18.0 (Enterprise)"));
+    }
+
+    /// Test-only probe budget for [`installed_cli_is_enterprise_within`].
+    /// csq's macOS CI runner is self-hosted and shares the host with
+    /// concurrent cargo builds / other agents, so the production 3s budget
+    /// ([`CLI_ENTERPRISE_PROBE_TIMEOUT_SECS`]) is NOT safe to assert against
+    /// under test — a fork/exec of `/bin/sh` can transiently take >3s under
+    /// contention with no defect in the code under test. Reproduced directly:
+    /// `installed_cli_is_enterprise_detects_enterprise_suffix` failed with
+    /// `finished in 3.08s` (the exact production timeout) while its two
+    /// sibling tests in the same run passed — the assertion is timeout-bound,
+    /// not code-bound. 60s is generous enough to absorb that contention while
+    /// still bounding a genuine hang so the suite cannot wedge forever.
+    #[cfg(unix)]
+    const TEST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // Workspace-local serial mutex, same pattern as
+    // `csq/tests/cli_deps_doctor_integration.rs::SERIAL` (an internal ticket, journal
+    // `internal-design-docs`).
+    // That integration-test binary's static is NOT reachable here — `csq/tests/*.rs`
+    // integration tests compile as separate binaries from `csq/src/**`'s own
+    // `#[cfg(test)]` unittest harness — so this is a second, local instance of the
+    // same pattern, not a shared import. Two independent defenses stack:
+    // (1) this mutex removes INTRA-BINARY contention (no two of the three tests
+    // below spawn `/bin/sh` at the same instant); (2) the generous
+    // `TEST_PROBE_TIMEOUT` above absorbs CROSS-PROCESS contention the mutex
+    // cannot touch (csq's macOS CI runner is self-hosted and shares the box
+    // with concurrent cargo builds / other agents' sessions, per
+    // `discovery_macos_ci_runner_is_self_hosted_local` — serializing this
+    // binary's own three tests does nothing about a sibling process eating
+    // every core). Neither layer alone is sufficient.
+    #[cfg(unix)]
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[test]
     fn installed_cli_is_enterprise_detects_enterprise_suffix() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+            SERIAL.clear_poison();
+            p.into_inner()
+        });
         let dir = TempDir::new().unwrap();
         let cli = write_fake_cli(dir.path(), "csq-ent", "csq 2.17.0 (enterprise)");
-        assert!(installed_cli_is_enterprise(&cli));
+        assert!(installed_cli_is_enterprise_within(&cli, TEST_PROBE_TIMEOUT));
     }
 
     #[cfg(unix)]
     #[test]
     fn installed_cli_is_enterprise_rejects_symlink() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+            SERIAL.clear_poison();
+            p.into_inner()
+        });
         // sec-M1: a symlink target (even one pointing at a real enterprise CLI)
         // must be rejected without spawning — `mode::detect` would canonicalize
         // it into the .app and launch Desktop mode. Fail-open (false) so
@@ -1819,7 +2192,7 @@ mod tests {
         let link = dir.path().join("csq-link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(
-            !installed_cli_is_enterprise(&link),
+            !installed_cli_is_enterprise_within(&link, TEST_PROBE_TIMEOUT),
             "a symlink target must be rejected (never probed)"
         );
     }
@@ -1827,15 +2200,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn installed_cli_is_enterprise_false_for_community_and_missing() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+            SERIAL.clear_poison();
+            p.into_inner()
+        });
         let dir = TempDir::new().unwrap();
         let community = write_fake_cli(dir.path(), "csq-comm", "csq 2.17.0 (community)");
         assert!(
-            !installed_cli_is_enterprise(&community),
+            !installed_cli_is_enterprise_within(&community, TEST_PROBE_TIMEOUT),
             "community CLI must not be flagged enterprise"
         );
         // Missing binary → false (shim refresh proceeds).
-        assert!(!installed_cli_is_enterprise(
-            &dir.path().join("does-not-exist")
+        assert!(!installed_cli_is_enterprise_within(
+            &dir.path().join("does-not-exist"),
+            TEST_PROBE_TIMEOUT
         ));
     }
 

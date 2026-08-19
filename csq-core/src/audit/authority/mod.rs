@@ -73,7 +73,9 @@
 //! defended boundary because (a) the roster is org-root-signed, so an FS-write
 //! attacker cannot forge a valid replacement; (b) rollback additionally
 //! requires a compromised revoked member key; (c) the FS-based floor catches
-//! naive rollback. Keychain-anchoring the floor is tracked in an internal ticket.
+//! naive rollback. Keychain-anchoring the floor is tracked in an internal ticket
+//! (was an internal ticket, a 3-item hardening backlog closed with no successor for this
+//! item — re-pointed 2026-08-12; see `scripts/verify/todo-closed-issue.sh`).
 //!
 //! # LDAP/AD source
 //!

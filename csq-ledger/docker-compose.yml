@@ -25,6 +25,14 @@ services:
     container_name: csq-ledger
     restart: unless-stopped
     ports:
+      # Only the read/write listener is published. The authority listener
+      # (revoke, verifier-bootstraps) binds 127.0.0.1:8081 by default and is
+      # NOT reachable from the host even if published — a loopback bind
+      # inside a container is only reachable from within that container's own
+      # network namespace. Use `docker exec` to reach it, or explicitly set
+      # CSQ_LEDGER_AUTHORITY_BIND=0.0.0.0 + publish "8081:8081" if you need
+      # host/external access, and put your own network control in front of
+      # it. See docs/audit-sinks/csq-ledger.md § "Two listeners".
       - "8080:8080"
     volumes:
       # The append-only log + signing key live here. For WORM enforcement,

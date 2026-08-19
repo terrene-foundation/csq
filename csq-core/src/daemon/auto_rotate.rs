@@ -247,7 +247,21 @@ pub fn tick(
         // VP-final F2: canonicalize the handle_dir path so symlinked base_dirs
         // (e.g. /var/folders/... vs /private/var/folders/... on macOS) don't
         // produce two independent cooldown keys for the same physical directory.
-        let handle_dir = std::fs::canonicalize(&handle_dir).unwrap_or(handle_dir);
+        //
+        // Security review 1386 M4 (sibling instance — found auditing an internal ticket's
+        // three named writer sites): this same canonicalize ALSO feeds the
+        // keychain clear (`clear_handle_dir`) and mirror
+        // (`sync_handle_dir_account_changed`) further down this loop body. A
+        // canonicalize failure must NOT feed those — `service_name` hashes
+        // whatever string it is given, so a clear/write under the
+        // non-canonical fallback lands on a DIFFERENT service name than the
+        // one CC uses (and than `logout`/the reaper, which both refuse this
+        // same fallback, will ever look up) — a permanent orphan holding a
+        // real OAuth token. `canonicalize_for_keychain_sync` returns the
+        // usual fallback for cooldown-key / repoint purposes, paired with
+        // whether the keychain calls below may run.
+        let (handle_dir, handle_dir_is_canonical) =
+            crate::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
 
         // Only consider term-* directories (handle dirs).
         let name = match handle_dir.file_name().and_then(|n| n.to_str()) {
@@ -263,8 +277,17 @@ pub fn tick(
 
         // Read which account this handle dir is currently bound to.
         // The symlink `term-<pid>/.csq-account` → `config-<current>/.csq-account`
-        // resolves to the current account's canonical marker.
-        let current_account = match markers::read_csq_account(&handle_dir) {
+        // resolves to the current account's canonical marker. M4-7 (an internal ticket
+        // Phase 4): the marker's CONTENT is a UUID whenever a `by_slot` mapping
+        // exists, so this MUST resolve through `resolve_marker_to_slot` (which
+        // accepts both numeric and UUID content) rather than the numeric-only
+        // `read_csq_account` — the latter silently returned `None` for every
+        // handle dir bound to a modern slot, making the rotator a structural
+        // no-op (`guard-reader-writer-parity.md`). Failing closed (skip) on an
+        // unresolvable marker is unchanged and correct — an unresolvable marker
+        // means we don't know what account this dir is bound to, so we must
+        // not act on it.
+        let current_account = match markers::resolve_marker_to_slot(base_dir, &handle_dir) {
             Some(a) => a,
             None => {
                 debug!(dir = %handle_dir.display(), "auto-rotation: no .csq-account marker in handle dir, skipping");
@@ -379,11 +402,27 @@ pub fn tick(
         // account's token; after a successful repoint, write the new account's token
         // via the account-changed path (which bypasses the newer-than guard —
         // Write, or ClearStale-delete when the new account has no valid token).
+        if !handle_dir_is_canonical {
+            warn!(
+                error_kind = "keychain_sync_canonicalize_failed",
+                dir = %handle_dir.display(),
+                account = current_account.get(),
+                "auto-rotation: could not canonicalize this handle dir's path \
+                 — keychain clear/mirror skipped for this rotation (non-fatal \
+                 — the repoint itself still proceeds; CC falls back to the \
+                 symlinked .credentials.json)"
+            );
+        }
         let _rebind_guard = crate::credentials::keychain::lock_handle_dir_for_swap(&handle_dir);
-        crate::credentials::keychain::clear_handle_dir(&handle_dir);
+        if handle_dir_is_canonical {
+            crate::credentials::keychain::clear_handle_dir(&handle_dir);
+        }
         match repoint_handle_dir(base_dir, claude_home, &handle_dir, target) {
             Ok(()) => {
-                let _ = crate::credentials::keychain::sync_handle_dir_account_changed(&handle_dir);
+                if handle_dir_is_canonical {
+                    let _ =
+                        crate::credentials::keychain::sync_handle_dir_account_changed(&handle_dir);
+                }
                 info!(
                     dir = %handle_dir.display(),
                     from = current_account.get(),
@@ -606,7 +645,7 @@ mod tests {
     use crate::credentials::{
         self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
     };
-    use crate::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+    use crate::quota::{state as quota_state, AccountQuota, UsageWindow};
     use crate::rotation::config::{save as save_rotation_config, RotationConfig};
     use crate::session::handle_dir::create_handle_dir;
     use crate::types::{AccessToken, AccountNum, RefreshToken};
@@ -663,7 +702,7 @@ mod tests {
     }
 
     fn setup_quota(base: &Path, account: u16, five_hour_pct: f64) {
-        let mut quota = quota_state::load_state(base).unwrap_or_else(|_| QuotaFile::empty());
+        let mut quota = quota_state::load_state_salvage(base);
         quota.set(
             account,
             AccountQuota {
@@ -754,6 +793,70 @@ mod tests {
     }
 
     // ── adapted existing tests ────────────────────────────────────────────
+
+    /// Creates `config-<account>/` with a UUID-content `.csq-account` marker
+    /// (the M4-7 writer shape — `markers::write_csq_account`) instead of the
+    /// legacy decimal `setup_config_dir` writes. Provisions the same
+    /// `by_slot[account]` mapping `setup_slot_uuid` writes via the shared
+    /// `write_uuid_account_marker` fixture helper
+    /// (`guard-reader-writer-parity.md`).
+    fn setup_config_dir_uuid(base: &Path, account: u16) -> PathBuf {
+        let config_dir = base.join(format!("config-{account}"));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        crate::testing::identity_fixtures::write_uuid_account_marker(base, &config_dir, account);
+        config_dir
+    }
+
+    /// M4-7 regression (`guard-reader-writer-parity.md`): production
+    /// `.csq-account` markers are UUID content whenever a `by_slot` mapping
+    /// exists (`markers::write_csq_account`, written by `csq run` /
+    /// `finalize_login`) — NOT the legacy decimal content every other
+    /// fixture in this suite writes via `setup_config_dir`. Before the fix,
+    /// `tick` read the marker with `markers::read_csq_account` (numeric-only)
+    /// and silently skipped every handle dir bound to a modern (UUID-marker)
+    /// slot, making auto-rotation a structural no-op on any host that had
+    /// ever run `csq run` post-M4-7.
+    #[test]
+    fn tick_resolves_uuid_marker_and_rotates() {
+        // Arrange: account 1 at 97% (above threshold), account 2 the better
+        // candidate. BOTH slots get UUID-content markers — the shape a
+        // modern install actually has on disk.
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
+        setup_quota(dir.path(), 1, 97.0);
+        setup_quota(dir.path(), 2, 10.0);
+        setup_config_dir_uuid(dir.path(), 1);
+        setup_config_dir_uuid(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10099, 1);
+
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        // Act
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        // Assert: handle dir repointed to account 2. Read via the same
+        // UUID-tolerant resolver `tick` itself now uses, so the assertion
+        // doesn't silently pass by re-using the narrow reader under test.
+        assert_eq!(
+            markers::resolve_marker_to_slot(dir.path(), &handle_dir),
+            Some(AccountNum::try_from(2u16).unwrap()),
+            "tick must resolve a UUID .csq-account marker and rotate — \
+             before the fix this handle dir was silently skipped"
+        );
+        let canonical_handle = std::fs::canonicalize(&handle_dir).unwrap_or(handle_dir.clone());
+        assert!(
+            cooldowns.contains_key(&canonical_handle),
+            "cooldown entry should be set for the handle dir on a UUID-marker rotation"
+        );
+    }
 
     #[test]
     fn tick_disabled_config_no_swaps() {

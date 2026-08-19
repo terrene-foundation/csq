@@ -36,8 +36,9 @@
 //! to the existing bail. No registry query is needed; the range constraint
 //! is enforced server-side by npm during package resolution.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -62,10 +63,17 @@ const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// gate formats its own user-facing messages.
 #[derive(Debug, Error)]
 pub enum UpdateError {
-    /// No upgrade command is defined for the `(cli, manager)` pair.
-    /// Occurs for `ClaudeNativeInstaller` and `Unknown` managers, and
-    /// for Brew-installed CLIs when no brew upgrade path exists.
-    #[error("no_auto_update_command: no upgrade command defined for this install manager")]
+    /// No auto-runnable upgrade could be dispatched. Occurs when:
+    /// - no upgrade command is defined for the `(cli, manager)` pair
+    ///   (`ClaudeNativeInstaller` / `Unknown` managers, or Brew CLIs with no
+    ///   brew upgrade path); OR
+    /// - an upgrade command IS defined but its program (a self-managed CLI
+    ///   binary such as `kimi`/`grok`) could not be resolved on disk via
+    ///   `find_in_path` — the binary is absent, so there is nothing to update.
+    ///
+    /// Both collapse to the same gate disposition (skip auto-update, fall
+    /// through to the existing bail), so they share one variant.
+    #[error("no_auto_update_command: no runnable upgrade command for this install manager")]
     NoCommand,
 
     /// `npm` was not found on PATH.
@@ -90,6 +98,117 @@ pub fn auto_update_enabled(no_auto_update_cli_flag: bool) -> bool {
     }
     // Env var opt-out: CSQ_NO_AUTO_UPDATE_CLI=1
     std::env::var("CSQ_NO_AUTO_UPDATE_CLI").as_deref() != Ok("1")
+}
+
+// ── Track-latest opt-in mode ──────────────────────────────────────────────
+//
+// The default auto-update gate is *floor-guarded*: it fires only when the
+// probe returns `Outdated` (binary below csq's `min_version`). A binary that
+// probes `Ok` (>= floor) is left alone — even when a newer release exists.
+//
+// Track-latest is an OPT-IN mode (default OFF, opposite polarity from
+// `auto_update_enabled`) that keeps the managed CLIs at the ABSOLUTE latest
+// release *within the supported major*. It reuses the exact same
+// `run_auto_update` path — the `upgrade_command` table is range-pinned
+// (`@pkg@>=M.m.p <N.0.0`), so `npm install -g` resolves the newest release
+// inside the supported range and never crosses a major boundary. A true
+// cross-major `@latest` would require a `min_version` bump per the 1.0-bump
+// policy (spec/13 §7) and is intentionally NOT what this mode does.
+//
+// Because running an npm install on every `csq run`/`csq login` would be
+// slow, the attempt is throttled to at most once per CLI per throttle
+// window via a per-CLI stamp file under the csq base dir.
+
+/// Throttle window for track-latest: attempt an upgrade at most once per CLI
+/// per 24h. Prevents every `csq run` from paying an npm-install round-trip.
+const TRACK_LATEST_THROTTLE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Self-heal threshold for a future-dated stamp. An ordinary forward clock
+/// skew (up to 30 days ahead) is absorbed as "not due" (don't hammer npm on
+/// minor jitter), but a stamp dated ABSURDLY far ahead — a one-time forward
+/// clock jump that was later corrected — would otherwise disable track-latest
+/// until real time catches up. Beyond this threshold the stamp is treated as
+/// corrupt → due, so the feature self-heals.
+const TRACK_LATEST_MAX_FUTURE_SKEW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Returns `true` when track-latest mode is enabled.
+///
+/// `track_latest_flag` is `true` when the operator passed `--track-latest`
+/// on the command line. Track-latest is ALSO enabled by the environment
+/// variable `CSQ_TRACK_LATEST=1`. Default: **OFF** (floor-guard is the safe
+/// default; track-latest is explicit opt-in).
+pub fn track_latest_enabled(track_latest_flag: bool) -> bool {
+    if track_latest_flag {
+        return true;
+    }
+    std::env::var("CSQ_TRACK_LATEST").as_deref() == Ok("1")
+}
+
+/// Per-CLI stamp file recording the last track-latest attempt time.
+///
+/// Lives beside the other csq per-slot/per-cli state under the base dir. The
+/// stamp is non-secret (a unix-seconds integer), so a plain write is fine —
+/// no atomic-replace / `secure_file` needed (security.md §5a scopes those to
+/// secret-bearing tmp files).
+fn track_latest_stamp_path(base_dir: &Path, cli: SurfaceCli) -> PathBuf {
+    base_dir.join(format!(
+        ".track-latest-{}.stamp",
+        super::minimum::binary_name(cli)
+    ))
+}
+
+/// Returns `true` when a track-latest attempt is due for `cli` — i.e. no
+/// attempt has been recorded within `TRACK_LATEST_THROTTLE` of `now`.
+///
+/// `now` is injected (csq-core has no ambient clock — pass
+/// `SystemTime::now()` in production, a fixed instant in tests). Missing or
+/// corrupt stamp ⇒ due. A stamp modestly in the future (ordinary clock skew,
+/// ≤ `TRACK_LATEST_MAX_FUTURE_SKEW`) ⇒ NOT due (conservative: don't hammer npm
+/// if the clock moved backwards). A stamp ABSURDLY in the future (a corrected
+/// one-time forward jump) ⇒ due (self-heal, so the feature doesn't stay off
+/// for years).
+pub fn track_latest_due(base_dir: &Path, cli: SurfaceCli, now: SystemTime) -> bool {
+    let path = track_latest_stamp_path(base_dir, cli);
+    let last_secs: u64 = match std::fs::read_to_string(&path) {
+        Ok(s) => match s.trim().parse() {
+            Ok(v) => v,
+            Err(_) => return true, // corrupt stamp → re-stamp on this run
+        },
+        Err(_) => return true, // no stamp → due
+    };
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Absurd future stamp (> now + 30d) → self-heal to due (LOW-4).
+    if last_secs > now_secs.saturating_add(TRACK_LATEST_MAX_FUTURE_SKEW.as_secs()) {
+        return true;
+    }
+    // now < last (ordinary skew, ≤ 30d): saturating_sub → 0 < throttle → NOT due.
+    now_secs.saturating_sub(last_secs) >= TRACK_LATEST_THROTTLE.as_secs()
+}
+
+/// Returns `true` when a runnable upgrade command exists for `(cli, manager)`.
+///
+/// Used by track-latest's `maybe_track_latest` to avoid printing a
+/// "checking for a newer…" line (and burning a stamp) for managers with no
+/// npm/native upgrade path (`ClaudeNativeInstaller` / `Unknown`), where the
+/// attempt would be an immediate `NoCommand` no-op.
+pub fn has_upgrade_command(cli: SurfaceCli, manager: InstallManager) -> bool {
+    upgrade_command(cli, manager).is_some()
+}
+
+/// Record a track-latest attempt for `cli` by writing `now` (unix seconds)
+/// to the stamp file. Best-effort — a failed write just means the next
+/// invocation re-attempts (no throttle), which is acceptable for a
+/// convenience feature. `now` is injected for testability.
+pub fn record_track_latest_attempt(base_dir: &Path, cli: SurfaceCli, now: SystemTime) {
+    let path = track_latest_stamp_path(base_dir, cli);
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(&path, now_secs.to_string());
 }
 
 /// Returns `true` when `npm` is available on PATH.
@@ -143,10 +262,27 @@ pub fn run_auto_update(cli: SurfaceCli, manager: InstallManager) -> Result<(), U
         return Err(UpdateError::NpmMissing);
     }
 
+    // For self-managed CLIs (`kimi upgrade` / `grok update`) the program is the
+    // CLI's own binary, which may live outside a minimal PATH (spec/13 §5
+    // known-location fallback). Resolve it to a full path so the spawn does not
+    // fail with ENOENT; if it cannot be resolved the binary is genuinely absent
+    // and there is nothing to update.
+    let resolved_program: std::path::PathBuf = if program == "npm" || program == "brew" {
+        std::path::PathBuf::from(program)
+    } else {
+        match super::install_path::find_in_path(program) {
+            Some(p) => p,
+            // An upgrade command was defined but the self-managed binary is not
+            // resolvable on disk → nothing to update. Same gate disposition as
+            // "no command defined", so we reuse NoCommand (see its doc comment).
+            None => return Err(UpdateError::NoCommand),
+        }
+    };
+
     // Build the subprocess with:
     // - DA-H2: stdin(Stdio::null()) to prevent npm prompts deadlocking
     // - SR-H1: env_clear() + allowlist to prevent secrets leaking to npm scripts
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(&resolved_program);
     cmd.args(&cmd_parts[1..]);
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     // DA-H2: prevent npm prompts from deadlocking by closing stdin
@@ -220,6 +356,11 @@ pub fn reprobe_after_update(cli: SurfaceCli) -> CliStatus {
 /// hardcoded `upgrade_command` table; no operator-supplied input reaches
 /// the returned string, so no path redaction is required.
 pub fn display_package_name(cli: SurfaceCli, manager: InstallManager) -> String {
+    // Self-managed CLIs have no package: `upgrade_command`'s last token is the
+    // subcommand (`upgrade`/`update`), not a package name. Display the CLI name.
+    if manager == InstallManager::SelfManaged {
+        return super::minimum::binary_name(cli).to_string();
+    }
     if let Some(parts) = upgrade_command(cli, manager) {
         // Last argument of the upgrade_command is always the package spec.
         if let Some(pkg) = parts.last() {
@@ -245,6 +386,7 @@ pub fn display_package_name(cli: SurfaceCli, manager: InstallManager) -> String 
         SurfaceCli::Claude => CLAUDE_NPM_PACKAGE.to_string(),
         SurfaceCli::Codex => CODEX_NPM_PACKAGE.to_string(),
         SurfaceCli::Gemini => GEMINI_NPM_PACKAGE.to_string(),
+        SurfaceCli::Kimi | SurfaceCli::Grok => super::minimum::binary_name(cli).to_string(),
         _ => "unknown-cli-package".to_string(),
     }
 }
@@ -259,9 +401,13 @@ pub fn display_package_name(cli: SurfaceCli, manager: InstallManager) -> String 
 /// so that copy-pasted commands from error messages remain range-pinned and
 /// do not default to `@latest`.
 pub fn display_full_package_spec(cli: SurfaceCli, manager: InstallManager) -> String {
-    if let Some(parts) = upgrade_command(cli, manager) {
-        if let Some(pkg) = parts.last() {
-            return pkg.clone();
+    // Self-managed CLIs have no package spec — the last argv token is the
+    // subcommand, not a package. Fall through to the CLI-name display.
+    if manager != InstallManager::SelfManaged {
+        if let Some(parts) = upgrade_command(cli, manager) {
+            if let Some(pkg) = parts.last() {
+                return pkg.clone();
+            }
         }
     }
     // Fallback: bare package name (IR-L3 constants).
@@ -283,6 +429,135 @@ mod tests {
         assert!(
             !auto_update_enabled(true),
             "CLI flag should disable auto-update"
+        );
+    }
+
+    // ── track-latest: enable check + throttle ─────────────────────────────────
+
+    /// The `--track-latest` flag enables the mode regardless of env.
+    #[test]
+    fn track_latest_enabled_by_flag() {
+        assert!(
+            track_latest_enabled(true),
+            "flag=true must enable track-latest"
+        );
+    }
+
+    /// Default is OFF: no flag + no env → disabled (opposite polarity from
+    /// auto-update, which is ON by default).
+    #[test]
+    fn track_latest_disabled_by_default() {
+        let _env_guard = crate::platform::test_env::lock();
+        unsafe { std::env::remove_var("CSQ_TRACK_LATEST") };
+        assert!(
+            !track_latest_enabled(false),
+            "no flag + no env must leave track-latest OFF"
+        );
+    }
+
+    /// `CSQ_TRACK_LATEST=1` enables track-latest without the flag.
+    #[test]
+    fn track_latest_enabled_by_env() {
+        let _env_guard = crate::platform::test_env::lock();
+        unsafe { std::env::set_var("CSQ_TRACK_LATEST", "1") };
+        let enabled = track_latest_enabled(false);
+        unsafe { std::env::remove_var("CSQ_TRACK_LATEST") };
+        assert!(enabled, "CSQ_TRACK_LATEST=1 must enable track-latest");
+    }
+
+    /// No stamp file → attempt is due.
+    #[test]
+    fn track_latest_due_when_no_stamp() {
+        let base = tempfile::TempDir::new().unwrap();
+        assert!(
+            track_latest_due(base.path(), SurfaceCli::Codex, SystemTime::now()),
+            "missing stamp must read as due"
+        );
+    }
+
+    /// A stamp recorded `now` makes a check at `now` NOT due (within window);
+    /// a check `now + throttle` IS due again (record→due roundtrip).
+    #[test]
+    fn track_latest_throttle_roundtrip() {
+        let base = tempfile::TempDir::new().unwrap();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        record_track_latest_attempt(base.path(), SurfaceCli::Codex, t0);
+
+        // Same instant → not due (attempt just recorded).
+        assert!(
+            !track_latest_due(base.path(), SurfaceCli::Codex, t0),
+            "an attempt just recorded must not be due again immediately"
+        );
+        // One second before the window elapses → still not due.
+        let almost = t0 + TRACK_LATEST_THROTTLE - Duration::from_secs(1);
+        assert!(
+            !track_latest_due(base.path(), SurfaceCli::Codex, almost),
+            "still within throttle window must not be due"
+        );
+        // Exactly one window later → due again.
+        let after = t0 + TRACK_LATEST_THROTTLE;
+        assert!(
+            track_latest_due(base.path(), SurfaceCli::Codex, after),
+            "a full throttle window later must be due again"
+        );
+    }
+
+    /// A stamp dated MODESTLY in the future (ordinary clock skew, ≤ 30d)
+    /// reads as NOT due — conservative: don't hammer npm on minor jitter.
+    #[test]
+    fn track_latest_ordinary_future_skew_is_not_due() {
+        let base = tempfile::TempDir::new().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        // 1 hour ahead — ordinary skew, within the 30d self-heal threshold.
+        let future = now + Duration::from_secs(3600);
+        record_track_latest_attempt(base.path(), SurfaceCli::Codex, future);
+        assert!(
+            !track_latest_due(base.path(), SurfaceCli::Codex, now),
+            "an ordinary future-skew stamp (≤30d) must read as not-due"
+        );
+    }
+
+    /// A stamp dated ABSURDLY in the future (> 30d — a corrected one-time
+    /// forward clock jump) self-heals to due (LOW-4), so track-latest is not
+    /// permanently disabled until real time catches up.
+    #[test]
+    fn track_latest_absurd_future_stamp_self_heals() {
+        let base = tempfile::TempDir::new().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        // ~31 years ahead — well beyond the 30d skew threshold.
+        let absurd = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        record_track_latest_attempt(base.path(), SurfaceCli::Codex, absurd);
+        assert!(
+            track_latest_due(base.path(), SurfaceCli::Codex, now),
+            "an absurd future stamp (>30d) must self-heal to due"
+        );
+    }
+
+    /// A corrupt (non-integer) stamp reads as due — re-stamp on this run.
+    #[test]
+    fn track_latest_corrupt_stamp_is_due() {
+        let base = tempfile::TempDir::new().unwrap();
+        let path = track_latest_stamp_path(base.path(), SurfaceCli::Codex);
+        std::fs::write(&path, "not-a-number").unwrap();
+        assert!(
+            track_latest_due(base.path(), SurfaceCli::Codex, SystemTime::now()),
+            "corrupt stamp must read as due"
+        );
+    }
+
+    /// Per-CLI isolation: a codex attempt does not throttle a gemini attempt.
+    #[test]
+    fn track_latest_stamp_is_per_cli() {
+        let base = tempfile::TempDir::new().unwrap();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        record_track_latest_attempt(base.path(), SurfaceCli::Codex, t0);
+        assert!(
+            !track_latest_due(base.path(), SurfaceCli::Codex, t0),
+            "codex just recorded → not due"
+        );
+        assert!(
+            track_latest_due(base.path(), SurfaceCli::Gemini, t0),
+            "gemini has no stamp → still due (per-CLI isolation)"
         );
     }
 
@@ -487,13 +762,28 @@ mod tests {
         // Use a very short timeout (1s) to keep the test fast.
         let short_timeout = Duration::from_millis(500);
 
-        let mut child = Command::new("sleep")
+        // Bind the helper binary ABSOLUTELY, not through `PATH`. Rust runs a
+        // crate's tests as threads of ONE process, and two sibling tests in
+        // this crate set `PATH` to "" process-wide while they run
+        // (`install_path.rs::path_walk_*` and `run_auto_update` below —
+        // `grep -n 'set_var("PATH"' csq-core/src/cli_deps/`). Resolving
+        // `sleep` through `PATH` therefore made this test's outcome depend on
+        // thread interleaving: it passes alone and fails under the `cli_deps`
+        // filter whenever it overlaps one of those windows. The dependency
+        // this test actually has is on a file existing, not on an environment
+        // variable no test owns.
+        let sleep_bin = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("a `sleep` binary must exist at /bin/sleep or /usr/bin/sleep on unix");
+
+        let mut child = Command::new(sleep_bin)
             .arg("60")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("sleep must be available on unix");
+            .expect("sleep must be spawnable on unix");
 
         let start = Instant::now();
         let result: Result<(), &str> = loop {
@@ -564,6 +854,74 @@ mod tests {
         assert_eq!(
             display_package_name(SurfaceCli::Gemini, InstallManager::NpmGlobal),
             GEMINI_NPM_PACKAGE,
+        );
+    }
+
+    // ── SelfManaged (Kimi/Grok) display guards ────────────────────────────────
+
+    /// display_package_name must return the CLI name, NOT the upgrade
+    /// subcommand token ("upgrade"/"update") which is `upgrade_command`'s last arg.
+    #[test]
+    fn display_package_name_self_managed_is_cli_name() {
+        assert_eq!(
+            display_package_name(SurfaceCli::Kimi, InstallManager::SelfManaged),
+            "kimi"
+        );
+        assert_eq!(
+            display_package_name(SurfaceCli::Grok, InstallManager::SelfManaged),
+            "grok"
+        );
+    }
+
+    /// display_full_package_spec must ALSO return the CLI name for SelfManaged —
+    /// the guard prevents it from returning upgrade_command.last() = "upgrade".
+    #[test]
+    fn display_full_package_spec_self_managed_is_cli_name_not_subcommand() {
+        let kimi = display_full_package_spec(SurfaceCli::Kimi, InstallManager::SelfManaged);
+        assert_eq!(
+            kimi, "kimi",
+            "must be CLI name, not the 'upgrade' subcommand"
+        );
+        let grok = display_full_package_spec(SurfaceCli::Grok, InstallManager::SelfManaged);
+        assert_eq!(
+            grok, "grok",
+            "must be CLI name, not the 'update' subcommand"
+        );
+    }
+
+    /// run_auto_update for a SelfManaged CLI whose binary is not resolvable on
+    /// disk (empty PATH + no vendor dir under a sandbox HOME) returns NoCommand
+    /// — nothing to update. Exercises the non-npm resolution branch.
+    #[cfg(unix)]
+    #[test]
+    fn run_auto_update_self_managed_unresolvable_binary_is_no_command() {
+        let _env_guard = crate::platform::test_env::lock();
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_path = std::env::var_os("PATH");
+        // SAFETY: env lock held; restored below. Empty PATH + a sandbox HOME with
+        // no ~/.kimi-code/bin makes find_in_path("kimi") miss both sources.
+        unsafe {
+            std::env::set_var("HOME", sandbox.path());
+            std::env::set_var("PATH", "");
+        }
+
+        let result = run_auto_update(SurfaceCli::Kimi, InstallManager::SelfManaged);
+
+        unsafe {
+            match old_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            matches!(result, Err(UpdateError::NoCommand)),
+            "unresolvable self-managed binary must yield NoCommand; got {result:?}"
         );
     }
 }

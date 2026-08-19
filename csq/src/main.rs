@@ -12,6 +12,15 @@
 
 mod mode;
 
+/// #1a-2 (daemon-auth-resilience Wave A2) — the daemon's persistent rolling
+/// file log, wired into whichever surface hosts a daemon (CLI foreground /
+/// background `csq daemon start`, or the desktop in-process supervisor).
+/// See `csq_core::daemon::log_gc` for the paired 14-day GC. Gated on
+/// `any(cli, desktop)` — those are the only two surfaces that ever host a
+/// daemon and reference this module.
+#[cfg(any(feature = "cli", feature = "desktop"))]
+mod daemon_log;
+
 #[cfg(feature = "cli")]
 mod cli;
 
@@ -49,7 +58,7 @@ pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (ente
 pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (community)");
 
 fn main() {
-    // #1011 headless self-test short-circuit. The self-test lives at the top of
+    // an internal ticket headless self-test short-circuit. The self-test lives at the top of
     // `desktop::run()`, but `mode::detect()` only resolves `Desktop` from the
     // `.app` bundle sentinel / `--desktop` — so `--self-test` on a raw binary
     // would otherwise route to CLI and never reach it. Route to `desktop::run()`

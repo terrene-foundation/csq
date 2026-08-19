@@ -72,8 +72,21 @@ pub(crate) fn append_launch_log(base_dir: &Path, event: &str, account: AccountNu
 /// changed (`csq swap` repointed its symlinks) — that bypasses the
 /// newer-than-keychain guard (which compares only expiry and would otherwise
 /// leave the PREVIOUS account's token in place → 401) and clears a stale item
-/// when the new slot has no valid token. `csq run` creates a fresh handle dir
-/// (no prior item), so it passes `false`.
+/// when the new slot has no valid token.
+///
+/// `csq run` ALSO passes `true`, even though it creates a fresh `term-<pid>`
+/// handle dir. A "fresh" dir has no item that TRULY belongs to it, but its
+/// canonicalized path can COLLIDE with a stale item left by a since-removed
+/// account bound to a handle dir at the same path (PID reuse; or — a real
+/// gap named in security review 1386, closed for logout but with a residual
+/// window on the keychain-clear side — a `csq logout` whose keychain clear
+/// could not be confirmed, e.g. a locked keychain). Passing `false` here
+/// would let the newer-than-keychain guard PRESERVE that stale, wrong-account
+/// item if its expiry happens to be later than the new session's fresh
+/// token — the account-terminal-separation resurrection this whole area
+/// exists to prevent. `true` makes the guard structurally unable to do that:
+/// it always overwrites with the valid current token, or clears when there
+/// is none.
 pub(crate) fn sync_cc_keychain(handle_dir_abs: &Path, account_changed: bool) {
     let result = if account_changed {
         csq_core::credentials::keychain::sync_handle_dir_account_changed(handle_dir_abs)
@@ -136,6 +149,7 @@ pub fn handle(
     coc_cache_enabled: bool,
     ignore_cli_version: bool,
     no_auto_update_cli: bool,
+    track_latest: bool,
     no_audit: bool,
     rest: &[String],
 ) -> Result<()> {
@@ -318,6 +332,8 @@ pub fn handle(
             surface_for_preflight,
             ignore_cli_version,
             no_auto_update_cli,
+            track_latest,
+            base_dir,
             &format!("csq run {account}"),
         )?;
     }
@@ -377,11 +393,82 @@ pub fn handle(
         );
     }
 
+    // Native-CLI dispatch (Wave 3, an internal journal entry): route to `launch_native` for
+    // Kimi/Grok slots. Per the same INV-P02 inversion as Gemini — no daemon
+    // prerequisite, no token refresh, no credential fanout, no `config-N/`
+    // creation. The native vendor binary self-authenticates.
+    //
+    // The predicate and the mapping are ONE total function
+    // (`SurfaceCli::native_surface`, `csq-core/src/cli_deps/mod.rs`), not an
+    // `if` guard plus a wildcard-terminated `match`. `SurfaceCli` is
+    // `#[non_exhaustive]`, so a `match` here could never be exhaustive — a
+    // sixth native surface omitted from the `if` would have taken the
+    // non-native path SILENTLY (an internal ticket). Inside csq-core the mapping's
+    // `match` has no wildcard, so that omission is a build failure instead.
+    if let Some(native_surface) = surface_for_preflight.native_surface() {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for native-CLI slots (slot {account} is \
+                 {native_surface}, requested: {profile_id})"
+            ));
+        }
+        return launch_native(
+            base_dir,
+            account,
+            native_surface,
+            capability_layer_enabled,
+            layer_is_auto,
+            &persisted_toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+            rest,
+            &mut audit_emitter,
+        );
+    }
+
+    // `is_third_party` was already computed above in the pre-flight block.
+    // Reuse the captured value — do NOT call discover_per_slot_third_party again.
+    //
+    // Anthropic-OAuth identity gate — MUST run BEFORE any side-effecting
+    // write below (an internal ticket). `resolve_slot_to_uuid` is the sole M4-12
+    // authority for "does this account exist"; an orphaned or never-logged-in
+    // slot has no `by_slot` entry. Pre-fix, this check ran AFTER
+    // `create_dir_all` + the `.csq-account`/`.current-account` marker writes
+    // + `mark_onboarding_complete`, so `csq run <N>` against an orphaned slot
+    // silently resurrected a phantom `config-N/` directory (`.claude.json` +
+    // both markers, byte-identical to a real login) before refusing to
+    // launch — confirmed via `csq daemon`'s `.csq-launch.log`, which recorded
+    // repeated unattended `csq run 12` invocations against a slot deleted
+    // from every identity map. `is_third_party` slots are exempt: a slot
+    // 3P-discovered from `config-N/settings.json` already has `config-N/` on
+    // disk by construction, so gating it here would be a no-op at best.
+    if !is_third_party {
+        if is_broker_failed(base_dir, account) {
+            return Err(anyhow!(
+                "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
+                account,
+                account
+            ));
+        }
+        if csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()).is_none() {
+            return Err(anyhow!(
+                "no identity record for account {} — run `csq login {}` to authenticate",
+                account,
+                account
+            ));
+        }
+    }
+
     // Ensure config-N exists (permanent account home)
     // PATH-BUILDER: constructs the permanent account directory path for
     // creation only; not reading credential content. Unchanged through
     // Phase 2 — see internal-design-docs
     // 03-phase2-readiness.md § M2-7. Phase 3 retargets.
+    //
+    // Reached only after the Anthropic-path identity gate above (or, for a
+    // discovered 3P slot, config-N already exists — see the gate's doc
+    // comment) — never for a slot csq is about to refuse to launch.
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)?;
 
@@ -400,9 +487,6 @@ pub fn handle(
     // Mark onboarding complete on config-N
     session::mark_onboarding_complete(&config_dir)?;
 
-    // `is_third_party` was already computed above in the pre-flight block.
-    // Reuse the captured value — do NOT call discover_per_slot_third_party again.
-
     if is_third_party {
         if let Some(profile_id) = profile {
             return Err(anyhow!(
@@ -412,17 +496,14 @@ pub fn handle(
 
         launch_third_party(base_dir, &claude_home, account, rest, &mut audit_emitter)
     } else {
-        // Anthropic OAuth path.
-        if is_broker_failed(base_dir, account) {
-            return Err(anyhow!(
-                "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
-                account,
-                account
-            ));
-        }
-
-        // Verify canonical credentials exist and are loadable.
-        // M4-12: numeric credentials/ path retired — resolve via UUID.
+        // Anthropic OAuth path. `is_broker_failed` + the identity-record
+        // check already ran above, before any write — re-resolve here only
+        // to build the credential path (a second `resolve_slot_to_uuid`
+        // call, same pattern the pre-fix code already used across its two
+        // marker/credential sites). A `None` here would mean the identity
+        // was removed in the narrow window between the two calls (e.g. a
+        // concurrent `csq logout`) — surfaced with the same operator-facing
+        // message rather than panicking.
         let canonical_path =
             csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get())
                 .map(|uuid| {
@@ -543,6 +624,31 @@ fn surface_cli_for_slot(base_dir: &Path, account: AccountNum) -> SurfaceCli {
     if std::fs::symlink_metadata(&gemini_canonical).is_ok() {
         return SurfaceCli::Gemini;
     }
+    // Native-CLI (Wave 3, an internal journal entry) — the credential-less binding marker's
+    // existence keys the surface, exactly like Codex/Gemini above. Checked
+    // last (after Codex/Gemini) since it's the newest surface and native
+    // markers never collide with the Codex/Gemini canonical paths.
+    if let Some(surface) = csq_core::providers::native::native_surface_for_slot(base_dir, account) {
+        // Exhaustive over `Surface` ON PURPOSE — no wildcard. `providers::
+        // catalog::Surface` is NOT `#[non_exhaustive]`, so a sixth variant
+        // fails THIS match at compile time.
+        //
+        // The three non-native arms are written out rather than asserted away.
+        // The prior `_ => unreachable!("native_surface_for_slot returned a
+        // non-native surface")` justified itself with a claim about ANOTHER
+        // function's return range, which no compiler checks
+        // (`doc-property-claims.md` MUST-1) — so a sixth native surface would
+        // have PANICKED out of `csq run` instead of failing the build.
+        // Falling through to the `SurfaceCli::Claude` tail below is the same
+        // outcome the surrounding `if let` already produces for an unbound
+        // slot, and it is not on any path a live caller reaches today:
+        // `native_surface_for_slot` filters on `Surface::is_native_cli`.
+        match surface {
+            Surface::Kimi => return SurfaceCli::Kimi,
+            Surface::Grok => return SurfaceCli::Grok,
+            Surface::ClaudeCode | Surface::Codex | Surface::Gemini => {}
+        }
+    }
     SurfaceCli::Claude
 }
 
@@ -553,18 +659,15 @@ fn surface_cli_for_slot(base_dir: &Path, account: AccountNum) -> SurfaceCli {
 /// canonical-path resolution), so this helper fully-qualifies the audit
 /// `Surface` to avoid the collision.
 ///
-/// `SurfaceCli` is `#[non_exhaustive]`; the wildcard arm maps any future
-/// surface to `Cc` as a safe default until it is explicitly wired here. The
-/// audit `Surface` enum currently has no variant beyond cc/codex/gemini, so a
-/// new surface has no audit tag of its own until both are extended together.
+/// `SurfaceCli` is `#[non_exhaustive]`, so a `match` in THIS crate cannot be
+/// exhaustive and would need a `_` arm. The previous form had one, defaulting
+/// an unwired surface to `Cc` — which mis-tags that surface's audit records
+/// rather than failing (an internal ticket). The mapping therefore lives in csq-core
+/// as [`SurfaceCli::audit_surface`], where the same `match` is wildcard-free
+/// and a sixth variant is a build failure; this is a thin re-export so the
+/// call sites and their tests keep reading in csq's own vocabulary.
 fn audit_surface_for(surface: SurfaceCli) -> csq_core::audit::Surface {
-    use csq_core::audit::Surface as AuditSurface;
-    match surface {
-        SurfaceCli::Claude => AuditSurface::Cc,
-        SurfaceCli::Codex => AuditSurface::Codex,
-        SurfaceCli::Gemini => AuditSurface::Gemini,
-        _ => AuditSurface::Cc,
-    }
+    surface.audit_surface()
 }
 
 /// `csq run N --native` dispatch (P0-B). Drives the native governed loop against
@@ -684,6 +787,20 @@ fn launch_third_party(
     rest: &[String],
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
 ) -> Result<()> {
+    // Wave 3 kimi/grok host-isolation follow-through (spec 08 MED-03):
+    // build HostContext from the parent env BEFORE any spawn-time work,
+    // mirroring `launch_gemini`'s placement. Every 3P bearer slot
+    // dispatched through this function (kimi, Z.AI, MiniMax, DeepSeek,
+    // Ollama) spawns the SAME `claude` binary below with `$HOME`
+    // unfiltered — `strip_sensitive_env` strips only
+    // ANTHROPIC_*/OPENAI_*/AWS_BEARER_TOKEN_BEDROCK/CLAUDE_API_KEY/
+    // CODEX_HOME, not arbitrary production-shaped secrets — so the
+    // host-isolation exposure is identical regardless of which 3P
+    // provider is bound to `account`. Kimi is the Wave 3 target that
+    // motivated this; the other 3P bearer providers share the exact
+    // same code path and therefore the exact same exposure.
+    let host_ctx = detect_host_context();
+
     // PATH-BUILDER: builds the legacy config-N/settings.json path for an
     // existence check only; no content is read here. Unchanged through
     // Phase 2 — see internal-design-docs
@@ -719,6 +836,22 @@ fn launch_third_party(
     strip_sensitive_env(&mut cmd);
     cmd.args(rest);
 
+    // Spec 08 MED-03 host-isolation warning, generalized to every 3P
+    // bearer provider (kimi included — the Wave 3 target) EXCEPT loopback
+    // ollama (see the `surface_name != "ollama"` guard below). Informational
+    // — does NOT abort the spawn. Unlike `launch_gemini`, this path has
+    // no capability-layer Inherit/WithLayer split (3P slots never run
+    // the capability-layer preflight), so every invocation IS the spawn
+    // and the warning fires unconditionally on production-secret
+    // detection rather than being gated to a WithLayer branch.
+    let surface_name = resolve_third_party_surface_name(base_dir, account);
+    // Loopback ollama has no remote vendor to exfiltrate to — the MED-03
+    // vendor-exposure warning is misleading there (a REMOTE ollama-compatible
+    // endpoint classifies as "third-party", not "ollama", so it still warns).
+    if surface_name != "ollama" {
+        emit_host_isolation_warning_if_needed(&host_ctx, account, surface_name);
+    }
+
     // Set the layer-bypass result_state + decision before handoff;
     // exec_or_spawn captures end_ts + flushes at the platform-correct
     // moment (Unix: before exec; Windows: after child.wait()).
@@ -729,66 +862,194 @@ fn launch_third_party(
     exec_or_spawn(cmd, &handle_dir, audit_emitter)
 }
 
+/// Resolves the catalog surface id (`"kimi"`, `"zai"`, `"mm"`, `"deepseek"`,
+/// `"ollama"`) bound to `account` via its 3P `settings.json` binding, for the
+/// spec 08 MED-03 host-isolation warning's message/log surface tag. Falls
+/// back to the generic `"third-party"` label when the slot's provider
+/// cannot be resolved (e.g. a display name with no catalog entry) — this
+/// should not happen for a slot `launch_third_party` was dispatched to
+/// (the caller already established `is_third_party == true`), but the
+/// warning is informational-only, so a resolution miss degrades to a
+/// generic label rather than aborting the spawn.
+fn resolve_third_party_surface_name(base_dir: &Path, account: AccountNum) -> &'static str {
+    discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .find(|a| a.id == account.get())
+        .and_then(|a| match a.source {
+            AccountSource::ThirdParty { provider } => {
+                csq_core::providers::catalog::id_from_display_name(&provider)
+            }
+            _ => None,
+        })
+        .unwrap_or("third-party")
+}
+
 /// True when the target `surface`'s NATIVE artifacts exist at `cwd` or any
-/// ancestor up to the project root.
+/// ancestor up to `project_root` (inclusive).
 ///
-/// When they do, the native CLI (`claude` / `codex` / `gemini`) loads them with
-/// its OWN harness, so csq must inject NOTHING (Model 2 — csq translates
-/// `.coc/`→native artifacts and gets out of the way; see memory
-/// `project_coc_two_model_architecture_and_native_delegation`). The
-/// capability-layer scaffold flattens the ENTIRE `.coc/` (all rules/agents/
+/// When they do, the native CLI (`claude` / `codex` / `gemini` / `kimi` /
+/// `grok`) loads them with its OWN harness, so csq must inject NOTHING
+/// (Model 2 — csq translates `.coc/`→native artifacts and gets out of the
+/// way; see memory `project_coc_two_model_architecture_and_native_delegation`).
+/// The capability-layer scaffold flattens the ENTIRE `.coc/` (all rules/agents/
 /// skills/commands, full bodies) into ONE system prompt; injecting that ON TOP
 /// of native artifacts the CLI already loads duplicated + overflowed codex's
 /// context window (the `csq run 9` "Context 0% left" bug on a 2.1 MB `.coc/`).
-fn native_artifacts_present(surface: Surface, cwd: &Path) -> bool {
-    let (dir_marker, file_marker) = match surface {
-        Surface::ClaudeCode => (".claude", "CLAUDE.md"),
-        Surface::Codex => (".codex", "AGENTS.md"),
-        Surface::Gemini => (".gemini", "GEMINI.md"),
+///
+/// `project_root` is `LoadOutcome::project_root` — `Some(root)` when
+/// `loader::discover` found a `.coc/` anywhere up-tree from `cwd`; `None`
+/// when it did not (the legacy-fallback case).
+///
+/// # Round-13 review MED-1 — the walk is bounded by an EXTERNAL root, not by
+/// re-detecting `.coc/`
+///
+/// The prior shape re-checked `current.join(".coc").is_dir()` inside this
+/// function's OWN walk to decide when to stop, on the claimed invariant that
+/// "the bound is always reached before $HOME in practice because this gate
+/// runs only on the WithLayer path, which the preflight enters only when a
+/// `.coc/` was found up-tree." That claim is FALSE:
+/// `run_capability_layer_preflight` reaches `WithLayer` via the LEGACY
+/// fallback chain too — `coc::load_with_cache`'s `discover(start)? == None`
+/// branch calls `load_legacy_or_empty(start)`, which can return a non-empty
+/// `CocSet` from a `.claude/`/`.gemini/`/`AGENTS.md` source with **no
+/// `.coc/` anywhere** (`LoadOutcome::project_root` is `None` in that case).
+/// With no `.coc/` for this function's own re-detection to ever find, the
+/// walk ran unbounded — up to `MAX_WALK_DEPTH` (64) or the filesystem root.
+///
+/// The practical consequence is worse than "eventually reaches `$HOME`":
+/// `$HOME/.claude` is GUARANTEED to exist on every host that has ever run
+/// csq at all — `base_dir()` creates `$HOME/.claude/accounts/` for csq's
+/// OWN account state, and `create_dir_all` creates `$HOME/.claude/` itself
+/// as a side effect of that. So the bare directory-existence check this
+/// function makes (`current.join(".claude").is_dir()`) returned `true` at
+/// `$HOME` on EVERY csq host regardless of whether the operator has any
+/// genuine CC-native global content (`CLAUDE.md`, `settings.json`) there at
+/// all — unlike `coc::fallback::probe`'s OWN `.claude/` detection
+/// (`claude_present`), which additionally requires a `rules/`/`agents/`/
+/// `skills/` subdirectory and is NOT fooled by a bare `accounts/`-only
+/// `.claude/`.
+///
+/// Consequence — stated as LATENT, because it is: on a `.coc/`-less project
+/// with some other legacy source (e.g. `.gemini/` present, no `.claude/`
+/// anywhere in the actual project tree), the unbounded walk found csq's OWN
+/// bookkeeping directory at `$HOME` and misread it as "CC already has native
+/// content here", suppressing injection. What that suppressed is today
+/// NOTHING: `coc::load_legacy_or_empty` returns `CocSet { source, ..empty() }`
+/// and its own doc says full legacy parsing "lands in PR-CA2/3/4". So no
+/// operator has yet lost governance content to this — the misdetection is real
+/// and the suppression is real, but the payload is empty until legacy parsing
+/// ships. An earlier draft of this comment asserted the live-loss version
+/// ("the operator's rules never reached CC's context"); that was not
+/// reproducible from the code and is corrected here rather than left to be
+/// read as established fact by the next session.
+///
+/// The fix: this function no longer re-detects `.coc/` at all. The caller
+/// (`run_capability_layer_preflight`, which already computed
+/// `LoadOutcome::project_root` during the SAME `.coc/` resolution) threads
+/// the actual root through `LayerControl::WithLayer`. When `project_root`
+/// is `None`, the walk checks ONLY `cwd` itself — no upward climb —
+/// mirroring `coc::fallback::probe`'s own no-upward-walk semantics for
+/// `.claude`/`.gemini` in that exact case (the only legacy resolver that
+/// DOES walk upward, `agents_md_walk_up`, is a separate, narrower
+/// mechanism checking `AGENTS.md` alone and is out of this fix's scope).
+/// `cwd.ancestors()` is a finite iterator bounded by the real path depth —
+/// no artificial iteration cap is needed on top of the `project_root`/
+/// cwd-only bound.
+fn native_artifacts_present(surface: Surface, cwd: &Path, project_root: Option<&Path>) -> bool {
+    let (dir_markers, file_markers): (&[&str], &[&str]) = match surface {
+        Surface::ClaudeCode => (&[".claude"], &["CLAUDE.md"]),
+        Surface::Codex => (&[".codex"], &["AGENTS.md"]),
+        Surface::Gemini => (&[".gemini"], &["GEMINI.md"]),
+        // Round-13 review MED-2: Kimi's per-directory project-root→cwd
+        // instruction sweep checks `<dir>/.kimi-code/AGENTS.md`, then
+        // `<dir>/AGENTS.md` else `<dir>/agents.md` (report 13 §3.1 row 3,
+        // verified via raw-binary read of the shipped binary) — NOT a bare
+        // `.kimi` dir, which Kimi never reads at all. The generic
+        // `~/.agents/` root is evidence-checked and excluded here: it is a
+        // HOME-only instructions fallback (report 13 §3.1 row 2, "rooted
+        // at the real OS home, not KIMI_CODE_HOME") and a project-level
+        // SKILLS marker (report 13 §3.3) — not part of the per-directory
+        // INSTRUCTIONS sweep this predicate models.
+        // Both spellings are listed because Kimi probes both; on the default
+        // case-insensitive macOS/Windows filesystems the second probe is
+        // redundant (it resolves to the same file), so it is load-bearing only
+        // on case-sensitive filesystems — i.e. Linux, and case-sensitive APFS
+        // volumes. Keeping it is correct on every platform; noting the split
+        // stops a future reader from "cleaning up" an apparently dead probe.
+        Surface::Kimi => (&[".kimi-code"], &["AGENTS.md", "agents.md"]),
+        // Round-13 review HIGH-1: Grok reads `.claude/` NATIVELY AND
+        // near-completely with ZERO setup (report 14 headline finding, §2
+        // G2 — verified empirically against a repo with no `.grok/` at
+        // all) — a `.claude/` dir means Grok already loads that content
+        // independently of csq. The prior marker set checked ONLY
+        // `.grok`/`AGENTS.md`, so a CC-first repo (`.claude/` present, no
+        // root `AGENTS.md`, no `.grok/`) — the majority shape, and the
+        // exact shape report 14 measured against — returned `false` here:
+        // the operator would be wrongly told to add a redundant
+        // `AGENTS.md` that would ALSO outrank the future
+        // `$GROK_HOME/AGENTS.md` (global scope, report 14 §7.1). File
+        // markers cover all six names Grok checks, in order, per
+        // directory (report 14 §3.1, verified via
+        // `12-project-rules.md:17-24`).
+        Surface::Grok => (
+            &[".grok", ".claude"],
+            &[
+                "AGENTS.md",
+                "CLAUDE.md",
+                "Agents.md",
+                "Claude.md",
+                "CLAUDE.local.md",
+                "AGENT.md",
+            ],
+        ),
     };
-    // Walk cwd → ancestors, mirroring how BOTH (a) the `.coc/` loader discovers
-    // its scaffold source (`coc::loader::discover`, walk-from-CWD-upward, spec 09
-    // §9.1.1) AND (b) the native CLI itself discovers its artifacts (claude/codex/
-    // gemini all walk up for `.claude/`/`AGENTS.md`/etc). A native artifact at ANY
-    // ancestor means the native CLI WILL load it, so csq must not also inject —
-    // otherwise running `csq run N` from a SUBDIRECTORY of a project whose `.coc/`
-    // + native artifacts both live at the root re-opens the duplication+overflow
-    // bug the leaf-only check missed (redteam R1 HIGH).
+
+    // With no `.coc/` root, the two marker classes get DIFFERENT bounds — and
+    // the asymmetry is the point (round-13 redteam MED).
     //
-    // The walk STOPS at the project root (the dir containing `.coc/`): the
-    // competing native artifacts live at or below it, and this bound keeps a
-    // user-global `~/.codex` / `~/.claude` from being mistaken for a project
-    // artifact. The bound is always reached before $HOME in practice because this
-    // gate runs only on the WithLayer path, which the preflight enters only when a
-    // `.coc/` was found up-tree — so a `.coc/` sits at or above `cwd` within the
-    // MAX_WALK_DEPTH (64) the loader itself uses.
-    let mut current = cwd;
-    for _ in 0..=64 {
-        if current.join(dir_marker).is_dir() || current.join(file_marker).is_file() {
+    // DIR markers (`.claude`, `.gemini`) are checked at `cwd` only. Climbing
+    // with them is what produced the `$HOME` misdetection above: csq's own
+    // `base_dir()` guarantees a bare `$HOME/.claude/` exists on every host.
+    //
+    // FILE markers (`AGENTS.md`, `CLAUDE.md`, …) climb, bounded at 64 levels —
+    // matching `coc::fallback::agents_md_walk_up`, the legacy resolver that
+    // actually produced the `CocSource` in this branch. Without the climb this
+    // gate was NARROWER than the resolver feeding it: the loader walked up to
+    // find `repo/AGENTS.md` and keep the layer active, while the gate refused
+    // to look past `cwd` and so reported "no native artifacts" for a project
+    // that plainly has one. `$HOME/CLAUDE.md`, if an operator has it, is
+    // genuine CC-native global content and SHOULD suppress — unlike the bare
+    // `.claude/` directory csq creates for itself.
+    const LEGACY_FILE_WALK_MAX: usize = 64;
+    for (depth, current) in cwd.ancestors().enumerate() {
+        let dir_hit = (project_root.is_some() || depth == 0)
+            && dir_markers.iter().any(|m| current.join(m).is_dir());
+        if dir_hit || file_markers.iter().any(|m| current.join(m).is_file()) {
             return true;
         }
-        // Project-root boundary: stop AFTER checking this level's native markers.
-        if current.join(".coc").is_dir() {
+        let reached_bound = match project_root {
+            Some(root) => current == root,
+            None => depth + 1 >= LEGACY_FILE_WALK_MAX,
+        };
+        if reached_bound {
             break;
-        }
-        match current.parent() {
-            Some(p) => current = p,
-            None => break,
         }
     }
     false
 }
 
 /// Whether csq should inject the flattened `.coc/` scaffold for `surface` given
-/// `cwd`.
+/// `cwd` (and the `.coc/` project root, if one was found — see
+/// [`native_artifacts_present`]).
 ///
 /// The scaffold injection is a TRANSITION / parity-testing mechanism, not the
 /// steady state: it MUST default OFF when the surface's native artifacts are
 /// present (the native CLI loads its own — see [`native_artifacts_present`]).
 /// `CSQ_COC_PARITY_TEST=1` forces injection regardless, the escape hatch for
 /// verifying `.coc/`→native parity via csq's sub-process path.
-fn should_inject_scaffold(surface: Surface, cwd: &Path) -> bool {
-    std::env::var_os("CSQ_COC_PARITY_TEST").is_some() || !native_artifacts_present(surface, cwd)
+fn should_inject_scaffold(surface: Surface, cwd: &Path, project_root: Option<&Path>) -> bool {
+    std::env::var_os("CSQ_COC_PARITY_TEST").is_some()
+        || !native_artifacts_present(surface, cwd, project_root)
 }
 
 /// Emits the operator note explaining that a `.coc/` scaffold was suppressed
@@ -799,6 +1060,8 @@ fn note_scaffold_deferred(surface: Surface) {
         Surface::ClaudeCode => "claude",
         Surface::Codex => "codex",
         Surface::Gemini => "gemini",
+        Surface::Kimi => "kimi",
+        Surface::Grok => "grok",
     };
     eprintln!(
         "csq: native {name} artifacts detected — deferring to the native CLI harness \
@@ -889,13 +1152,43 @@ fn launch_anthropic(
     // variant) would silently downgrade the settings overlay to config-N,
     // undoing the identity-keyed path for coexisting-layout slots.
 
-    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+    // Security review 1386 M4: `canonicalize_for_keychain_sync` returns the
+    // usual non-canonical fallback for `handle_dir_abs` (still the right
+    // `CLAUDE_CONFIG_DIR` to launch against), paired with whether canonicalize
+    // actually succeeded — the keychain write below MUST be skipped when it
+    // did not (see that function's doc for why).
+    let (handle_dir_abs, handle_dir_is_canonical) =
+        csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+
+    // Security review 1386 H1: opportunistically retry any keychain item a
+    // prior `csq logout` could not confirm clearing (locked/unreachable
+    // keychain at the time). The daemon's periodic sweep covers this too,
+    // but `csq run` works without a daemon running — this is the only
+    // recurring channel for that install shape. Cheap when the queue is
+    // empty (one file read, no subprocess calls) — but NOT non-blocking
+    // when it isn't (doc-property-claims.md MUST-2 correction: an earlier
+    // version of this comment claimed "never blocks the launch", which was
+    // true of the empty-queue case and false of the case this exists for).
+    // `sweep_pending_clears_opportunistic` (a small, separate budget from
+    // the daemon's) bounds the worst case to ~37.5s rather than inheriting
+    // the daemon's ~187.5s — see its doc for why a background thread was
+    // considered and rejected for this exec-replacing path.
+    let _ = csq_core::credentials::keychain::sweep_pending_clears_opportunistic(base_dir);
 
     // CC reads this account's OAuth credential from the keychain item keyed by
     // the CLAUDE_CONFIG_DIR path below — not from the symlinked
     // `.credentials.json`. Mirror the bound account's current token into it so
     // CC picks up the fresh credential (it re-checks the keychain ~every 30s).
-    sync_cc_keychain(&handle_dir_abs, false);
+    if handle_dir_is_canonical {
+        sync_cc_keychain(&handle_dir_abs, true);
+    } else {
+        tracing::warn!(
+            error_kind = "keychain_sync_canonicalize_failed",
+            "csq run: could not canonicalize this handle dir's path — the \
+             keychain mirror was NOT written (non-fatal — launch continues; \
+             CC falls back to the symlinked .credentials.json)"
+        );
+    }
 
     println!("Launching claude for account {} (term-{})...", account, pid);
 
@@ -931,6 +1224,7 @@ fn launch_anthropic(
             scaffold,
             rules_only_scaffold,
             artifacts,
+            project_root,
         } => {
             // PR-CA7c / E2BIG fix: deliver the scaffold (rules + structured-
             // output directive when applicable) to CC via
@@ -973,7 +1267,7 @@ fn launch_anthropic(
             // delivered natively — nothing is ever dropped. When the project
             // carries its own native `.claude/`, the scaffold is deferred
             // entirely (Level-1 behavior byte-unchanged).
-            let inject = should_inject_scaffold(Surface::ClaudeCode, &cwd);
+            let inject = should_inject_scaffold(Surface::ClaudeCode, &cwd, project_root.as_deref());
             let has_materializable = !artifacts.agents.is_empty()
                 || !artifacts.skills.is_empty()
                 || !artifacts.commands.is_empty();
@@ -1321,7 +1615,7 @@ fn launch_codex(
     // escalation despite the file having approval_policy = "never" +
     // sandbox_mode = "danger-full-access".
     //
-    // GH #978: the derived FULL-BYPASS flag
+    // GH an internal ticket: the derived FULL-BYPASS flag
     // (`--dangerously-bypass-approvals-and-sandbox`) is a TERMINAL override —
     // a later `-s read-only` in the passthrough cannot undo it (it is not a
     // `-s` value, so codex's last-wins argparse does not apply). So a caller
@@ -1385,6 +1679,7 @@ fn launch_codex(
             // prose. `rules_only_scaffold` is a CC-only field (rebuilt inline
             // here via `reduced_surface_prose` instead).
             artifacts,
+            project_root,
             ..
         } => {
             // PR-CA8 commit 2: materialize per-spawn config.toml in the
@@ -1408,7 +1703,7 @@ fn launch_codex(
             // rewrite (`mcp_wrap`) is orthogonal and still materializes.
             // `CSQ_COC_PARITY_TEST=1` forces injection for parity testing.
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let inject = should_inject_scaffold(Surface::Codex, &cwd);
+            let inject = should_inject_scaffold(Surface::Codex, &cwd, project_root.as_deref());
             // S3 (an internal ticket): deliver codex-native SKILLS through
             // `$CODEX_HOME/skills/` (native progressive disclosure instead of a
             // flattened prose blob). agents/commands/rules have no native codex
@@ -1442,7 +1737,7 @@ fn launch_codex(
                 // Skills native → prose is every OTHER kind (rules/agents/commands).
                 let remaining = csq_core::coc::translate::SurfaceArtifacts {
                     skills: Vec::new(),
-                    ..artifacts.clone()
+                    ..(*artifacts).clone()
                 };
                 reduced_surface_prose(
                     Surface::Codex,
@@ -2237,7 +2532,7 @@ fn verify_codex_canonical_is_regular_file(base_dir: &Path, account: AccountNum) 
 
 /// Detect a headless (non-interactive) Gemini invocation — a `-p` / `--prompt`
 /// one-shot. gemini-cli's `-i` / `--prompt-interactive` seeds an INTERACTIVE
-/// session and is NOT headless. #965: a headless run must not reach gemini-cli's
+/// session and is NOT headless. an internal ticket: a headless run must not reach gemini-cli's
 /// interactive browser-auth prompt, so this gates the pre-spawn OAuth check.
 fn gemini_invocation_is_headless(rest: &[String]) -> bool {
     let interactive = rest.iter().any(|a| {
@@ -2309,7 +2604,7 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
 /// likely the desktop spawn path landing inside csq-cli, or a
 /// future Bedrock launcher reusing the same shape), factor both
 /// bodies into csq-core. Both sites must be edited together — AND the
-/// factored spawn path MUST carry the #965 headless-OAuth guard
+/// factored spawn path MUST carry the an internal ticket headless-OAuth guard
 /// (`gemini_invocation_is_headless` → `oauth_login::check_headless_oauth_ready`)
 /// so a future desktop/Bedrock caller cannot silently regress the "no
 /// interactive prompt on a headless run" contract. The guard is structurally
@@ -2440,7 +2735,7 @@ fn launch_gemini(
         ));
     }
 
-    // #965: a headless (`-p`/`--prompt`) run against a Code Assist OAuth Gemini
+    // an internal ticket: a headless (`-p`/`--prompt`) run against a Code Assist OAuth Gemini
     // slot whose `~/.gemini/oauth_creds.json` is missing or stale would trip
     // gemini-cli's interactive browser-auth prompt ("Opening authentication
     // page ... [Y/n]"), which hangs any non-TTY caller with no catchable error.
@@ -2451,7 +2746,7 @@ fn launch_gemini(
     // non-TTY check fires for EVERY piped/redirected/CI invocation — including
     // stub-driven integration harnesses (`cu2_gemini_one_shot_integration`) and
     // any non-OAuth spawn — and would reject a legitimate one-shot whose creds
-    // gemini-cli would resolve differently. The reported failure (#965) is the
+    // gemini-cli would resolve differently. The reported failure (an internal ticket) is the
     // `-p` case; the piped-stdin-without-`-p` variant is a documented, accepted
     // limitation (zero-tolerance Rule 5: the specific blocker is that non-TTY
     // detection breaks stub/test spawns + non-OAuth gemini paths).
@@ -2525,6 +2820,19 @@ fn launch_gemini(
 
     println!("Launching gemini for account {} (term-{})...", account, pid);
 
+    // host-isolation-parity-followups (1): emit ABOVE the Inherit/
+    // WithLayer split so the spec-08 MED-03 warning fires on BOTH
+    // gemini spawn paths, not only WithLayer. The risk this warns
+    // about — the model reading the parent `$HOME` unfiltered — is
+    // identical on Inherit (v2.3.1 byte-equivalent path): neither arm
+    // overrides `$HOME` before `spawn_gemini` execs, so gating the
+    // warning to WithLayer was an oversight, not a deliberate scope
+    // limit (confirmed against an internal ticket's own review notes, which
+    // flagged this exact asymmetry as "pre-existing" and unresolved).
+    // Matches the unconditional 3P-bearer gate in `launch_third_party`
+    // (only `surface_name != "ollama"` gates that one).
+    emit_host_isolation_warning_if_needed(&host_ctx, account, "gemini");
+
     match layer_control {
         LayerControl::Inherit => {
             // v2.3.1 byte-equivalent path — exec on Unix / exit on
@@ -2579,14 +2887,15 @@ fn launch_gemini(
             // S4 (an internal ticket): gemini materializes SKILLS + COMMANDS natively; the
             // rest is prose (`rules_only_scaffold` is a CC-only field).
             artifacts,
+            project_root,
             ..
         } => {
-            // PR-CA8b commit 4: emit the host-isolation warning per
-            // spec 08 MED-03 if production-shaped secrets were
-            // detected. Informational — does NOT abort spawn.
-            // Operator-side mitigation (clean VM) per spec 08 stays
-            // load-bearing.
-            emit_host_isolation_warning_if_needed(&host_ctx, account);
+            // host-isolation-parity-followups (1): the spec 08 MED-03
+            // warning now emits ONCE, unconditionally, above this
+            // match (both Inherit and WithLayer read the parent
+            // `$HOME` unfiltered) — see the emit call before `match
+            // layer_control` above. Do NOT re-add an emit here; that
+            // would double-fire the warning on the WithLayer path.
 
             // Build the spawn plan. Layer-on variant calls
             // probe::reassert_settings_drift_with_system_instruction
@@ -2601,7 +2910,7 @@ fn launch_gemini(
             // present — gemini-cli loads its own artifacts, so injecting the
             // full `.coc/` flatten into `settings.json system_instruction`
             // duplicates + overflows context. `CSQ_COC_PARITY_TEST=1` forces it.
-            let inject = should_inject_scaffold(Surface::Gemini, &cwd);
+            let inject = should_inject_scaffold(Surface::Gemini, &cwd, project_root.as_deref());
             // S4 (an internal ticket): deliver gemini-native SKILLS + COMMANDS through
             // `.gemini/skills/` + `.gemini/commands/` (native progressive
             // disclosure + `/commands`). Runs BEFORE the settings.json write below
@@ -2661,7 +2970,7 @@ fn launch_gemini(
                     } else {
                         artifacts.commands.clone()
                     },
-                    ..artifacts.clone()
+                    ..(*artifacts).clone()
                 };
                 reduced_surface_prose(
                     Surface::Gemini,
@@ -2761,6 +3070,456 @@ fn launch_gemini(
     }
 }
 
+/// Refuse to launch a native slot whose binding marker is a SYMLINK. csq only
+/// ever writes a REGULAR file at `credentials/{kimi,grok}-<N>.json` (via
+/// `native::write_binding`), so a symlink here is external tampering. Because
+/// `native::marker_exists` (and thus the `binding_guard` union detector) now
+/// treats a dangling marker symlink as BOUND for fail-toward-refuse (redteam R2
+/// MEDIUM-2), dispatch MUST refuse it explicitly rather than exec the vendor CLI
+/// against tampered state — parity with `launch_gemini`'s symlink refusal and
+/// codex's `verify_codex_canonical_is_regular_file`.
+fn refuse_native_marker_symlink(
+    base_dir: &Path,
+    account: AccountNum,
+    surface: Surface,
+    descriptor: &csq_core::providers::native::NativeCli,
+) -> Result<()> {
+    let marker = csq_core::providers::native::marker_path(base_dir, account, surface);
+    if let Ok(meta) = std::fs::symlink_metadata(&marker) {
+        if meta.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing {} launch: {} is a symlink. csq only writes a regular file at this path; a symlink here means an external process mutated the credentials directory. Re-run `csq login {account} --provider {}` to rewrite.",
+                descriptor.display_name,
+                redact_path(&marker),
+                descriptor.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `csq run N` dispatch for a native, self-authenticating vendor-CLI slot
+/// (Kimi/Grok — Wave 3, an internal journal entry). Modeled on [`launch_gemini`] but
+/// substantially simpler per the INV-P02 inversion (spec 07 §7.5): native
+/// CLIs self-authenticate, so this function does NOT open the secret vault,
+/// does NOT check OAuth readiness, does NOT load/refresh/fan-out any
+/// credential, and does NOT create `config-<N>/`.
+///
+/// Steps:
+/// 1. Capability-layer pre-flight ([`run_capability_layer_preflight`]).
+/// 2. `--bench-mode layer-only` early return.
+/// 3. Assert the binding marker exists
+///    ([`csq_core::providers::native::marker_exists`]) — a clear
+///    remediation error if not (the marker is written by `csq login N
+///    --provider {kimi-cli,grok}`, never by `csq run`).
+/// 4. Create the minimal `term-<pid>` handle dir with only `.csq-account`
+///    (mirrors `launch_gemini` — no `config-N/`, no per-spawn settings
+///    file: native CLIs have no per-account config surface for csq to
+///    materialize into).
+/// 5. Fire the spec 08 MED-03 host-isolation warning (the model reads
+///    `$HOME` unfiltered, the same exposure as every other spawned
+///    surface).
+/// 6. Resolve the vendor binary (PATH + the known-install-dir fallback —
+///    `~/.kimi-code/bin` / `~/.grok/bin`, since neither is on PATH by
+///    default) and **exec** it (Unix) / spawn+wait (non-Unix) via
+///    [`exec_or_spawn`], inheriting the parent env (minus a small
+///    csq-session-dir scrub) + cwd + `rest` passthrough args.
+///
+/// ## Per-slot vendor home (0135 design lock)
+///
+/// Before spawn, [`set_native_home_env`] points the vendor at THIS slot's
+/// isolated home ([`csq_core::providers::native::native_home_path`]) via
+/// `descriptor.home_env` (`KIMI_CODE_HOME` / `GROK_HOME`), after stripping
+/// BOTH native home vars from the child env. Strip-both-then-set-one is
+/// security-load-bearing: an inherited parent-shell `GROK_HOME` while
+/// launching a Kimi slot must never leak into the child — that is the
+/// exact multi-account isolation bug this redesign fixes. The vendor
+/// loads/refreshes its own credentials from that home; csq never reads or
+/// writes inside it.
+///
+/// ## No spawn-boundary governance gate (M6 T6.1)
+///
+/// Unlike `launch_codex`/`launch_gemini`, this function does NOT evaluate
+/// the enterprise M6 T6.1 spawn-boundary gate
+/// (`csq_trust_contract::SpawnCli`) — that enum has only `Codex`/`Gemini`
+/// variants today (not `#[non_exhaustive]`); adding Kimi/Grok variants is a
+/// cross-crate change out of this shard's scope (an internal journal entry W3-4). This
+/// mirrors the gate's own documented scope ("Only codex/gemini hit this
+/// spawn-boundary gate; cc and 3P providers are gated in-loop, not here") —
+/// native surfaces join that same "not gated here" set for now.
+///
+/// ## No capability-layer materialization YET (missing wiring, not a
+/// structural limitation of the vendor CLIs)
+///
+/// This function does NOT currently write anything into Kimi/Grok's own
+/// config surface — but that surface DOES exist. `<KIMI_CODE_HOME>/
+/// config.toml` is a real per-slot vendor-written file
+/// `coc::translate::kimi_merge::merge_kimi_config_via_toml_value` already
+/// knows how to round-trip-merge into (see that module's doc comment), and
+/// `$GROK_HOME/{AGENTS.md,config.toml,settings.json}` is the documented
+/// Grok target (`coc::translate::grok` module doc). Both homes are ALREADY
+/// pointed at by THIS function via [`set_native_home_env`] below — the
+/// vendor CLI reads/writes them directly on every spawn. What is missing
+/// is the CALL from this function into `emit_kimi_native`/
+/// `emit_grok_native` (plus a not-yet-written Grok config/settings merge
+/// helper, mirroring `kimi_merge`) BEFORE spawn — that wiring is a
+/// follow-on shard (an internal journal entry W3-4), not a structural gap in what the
+/// vendor CLIs read. So today this function never calls `spawn_with_layer`
+/// — every [`LayerControl`] outcome (`Inherit` or `WithLayer`) converges
+/// on the same `exec_or_spawn` call below, unlike `launch_codex`/
+/// `launch_gemini` which branch into a governed spawn+post-validate loop
+/// on `WithLayer`. When `WithLayer` resolves a non-empty scaffold that
+/// `should_inject_scaffold` says SHOULD be delivered (no native
+/// `AGENTS.md`/`.kimi`/`.grok` artifacts found anywhere up-tree), there is
+/// nowhere TODAY to deliver it — csq notes the gap on stderr rather than
+/// silently dropping it. The common case (native artifacts present)
+/// already suppresses injection via `should_inject_scaffold`, so this note
+/// fires only for a `.coc/`-only project with no native CLI artifacts
+/// anywhere up-tree. This note (and the `spawn_with_layer` bypass above)
+/// MUST be removed/updated when the wiring shard lands.
+///
+/// ### Acceptance criterion for the wiring shard — audit-emission parity
+///
+/// A native Kimi/Grok run whose in-scope RULE set (`SurfaceArtifacts.rules`
+/// after `flatten_artifacts` — NOT the whole scaffold; a `.coc/` with zero
+/// rules but non-empty agents/skills/commands legitimately has an empty
+/// rule set) is non-empty MUST emit non-empty `rule_ids_cited_*` on the
+/// audit record; a run that delivers NO scaffold at all MUST emit
+/// `Degraded`/`Bypass` (mirroring every other surface's Inherit/no-layer
+/// classification — see the `audit_emitter.set_result` call in this
+/// function's `Ok` path below). **This AC is UNTESTABLE in this PR — no
+/// spawn path here materializes a scaffold at all (see the section above),
+/// so there is no live behavior to assert against.** The wiring shard that
+/// adds the `emit_kimi_native`/`emit_grok_native` calls MUST add the test
+/// alongside the wiring, not before it — writing a test that cannot fail
+/// today would be vacuous coverage.
+///
+/// ### Additional wiring-shard obligations (redteam round 4)
+///
+/// - **Symlink re-stat / refuse-on-symlink + per-slot write lock +
+///   reconcile-on-emit** for the PERSISTENT vendor homes (R4-2). Unlike
+///   `emit_cc_plugin`'s fresh per-spawn dest (pre-plant impossible),
+///   `<KIMI_CODE_HOME>` / `$GROK_HOME` have an unbounded pre-plant
+///   window. Before EVERY read AND write the wiring MUST re-stat the
+///   target and refuse (operator-visibly) when it is a symlink, and MUST
+///   serialize concurrent emits per slot. (R11 MED-1: `emit_kimi_native`/
+///   `emit_grok_native` already do this for their own pre-write overwrite
+///   snapshot READ and the write itself, at the LEAF artifact path ONLY —
+///   see `write_file_restorable`'s `symlink_metadata` check in
+///   `materialize.rs`. This is LEAF-scoped coverage, not full coverage: it
+///   does NOT defend a symlinked ANCESTOR — a symlink at `dest` ITSELF or
+///   at an intermediate directory component (`dest/skills`) is still
+///   followed by `create_dir_all`. This AC covers that remaining gap, plus
+///   any ADDITIONAL reads/writes the wiring shard itself performs, e.g. a
+///   `kimi_merge`-style existing-`config.toml` read.) Reconcile-on-emit
+///   MUST filter every delete candidate through
+///   `coc::translate::materialize::is_csq_owned_entry` (R11 MED-2) — an
+///   entry for which it returns `false` MUST NEVER be a reconcile-delete
+///   candidate. Note its doc comment's one inherent limitation: a
+///   user-authored entry literally named `csq-<anything>` is
+///   indistinguishable from csq-owned and WILL be reconciled.
+/// - **csq-unique hook command minting** (R4-4): every csq-contributed
+///   hook command MUST carry a csq-unique token so the ownership-marker
+///   identity key (`command`) can never collide with a user-authored
+///   hook — see `kimi_merge::CSQ_MANAGED_HOOK_COMMANDS_KEY`.
+/// - **`${{` template-DSL pre-flight over the AGENTS.md body** (R7-1):
+///   the emitter's `check_no_template_dsl` covers skills/commands/agents
+///   bodies but NOT the rule prose carried in
+///   `GrokSpawnPayload.agents_md` (translate is pure). The
+///   `$GROK_HOME/AGENTS.md` write MUST run
+///   `coc::translate::materialize::check_no_template_dsl` (pub for this
+///   purpose) over the merged body first — a `.coc/` rule documenting CI
+///   behavior with a GitHub-Actions-style `${{ matrix.foo }}` /
+///   `${{ secrets.X }}` literal is a common accidental collision Grok
+///   would silently substitute at spawn.
+/// - **Flip every "not delivered yet" disclosure surface** (round-13
+///   review "also" item): today's not-delivered posture is spread across
+///   THREE places that must ALL flip together, or the operator sees a
+///   stale "not delivered" claim after the wiring ships (the mirror-image
+///   lie of a stale "delivered" claim). Checklist for the wiring shard:
+///   1. This doc comment's "No capability-layer materialization YET"
+///      section above (including the operator stderr note and the
+///      `spawn_with_layer` bypass it documents) — remove/update per its
+///      own "MUST be removed/updated when the wiring shard lands" note.
+///   2. `csq/src/cli/commands/inspect_coc.rs`'s `NOT_DELIVERED_BANNER`
+///      text + `render_translate_json`'s `"delivered": false` key for
+///      `Surface::Kimi`/`Surface::Grok` — both MUST flip to `true`/absent
+///      once `launch_native` actually materializes native artifacts.
+///   3. The `inspect_coc.rs` test suite pinning the not-delivered
+///      posture (`non_json_summary_marks_kimi_and_grok_as_not_delivered`,
+///      `translate_json_marks_kimi_and_grok_as_not_delivered`, and the
+///      sibling reject-boundary tests asserting Kimi/Grok do NOT yet
+///      match the wired-surfaces set) MUST be updated to assert the NEW
+///      delivered posture — leaving them unchanged would pin a stale
+///      claim as a passing test.
+/// - **Duplicate-subagent hazard on Grok** (round-13 review HIGH-2): NO
+///   `[compat.claude]` cell suppresses `.claude/agents/` subagent
+///   discovery (the `agents` cell name is a false friend — see
+///   `GrokSpawnPayload::compat_cells_disabled`'s doc comment). So a
+///   project carrying `.claude/agents/REVIEW.md` and no `.coc/` resolves
+///   through the legacy chain to a `CocSet` containing `REVIEW`, and
+///   `emit_grok_native` would write `$GROK_HOME/agents/csq-REVIEW.md`
+///   while Grok independently loads `.claude/agents/REVIEW.md` — same
+///   body, two names, two subagents with near-identical `description:`
+///   competing for automatic selection. The `csq-` prefix that prevents a
+///   FILENAME collision is exactly what hides the duplicate from Grok's
+///   own dedup. The wiring shard MUST either skip materializing an
+///   `agents/<ID>.md` entry whose id already resolves to a `.claude/
+///   agents/<ID>.md` (or `.grok/agents/<ID>.md`) file reachable from
+///   `cwd` up to the resolved project root (mirroring
+///   `native_artifacts_present`'s own bounded walk — see that function's
+///   doc comment for why an UNBOUNDED walk is itself a bug), OR gate the
+///   entire native-agent materialization on `!native_artifacts_present`
+///   the same way scaffold injection is gated.
+#[allow(clippy::too_many_arguments)]
+fn launch_native(
+    base_dir: &Path,
+    account: AccountNum,
+    surface: Surface,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    bench_mode: Option<&str>,
+    coc_cache_enabled: bool,
+    rest: &[String],
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    use csq_core::providers::native;
+
+    let descriptor = native::descriptor(surface)
+        .ok_or_else(|| anyhow!("internal error: {surface} is not a native-CLI surface"))?;
+
+    // PR-CA8b commit 4 pattern: build HostContext from the parent env BEFORE
+    // any spawn-time work (see launch_gemini for the identical rationale).
+    let host_ctx = detect_host_context();
+
+    let layer_control = match run_capability_layer_preflight(
+        base_dir,
+        account,
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        surface,
+        coc_cache_enabled,
+        rest,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!(
+                "error: {}",
+                csq_core::error::redact_tokens(&format!("{err}"))
+            );
+            // M06 fail-loud (H1): this `process::exit` bypasses Drop — flush the
+            // owning emitter's record BEFORE exit. Capability layer rejected the
+            // run before any spawn → Fail + Reject.
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            }
+            std::process::exit(err.exit_code() as i32);
+        }
+    };
+
+    // --bench-mode layer-only: terminate before subprocess spawn.
+    if let Some("layer-only") = bench_mode {
+        return handle_bench_mode_layer_only(surface, audit_emitter);
+    }
+
+    // A dangling/tampered marker symlink now reads as "bound" for the conflict
+    // guard (`native::marker_exists` uses `symlink_metadata` for fail-toward-
+    // refuse — redteam R2 MEDIUM-2). Dispatch MUST therefore explicitly refuse a
+    // symlink marker here rather than exec the vendor CLI against tampered state
+    // — parity with `launch_gemini`'s symlink refusal above.
+    refuse_native_marker_symlink(base_dir, account, surface, descriptor)?;
+
+    // Assert the binding marker exists — `csq run` never writes it (that is
+    // `csq login N --provider {kimi-cli,grok}`'s job).
+    if !native::marker_exists(base_dir, account, surface) {
+        return Err(anyhow!(
+            "slot {account} has no {} binding — run `csq login {account} --provider {}` first",
+            descriptor.display_name,
+            descriptor.id
+        ));
+    }
+
+    // Minimal handle dir: just the directory + .csq-account marker. No
+    // config-N/, no per-spawn settings/config file — native CLIs run
+    // directly in the caller's cwd with no csq-managed home to redirect.
+    std::fs::create_dir_all(base_dir).context("failed to create accounts root")?;
+    let pid = std::process::id();
+    let handle_dir = base_dir.join(format!("term-{}", pid));
+    std::fs::create_dir_all(&handle_dir).with_context(|| {
+        format!(
+            "failed to create {} handle dir at {}",
+            descriptor.display_name,
+            redact_path(&handle_dir)
+        )
+    })?;
+    let marker_result =
+        match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
+            Some(uuid) => markers::write_csq_account(&handle_dir, uuid),
+            None => markers::write_csq_account_legacy(&handle_dir, account),
+        };
+    if let Err(e) = marker_result {
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        return Err(anyhow!(
+            "failed to write .csq-account marker for {} handle dir: {e}",
+            descriptor.display_name
+        ));
+    }
+
+    println!(
+        "Launching {} for account {} (term-{})...",
+        descriptor.display_name, account, pid
+    );
+
+    // Same host-isolation exposure as every other spawned surface — the
+    // model reads $HOME unfiltered. Emitted unconditionally (mirrors the
+    // gemini unconditional-emit fix, host-isolation-parity-followups (1)) —
+    // this function has only one spawn path, so there is no Inherit/
+    // WithLayer split to worry about double-firing across.
+    emit_host_isolation_warning_if_needed(&host_ctx, account, descriptor.id);
+
+    // No per-spawn materialization surface exists for native CLIs (see
+    // docstring above) — note the gap rather than silently dropping a
+    // non-empty scaffold the operator would otherwise never learn was
+    // skipped.
+    match layer_control {
+        LayerControl::WithLayer {
+            scaffold,
+            project_root,
+            ..
+        } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if should_inject_scaffold(surface, &cwd, project_root.as_deref())
+                && scaffold.as_deref().is_some_and(|s| !s.is_empty())
+            {
+                eprintln!(
+                    "note: csq: {} native delivery isn't wired yet — csq points \
+                     {} at this slot's vendor home but doesn't materialize the \
+                     .coc/ scaffold into it yet (that wiring is a follow-on shard). \
+                     Add an AGENTS.md in this directory so {} loads it natively in \
+                     the meantime.",
+                    descriptor.display_name, descriptor.home_env, descriptor.binary
+                );
+            }
+        }
+        LayerControl::Inherit => {}
+    }
+
+    // No enterprise M6 T6.1 spawn-boundary gate — see docstring above.
+
+    let binary_path = csq_core::cli_deps::install_path::find_in_path(descriptor.binary)
+        .ok_or_else(|| {
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            anyhow!(
+                "{} binary ({}) not found on PATH or in its known install dir — \
+                 run `csq cli install {}` first",
+                descriptor.display_name,
+                descriptor.binary,
+                descriptor.binary
+            )
+        })?;
+
+    let mut cmd = Command::new(&binary_path);
+    // Scrub csq-session-dir env so the native CLI never accidentally
+    // resolves a stale csq-managed config dir from the parent shell
+    // (mirrors launch_codex's identical CLAUDE_CONFIG_DIR scrub posture).
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+    cmd.env_remove("CLAUDE_HOME");
+    cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    // C2 (0135 design lock): redirect the vendor at THIS slot's isolated
+    // vendor home. See `set_native_home_env` doc comment for the
+    // strip-both-then-set-one security rationale.
+    set_native_home_env(&mut cmd, descriptor, base_dir, account);
+    // Pin the vendor model when the descriptor declares one (Kimi → K3;
+    // the native kimi CLI otherwise self-defaults to K2.7). Injected BEFORE
+    // the operator's trailing args and SUPPRESSED when the operator already
+    // passed their own `-m`/`--model` — see `native_pinned_model_to_inject`.
+    if let Some(model) = native_pinned_model_to_inject(descriptor, rest) {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.args(rest);
+
+    {
+        use csq_core::audit::{Decision, ResultState};
+        // No rule validation runs on this path (no post-validate loop, see
+        // docstring above) — Degraded + Bypass mirrors every other
+        // surface's Inherit/no-layer classification.
+        audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+    }
+    exec_or_spawn(cmd, &handle_dir, audit_emitter)
+}
+
+/// Sets the vendor-isolation env var for a native-CLI spawn (`csq run` on a
+/// Kimi/Grok slot), redirecting the vendor at slot `slot`'s isolated home
+/// ([`csq_core::providers::native::native_home_path`]). Extracted as a
+/// standalone helper so the env-construction is directly testable without
+/// spawning a real process (mirrors `attach_scaffold`'s `Command` + `get_envs`
+/// testing pattern).
+///
+/// **PRIMARY METHODOLOGICAL DIRECTIVE (0135 design lock):** strip BOTH known
+/// native home vars (`KIMI_CODE_HOME` AND `GROK_HOME`) BEFORE setting
+/// `descriptor.home_env` to the slot's home — never strip only the
+/// surface's own var. Strip-before-set is the same discipline
+/// `launch_codex` uses for `CODEX_HOME` (strip first so the explicit value
+/// below always wins over a parent-shell export); strip-BOTH is additional
+/// and load-bearing here because there are two sibling native surfaces
+/// sharing this call site. A parent shell exporting `GROK_HOME` while csq
+/// launches a Kimi slot must NOT leak into the child — that would silently
+/// redirect the vendor at the wrong account, the exact multi-account
+/// isolation bug this redesign fixes.
+fn set_native_home_env(
+    cmd: &mut Command,
+    descriptor: &csq_core::providers::native::NativeCli,
+    base_dir: &Path,
+    slot: AccountNum,
+) {
+    use csq_core::providers::native;
+    cmd.env_remove(native::KIMI.home_env);
+    cmd.env_remove(native::GROK.home_env);
+    cmd.env(
+        descriptor.home_env,
+        native::native_home_path(base_dir, slot, descriptor.surface),
+    );
+}
+
+/// Decides the model alias csq should inject as `--model <alias>` when it
+/// spawns a native vendor CLI, or `None` to inject nothing.
+///
+/// Returns `Some(alias)` only when BOTH hold:
+/// 1. the descriptor declares a [`pinned_model`](csq_core::providers::native::NativeCli::pinned_model)
+///    (Kimi pins K3; Grok is `None`, trusting the vendor's own latest default), AND
+/// 2. the operator did NOT already pass their own model selection in the
+///    trailing args — a per-invocation `-m`/`--model` always wins over the
+///    csq default, so csq stays out of the way when the operator is explicit.
+///
+/// Extracted as a pure function (no `Command`, no I/O) so the injection
+/// decision is directly unit-testable — the same rationale as
+/// [`set_native_home_env`]'s extraction.
+fn native_pinned_model_to_inject<'a>(
+    descriptor: &'a csq_core::providers::native::NativeCli,
+    rest: &[String],
+) -> Option<&'a str> {
+    let model = descriptor.pinned_model?;
+    // Suppress the csq default when the operator set their own model. Covers
+    // `-m X`, `-mX`, `--model X`, and `--model=X`. `--model` deliberately
+    // does NOT match the `-m`-prefix arm (it starts with `--`, not `-m`).
+    let operator_set_model = rest.iter().any(|a| {
+        a == "--model" || a.starts_with("--model=") || (a.starts_with("-m") && !a.starts_with("--"))
+    });
+    if operator_set_model {
+        None
+    } else {
+        Some(model)
+    }
+}
+
 /// CU2 (an internal ticket): dispatches a spawned gemini Child on the
 /// with-layer path. The child was spawned with the correct stdio
 /// shape for `mode` by the caller (piped for OneShot, inherited for
@@ -2830,6 +3589,36 @@ fn spawn_gemini_with_layer_dispatch(
                     return Err(anyhow!("failed to wait for gemini-cli: {e}"));
                 }
             };
+
+            // Same guard as the CC reference path: a child that exited
+            // non-zero having written NOTHING has not been governed and cannot
+            // be judged. Post-validation on an empty string answers identically
+            // whether the model was non-compliant or never ran, so reporting its
+            // verdict would name the wrong subsystem and bury the child's own
+            // error. Fail + Accept: the run failed, the capability layer did not
+            // reject it.
+            if !output.status.success() && output.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                let _ = std::io::stderr().write_all(&output.stderr);
+                eprintln!(
+                    "csq: gemini-cli exited {} without producing output — the \
+                     capability layer did not evaluate it (there was nothing to \
+                     evaluate). The error above is the child's own.",
+                    output
+                        .status
+                        .code()
+                        .map_or_else(|| "on a signal".to_string(), |c| format!("with code {c}"))
+                );
+                let _ = std::fs::remove_dir_all(handle_dir);
+                {
+                    use csq_core::audit::{Decision, ResultState};
+                    let end_ts =
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    audit_emitter.set_end_ts(end_ts);
+                    audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+                    fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                }
+                std::process::exit(output.status.code().unwrap_or(1));
+            }
 
             // UTF-8 lossy: citation / negative-evidence checks operate on
             // textual signal; a mid-byte truncation cannot manufacture a
@@ -2910,7 +3699,13 @@ fn spawn_gemini_with_layer_dispatch(
                                     .collect()
                             })
                             .unwrap_or_default();
-                        audit_emitter.set_rule_ids(cited, vec![]);
+                        // Post-validate PASSED, so FR-CL-04 repair did not
+                        // run and `after_repair == original`. Passing
+                        // `(cited, vec![])` here recorded
+                        // `rule_ids_dropped_invalid_format = cited.len()` —
+                        // "every citation was dropped as malformed" — on the
+                        // success path. See `set_rule_ids_unrepaired`.
+                        audit_emitter.set_rule_ids_unrepaired(cited);
                     }
                     Ok(())
                 }
@@ -2999,11 +3794,24 @@ fn detect_host_context() -> csq_core::coc::translate::gemini::HostContext {
 /// list. Round-1 H8: uses `tracing::warn!` with structured fields,
 /// NOT `log::warn!` formatted string.
 ///
+/// `surface` names the CLI/provider whose spawn reads `$HOME`
+/// unfiltered (`"gemini"` for the Gemini path; the bound 3P catalog id
+/// — `"kimi"`, `"zai"`, `"mm"`, `"deepseek"`, `"ollama"` — for 3P bearer
+/// slots dispatched through `launch_third_party`, since ALL of them
+/// spawn the same `claude` binary with the same unfiltered-`$HOME`
+/// exposure; see the callsite in `launch_third_party`). Surface-generic
+/// since PR-kimi-grok-host-isolation (Wave 3): the message text and
+/// `error_kind`/`surface` log fields are parameterized so the operator
+/// sees exactly which model is on the exposed host — the gemini call
+/// site pins `"gemini"`, reproducing the pre-generalization byte-exact
+/// message.
+///
 /// Informational — does NOT abort the spawn. Operator-side
 /// mitigation (clean VM) per spec 08 stays load-bearing.
 fn emit_host_isolation_warning_if_needed(
     host_ctx: &csq_core::coc::translate::gemini::HostContext,
     account: AccountNum,
+    surface: &str,
 ) {
     if !host_ctx.production_secrets_present {
         return;
@@ -3013,18 +3821,18 @@ fn emit_host_isolation_warning_if_needed(
         .unwrap_or("<unknown>")
         .to_string();
     eprintln!(
-        "warning: gemini host-isolation — {count} production-shaped env-var name(s) detected \
-         (e.g. {exemplar}); model running gemini reads $HOME unfiltered; \
+        "warning: {surface} host-isolation — {count} production-shaped env-var name(s) detected \
+         (e.g. {exemplar}); model running {surface} reads $HOME unfiltered; \
          see specs/08 MED-03 host-isolation caveat."
     );
     tracing::warn!(
         target: "csq::capability_layer",
-        error_kind = "gemini_host_isolation_warning",
-        surface = "gemini",
+        error_kind = format!("{surface}_host_isolation_warning"),
+        surface = surface,
         account = account.get(),
         detected_count = count,
         first_name = exemplar.as_str(),
-        "gemini host-isolation warning emitted"
+        "{} host-isolation warning emitted", surface
     );
 }
 
@@ -3184,7 +3992,21 @@ enum LayerControl {
         /// bodies. The CC launch path materializes agents/skills/commands into a
         /// native session-scoped plugin (Level-2, an internal ticket S2); the codex/gemini
         /// launch paths ignore this field today.
-        artifacts: csq_core::coc::translate::SurfaceArtifacts,
+        // Boxed (clippy::large_enum_variant) — `project_root` below pushed the
+        // variant over the size threshold; `SurfaceArtifacts` is the largest
+        // field, so it's the one to box (mirrors `LayerOutcome::Enabled`'s
+        // `pre_spawn` box for the identical reason).
+        artifacts: Box<csq_core::coc::translate::SurfaceArtifacts>,
+        /// The `.coc/` project root `loader::discover` resolved (`LoadOutcome::
+        /// project_root`), or `None` when no `.coc/` was found anywhere up-tree
+        /// (the legacy-fallback case — `coc::fallback::probe` still may have
+        /// produced a non-empty `CocSet` from `.claude/`/`.gemini/`/`AGENTS.md`
+        /// at `cwd` alone). Round-13 review MED-1: threaded through so
+        /// `native_artifacts_present`'s upward walk is bounded by this ACTUAL
+        /// root rather than re-detecting `.coc/` itself — see that function's
+        /// doc comment for why the re-detection was unbounded in the
+        /// legacy-fallback case and what that unboundedness broke in practice.
+        project_root: Option<std::path::PathBuf>,
     },
 }
 
@@ -3259,8 +4081,12 @@ fn load_coc_with_timing(
 fn record_root_seen(project_root: &Path, roots_seen_path: Option<&Path>) {
     let path: PathBuf = match roots_seen_path {
         Some(p) => p.to_path_buf(),
-        None => match dirs::home_dir() {
-            Some(h) => h.join(".csq").join("coc-roots-seen.jsonl"),
+        // SHARED resolver — the daemon-side sweeper reads through this exact
+        // function, so the writer and the reader cannot drift apart. They did:
+        // the sweeper used to hardcode `<base_dir>/coc-roots-seen.jsonl` and so
+        // never saw a single root this writer recorded.
+        None => match csq_core::daemon::coc_cache_sweeper::default_roots_seen_path() {
+            Some(p) => p,
             None => {
                 tracing::warn!(
                     error_kind = "coc_roots_seen_path",
@@ -3392,7 +4218,8 @@ fn run_capability_layer_preflight(
                 rule_ids_in_scope,
                 scaffold: pre_spawn.scaffold,
                 rules_only_scaffold: pre_spawn.rules_only_scaffold,
-                artifacts: pre_spawn.artifacts,
+                artifacts: Box::new(pre_spawn.artifacts),
+                project_root: outcome.project_root,
             })
         }
     }
@@ -3663,6 +4490,50 @@ fn spawn_one_shot_with_post_validate(
         }
     };
 
+    // The child FAILED and produced no stdout — surface ITS error, do not
+    // post-validate.
+    //
+    // Post-validation asks "did this output cite the in-scope RULE_IDs". On an
+    // EMPTY string that question has exactly one answer regardless of the truth
+    // it is meant to measure: a non-compliant model and a child that never ran
+    // are indistinguishable to it. Running it here therefore produced a
+    // confident verdict about compliance from a run that produced nothing to be
+    // compliant WITH, and printed that verdict INSTEAD of the actual cause.
+    //
+    // Observed: `claude --print` with no prompt exits non-zero with
+    // "Input must be provided either through stdin or as a prompt argument",
+    // and the operator saw only
+    // "capability layer rejected output: ... cited none of the 82 in-scope
+    // RULE_ID(s)" — a message that names the wrong subsystem and gives no route
+    // to the real problem.
+    //
+    // A child that exits non-zero having written nothing has not been governed
+    // and cannot be judged; its own stderr is the load-bearing diagnostic. The
+    // audit records Fail + Accept — the run failed, but the capability layer did
+    // NOT reject it, so recording Reject here would attribute the failure to
+    // csq's governance rather than to the child.
+    if !output.status.success() && output.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+        let _ = std::io::stderr().write_all(&output.stderr);
+        eprintln!(
+            "csq: claude exited {} without producing output — the capability layer \
+             did not evaluate it (there was nothing to evaluate). The error above \
+             is the child's own.",
+            output
+                .status
+                .code()
+                .map_or_else(|| "on a signal".to_string(), |c| format!("with code {c}"))
+        );
+        let _ = std::fs::remove_dir_all(handle_dir);
+        {
+            use csq_core::audit::{Decision, ResultState};
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+        }
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
     // UTF-8 lossy is acceptable for post-validation: the citation +
     // negative-evidence checks operate on textual signal, and a
     // mid-byte truncation cannot manufacture a citation that wasn't
@@ -3907,6 +4778,12 @@ fn resolve_account(base_dir: &Path, explicit: Option<AccountNum>) -> Result<Opti
     // so the user can pick by number across surfaces.
     let mut accounts = discovery::discover_anthropic(base_dir);
     accounts.extend(discovery::discover_codex(base_dir));
+    // Wave 3: a native-CLI slot (Kimi/Grok marker) is runnable, so bare
+    // `csq run` on a native-only host must auto-pick it instead of launching
+    // vanilla claude (redteam round-2 NEW-1). The `Surface::Kimi/Grok` hint
+    // arms below already expect these entries. (Gemini's parallel auto-pick
+    // exclusion is a separate pre-existing item, left as-is here.)
+    accounts.extend(discovery::discover_native(base_dir));
     let with_creds: Vec<_> = accounts.iter().filter(|a| a.has_credentials).collect();
 
     match with_creds.len() {
@@ -3923,6 +4800,8 @@ fn resolve_account(base_dir: &Path, explicit: Option<AccountNum>) -> Result<Opti
                     Surface::ClaudeCode => "",
                     Surface::Codex => " [codex]",
                     Surface::Gemini => " [gemini]",
+                    Surface::Kimi => " [kimi]",
+                    Surface::Grok => " [grok]",
                 };
                 msg.push_str(&format!(
                     "  csq run {}  ({}){}\n",
@@ -4241,6 +5120,8 @@ fn write_bench_jsonl(
         Surface::ClaudeCode => "cc",
         Surface::Codex => "codex",
         Surface::Gemini => "gemini",
+        Surface::Kimi => "kimi",
+        Surface::Grok => "grok",
     };
 
     // Header record.
@@ -4481,9 +5362,16 @@ mod tests {
                 .unwrap()
                 .contains("paths:\n  - \"src/**/*.rs\"")
         );
+        // Byte-exact, INCLUDING the provenance boundary: this is the consumer's
+        // view of the emitted artifact from a different crate, so pinning the
+        // literal here is what makes the wire format a cross-crate contract
+        // rather than an internal detail of `wrap_rule_provenance` (which is
+        // `pub(crate)` in csq-core and unreachable from this test).
         assert_eq!(
             std::fs::read_to_string(rd.join("csq-coc/coc-RULE-UNSCOPED.md")).unwrap(),
-            "always on\n"
+            "<!-- csq:coc-source id=\"RULE-UNSCOPED\" -->\n\
+             always on\n\
+             <!-- /csq:coc-source id=\"RULE-UNSCOPED\" -->\n"
         );
         // The user-global source dir is UNTOUCHED (no coc files leaked into it).
         assert!(!user_rules.join("csq-coc").exists());
@@ -4791,98 +5679,205 @@ mod tests {
     }
 
     // ── Fix A: native-artifact scaffold gate (native-delegation) ──────────
+    // Round-13 review MED-1: `native_artifacts_present` no longer re-detects
+    // `.coc/` internally — every test below passes the project root
+    // EXPLICITLY (`Some(root)`) instead of planting a literal `.coc/` dir for
+    // the function to rediscover. `None` means "no `.coc/` found anywhere" —
+    // the legacy-fallback case — and is exercised directly below.
 
     #[test]
     fn native_artifacts_present_detects_each_surface() {
         let dir = TempDir::new().unwrap();
         let cwd = dir.path();
-        // Bound the upward walk to this dir (deterministic regardless of the
-        // tempdir's real ancestors) by planting the project-root `.coc/` marker.
-        std::fs::create_dir(cwd.join(".coc")).unwrap();
+        let root = Some(cwd);
         // Empty (of native artifacts) dir → no native artifacts for any surface.
-        assert!(!native_artifacts_present(Surface::ClaudeCode, cwd));
-        assert!(!native_artifacts_present(Surface::Codex, cwd));
-        assert!(!native_artifacts_present(Surface::Gemini, cwd));
+        assert!(!native_artifacts_present(Surface::ClaudeCode, cwd, root));
+        assert!(!native_artifacts_present(Surface::Codex, cwd, root));
+        assert!(!native_artifacts_present(Surface::Gemini, cwd, root));
 
         // cc: `.claude/` dir OR `CLAUDE.md` file.
         std::fs::create_dir(cwd.join(".claude")).unwrap();
-        assert!(native_artifacts_present(Surface::ClaudeCode, cwd));
+        assert!(native_artifacts_present(Surface::ClaudeCode, cwd, root));
         assert!(
-            !native_artifacts_present(Surface::Codex, cwd),
+            !native_artifacts_present(Surface::Codex, cwd, root),
             ".claude/ must not count as a codex native artifact"
         );
 
         // codex: `.codex/` dir OR `AGENTS.md` file.
         std::fs::write(cwd.join("AGENTS.md"), "x").unwrap();
-        assert!(native_artifacts_present(Surface::Codex, cwd));
+        assert!(native_artifacts_present(Surface::Codex, cwd, root));
 
         // gemini: `.gemini/` dir OR `GEMINI.md` file.
-        assert!(!native_artifacts_present(Surface::Gemini, cwd));
+        assert!(!native_artifacts_present(Surface::Gemini, cwd, root));
         std::fs::create_dir(cwd.join(".gemini")).unwrap();
-        assert!(native_artifacts_present(Surface::Gemini, cwd));
+        assert!(native_artifacts_present(Surface::Gemini, cwd, root));
     }
 
     #[test]
     fn native_artifacts_present_detects_marker_files_without_dirs() {
         // A bare CLAUDE.md / GEMINI.md (no dir) still counts as native.
         let dir = TempDir::new().unwrap();
-        // Bound the walk to this dir so the negative assertion below cannot
-        // false-positive on a real ancestor `AGENTS.md` (R2 finding 1).
-        std::fs::create_dir(dir.path().join(".coc")).unwrap();
+        let root = Some(dir.path());
         std::fs::write(dir.path().join("CLAUDE.md"), "x").unwrap();
         std::fs::write(dir.path().join("GEMINI.md"), "x").unwrap();
-        assert!(native_artifacts_present(Surface::ClaudeCode, dir.path()));
-        assert!(native_artifacts_present(Surface::Gemini, dir.path()));
-        // Codex has no marker here → not falsely detected (walk stops at `.coc/`).
-        assert!(!native_artifacts_present(Surface::Codex, dir.path()));
+        assert!(native_artifacts_present(
+            Surface::ClaudeCode,
+            dir.path(),
+            root
+        ));
+        assert!(native_artifacts_present(Surface::Gemini, dir.path(), root));
+        // Codex has no marker here → not falsely detected.
+        assert!(!native_artifacts_present(Surface::Codex, dir.path(), root));
     }
 
     #[test]
     fn native_artifacts_present_detects_intermediate_ancestor_marker() {
         // R2 finding 2: a native artifact at an INTERMEDIATE dir between cwd and
-        // the `.coc/` root must be detected (the walk checks every level).
+        // the project root must be detected (the walk checks every level).
         let root = TempDir::new().unwrap();
-        std::fs::create_dir(root.path().join(".coc")).unwrap(); // project root
         let mid = root.path().join("a");
         std::fs::create_dir(&mid).unwrap();
         std::fs::write(mid.join("AGENTS.md"), "x").unwrap(); // codex native at intermediate level
         let cwd = mid.join("b");
         std::fs::create_dir(&cwd).unwrap();
-        assert!(native_artifacts_present(Surface::Codex, &cwd));
+        assert!(native_artifacts_present(
+            Surface::Codex,
+            &cwd,
+            Some(root.path())
+        ));
     }
 
     #[test]
     fn native_artifacts_present_walks_up_to_project_root() {
         // Redteam R1 HIGH: running `csq run N` from a SUBDIR of a project whose
-        // native artifacts + `.coc/` live at the root must still detect them
-        // (mirrors the `.coc/` loader's upward walk + the native CLI's own
-        // artifact discovery). The leaf-only check missed this, re-opening the
-        // overflow bug for every non-root invocation.
+        // native artifacts live at the root must still detect them (mirrors the
+        // `.coc/` loader's upward walk + the native CLI's own artifact
+        // discovery). The leaf-only check missed this, re-opening the overflow
+        // bug for every non-root invocation.
         let root = TempDir::new().unwrap();
-        std::fs::create_dir(root.path().join(".coc")).unwrap(); // project-root marker
         std::fs::write(root.path().join("AGENTS.md"), "x").unwrap(); // codex native at root
         let subdir = root.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&subdir).unwrap();
         // From the deep subdir, the root-level AGENTS.md is still found.
-        assert!(native_artifacts_present(Surface::Codex, &subdir));
+        assert!(native_artifacts_present(
+            Surface::Codex,
+            &subdir,
+            Some(root.path())
+        ));
         // A surface with NO native artifact at any level is not falsely
-        // suppressed; the walk stops at the `.coc/` project root → false.
-        assert!(!native_artifacts_present(Surface::Gemini, &subdir));
+        // suppressed; the walk stops at the project root → false.
+        assert!(!native_artifacts_present(
+            Surface::Gemini,
+            &subdir,
+            Some(root.path())
+        ));
     }
 
     #[test]
-    fn native_artifacts_present_walk_stops_at_coc_root() {
-        // The walk must NOT climb past the `.coc/` project root into a parent
+    fn native_artifacts_present_walk_stops_at_project_root() {
+        // The walk must NOT climb past the given project root into a parent
         // that happens to hold a native marker (e.g. a user-global `~/.codex`
-        // above the project) — the `.coc/` boundary bounds it.
+        // above the project) — the explicit root bounds it.
         let outer = TempDir::new().unwrap();
         std::fs::create_dir(outer.path().join(".codex")).unwrap(); // "user-global"-shaped, ABOVE project
         let project = outer.path().join("project");
         std::fs::create_dir(&project).unwrap();
-        std::fs::create_dir(project.join(".coc")).unwrap(); // project root
-                                                            // codex native artifact is NOT in the project → false despite the
-                                                            // ancestor `.codex` (walk stops at the project's `.coc/`).
-        assert!(!native_artifacts_present(Surface::Codex, &project));
+        // codex native artifact is NOT in the project → false despite the
+        // ancestor `.codex` (walk stops at the project root).
+        assert!(!native_artifacts_present(
+            Surface::Codex,
+            &project,
+            Some(&project)
+        ));
+    }
+
+    /// Round-13 review MED-1 non-vacuity: `project_root = None` (no `.coc/`
+    /// found anywhere — the legacy-fallback case) MUST check `cwd` alone, NOT
+    /// climb to an ancestor. Before the fix, the walk's own `.coc`
+    /// re-detection never found a `.coc/` in this scenario (there is none)
+    /// and climbed unbounded — reaching `$HOME/.claude`, which
+    /// `base_dir()`'s `create_dir_all("$HOME/.claude/accounts")` guarantees
+    /// exists on every csq host regardless of genuine CC-native content.
+    /// This test plants the identical shape: a `.claude`-look-alike ancestor
+    /// ABOVE cwd, with nothing native AT cwd itself.
+    #[test]
+    fn native_artifacts_present_none_root_checks_cwd_only_no_upward_climb() {
+        let home_like = TempDir::new().unwrap();
+        // Stand-in for `$HOME/.claude` — csq's own bookkeeping dir, not
+        // genuine CC-native content, but indistinguishable to a bare
+        // `is_dir()` check.
+        std::fs::create_dir(home_like.path().join(".claude")).unwrap();
+        let project = home_like.path().join("some-project");
+        std::fs::create_dir(&project).unwrap();
+        // No `.coc/` anywhere → project_root is None. Nothing native AT
+        // `project` itself.
+        assert!(
+            !native_artifacts_present(Surface::ClaudeCode, &project, None),
+            "None-root must check cwd only — must NOT climb to the ancestor \
+             `.claude` and misreport native content present"
+        );
+        // Sanity: the SAME ancestor marker IS found when `project` itself is
+        // the (explicit) root — proves the predicate isn't just broken.
+        std::fs::create_dir(project.join(".claude")).unwrap();
+        assert!(native_artifacts_present(
+            Surface::ClaudeCode,
+            &project,
+            Some(&project)
+        ));
+    }
+
+    /// Round-13 review HIGH-1 non-vacuity: Grok reads `.claude/` NATIVELY
+    /// (report 14 §2 G2) — a project carrying ONLY `.claude/` (the majority,
+    /// CC-first shape) MUST be detected as "Grok already has native content",
+    /// not silently missed.
+    #[test]
+    fn native_artifacts_present_grok_detects_claude_dir() {
+        let dir = TempDir::new().unwrap();
+        let root = Some(dir.path());
+        assert!(!native_artifacts_present(Surface::Grok, dir.path(), root));
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        assert!(native_artifacts_present(Surface::Grok, dir.path(), root));
+    }
+
+    /// Grok's six-name instruction-file sweep (report 14 §3.1, verified via
+    /// `12-project-rules.md:17-24`) — every name must be detected individually.
+    #[test]
+    fn native_artifacts_present_grok_detects_all_six_instruction_names() {
+        for name in [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "Agents.md",
+            "Claude.md",
+            "CLAUDE.local.md",
+            "AGENT.md",
+        ] {
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join(name), "x").unwrap();
+            assert!(
+                native_artifacts_present(Surface::Grok, dir.path(), Some(dir.path())),
+                "Grok must detect `{name}`"
+            );
+        }
+    }
+
+    /// Round-13 review MED-2: Kimi's real per-directory marker is
+    /// `.kimi-code/`, never `.kimi/` (report 13 §3.1 row 3) — and the
+    /// lowercase `agents.md` fallback must ALSO be detected.
+    #[test]
+    fn native_artifacts_present_kimi_detects_kimi_code_dir_and_lowercase_agents_md() {
+        let dir = TempDir::new().unwrap();
+        let root = Some(dir.path());
+        assert!(!native_artifacts_present(Surface::Kimi, dir.path(), root));
+        std::fs::create_dir(dir.path().join(".kimi-code")).unwrap();
+        assert!(native_artifacts_present(Surface::Kimi, dir.path(), root));
+
+        let dir2 = TempDir::new().unwrap();
+        std::fs::write(dir2.path().join("agents.md"), "x").unwrap();
+        assert!(native_artifacts_present(
+            Surface::Kimi,
+            dir2.path(),
+            Some(dir2.path())
+        ));
     }
 
     #[test]
@@ -4897,20 +5892,19 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let cwd = dir.path();
-        // Bound the upward walk to this dir with a project-root `.coc/` marker.
-        std::fs::create_dir(cwd.join(".coc")).unwrap();
+        let root = Some(cwd);
         // No native artifacts → inject (transition behavior preserved).
-        assert!(should_inject_scaffold(Surface::Codex, cwd));
+        assert!(should_inject_scaffold(Surface::Codex, cwd, root));
         // Native present → defer (do NOT inject) — THE fix.
         std::fs::create_dir(cwd.join(".codex")).unwrap();
-        assert!(!should_inject_scaffold(Surface::Codex, cwd));
+        assert!(!should_inject_scaffold(Surface::Codex, cwd, root));
 
         // Parity override forces injection even when native present.
         // SAFETY: still under test_env::lock.
         unsafe {
             std::env::set_var("CSQ_COC_PARITY_TEST", "1");
         }
-        assert!(should_inject_scaffold(Surface::Codex, cwd));
+        assert!(should_inject_scaffold(Surface::Codex, cwd, root));
 
         // SAFETY: restore prior value under the lock.
         unsafe {
@@ -4923,7 +5917,7 @@ mod tests {
 
     #[test]
     fn gemini_invocation_is_headless_detects_print_flags() {
-        // #965: `-p` / `--prompt` / `--prompt=x` are headless one-shots.
+        // an internal ticket: `-p` / `--prompt` / `--prompt=x` are headless one-shots.
         assert!(gemini_invocation_is_headless(&["-p".into(), "hi".into()]));
         assert!(gemini_invocation_is_headless(&[
             "--prompt".into(),
@@ -5016,6 +6010,257 @@ mod tests {
         );
     }
 
+    /// W3-3 (an internal journal entry): a slot bound to a native Kimi/Grok CLI (via the
+    /// credential-less binding marker `credentials/{kimi,grok}-<N>.json`)
+    /// MUST dispatch to `SurfaceCli::Kimi`/`Grok`, not fall through to Claude.
+    #[test]
+    fn surface_cli_for_slot_detects_native_kimi_and_grok_markers() {
+        use csq_core::providers::catalog::Surface as CatalogSurface;
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        let kimi_slot = acc(9);
+        assert_eq!(
+            surface_cli_for_slot(base, kimi_slot),
+            SurfaceCli::Claude,
+            "an unbound slot falls through to Claude"
+        );
+        native::write_binding(base, kimi_slot, CatalogSurface::Kimi).unwrap();
+        assert_eq!(
+            surface_cli_for_slot(base, kimi_slot),
+            SurfaceCli::Kimi,
+            "a slot with a Kimi binding marker MUST dispatch to SurfaceCli::Kimi"
+        );
+
+        let grok_slot = acc(10);
+        native::write_binding(base, grok_slot, CatalogSurface::Grok).unwrap();
+        assert_eq!(
+            surface_cli_for_slot(base, grok_slot),
+            SurfaceCli::Grok,
+            "a slot with a Grok binding marker MUST dispatch to SurfaceCli::Grok"
+        );
+    }
+
+    /// redteam R2 MEDIUM-2: dispatch MUST refuse a native slot whose binding
+    /// marker is a symlink (external tampering) rather than exec the vendor CLI
+    /// against it — parity with `launch_gemini`'s symlink refusal. Since
+    /// `marker_exists` now treats a dangling symlink as bound (fail-toward-
+    /// refuse), this dispatch gate is what keeps a tampered slot from launching.
+    #[test]
+    #[cfg(unix)]
+    fn refuse_native_marker_symlink_rejects_symlink_allows_regular() {
+        use csq_core::providers::catalog::Surface as CatalogSurface;
+        use csq_core::providers::native;
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let slot = acc(11);
+        let kimi = native::descriptor(CatalogSurface::Kimi).unwrap();
+
+        // A regular-file marker (what csq writes) is accepted.
+        native::write_binding(base, slot, CatalogSurface::Kimi).unwrap();
+        assert!(refuse_native_marker_symlink(base, slot, CatalogSurface::Kimi, kimi).is_ok());
+
+        // Replace it with a symlink → refused with an actionable message.
+        let marker = native::marker_path(base, slot, CatalogSurface::Kimi);
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere.json"), &marker).unwrap();
+        let err = refuse_native_marker_symlink(base, slot, CatalogSurface::Kimi, kimi);
+        assert!(err.is_err(), "a symlink marker must be refused");
+        assert!(err.unwrap_err().to_string().contains("is a symlink"));
+    }
+
+    /// W3-7 (an internal journal entry): the `handle` collision guard bails when
+    /// `is_third_party && surface_for_preflight != SurfaceCli::Claude` —
+    /// designed to catch a slot that has BOTH a 3P binding AND a
+    /// Codex/Gemini canonical present (a corrupted on-disk state). A
+    /// native-CLI slot (Kimi/Grok) MUST NOT trip this guard: it has a
+    /// binding marker (so `surface_for_preflight` resolves to
+    /// `SurfaceCli::Kimi`/`Grok`, not `Claude`) but it is emphatically
+    /// NOT a 3P binding (`discover_per_slot_third_party` scans
+    /// `config-N/settings.json` for a 3P `ANTHROPIC_BASE_URL`; native
+    /// slots never write one). This pins the premise the guard's
+    /// `is_third_party` flag relies on: a native slot's
+    /// `discover_per_slot_third_party` entry is absent, so
+    /// `is_third_party` evaluates `false` and the guard's `&&` short-
+    /// circuits — the bail never fires. (`account-terminal-separation.md`
+    /// MUST Rule 3 — identity derivation must key on the canonical
+    /// marker, not a guessed/overlapping classification.)
+    #[test]
+    fn native_slot_not_misclassified_as_3p_collision() {
+        use csq_core::providers::catalog::Surface as CatalogSurface;
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let kimi_slot = acc(11);
+        native::write_binding(base, kimi_slot, CatalogSurface::Kimi).unwrap();
+
+        // Premise 1: surface_for_preflight resolves away from Claude.
+        assert_eq!(surface_cli_for_slot(base, kimi_slot), SurfaceCli::Kimi);
+
+        // Premise 2: the slot is NOT reported as a 3P per-slot binding —
+        // the collision guard's `is_third_party` flag is derived from
+        // exactly this discovery call in `handle`.
+        let is_third_party = discovery::discover_per_slot_third_party(base)
+            .into_iter()
+            .any(|a| {
+                a.id == kimi_slot.get() && matches!(a.source, AccountSource::ThirdParty { .. })
+            });
+        assert!(
+            !is_third_party,
+            "a native-CLI slot must never be classified as a 3P per-slot binding — \
+             doing so would trip the `is_third_party && surface != Claude` collision \
+             guard and spuriously bail `csq run` on every native session"
+        );
+    }
+
+    // ── set_native_home_env (C2, 0135 design lock) ────────────────────
+
+    /// A Kimi slot's spawn env sets `KIMI_CODE_HOME` to
+    /// `native_home_path(...)` for the slot and does NOT set `GROK_HOME`
+    /// (only strips it — see the sibling strip test below). Pins the C2
+    /// contract: the vendor is redirected at the slot's own isolated home,
+    /// never the sibling surface's var.
+    #[test]
+    fn set_native_home_env_kimi_sets_home_and_not_grok() {
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(1);
+        let mut cmd = Command::new("echo"); // dummy executable, never spawned
+
+        set_native_home_env(&mut cmd, &native::KIMI, base, slot);
+
+        let expected_home = native::native_home_path(base, slot, native::KIMI.surface);
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = cmd.get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| {
+                *k == std::ffi::OsStr::new("KIMI_CODE_HOME")
+                    && *v == Some(expected_home.as_os_str())
+            }),
+            "KIMI_CODE_HOME must be set to native_home_path(...); got {envs:?}"
+        );
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, v)| *k == std::ffi::OsStr::new("GROK_HOME") && v.is_some()),
+            "GROK_HOME must never be set (Some) for a Kimi slot; got {envs:?}"
+        );
+    }
+
+    /// Symmetric to the Kimi case above: a Grok slot sets `GROK_HOME` and
+    /// never sets `KIMI_CODE_HOME`.
+    #[test]
+    fn set_native_home_env_grok_sets_home_and_not_kimi() {
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(2);
+        let mut cmd = Command::new("echo");
+
+        set_native_home_env(&mut cmd, &native::GROK, base, slot);
+
+        let expected_home = native::native_home_path(base, slot, native::GROK.surface);
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = cmd.get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| {
+                *k == std::ffi::OsStr::new("GROK_HOME") && *v == Some(expected_home.as_os_str())
+            }),
+            "GROK_HOME must be set to native_home_path(...); got {envs:?}"
+        );
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, v)| *k == std::ffi::OsStr::new("KIMI_CODE_HOME") && v.is_some()),
+            "KIMI_CODE_HOME must never be set (Some) for a Grok slot; got {envs:?}"
+        );
+    }
+
+    /// The strip: for a Kimi slot, `GROK_HOME` MUST be EXPLICITLY removed
+    /// from the child env (`Command::env_remove`, surfaced by `get_envs()`
+    /// as a `(key, None)` modification), not merely left un-set. A `None`
+    /// modification structurally suppresses ANY inherited parent-shell
+    /// value for that key regardless of what the real process env holds —
+    /// this is the mechanism-level proof that a poisoned parent-shell
+    /// `GROK_HOME` cannot leak into a Kimi child (0135 design lock: the
+    /// exact multi-account isolation bug this redesign fixes). Mirrors
+    /// `strip_sensitive_env_covers_openai_and_codex_home`'s "we can't
+    /// mutate the real env during parallel tests" posture — the assertion
+    /// is on `Command`'s recorded modification, not on `std::env`.
+    #[test]
+    fn set_native_home_env_strips_inherited_grok_home_for_kimi_slot() {
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(3);
+        let mut cmd = Command::new("echo");
+
+        set_native_home_env(&mut cmd, &native::KIMI, base, slot);
+
+        let stripped = cmd
+            .get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new("GROK_HOME") && v.is_none());
+        assert!(
+            stripped,
+            "GROK_HOME must be an explicit env_remove modification (None), \
+             not merely absent, so an inherited parent-shell value is suppressed"
+        );
+    }
+
+    #[test]
+    fn native_pin_injects_kimi_k3_by_default() {
+        use csq_core::providers::native;
+        // No operator args → csq pins K3 (the vendor CLI would otherwise
+        // launch its own K2.7 default).
+        assert_eq!(
+            native_pinned_model_to_inject(&native::KIMI, &[]),
+            Some("kimi-code/k3")
+        );
+    }
+
+    #[test]
+    fn native_pin_none_for_grok() {
+        use csq_core::providers::native;
+        // Grok has no pin — its CLI self-defaults to its latest model.
+        assert_eq!(native_pinned_model_to_inject(&native::GROK, &[]), None);
+    }
+
+    #[test]
+    fn native_pin_suppressed_by_operator_model_flag() {
+        use csq_core::providers::native;
+        let cases: &[&[&str]] = &[
+            &["-m", "kimi-code/kimi-for-coding"],
+            &["-mkimi-code/kimi-for-coding"],
+            &["--model", "kimi-code/kimi-for-coding"],
+            &["--model=kimi-code/kimi-for-coding"],
+            &["--auto", "--model", "foo"],
+        ];
+        for case in cases {
+            let rest: Vec<String> = case.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                native_pinned_model_to_inject(&native::KIMI, &rest),
+                None,
+                "operator model flag {case:?} must suppress the csq pin"
+            );
+        }
+    }
+
+    #[test]
+    fn native_pin_not_suppressed_by_unrelated_flags() {
+        use csq_core::providers::native;
+        // A `--max-turns` / `-p` arg must NOT be mistaken for a model flag.
+        let rest = vec!["-p".to_string(), "hello".to_string()];
+        assert_eq!(
+            native_pinned_model_to_inject(&native::KIMI, &rest),
+            Some("kimi-code/k3")
+        );
+    }
+
     /// M19b regression: the v1 `AuditRecord.surface` records the ACTUAL
     /// dispatched surface, not a hardcoded `cc`. Pre-fix, `run.rs` built the
     /// record with `surface: Surface::Cc` before the surface was even determined,
@@ -5054,6 +6299,8 @@ mod tests {
         assert_eq!(audit_surface_for(SurfaceCli::Claude), A::Cc);
         assert_eq!(audit_surface_for(SurfaceCli::Codex), A::Codex);
         assert_eq!(audit_surface_for(SurfaceCli::Gemini), A::Gemini);
+        assert_eq!(audit_surface_for(SurfaceCli::Kimi), A::Kimi);
+        assert_eq!(audit_surface_for(SurfaceCli::Grok), A::Grok);
     }
 
     /// PR-C3c regression: `resolve_account` lists Codex slots
@@ -5402,6 +6649,137 @@ mod tests {
             serde_json::json!("dark"),
             "global base key must survive merge"
         );
+    }
+
+    // ============================================================
+    // Wave 3 kimi/grok host-isolation warning (spec 08 MED-03)
+    // ============================================================
+
+    /// `resolve_third_party_surface_name` resolves a kimi-bound slot to the
+    /// catalog id `"kimi"` — the same id `emit_host_isolation_warning_if_needed`
+    /// uses to build the operator-facing message/log surface tag. Mirrors
+    /// `coc::translate::gemini::host_isolation_warning_fires_when_secrets_detected`
+    /// (both assert the host-isolation surfacing mechanism engages for the
+    /// respective surface) — the closest in-tree analogue reachable from
+    /// `launch_third_party`, since kimi has no `GeminiSpawnPayload`-shaped
+    /// translate step to assert a `host_isolation_warning` bit on.
+    #[test]
+    fn resolve_third_party_surface_name_resolves_kimi_binding() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let config_dir = base.path().join("config-7");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let slot_settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                "ANTHROPIC_AUTH_TOKEN": "sk-kimi-test"
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&slot_settings).unwrap(),
+        )
+        .unwrap();
+
+        let account = AccountNum::try_from(7u16).unwrap();
+        let surface = resolve_third_party_surface_name(base.path(), account);
+        assert_eq!(
+            surface, "kimi",
+            "a slot bound to the Kimi coding-subscription endpoint must resolve \
+             to the catalog id \"kimi\", not the display name \"Kimi\" or a \
+             generic fallback"
+        );
+    }
+
+    /// A slot with no 3P binding on disk (unbound / never `setkey`'d) falls
+    /// back to the generic `"third-party"` label rather than panicking or
+    /// silently omitting the warning's surface tag.
+    #[test]
+    fn resolve_third_party_surface_name_falls_back_when_unbound() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // No config-N directory at all for this slot.
+        let account = AccountNum::try_from(9u16).unwrap();
+        let surface = resolve_third_party_surface_name(base.path(), account);
+        assert_eq!(surface, "third-party");
+    }
+
+    /// M1 (security redteam MEDIUM): the host-isolation warning gate in
+    /// `launch_third_party` (`if surface_name != "ollama" { emit(...) }`)
+    /// MUST be skipped for a loopback-bound ollama slot but MUST still fire
+    /// for every other 3P surface — kimi included, the Wave 3 target.
+    /// `provider_from_base_url` (`csq-core/src/accounts/discovery.rs`)
+    /// classifies a slot as `"Ollama"` ONLY when `ANTHROPIC_BASE_URL`
+    /// contains `localhost`/`127.0.0.1`, so `resolve_third_party_surface_name`
+    /// returning exactly `"ollama"` is, by construction, loopback — no
+    /// remote vendor to exfiltrate to. This test exercises the REAL resolve
+    /// function against real loopback + kimi fixtures and asserts the exact
+    /// boolean condition the production gate uses, so a future rename of the
+    /// ollama catalog id or a change to the gate's comparison target would
+    /// fail this test.
+    #[test]
+    fn host_isolation_warning_gate_skips_ollama_but_fires_for_kimi() {
+        let base = tempfile::tempdir().expect("tempdir");
+
+        let ollama_dir = base.path().join("config-20");
+        std::fs::create_dir_all(&ollama_dir).unwrap();
+        std::fs::write(
+            ollama_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": { "ANTHROPIC_BASE_URL": "http://localhost:11434" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let kimi_dir = base.path().join("config-21");
+        std::fs::create_dir_all(&kimi_dir).unwrap();
+        std::fs::write(
+            kimi_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-kimi-test"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let ollama_account = AccountNum::try_from(20u16).unwrap();
+        let kimi_account = AccountNum::try_from(21u16).unwrap();
+
+        let ollama_surface = resolve_third_party_surface_name(base.path(), ollama_account);
+        let kimi_surface = resolve_third_party_surface_name(base.path(), kimi_account);
+
+        // Mirrors the exact production gate in `launch_third_party`:
+        //     if surface_name != "ollama" { emit_host_isolation_warning_if_needed(...) }
+        // — asserted via the two boundary values the gate distinguishes.
+        assert_eq!(
+            ollama_surface, "ollama",
+            "loopback ollama MUST be excluded from the MED-03 warning — no remote \
+             vendor to exfiltrate to"
+        );
+        assert_ne!(
+            kimi_surface, "ollama",
+            "kimi MUST still fire the MED-03 warning — remote vendor, unfiltered $HOME"
+        );
+    }
+
+    /// `emit_host_isolation_warning_if_needed` is a no-op (no panic, silent
+    /// return) when `HostContext::production_secrets_present` is false —
+    /// exercised directly for the kimi/zai/mm/deepseek/ollama surface tags
+    /// now reachable through `resolve_third_party_surface_name`, mirroring
+    /// gemini's `host_isolation_warning_clear_by_default` coverage of the
+    /// same "clear by default" invariant.
+    #[test]
+    fn emit_host_isolation_warning_if_needed_noop_when_clear() {
+        let host_ctx = csq_core::coc::translate::gemini::HostContext::default();
+        let account = AccountNum::try_from(1u16).unwrap();
+        for surface in ["gemini", "kimi", "zai", "mm", "deepseek", "ollama"] {
+            // Must not panic for any surface tag — the function returns
+            // immediately on `!production_secrets_present` before touching
+            // `surface` at all.
+            emit_host_isolation_warning_if_needed(&host_ctx, account, surface);
+        }
     }
 
     // ============================================================

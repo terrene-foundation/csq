@@ -68,6 +68,13 @@ const SKIP_FILES_EXACT: &[&str] =
 /// document the retracted policy in full (journal entries OWN the
 /// historical record; release notes for already-published versions
 /// preserve historical accuracy). Matched as path prefixes.
+// community-strip-safe: this test names `workspaces/` and `journal/`, both of
+// which the community extraction strips, but it never DEPENDS on them — the
+// scan loop opens with `if !root_path.exists() { continue; }`, so in the
+// community tree those roots are skipped and the test passes on the roots that
+// do ship. Declared here rather than in a list elsewhere so the claim sits next
+// to the guard that makes it true; the extraction's leak-check-3f reads this
+// marker. If that existence guard is ever removed, delete this line with it.
 const SKIP_PREFIXES: &[&str] = &[
     "workspaces/",    // every journal entry; the retraction lives there
     "journal/",       // root-level journal

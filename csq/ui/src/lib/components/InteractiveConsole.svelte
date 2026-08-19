@@ -1,5 +1,5 @@
 <script lang="ts">
-  // ── Interactive per-turn enforcement console (#793) ──────────────────
+  // ── Interactive per-turn enforcement console (an internal ticket) ──────────────────
   //
   // Operator-facing surface for the M-IC governed-turn hold/override flow.
   // The daemon owns every enforcement decision; this renderer ONLY relays the
@@ -44,7 +44,7 @@
     reason?: string;
     content?: unknown;
   }
-  // The auth mode tag the daemon stamps on the session (#793): `subscription`
+  // The auth mode tag the daemon stamps on the session (an internal ticket): `subscription`
   // = degraded CLI-capture tier, `direct-api` = the paid-key Phase-2b moat.
   // Captured once at open; later turn responses carry only `StateView`.
   type AuthMode = "subscription" | "direct-api";
@@ -53,7 +53,7 @@
     state: StateView;
     auth_mode?: AuthMode;
   }
-  // One pickable subscription account (#793 §FD1 escape hatch). The daemon
+  // One pickable subscription account (an internal ticket §FD1 escape hatch). The daemon
   // resolves the default (PR-3: lowest NON-capped account with credentials); the
   // operator can override it here. `seven_day_pct` is the account's last-polled
   // 7-day utilization (0-100) or null/absent when the daemon has no quota row.
@@ -104,7 +104,7 @@
 
   // ── Reactive state ──────────────────────────────────────────────────
   let sessionKey = $state<string | null>(null);
-  // Auth mode tag for the open session (#793). Captured at open, cleared on
+  // Auth mode tag for the open session (an internal ticket). Captured at open, cleared on
   // close; the daemon omits it for untagged (mock/test) sessions → no badge.
   let authMode = $state<AuthMode | null>(null);
   let view = $state<StateView | null>(null);
@@ -112,7 +112,7 @@
   let justification = $state("");
   let busy = $state(false);
   let errorTag = $state<string | null>(null);
-  // Account picker (#793 §FD1). `candidateSlots` is queried before open; when
+  // Account picker (an internal ticket §FD1). `candidateSlots` is queried before open; when
   // ≥2 are available the operator sees a dropdown and `selectedSlot` is the
   // chosen account (`null` → daemon default). Empty list → no picker (single or
   // zero subscription account, or a direct-API/keyed provider).
@@ -144,7 +144,7 @@
   }
 
   // Query the pickable subscription accounts before the operator opens a session
-  // (#793 §FD1). Best-effort: if the gate is closed or the daemon is unreachable,
+  // (an internal ticket §FD1). Best-effort: if the gate is closed or the daemon is unreachable,
   // the picker stays empty and `openSession` falls back to the daemon default —
   // the inactive notice surfaces on the open attempt, not here.
   async function loadOptions() {
@@ -350,7 +350,7 @@
       fails governance so you can review and override or abandon it.
     </p>
     {#if candidateSlots.length > 1}
-      <!-- #793 §FD1 account picker: choose which subscription account runs this
+      <!-- an internal ticket §FD1 account picker: choose which subscription account runs this
            session when the default (lowest-numbered) is rate-limited. -->
       <div class="picker">
         <label for="account-select">Subscription account</label>
@@ -474,7 +474,7 @@
     align-items: center;
     gap: 0.5rem;
   }
-  /* #793 auth-mode tag: subscription (degraded) is the neutral default;
+  /* an internal ticket auth-mode tag: subscription (degraded) is the neutral default;
      direct-api (the paid-key moat) is accented to signal full capability. */
   .auth-badge {
     text-transform: uppercase;
@@ -500,7 +500,7 @@
     font-size: 0.85rem;
     margin: 0;
   }
-  /* #793 §FD1 account picker */
+  /* an internal ticket §FD1 account picker */
   .picker {
     display: flex;
     flex-direction: column;
@@ -628,7 +628,11 @@
   button.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
+    /* i-audit sweep — white-on-accent measured 2.21:1 in the default
+       dark theme (WCAG AA needs 4.5:1). var(--bg-primary) flips per
+       theme and clears AA on both (dark 7.93:1, light 6.20:1) — same
+       fix as an internal ticket's AddAccountModal .actions button.primary. */
+    color: var(--bg-primary);
   }
   button.danger {
     color: var(--danger, #c0392b);

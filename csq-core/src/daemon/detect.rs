@@ -28,6 +28,10 @@ use crate::platform::process;
 #[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+// Only used by the `#[cfg(unix)]` `HEALTH_TIMEOUT` const below; the two
+// fully-qualified `std::time::Duration` callsites in tests don't need the
+// import, so gate it to match `HEALTH_TIMEOUT` (else unused on Windows).
+#[cfg(unix)]
 use std::time::Duration;
 
 /// Result of detecting whether the daemon is available.
@@ -103,7 +107,7 @@ pub fn version_drift_reason(daemon_version: &str) -> Option<String> {
 /// human-readable stderr lines (`eprintln!("warning: {reason}")`)
 /// where a smuggled `\n` would split the warning across visible
 /// terminal lines and obscure the real diagnostic.
-/// Origin: redteam follow-up to PRs #335-#337 (LOW finding —
+/// Origin: redteam follow-up to PRs an internal ticket-an internal ticket (LOW finding —
 /// version_drift control-char passthrough).
 fn parse_daemon_version(http_response: &str) -> String {
     // Split the headers from the body at the first blank line. axum's
@@ -171,6 +175,17 @@ pub fn detect_daemon(base_dir: &Path) -> DetectResult {
         return DetectResult::Stale {
             reason: format!("PID {pid} not alive"),
         };
+    }
+
+    // Step 2b: PID *identity*. Liveness alone cannot distinguish "our
+    // daemon is running" from "the kernel reissued a dead daemon's PID
+    // to an unrelated program". Treat a positively-foreign PID as no
+    // daemon at all — `NotRunning`, not `Stale` — because `Stale` reads
+    // as "a daemon is mid-startup, wait for it" to every caller, and the
+    // remediation it implies (`csq daemon stop`) would signal the
+    // stranger. See `process::is_pid_foreign` for the fail-open contract.
+    if process::is_pid_foreign(pid) {
+        return DetectResult::NotRunning;
     }
 
     // Step 3 + 4: socket / pipe connect + health check.
@@ -470,7 +485,7 @@ mod tests {
     /// Any character outside the semver-shape allowlist routes the
     /// version to "predates handshake" rather than letting the raw
     /// bytes flow into stderr lines via `eprintln!("warning: …")`.
-    /// Origin: redteam follow-up to PRs #335-#337.
+    /// Origin: redteam follow-up to PRs an internal ticket-an internal ticket.
     #[test]
     fn parse_daemon_version_rejects_newline_in_version_field() {
         let resp = "HTTP/1.1 200 OK\r\n\r\n\
@@ -625,7 +640,7 @@ mod tests {
     // worked in isolation but POLLUTED the env for unrelated tests like
     // `detect_live_pid_but_missing_socket_is_stale`, which then read a
     // stale TempDir path that no longer existed and saw `NotRunning`
-    // instead of `Stale`. Surfaced post-merge of #113.
+    // instead of `Stale`. Surfaced post-merge of an internal ticket.
     //
     // The corrupt + dead-pid code paths are still exercised on macOS,
     // and the Windows + Linux pid-resolution paths have their own
@@ -664,6 +679,44 @@ mod tests {
         }
     }
 
+    /// Regression: a PID file naming a LIVE process that is not csq must
+    /// report `NotRunning`, never `Stale`.
+    ///
+    /// The originating incident: a daemon died without running its `Drop`,
+    /// its PID file survived naming PID 1754, and hours later the kernel
+    /// had reissued 1754 to a Microsoft Teams helper. `detect_daemon`
+    /// checked only liveness, so it returned
+    /// `Stale { "PID 1754 alive but socket ... missing (daemon may still
+    /// be starting)" }`. Two things went wrong downstream: the Codex spawn
+    /// gate refused every `csq run <codex-slot>` telling the user to wait
+    /// for a daemon that would never appear, and the remediation it
+    /// printed (`csq daemon stop`) would have SIGTERMed the Teams helper.
+    #[cfg(unix)]
+    #[test]
+    fn detect_live_but_foreign_pid_is_not_running() {
+        let _shared_env_guard = crate::platform::test_env::lock();
+        let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let pid_path = super::super::pid_file_path(dir.path());
+        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+
+        let mut foreign = crate::platform::process::spawn_foreign_test_process();
+        fs::write(&pid_path, format!("{}\n", foreign.id())).unwrap();
+
+        let result = detect_daemon(dir.path());
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        let _ = fs::remove_file(&pid_path);
+
+        assert_eq!(
+            result,
+            DetectResult::NotRunning,
+            "a recycled PID must read as no-daemon, not as a daemon that is \
+             starting up (which tells callers to wait and to run `daemon stop`)"
+        );
+    }
+
     /// Serializes the two tests that read / write the shared
     /// `socket_path(base_dir)` on Linux. `socket_path` ignores
     /// `base_dir` when `XDG_RUNTIME_DIR` is set (paths.rs:65-78),
@@ -685,7 +738,7 @@ mod tests {
     /// `std::env::set_var("LOCALAPPDATA", ...)` with their own TempDir
     /// race — one test's `set_var` clobbers another's, and that test's
     /// subsequent `detect_daemon` reads the wrong directory (producing
-    /// `NotRunning` instead of `Stale`). PR-C8 (#179) surfaced this on
+    /// `NotRunning` instead of `Stale`). PR-C8 (an internal ticket) surfaced this on
     /// Windows CI; analogous to the Linux `SOCKET_TEST_MUTEX` fix
     /// (e6bfadc). Pre-existing latent race; new tests changed the
     /// parallel scheduling order enough to expose it.

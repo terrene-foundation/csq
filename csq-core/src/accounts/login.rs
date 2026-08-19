@@ -165,11 +165,21 @@ pub fn ensure_login_identity_minted(base_dir: &Path, account: AccountNum) -> Res
 ///    `ANTHROPIC_AUTH_TOKEN` env vars that override OAuth
 ///    credentials at CC startup. Strip them here so the fresh OAuth
 ///    tokens actually route to Anthropic.
-/// 3. Reads the OAuth email from `config-N/.claude.json` and
+/// 3. **Removes any stale Gemini or native-CLI (Kimi/Grok) binding marker**
+///    left on this slot (GH an internal ticket), for the same "replace, don't
+///    refuse" reason as step 2. Split into a DETECTION captured here, before
+///    the identity mint (see
+///    [`crate::accounts::binding_guard::detect_stale_marker_binding`] for why
+///    the ordering is load-bearing), and an ACTION deferred to the very end
+///    of this function — see
+///    [`crate::accounts::binding_guard::clear_detected_marker_binding`] for
+///    why acting immediately would risk destroying the prior binding on a
+///    subsequent failure.
+/// 4. Reads the OAuth email from `config-N/.claude.json` and
 ///    updates `profiles.json`. Falls back to `"unknown"` if the
 ///    email is missing — non-fatal because the credential file is
 ///    already written and CC can use the account.
-/// 4. Clears the `broker_failed` sentinel for this account so the
+/// 5. Clears the `broker_failed` sentinel for this account so the
 ///    daemon retries refresh on the next tick.
 ///
 /// Errors are propagated only when the *bookkeeping* itself fails
@@ -178,6 +188,7 @@ pub fn ensure_login_identity_minted(base_dir: &Path, account: AccountNum) -> Res
 /// the credential file is not.
 pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, ConfigError> {
     let config_dir = base_dir.join(format!("config-{}", account));
+
     // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the
     // `.csq-account` marker is written AFTER `mint_for_login` below so
     // we can resolve the slot's identity UUID and emit it as the
@@ -187,20 +198,36 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
     // contract until `phase4_gate_check` refuses pure-legacy. See the
     // marker write below the mint block.
 
-    // Strip any pre-existing 3P binding. If this fails we let the
-    // error propagate — we'd rather the user see "login cleanup
-    // failed" than a silent-success followed by "my OAuth login
-    // didn't take because the slot is still pinned to MiniMax".
-    match crate::accounts::third_party::unbind_provider_from_slot(base_dir, account) {
-        Ok(true) => {
-            tracing::info!(
-                account = account.get(),
-                "finalize_login: stripped third-party provider binding"
-            );
-        }
-        Ok(false) => {}
-        Err(e) => return Err(e),
-    }
+    // GH an internal ticket: CAPTURE (do not act on) any stale ADDITIVE marker
+    // binding (Gemini / native Kimi-Grok) BEFORE the identity mint below.
+    //
+    // an internal ticket regression (fixed): `detect_stale_marker_binding` used to
+    // delegate to `detect_bound_surface`'s precedence-ordered union
+    // detector (Codex → Anthropic → Gemini → native → 3P), so calling it
+    // here — before THIS function's own `mint_for_login` — was load-bearing:
+    // an internal ticket's `ensure_login_identity_minted` mints `by_slot[account]`
+    // for the fresh Anthropic identity in EVERY production caller before
+    // `finalize_login` is even invoked, so by the time this line ran,
+    // `by_slot[account]` already resolved to the new identity and the
+    // delegated detector reported Anthropic ahead of the stale marker —
+    // masking it regardless of where in this function the call sat.
+    // `detect_stale_marker_binding` now sources detection directly from the
+    // Gemini/native marker predicates instead of the union detector (see its
+    // doc comment), so it is no longer precedence-masked and this call is no
+    // longer ordering-sensitive relative to any mint. It stays here, ahead
+    // of the profiles lock, purely to keep the CAPTURE step visually
+    // adjacent to the rest of the pre-lock bookkeeping. The 3P unbind runs
+    // AFTER the profiles lock (see its comment there).
+    //
+    // Security review (GH an internal ticket): the ACTION is deferred to the very
+    // end of this function, past every later fallible step (`?` on the
+    // profiles lock, the mint, the settings pair) — see the call site below.
+    // Acting immediately here would delete the prior binding even when
+    // `finalize_login` subsequently fails, leaving the slot with NEITHER the
+    // new identity NOR the old one. `detect_stale_marker_binding` is pure —
+    // nothing is deleted by this call.
+    let stale_marker_binding =
+        crate::accounts::binding_guard::detect_stale_marker_binding(base_dir, account);
 
     let email = read_email_from_claude_json(&config_dir).unwrap_or_else(|| "unknown".to_string());
 
@@ -219,6 +246,61 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
     // The credential file is already written; the profile row failure is
     // recoverable by the next login or daemon Pass 0, but we should surface it.
     let profiles_lock = ProfilesFileLock::acquire(base_dir)?;
+
+    // GH an internal ticket (security review, round 3): strip any pre-existing 3P
+    // binding HERE — after the profiles lock, not before it.
+    //
+    // `unbind_provider_from_slot` is DESTRUCTIVE: it removes
+    // `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` from
+    // `config-<N>/settings.json`. That auth token IS the operator's 3P API
+    // key, so running it before a step that can still fail meant a login
+    // which then failed left the slot with NEITHER a new OAuth identity NOR
+    // its previous 3P key — the operator had to find and re-enter the key.
+    // This is the same defect the marker capture/act split above fixes, and
+    // strictly worse, because a marker is credential-less and a key is not.
+    //
+    // Placement is bounded on BOTH sides and neither bound is optional:
+    //   - It MUST be after `ProfilesFileLock::acquire`, the only remaining
+    //     early-return (`?`) in this window. The `mint_for_login` failure
+    //     below is non-fatal (warn-and-continue), as is the marker write.
+    //   - It MUST stay before TWO dependents that both read
+    //     `config-<N>/settings.json` OFF DISK and require the strip to have
+    //     already happened. Deferring past either would leak the stale 3P
+    //     `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` into the fresh OAuth
+    //     identity's settings — a correctness bug, not merely a security one:
+    //       (a) `mint_for_login`'s M2-3 fresh-UUID seed, which copies
+    //           `config-<N>/settings.json` into `identities/<UUID>/settings.json`
+    //           on first mint (`daemon::identity_mint`, "M2-3: seed
+    //           identities/<UUID>/settings.json from config-<N>/settings.json").
+    //       (b) the M4-2 settings pair-write below, whose contract is that the
+    //           two paths are BYTE-EQUIVALENT; copying pre-unbind bytes and then
+    //           mutating the source would desync the pair.
+    //     (a) is the TIGHTER bound and sits earlier than (b) — an earlier
+    //     revision of this comment named only (b), which understated how narrow
+    //     the window actually is.
+    //
+    // Residual, deliberately not closed here: a later fallible return (the
+    // UUID-credential freshness seed, reachable only once `mint_for_login` has
+    // already SUCCEEDED) still sits past the unbind. Closing it would require
+    // (a) and (b) to take a passed-in stripped-settings value instead of
+    // re-reading disk — shared-code surgery outside this change's blast radius.
+    // It is materially less severe: by that point `by_slot` is mapped and the
+    // profile is written, so the operator has a working-but-erroring Anthropic
+    // login rather than the "neither identity nor key" state this fix removes.
+    //
+    // So this is a MOVE, not the capture/act split used for the markers: the
+    // unbind reads `config-<N>/settings.json` directly rather than `by_slot`,
+    // so the mint cannot mask it and there is nothing to capture early.
+    match crate::accounts::third_party::unbind_provider_from_slot(base_dir, account) {
+        Ok(true) => {
+            tracing::info!(
+                account = account.get(),
+                "finalize_login: stripped third-party provider binding"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => return Err(e),
+    }
 
     // F-H-1 fix: clear any stale `by_slot_identity[N]` left from a prior
     // non-OAuth binding (3P API-key or Codex) on this slot.  Without this
@@ -529,6 +611,18 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
     // login. Test-safe: a base with no `term-*` dirs sweeps nothing.
     let _ = crate::credentials::keychain::sync_all_handle_dirs(base_dir);
 
+    // GH an internal ticket (CLOSED, shipped): ACT on the marker binding captured
+    // earlier — left un-acted until this point — before the mint above.
+    // This is the LAST statement in `finalize_login`
+    // reachable only once every fallible step (`?`) above has already
+    // succeeded — the mint, the profile save, the UUID credential seed.
+    // Acting here rather than at detection time means a `finalize_login`
+    // that fails partway through leaves the prior Gemini/native binding
+    // untouched, exactly like the pre-fix refuse behaviour did on failure.
+    if let Some(surface) = stale_marker_binding {
+        crate::accounts::binding_guard::clear_detected_marker_binding(base_dir, account, surface);
+    }
+
     Ok(email)
 }
 
@@ -621,6 +715,7 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_env::with_in_memory_secret_backend;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1583,7 +1678,345 @@ mod tests {
         );
     }
 
-    /// #633: `ensure_login_identity_minted` mints a fresh slot's UUID from the
+    /// GH an internal ticket: `csq login N` (Anthropic) onto a slot previously bound
+    /// ONLY to Gemini (no prior Anthropic/Codex identity — additive binds
+    /// already refuse onto an OAuth-bound slot, so this is the only reachable
+    /// pre-state) must clear the stale Gemini marker so the slot does not
+    /// carry two bindings afterward.
+    ///
+    /// PRODUCTION ORDERING (an internal ticket regression — was a false pass here
+    /// before the fix): every production caller
+    /// (`csq/src/cli/commands/login.rs::handle_direct_post_subprocess`, and
+    /// the desktop login twins) calls `ensure_login_identity_minted` +
+    /// `save_canonical_for` BEFORE `finalize_login` ever runs (an internal ticket),
+    /// which mints `by_slot[account]` for the fresh Anthropic identity ahead
+    /// of the marker-cleanup call inside `finalize_login`. The prior version
+    /// of this test called `finalize_login` directly against a base with NO
+    /// `by_slot` mapping at all — a state no production caller ever
+    /// produces — which is why it passed against the precedence-masked
+    /// detector `detect_stale_marker_binding` used to delegate to. Mint
+    /// FIRST here, exactly as production does, so this test actually
+    /// exercises the reachable pre-state.
+    #[test]
+    fn finalize_login_clears_stale_gemini_marker() {
+        use crate::providers::gemini::provisioning::{
+            is_gemini_bound_slot, write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.join("config-1");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "pre: slot must be Gemini-bound before the OAuth login"
+        );
+
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let anthropic_creds = crate::credentials::CredentialFile::Anthropic(
+            crate::credentials::AnthropicCredentialFile {
+                claude_ai_oauth: crate::credentials::OAuthPayload {
+                    access_token: crate::types::AccessToken::new("sk-ant-oat01-fh1-test".into()),
+                    refresh_token: crate::types::RefreshToken::new("sk-ant-ort01-fh1-test".into()),
+                    expires_at: 4102444800000,
+                    scopes: vec!["user:inference".into()],
+                    subscription_type: Some("max".into()),
+                    rate_limit_tier: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                extra: std::collections::HashMap::new(),
+            },
+        );
+        credentials::save(&config_dir.join(".credentials.json"), &anthropic_creds).unwrap();
+
+        // PRODUCTION ORDERING: mint the slot's identity UUID, then write the
+        // canonical UUID-keyed credential — exactly what
+        // `handle_direct_post_subprocess` does — BEFORE `finalize_login` runs.
+        ensure_login_identity_minted(base, account)
+            .expect("ensure_login_identity_minted must succeed");
+        credentials::save_canonical_for(base, account, &anthropic_creds)
+            .expect("save_canonical_for must succeed");
+
+        // Pin the vault backend: `clear_detected_marker_binding` deletes the
+        // Gemini vault entry BEFORE the marker and is fail-closed on any
+        // vault-step failure, so an ambient-resolved vault makes this test
+        // platform-dependent — GREEN on macOS/Windows (their vaults always
+        // open) and RED on a bus-less Linux CI runner, where the marker is
+        // deliberately left in place. See
+        // `platform::test_env::with_in_memory_secret_backend`.
+        let result = with_in_memory_secret_backend(|| finalize_login(base, account));
+        assert!(
+            result.is_ok(),
+            "finalize_login must succeed on Gemini→OAuth transition: {result:?}"
+        );
+        assert!(
+            !is_gemini_bound_slot(base, account),
+            "the stale Gemini marker must be removed after finalize_login \
+             (production ordering: identity already minted before finalize_login runs)"
+        );
+    }
+
+    /// Security review regression (GH an internal ticket): a `finalize_login` that
+    /// FAILS after the stale-marker DETECTION point must NOT have deleted the
+    /// prior Gemini binding. Before the capture/act split, cleanup ran
+    /// immediately at the detection point — deleting the marker even when the
+    /// rest of `finalize_login` (the profiles lock, the mint, the profile
+    /// save) subsequently failed, leaving the slot with NEITHER the new
+    /// Anthropic identity (never minted) NOR the old Gemini binding (already
+    /// gone). This forces exactly that failure — `.profiles.lock` pre-created
+    /// as a DIRECTORY makes `ProfilesFileLock::acquire`'s `OpenOptions::write`
+    /// fail deterministically (EISDIR) — and asserts the Gemini marker
+    /// SURVIVES.
+    // UNIX-ONLY FIXTURE, not a unix-only property. The failure this test needs
+    // is injected by creating `.profiles.lock` as a DIRECTORY, so that
+    // `ProfilesFileLock::acquire`'s `OpenOptions::write(true).open(path)` fails
+    // EISDIR. Windows does not share those semantics — the open does not fail
+    // the same way, so `finalize_login` SUCCEEDS and the fixture never creates
+    // the condition under test (CI: `Rust tests (windows-latest)`, 4 tests, all
+    // on the `result.is_err()` assertion).
+    //
+    // The behaviour being pinned — a login that fails must not destroy a
+    // binding it never replaced — is platform-independent and lives in
+    // ordinary control flow. Only the failure INJECTION is Unix-specific, so
+    // the test is gated rather than weakened into something that passes
+    // everywhere by asserting less.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_login_failure_preserves_prior_gemini_binding() {
+        use crate::providers::gemini::provisioning::{
+            is_gemini_bound_slot, write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.join("config-1");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "pre: slot must be Gemini-bound before the OAuth login attempt"
+        );
+
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        credentials::save(
+            &config_dir.join(".credentials.json"),
+            &crate::credentials::CredentialFile::Anthropic(
+                crate::credentials::AnthropicCredentialFile {
+                    claude_ai_oauth: crate::credentials::OAuthPayload {
+                        access_token: crate::types::AccessToken::new(
+                            "sk-ant-oat01-fh1-test".into(),
+                        ),
+                        refresh_token: crate::types::RefreshToken::new(
+                            "sk-ant-ort01-fh1-test".into(),
+                        ),
+                        expires_at: 4102444800000,
+                        scopes: vec!["user:inference".into()],
+                        subscription_type: Some("max".into()),
+                        rate_limit_tier: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    extra: std::collections::HashMap::new(),
+                },
+            ),
+        )
+        .unwrap();
+
+        // Force ProfilesFileLock::acquire to fail: it opens `.profiles.lock`
+        // with `OpenOptions::write(true)`, which errors EISDIR against a
+        // directory. This is the exact failure point security review named
+        // ("the very next fallible step is ProfilesFileLock::acquire").
+        fs::create_dir_all(base.join(".profiles.lock")).unwrap();
+
+        // Pinned for the same reason as the sibling cleanup test, and for one
+        // more: with an ambient vault that cannot open, the cleanup is blocked
+        // by the environment rather than by the capture/act split, so the
+        // survival assertion would hold even if that split regressed. Pinning
+        // an always-available backend keeps this test discriminating.
+        let result = with_in_memory_secret_backend(|| finalize_login(base, account));
+        assert!(
+            result.is_err(),
+            "finalize_login must fail when the profiles lock cannot be acquired: {result:?}"
+        );
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "the Gemini marker must SURVIVE a finalize_login that fails after \
+             the detect point — a failed login must not destroy a binding it \
+             never actually replaced"
+        );
+    }
+
+    /// GH an internal ticket (security review, round 3). Sibling of the Gemini test
+    /// above, for the THIRD-PARTY binding — and the more expensive variant.
+    ///
+    /// `unbind_provider_from_slot` removes `ANTHROPIC_AUTH_TOKEN` from
+    /// `config-<N>/settings.json`, and that token IS the operator's 3P API
+    /// key. While the unbind ran BEFORE `ProfilesFileLock::acquire`, a login
+    /// that failed on the lock left the slot with neither a new OAuth identity
+    /// nor its previous key — the operator had to go find and re-enter it.
+    /// A credential-less marker is recoverable by re-binding; a discarded API
+    /// key is not.
+    ///
+    /// Non-vacuity: moving the unbind back above the lock acquisition reds
+    /// this test — the token is gone by the time `finalize_login` returns Err.
+    // UNIX-ONLY FIXTURE, not a unix-only property. The failure this test needs
+    // is injected by creating `.profiles.lock` as a DIRECTORY, so that
+    // `ProfilesFileLock::acquire`'s `OpenOptions::write(true).open(path)` fails
+    // EISDIR. Windows does not share those semantics — the open does not fail
+    // the same way, so `finalize_login` SUCCEEDS and the fixture never creates
+    // the condition under test (CI: `Rust tests (windows-latest)`, 4 tests, all
+    // on the `result.is_err()` assertion).
+    //
+    // The behaviour being pinned — a login that fails must not destroy a
+    // binding it never replaced — is platform-independent and lives in
+    // ordinary control flow. Only the failure INJECTION is Unix-specific, so
+    // the test is gated rather than weakened into something that passes
+    // everywhere by asserting less.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_login_failure_preserves_prior_third_party_key() {
+        use crate::accounts::third_party::bind_provider_to_slot;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.join("config-1");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        // Arrange: slot 1 is bound to a 3P provider with a real-shaped key.
+        bind_provider_to_slot(base, "mm", account, Some("sk-test-minimax-round3"), None).unwrap();
+        let settings_path = config_dir.join("settings.json");
+        let before = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            before.contains("ANTHROPIC_AUTH_TOKEN"),
+            "pre: the 3P binding must carry an auth token before the login attempt"
+        );
+
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        credentials::save(
+            &config_dir.join(".credentials.json"),
+            &crate::credentials::CredentialFile::Anthropic(
+                crate::credentials::AnthropicCredentialFile {
+                    claude_ai_oauth: crate::credentials::OAuthPayload {
+                        access_token: crate::types::AccessToken::new("sk-ant-oat01-r3-test".into()),
+                        refresh_token: crate::types::RefreshToken::new(
+                            "sk-ant-ort01-r3-test".into(),
+                        ),
+                        expires_at: 4102444800000,
+                        scopes: vec!["user:inference".into()],
+                        subscription_type: Some("max".into()),
+                        rate_limit_tier: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    extra: std::collections::HashMap::new(),
+                },
+            ),
+        )
+        .unwrap();
+
+        // Act: force the same EISDIR failure at `ProfilesFileLock::acquire`.
+        // Unlike the Gemini fixture, `bind_provider_to_slot` has already taken
+        // the profiles lock, so `.profiles.lock` exists as a regular FILE —
+        // `create_dir_all` would fail EEXIST against it. Remove it first.
+        let lock_path = base.join(".profiles.lock");
+        let _ = fs::remove_file(&lock_path);
+        fs::create_dir_all(&lock_path).unwrap();
+        let result = finalize_login(base, account);
+
+        // Assert: the login failed AND the operator's key survived it.
+        assert!(
+            result.is_err(),
+            "finalize_login must fail when the profiles lock cannot be acquired: {result:?}"
+        );
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            after.contains("ANTHROPIC_AUTH_TOKEN"),
+            "the 3P API key must SURVIVE a finalize_login that fails — a login \
+             that replaced nothing must not discard the operator's key. \
+             settings.json after the failed login: {after}"
+        );
+    }
+
+    /// GH an internal ticket: `csq login N` (Anthropic) onto a slot previously bound
+    /// ONLY to a native CLI (Kimi/Grok) must clear the stale native marker so
+    /// the slot does not carry two bindings afterward.
+    ///
+    /// PRODUCTION ORDERING (an internal ticket regression — see the Gemini test above
+    /// for the full rationale): mint the identity + save the canonical
+    /// credential BEFORE `finalize_login`, exactly as
+    /// `handle_direct_post_subprocess` does, so this test exercises the
+    /// state production actually reaches rather than an unreachable
+    /// empty-`by_slot` fixture.
+    #[test]
+    fn finalize_login_clears_stale_native_marker() {
+        use crate::providers::catalog::Surface;
+        use crate::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.join("config-1");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        native::write_binding(base, account, Surface::Kimi).unwrap();
+        assert!(native::marker_exists(base, account, Surface::Kimi));
+
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let anthropic_creds = crate::credentials::CredentialFile::Anthropic(
+            crate::credentials::AnthropicCredentialFile {
+                claude_ai_oauth: crate::credentials::OAuthPayload {
+                    access_token: crate::types::AccessToken::new("sk-ant-oat01-fh1-test".into()),
+                    refresh_token: crate::types::RefreshToken::new("sk-ant-ort01-fh1-test".into()),
+                    expires_at: 4102444800000,
+                    scopes: vec!["user:inference".into()],
+                    subscription_type: Some("max".into()),
+                    rate_limit_tier: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                extra: std::collections::HashMap::new(),
+            },
+        );
+        credentials::save(&config_dir.join(".credentials.json"), &anthropic_creds).unwrap();
+
+        // PRODUCTION ORDERING: mint, then save canonical — BEFORE finalize_login.
+        ensure_login_identity_minted(base, account)
+            .expect("ensure_login_identity_minted must succeed");
+        credentials::save_canonical_for(base, account, &anthropic_creds)
+            .expect("save_canonical_for must succeed");
+
+        let result = finalize_login(base, account);
+        assert!(
+            result.is_ok(),
+            "finalize_login must succeed on native→OAuth transition: {result:?}"
+        );
+        assert!(
+            !native::marker_exists(base, account, Surface::Kimi),
+            "the stale native marker must be removed after finalize_login \
+             (production ordering: identity already minted before finalize_login runs)"
+        );
+    }
+
+    /// an internal ticket: `ensure_login_identity_minted` mints a fresh slot's UUID from the
     /// OAuth email in `config-N/.claude.json` when no `by_slot` mapping exists.
     /// This is the fresh-install / macOS-keychain-only case where the later
     /// `save_canonical_for` would otherwise fail-closed on the absent UUID
@@ -1621,7 +2054,7 @@ mod tests {
         );
     }
 
-    /// #633: a second call is a no-op — the slot keeps its original UUID.
+    /// an internal ticket: a second call is a no-op — the slot keeps its original UUID.
     /// This is the property that makes `finalize_login`'s later
     /// `mint_for_login` an idempotent reuse rather than a churn / second UUID.
     #[test]
@@ -1644,7 +2077,7 @@ mod tests {
         assert_eq!(first, second, "UUID must not churn across repeat calls");
     }
 
-    /// #633: with no email source (no `.claude.json`), the helper returns `Ok`
+    /// an internal ticket: with no email source (no `.claude.json`), the helper returns `Ok`
     /// WITHOUT inventing an identity. The caller's `save_canonical_for` then
     /// surfaces its own genuine fail-closed error rather than this helper
     /// minting a UUID against a guessed / absent email.

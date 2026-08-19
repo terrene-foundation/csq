@@ -1,93 +1,217 @@
 //! `csq models list [provider]` — list models. `csq models switch <provider> <model>` — switch.
+//!
+//! `--json` drives coverage from [`csq_core::providers::registry`] — THE canonical
+//! union of the wrapped-provider catalog and the native-CLI table — so every id
+//! `registry::known_ids()` reports is listable, not just the subset that happens
+//! to carry curated [`ModelCatalog`] rows. Dispatch keys off
+//! [`ProviderDescriptor::kind`] (`Wrapped` vs `Native`), never a per-id `if
+//! provider_id == "grok"` chain: a native descriptor has no catalog entries by
+//! construction, so it always reports its `default_model`; a wrapped descriptor
+//! (Codex today) with zero catalog rows falls back to the same synthesized-default
+//! row rather than an empty array. Ollama's live-pulled-model enumeration is the
+//! one kept id-check — it is a genuine runtime-vs-static distinction, not a
+//! provider-identity branch (`agents.md` "PRIMARY METHODOLOGICAL DIRECTIVE").
 
 use anyhow::{anyhow, Result};
 use csq_core::providers::catalog::ModelConfigTarget;
-use csq_core::providers::{self, ModelCatalog};
+use csq_core::providers::registry::{self, ProviderDescriptor};
+use csq_core::providers::{self, ModelCatalog, ProviderKind};
+use csq_core::sdk::{self, Envelope, SdkError, SdkErrorCode, SCHEMA_MODELS_V1};
 use serde::Serialize;
 use std::path::Path;
 
-#[derive(Serialize)]
+/// One model row. Mirrors [`csq_core::providers::ModelInfo`]'s full shape
+/// (`context_window` / `output_limit` / `aliases`, previously dropped by the
+/// old id/name-only `ModelEntry`) plus the provider identity and
+/// [`Self::is_default`].
+#[derive(Debug, Serialize)]
 struct ModelEntry {
     provider_id: String,
     provider_name: String,
     model_id: String,
     model_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
+    /// `true` iff this row is NOT a curated [`ModelCatalog`] entry — it is the
+    /// provider's [`ProviderDescriptor::default_model`], synthesized because no
+    /// catalog rows exist for this provider (every native vendor CLI; a wrapped
+    /// provider like Codex whose model space csq does not curate). A host
+    /// building a model picker uses this to distinguish "csq vouches for this
+    /// row's specs" from "this is just the provider's current default, no
+    /// context/output data available."
+    is_default: bool,
+}
+
+/// The `csq.models.v1` success payload.
+#[derive(Serialize)]
+struct ModelsPayload {
+    models: Vec<ModelEntry>,
+}
+
+/// A row synthesized from `d.default_model` — never a bare-empty substitute.
+/// `default_model` is empty only for a native descriptor whose vendor CLI picks
+/// its own model with no fixed csq-visible default (doc'd on
+/// [`csq_core::providers::native::NativeCli::default_model`]); that case still
+/// reports one row with an explicit "vendor-selected" placeholder rather than
+/// silently contributing zero entries.
+fn default_entry(d: &ProviderDescriptor) -> ModelEntry {
+    let (model_id, model_name) = if d.default_model.is_empty() {
+        (
+            "(vendor-selected)".to_string(),
+            format!("{} picks its model automatically", d.name),
+        )
+    } else {
+        (d.default_model.to_string(), d.default_model.to_string())
+    };
+    ModelEntry {
+        provider_id: d.id.to_string(),
+        provider_name: d.name.to_string(),
+        model_id,
+        model_name,
+        context_window: None,
+        output_limit: None,
+        aliases: Vec::new(),
+        is_default: true,
+    }
+}
+
+/// This provider's curated [`ModelCatalog`] rows, mapped to [`ModelEntry`].
+fn catalog_entries(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelEntry> {
+    catalog
+        .by_provider(d.id)
+        .into_iter()
+        .map(|m| ModelEntry {
+            provider_id: d.id.to_string(),
+            provider_name: d.name.to_string(),
+            model_id: m.id.clone(),
+            model_name: m.name.clone(),
+            context_window: m.context_window,
+            output_limit: m.output_limit,
+            aliases: m.aliases.clone(),
+            is_default: false,
+        })
+        .collect()
+}
+
+/// Ollama's model space is whatever the user has pulled locally — queried live,
+/// never curated. Kept as an explicit id check (not a `kind` branch): this is a
+/// runtime-vs-static distinction orthogonal to wrapped/native classification.
+fn ollama_live_entries(d: &ProviderDescriptor) -> Vec<ModelEntry> {
+    providers::ollama::get_ollama_models()
+        .into_iter()
+        .map(|name| ModelEntry {
+            provider_id: d.id.to_string(),
+            provider_name: d.name.to_string(),
+            model_id: name.clone(),
+            model_name: name,
+            context_window: None,
+            output_limit: None,
+            aliases: Vec::new(),
+            is_default: false,
+        })
+        .collect()
+}
+
+/// Every listable row for one provider. Dispatch is on [`ProviderDescriptor::kind`]:
+/// a [`ProviderKind::Native`] descriptor has no [`ModelCatalog`] rows by
+/// construction (the catalog only covers `catalog::PROVIDERS` ids), so it always
+/// reports [`default_entry`]. A [`ProviderKind::Wrapped`] descriptor reports its
+/// catalog rows (plus Ollama's live rows); if that combined set is empty — Codex
+/// today, whose model space csq does not curate — it falls back to
+/// [`default_entry`] rather than an empty array.
+fn entries_for(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelEntry> {
+    match d.kind {
+        ProviderKind::Native => vec![default_entry(d)],
+        ProviderKind::Wrapped => {
+            let mut entries = catalog_entries(d, catalog);
+            if d.id == "ollama" {
+                entries.extend(ollama_live_entries(d));
+            }
+            if entries.is_empty() {
+                entries.push(default_entry(d));
+            }
+            entries
+        }
+    }
+}
+
+/// The fallible core of the `--json` path: resolve `provider_filter` against
+/// [`registry`] and build every listable row. Returns [`SdkError`] (never bails
+/// via `anyhow`) so the caller can wrap it directly in a failure envelope — the
+/// same shape as `exec::run_exec`. Split out from [`handle_list`] so it can be
+/// unit-tested without going through [`sdk::emit`] + `std::process::exit`.
+fn list_models_json(
+    provider_filter: &str,
+    catalog: &ModelCatalog,
+) -> Result<Vec<ModelEntry>, SdkError> {
+    let descriptors: Vec<ProviderDescriptor> = if provider_filter == "all" {
+        registry::all()
+    } else {
+        match registry::lookup(provider_filter) {
+            Some(d) => vec![d],
+            None => {
+                let known: Vec<String> = registry::known_ids()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                return Err(SdkError::trusted(
+                    SdkErrorCode::ProviderNotFound,
+                    format!("unknown provider: {provider_filter}"),
+                )
+                .with_known(known));
+            }
+        }
+    };
+
+    Ok(descriptors
+        .iter()
+        .flat_map(|d| entries_for(d, catalog))
+        .collect())
 }
 
 pub fn handle_list(_base_dir: &Path, provider_filter: &str, json: bool) -> Result<()> {
     let catalog = ModelCatalog::default_catalog();
 
     if json {
-        let mut entries = Vec::new();
-        let providers_list: Vec<_> = if provider_filter == "all" {
-            providers::PROVIDERS.iter().collect()
-        } else {
-            let p = providers::get_provider(provider_filter)
-                .ok_or_else(|| anyhow!("unknown provider: {provider_filter}"))?;
-            vec![p]
+        let code = match list_models_json(provider_filter, &catalog) {
+            Ok(models) => sdk::emit(&Envelope::success(
+                SCHEMA_MODELS_V1,
+                None,
+                ModelsPayload { models },
+            ))?,
+            Err(err) => sdk::emit(&Envelope::<ModelsPayload>::failure(
+                SCHEMA_MODELS_V1,
+                None,
+                err,
+            ))?,
         };
-
-        for provider in providers_list {
-            for m in catalog.by_provider(provider.id) {
-                entries.push(ModelEntry {
-                    provider_id: provider.id.to_string(),
-                    provider_name: provider.name.to_string(),
-                    model_id: m.id.to_string(),
-                    model_name: m.name.to_string(),
-                });
-            }
-            if provider.id == "ollama" {
-                for name in providers::ollama::get_ollama_models() {
-                    entries.push(ModelEntry {
-                        provider_id: "ollama".into(),
-                        provider_name: "Ollama".into(),
-                        model_id: name.clone(),
-                        model_name: name,
-                    });
-                }
-            }
-        }
-
-        println!("{}", serde_json::to_string(&entries)?);
-        return Ok(());
+        std::process::exit(code);
     }
 
     println!();
 
-    if provider_filter == "all" {
-        for provider in providers::PROVIDERS {
-            let models: Vec<_> = catalog.by_provider(provider.id).into_iter().collect();
-            if models.is_empty() && provider.id != "ollama" {
-                continue;
-            }
-            println!("{} ({})", provider.name, provider.id);
-            for m in &models {
-                println!("  {} — {}", m.id, m.name);
-            }
-            if provider.id == "ollama" {
-                let live = providers::ollama::get_ollama_models();
-                if live.is_empty() && models.is_empty() {
-                    println!("  (ollama not installed or no models)");
-                } else {
-                    for name in &live {
-                        println!("  {name}");
-                    }
-                }
-            }
-            println!();
-        }
+    let descriptors: Vec<ProviderDescriptor> = if provider_filter == "all" {
+        registry::all()
     } else {
-        let provider = providers::get_provider(provider_filter)
-            .ok_or_else(|| anyhow!("unknown provider: {provider_filter}"))?;
+        vec![registry::lookup(provider_filter)
+            .ok_or_else(|| anyhow!("unknown provider: {provider_filter}"))?]
+    };
 
-        println!("{} ({})", provider.name, provider.id);
-        let models = catalog.by_provider(provider.id);
-        for m in &models {
-            println!("  {} — {}", m.id, m.name);
+    for d in &descriptors {
+        let models = entries_for(d, &catalog);
+        if provider_filter == "all" && models.is_empty() {
+            continue;
         }
-        if provider.id == "ollama" {
-            for name in providers::ollama::get_ollama_models() {
-                println!("  {name}");
+        println!("{} ({})", d.name, d.id);
+        for m in &models {
+            if m.is_default {
+                println!("  {} — {} (default)", m.model_id, m.model_name);
+            } else {
+                println!("  {} — {}", m.model_id, m.model_name);
             }
         }
         println!();
@@ -445,6 +569,123 @@ mod tests {
     use csq_core::types::AccountNum;
     use serde_json::Value;
     use tempfile::TempDir;
+
+    // ── JSON registry-union coverage (GH an internal ticket, closes an internal ticket) ──────────
+
+    /// The regression this module was built to fix: `csq models list --json
+    /// grok` used to fail `Error: unknown provider: grok` (rc=1) — `grok` is
+    /// native-only and absent from `catalog::PROVIDERS`. It must now resolve
+    /// and report a default row.
+    #[test]
+    fn json_list_grok_resolves_and_returns_default_entry() {
+        let catalog = ModelCatalog::default_catalog();
+        let entries = list_models_json("grok", &catalog).expect("grok must resolve");
+        assert_eq!(
+            entries.len(),
+            1,
+            "grok has no catalog rows — one default row"
+        );
+        assert_eq!(entries[0].provider_id, "grok");
+        assert_eq!(entries[0].model_id, "grok-4.5");
+        assert!(entries[0].is_default, "grok's row is a synthesized default");
+        assert!(entries[0].context_window.is_none());
+    }
+
+    /// The second regression: `csq models list --json codex` returned a bare
+    /// `[]` (rc=0) with no indication why — `ModelCatalog` has zero Codex
+    /// rows. It must now report the provider's default model instead of an
+    /// empty array.
+    #[test]
+    fn json_list_codex_is_never_a_bare_empty_array() {
+        let catalog = ModelCatalog::default_catalog();
+        let entries = list_models_json("codex", &catalog).expect("codex must resolve");
+        assert!(!entries.is_empty(), "codex must not report a bare []");
+        assert!(
+            entries.iter().all(|e| e.is_default),
+            "every codex row is a synthesized default (no curated catalog rows)"
+        );
+        assert_eq!(entries[0].provider_id, "codex");
+    }
+
+    /// The third regression: `csq models list --json kimi` dropped
+    /// `context_window` / `output_limit` / `aliases` — the old `ModelEntry`
+    /// carried only id/name pairs. Kimi K3's 1,048,576-token window (and its
+    /// `k3` alias) must survive into the JSON row.
+    #[test]
+    fn json_list_kimi_preserves_context_window_output_limit_and_aliases() {
+        let catalog = ModelCatalog::default_catalog();
+        let entries = list_models_json("kimi", &catalog).expect("kimi must resolve");
+        let k3 = entries
+            .iter()
+            .find(|e| e.model_id == "kimi-k3[1m]")
+            .expect("kimi-k3[1m] row present");
+        assert_eq!(k3.context_window, Some(1_048_576));
+        assert_eq!(k3.output_limit, Some(8_192));
+        assert!(k3.aliases.contains(&"k3".to_string()));
+        assert!(
+            !k3.is_default,
+            "a genuine catalog row, not a synthesized default"
+        );
+    }
+
+    /// Every id `registry::known_ids()` reports MUST be listable — asserted
+    /// over the WHOLE set, not a sample (`autonomous-execution.md`
+    /// "sampling" is not this rule, but the spirit applies: a partial check
+    /// would have missed exactly the grok/codex gaps this module fixes).
+    #[test]
+    fn json_list_all_covers_every_known_id() {
+        let catalog = ModelCatalog::default_catalog();
+        let entries = list_models_json("all", &catalog).expect("`all` never fails");
+        let covered: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.provider_id.as_str()).collect();
+        for id in registry::known_ids() {
+            assert!(
+                covered.contains(id),
+                "provider `{id}` from registry::known_ids() has no row in `models list --json all`"
+            );
+        }
+    }
+
+    /// An unknown `--json` provider filter must return a typed
+    /// `provider_not_found` error carrying the full known-id set — never a
+    /// bare `anyhow!` string (the pre-fix behavior).
+    #[test]
+    fn json_list_unknown_provider_returns_typed_error_with_known_ids() {
+        let catalog = ModelCatalog::default_catalog();
+        let err =
+            list_models_json("nosuchprovider", &catalog).expect_err("bogus id must not resolve");
+        assert_eq!(err.code, SdkErrorCode::ProviderNotFound);
+        let known = err.known.expect("known ids must be attached");
+        assert!(known.contains(&"grok".to_string()));
+        assert!(known.contains(&"claude".to_string()));
+        assert!(known.contains(&"codex".to_string()));
+    }
+
+    /// Dispatch is keyed off `ProviderDescriptor::kind`, not a per-id string
+    /// chain: EVERY native descriptor (not just grok) reports a
+    /// default-marked row with no catalog lookup, driven purely by `kind ==
+    /// ProviderKind::Native`.
+    #[test]
+    fn entries_for_dispatches_every_native_descriptor_by_kind_not_id() {
+        let catalog = ModelCatalog::default_catalog();
+        for d in registry::all() {
+            if d.kind != ProviderKind::Native {
+                continue;
+            }
+            let entries = entries_for(&d, &catalog);
+            assert_eq!(
+                entries.len(),
+                1,
+                "{}: native providers report exactly one row",
+                d.id
+            );
+            assert!(
+                entries[0].is_default,
+                "{}: native row is a default row",
+                d.id
+            );
+        }
+    }
 
     // ── Ollama-specific paths ───────────────────────────────
 

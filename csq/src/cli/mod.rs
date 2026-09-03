@@ -1519,6 +1519,14 @@ enum SetkeyCmd {
         #[cfg(feature = "enterprise")]
         #[arg(long, requires = "backend")]
         sa_file: Option<String>,
+        /// Pin the model this cloud slot uses, written as `ANTHROPIC_MODEL`
+        /// into the slot's settings (e.g. `claude-opus-4-6@default`). Without
+        /// it CC picks its own default, which may be a model the project has
+        /// no quota for — CC retries that 429 silently, so the slot appears to
+        /// hang. Requires `--backend`.
+        #[cfg(feature = "enterprise")]
+        #[arg(long, requires = "backend")]
+        model: Option<String>,
     },
     /// Ollama profile (keyless — creates the settings file with defaults)
     Ollama {
@@ -2087,6 +2095,7 @@ pub fn run() -> Result<()> {
                 project,
                 region,
                 sa_file,
+                model,
                 key,
             } = &sk
             {
@@ -2097,6 +2106,7 @@ pub fn run() -> Result<()> {
                     project.as_deref(),
                     region.as_deref(),
                     sa_file.as_deref(),
+                    model.as_deref(),
                     key.as_deref(),
                 );
             }

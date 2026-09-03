@@ -141,6 +141,32 @@ pub fn is_dns_label_char(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
 }
 
+/// `true` for the cloud-Claude model-id charset — ASCII lowercase, digits,
+/// `-`, `.`, `@`, `:` and `/`.
+///
+/// Covers the three shapes operators actually paste: a Vertex id
+/// (`claude-opus-4-6@default`), a Bedrock model id
+/// (`anthropic.claude-opus-4-6-v1:0`), and a Bedrock inference-profile ARN
+/// (`arn:aws:bedrock:<region>:<acct>:inference-profile/us.anthropic.…`) —
+/// which is why `/` is admitted and the length bound is 200, not 64.
+///
+/// Input hygiene, NOT a security boundary — and the reason is a specific
+/// channel separation, not a general property. csq DOES interpolate a model
+/// into a URL path segment elsewhere, but that value reaches it only through
+/// `GovernedRequest.model_override` (`csq eval --model`), never from a slot's
+/// env block, and it is independently re-validated at that call site by a
+/// stricter path-segment charset plus a host assert. Should anything ever wire
+/// this env value into `model_override`, THIS charset becomes load-bearing and
+/// must be re-derived. `validate_endpoint_component` independently rejects
+/// `..`.
+///
+/// (Deliberately no module path here: this file SHIPS in the community
+/// edition, and naming the proprietary client module leaks it into the public
+/// tree — the extraction's leak-check-1b caught exactly that.)
+pub fn is_cloud_model_id_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | '@' | ':' | '/')
+}
+
 /// `true` for the Azure deployment-name / api-version charset: ASCII
 /// alphanumerics plus `.`, `_`, `-` (valid path-segment bytes, no host- or
 /// segment-redirection primitives). Used by [`validate_endpoint_component`].
@@ -570,12 +596,18 @@ pub enum CloudClaudeBackendSpec<'a> {
         project: &'a str,
         region: &'a str,
         sa_path: &'a std::path::Path,
+        /// Optional `ANTHROPIC_MODEL` pin written into the slot's env block.
+        /// `None` leaves CC to pick its default model.
+        model: Option<&'a str>,
     },
     /// Anthropic Claude via AWS Bedrock. `region` is DNS-label-validated;
     /// `bearer_token` is the `AWS_BEARER_TOKEN_BEDROCK` value.
     Bedrock {
         region: &'a str,
         bearer_token: &'a str,
+        /// Optional `ANTHROPIC_MODEL` pin written into the slot's env block.
+        /// `None` leaves CC to pick its default model.
+        model: Option<&'a str>,
     },
 }
 
@@ -599,6 +631,11 @@ const CLOUD_CLAUDE_ENV_KEYS: &[&str] = &[
     "GOOGLE_APPLICATION_CREDENTIALS",
     "AWS_REGION",
     "AWS_BEARER_TOKEN_BEDROCK",
+    // The per-slot model pin (an internal ticket follow-up). Purged with the rest so a
+    // re-provision WITHOUT --model clears a previous pin rather than silently
+    // inheriting it — a stale pin names a model the new region may not serve,
+    // which CC surfaces as a silent hang rather than an error.
+    "ANTHROPIC_MODEL",
 ];
 
 /// Removes every [`CLOUD_CLAUDE_ENV_KEYS`] entry from a settings `env` block —
@@ -652,48 +689,69 @@ pub fn bind_cloud_claude_backend_to_slot(
     // 1. Validate inputs BEFORE any fs mutation. project/region are interpolated
     //    into the GCP/AWS endpoints CC builds, so they get the same
     //    credential-redirection (SSRF) allowlist defense as the native providers.
-    let (provider_id, env_pairs): (&str, Vec<(&str, String)>) = match spec {
-        CloudClaudeBackendSpec::Vertex {
-            project,
-            region,
-            sa_path,
-        } => {
-            validate_endpoint_component(project, "--project", is_dns_label_char, 30)?;
-            validate_endpoint_component(region, "--region", is_dns_label_char, 40)?;
-            let abs = crate::providers::gemini::provisioning::validate_vertex_sa_path(sa_path)
-                .map_err(|_| ConfigError::MergeConflict {
-                    key: "--sa-file rejected (must be a regular, non-symlink JSON file ≤ 64 KiB)"
-                        .into(),
-                })?;
-            (
-                "claude-vertex",
-                vec![
-                    ("CLAUDE_CODE_USE_VERTEX", "1".to_string()),
-                    ("ANTHROPIC_VERTEX_PROJECT_ID", (*project).to_string()),
-                    ("CLOUD_ML_REGION", (*region).to_string()),
-                    (
-                        "GOOGLE_APPLICATION_CREDENTIALS",
-                        abs.to_string_lossy().to_string(),
-                    ),
-                ],
-            )
-        }
-        CloudClaudeBackendSpec::Bedrock {
-            region,
-            bearer_token,
-        } => {
-            validate_endpoint_component(region, "--region", is_dns_label_char, 40)?;
-            validate_key_shape(bearer_token)?;
-            (
-                "claude-bedrock",
-                vec![
-                    ("CLAUDE_CODE_USE_BEDROCK", "1".to_string()),
-                    ("AWS_REGION", (*region).to_string()),
-                    ("AWS_BEARER_TOKEN_BEDROCK", (*bearer_token).to_string()),
-                ],
-            )
-        }
-    };
+    let (provider_id, mut env_pairs, model_pin): (&str, Vec<(&str, String)>, Option<&str>) =
+        match spec {
+            CloudClaudeBackendSpec::Vertex {
+                project,
+                region,
+                sa_path,
+                model,
+            } => {
+                validate_endpoint_component(project, "--project", is_dns_label_char, 30)?;
+                validate_endpoint_component(region, "--region", is_dns_label_char, 40)?;
+                let abs = crate::providers::gemini::provisioning::validate_vertex_sa_path(sa_path)
+                    .map_err(|_| ConfigError::MergeConflict {
+                        key:
+                            "--sa-file rejected (must be a regular, non-symlink JSON file ≤ 64 KiB)"
+                                .into(),
+                    })?;
+                (
+                    "claude-vertex",
+                    vec![
+                        ("CLAUDE_CODE_USE_VERTEX", "1".to_string()),
+                        ("ANTHROPIC_VERTEX_PROJECT_ID", (*project).to_string()),
+                        ("CLOUD_ML_REGION", (*region).to_string()),
+                        (
+                            "GOOGLE_APPLICATION_CREDENTIALS",
+                            abs.to_string_lossy().to_string(),
+                        ),
+                    ],
+                    *model,
+                )
+            }
+            CloudClaudeBackendSpec::Bedrock {
+                region,
+                bearer_token,
+                model,
+            } => {
+                validate_endpoint_component(region, "--region", is_dns_label_char, 40)?;
+                validate_key_shape(bearer_token)?;
+                (
+                    "claude-bedrock",
+                    vec![
+                        ("CLAUDE_CODE_USE_BEDROCK", "1".to_string()),
+                        ("AWS_REGION", (*region).to_string()),
+                        ("AWS_BEARER_TOKEN_BEDROCK", (*bearer_token).to_string()),
+                    ],
+                    *model,
+                )
+            }
+        };
+
+    // 1b. Optional per-slot model pin. Without it CC picks its own default,
+    //     which on a cloud backend may be a model the project has no quota for —
+    //     and CC retries that 429 silently rather than surfacing it, so the
+    //     operator sees an indefinite hang with no diagnostic. Pinning is the
+    //     only way to make the slot deterministic.
+    //     Normalisation lives HERE, not in each caller: the CLI passed the raw
+    //     argument while the desktop trimmed first, so `" claude-opus-4-6@default "`
+    //     was rejected on one surface and accepted on the other (redteam L1).
+    //     Trimming in the binder makes both surfaces inherit one rule.
+    let model_pin = model_pin.map(str::trim).filter(|m| !m.is_empty());
+    if let Some(model) = model_pin {
+        validate_endpoint_component(model, "--model", is_cloud_model_id_char, 200)?;
+        env_pairs.push(("ANTHROPIC_MODEL", model.to_string()));
+    }
 
     // 2. Residency gate: cloud-Claude routes prompt data to a GCP/AWS region —
     //    refuse if the operating envelope's residency policy forbids that provider.
@@ -1323,6 +1381,7 @@ mod tests {
                 project: "my-proj",
                 region: "us-east5",
                 sa_path: &sa,
+                model: None,
             },
         )
         .expect("vertex provision succeeds on a fresh slot");
@@ -1359,6 +1418,7 @@ mod tests {
             &CloudClaudeBackendSpec::Bedrock {
                 region: "us-east-1",
                 bearer_token: "aws-bearer-token-value-1234567890",
+                model: None,
             },
         )
         .expect("bedrock provision succeeds");
@@ -1388,6 +1448,7 @@ mod tests {
                 project: "p",
                 region: "r",
                 sa_path: &sa,
+                model: None,
             },
         )
         .unwrap_err();
@@ -1420,6 +1481,7 @@ mod tests {
                 project: "p",
                 region: "r",
                 sa_path: &sa,
+                model: None,
             },
         )
         .unwrap_err();
@@ -1444,6 +1506,7 @@ mod tests {
                 project: "p",
                 region: "r",
                 sa_path: &sa,
+                model: None,
             },
         )
         .unwrap();
@@ -1453,6 +1516,7 @@ mod tests {
             &CloudClaudeBackendSpec::Bedrock {
                 region: "eu-west-1",
                 bearer_token: "aws-bearer-token-value-1234567890",
+                model: None,
             },
         )
         .expect("re-provision to bedrock succeeds");
@@ -1464,6 +1528,206 @@ mod tests {
         );
         assert!(env.get("ANTHROPIC_VERTEX_PROJECT_ID").is_none());
         assert!(env.get("GOOGLE_APPLICATION_CREDENTIALS").is_none());
+    }
+
+    /// The pin is written verbatim into the env block CC reads.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_vertex_writes_model_pin() {
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(31u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "my-proj",
+                region: "europe-west1",
+                sa_path: &sa,
+                model: Some("claude-opus-4-6@default"),
+            },
+        )
+        .expect("vertex provision with a model pin succeeds");
+
+        let env = slot_env(dir.path(), 31);
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").unwrap(),
+            "claude-opus-4-6@default"
+        );
+    }
+
+    /// No pin requested => no key written, so CC keeps its own default.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_vertex_without_model_writes_no_pin() {
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(32u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "my-proj",
+                region: "europe-west1",
+                sa_path: &sa,
+                model: None,
+            },
+        )
+        .unwrap();
+        assert!(slot_env(dir.path(), 32).get("ANTHROPIC_MODEL").is_none());
+    }
+
+    /// Re-provisioning WITHOUT a pin must clear a previous one. A stale pin
+    /// names a model the new region may not serve, and CC surfaces that as a
+    /// silent hang rather than an error — so inheriting it is worse than
+    /// having no pin at all.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_reprovision_clears_stale_model_pin() {
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(33u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "my-proj",
+                region: "global",
+                sa_path: &sa,
+                model: Some("claude-opus-4-8@default"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            slot_env(dir.path(), 33).get("ANTHROPIC_MODEL").unwrap(),
+            "claude-opus-4-8@default"
+        );
+
+        // Same slot, EU region, no pin: the global-only model must NOT survive.
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "my-proj",
+                region: "europe-west1",
+                sa_path: &sa,
+                model: None,
+            },
+        )
+        .unwrap();
+        let env = slot_env(dir.path(), 33);
+        assert!(
+            env.get("ANTHROPIC_MODEL").is_none(),
+            "stale pin survived a re-provision: {:?}",
+            env.get("ANTHROPIC_MODEL")
+        );
+        assert_eq!(env.get("CLOUD_ML_REGION").unwrap(), "europe-west1");
+    }
+
+    /// Whitespace is normalised in the BINDER, so the CLI (which passes its
+    /// argument verbatim) and the desktop (which trimmed first) cannot disagree
+    /// about whether `" model "` is valid. Redteam L1.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_trims_model_pin_so_surfaces_agree() {
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(36u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "my-proj",
+                region: "europe-west1",
+                sa_path: &sa,
+                model: Some("  claude-opus-4-6@default  "),
+            },
+        )
+        .expect("a padded model id is accepted and trimmed, not rejected");
+        assert_eq!(
+            slot_env(dir.path(), 36).get("ANTHROPIC_MODEL").unwrap(),
+            "claude-opus-4-6@default"
+        );
+    }
+
+    /// An all-whitespace pin means "no pin", matching the desktop's empty-field
+    /// semantics rather than failing validation.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_blank_model_pin_is_no_pin() {
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(37u16).unwrap();
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Vertex {
+                project: "my-proj",
+                region: "europe-west1",
+                sa_path: &sa,
+                model: Some("   "),
+            },
+        )
+        .expect("a blank pin is not an error");
+        assert!(slot_env(dir.path(), 37).get("ANTHROPIC_MODEL").is_none());
+    }
+
+    /// A Bedrock inference-profile ARN is a legitimate `ANTHROPIC_MODEL`
+    /// value: it carries `/` and runs well past 64 chars. Rejecting it would
+    /// push operators straight back to hand-editing settings.json.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_accepts_bedrock_inference_profile_arn() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(35u16).unwrap();
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:inference-profile/\
+                   us.anthropic.claude-opus-4-6-v1:0";
+        bind_cloud_claude_backend_to_slot(
+            dir.path(),
+            slot,
+            &CloudClaudeBackendSpec::Bedrock {
+                region: "us-east-1",
+                bearer_token: "bedrock-token-value",
+                model: Some(arn),
+            },
+        )
+        .expect("a Bedrock inference-profile ARN is a valid model pin");
+        assert_eq!(
+            slot_env(dir.path(), 35).get("ANTHROPIC_MODEL").unwrap(),
+            &arn
+        );
+    }
+
+    /// The pin is interpolated into nothing, but it IS operator input on a
+    /// credential path — hold it to the same charset discipline as the rest.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn bind_cloud_claude_rejects_malformed_model_pin() {
+        let dir = TempDir::new().unwrap();
+        let sa = write_fake_sa(dir.path());
+        let slot = AccountNum::try_from(34u16).unwrap();
+        // NB: "" and "   " are NOT here — they normalise to "no pin", which
+        // `bind_cloud_claude_blank_model_pin_is_no_pin` covers.
+        for bad in [
+            "claude opus",
+            "claude/../etc",
+            "CLAUDE-OPUS",
+            "a\nb",
+            "x\ty",
+        ] {
+            let err = bind_cloud_claude_backend_to_slot(
+                dir.path(),
+                slot,
+                &CloudClaudeBackendSpec::Vertex {
+                    project: "my-proj",
+                    region: "europe-west1",
+                    sa_path: &sa,
+                    model: Some(bad),
+                },
+            )
+            .expect_err(&format!("model {bad:?} must be rejected"));
+            assert!(format!("{err}").contains("--model"), "got: {err}");
+        }
     }
 
     #[cfg(feature = "enterprise")]
@@ -1481,6 +1745,7 @@ mod tests {
                 project: "evil.example.com/",
                 region: "r",
                 sa_path: &sa,
+                model: None,
             },
         )
         .unwrap_err();
@@ -1504,6 +1769,7 @@ mod tests {
                 project: "p",
                 region: "r",
                 sa_path: &link,
+                model: None,
             },
         )
         .unwrap_err();
@@ -1594,6 +1860,7 @@ mod tests {
                 project: "p",
                 region: "r",
                 sa_path: &sa,
+                model: None,
             },
         )
         .unwrap();
@@ -1618,6 +1885,7 @@ mod tests {
             &CloudClaudeBackendSpec::Bedrock {
                 region: "us-east-1",
                 bearer_token: "aws-bearer-token-value-1234567890",
+                model: None,
             },
         )
         .unwrap();

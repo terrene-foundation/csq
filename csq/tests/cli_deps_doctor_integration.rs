@@ -5,7 +5,7 @@
 //! - Slot-suppression: surface row appears only when authenticated slots exist.
 //! - Stale-slot variant: `Missing | WrongBinary` with slots configured.
 //! - Empty-state row: no slots on any surface.
-//! - `schema_version` in JSON output — both editions report 24 as of v24
+//! - `schema_version` in JSON output — both editions report 25 as of v25
 //!   (`stale_quota_slots`, cross-edition); asserted against the
 //!   build-active value, not a literal.
 //! - Absent-key test: `codex_cli` omitted when no codex slots (R1-L2).
@@ -231,7 +231,7 @@ fn test_1_all_surfaces_with_stubs_render_three_rows() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version: BOTH editions report 24. v24's `unshared_handle_state` is
+    // schema_version: BOTH editions report 25. v25's `codex_shared_shape_mismatches` is
     // NOT cfg-gated (the community build computes+emits it too), so per the
     // shared-monotonic-counter "highest field-version an edition emits"
     // contract the community ceiling jumps straight from 19 to 23 — past
@@ -240,12 +240,12 @@ fn test_1_all_surfaces_with_stubs_render_three_rows() {
     // spawned binary carries this crate's feature set. Keep in lockstep
     // with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema = 24;
+    let expected_schema = 25;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema = 24;
+    let expected_schema = 25;
     assert_eq!(
         json["schema_version"], expected_schema,
-        "schema_version must equal the edition-active value (both editions: 24)"
+        "schema_version must equal the edition-active value (both editions: 25)"
     );
     assert_eq!(json["claude_code"]["status"], "ok");
     assert_eq!(json["codex_cli"]["status"], "ok");
@@ -533,7 +533,7 @@ fn test_10_json_schema_version_2() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version: BOTH editions report 24. v24 (`unshared_handle_state`) is
+    // schema_version: BOTH editions report 25. v25 (`codex_shared_shape_mismatches`) is
     // NOT cfg-gated (always-computed, `skip_serializing_if` empty — a
     // RUNTIME-state omission, not an edition capability), so the community
     // ceiling jumps straight from 19 to 23, past the intervening
@@ -542,13 +542,13 @@ fn test_10_json_schema_version_2() {
     // The spawned binary carries this crate's feature set. Keep in
     // lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema: u64 = 24;
+    let expected_schema: u64 = 25;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema: u64 = 24;
+    let expected_schema: u64 = 25;
     assert_eq!(
         json["schema_version"],
         Value::Number(serde_json::Number::from(expected_schema)),
-        "schema_version must equal the edition-active value (both editions: 24)"
+        "schema_version must equal the edition-active value (both editions: 25)"
     );
 }
 

@@ -1,0 +1,55 @@
+{
+  "$comment": [
+    "SINGLE declaration of what a self-hosted runner must provide for csq's CI.",
+    "",
+    "WHY THIS FILE EXISTS. Before it, the requirement lived implicitly in nine",
+    "separate `ensure-apt-deps.sh` call sites plus an unwritten assumption that",
+    "`claude` was on PATH. Nothing stated the whole set, so nothing could check",
+    "it, so a runner that lacked half of it was indistinguishable from a healthy",
+    "one until a job failed 40 minutes in with a misleading message.",
+    "",
+    "Measured 2026-09-01: the org pool holds two disjoint Linux fleets that both",
+    "answer to [self-hosted, Linux, X64]. The `ci-portable` fleet (16) satisfies",
+    "these profiles; the `kailash-release` fleet (4) satisfies none of them. Jobs",
+    "are label-pinned to `ci-portable` — this file is the belt to that braces: it",
+    "catches a runner that carries the label without the capability.",
+    "",
+    "Edit THIS file, never the assert script's internals."
+  ],
+  "profiles": {
+    "rust": {
+      "why": "Any cargo build/test job.",
+      "binaries": ["cargo", "rustc", "git"],
+      "packages": [],
+      "needs_sudo": false
+    },
+    "claude-cli": {
+      "why": "Jobs whose tests shell out to the `claude` binary. Its absence is silent: the eval harness records `skipped_cli_missing` and asserts on empty output, and csq-core's phase2b tests fail with `claude binary not found on PATH`. Both read as flakes.",
+      "binaries": ["claude"],
+      "packages": [],
+      "needs_sudo": false
+    },
+    "tauri-linux": {
+      "why": "Desktop bundle build (release.yml build-desktop, edition-seam enterprise-build).",
+      "binaries": [],
+      "packages": [
+        "libwebkit2gtk-4.1-dev",
+        "librsvg2-dev",
+        "patchelf"
+      ],
+      "needs_sudo": false
+    },
+    "harness-sandbox": {
+      "why": "coc-harness runs the eval harness under bubblewrap.",
+      "binaries": ["bwrap"],
+      "packages": ["bubblewrap"],
+      "needs_sudo": false
+    },
+    "windows-cross": {
+      "why": "cfg(windows) clippy via the mingw cross target.",
+      "binaries": ["x86_64-w64-mingw32-gcc"],
+      "packages": ["gcc-mingw-w64-x86-64"],
+      "needs_sudo": false
+    }
+  }
+}

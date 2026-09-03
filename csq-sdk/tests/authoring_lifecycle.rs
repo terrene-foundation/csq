@@ -15,8 +15,8 @@ use csq_sdk::{
     DeliveryFormFactor, DistillationRequest, DistillationResponse, Envelope, FormFactorSignal,
     FormFactorSignalKind, InMemorySessionMemory, IntentTurn, IntentTurnRequest, IntentTurnResponse,
     IntentTurnSequence, MemoryDeleteRequest, MemoryEditRequest, MemoryGateway, MemoryReadRequest,
-    MemoryScope, RequestCorrelation, RoutingEvidence, RoutingPolicy, SdkError, SdkErrorCode,
-    SessionBinding, SessionContext, SessionMemoryStore, SessionTurn, StepTransition, StoredRecord,
+    MemoryScope, RequestCorrelation, RoutingEvidence, RoutingPolicy, ScopeRead, SdkError,
+    SdkErrorCode, SessionBinding, SessionContext, SessionMemoryStore, SessionTurn, StepTransition,
     TurnDisposition, TurnRole, VerificationMethod, VerifiedOperator, WorkerUtterance,
     SCHEMA_AUTHORING_MEMORY_V1,
 };
@@ -57,18 +57,9 @@ struct CountingStore {
 }
 
 impl SessionMemoryStore for CountingStore {
-    fn load(
-        &mut self,
-        scope: &MemoryScope,
-        item_id: &str,
-    ) -> Result<Option<StoredRecord>, SdkError> {
+    fn load(&mut self, scope: &MemoryScope, item_id: &str) -> Result<ScopeRead, SdkError> {
         self.touches += 1;
         self.inner.load(scope, item_id)
-    }
-
-    fn revision(&mut self, scope: &MemoryScope) -> Result<u64, SdkError> {
-        self.touches += 1;
-        self.inner.revision(scope)
     }
 
     fn store(

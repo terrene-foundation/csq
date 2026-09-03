@@ -123,6 +123,10 @@ struct DoctorReport {
     /// judgement (a cache legitimately is not), and relocating a user's state is not a
     /// diagnostic's job.
     unshared_handle_state: Vec<UnsharedHandleStateJson>,
+    /// Shared codex targets whose SHAPE is wrong (v25) — the cause of
+    /// `failed to start embedded app server`. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    codex_shared_shape_mismatches: Vec<CodexSharedShapeJson>,
     broker_failed: BrokerFailedInfo,
     mixed_state_slots: MixedStateInfo,
     terminals: TerminalInfo,
@@ -639,6 +643,36 @@ struct AuditSinkDoctorInfo {
 /// vendor-CLI login — that writes to the vendor's own home dir
 /// (`~/.grok`/`~/.kimi-code`) and leaves the csq slot token expired with
 /// quota frozen (see `discovery_native_slot_login_must_go_through_csq`).
+/// A shared codex-home target whose on-disk shape disagrees with the shape
+/// codex-cli needs (v25).
+///
+/// This is the state that makes `csq run <codex slot>` abort with
+/// `failed to start embedded app server` — an upstream error naming neither the
+/// entry nor the shape, so it is undiagnosable from the message alone. Hosts
+/// provisioned before the kind was declared carry `codex-version.json`,
+/// `codex-models_cache.json` and `codex-installation_id` as empty DIRECTORIES.
+///
+/// Reported even when `repairable` is true: the next spawn fixes those, but an
+/// operator staring at a broken slot deserves to see the cause NOW rather than
+/// be told to try again.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct CodexSharedShapeJson {
+    /// Slot whose `config-N` holds the wrong-shaped target.
+    slot: u16,
+    /// codex-home entry name, e.g. `version.json`.
+    name: String,
+    /// What is on disk: `"dir"` / `"file"`.
+    found: String,
+    /// What codex-cli needs: `"dir"` / `"file"`.
+    expected: String,
+    /// `true` when the next `csq run <slot>` self-heals it (an EMPTY dir where a
+    /// file belongs). `false` means csq will NOT touch it — repairing would
+    /// destroy state — and an operator must act.
+    self_heals: bool,
+    /// Actionable remediation, never a generic tag.
+    hint: String,
+}
+
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 struct StaleQuotaSlotJson {
     /// Slot number.
@@ -1557,9 +1591,9 @@ struct UnsharedHandleStateJson {
 
 // v24 adds `unshared_handle_state`. Both ceilings move together, as v23 did.
 #[cfg(feature = "enterprise")]
-const DOCTOR_SCHEMA_VERSION: u32 = 24;
+const DOCTOR_SCHEMA_VERSION: u32 = 25;
 #[cfg(not(feature = "enterprise"))]
-const DOCTOR_SCHEMA_VERSION: u32 = 24;
+const DOCTOR_SCHEMA_VERSION: u32 = 25;
 
 /// Derive the `schema` string from [`DOCTOR_SCHEMA_VERSION`] — the ONLY place
 /// `"csq.doctor.v"` + the version number are concatenated (an internal ticket Track B: a
@@ -1741,6 +1775,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         daemon: check_daemon(base_dir),
         accounts: check_accounts(base_dir),
         stale_quota_slots: check_stale_quota_polls(base_dir),
+        codex_shared_shape_mismatches: check_codex_shared_shapes(base_dir),
         unshared_handle_state: csq_core::session::share_audit::unshared_state_by_name(base_dir)
             .into_iter()
             .map(|(name, hits)| UnsharedHandleStateJson {
@@ -3511,6 +3546,60 @@ fn check_accounts(base_dir: &Path) -> AccountsInfo {
     }
 }
 
+/// Builds the `codex_shared_shape_mismatches` rows (v25).
+///
+/// Delegates to `csq_core::session::handle_dir::shared_codex_shape_mismatches`,
+/// which reads the SAME `CODEX_SHARED_STATE` table the provisioning path uses.
+/// A diagnostic that enumerated its own copy of that list would drift from the
+/// writer and then report confidently on a world the product had left
+/// (`diagnostic-surface-parity.md`).
+fn check_codex_shared_shapes(base_dir: &Path) -> Vec<CodexSharedShapeJson> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return out;
+    };
+    let mut slots: Vec<u16> = entries
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("config-"))
+                .and_then(|n| n.parse::<u16>().ok())
+        })
+        .collect();
+    slots.sort_unstable();
+
+    for slot in slots {
+        let config_dir = base_dir.join(format!("config-{slot}"));
+        for m in csq_core::session::handle_dir::shared_codex_shape_mismatches(&config_dir) {
+            let hint = if m.self_heals_hint() {
+                format!(
+                    "empty directory where codex-cli needs a file; the next `csq run {slot}` repairs it automatically"
+                )
+            } else if m.found_dir {
+                format!(
+                    "directory where codex-cli needs a file, and it is NOT empty — csq will not delete it. Move `{}` aside, then re-run `csq run {slot}`",
+                    m.path.display()
+                )
+            } else {
+                format!(
+                    "file where codex-cli needs a directory — csq will not delete it. Move `{}` aside, then re-run `csq run {slot}`",
+                    m.path.display()
+                )
+            };
+            out.push(CodexSharedShapeJson {
+                slot,
+                name: m.name.clone(),
+                found: if m.found_dir { "dir" } else { "file" }.to_string(),
+                expected: if m.want_dir { "dir" } else { "file" }.to_string(),
+                self_heals: m.repairable,
+                hint,
+            });
+        }
+    }
+    out
+}
+
 /// Builds the `stale_quota_slots` row — the ONLY doctor check that reads
 /// [`csq_core::quota::status::show_status`], the same function `csq status`
 /// calls on its fallback (non-daemon) path, so `stale_secs` classification
@@ -4340,6 +4429,24 @@ fn print_report(r: &DoctorReport) {
     // `csq status` to find out WHICH slot is frozen — closes the gap where
     // `csq doctor` read all-green while `csq status` showed native
     // Kimi/Grok slots `stale 1d`+ with an expired vendor token.
+    // v25: the cause of codex's `failed to start embedded app server`. Printed
+    // even when it self-heals — an operator looking at a broken slot should see
+    // WHY now, not be told to try again and hope.
+    for m in &r.codex_shared_shape_mismatches {
+        println!(
+            "  Codex state: {} slot {} \"{}\" is a {} but codex-cli needs a {} — {}",
+            // Self-healing ones are informational: the next spawn fixes them, so
+            // warning permanently would be alarm fatigue on a resolved condition.
+            // The ones csq refuses to touch need a human and stay `⚠`.
+            if m.self_heals { info() } else { warn() },
+            m.slot,
+            m.name,
+            m.found,
+            m.expected,
+            m.hint
+        );
+    }
+
     for s in &r.stale_quota_slots {
         println!(
             "  Quota poll:  {} slot {} [{}] \"{}\" stale {} — {}",
@@ -5777,6 +5884,7 @@ mod tests {
             schema: doctor_schema_string(),
             audit_records_unverified: 0,
             unshared_handle_state: Vec::new(),
+            codex_shared_shape_mismatches: Vec::new(),
             version: "0.0.0".into(),
             platform: PlatformInfo {
                 os: "test".into(),

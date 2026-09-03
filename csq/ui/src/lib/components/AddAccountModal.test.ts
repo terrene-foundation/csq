@@ -1050,6 +1050,159 @@ describe("AddAccountModal", () => {
     ).toBeNull();
   });
 
+  it("sends the model pin when the operator supplies one", async () => {
+    setupMocks({
+      get_build_edition: "enterprise",
+      cloud_claude_provision_vertex: undefined,
+    });
+    mockOpenDialog.mockResolvedValueOnce("/abs/sa.json");
+
+    const { container } = renderModal();
+    await settle(15);
+
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-card"]',
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    await fireEvent.input(
+      container.querySelector(
+        '[data-testid="cloud-claude-vertex-project"]',
+      ) as HTMLInputElement,
+      { target: { value: "kailash-coc" } },
+    );
+    await fireEvent.input(
+      container.querySelector(
+        '[data-testid="cloud-claude-vertex-region"]',
+      ) as HTMLInputElement,
+      { target: { value: "europe-west1" } },
+    );
+    await fireEvent.input(
+      container.querySelector(
+        '[data-testid="cloud-claude-model"]',
+      ) as HTMLInputElement,
+      { target: { value: "  claude-opus-4-6@default  " } },
+    );
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-vertex-pick"]',
+      ) as HTMLButtonElement,
+    );
+    await settle();
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-vertex-submit"]',
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    // Trimmed, and passed through as a real value rather than null.
+    expect(mockInvoke).toHaveBeenCalledWith("cloud_claude_provision_vertex", {
+      baseDir: "/home/test/.claude/accounts",
+      slot: 3,
+      project: "kailash-coc",
+      region: "europe-west1",
+      saPath: "/abs/sa.json",
+      model: "claude-opus-4-6@default",
+    });
+  });
+
+  it("offers the model pin on the Bedrock tab too, and sends it", async () => {
+    setupMocks({
+      get_build_edition: "enterprise",
+      cloud_claude_provision_bedrock: undefined,
+    });
+
+    const { container } = renderModal();
+    await settle(15);
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-card"]',
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    // Switch to the Bedrock tab.
+    const tabs = Array.from(container.querySelectorAll("button")).filter((b) =>
+      b.textContent?.includes("AWS Bedrock"),
+    );
+    await fireEvent.click(tabs[0] as HTMLButtonElement);
+    await settle();
+
+    // The pin field must exist here, not only on the Vertex tab.
+    const model = container.querySelector(
+      '[data-testid="cloud-claude-model"]',
+    ) as HTMLInputElement;
+    expect(model).not.toBeNull();
+
+    await fireEvent.input(
+      container.querySelector(
+        '[data-testid="cloud-claude-bedrock-region"]',
+      ) as HTMLInputElement,
+      { target: { value: "us-east-1" } },
+    );
+    await fireEvent.input(
+      container.querySelector(
+        '[data-testid="cloud-claude-bedrock-token"]',
+      ) as HTMLInputElement,
+      { target: { value: "bedrock-bearer-token" } },
+    );
+    await fireEvent.input(model, {
+      target: { value: "anthropic.claude-opus-4-6-v1:0" },
+    });
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-bedrock-submit"]',
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    expect(mockInvoke).toHaveBeenCalledWith("cloud_claude_provision_bedrock", {
+      baseDir: "/home/test/.claude/accounts",
+      slot: 3,
+      region: "us-east-1",
+      bearerToken: "bedrock-bearer-token",
+      model: "anthropic.claude-opus-4-6-v1:0",
+    });
+  });
+
+  it("clears the model pin when switching backend tabs", async () => {
+    setupMocks({ get_build_edition: "enterprise" });
+
+    const { container } = renderModal();
+    await settle(15);
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="cloud-claude-card"]',
+      ) as HTMLButtonElement,
+    );
+    await settle();
+
+    // Type a VERTEX-shaped id on the Vertex tab...
+    await fireEvent.input(
+      container.querySelector(
+        '[data-testid="cloud-claude-model"]',
+      ) as HTMLInputElement,
+      { target: { value: "claude-opus-4-6@default" } },
+    );
+    await settle();
+
+    // ...switch to Bedrock. The Vertex id must NOT survive: the charset
+    // admits it, so it would be written to a Bedrock slot verbatim and hang.
+    const tabs = Array.from(container.querySelectorAll("button")).filter((b) =>
+      b.textContent?.includes("AWS Bedrock"),
+    );
+    await fireEvent.click(tabs[0] as HTMLButtonElement);
+    await settle();
+
+    const afterSwitch = container.querySelector(
+      '[data-testid="cloud-claude-model"]',
+    ) as HTMLInputElement;
+    expect(afterSwitch.value).toBe("");
+  });
+
   it("provisions a Claude slot via Vertex from the cloud-Claude card", async () => {
     setupMocks({
       get_build_edition: "enterprise",
@@ -1099,6 +1252,7 @@ describe("AddAccountModal", () => {
       project: "my-gcp-project",
       region: "us-east5",
       saPath: "/abs/sa.json",
+      model: null,
     });
     expect(container.textContent).toContain("Google Vertex AI");
   });
@@ -1149,6 +1303,7 @@ describe("AddAccountModal", () => {
       slot: 3,
       region: "us-east-1",
       bearerToken: "bedrock-bearer-token",
+      model: null,
     });
     expect(container.textContent).toContain("AWS Bedrock");
   });

@@ -674,8 +674,8 @@ Apache License
 
 Used by:
 
-- [csq-redact 2.18.0](https://github.com/terrene-foundation/csq)
-- [csq-sdk 2.18.0](https://github.com/terrene-foundation/csq)
+- [csq-redact 2.19.0](https://github.com/terrene-foundation/csq)
+- [csq-sdk 2.19.0](https://github.com/terrene-foundation/csq)
 - [dunce 1.0.5](https://gitlab.com/kornelski/dunce)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [sync_wrapper 1.0.2](https://github.com/Actyx/sync_wrapper)

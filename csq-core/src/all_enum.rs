@@ -44,6 +44,24 @@
 //!   against `ALL`'s own recorded length, never against the enum's actual
 //!   variant count.
 //!
+//! # What the generated non-vacuity guard does and does not close
+//!
+//! The macro emits `const _: () = assert!(!ALL.is_empty(), ..)` for every
+//! consumer (an internal ticket). That closes ONE specific hole: a consumer test
+//! written as `for x in Foo::ALL { assert!(..) }` asserts nothing at all when
+//! `ALL` is empty, and passes. The guard makes that state a compile error.
+//!
+//! It does NOT make such a test non-vacuous in general — a test that iterates
+//! a NON-empty `ALL` still proves only what it asserts about the elements it
+//! saw. Consumers that want to show their loop ran should assert an iteration
+//! COUNT against `Foo::ALL.len()`, which this guard makes non-zero.
+//!
+//! It also does not need to check for DUPLICATES. A duplicated variant in a
+//! macro invocation is rejected as `E0428` at the enum definition the macro
+//! expands to, before `ALL` is built — verified against `rustc`, not assumed.
+//! A hand-written duplicate check over `ALL` is therefore guarding a state
+//! that is no longer expressible.
+//!
 //! Both shapes have the same root cause: nothing forces the two SITES —
 //! the enum definition and the `ALL` literal — to move together. This
 //! macro removes the second site. `Foo` and `Foo::ALL` are generated from
@@ -93,6 +111,26 @@ macro_rules! declare_all_enum {
             /// class this replaces.
             pub const ALL: &'static [$name] = &[$($name::$variant),+];
         }
+
+        // The non-vacuity guard, generated per consumer so no enum has to
+        // remember to carry one (an internal ticket).
+        //
+        // Every consumer test of the shape `for x in Foo::ALL { .. }` asserts
+        // its property zero times if `ALL` is empty, and passes — green
+        // whether or not the property holds, which `instrument-discipline.md`
+        // MUST-2 says is not evidence. This makes an empty `ALL` a COMPILE
+        // error, so that shape cannot iterate zero times in any present or
+        // future consumer.
+        //
+        // `const _` is anonymous and so may repeat, which matters: `oq1.rs`
+        // invokes this macro twice in one module, and any named item (a test
+        // fn, a `mod`) would collide there without a `paste!`-style ident
+        // concatenation this crate does not depend on.
+        const _: () = assert!(
+            !$name::ALL.is_empty(),
+            "declare_all_enum!: ALL is empty, so every `for x in ALL` test over it \
+             iterates zero times and passes vacuously"
+        );
     };
 }
 

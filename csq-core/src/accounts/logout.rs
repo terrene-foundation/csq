@@ -684,7 +684,53 @@ fn bound_handle_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
     // this scanner (the in-use guard AND the keychain-clear step) run
     // BEFORE removing the profiles entry (SAFETY-ORDERING), so a modern
     // (post-A++) Anthropic OAuth slot resolves here under normal operation.
-    let account_uuid = profiles::resolve_slot_to_uuid(base_dir, account.get());
+    // ONE profiles snapshot for BOTH the account's own UUID and the reverse
+    // map. Two separate loads admit a torn view — load#1 says "this account
+    // has no UUID" while load#2 attributes our UUID to another slot — which
+    // is precisely the delete-under-a-live-session state below (redteam M4).
+    let profiles_snapshot = profiles::load(&profiles::profiles_path(base_dir)).ok();
+
+    // Resolved once: `account`'s own identity UUID, if `profiles.json`
+    // currently maps it via `by_slot`. Both `logout_account` callers of
+    // this scanner (the in-use guard AND the keychain-clear step) run
+    // BEFORE removing the profiles entry (SAFETY-ORDERING), so a modern
+    // (post-A++) Anthropic OAuth slot resolves here under normal operation.
+    let account_uuid = profiles_snapshot
+        .as_ref()
+        .and_then(|pf| pf.by_slot.get(&account.get().to_string()).copied());
+
+    // The UUID our OWN config dir's marker claims, if it holds one.
+    //
+    // Load-bearing when `account_uuid` is None (redteam C1). "Attributed to
+    // another slot" does NOT imply "not ours": `identity_mint::mint_for_login`
+    // REUSES `by_email[email]`, so two slots can legitimately share one UUID,
+    // and the codex partial-mint rollback (`profiles::remove_slot_mapping`,
+    // called from `providers/codex/{login,desktop_login}.rs`) drops
+    // `by_slot[N]` while leaving `config-N/` and its UUID marker intact.
+    // Without this check, a live handle dir resolving into our own config dir
+    // would be attributed to the sibling slot that still holds the UUID, and
+    // logout would delete the directory out from under it.
+    let own_marker_uuid =
+        markers::read_identity_marker(&base_dir.join(format!("config-{}", account.get())))
+            .and_then(|m| m.uuid);
+
+    // UUID -> LOWEST owning slot. `min` matches `profiles::resolve_uuid_to_slot`
+    // so the two resolvers cannot disagree on a UUID bound to several slots
+    // (redteam L5); a plain `collect` would keep an arbitrary hash-order slot.
+    let uuid_owner: std::collections::HashMap<_, u16> = profiles_snapshot
+        .as_ref()
+        .map(|pf| {
+            let mut m = std::collections::HashMap::new();
+            for (k, v) in &pf.by_slot {
+                if let Ok(slot) = k.parse::<u16>() {
+                    m.entry(*v)
+                        .and_modify(|s: &mut u16| *s = (*s).min(slot))
+                        .or_insert(slot);
+                }
+            }
+            m
+        })
+        .unwrap_or_default();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -719,11 +765,28 @@ fn bound_handle_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
             (Some(n), None) => n == account,
             (None, Some(u)) => match account_uuid {
                 Some(slot_uuid) => u == slot_uuid,
-                // `account` has no by_slot UUID mapping, so we cannot rule
-                // OUT that this handle dir belongs to it. Destructive
-                // operation: fail TOWARD in-use/bound on ambiguity rather
-                // than silently proceeding on a comparison we cannot make.
-                None => true,
+                // `account` has no `by_slot` UUID. That is NOT automatically
+                // ambiguous: if this dir's UUID maps to a KNOWN slot, the dir
+                // is definitively that slot's and provably not ours.
+                //
+                // Only a UUID we cannot attribute to any slot is genuinely
+                // ambiguous, and there we keep the fail-TOWARD-bound posture —
+                // a destructive operation must not proceed on a comparison it
+                // cannot make (`guard-reader-writer-parity.md` MUST-2).
+                None => {
+                    if own_marker_uuid == Some(u) {
+                        // Our own config dir claims this UUID — it may be ours
+                        // even though `by_slot` attributes it elsewhere.
+                        true
+                    } else {
+                        // Attributable to some OTHER known slot -> definitively
+                        // that slot's. Unattributable -> genuinely ambiguous, so
+                        // keep the fail-TOWARD-bound posture: a destructive
+                        // operation must not proceed on a comparison it cannot
+                        // soundly make (`guard-reader-writer-parity.md` MUST-2).
+                        !uuid_owner.contains_key(&u)
+                    }
+                }
             },
             // `read_identity_marker`'s contract guarantees exactly one
             // field is `Some` on every `Some(_)` return (see its doc
@@ -1528,6 +1591,187 @@ mod tests {
             Err(LogoutError::InUse { account: a, .. }) => assert_eq!(a, account(slot_n)),
             other => panic!("expected InUse (fail-toward-ambiguous), got {other:?}"),
         }
+    }
+
+    /// REGRESSION (2026-08-28): a NON-OAuth slot — 3P bearer, native, or
+    /// cloud-Claude — has no `by_slot` UUID at all (its profiles entry lives
+    /// in `by_slot_identity`, which holds a LABEL like `apikey:claude-vertex`,
+    /// not a UUID). `resolve_slot_to_uuid` therefore returns `None` for it,
+    /// which is correct — but the scanner then treated EVERY UUID-markered
+    /// live handle dir as bound, so such a slot could never be logged out
+    /// while any OAuth session was alive.
+    ///
+    /// Observed on a real host: `csq logout 20` refused with 21 live PIDs,
+    /// none of whose handle dirs resolved to `config-20`. Slots 13-20 were
+    /// all un-logout-able.
+    ///
+    /// The ambiguity posture is preserved where it is genuine (see
+    /// `logout_refuses_when_uuid_marker_present_but_slot_has_no_by_slot_mapping`
+    /// and the unknown-UUID test below): a dir whose UUID maps to a KNOWN,
+    /// DIFFERENT slot is not ambiguous — it is definitively not ours.
+    #[test]
+    fn logout_of_nonoauth_slot_ignores_dirs_owned_by_other_known_slots() {
+        use crate::accounts::identity_store::IdentityId;
+
+        let dir = TempDir::new().unwrap();
+        let oauth_slot = 4u16;
+        let nonoauth_slot = 20u16;
+        provision_account(dir.path(), oauth_slot);
+        provision_account(dir.path(), nonoauth_slot);
+
+        // Slot 4 is a normal OAuth slot WITH a by_slot UUID; slot 20 has none
+        // (the production shape for a cloud-Claude / 3P / native slot).
+        let uuid_4 = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(oauth_slot, "alice@x.com", uuid_4)]);
+        markers::write_csq_account(&dir.path().join(format!("config-{oauth_slot}")), uuid_4)
+            .unwrap();
+
+        // A LIVE handle dir bound to slot 4 — not to slot 20.
+        let my_pid = std::process::id();
+        let handle = dir.path().join(format!("term-{my_pid}"));
+        fs::create_dir_all(&handle).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            dir.path()
+                .join(format!("config-{oauth_slot}"))
+                .join(".csq-account"),
+            handle.join(".csq-account"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(
+            dir.path()
+                .join(format!("config-{oauth_slot}"))
+                .join(".csq-account"),
+            handle.join(".csq-account"),
+        )
+        .unwrap();
+        fs::write(handle.join(".live-pid"), my_pid.to_string()).unwrap();
+
+        // Logging out slot 20 must SUCCEED: the only live dir provably
+        // belongs to slot 4.
+        logout_account(dir.path(), account(nonoauth_slot)).expect(
+            "logout of a non-OAuth slot must not be blocked by a live dir owned by another slot",
+        );
+        assert!(!dir.path().join(format!("config-{nonoauth_slot}")).exists());
+        // Slot 4 untouched.
+        assert!(dir.path().join(format!("config-{oauth_slot}")).exists());
+    }
+
+    /// REGRESSION (redteam C1): a slot can lose its `by_slot` entry while
+    /// KEEPING its config dir and that dir's UUID marker — the codex
+    /// partial-mint rollback (`profiles::remove_slot_mapping`) does exactly
+    /// this — and `identity_mint::mint_for_login` REUSES `by_email[email]`,
+    /// so a sibling slot can legitimately hold the same UUID.
+    ///
+    /// In that state the dir's UUID IS attributable (to the sibling), but the
+    /// live handle dir resolves into OUR config dir. Treating "attributable
+    /// elsewhere" as "not ours" would delete the directory out from under a
+    /// running session — the exact failure the guard exists to prevent.
+    #[test]
+    fn logout_refuses_when_our_own_marker_uuid_is_attributed_to_a_sibling_slot() {
+        use crate::accounts::identity_store::IdentityId;
+
+        let dir = TempDir::new().unwrap();
+        let sibling = 4u16;
+        let target = 20u16;
+        provision_account(dir.path(), sibling);
+        provision_account(dir.path(), target);
+
+        // One UUID, shared: `by_slot` maps it to the SIBLING only. The target
+        // has no by_slot entry (rollback removed it) but its config dir marker
+        // still carries the shared UUID.
+        let shared = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(sibling, "alice@x.com", shared)]);
+        markers::write_csq_account(&dir.path().join(format!("config-{sibling}")), shared).unwrap();
+        markers::write_csq_account(&dir.path().join(format!("config-{target}")), shared).unwrap();
+
+        // A LIVE handle dir resolving into the TARGET's config dir.
+        let my_pid = std::process::id();
+        let handle = dir.path().join(format!("term-{my_pid}"));
+        fs::create_dir_all(&handle).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            dir.path()
+                .join(format!("config-{target}"))
+                .join(".csq-account"),
+            handle.join(".csq-account"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(
+            dir.path()
+                .join(format!("config-{target}"))
+                .join(".csq-account"),
+            handle.join(".csq-account"),
+        )
+        .unwrap();
+        fs::write(handle.join(".live-pid"), my_pid.to_string()).unwrap();
+
+        match logout_account(dir.path(), account(target)) {
+            Err(LogoutError::InUse { account: a, pids }) => {
+                assert_eq!(a, account(target));
+                assert!(pids.contains(&my_pid), "expected my PID in {pids:?}");
+            }
+            other => panic!(
+                "expected InUse — a live dir in our own config dir must block logout even when \
+                 by_slot attributes our marker UUID to a sibling slot; got {other:?}"
+            ),
+        }
+        // The live session's directory must still be there.
+        assert!(dir.path().join(format!("config-{target}")).exists());
+        assert!(dir
+            .path()
+            .join(format!("credentials/{target}.json"))
+            .exists());
+    }
+
+    /// The fail-closed half of the same arm: when the live dir's UUID maps to
+    /// NO known slot, it stays ambiguous and logout must still refuse.
+    #[test]
+    fn logout_of_nonoauth_slot_still_refuses_on_unknown_uuid_dir() {
+        use crate::accounts::identity_store::IdentityId;
+
+        let dir = TempDir::new().unwrap();
+        let nonoauth_slot = 20u16;
+        let stranger_slot = 7u16;
+        provision_account(dir.path(), nonoauth_slot);
+        provision_account(dir.path(), stranger_slot);
+
+        // A UUID that appears in NO by_slot mapping at all.
+        let orphan_uuid = IdentityId::new_v4();
+        markers::write_csq_account(
+            &dir.path().join(format!("config-{stranger_slot}")),
+            orphan_uuid,
+        )
+        .unwrap();
+
+        let my_pid = std::process::id();
+        let handle = dir.path().join(format!("term-{my_pid}"));
+        fs::create_dir_all(&handle).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            dir.path()
+                .join(format!("config-{stranger_slot}"))
+                .join(".csq-account"),
+            handle.join(".csq-account"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(
+            dir.path()
+                .join(format!("config-{stranger_slot}"))
+                .join(".csq-account"),
+            handle.join(".csq-account"),
+        )
+        .unwrap();
+        fs::write(handle.join(".live-pid"), my_pid.to_string()).unwrap();
+
+        match logout_account(dir.path(), account(nonoauth_slot)) {
+            Err(LogoutError::InUse { .. }) => {}
+            other => panic!("expected InUse on an unattributable UUID dir, got {other:?}"),
+        }
+        assert!(dir.path().join(format!("config-{nonoauth_slot}")).exists());
     }
 
     /// Specificity check: a UUID-marker handle dir bound to a DIFFERENT

@@ -447,6 +447,7 @@ pub fn handle_cloud_claude(
     project: Option<&str>,
     region: Option<&str>,
     sa_file: Option<&str>,
+    model: Option<&str>,
     key: Option<&str>,
 ) -> Result<()> {
     use csq_core::accounts::third_party::{
@@ -476,6 +477,7 @@ pub fn handle_cloud_claude(
                     project,
                     region,
                     sa_path,
+                    model,
                 },
             )
             .map_err(map_cloud_claude_error)?;
@@ -483,6 +485,10 @@ pub fn handle_cloud_claude(
             println!("  Project: {project}");
             println!("  Region:  {region}");
             println!("  SA file: {}", redact_path(sa_path));
+            match model {
+                Some(m) => println!("  Model:   {m}"),
+                None => println!("  Model:   (CC default — pin with --model if the slot hangs)"),
+            }
         }
         "bedrock" => {
             let token = read_key_arg_or_stdin(None)
@@ -493,11 +499,19 @@ pub fn handle_cloud_claude(
                 &CloudClaudeBackendSpec::Bedrock {
                     region,
                     bearer_token: &token,
+                    model,
                 },
             )
             .map_err(map_cloud_claude_error)?;
             println!("Provisioned slot {slot_num} → Claude via AWS Bedrock");
             println!("  Region: {region}");
+            // Same feedback as the Vertex arm (redteam L2): an operator who
+            // omits --model otherwise gets no hint about the silent-hang mode
+            // this flag exists to prevent.
+            match model {
+                Some(m) => println!("  Model:  {m}"),
+                None => println!("  Model:  (CC default — pin with --model if the slot hangs)"),
+            }
         }
         other => {
             return Err(anyhow!(
@@ -1297,6 +1311,7 @@ mod tests {
             Some("p"),
             Some("r"),
             Some("/x/sa.json"),
+            None,
             Some("sk-ant-somekey"),
         )
         .unwrap_err()
@@ -1316,6 +1331,7 @@ mod tests {
             Some("r"),
             Some("/x/sa.json"),
             None,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -1326,7 +1342,7 @@ mod tests {
     #[test]
     fn handle_cloud_claude_requires_region() {
         let dir = TempDir::new().unwrap();
-        let err = handle_cloud_claude(dir.path(), "bedrock", Some(7), None, None, None, None)
+        let err = handle_cloud_claude(dir.path(), "bedrock", Some(7), None, None, None, None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--region"), "got: {err}");
@@ -1336,9 +1352,18 @@ mod tests {
     #[test]
     fn handle_cloud_claude_rejects_unknown_backend() {
         let dir = TempDir::new().unwrap();
-        let err = handle_cloud_claude(dir.path(), "gcp", Some(7), None, Some("r"), None, None)
-            .unwrap_err()
-            .to_string();
+        let err = handle_cloud_claude(
+            dir.path(),
+            "gcp",
+            Some(7),
+            None,
+            Some("r"),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unknown --backend"), "got: {err}");
     }
 
@@ -1354,6 +1379,7 @@ mod tests {
             Some("r"),
             Some("/x/sa.json"),
             None,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -1364,6 +1390,7 @@ mod tests {
             Some(7),
             Some("p"),
             Some("r"),
+            None,
             None,
             None,
         )

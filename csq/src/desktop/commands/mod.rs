@@ -5005,6 +5005,7 @@ pub fn cloud_claude_provision_vertex(
     project: String,
     region: String,
     sa_path: String,
+    model: Option<String>,
 ) -> Result<(), String> {
     use csq_core::accounts::third_party::{
         bind_cloud_claude_backend_to_slot, CloudClaudeBackendSpec,
@@ -5043,6 +5044,7 @@ pub fn cloud_claude_provision_vertex(
             project,
             region,
             sa_path: &path,
+            model: model.as_deref(),
         },
     )
     .map_err(cloud_claude_error_text)
@@ -5066,6 +5068,7 @@ pub fn cloud_claude_provision_bedrock(
     slot: u16,
     region: String,
     bearer_token: String,
+    model: Option<String>,
 ) -> Result<(), String> {
     use csq_core::accounts::third_party::{
         bind_cloud_claude_backend_to_slot, CloudClaudeBackendSpec,
@@ -5095,6 +5098,7 @@ pub fn cloud_claude_provision_bedrock(
         slot_num,
         &CloudClaudeBackendSpec::Bedrock {
             region,
+            model: model.as_deref(),
             bearer_token: token,
         },
     )
@@ -7633,6 +7637,7 @@ mod tests {
             "my-project".into(),
             "us-east5".into(),
             "/abs/sa.json".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("invalid slot"), "got: {err}");
@@ -7647,6 +7652,7 @@ mod tests {
             "  ".into(),
             "us-east5".into(),
             "/abs/sa.json".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("project ID must not be empty"), "got: {err}");
@@ -7661,6 +7667,7 @@ mod tests {
             "my-project".into(),
             "  ".into(),
             "/abs/sa.json".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("region must not be empty"), "got: {err}");
@@ -7675,6 +7682,7 @@ mod tests {
             "my-project".into(),
             "us-east5".into(),
             "   ".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("path must not be empty"), "got: {err}");
@@ -7689,6 +7697,7 @@ mod tests {
             "my-project".into(),
             "us-east5".into(),
             "./relative/sa.json".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("absolute"), "got: {err}");
@@ -7703,6 +7712,7 @@ mod tests {
             "my-project".into(),
             "us-east5".into(),
             "/abs/sa.json".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
@@ -7716,6 +7726,7 @@ mod tests {
             0,
             "us-east-1".into(),
             "bedrock-bearer-token".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("invalid slot"), "got: {err}");
@@ -7729,6 +7740,7 @@ mod tests {
             1,
             "  ".into(),
             "bedrock-bearer-token".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("region must not be empty"), "got: {err}");
@@ -7737,9 +7749,14 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_bedrock_rejects_empty_token() {
-        let err =
-            cloud_claude_provision_bedrock("/tmp".into(), 1, "us-east-1".into(), "   ".into())
-                .unwrap_err();
+        let err = cloud_claude_provision_bedrock(
+            "/tmp".into(),
+            1,
+            "us-east-1".into(),
+            "   ".into(),
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
@@ -7749,7 +7766,7 @@ mod tests {
         // ESC byte mid-paste — same truncation shape the Gemini API-key
         // path guards against. Refuse at the boundary.
         let token = "bedrock\x1btoken".to_string();
-        let err = cloud_claude_provision_bedrock("/tmp".into(), 1, "us-east-1".into(), token)
+        let err = cloud_claude_provision_bedrock("/tmp".into(), 1, "us-east-1".into(), token, None)
             .unwrap_err();
         assert!(err.contains("control characters"), "got: {err}");
     }
@@ -7762,6 +7779,7 @@ mod tests {
             1,
             "us-east-1".into(),
             "bedrock-bearer-token".into(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");

@@ -27,8 +27,8 @@ on:
       - "scripts/check-binding-guard-parity.py"
       - ".github/workflows/binding-guard-parity.yml"
 
-# Cancel a superseded run on the same ref — same self-hosted-fleet
-# CONTENTION rationale as test.yml (see that file's comment). `main` is
+# Cancel a superseded run on the same ref — concurrency hygiene: a superseded run on the same ref is
+# wasted work. `main` is
 # excluded: a push to main must produce a verdict for every commit.
 concurrency:
   group: binding-guard-parity-${{ github.ref }}
@@ -37,7 +37,7 @@ concurrency:
 jobs:
   binding-guard-parity:
     name: slot-binding detection flows through one detector
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Gate — no hand-rolled surface detection outside binding_guard

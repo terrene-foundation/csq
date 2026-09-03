@@ -147,6 +147,32 @@ where
         guard.retain(|_, entry| entry.inserted_at.elapsed() <= cutoff);
         before - guard.len()
     }
+
+    /// Test-only: ages an existing entry by `by`, as if it had been inserted
+    /// that much earlier. Returns false if the key is absent.
+    ///
+    /// Expiry tests are ABOUT the expiry predicate, not about the wall clock,
+    /// but with `Instant::now()` fixed inside `set` the only way to reach an
+    /// expired state was to sleep — which makes every such test a race between
+    /// the TTL and the scheduler. Back-dating removes the clock from the test
+    /// entirely: the assertions become deterministic at any host load.
+    ///
+    /// `#[cfg(test)]`, so it is not part of the shipped API and cannot be
+    /// reached from production code.
+    #[cfg(test)]
+    fn backdate(&self, key: &K, by: Duration) -> bool {
+        let mut guard = self.entries.write().expect("cache lock poisoned");
+        match guard.get_mut(key) {
+            Some(entry) => {
+                entry.inserted_at = entry
+                    .inserted_at
+                    .checked_sub(by)
+                    .expect("backdate underflowed the monotonic clock");
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -170,21 +196,23 @@ mod tests {
 
     #[test]
     fn expired_entry_returns_none() {
-        let cache: TtlCache<String, u32> = TtlCache::new(Duration::from_millis(5));
+        let cache: TtlCache<String, u32> = TtlCache::new(Duration::from_secs(60));
         cache.set("foo".into(), 1);
-        thread::sleep(Duration::from_millis(20));
+        // Aged well past the TTL, deterministically — no sleep, no race.
+        assert!(cache.backdate(&"foo".to_string(), Duration::from_secs(120)));
         assert_eq!(cache.get(&"foo".to_string()), None);
     }
 
     #[test]
     fn set_overwrites_and_resets_timestamp() {
-        // 10x margin over scheduler hiccups: TTL 2000ms, post-overwrite sleep
-        // 200ms. Earlier 200ms/50ms config flaked on macOS CI under load.
-        let cache: TtlCache<String, u32> = TtlCache::new(Duration::from_millis(2000));
+        // Previously TTL 2000ms with two sleeps, widened from 200ms/50ms after
+        // it flaked on macOS CI under load. Widening a margin does not remove a
+        // race, it only lengthens the odds — so the clock is gone instead: the
+        // first entry is aged past the TTL, and the overwrite must reset it.
+        let cache: TtlCache<String, u32> = TtlCache::new(Duration::from_secs(60));
         cache.set("foo".into(), 1);
-        thread::sleep(Duration::from_millis(100));
+        assert!(cache.backdate(&"foo".to_string(), Duration::from_secs(120)));
         cache.set("foo".into(), 2);
-        thread::sleep(Duration::from_millis(200));
         assert_eq!(cache.get(&"foo".to_string()), Some(2));
     }
 
@@ -215,14 +243,21 @@ mod tests {
 
     #[test]
     fn sweep_removes_only_expired() {
-        let cache: TtlCache<String, u32> = TtlCache::new(Duration::from_millis(20));
+        // Failed on CI 2026-09-01 (`left: None, right: Some(2)`) with TTL 20ms
+        // and a 30ms sleep: the assertion required "new" to be READ within 20ms
+        // of being written, so under host load the sweep evicted both entries
+        // and the test reported a bug in code that was fine. The margin was the
+        // defect. Now: a 60s TTL that nothing in this test can outrun, with
+        // "old" aged past it explicitly.
+        let cache: TtlCache<String, u32> = TtlCache::new(Duration::from_secs(60));
         cache.set("old".into(), 1);
-        thread::sleep(Duration::from_millis(30));
         cache.set("new".into(), 2);
+        assert!(cache.backdate(&"old".to_string(), Duration::from_secs(120)));
 
         let removed = cache.sweep_expired();
         assert_eq!(removed, 1);
         assert_eq!(cache.get(&"new".to_string()), Some(2));
+        assert_eq!(cache.get(&"old".to_string()), None);
         assert_eq!(cache.len(), 1);
     }
 

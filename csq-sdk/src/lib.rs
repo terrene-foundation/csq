@@ -60,8 +60,8 @@ pub use authoring_intent::{
 pub use authoring_memory::{
     AbsenceProof, AuthoritativeState, InMemorySessionMemory, MemoryDeleteRequest,
     MemoryEditRequest, MemoryGateway, MemoryOperation, MemoryReadRequest, MemoryScope,
-    MutationOutcome, MutationReceipt, ObservedItem, ReadOutcome, ReportedState, SessionMemoryStore,
-    StoredRecord, UnobservedReason,
+    MutationOutcome, MutationReceipt, ObservedItem, ReadOutcome, ReportedState, ScopeRead,
+    SessionMemoryStore, StoredRecord, UnobservedReason,
 };
 pub use authoring_session::{
     AuthoringSessionRequest, AuthoringSessionResponse, EgressAuthorization, RequestCorrelation,

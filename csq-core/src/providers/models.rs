@@ -28,7 +28,17 @@ impl ModelCatalog {
                     id: "claude-opus-4-8".into(),
                     name: "Claude Opus 4.8".into(),
                     provider: "claude".into(),
-                    context_window: Some(200_000),
+                    // 1M, not the 200_000 this carried since v2.0. That literal
+                    // was correct when it was written and then rode forward
+                    // untouched across 4.6 -> 4.7 -> 4.8: every version bump
+                    // renamed `id`/`name`/`aliases` only (4a3b8e0b), and every
+                    // later commit that DID touch a context_window was for a
+                    // different provider (Sonnet 5, Kimi, DeepSeek, Gemini).
+                    // Nothing failed, because — unlike deepseek-v4-pro and
+                    // kimi-k3 — no test pinned a Claude window. See
+                    // `claude_opus_4_8_context_window_is_1m` below, which is the
+                    // part that stops this rotting again.
+                    context_window: Some(1_000_000),
                     output_limit: Some(8_192),
                     aliases: vec!["opus".into(), "opus-4-8".into(), "opus-4-7".into()],
                 },
@@ -198,12 +208,51 @@ impl ModelCatalog {
         }
     }
 
+    /// Strips deployment-specific suffixes a model id can carry, for LOOKUP
+    /// only — the stored catalog id is never rewritten.
+    ///
+    /// Two shapes occur in real slot settings:
+    ///   * Vertex pins a version: `claude-opus-4-8@default` (also `@20260115`).
+    ///   * CC annotates a window: `glm-5.2[1m]` (see `native::model`, which
+    ///     strips the same annotation for the raw-API path).
+    ///
+    /// Both defeated exact matching, so `find` returned `None` for every Vertex
+    /// slot and the statusline lost `ctx_window_true` — falling back to CC's own
+    /// ~200k assumption. That is the defect an internal ticket fixed for DeepSeek, still live
+    /// on the Vertex path until this normalisation.
+    fn normalize_for_lookup(query: &str) -> &str {
+        let base = match query.find('[') {
+            Some(i) => &query[..i],
+            None => query,
+        };
+        let base = match base.find('@') {
+            Some(i) => &base[..i],
+            None => base,
+        };
+        base.trim()
+    }
+
     /// Finds a model by ID or alias.
+    ///
+    /// Exact match is tried FIRST, so a catalog id that legitimately contains
+    /// `@` or `[` still wins over its own normalised form; normalisation is a
+    /// fallback, never a rewrite.
     pub fn find(&self, query: &str) -> Option<&ModelInfo> {
         let q = query.to_lowercase();
+        let exact = self
+            .models
+            .iter()
+            .find(|m| m.id.to_lowercase() == q || m.aliases.iter().any(|a| a.to_lowercase() == q));
+        if exact.is_some() {
+            return exact;
+        }
+        let n = Self::normalize_for_lookup(&q);
+        if n == q {
+            return None;
+        }
         self.models
             .iter()
-            .find(|m| m.id.to_lowercase() == q || m.aliases.iter().any(|a| a.to_lowercase() == q))
+            .find(|m| m.id.to_lowercase() == n || m.aliases.iter().any(|a| a.to_lowercase() == n))
     }
 
     /// Returns all models for a specific provider.
@@ -241,6 +290,40 @@ mod tests {
         let cat = ModelCatalog::default_catalog();
         assert!(!cat.models.is_empty());
         assert!(cat.find("claude-opus-4-8").is_some());
+
+        // Vertex pins a version suffix in the slot's ANTHROPIC_MODEL. Before
+        // normalisation this returned None, so `ctx_window_true` was None for
+        // EVERY Vertex slot and the statusline silently fell back to CC's ~200k
+        // assumption (the an internal ticket defect, on a different provider).
+        assert_eq!(
+            cat.find("claude-opus-4-8@default").map(|m| m.id.as_str()),
+            Some("claude-opus-4-8"),
+            "Vertex @version suffix must not defeat catalog lookup"
+        );
+        assert_eq!(
+            cat.find("claude-opus-4-8@20260115").map(|m| m.id.as_str()),
+            Some("claude-opus-4-8"),
+            "a numeric Vertex version pin resolves the same way"
+        );
+        // CC's window annotation, the shape native::model already strips.
+        assert_eq!(
+            cat.find("claude-opus-4-8[1m]").map(|m| m.id.as_str()),
+            Some("claude-opus-4-8")
+        );
+        // Aliases normalise too.
+        assert_eq!(
+            cat.find("opus@default").map(|m| m.id.as_str()),
+            Some("claude-opus-4-8")
+        );
+        // Case-insensitive, as before.
+        assert_eq!(
+            cat.find("CLAUDE-OPUS-4-8@DEFAULT").map(|m| m.id.as_str()),
+            Some("claude-opus-4-8")
+        );
+        // A genuinely unknown model stays unknown — normalisation must not
+        // manufacture a match.
+        assert!(cat.find("claude-opus-5@default").is_none());
+        assert!(cat.find("no-such-model").is_none());
     }
 
     #[test]
@@ -293,6 +376,28 @@ mod tests {
         assert_eq!(m.context_window, Some(1_000_000));
         // aliases still resolve to the 1M entry.
         assert_eq!(cat.find("ds-pro").unwrap().context_window, Some(1_000_000));
+    }
+
+    /// Pins Claude Opus 4.8's window, mirroring the deepseek/kimi tests.
+    ///
+    /// This test is the actual fix. The value it guards was wrong for multiple
+    /// releases and nothing noticed, because the Claude entries were the only
+    /// ones in this catalog with no window assertion — so a stale literal could
+    /// ride through version renames indefinitely. The number below is the
+    /// maintainer-supplied figure for Opus 4.8 (2026-09-02).
+    #[test]
+    fn claude_opus_4_8_context_window_is_1m() {
+        let cat = ModelCatalog::default_catalog();
+        let m = cat.find("claude-opus-4-8").expect("opus 4.8 in catalog");
+        assert_eq!(m.context_window, Some(1_000_000));
+        // Reached the same way the statusline reaches it: via the alias, and
+        // via the Vertex-suffixed form a slot's settings.json actually holds.
+        assert_eq!(cat.find("opus").unwrap().context_window, Some(1_000_000));
+        assert_eq!(
+            cat.find("claude-opus-4-8@default").unwrap().context_window,
+            Some(1_000_000),
+            "the statusline resolves the Vertex-pinned id; it must see the true window"
+        );
     }
 
     #[test]

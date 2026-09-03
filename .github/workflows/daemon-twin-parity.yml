@@ -37,8 +37,8 @@ on:
       - "scripts/check-daemon-twin-parity.py"
       - ".github/workflows/daemon-twin-parity.yml"
 
-# Cancel a superseded run on the same ref — same self-hosted-fleet
-# CONTENTION rationale as test.yml (see that file's comment). `main` is
+# Cancel a superseded run on the same ref — concurrency hygiene: a superseded run on the same ref is
+# wasted work. `main` is
 # excluded: a push to main must produce a verdict for every commit.
 concurrency:
   group: daemon-twin-parity-${{ github.ref }}
@@ -47,7 +47,7 @@ concurrency:
 jobs:
   daemon-twin-parity:
     name: daemon twins supervise the same subsystems
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Gate — CLI and desktop daemon twins have identical subsystem sets

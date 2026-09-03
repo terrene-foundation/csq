@@ -1,858 +1,184 @@
 # Code Squad Q (csq)
 
-Multi-provider session manager for Claude Code. Run Claude Code against local models (Ollama), third-party APIs (MiniMax, Z.AI), or pool multiple Claude Max subscriptions -- all with per-terminal isolation, shared history, a desktop dashboard, and a statusline.
+Run several Claude Code accounts on one machine, switch between them per terminal,
+and see how much quota each one has left.
 
-<table>
-<tr>
-<td><img src="docs/screenshots/accounts.png" width="380" alt="Accounts view with quota bars and rank badges"></td>
-<td><img src="docs/screenshots/sessions.png" width="380" alt="Sessions view with sort and swap"></td>
-</tr>
-</table>
+Claude Code stores its credentials in a single config directory. If you have more
+than one account, using them at the same time means logging in and out — and every
+switch invalidates the session you just left. csq gives each account a permanent
+home and each terminal its own view, so several sessions can run side by side
+against different accounts without disturbing one another.
+
+Apache-2.0 licensed, maintained by the Terrene Foundation.
 
 ## What it does
 
-- **Desktop dashboard** -- see all accounts, quota bars, token health, and reset times at a glance. Sort by custom order, 5h reset, or 7d reset. Ranked badges show which accounts to use first.
-- **Any model provider** -- bind a provider to a slot with `csq setkey mm --slot 9 --key …`, then launch with `csq run 9`. Mix Claude Max OAuth slots, MiniMax, Z.AI, and local Ollama in the same account list.
-- **Per-terminal isolation** -- each terminal gets its own `CLAUDE_CONFIG_DIR` and keychain slot. Swapping one terminal doesn't affect others. 15+ concurrent terminals work without contention.
-- **Shared history & memory** -- conversations, projects, and auto-memory are symlinked from `~/.claude`, so `/resume` works across all accounts and providers.
-- **Background daemon** -- auto-refreshes OAuth tokens and polls Anthropic for usage data. No manual token management after initial login.
-- **In-place account swap** -- `! csq swap N` from inside CC switches credentials without restarting the conversation.
-- **Context & cost in statusline** -- see `csq #5:alice 5h:42% | ctx:241k 24% | $5.39` at a glance.
-- **System tray** -- tray icon with per-account quick-swap menu. Icon color reflects health (green/yellow/red).
-- **Cross-platform** -- macOS, Linux, and Windows. Tested in CI on all three.
+- **Keeps several accounts signed in at once.** Each account keeps its own
+  credentials and refreshes its own tokens in the background, so none of them go
+  stale while you are using another.
+- **Isolates terminals.** Every session gets its own handle directory. Switching
+  accounts in one terminal leaves the others exactly where they were.
+- **Shows quota.** A background daemon polls each account's usage and renders it
+  in `csq status`, in your statusline, and in the desktop app — so you can see
+  which account has room before you start a long task, not after it stops.
+- **Suggests where to go next.** `csq suggest` picks the account with the most
+  headroom.
+- **Speaks to other providers too.** Alongside Claude accounts, csq can bind a
+  slot to a third-party API key or a local model, and manage those the same way.
+- **Records what ran.** An optional hash-linked audit trail logs each session with
+  a local signing key, and `csq audit verify` checks the chain.
 
 ## Install
 
-**Stable releases** (`vX.Y.Z`) ship a **Developer-ID signed and Apple-notarized** macOS `.dmg` — it launches with a normal double-click, no Gatekeeper bypass. Windows binaries are **not Authenticode-signed** (no Microsoft cert), so Windows shows a one-time SmartScreen prompt. Linux artifacts are unaffected. CLI binaries download via the install script with no warnings on any platform.
-
-**macOS (stable `.dmg`)** — mount, drag `Code Squad Q.app` to `Applications`, double-click. Because the bundle is notarized, no `xattr`, no System Settings detour, no right-click dance.
-
-**Pre-release builds only** (`-rc.N`, `-alpha`, `-beta`) use an ad-hoc codesign fallback and are _not_ notarized — these still trip Gatekeeper. If you opted into a pre-release `.dmg` and see the malware warning, clear the quarantine attribute once:
+### macOS — Homebrew
 
 ```bash
-xattr -cr "/Applications/Code Squad Q.app"
-open "/Applications/Code Squad Q.app"
+brew tap terrene-foundation/csq
+brew install csq
 ```
 
-(Stable releases do not need this. The classic "right-click → Open" bypass no longer works on macOS Sonoma+ for un-notarized apps — use the `xattr` one-liner for pre-release bundles.)
+### macOS / Linux — direct download
 
-The desktop app ships as `.dmg` (macOS), `.AppImage`/`.deb`/`.rpm` (Linux), and `.msi` (Windows). You can also build any component from source.
-
-### Prerequisites
-
-- **Claude Code** — install via [docs.anthropic.com/en/docs/claude-code](https://docs.anthropic.com/en/docs/claude-code)
-- Building from source: **Rust** 1.94+ ([rustup.rs](https://rustup.rs)) and, for the desktop app, **Node.js** 22+
-
-### CLI — binary install (recommended)
-
-<table>
-<tr>
-<th>macOS</th>
-<th>Linux</th>
-<th>Windows</th>
-</tr>
-<tr>
-<td>
+Grab the archive for your platform from the
+[latest release](https://github.com/terrene-foundation/csq/releases/latest),
+unpack it, and put `csq` somewhere on your `PATH`:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
+install -m 0755 csq ~/.local/bin/csq
 ```
 
-Installs to `~/.local/bin/csq`. SHA256 verified against the release's `SHA256SUMS`.
+Once installed, `csq update` checks for newer releases and `csq update install`
+applies one.
 
-Works on both Apple Silicon (`aarch64`) and Intel (`x86_64`).
+### Desktop app
 
-</td>
-<td>
+The macOS `.dmg` and the Linux `.AppImage` are attached to the same release. The
+desktop app shows the same account and quota state as the CLI, and updates itself.
+
+### From source
+
+You need a recent stable Rust toolchain. On Linux you also need the system
+libraries Tauri builds against (`libwebkit2gtk-4.1-dev`,
+`libayatana-appindicator3-dev`, `librsvg2-dev`, `patchelf`).
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
+cargo build --release -p csq --features cli --no-default-features
+install -m 0755 target/release/csq ~/.local/bin/csq
 ```
 
-Installs to `~/.local/bin/csq`. SHA256 verified against the release's `SHA256SUMS`.
-
-`x86_64` only. For `aarch64` Linux, build from source.
-
-</td>
-<td>
-
-```powershell
-# PowerShell
-$url = "https://github.com/terrene-foundation/csq/releases/latest/download/csq-windows-x86_64.exe"
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
-Invoke-WebRequest $url -OutFile "$env:USERPROFILE\.local\bin\csq.exe"
-```
-
-Then add `%USERPROFILE%\.local\bin` to `PATH` if it isn't already.
-
-</td>
-</tr>
-</table>
-
-After install:
+## Getting started
 
 ```bash
-csq --version    # should print: csq 2.8.0
-csq doctor       # runs diagnostics
-csq login 1      # authenticate your first account
+csq install          # create the directories csq needs, once
+csq login 1          # sign in — opens your browser
+csq login 2          # ...as many accounts as you want
+csq status           # see all of them, with quota
+csq run 1            # start Claude Code on account 1
 ```
 
-### CLI — from source
+`csq run 1` starts a session bound to account 1. Open a second terminal, run
+`csq run 2`, and the two sessions coexist — different accounts, neither one
+logging the other out.
+
+Inside a session, `csq swap 3` repoints *that* terminal at account 3. Claude Code
+picks the change up on its next API call; you do not need to restart it, and no
+other terminal is affected.
+
+When an account runs low:
 
 ```bash
-git clone https://github.com/terrene-foundation/csq.git
-cd csq
-cargo build --release -p csq-cli
-cp target/release/csq ~/.local/bin/csq    # or anywhere on your $PATH
+csq suggest          # which account has the most headroom
+csq swap 4           # move this terminal there
 ```
 
-### Desktop app — binary install
+## Accounts and terminals
 
-Download the latest artifact for your platform from [GitHub Releases](https://github.com/terrene-foundation/csq/releases).
+Almost every subtle bug in a tool like this comes from confusing these two, so it
+is worth being explicit.
 
-<table>
-<tr>
-<th>macOS</th>
-<th>Linux</th>
-<th>Windows</th>
-</tr>
-<tr>
-<td>
+An **account** is an identity you signed in as. It owns a permanent directory, its
+own credentials, and its own quota. It refreshes its own tokens and polls its own
+usage, and it is the only authority on how much quota it has left.
 
-**`csq-desktop-macos.dmg`**
+A **terminal** is one running session. It has an ephemeral handle directory whose
+symlinks point at whichever account it is currently using. A terminal *displays*
+quota; it never *writes* it. Swapping in one terminal repoints that terminal's
+symlinks and leaves its siblings untouched.
 
-1. Double-click the `.dmg` to mount it
-2. Drag `Code Squad Q.app` to `Applications`
-3. Double-click to launch
+The rule that falls out: a quota figure must come from the poller that fetched it
+for a known account — never from "which account does this terminal seem to be
+on?", a question with several answers that disagree.
 
-Stable `.dmg` builds are Developer-ID signed and notarized, so there is no Gatekeeper prompt. (Pre-release `.dmg`s are not notarized — see the **Install** section's `xattr` one-liner.)
+## Other providers
 
-</td>
-<td>
-
-**`csq-desktop-linux.AppImage`** — no install, just run:
+A slot does not have to be a Claude subscription account. `csq setkey` binds a
+slot to an API key or a local model instead, and `csq run <N>` launches against
+it the same way:
 
 ```bash
-chmod +x csq-desktop-linux.AppImage
-./csq-desktop-linux.AppImage
+csq setkey ollama --slot 7                 # a local model, no key needed
+csq setkey deepseek --slot 8               # reads the key from stdin
+csq listkeys                               # what is configured where
 ```
 
-Or install system-wide with **`csq-desktop-linux.deb`** / **`csq-desktop-linux.rpm`**:
+Run `csq setkey --help` for the providers available in your build. Keys are read
+from stdin rather than argv, so they do not land in your shell history, and the
+files csq writes them to are created `0600`.
+
+## Diagnostics
 
 ```bash
-sudo dpkg -i csq-desktop-linux.deb
-# or
-sudo rpm -i csq-desktop-linux.rpm
+csq doctor           # check the whole installation and explain anything odd
+csq daemon status    # is the background daemon running
+csq probe <N>        # live-check one slot's credentials against its provider
+csq repair           # fix credential/slot inconsistencies
 ```
 
-</td>
-<td>
+`csq doctor` is the one to reach for first. It knows the difference between a slot
+that is broken and one that merely *looks* broken — an expected-stale poll, for
+instance — and says which.
 
-**`csq-desktop-windows.msi`**
+## Audit trail
 
-1. Double-click the `.msi` to run the installer
-2. On first launch: **More info** → **Run anyway** (SmartScreen)
-
-SmartScreen remembers your choice after the first launch.
-
-</td>
-</tr>
-</table>
-
-### Desktop app — from source
+Each `csq run` can append a signed, hash-linked record of the session. The chain
+is verified when the daemon starts, and on demand:
 
 ```bash
-git clone https://github.com/terrene-foundation/csq.git    # skip if already cloned
-cd csq/csq-desktop
-npm install
-npx @tauri-apps/cli build
+csq audit verify
 ```
 
-Artifacts land at `target/release/bundle/<format>/`:
-
-| Platform | Outputs                                         |
-| -------- | ----------------------------------------------- |
-| macOS    | `macos/Code Squad Q.app`, `dmg/*.dmg`           |
-| Linux    | `deb/*.deb`, `rpm/*.rpm`, `appimage/*.AppImage` |
-| Windows  | `msi/*.msi`, `nsis/*-setup.exe`                 |
-
-### Development mode
-
-```bash
-cd csq-desktop && npx @tauri-apps/cli dev    # hot-reload desktop
-cargo run -p csq-cli -- run 1                # run CLI from source without install
-```
-
-## Upgrading from an earlier csq
-
-**Your accounts and credentials in `~/.claude/accounts/` are preserved
-across every upgrade** — the on-disk layout has been stable since the
-original Python version. If you are already on a Rust build, the
-canonical upgrade path is `csq update install` (see below). Coming from
-the Python original, do the one-time migration first.
-
-```bash
-csq --version    # which build you're on (current: csq 2.8.0)
-```
-
-### From the Python era (v1.x — `pip install csq` / git clone)
-
-The original csq was a stdlib-only Python tool (`rotation-engine.py`).
-If you installed it via `pip` or by cloning the repo and adding it to
-`$PATH`, that version is no longer maintained. Migrate to the Rust v2:
-
-```bash
-# Optional — uninstall the old Python version
-pip uninstall csq    # if you used pip
-# Or just delete your old git checkout — credentials live in
-# ~/.claude/accounts/ and are not touched by uninstall
-
-# Install the current Rust binary
-curl -sSL https://raw.githubusercontent.com/terrene-foundation/csq/main/install.sh | bash
-csq --version    # csq 2.8.0
-```
-
-Your accounts at `~/.claude/accounts/credentials/N.json` are picked
-up automatically by the Rust version — same paths, same JSON schema,
-no migration step needed. Run `csq doctor` to verify the daemon can
-see all your accounts.
-
-> **About commands**: a few v1.x command flags were renamed in v2.
-> `csq run N` and `csq swap N` are unchanged. If a script references
-> a flag that no longer exists, run `csq help` for the current
-> surface.
-
-> **Coming from a very old Rust pre-release** (`v2.0.0-alpha.1/2/3`):
-> those binaries shipped before the Foundation Ed25519 release key was
-> wired in, so `csq update install` refuses with _"the release signing
-> key has not been configured"_. Re-run the `curl … | bash` installer
-> **once** to pick up a current build; `csq update install` works for
-> every release after that.
-
-### Current Rust binary — `csq update install`
-
-Current builds verify releases against the Foundation's Ed25519 signing
-key and can upgrade themselves in place:
-
-```bash
-csq update check         # see if a newer version exists
-csq update install       # download, verify SHA256 + Ed25519, atomic swap
-```
-
-The CLI also runs a background check on every invocation and prints
-`csq vX.Y.Z available — run csq update install to upgrade` to stderr
-when a release lands. Cached for 24 hours per machine. The desktop
-app does the same check on launch and surfaces the notice via system
-log.
-
-### Desktop app upgrades
-
-The desktop bundle (`Code Squad Q.app` on macOS, `.msi` on
-Windows, `.deb`/`.rpm`/`.AppImage` on Linux) is a separate artifact
-from the CLI binary and currently upgrades by re-downloading from
-[GitHub Releases](https://github.com/terrene-foundation/csq/releases).
-The CLI binary inside the desktop bundle and the standalone CLI binary
-are interchangeable — installing the standalone CLI does NOT replace
-the desktop bundle, and vice versa. If you use both, upgrade both.
-
-The desktop daemon runs the same background update check as the CLI
-and prints to the system log on launch when an update is available;
-in-app notification UI is on the roadmap for a future release.
-
-### What if I have local changes?
-
-`csq` does not modify the user's `~/.claude/accounts/` data structure
-across versions, so an upgrade is safe even if you're mid-session:
-
-- Running CC sessions: each session uses an ephemeral
-  `term-<pid>/` handle dir under `~/.claude/accounts/`. The daemon
-  sweep preserves any pasted images into `~/.claude/image-cache/`
-  before removing dead handle dirs, so closing your terminal and
-  upgrading does not lose work.
-- The daemon: stop it before upgrading the desktop app
-  (`Quit` from the tray menu, or `csq daemon stop` for the CLI
-  daemon). The new version will re-launch on next CLI invocation
-  or on app start.
-
-## CLI dependency management
-
-csq integrates with three external CLIs: `claude` (Anthropic Claude Code),
-`codex` (OpenAI codex-cli), and `gemini` (Google gemini-cli). Each is a
-separate install with its own version cadence. Drift between csq and the
-upstream CLI's version produces opaque errors at command time — for example,
-codex-cli before 0.40.0 rejects the `--device-auth` flag csq uses for OAuth
-login, and gemini-cli before 0.41.2 uses a different auth subcommand shape.
-
-### Doctor row meanings
-
-`csq doctor` reports the health of every CLI csq has authenticated slots for.
-Status labels below are shorthand; live `csq doctor` prints the icon + current
-version + minimum, e.g. `✓ 2.1.138 (min 2.0.0)`. Possible status rows:
-
-| Row                 | Meaning                                                                                                      |
-| ------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `✓ ok`              | Installed at or above the minimum supported version.                                                         |
-| `⚠ outdated`        | Installed but below the minimum. Run `csq cli upgrade <name>`.                                               |
-| `✗ missing`         | Not installed (or not on PATH). Run `csq cli install <name>`.                                                |
-| `⚠ wrong binary`    | The binary on PATH is not the upstream csq supports (e.g. the homebrew-formula `codex` is a different tool). |
-| `⚠ probe timed out` | `<name> --version` did not return within 2 seconds.                                                          |
-| `⚠ probe disabled`  | `CSQ_CLI_DEPS_PROBE_DISABLE=1` is set; all version checks are skipped.                                       |
-
-Surface rows are suppressed when no authenticated slots of that surface exist.
-For example, if you have no codex slots, the `codex` row does not appear.
-
-### Pre-flight gates in `csq login` and `csq run`
-
-Before spawning the upstream CLI, both `csq login N` and `csq run N` probe
-the slot's CLI binary and bail if the version is outside the supported range.
-The gate produces a structured remediation message naming the exact fix.
-
-To bypass the gate for a single invocation (for example, while you are in the
-middle of upgrading), pass `--ignore-cli-version`:
-
-```bash
-csq login 3 --provider codex --ignore-cli-version
-csq run 1 --ignore-cli-version
-```
-
-`--ignore-cli-version` downgrades `Outdated` and `UnrecognizedVersion` from a
-hard bail to a warning. It has **no effect** on `Missing` or `WrongBinary` —
-there is no binary to proceed against in those cases. A warning line is emitted
-to stderr on every honored invocation; there is no persistent override and no
-env var memory.
-
-### `csq cli install/upgrade <name>`
-
-```bash
-csq cli install codex      # installs codex-cli via npm
-csq cli upgrade gemini     # upgrades gemini-cli to the latest supported version
-```
-
-These subcommands install or upgrade the named CLI using your existing package
-manager (npm or brew, depending on how the CLI was originally installed). The
-full behavior is live in v2.7.0:
-
-- **Interactive consent** (`[y/N]`) is required before any package manager
-  spawn. The prompt shows the exact command that will be run, including the
-  resolved absolute path to `npm` or `brew`.
-- **Non-TTY environments are blocked.** Running in a CI environment (detected
-  via `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, and other standard CI sentinels)
-  exits non-zero with a clear message. Pipe-stdin invocations are also blocked.
-- **csq does NOT invoke `sudo`.** If you see an `EACCES` permission error,
-  three remediation options are printed; choose the one that fits your
-  environment.
-- **`--ignore-cli-version` is NOT accepted** by `csq cli install` or
-  `csq cli upgrade`. The install IS the version-fix; the flag is accepted only
-  by `csq login` and `csq run`.
-- **Post-install re-probe.** After a successful install, csq invalidates its
-  cached probe result and re-probes to report the installed version. If the
-  re-probe returns a version below minimum, a registry-side downgrade warning
-  is printed.
-- **Chained Node.js install.** If you attempt to install a CLI via npm but
-  `npm` is not on PATH, csq offers to install Node.js first. On Linux, where
-  the install command requires `sudo`, csq prints the command for you to run
-  manually rather than auto-escalating.
-
-csq does **not** invoke `sudo`; if you see an `EACCES` error, see the
-remediation steps printed at that time.
-
-### Per-surface minimum versions
-
-| CLI      | Minimum version | Rationale                                                                                          |
-| -------- | --------------- | -------------------------------------------------------------------------------------------------- |
-| `claude` | 2.0.0           | CC 2.x `claudeAiOauth` credential schema (spec 01).                                                |
-| `codex`  | 0.40.0          | `--device-auth` flag landing version. Pre-0.40 predates it.                                        |
-| `gemini` | 0.41.2          | Pre-0.41.2 had a `gemini auth login` subcommand csq's flow no longer expects (removed at 0.41.2+). |
-
-For the code-cited anchors, see `specs/13-multi-cli-detection-contract.md` §4.
-
-### `CSQ_CLI_DEPS_PROBE_DISABLE`
-
-If your upstream CLI's `--version` output changes shape in a way that csq
-cannot parse (for example, a pre-release build that uses a non-semver format),
-set `CSQ_CLI_DEPS_PROBE_DISABLE=1` to skip all version probes:
-
-```bash
-CSQ_CLI_DEPS_PROBE_DISABLE=1 csq run 1
-```
-
-A disclosure warning is emitted to stderr on every invocation when this env
-var is set, so a hostile `.envrc` cannot silently disable the gates. The
-escape hatch is intended for operators pinned to non-standard CLI builds; it
-is not a substitute for upgrading.
-
-### See also
-
-- `specs/13-multi-cli-detection-contract.md` — the authoritative contract
-  (probe semantics, manager classification, dispatch table, security boundary).
-- `internal-design-docs` — analysis, plans, and journals for this feature.
-
-## Using local models (Ollama)
-
-Run Claude Code against any model in Ollama -- no API key needed, no rate limits, fully local.
-
-### Prerequisites
-
-Install [Ollama](https://ollama.com) and pull a model:
-
-```bash
-ollama pull gemma4           # 9.6 GB -- recommended: fast, COC-compliant
-ollama pull qwen3.5          # 6.6 GB -- capable but slow on local hardware
-```
-
-Claude Code requires a large context window. Recommended: **256k tokens** (set via Ollama's `num_ctx` parameter or model defaults).
-
-### Setup (one-time)
-
-```bash
-csq setkey ollama            # creates the Ollama profile (no key needed)
-```
-
-This creates `~/.claude/settings-ollama.json` with:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:11434",
-    "ANTHROPIC_AUTH_TOKEN": "ollama",
-    "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_MODEL": "qwen3:latest",
-    "ANTHROPIC_SMALL_FAST_MODEL": "qwen3:latest",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen3:latest",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "qwen3:latest",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3:latest",
-    "API_TIMEOUT_MS": "3000000",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
-  }
-}
-```
-
-To change the model: `csq models ollama <model-name>` (or edit `~/.claude/settings-ollama.json` manually).
-
-### Run
-
-```bash
-csq run 1 -p ollama          # start CC on account 1, routed through Ollama
-```
-
-See [Ollama's Claude Code integration docs](https://docs.ollama.com/integrations/claude-code) for more options.
-
-## Using third-party APIs (MiniMax, Z.AI)
-
-Third-party providers are assigned to numbered slots the same way OAuth accounts are. Each slot gets its own `config-<N>/settings.json` with the provider's base URL, API key, and default model. You then launch it with plain `csq run <N>`.
-
-### MiniMax (M2.7)
-
-```bash
-csq setkey mm --slot 9 --key sk-…   # validates the key, writes config-9/settings.json
-csq run 9                           # launches CC routed through MiniMax on slot 9
-```
-
-`csq setkey mm --slot 9` writes `~/.claude/accounts/config-9/settings.json` with:
-
-| Setting                | Value                              |
-| ---------------------- | ---------------------------------- |
-| `ANTHROPIC_BASE_URL`   | `https://api.minimax.io/anthropic` |
-| `ANTHROPIC_AUTH_TOKEN` | your key                           |
-| `ANTHROPIC_MODEL`      | `MiniMax-M3`                       |
-
-It also upserts `profiles.json[9]` with `method: "api_key"` and writes the `.csq-account` marker so the dashboard and `csq run` can identify the slot.
-
-Omitting `--key` prompts for the key with hidden input (paste-safe for long JWTs). Omitting `--slot` falls back to the legacy global `settings-mm.json` store (no slot binding — useful only if you plan to attach it to a slot later).
-
-### Z.AI (GLM-5.2)
-
-```bash
-csq setkey zai --slot 10 --key …
-csq run 10
-```
-
-Writes `config-10/settings.json` with:
-
-| Setting                | Value                            |
-| ---------------------- | -------------------------------- |
-| `ANTHROPIC_BASE_URL`   | `https://api.z.ai/api/anthropic` |
-| `ANTHROPIC_AUTH_TOKEN` | your key                         |
-| `ANTHROPIC_MODEL`      | `glm-5.2[1m]`                    |
-
-### Claude direct API key
-
-If you have a direct Anthropic API key (not OAuth/Max subscription):
-
-```bash
-csq setkey claude --slot 11 --key sk-ant-…
-csq run 11
-```
-
-The key lands in `config-11/settings.json` `env.ANTHROPIC_API_KEY` (Anthropic-native env var). CC reads it on startup and uses direct API mode instead of OAuth.
-
-### Gemini
-
-Three auth paths — pick one per slot:
-
-| Auth                          | Command                                                          | When to use                                                                                                                                                                                                                                                                                              |
-| ----------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Code Assist OAuth**         | `csq login 12 --provider gemini`                                 | You have a Gemini Code Assist subscription. Shells out to `gemini auth login`; gemini-cli opens your browser and writes tokens to `~/.gemini/oauth_creds.json`. csq is read-only on those tokens — refresh stays gemini-cli's job; the daemon reads `access_token` for quota polling per spec 05 §5.8.2. |
-| **AI Studio API key**         | `csq setkey gemini --slot 13 --key AIza…`                        | You have an AI Studio API key (the `AIza…` shape). Key lands in your platform vault, never on disk in plaintext.                                                                                                                                                                                         |
-| **Vertex AI service account** | `csq setkey gemini --slot 14 --vertex-sa-json /abs/path/sa.json` | You're on Vertex AI with a service-account JSON. csq stores the path; gemini-cli reads the file at spawn time.                                                                                                                                                                                           |
-
-Then `csq run <slot>` works the same way for all three. The desktop AddAccount modal exposes the same three paths via tabs.
-
-### Codex (ChatGPT)
-
-```bash
-csq login 15 --provider codex   # device-auth flow; shows a code to enter on chatgpt.com
-csq run 15
-```
-
-### How slot binding works
-
-When you run `csq setkey <provider> --slot <N> --key <KEY>`, csq:
-
-1. Validates the key against the provider (best-effort probe).
-2. Creates `~/.claude/accounts/config-<N>/` if missing.
-3. Writes `config-<N>/settings.json` with the provider's `env` block (base URL, token, model keys).
-4. Upserts `profiles.json[N]` with `method: "api_key"` and `provider: <id>`.
-5. Writes the `.csq-account` marker.
-
-When you then run `csq run <N>`, csq:
-
-1. Detects the slot is third-party via `discover_per_slot_third_party()` (it reads `env.ANTHROPIC_BASE_URL` from `config-<N>/settings.json`).
-2. Skips the OAuth credential load — third-party slots have no `credentials/<N>.json` on purpose.
-3. Creates an ephemeral `term-<pid>` handle dir with a `settings.json` symlink back to `config-<N>`.
-4. Execs `claude` with `CLAUDE_CONFIG_DIR` set to the handle dir. CC reads the provider env from the symlinked `settings.json` at startup and routes every request through the provider.
-
-Your default `~/.claude/settings.json` is never modified. Each terminal gets a fresh handle dir that is swept when the process exits.
-
-### Managing profiles
-
-```bash
-csq listkeys                 # show configured providers with masked key fingerprints
-csq rmkey zai                # remove a profile entirely
-```
-
-### Model management
-
-```bash
-csq models                   # show all profiles + current models
-csq models zai               # list available models for Z.AI
-csq models zai glm-4.7       # switch zai to a different model
-csq models ollama            # list locally installed ollama models
-```
-
-When a newer model is available, `csq models` shows an update indicator:
-
-```
-Profile      Model                          Status
-zai          glm-5.2[1m]                    (latest)
-mm           MiniMax-M3                     (latest)
-```
-
-The model catalog updates automatically -- csq auto-updates from GitHub on every `csq run` (silently, in the background, with a 3s timeout for offline safety).
-
-## Model benchmarks
-
-csq routes Claude Code to any provider -- but which models actually work well? We ship benchmark harnesses that test model performance under real workloads.
-
-### Which model should I use?
-
-| Model               | Provider | Runs  |   Speed   | Cooperative (/50) | Adversarial (/50) | Total (/100) |
-| ------------------- | -------- | ----- | :-------: | :---------------: | :---------------: | :----------: |
-| **Claude Opus 4.6** | default  | 5-run | 13s/task  |       50.0        |       43.0        |   **93.0**   |
-| **Z.AI GLM-5.1**    | zai      | 5-run | 46s/task  |       49.0        |       36.8        |   **85.8**   |
-| **MiniMax M2.7**    | mm       | 5-run | 14s/task  |       49.6        |       21.0        |   **70.6**   |
-| **gemma4**          | ollama   | 1-run | 165s/task |        45         |        10         |    **55**    |
-| **qwen3.5**         | ollama   | 1-run | 175s/task |        25         |        26         |    **51**    |
-
-**What this means for choosing a provider:**
-
-- **Claude Opus** is the clear leader -- near-perfect rule adherence and the only model that consistently refuses adversarial prompts. Use this when quality matters.
-- **GLM-5.1** is the strongest non-Claude model (85.8). Good for cost-sensitive workloads where you can review outputs.
-- **MiniMax M2.7** is fast (14s/task, comparable to Claude) but weak on adversarial tests. Use for speed when you're actively supervising.
-- **gemma4** (local, free) completes everything but rarely enforces rules under pressure. Good for experimentation and offline work.
-- **qwen3.5** (local, free) is too slow for practical use on most hardware (175s/task, 50% timeout rate).
-
-## Multi-account rotation (Claude Max)
-
-Pool multiple Claude Max subscriptions for uninterrupted sessions. When one account hits a rate limit, swap to another.
-
-### The problem
-
-Claude Max has rolling rate limits (5-hour and 7-day windows). Heavy users hit these regularly. Manually switching with `/login` interrupts flow and requires guessing which account has capacity.
-
-### Setup (one-time per account)
-
-```bash
-csq login 1   # opens browser, log in to account 1, saves creds
-csq login 2   # repeat for each account
-csq login 3
-# ...as many as you need
-```
-
-**How `csq login N` works** (from `v2.0.0-alpha.5`): if the `claude`
-binary is on your `PATH`, csq delegates the OAuth flow to
-`claude auth login` with an isolated `CLAUDE_CONFIG_DIR=config-N/`.
-Same seamless UX as running `claude auth login` directly — browser
-opens, you sign in, Claude Code's hosted-callback page bridges the
-authorization code back automatically. csq imports the credentials
-from the isolated dir when CC exits, then writes `credentials/N.json`
-with the atomic-replace helpers.
-
-If `claude` isn't on your `PATH`, csq falls back to an in-process
-paste-code flow: it opens the authorize URL, then prompts on stdin
-for the authorization code Anthropic's hosted callback page displays.
-Paste the code and csq completes the exchange via the daemon.
-
-To free a slot, run `csq logout N` (CLI) or click "Remove" on the slot
-card in the desktop dashboard. Both clear `credentials/N.json`,
-`config-N/`, the `profiles.json` entry, and the cached quota.
-
-### Daily use
-
-```bash
-csq run 1                    # terminal 1 on account 1
-csq run 3                    # terminal 2 on account 3
-csq run 5                    # terminal 3 on account 5
-```
-
-If you have only one account, `csq` (no number) auto-resolves. With zero accounts, `csq` is invisible -- just runs vanilla `claude`.
-
-Any extra arguments pass through to `claude`:
-
-```bash
-csq run 5 --resume           # resume the most recent conversation
-csq run 5 --resume <id>      # resume a specific session
-csq run 3 -p "summarize X"   # one-shot prompt
-```
-
-### When rate limited
-
-Inside the rate-limited CC session, type:
-
-```
-!csq swap 3       # swap THIS terminal to account 3
-```
-
-The `!` prefix runs the command as a local shell op -- works even when CC is rate-limited. The next message you send uses account 3's token, in the same conversation, no restart.
-
-If you want to know which account to swap to:
-
-```
-!csq suggest      # shows the account with most capacity
-```
-
-### Quick start (single account)
-
-```bash
-csq              # equivalent to vanilla `claude` -- csq stays out of your way
-csq --resume     # passes flags straight through
-```
-
-## Desktop app
-
-The desktop app provides a live dashboard for managing accounts and sessions. It runs an in-process daemon that handles token refresh, usage polling, and credential fanout -- no separate process needed.
-
-<table>
-<tr>
-<td width="50%">
-
-**Accounts tab**
-
-- Quota bars (5h and 7d) with color coding
-- Token health badges (healthy/expiring/expired)
-- Reset countdowns with ranked badges (1, 2, 3...)
-- Sort by custom order, 5h reset, or 7d reset
-- Maxed-out accounts excluded from rankings
-- Re-auth button on expired accounts
-- Double-click to rename any account
-
-</td>
-<td width="50%">
-
-**Sessions tab**
-
-- Every running `claude` process appears automatically
-- Account labels update in real-time after renames
-- Quota per session at a glance
-- Sort by custom order, title, or account
-- Click "Swap" to change any session's account
-- "Restart needed" badge for stale sessions
-- Double-click to give sessions custom names
-
-</td>
-</tr>
-</table>
-
-**System tray**: icon with per-account quick-swap menu. Icon color reflects health. "Launch on login" toggle for auto-start.
-
-## Command reference
-
-```bash
-# Session management
-csq run N                    # start CC on account N (OAuth or 3P-bound slot)
-csq run N --resume           # resume most recent conversation on account N
-csq swap N                   # in-place swap THIS terminal to account N
-csq status                   # show all accounts with quota and reset times
-csq suggest                  # suggest which account to swap to
-csq statusline               # compact status for shell prompt integration
-
-# Account management — OAuth flows (browser-driven)
-csq login N                                # Claude Max OAuth (default; --provider claude)
-csq login N --provider codex               # Codex / ChatGPT OAuth (device-auth)
-csq login N --provider gemini              # Gemini Code Assist OAuth (shells out to `gemini auth login`)
-csq repair                                 # fix credential + slot-attribution issues (alias: repair-credentials)
-
-# Provider slots — non-OAuth credential paths (paste a key / pick a file)
-csq setkey claude --slot N --key sk-ant-…  # Claude direct API key
-csq setkey mm     --slot N --key sk-…      # MiniMax Bearer
-csq setkey zai    --slot N --key sk-…      # Z.AI Bearer
-csq setkey deepseek --slot N --key sk-…    # DeepSeek Bearer
-csq setkey gemini --slot N --key AIza…     # Gemini AI Studio API key
-csq setkey gemini --slot N --vertex-sa-json /abs/path/sa.json  # Gemini Vertex SA
-csq setkey ollama --slot N                 # Ollama (keyless, local)
-csq setkey <provider>                      # store key globally (no slot)
-csq listkeys                               # show configured providers with masked keys
-csq rmkey <provider>                       # remove a provider profile
-csq models                                 # show all profiles + current models
-csq models <provider> <name>               # switch a provider to a different model
-
-# Convention: `login` is for browser-driven OAuth (Claude Max, Codex, Gemini Code
-# Assist); `setkey` is for paste-a-key / pick-a-file credentials (Claude direct
-# API, AI Studio, Vertex SA, MiniMax/Z.AI/DeepSeek Bearer, Ollama keyless).
-
-# System
-csq daemon start             # start background daemon
-csq daemon stop              # stop background daemon
-csq daemon status            # check daemon health
-csq doctor                   # run diagnostics and report system health
-csq install                  # install csq into ~/.claude (create dirs, patch settings)
-csq update                   # check for newer releases on GitHub
-```
-
-## How it works
-
-### Per-terminal isolation
-
-Claude Code uses `CLAUDE_CONFIG_DIR` to determine which keychain entry to read/write. Each config directory gets a unique keychain slot.
-
-```
-csq run 3
-  -> CLAUDE_CONFIG_DIR=~/.claude/accounts/config-3
-  -> isolated credentials, settings, identity
-  -> shared history, projects, memory (symlinked from ~/.claude)
-```
-
-### Shared artifacts
-
-Only credentials, account identity, and `settings.json` stay isolated. Everything else in `~/.claude` (projects, sessions, history, plugins, commands, agents, skills, memory) is symlinked into each `config-N/` on every `csq run`. So all terminals see the same conversations, the same `/resume` list, and the same auto-memory.
-
-### Background daemon
-
-The daemon runs in-process inside the desktop app (or standalone via `csq daemon start`) and handles:
-
-- **Token refresh** -- checks every 5 minutes, refreshes tokens expiring within 2 hours
-- **Usage polling** -- polls Anthropic's `/api/oauth/usage` for each account's real quota
-- **Credential fanout** -- distributes refreshed tokens to all terminals using that account
-- **IPC server** -- Unix socket for CLI and desktop communication
-
-### Account/terminal separation
-
-- **Account** = an authenticated Anthropic identity with its own credentials and quota
-- **Terminal** = a CC instance that borrows an account's credentials
-- Quota comes from Anthropic's API (polled by the daemon), not from individual terminals
-- The `.csq-account` marker file in each config dir is the source of truth for identity
-
-### Credential storage
-
-- **macOS**: per-config-dir keychain entry via `security-framework` with file fallback
-- **Linux / WSL / Windows**: file-only (`.credentials.json` in the per-config-dir)
-- All credential files written atomically (temp + rename) with `0600` permissions
-
-## Architecture
-
-csq is a Rust workspace with three crates:
-
-| Crate         | Purpose                                                             |
-| ------------- | ------------------------------------------------------------------- |
-| `csq-core`    | OAuth, credentials, quota, daemon, session discovery, rotation      |
-| `csq-cli`     | CLI binary (`csq run`, `csq login`, `csq status`, `csq swap`, etc.) |
-| `csq-desktop` | Tauri 2.x desktop app with Svelte 5 frontend                        |
-
-### Files
-
-| Path                                       | Purpose                                  |
-| ------------------------------------------ | ---------------------------------------- |
-| `~/.claude/accounts/credentials/N.json`    | OAuth credentials per account (mode 600) |
-| `~/.claude/accounts/profiles.json`         | Account labels and email mappings        |
-| `~/.claude/accounts/quota.json`            | Per-account quota from Anthropic API     |
-| `~/.claude/accounts/config-N/`             | Per-terminal CC config directory         |
-| `~/.claude/accounts/config-N/.csq-account` | Account identity marker                  |
-| `~/.claude/settings-<provider>.json`       | Provider profile overlays                |
-
-### Platform support
-
-| Platform | CLI  | Desktop | Daemon         | Session discovery     |
-| -------- | ---- | ------- | -------------- | --------------------- |
-| macOS    | Full | Full    | Full           | Full (ps + osascript) |
-| Linux    | Full | Full    | Full           | Full (/proc)          |
-| Windows  | Full | Full    | Planned (M8.6) | Full (PEB walking)    |
-
-## Use in VS Code
-
-The VS Code Claude Code extension reads the same `~/.claude/settings.json` that csq writes, so the statusline and `! csq swap N` both work in VS Code's Claude Code panel. The core swap functionality (`! csq swap N`) is a shell command and works regardless of hook reliability.
-
-No VS Code extension or plugin is needed. Install csq once via the regular installer; VS Code picks it up automatically.
-
-## Troubleshooting
-
-**Statusline not showing** -- check that `~/.claude/settings.json` has `"statusLine": {"type":"command","command":"csq statusline"}`. `csq install` sets this automatically; run it once if you're upgrading from a pre-alpha.18 install that used the old `statusline-quota.sh` wrapper. Run `csq doctor` for diagnostics.
-
-**`csq swap` says swap succeeded but CC shows "rate limited"** -- the access token may be stuck on Anthropic's side. Run `csq login N` to capture a fresh token via a full OAuth flow.
-
-**Desktop app shows "restart needed"** -- this means credentials were swapped after that CC session started. CC caches credentials in memory, so you need to `/exit` and relaunch that session for the swap to take effect.
-
-**Wrong model after swap** -- check `~/.claude/accounts/config-N/.claude.json` for a `cachedGrowthBookFeatures.tengu_auto_mode_config` flag. Anthropic's A/B testing can silently override model selection. Delete the cache entry to fix.
-
-**Symlinks fail on Windows** -- csq uses directory junctions (`mklink /J`) on Windows, which don't need admin privileges. If junction creation fails, csq falls back to copying.
-
-**`SessionStart:startup hook error` / `node:internal/modules/cjs/loader:1143`** -- Claude Code is trying to execute a hook declared in your project or global `settings.json`, and either (a) Node.js is not installed or (b) the hook script was copied without its sibling `./lib/` modules. `csq install` and `csq run` now preflight both conditions and print the exact fix. Manual checks:
-
-- **WSL / Debian / Ubuntu**: `sudo apt install -y nodejs`
-- **Fedora / RHEL**: `sudo dnf install -y nodejs`
-- **macOS (with Homebrew)**: `brew install node`
-- **Windows**: `winget install OpenJS.NodeJS` or download from <https://nodejs.org>
-
-If node is installed and you still see `loader:1143`, the hook script in your project (commonly `.claude/hooks/session-start.js`) has a `require("./lib/...")` whose target is missing. Restore the full `.claude/hooks/` tree from the project template, or remove the `hooks` block from the offending `settings.json`.
-
-## Uninstall
-
-```bash
-rm -rf ~/.claude/accounts
-rm ~/.local/bin/csq          # or ~/bin/csq
-# Remove statusLine and hooks from ~/.claude/settings.json
-```
-
-**Windows**: remove directory junctions inside `config-N/` before deleting:
-
-```bash
-for d in ~/.claude/accounts/config-*/; do
-    for item in "$d"*; do
-        [ -L "$item" ] && rm "$item"
-    done
-done
-rm -rf ~/.claude/accounts
-```
+Records are signed with a local key that csq generates and keeps to your user
+account. If the chain is ever broken, csq says so rather than quietly continuing.
 
 ## Development
 
 ```bash
-cargo test --workspace              # 646 Rust tests
+cargo test --workspace --features csq/test-utils   # the test suite
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
-cd csq-desktop && npm run tauri dev # desktop dev mode
-cd csq-desktop && npx vitest run    # Svelte tests
 ```
+
+The frontend lives in `csq/ui`:
+
+```bash
+cd csq/ui && npm install && npm test
+```
+
+Tests, clippy, and fmt passing is necessary but not sufficient before calling a
+user-facing change done. Build the binary, install it, and run the command a user
+would actually run — a green suite says the code is right, not that the artifact
+on disk is the one you fixed.
+
+`specs/` is the authoritative description of how the system behaves; start at
+`specs/_index.md` and read only what your change touches.
+
+## Contributing
+
+Contributions are welcome. Changes go through pull requests, commit messages
+follow [Conventional Commits](https://www.conventionalcommits.org/), and tests
+land alongside the code they cover. Anything touching credentials, the keychain,
+or the sign-in flows deserves a careful security read before it merges.
 
 ## License
 
-Apache 2.0 -- [Terrene Foundation](https://terrene.foundation)
+Apache-2.0. See [LICENSE](LICENSE).

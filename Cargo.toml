@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.18.0"
+version = "2.19.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/terrene-foundation/csq"
@@ -27,13 +27,13 @@ repository = "https://github.com/terrene-foundation/csq"
 # NOT these dep literals (nor the enterprise SDK crate's `=X.Y.Z` pin), so the
 # `version_pins_match_workspace` test in the enterprise SDK crate fails closed on drift
 # until W5 automates the bump — do NOT trust the /release flow to keep these in sync.
-csq-redact = { path = "csq-redact", version = "2.18.0" }
+csq-redact = { path = "csq-redact", version = "2.19.0" }
 # csq-sdk — public (Apache-2.0) SDK wire contract (W2): envelope/error/adapter +
 # payload DTOs. csq-core depends on it and re-exports it (crate::sdk::*); the
 # builders (EDITION + audit->DTO mapping) live app-side in csq-core. `version`
 # alongside `path` for the same publishability reason as csq-redact above; the same
 # `version_pins_match_workspace` guard covers this literal.
-csq-sdk = { path = "csq-sdk", version = "2.18.0" }
+csq-sdk = { path = "csq-sdk", version = "2.19.0" }
 # csq-merkle — an internal ticket RFC 6962 Merkle verifier leaf crate (publish=false). Both
 # csq-ledger AND csq-core depend on it; no `version` alongside `path` is needed
 # because it is not published and no publishable (OPEN) crate depends on it — it

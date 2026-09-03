@@ -59,24 +59,55 @@ use tracing::{debug, info, warn};
 /// The sqlite files carry a SCHEMA-VERSION suffix (`state_5`, `logs_2`), so naming them
 /// literally would go stale the next time codex bumps one. They are matched by prefix
 /// against what `config-N` actually holds instead — see `codex_shared_pairs`.
-const CODEX_SHARED_STATE: &[(&str, &str)] = &[
-    ("sessions", "codex-sessions"),
-    ("history.jsonl", "codex-history.jsonl"),
+/// Whether a shared codex-home entry is a FILE or a DIRECTORY.
+///
+/// DECLARED, never inferred. The previous code guessed from the filename —
+/// `.jsonl`/`.sqlite` meant file, everything else meant directory — so
+/// `version.json`, `models_cache.json` and `installation_id` (all FILES in a
+/// real `~/.codex`) were pre-created as DIRECTORIES. codex-cli then could not
+/// write them and aborted with `failed to start embedded app server`, which
+/// names neither the file nor the directory that caused it.
+///
+/// The suffix rule was a negative default: anything it had not been taught was
+/// silently a directory, so ADDING a file-shaped entry was enough to break the
+/// spawn (`cc-artifacts.md` Rule 10 — enumerate, do not default). With the kind
+/// in the tuple the compiler makes a new entry state it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SharedKind {
+    File,
+    Dir,
+}
+
+const CODEX_SHARED_STATE: &[(&str, &str, SharedKind)] = &[
+    ("sessions", "codex-sessions", SharedKind::Dir),
+    ("history.jsonl", "codex-history.jsonl", SharedKind::File),
     // Everything below was found SPLIT on a maintainer host by
     // `session::share_audit`, not predicted. `state_<N>.sqlite` was the reported
     // symptom; these were the rest of the same profile:
     //   plugins 119.7M · thread_history_1 112.5M · state_5 104.6M · skills 1.1M,
     //   plus memories/goals/queue and the small per-profile files — ~440M of a
     //   codex profile that was being rebuilt from scratch in every terminal.
-    ("skills", "codex-skills"),
-    ("plugins", "codex-plugins"),
-    ("session_index.jsonl", "codex-session_index.jsonl"),
-    ("models_cache.json", "codex-models_cache.json"),
-    ("version.json", "codex-version.json"),
-    ("installation_id", "codex-installation_id"),
+    ("skills", "codex-skills", SharedKind::Dir),
+    ("plugins", "codex-plugins", SharedKind::Dir),
+    (
+        "session_index.jsonl",
+        "codex-session_index.jsonl",
+        SharedKind::File,
+    ),
+    (
+        "models_cache.json",
+        "codex-models_cache.json",
+        SharedKind::File,
+    ),
+    ("version.json", "codex-version.json", SharedKind::File),
+    ("installation_id", "codex-installation_id", SharedKind::File),
     // A lock shared by nobody is not a lock: two terminals writing one thread must
     // contend on the SAME directory, or the guard is decorative.
-    ("thread-writer-locks", "codex-thread-writer-locks"),
+    (
+        "thread-writer-locks",
+        "codex-thread-writer-locks",
+        SharedKind::Dir,
+    ),
 ];
 
 /// Prefixes of codex's schema-versioned sqlite state, shared account-wide.
@@ -101,10 +132,10 @@ const CODEX_SHARED_SQLITE_SUFFIX: &str = ".sqlite";
 /// by prefix rather than named literally so a version bump cannot silently unshare it.
 /// A `-wal`/`-shm` sidecar is deliberately skipped: SQLite places those beside the
 /// resolved database itself.
-fn codex_shared_pairs(config_dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut pairs: Vec<(String, PathBuf)> = CODEX_SHARED_STATE
+fn codex_shared_pairs(config_dir: &Path) -> Vec<(String, PathBuf, SharedKind)> {
+    let mut pairs: Vec<(String, PathBuf, SharedKind)> = CODEX_SHARED_STATE
         .iter()
-        .map(|(name, target)| ((*name).to_string(), config_dir.join(target)))
+        .map(|(name, target, kind)| ((*name).to_string(), config_dir.join(target), *kind))
         .collect();
 
     if let Ok(entries) = std::fs::read_dir(config_dir) {
@@ -114,7 +145,8 @@ fn codex_shared_pairs(config_dir: &Path) -> Vec<(String, PathBuf)> {
             if !name.ends_with(CODEX_SHARED_SQLITE_SUFFIX) {
                 continue;
             }
-            pairs.push((name.to_string(), config_dir.join(name)));
+            // A `*.sqlite` discovered in config-N is a database — always a file.
+            pairs.push((name.to_string(), config_dir.join(name), SharedKind::File));
         }
     }
     pairs
@@ -130,20 +162,131 @@ fn codex_shared_pairs(config_dir: &Path) -> Vec<(String, PathBuf)> {
 /// handle dir, because `config-N/codex-history.jsonl` did not exist at provisioning time.
 /// Being on the list has to be sufficient; otherwise the list describes an intention
 /// rather than a guarantee.
+/// A shared codex-home target whose on-disk shape disagrees with its DECLARED
+/// kind — the state that makes codex-cli abort with `failed to start embedded
+/// app server`, an error naming neither the entry nor the shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedShapeMismatch {
+    /// codex-home entry name, e.g. `version.json`.
+    pub name: String,
+    /// The `config-N/codex-*` path that is wrong.
+    pub path: PathBuf,
+    /// What is on disk.
+    pub found_dir: bool,
+    /// What codex-cli needs.
+    pub want_dir: bool,
+    /// Whether the next spawn will self-heal it (an EMPTY dir where a file
+    /// belongs). `false` means it needs an operator: repairing would destroy
+    /// state, so csq will not do it.
+    pub repairable: bool,
+}
+
+impl SharedShapeMismatch {
+    /// `true` when the next spawn repairs this automatically.
+    pub fn self_heals_hint(&self) -> bool {
+        self.repairable
+    }
+}
+
+/// Report every shared codex target in `config_dir` whose shape is wrong.
+///
+/// Reads the SAME `CODEX_SHARED_STATE` table the provisioning path uses, rather
+/// than re-deriving a list — a diagnostic that enumerates its own copy drifts
+/// from the writer and then reports on a world the product left
+/// (`diagnostic-surface-parity.md`).
+pub fn shared_codex_shape_mismatches(config_dir: &Path) -> Vec<SharedShapeMismatch> {
+    let mut out = Vec::new();
+    for (name, target, kind) in codex_shared_pairs(config_dir) {
+        let Ok(meta) = target.symlink_metadata() else {
+            continue; // absent is fine: the spawn path creates it correctly
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let found_dir = meta.is_dir();
+        let want_dir = kind == SharedKind::Dir;
+        if found_dir == want_dir {
+            continue;
+        }
+        out.push(SharedShapeMismatch {
+            name,
+            found_dir,
+            want_dir,
+            repairable: found_dir && !want_dir && dir_is_empty(&target),
+            path: target,
+        });
+    }
+    out
+}
+
+/// `true` when `p` is a directory containing nothing.
+fn dir_is_empty(p: &Path) -> bool {
+    std::fs::read_dir(p)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(false)
+}
+
+/// Repair a target already created with the WRONG shape, but ONLY when doing so
+/// destroys nothing.
+///
+/// The kind used to be inferred from the filename, so hosts provisioned before
+/// that fix carry `codex-version.json`, `codex-models_cache.json` and
+/// `codex-installation_id` as empty DIRECTORIES. Fixing the creation path alone
+/// leaves those hosts broken forever: the target already exists, so the create
+/// branch never runs, and codex-cli keeps failing with `failed to start embedded
+/// app server`.
+///
+/// Deliberately narrow. The ONLY repaired case is an EMPTY directory where a
+/// file belongs — provably zero data loss. A non-empty directory, or a file
+/// where a directory belongs, is LEFT ALONE and surfaced by `csq doctor`
+/// instead: self-healing must never be able to delete state a user would miss.
+fn repair_wrong_shaped_target(name: &str, target: &Path, kind: SharedKind) {
+    let Ok(meta) = target.symlink_metadata() else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return; // not ours to reshape
+    }
+    let is_dir = meta.is_dir();
+    let want_dir = kind == SharedKind::Dir;
+    if is_dir == want_dir {
+        return; // already correct
+    }
+    if is_dir && !want_dir && dir_is_empty(target) {
+        if std::fs::remove_dir(target).is_ok() {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(target);
+            debug!(
+                item = name,
+                "repaired wrong-shaped shared codex target (empty dir -> file)"
+            );
+        }
+        return;
+    }
+    // Anything else would destroy data. Leave it; `csq doctor` reports it.
+    debug!(
+        item = name,
+        is_dir, want_dir, "shared codex target has the wrong shape and cannot be repaired safely"
+    );
+}
+
 fn link_shared_codex_item(
     handle_dir: &Path,
     name: &str,
     target: &Path,
+    kind: SharedKind,
 ) -> Result<(), CredentialError> {
+    repair_wrong_shaped_target(name, target, kind);
     if !target.exists() && target.symlink_metadata().is_err() {
-        let created = if name.ends_with(".jsonl") || name.ends_with(".sqlite") {
-            std::fs::OpenOptions::new()
+        let created = match kind {
+            SharedKind::File => std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(target)
-                .map(|_| ())
-        } else {
-            std::fs::create_dir_all(target)
+                .map(|_| ()),
+            SharedKind::Dir => std::fs::create_dir_all(target),
         };
         // Non-fatal: a target we cannot pre-create is left to codex-cli, which is the
         // old behaviour. Better a degraded share than a failed spawn.
@@ -776,8 +919,8 @@ pub fn create_handle_dir_codex_named(
     // SHARED state: conversation history and codex's schema-versioned sqlite
     // metadata (names, recency). Anything not linked here becomes a real file in
     // the handle dir and is destroyed with it.
-    for (name, target) in codex_shared_pairs(&config_dir) {
-        link_shared_codex_item(&handle_dir, &name, &target)?;
+    for (name, target, kind) in codex_shared_pairs(&config_dir) {
+        link_shared_codex_item(&handle_dir, &name, &target, kind)?;
         debug!(item = %name, "linked shared codex state");
     }
 
@@ -1683,19 +1826,22 @@ pub fn repoint_handle_dir_codex(
     // is CREATED rather than skipped. Skipping is what let a listed item become
     // per-terminal state in the first place, and at swap time it additionally
     // strands the item on the OLD slot until codex-cli happens to recreate it.
-    for (name, new_target) in codex_shared_pairs(&new_config) {
+    for (name, new_target, kind) in codex_shared_pairs(&new_config) {
         let link_path = handle_dir.join(&name);
         let tmp_path = handle_dir.join(format!("{name}.swap-tmp"));
 
         if !new_target.exists() && new_target.symlink_metadata().is_err() {
-            let created = if name.ends_with(".jsonl") || name.ends_with(".sqlite") {
-                std::fs::OpenOptions::new()
+            // DECLARED kind, same as the provisioning path. This site carried a
+            // SECOND copy of the suffix heuristic, so the file-vs-dir bug existed
+            // here too — a swap onto a slot whose target was absent created the
+            // same wrong-shaped entry.
+            let created = match kind {
+                SharedKind::File => std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&new_target)
-                    .map(|_| ())
-            } else {
-                std::fs::create_dir_all(&new_target)
+                    .map(|_| ()),
+                SharedKind::Dir => std::fs::create_dir_all(&new_target),
             };
             if let Err(e) = created {
                 // Non-fatal, but remove any link still pointing at the OLD slot
@@ -3171,6 +3317,124 @@ fn create_symlink(target: &Path, link: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// Self-heal: an EMPTY directory where a file belongs is repaired, because a
+    /// host provisioned before the kind was declared already has one and the
+    /// create branch never runs for an existing target.
+    #[test]
+    fn repair_converts_empty_dir_to_file() {
+        use super::{repair_wrong_shaped_target, SharedKind};
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("codex-version.json");
+        std::fs::create_dir(&t).unwrap();
+
+        repair_wrong_shaped_target("version.json", &t, SharedKind::File);
+
+        assert!(t.is_file(), "empty dir should have been replaced by a file");
+    }
+
+    /// The safety half: a NON-EMPTY directory is never destroyed, even though it
+    /// is the wrong shape. Self-healing that can delete user state is worse than
+    /// the bug it fixes; `csq doctor` surfaces this case instead.
+    #[test]
+    fn repair_refuses_to_destroy_a_non_empty_dir() {
+        use super::{repair_wrong_shaped_target, SharedKind};
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("codex-models_cache.json");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("something-a-user-cares-about"), b"data").unwrap();
+
+        repair_wrong_shaped_target("models_cache.json", &t, SharedKind::File);
+
+        assert!(t.is_dir(), "non-empty dir must be left alone");
+        assert!(
+            t.join("something-a-user-cares-about").exists(),
+            "contents must survive"
+        );
+    }
+
+    /// The other direction: a FILE where a directory belongs is also left alone —
+    /// it may hold content, and removing it is not provably safe.
+    #[test]
+    fn repair_refuses_to_delete_a_file_where_a_dir_belongs() {
+        use super::{repair_wrong_shaped_target, SharedKind};
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("codex-skills");
+        std::fs::write(&t, b"not empty").unwrap();
+
+        repair_wrong_shaped_target("skills", &t, SharedKind::Dir);
+
+        assert!(t.is_file(), "file must be left alone");
+        assert_eq!(std::fs::read(&t).unwrap(), b"not empty");
+    }
+
+    /// A correctly-shaped target is untouched (no churn on the happy path).
+    #[test]
+    fn repair_leaves_a_correct_target_alone() {
+        use super::{repair_wrong_shaped_target, SharedKind};
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("codex-version.json");
+        std::fs::write(&f, b"v").unwrap();
+        repair_wrong_shaped_target("version.json", &f, SharedKind::File);
+        assert!(f.is_file());
+        assert_eq!(std::fs::read(&f).unwrap(), b"v");
+
+        let dir = d.path().join("codex-skills");
+        std::fs::create_dir(&dir).unwrap();
+        repair_wrong_shaped_target("skills", &dir, SharedKind::Dir);
+        assert!(dir.is_dir());
+    }
+
+    /// REGRESSION (2026-08-30): every shared codex-home entry must be created
+    /// with the shape codex-cli actually uses. The kind used to be INFERRED
+    /// from the filename (`.jsonl`/`.sqlite` => file, everything else =>
+    /// directory), so `version.json`, `models_cache.json` and
+    /// `installation_id` — all FILES in a real `~/.codex` — were pre-created as
+    /// DIRECTORIES. codex-cli then aborted with `failed to start embedded app
+    /// server`, an error naming neither the entry nor the shape.
+    ///
+    /// Pinned against the shapes observed in a live `~/.codex`, so a future
+    /// entry added with the wrong kind fails here rather than at a user's spawn.
+    #[test]
+    fn shared_codex_state_declares_the_shape_codex_actually_uses() {
+        use super::{SharedKind, CODEX_SHARED_STATE};
+
+        // name -> the shape codex-cli uses (verified on a live ~/.codex).
+        let expected: &[(&str, SharedKind)] = &[
+            ("sessions", SharedKind::Dir),
+            ("history.jsonl", SharedKind::File),
+            ("skills", SharedKind::Dir),
+            ("plugins", SharedKind::Dir),
+            ("session_index.jsonl", SharedKind::File),
+            ("models_cache.json", SharedKind::File),
+            ("version.json", SharedKind::File),
+            ("installation_id", SharedKind::File),
+            ("thread-writer-locks", SharedKind::Dir),
+        ];
+
+        for (name, want) in expected {
+            let got = CODEX_SHARED_STATE
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} missing from CODEX_SHARED_STATE"))
+                .2;
+            assert_eq!(got, *want, "{name} declares the wrong shape");
+        }
+
+        // Every entry is covered above: a new one must state its kind here too,
+        // which is the point — the list cannot grow silently.
+        assert_eq!(
+            CODEX_SHARED_STATE.len(),
+            expected.len(),
+            "CODEX_SHARED_STATE changed; add the new entry (and its real shape) to this test"
+        );
+
+        // The old heuristic's exact blind spot: a `.json` file is NOT a directory.
+        for (name, _, kind) in CODEX_SHARED_STATE {
+            if name.ends_with(".json") {
+                assert_eq!(*kind, SharedKind::File, "{name} is a .json FILE, not a dir");
+            }
+        }
+    }
     use super::*;
     use tempfile::TempDir;
 

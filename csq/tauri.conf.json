@@ -1,7 +1,7 @@
 {
   "$schema": "ui/node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Code Squad Q",
-  "version": "2.18.0",
+  "version": "2.19.0",
   "identifier": "foundation.terrene.claude-squad",
   "build": {
     "frontendDist": "ui/dist",
@@ -35,11 +35,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "deb", "rpm", "appimage", "msi", "nsis"],
+    "targets": [
+      "app",
+      "dmg",
+      "deb",
+      "rpm",
+      "appimage",
+      "msi",
+      "nsis"
+    ],
     "publisher": "Terrene Foundation",
     "homepage": "https://github.com/terrene-foundation/csq",
     "shortDescription": "Multi-provider session manager for Claude Code",
-    "longDescription": "Code Squad Q (csq) — run Claude Code against local models, third-party APIs, or pool multiple Claude Max subscriptions with per-terminal isolation and quota monitoring.",
+    "longDescription": "Code Squad Q (csq) \u2014 run Claude Code against local models, third-party APIs, or pool multiple Claude Max subscriptions with per-terminal isolation and quota monitoring.",
     "category": "DeveloperTool",
     "icon": [
       "icons/32x32.png",
@@ -72,11 +80,17 @@
     "createUpdaterArtifacts": true,
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libappindicator3-1"],
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libappindicator3-1"
+        ],
         "section": "devel"
       },
       "rpm": {
-        "depends": ["webkit2gtk4.1", "libappindicator-gtk3"]
+        "depends": [
+          "webkit2gtk4.1",
+          "libappindicator-gtk3"
+        ]
       },
       "appimage": {
         "bundleMediaFramework": false

@@ -128,6 +128,36 @@ impl StoredRecord {
     }
 }
 
+/// One authoritative read of a key, and the scope revision it was read AT.
+///
+/// The two travel together because an [`AbsenceProof`] is exactly the conjunction of
+/// them — "this key held no record, at this revision" — and a conjunction assembled
+/// from two separate store calls is not one observation. Reading the record and the
+/// watermark as one value is what lets an implementor make the pair atomic; with two
+/// calls it cannot, whatever it does internally, because the gateway has already
+/// interleaved them.
+///
+/// `#[non_exhaustive]`: construct via [`ScopeRead::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScopeRead {
+    /// The record the key held, or `None` if the scope holds no such item.
+    pub record: Option<StoredRecord>,
+    /// The scope's revision watermark AT the moment `record` was determined.
+    pub scope_revision: u64,
+}
+
+impl ScopeRead {
+    /// Build a read result from its two always-present fields.
+    #[must_use]
+    pub const fn new(record: Option<StoredRecord>, scope_revision: u64) -> Self {
+        Self {
+            record,
+            scope_revision,
+        }
+    }
+}
+
 /// The backing store for authoritative session memory.
 ///
 /// This crate is the wire contract and owns no persistence; the APP supplies the
@@ -140,30 +170,39 @@ impl StoredRecord {
 /// (`Err`). Collapsing the second into the first would let the gateway mint an
 /// [`AbsenceProof`] for a read that never happened, which is the one thing the proof
 /// exists to rule out.
+///
+/// # Store errors do not reach the wire
+///
+/// An implementor's error message is NOT forwarded. [`MemoryGateway`] re-wraps every
+/// store error, preserving only its [`SdkErrorCode`] and substituting a fixed label of
+/// this module's own — so a message built with [`SdkError::trusted`] (which skips
+/// redaction by design) cannot carry an item id, revision, scope, or memory content
+/// out through a refusal envelope. The `known` set is dropped for the same reason.
+///
+/// This is belt-and-braces, not a licence: an implementor SHOULD still keep its
+/// messages free of content, because it cannot know that every future caller of its
+/// store is this gateway. But the guarantee that a refusal from THIS surface is
+/// content-free does not depend on it doing so.
 pub trait SessionMemoryStore {
-    /// Read the authoritative record for `item_id`, or `Ok(None)` if the scope holds
-    /// no such item.
+    /// Read the authoritative record for `item_id` together with the scope revision
+    /// that read was taken at.
+    ///
+    /// [`ScopeRead::record`] is `None` when the scope holds no such item;
+    /// [`ScopeRead::scope_revision`] is the watermark an observation of the scope is
+    /// anchored to, and is what an [`AbsenceProof`] names. A key the scope does not
+    /// hold has no revision of its own, which is why the watermark is returned
+    /// unconditionally rather than derived from a record that may not exist.
+    ///
+    /// An implementor SHOULD determine both halves under whatever consistency
+    /// mechanism it has (one snapshot, one transaction, one lock). The gateway cannot
+    /// do this on its behalf: it is a single call precisely so that a concurrent
+    /// writer has no window between the record and the watermark to land in.
     ///
     /// # Errors
     /// Any [`SdkError`] the store raises. An error means the question was NOT answered;
-    /// it must not be used to signal absence.
-    fn load(
-        &mut self,
-        scope: &MemoryScope,
-        item_id: &str,
-    ) -> Result<Option<StoredRecord>, SdkError>;
-
-    /// The scope's current revision watermark — the revision an observation of the
-    /// scope is anchored to.
-    ///
-    /// A key the scope does not hold has no revision of its own, so this is what an
-    /// [`AbsenceProof`] is anchored at. An implementor that cannot answer returns
-    /// `Err`, and the gateway then reports [`AuthoritativeState::Unobserved`] rather
-    /// than minting a proof it cannot anchor.
-    ///
-    /// # Errors
-    /// Any [`SdkError`] the store raises.
-    fn revision(&mut self, scope: &MemoryScope) -> Result<u64, SdkError>;
+    /// it must not be used to signal absence. The gateway reports
+    /// [`AuthoritativeState::Unobserved`] rather than minting a proof it cannot anchor.
+    fn load(&mut self, scope: &MemoryScope, item_id: &str) -> Result<ScopeRead, SdkError>;
 
     /// Write `content` at `item_id`, returning the revision the write landed at.
     ///
@@ -725,6 +764,7 @@ impl<'a, S: SessionMemoryStore> MemoryGateway<'a, S> {
         let scope = MemoryScope::of_session(self.context);
         self.store
             .store(&scope, item_id, expected_revision, content)
+            .map_err(reclassify_store_error)
     }
 
     /// Remove, gated exactly as [`Self::apply_store`].
@@ -735,7 +775,9 @@ impl<'a, S: SessionMemoryStore> MemoryGateway<'a, S> {
         _egress: &EgressAuthorization,
     ) -> Result<u64, SdkError> {
         let scope = MemoryScope::of_session(self.context);
-        self.store.remove(&scope, item_id, expected_revision)
+        self.store
+            .remove(&scope, item_id, expected_revision)
+            .map_err(reclassify_store_error)
     }
 
     /// The authoritative read, and the ONLY site that mints an [`AbsenceProof`].
@@ -751,23 +793,24 @@ impl<'a, S: SessionMemoryStore> MemoryGateway<'a, S> {
     ) -> AuthoritativeState {
         let scope = MemoryScope::of_session(self.context);
         match self.store.load(&scope, item_id) {
-            Ok(Some(record)) => AuthoritativeState::Present(match disclosure {
-                Disclosure::Content => {
-                    ObservedItem::disclosed(item_id, record.revision, record.content)
-                }
-                Disclosure::PresenceOnly => ObservedItem::undisclosed(item_id, record.revision),
-            }),
-            Ok(None) => match self.store.revision(&scope) {
+            Ok(read) => match read.record {
+                Some(record) => AuthoritativeState::Present(match disclosure {
+                    Disclosure::Content => {
+                        ObservedItem::disclosed(item_id, record.revision, record.content)
+                    }
+                    Disclosure::PresenceOnly => ObservedItem::undisclosed(item_id, record.revision),
+                }),
                 // The ONLY AbsenceProof literal in this crate. It sits behind two
-                // conditions: the store answered the read, and it answered with no
-                // record; and the scope's revision is known, so the proof names WHEN
-                // the key was empty. An unanchorable absence is not a proof.
-                Ok(observed_at_revision) => AuthoritativeState::Absent(AbsenceProof {
+                // conditions, and they are now established by ONE store call: the store
+                // answered the read, and it answered with no record; and that answer
+                // carried the scope revision, so the proof names WHEN the key was empty.
+                // An unanchorable absence is not a proof — and a pair of separately
+                // anchored halves is not one observation.
+                None => AuthoritativeState::Absent(AbsenceProof {
                     scope: scope.clone(),
                     item_id: item_id.to_owned(),
-                    observed_at_revision,
+                    observed_at_revision: read.scope_revision,
                 }),
-                Err(_) => AuthoritativeState::Unobserved(UnobservedReason::ReadBackFailed),
             },
             Err(_) => AuthoritativeState::Unobserved(UnobservedReason::ReadBackFailed),
         }
@@ -781,6 +824,35 @@ enum Disclosure {
     Content,
     /// A mutation read-back: presence is the question, content is not disclosed.
     PresenceOnly,
+}
+
+/// Re-wrap a store-authored error so only its CLASS crosses the envelope.
+///
+/// The implementor's [`SdkErrorCode`] is preserved — that is the part a consumer
+/// branches on, and [`SdkErrorCode::RevisionConflict`] in particular carries a
+/// mechanical recovery. Everything the implementor WROTE is discarded: the message is
+/// replaced with a fixed `&'static str` of this module's own, and any `known` set is
+/// dropped.
+///
+/// # Why the message cannot be forwarded
+///
+/// [`SdkError::trusted`] skips redaction by design, so an implementor building
+/// ``SdkError::trusted(RevisionConflict, format!("item {item_id} at rev {n}: {content}"))``
+/// would put an item id and memory content on the same wire this module keeps
+/// scrupulously clean (`rules/security.md` §2). Redaction would not save it either:
+/// `csq-redact` catches secret-SHAPED tokens, and an item id or a memory body has no
+/// shape to catch. Dropping the message is the only mechanism that holds for a store
+/// this crate does not own.
+fn reclassify_store_error(err: SdkError) -> SdkError {
+    SdkError::trusted(
+        err.code,
+        match err.code {
+            SdkErrorCode::RevisionConflict => {
+                "authoring memory: the store refused the mutation — the item is not at the expected revision"
+            }
+            _ => "authoring memory: the store did not apply the mutation",
+        },
+    )
 }
 
 /// The longest item id this contract admits.
@@ -917,16 +989,15 @@ impl InMemorySessionMemory {
 }
 
 impl SessionMemoryStore for InMemorySessionMemory {
-    fn load(
-        &mut self,
-        scope: &MemoryScope,
-        item_id: &str,
-    ) -> Result<Option<StoredRecord>, SdkError> {
-        Ok(self.scope_state(scope).items.get(item_id).cloned())
-    }
-
-    fn revision(&mut self, scope: &MemoryScope) -> Result<u64, SdkError> {
-        Ok(self.scope_state(scope).revision)
+    /// Both halves are read from the same `&mut` borrow of the scope's state, so no
+    /// other caller can interleave between them — this implementor's atomicity is the
+    /// borrow itself.
+    fn load(&mut self, scope: &MemoryScope, item_id: &str) -> Result<ScopeRead, SdkError> {
+        let state = self.scope_state(scope);
+        Ok(ScopeRead::new(
+            state.items.get(item_id).cloned(),
+            state.revision,
+        ))
     }
 
     fn store(
@@ -1010,10 +1081,21 @@ mod tests {
         /// Number of `load` + `store` + `remove` calls that reached the store.
         touches: usize,
         fail_load: bool,
+        /// The store can read the record but cannot determine the scope watermark, so
+        /// it cannot answer at all — an absence it returned would be unanchorable.
         fail_revision: bool,
         /// Re-insert the item immediately after a `remove`, modelling a concurrent
         /// re-create between the mutation and its read-back.
         resurrect_on_remove: bool,
+        /// The store refuses the mutation with an error whose message carries the item
+        /// id and the memory content — built with `SdkError::trusted`, so redaction is
+        /// skipped by design. A conforming implementor should not do this; the point is
+        /// that the gateway's guarantee must not DEPEND on it not doing it.
+        leak_through_store_error: bool,
+        /// The scope's watermark advances on every read, modelling a concurrently
+        /// written scope. Any anchor assembled from two separate calls disagrees with
+        /// itself; one call cannot.
+        bump_revision_per_read: bool,
     }
 
     impl FakeStore {
@@ -1029,25 +1111,23 @@ mod tests {
     }
 
     impl SessionMemoryStore for FakeStore {
-        fn load(
-            &mut self,
-            scope: &MemoryScope,
-            item_id: &str,
-        ) -> Result<Option<StoredRecord>, SdkError> {
+        fn load(&mut self, scope: &MemoryScope, item_id: &str) -> Result<ScopeRead, SdkError> {
             self.touches += 1;
             self.seen_scopes.push(scope.clone());
-            if self.fail_load {
+            // Two distinct ways to be unable to answer, both now surfacing through the
+            // one call: the record could not be read, or it could but the scope's
+            // watermark could not be determined — and an absence with no watermark is
+            // not anchorable, so it must not be reported as one.
+            if self.fail_load || self.fail_revision {
                 return Err(SdkError::trusted(SdkErrorCode::Internal, "store offline"));
             }
-            Ok(self.items.get(item_id).cloned())
-        }
-
-        fn revision(&mut self, scope: &MemoryScope) -> Result<u64, SdkError> {
-            self.seen_scopes.push(scope.clone());
-            if self.fail_revision {
-                return Err(SdkError::trusted(SdkErrorCode::Internal, "store offline"));
+            if self.bump_revision_per_read {
+                self.revision += 1;
             }
-            Ok(self.revision)
+            Ok(ScopeRead::new(
+                self.items.get(item_id).cloned(),
+                self.revision,
+            ))
         }
 
         fn store(
@@ -1059,6 +1139,12 @@ mod tests {
         ) -> Result<u64, SdkError> {
             self.touches += 1;
             self.seen_scopes.push(scope.clone());
+            if self.leak_through_store_error {
+                return Err(SdkError::trusted(
+                    SdkErrorCode::RevisionConflict,
+                    format!("item {item_id} at rev {}: {content}", self.revision),
+                ));
+            }
             let current = self.items.get(item_id).map(|r| r.revision);
             if let Some(expected) = expected_revision {
                 if current != Some(expected) {
@@ -1084,6 +1170,12 @@ mod tests {
         ) -> Result<u64, SdkError> {
             self.touches += 1;
             self.seen_scopes.push(scope.clone());
+            if self.leak_through_store_error {
+                return Err(SdkError::trusted(
+                    SdkErrorCode::RevisionConflict,
+                    format!("item {item_id} at rev {}", self.revision),
+                ));
+            }
             let current = self.items.get(item_id).map(|r| r.revision);
             if let Some(expected) = expected_revision {
                 if current != Some(expected) {
@@ -1221,6 +1313,100 @@ mod tests {
         assert!(
             outcome.proven_absent().is_none(),
             "an unobserved read-back is NOT proof of deletion"
+        );
+    }
+
+    // ── M2: a store's own message never reaches the wire ────────────────────────
+
+    #[test]
+    fn a_store_error_carrying_content_is_reclassified_to_its_code_alone() {
+        let ctx = context();
+        let mut store = FakeStore::with_item(SECRET_CONTENT);
+        store.leak_through_store_error = true;
+
+        let err = MemoryGateway::new(&ctx, &mut store)
+            .edit(&MemoryEditRequest::new(binding(), ITEM, "new body"))
+            .expect_err("the store refused the write");
+
+        assert_eq!(
+            err.code,
+            SdkErrorCode::RevisionConflict,
+            "the CLASS is preserved — it is what a consumer branches on"
+        );
+        let rendered = serde_json::to_string(&err).expect("the error serializes");
+        assert!(
+            !rendered.contains(ITEM),
+            "the item id must not cross the envelope: {rendered}"
+        );
+        assert!(
+            !rendered.contains("new body") && !rendered.contains(SECRET_CONTENT),
+            "memory content must not cross the envelope: {rendered}"
+        );
+        assert!(
+            rendered.contains("revision_conflict"),
+            "the code still reaches the consumer: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_leaking_store_error_is_reclassified_on_the_delete_path_too() {
+        let ctx = context();
+        let mut store = FakeStore::with_item(SECRET_CONTENT);
+        store.leak_through_store_error = true;
+
+        let err = MemoryGateway::new(&ctx, &mut store)
+            .delete(&MemoryDeleteRequest::new(binding(), ITEM))
+            .expect_err("the store refused the removal");
+
+        let rendered = serde_json::to_string(&err).expect("the error serializes");
+        assert!(
+            !rendered.contains(ITEM),
+            "delete is the sibling path and gets the same treatment: {rendered}"
+        );
+    }
+
+    // ── L1: the absence anchor is ONE observation ───────────────────────────────
+
+    #[test]
+    fn an_absence_proof_is_anchored_at_the_revision_its_own_read_returned() {
+        // The scope moves under every read. Assembling the anchor from a `load` and a
+        // separate `revision` call would name a revision the read never saw; a single
+        // call cannot disagree with itself.
+        let ctx = context();
+        let mut store = FakeStore {
+            revision: 7,
+            bump_revision_per_read: true,
+            ..Default::default()
+        };
+
+        let outcome = MemoryGateway::new(&ctx, &mut store)
+            .delete(&MemoryDeleteRequest::new(binding(), ITEM))
+            .expect("removing an absent key is idempotent");
+
+        let proof = outcome
+            .proven_absent()
+            .expect("the read-back observed no record");
+        // 7 -> 8 on the removal's own bump, then 8 -> 9 on the single read-back. The
+        // proof names 9 because that is what the read that observed the absence
+        // returned; there is no second call whose answer it could have named instead.
+        assert_eq!(
+            proof.observed_at_revision(),
+            9,
+            "the proof is anchored at the watermark its OWN read returned"
+        );
+    }
+
+    #[test]
+    fn one_read_back_reaches_the_store_exactly_once() {
+        let ctx = context();
+        let mut store = FakeStore::default();
+        MemoryGateway::new(&ctx, &mut store)
+            .read(&MemoryReadRequest::new(binding(), ITEM))
+            .expect("the read is admitted");
+        assert_eq!(
+            store.touches, 1,
+            "record and watermark arrive together; a second call is the window this \
+             contract exists to close"
         );
     }
 
@@ -1650,19 +1836,21 @@ mod in_memory_store_tests {
     #[test]
     fn a_write_is_readable_and_lands_at_a_bumped_revision() {
         let mut store = InMemorySessionMemory::new();
-        assert_eq!(store.revision(&scope()).unwrap(), 0);
+        assert_eq!(store.load(&scope(), ITEM).unwrap().scope_revision, 0);
         let at = store.store(&scope(), ITEM, None, "body").unwrap();
         assert_eq!(at, 1, "the first write bumps the watermark to 1");
+        let read = store.load(&scope(), ITEM).unwrap();
+        assert_eq!(read.record, Some(StoredRecord::new(1, "body")));
         assert_eq!(
-            store.load(&scope(), ITEM).unwrap(),
-            Some(StoredRecord::new(1, "body"))
+            read.scope_revision, 1,
+            "the record and the watermark it was read at arrive together"
         );
     }
 
     #[test]
     fn an_unheld_key_is_no_record_never_an_error() {
         let mut store = InMemorySessionMemory::new();
-        assert_eq!(store.load(&scope(), ITEM).unwrap(), None);
+        assert_eq!(store.load(&scope(), ITEM).unwrap().record, None);
     }
 
     #[test]
@@ -1674,7 +1862,7 @@ mod in_memory_store_tests {
             .expect_err("a stale precondition is refused");
         assert_eq!(err.code, SdkErrorCode::RevisionConflict);
         assert_eq!(
-            store.load(&scope(), ITEM).unwrap(),
+            store.load(&scope(), ITEM).unwrap().record,
             Some(StoredRecord::new(1, "first")),
             "the refused write did not apply"
         );
@@ -1694,7 +1882,7 @@ mod in_memory_store_tests {
         let mut store = InMemorySessionMemory::new();
         store.store(&scope(), ITEM, None, "body").unwrap();
         assert_eq!(store.remove(&scope(), ITEM, None).unwrap(), 2);
-        assert_eq!(store.load(&scope(), ITEM).unwrap(), None);
+        assert_eq!(store.load(&scope(), ITEM).unwrap().record, None);
         assert_eq!(
             store.remove(&scope(), ITEM, None).unwrap(),
             2,
@@ -1710,11 +1898,11 @@ mod in_memory_store_tests {
 
         store.store(&scope(), ITEM, None, "alpha").unwrap();
 
-        assert_eq!(store.load(&other, ITEM).unwrap(), None);
-        assert_eq!(store.load(&foreign_tenant, ITEM).unwrap(), None);
-        assert_eq!(store.revision(&other).unwrap(), 0);
-        assert_eq!(store.revision(&foreign_tenant).unwrap(), 0);
-        assert_eq!(store.revision(&scope()).unwrap(), 1);
+        assert_eq!(store.load(&other, ITEM).unwrap().record, None);
+        assert_eq!(store.load(&foreign_tenant, ITEM).unwrap().record, None);
+        assert_eq!(store.load(&other, ITEM).unwrap().scope_revision, 0);
+        assert_eq!(store.load(&foreign_tenant, ITEM).unwrap().scope_revision, 0);
+        assert_eq!(store.load(&scope(), ITEM).unwrap().scope_revision, 1);
     }
 
     #[test]

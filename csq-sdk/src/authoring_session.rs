@@ -173,6 +173,17 @@ pub enum RequestCorrelation {
     Digest(String),
 }
 
+/// The longest correlation value this contract admits.
+///
+/// A bound, not a taste. Two outcomes have to stay separable: a legitimate
+/// correlation — a request id (`"req-1"`), a UUID (36 bytes), or a hex content digest
+/// (64 bytes for SHA-256, 128 for SHA-512) — and a value carrying something other than
+/// an identity. 512 sits about 4x above the largest legitimate form and far below a
+/// length at which echoing it into a receipt, a log line, or a store key is expensive.
+/// It is deliberately the same bound as `authoring_memory`'s item id: both are
+/// caller-supplied identifiers that this crate hands onward verbatim.
+pub const CORRELATION_MAX_BYTES: usize = 512;
+
 impl RequestCorrelation {
     /// The correlation's value, whichever arm carries it.
     #[must_use]
@@ -182,15 +193,37 @@ impl RequestCorrelation {
         }
     }
 
-    /// Structural check: the correlation carries a value.
+    /// Structural check: the correlation carries a value, and one short enough to be
+    /// an identifier.
+    ///
+    /// # Why a length bound and not just emptiness
+    ///
+    /// This value is chosen entirely by the caller and is echoed VERBATIM into
+    /// artifacts that outlive the turn — most notably
+    /// `crate::authoring_memory::MutationReceipt`, an attestation that is serialized
+    /// and may be persisted or audited. Every other field of that receipt is derived
+    /// by the gateway; this one is not, so it is the receipt's only fully
+    /// caller-controlled surface. An identifier or a digest is tens of bytes; the
+    /// bound admits those with orders of magnitude to spare and refuses a value being
+    /// used as a smuggling channel or as a way to inflate a stored attestation.
+    ///
+    /// The bound is on BYTES, not chars, because that is what a store, a log line, and
+    /// a wire payload actually pay for.
     ///
     /// # Errors
-    /// [`SdkErrorCode::InvalidInput`] when the value is empty.
+    /// [`SdkErrorCode::InvalidInput`] when the value is empty or exceeds
+    /// [`CORRELATION_MAX_BYTES`].
     pub fn validate(&self) -> Result<(), SdkError> {
         if self.value().is_empty() {
             return Err(SdkError::trusted(
                 SdkErrorCode::InvalidInput,
                 "authoring session: request correlation value must not be empty",
+            ));
+        }
+        if self.value().len() > CORRELATION_MAX_BYTES {
+            return Err(SdkError::trusted(
+                SdkErrorCode::InvalidInput,
+                "authoring session: request correlation value is too long",
             ));
         }
         Ok(())
@@ -733,6 +766,47 @@ mod tests {
     }
 
     // ── shape validation ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_correlation_longer_than_the_bound_is_refused() {
+        let over = RequestCorrelation::Id("x".repeat(CORRELATION_MAX_BYTES + 1));
+        let err = over
+            .validate()
+            .expect_err("an over-long correlation is refused");
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        assert!(
+            err.message.as_str().contains("too long"),
+            "the refusal names the SIZE class, not emptiness: {}",
+            err.message.as_str()
+        );
+
+        // The bound admits what it should — exactly at the limit, and every legitimate
+        // form: a request id, a UUID, and a SHA-512 hex digest.
+        RequestCorrelation::Id("x".repeat(CORRELATION_MAX_BYTES))
+            .validate()
+            .expect("exactly at the limit is admitted");
+        RequestCorrelation::Id("req-1".to_string())
+            .validate()
+            .expect("a request id is admitted");
+        RequestCorrelation::Digest("f".repeat(128))
+            .validate()
+            .expect("a SHA-512 hex digest is admitted");
+    }
+
+    #[test]
+    fn an_over_long_correlation_is_refused_through_the_full_binding_gate() {
+        // Reached via the gate a caller actually crosses, not just the leaf check —
+        // this is the path that would otherwise clone the value into a receipt.
+        let mut b = binding();
+        b.correlation = RequestCorrelation::Id("x".repeat(CORRELATION_MAX_BYTES + 1));
+        assert_eq!(
+            context()
+                .admit(&b)
+                .expect_err("the binding is refused")
+                .code,
+            SdkErrorCode::InvalidInput
+        );
+    }
 
     #[test]
     fn absent_invariants_are_refused_as_invalid_input() {

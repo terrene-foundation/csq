@@ -229,6 +229,9 @@
         region: string;
         /// Vertex SA JSON absolute path — empty until the user picks one.
         saPath: string;
+        /// Optional ANTHROPIC_MODEL pin. Empty means "let CC choose", which
+        /// can hang if CC's default has no quota in this project/region.
+        model: string;
         /// AWS Bedrock bearer token paste buffer (Bedrock only). Never
         /// echoed back over IPC.
         bearerToken: string;
@@ -1225,6 +1228,7 @@
       project: '',
       region: '',
       saPath: '',
+      model: '',
       bearerToken: '',
       submitting: false,
       error: null,
@@ -1233,7 +1237,11 @@
 
   function setCloudClaudeMode(mode: 'vertex' | 'bedrock') {
     if (step.kind !== 'cloud-claude-provision') return;
-    step = { ...step, mode, error: null };
+    // `model` is cleared with the mode: the id shapes differ per backend
+    // (`claude-opus-4-6@default` vs `anthropic.claude-opus-4-6-v1:0`), and the
+    // charset admits both, so a carried-over Vertex id would be written to a
+    // Bedrock slot verbatim and then hang at request time (an internal ticket).
+    step = { ...step, mode, model: '', error: null };
   }
 
   /// Opens the OS file picker scoped to JSON files for the Vertex SA.
@@ -1284,6 +1292,7 @@
         project,
         region,
         saPath,
+        model: current.model.trim() || null,
       });
       onAccountAdded();
       step = {
@@ -1316,6 +1325,7 @@
         slot: current.account,
         region,
         bearerToken: token,
+        model: current.model.trim() || null,
       });
       onAccountAdded();
       step = {
@@ -2248,6 +2258,24 @@
                 {step.saPath || '(no file selected)'}
               </code>
             </div>
+            <label class="field">
+              <span>Model <span class="optional">(optional)</span></span>
+              <input
+                type="text"
+                bind:value={step.model}
+                placeholder="claude-opus-4-6@default"
+                autocomplete="off"
+                spellcheck="false"
+                disabled={step.submitting}
+                data-testid="cloud-claude-model"
+              />
+              <span class="hint-inline">
+                Pins <code>ANTHROPIC_MODEL</code> for this slot. Leave blank to
+                let Claude Code choose — but if its default has no quota in this
+                project and region, the slot will appear to hang rather than
+                report an error.
+              </span>
+            </label>
             {#if step.error}
               <div class="error-banner">{step.error}</div>
             {/if}
@@ -2292,6 +2320,24 @@
                 disabled={step.submitting}
                 data-testid="cloud-claude-bedrock-token"
               />
+            </label>
+            <label class="field">
+              <span>Model <span class="optional">(optional)</span></span>
+              <input
+                type="text"
+                bind:value={step.model}
+                placeholder="anthropic.claude-opus-4-6-v1:0"
+                autocomplete="off"
+                spellcheck="false"
+                disabled={step.submitting}
+                data-testid="cloud-claude-model"
+              />
+              <span class="hint-inline">
+                Pins <code>ANTHROPIC_MODEL</code> for this slot. Leave blank to
+                let Claude Code choose — but if its default has no quota in this
+                project and region, the slot will appear to hang rather than
+                report an error.
+              </span>
             </label>
             {#if step.error}
               <div class="error-banner">{step.error}</div>
@@ -2556,6 +2602,21 @@
   .field span {
     font-size: 0.8rem;
     color: var(--text-secondary);
+  }
+  .field .optional {
+    font-weight: 400;
+    opacity: 0.7;
+  }
+  .field .hint-inline {
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--text-secondary);
+    opacity: 0.85;
+  }
+  .field .hint-inline code {
+    background: var(--bg-tertiary);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
   }
   .field input,
   .field select {

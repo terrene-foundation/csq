@@ -61,13 +61,89 @@
 //! Every refusal in this module is a fixed `&'static str` naming the CLASS of defect.
 //! No tenant id, operator id, session id, turn id, step id, or signal id is
 //! interpolated into an error, so a refusal envelope carries no session content
-//! (`rules/security.md` §2). Session turns are carried as a `digest` handle rather than
-//! as turn text, so the payload itself holds no authored content either.
+//! (`rules/security.md` §2). That holds for BOTH directions and is the guarantee this
+//! module actually makes.
+//!
+//! The PAYLOADS are not symmetric, and the difference matters to a consumer deciding
+//! what it may log or forward:
+//!
+//! - a [`DistillationRequest`] carries its session turns as a `digest` handle rather
+//!   than as turn text, so the request holds no authored content;
+//! - a [`DistillationResponse`] DOES carry authored prose, by construction. Every
+//!   [`DecisionStep`] in the distilled procedure has a `question` and a `criterion`,
+//!   and those are distilled session content — producing them is the entire point of
+//!   the operation. The response is content-BEARING, and a reader must not infer from
+//!   the request's digest handles that a distillation response can be logged or
+//!   forwarded as though it were content-free.
+
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::authoring_session::{EgressAuthorization, SessionBinding, SessionContext};
 use crate::error::{SdkError, SdkErrorCode};
+
+// ── cardinality bounds ──────────────────────────────────────────────────────────
+//
+// Every collection below arrives from a caller and is validated by walking it. Without
+// a bound, validation cost is a function of what the caller sent — and validation is
+// what runs BEFORE the payload has been established as anything, so it is the one
+// place a bound has to be unconditional rather than earned.
+//
+// A bound here is not a substitute for an envelope-level payload limit; `csq-sdk`'s
+// `Envelope` is serialize-only (it emits, it does not parse), so nothing upstream of
+// these checks bounds an inbound payload at all. These ARE the bound.
+//
+// Each is sized to keep two outcomes separable: the largest plausible legitimate value,
+// and a value large enough that walking it is the point. Where the honest ceiling is
+// another bound (a step cites turns; there are at most `MAX_SESSION_TURNS` of them),
+// the same number is reused rather than invented.
+
+/// The most session turns one distillation request may carry.
+///
+/// A long authoring session runs to hundreds of turns; 4096 is several times that and
+/// far below a size at which a single linear pass is noticeable.
+pub const MAX_SESSION_TURNS: usize = 4096;
+
+/// The most form-factor signals one request may carry.
+///
+/// A signal is observed IN a turn, so the natural ceiling is one per turn.
+pub const MAX_FORM_FACTOR_SIGNALS: usize = MAX_SESSION_TURNS;
+
+/// The most steps one decision procedure may declare.
+///
+/// A distilled procedure is meant to be READ by a person. A thousand steps is already
+/// far past legible; the bound exists for the machine, not the reader.
+pub const MAX_DECISION_STEPS: usize = 1024;
+
+/// The most branches out of a single decision step.
+///
+/// A step is one decision. Sixty-four branches is well beyond any decision a human
+/// makes at one point in a procedure.
+pub const MAX_STEP_OUTCOMES: usize = 64;
+
+/// The most source turns a single step or signal may cite.
+///
+/// A citation names a turn, and the request carries at most `MAX_SESSION_TURNS` of
+/// them — citing every turn in the session is the honest ceiling.
+pub const MAX_SOURCE_TURN_CITATIONS: usize = MAX_SESSION_TURNS;
+
+/// The most signals a determined inference may name as supporting it.
+///
+/// The supporting set is drawn from the request's signals, so it is bounded by them.
+pub const MAX_SUPPORTING_SIGNALS: usize = MAX_FORM_FACTOR_SIGNALS;
+
+/// Refuse when a caller-supplied collection exceeds its bound.
+///
+/// The refusal names the collection's CLASS and neither the offending count nor the
+/// limit — consistent with every other refusal in this module (§ Leak safety), and
+/// because a caller that sent the collection already knows how big it was.
+fn bound(len: usize, max: usize, message: &'static str) -> Result<(), SdkError> {
+    if len > max {
+        return Err(refuse(message));
+    }
+    Ok(())
+}
 
 /// Who produced a turn in the authoring session.
 ///
@@ -272,11 +348,6 @@ impl DecisionProcedure {
         }
     }
 
-    /// Whether a step with this id is declared.
-    fn has_step(&self, step_id: &str) -> bool {
-        self.steps.iter().any(|s| s.step_id == step_id)
-    }
-
     /// Check the procedure's structure and its provenance against the session turns it
     /// claims to distil.
     ///
@@ -304,20 +375,32 @@ impl DecisionProcedure {
                 "authoring distill: a decision procedure must declare at least one step",
             ));
         }
+        // Bound before walking: step count gates every loop below, and each of those
+        // loops resolves ids against the request's turns.
+        bound(
+            self.steps.len(),
+            MAX_DECISION_STEPS,
+            "authoring distill: a decision procedure declares too many steps",
+        )?;
 
-        for (index, step) in self.steps.iter().enumerate() {
-            step_shape_is_valid(step)?;
-
-            if self.steps[..index]
-                .iter()
-                .any(|s| s.step_id == step.step_id)
-            {
+        let turn_ids = turn_id_set(turns);
+        // Built once, up front, so outcome-target resolution is a lookup rather than a
+        // scan of every step per outcome. Declared-ness is a property of the step SET,
+        // which is fully known before any outcome is examined.
+        let mut step_ids: HashSet<&str> = HashSet::with_capacity(self.steps.len());
+        for step in &self.steps {
+            if !step_ids.insert(step.step_id.as_str()) {
                 return Err(refuse(
                     "authoring distill: decision step ids must be unique within the procedure",
                 ));
             }
+        }
+
+        for step in &self.steps {
+            step_shape_is_valid(step)?;
+
             for turn_id in &step.source_turns {
-                if !turns.iter().any(|t| &t.turn_id == turn_id) {
+                if !turn_ids.contains(turn_id.as_str()) {
                     return Err(refuse(
                         "authoring distill: decision step cites a turn absent from the session",
                     ));
@@ -325,7 +408,7 @@ impl DecisionProcedure {
             }
             for outcome in &step.outcomes {
                 if let StepTransition::Step(target) = &outcome.transition {
-                    if !self.has_step(target) {
+                    if !step_ids.contains(target.as_str()) {
                         return Err(refuse(
                             "authoring distill: decision outcome names an undeclared step",
                         ));
@@ -334,7 +417,7 @@ impl DecisionProcedure {
             }
         }
 
-        if !self.has_step(&self.entry_step) {
+        if !step_ids.contains(self.entry_step.as_str()) {
             return Err(refuse(
                 "authoring distill: procedure entry step is not a declared step",
             ));
@@ -350,17 +433,22 @@ impl DecisionProcedure {
     /// distillation asserts. Called only after the entry and every transition target
     /// have been shown to resolve.
     fn all_steps_reachable(&self) -> Result<(), SdkError> {
-        let mut seen: Vec<&str> = vec![self.entry_step.as_str()];
+        // `seen` is a set and the step lookup is a map: the previous shape used
+        // `Vec::contains` for membership and a linear `find` for the lookup, so a
+        // procedure of n steps cost O(n²) even though it is a plain graph walk.
+        let by_id: std::collections::HashMap<&str, &DecisionStep> =
+            self.steps.iter().map(|s| (s.step_id.as_str(), s)).collect();
+        let mut seen: HashSet<&str> = HashSet::with_capacity(self.steps.len());
+        seen.insert(self.entry_step.as_str());
         let mut frontier: Vec<&str> = vec![self.entry_step.as_str()];
 
         while let Some(step_id) = frontier.pop() {
-            let Some(step) = self.steps.iter().find(|s| s.step_id == step_id) else {
+            let Some(step) = by_id.get(step_id) else {
                 continue;
             };
             for outcome in &step.outcomes {
                 if let StepTransition::Step(target) = &outcome.transition {
-                    if !seen.contains(&target.as_str()) {
-                        seen.push(target.as_str());
+                    if seen.insert(target.as_str()) {
                         frontier.push(target.as_str());
                     }
                 }
@@ -374,6 +462,14 @@ impl DecisionProcedure {
             "authoring distill: every declared step must be reachable from the entry step",
         ))
     }
+}
+
+/// The set of turn ids a request declared, for resolving citations in one pass.
+///
+/// Every citation check in this module asks the same question — "is this id one of the
+/// session's turns?" — and asked it by scanning the turn slice, once per citation.
+fn turn_id_set(turns: &[SessionTurn]) -> HashSet<&str> {
+    turns.iter().map(|t| t.turn_id.as_str()).collect()
 }
 
 /// Shape check for one step, split out to keep [`DecisionProcedure::validate`] within
@@ -394,6 +490,16 @@ fn step_shape_is_valid(step: &DecisionStep) -> Result<(), SdkError> {
             "authoring distill: decision step must name the criterion that decides it",
         ));
     }
+    bound(
+        step.outcomes.len(),
+        MAX_STEP_OUTCOMES,
+        "authoring distill: decision step declares too many outcomes",
+    )?;
+    bound(
+        step.source_turns.len(),
+        MAX_SOURCE_TURN_CITATIONS,
+        "authoring distill: decision step cites too many source turns",
+    )?;
     if step.source_turns.is_empty() {
         return Err(refuse(
             "authoring distill: decision step must cite at least one source turn",
@@ -550,6 +656,15 @@ impl FormFactorSignal {
     /// [`SdkErrorCode::InvalidInput`] when the id is empty, no source turn is cited, or
     /// a cited turn is not among `turns`.
     pub fn validate(&self, turns: &[SessionTurn]) -> Result<(), SdkError> {
+        self.validate_against(&turn_id_set(turns))
+    }
+
+    /// [`Self::validate`] against a turn-id set the caller already built.
+    ///
+    /// Exists so [`DistillationRequest::validate_shape`] builds the set ONCE for the
+    /// whole request instead of once per signal; validating n signals against n turns
+    /// was O(n²) string comparisons on a caller-supplied payload.
+    fn validate_against(&self, turn_ids: &HashSet<&str>) -> Result<(), SdkError> {
         if self.signal_id.is_empty() {
             return Err(refuse(
                 "authoring distill: form-factor signal id must not be empty",
@@ -560,8 +675,13 @@ impl FormFactorSignal {
                 "authoring distill: form-factor signal must cite at least one source turn",
             ));
         }
+        bound(
+            self.source_turns.len(),
+            MAX_SOURCE_TURN_CITATIONS,
+            "authoring distill: form-factor signal cites too many source turns",
+        )?;
         for turn_id in &self.source_turns {
-            if !turns.iter().any(|t| &t.turn_id == turn_id) {
+            if !turn_ids.contains(turn_id.as_str()) {
                 return Err(refuse(
                     "authoring distill: form-factor signal cites a turn absent from the session",
                 ));
@@ -691,6 +811,11 @@ impl FormFactorInference {
                         "authoring distill: a determined form factor must name the signals that implied it",
                     ));
                 }
+                bound(
+                    d.supporting_signals.len(),
+                    MAX_SUPPORTING_SIGNALS,
+                    "authoring distill: a determined form factor names too many supporting signals",
+                )?;
                 if d.supporting_signals.iter().any(String::is_empty) {
                     return Err(refuse(
                         "authoring distill: supporting signal id must not be empty",
@@ -792,8 +917,18 @@ impl DistillationRequest {
     /// - [`SdkErrorCode::TenantMismatch`] / [`SdkErrorCode::IdentityMismatch`] /
     ///   [`SdkErrorCode::RoutingDenied`] — as [`SessionContext::admit`].
     pub fn admit(&self, context: &SessionContext) -> Result<AdmittedDistillation, SdkError> {
-        self.validate_shape()?;
+        // The governance gate runs FIRST, matching this module's own response direction
+        // (`DistillationResponse::accept` admits before it validates) and the sibling
+        // shards. Two reasons, and the second is why the ordering is load-bearing
+        // rather than cosmetic:
+        //
+        // 1. a caller that fails tenant, identity, or routing learns only that, and
+        //    nothing about how its payload was judged;
+        // 2. payload validation walks caller-supplied collections. Running it first
+        //    lets an unauthorized caller spend this process's time on a payload it was
+        //    never entitled to submit. Bounded work is still work.
         let authorization = context.admit(&self.binding)?;
+        self.validate_shape()?;
         Ok(AdmittedDistillation {
             authorization,
             inference: infer_form_factor(&self.form_factor_signals),
@@ -811,23 +946,35 @@ impl DistillationRequest {
                 "authoring distill: a distillation request must carry at least one session turn",
             ));
         }
-        for (index, turn) in self.turns.iter().enumerate() {
+        // Both bounds are checked BEFORE either collection is walked, so an oversized
+        // payload is refused on its length rather than on its content.
+        bound(
+            self.turns.len(),
+            MAX_SESSION_TURNS,
+            "authoring distill: a distillation request carries too many session turns",
+        )?;
+        bound(
+            self.form_factor_signals.len(),
+            MAX_FORM_FACTOR_SIGNALS,
+            "authoring distill: a distillation request carries too many form-factor signals",
+        )?;
+
+        // Uniqueness by insertion into a set: `insert` returning false IS the duplicate,
+        // so the check costs one pass rather than one scan of the prefix per element.
+        let mut turn_ids: HashSet<&str> = HashSet::with_capacity(self.turns.len());
+        for turn in &self.turns {
             turn.validate()?;
-            if self.turns[..index]
-                .iter()
-                .any(|t| t.turn_id == turn.turn_id)
-            {
+            if !turn_ids.insert(turn.turn_id.as_str()) {
                 return Err(refuse(
                     "authoring distill: session turn ids must be unique within the request",
                 ));
             }
         }
-        for (index, signal) in self.form_factor_signals.iter().enumerate() {
-            signal.validate(&self.turns)?;
-            if self.form_factor_signals[..index]
-                .iter()
-                .any(|s| s.signal_id == signal.signal_id)
-            {
+
+        let mut signal_ids: HashSet<&str> = HashSet::with_capacity(self.form_factor_signals.len());
+        for signal in &self.form_factor_signals {
+            signal.validate_against(&turn_ids)?;
+            if !signal_ids.insert(signal.signal_id.as_str()) {
                 return Err(refuse(
                     "authoring distill: form-factor signal ids must be unique within the request",
                 ));
@@ -1025,6 +1172,234 @@ mod tests {
 
     fn response() -> DistillationResponse {
         DistillationResponse::new(binding(), procedure(), infer_form_factor(&[shell_signal()]))
+    }
+
+    // ── M5: caller-supplied collections are bounded ─────────────────────────────
+
+    /// `n` well-formed, uniquely-identified turns — a payload that is legitimate in
+    /// every respect except its size, so only the bound can refuse it.
+    fn many_turns(n: usize) -> Vec<SessionTurn> {
+        (0..n)
+            .map(|i| SessionTurn::new(format!("turn-{i}"), TurnRole::Operator, "sha256:aaaa"))
+            .collect()
+    }
+
+    #[test]
+    fn a_request_carrying_more_turns_than_the_bound_is_refused() {
+        let over = DistillationRequest::new(binding(), many_turns(MAX_SESSION_TURNS + 1), vec![]);
+        let err = over
+            .admit(&context())
+            .expect_err("an oversized turn list is refused");
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        assert!(
+            err.message.as_str().contains("too many session turns"),
+            "the refusal must name the SIZE class, not some other defect: {}",
+            err.message.as_str()
+        );
+
+        // The bound admits what it should: exactly at the limit still passes, so the
+        // refusal above is the SIZE and not some other property of a large payload.
+        let at = DistillationRequest::new(binding(), many_turns(MAX_SESSION_TURNS), vec![]);
+        at.admit(&context())
+            .expect("exactly at the limit is admitted");
+    }
+
+    #[test]
+    fn a_request_carrying_more_signals_than_the_bound_is_refused() {
+        let signals: Vec<FormFactorSignal> = (0..=MAX_FORM_FACTOR_SIGNALS)
+            .map(|i| {
+                FormFactorSignal::new(
+                    format!("sig-{i}"),
+                    FormFactorSignalKind::InvokedFromShell,
+                    vec!["turn-1".to_string()],
+                )
+            })
+            .collect();
+        let err = DistillationRequest::new(binding(), turns(), signals)
+            .admit(&context())
+            .expect_err("an oversized signal list is refused");
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        assert!(
+            err.message
+                .as_str()
+                .contains("too many form-factor signals"),
+            "the refusal must name the SIZE class: {}",
+            err.message.as_str()
+        );
+    }
+
+    #[test]
+    fn a_signal_citing_more_source_turns_than_the_bound_is_refused() {
+        let citations: Vec<String> = (0..=MAX_SOURCE_TURN_CITATIONS)
+            .map(|i| format!("turn-{i}"))
+            .collect();
+        let signal =
+            FormFactorSignal::new("sig-1", FormFactorSignalKind::InvokedFromShell, citations);
+        let err = DistillationRequest::new(binding(), turns(), vec![signal])
+            .admit(&context())
+            .expect_err("an oversized citation list is refused");
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        // Every one of those citations also names a turn the session does not carry,
+        // which refuses with the SAME code. Only the message separates the two, so
+        // only the message can show the BOUND is what fired.
+        assert!(
+            err.message.as_str().contains("cites too many source turns"),
+            "the bound must fire before citation resolution: {}",
+            err.message.as_str()
+        );
+    }
+
+    #[test]
+    fn a_procedure_declaring_more_steps_than_the_bound_is_refused() {
+        let steps: Vec<DecisionStep> = (0..=MAX_DECISION_STEPS)
+            .map(|i| {
+                DecisionStep::new(
+                    format!("step-{i}"),
+                    "q",
+                    "c",
+                    vec!["turn-1".to_string()],
+                    vec![DecisionOutcome::new(
+                        "out",
+                        StepTransition::Terminal("done".to_string()),
+                    )],
+                )
+            })
+            .collect();
+        let err = DecisionProcedure::new("proc-1", "step-0", steps)
+            .validate(&turns())
+            .expect_err("an oversized step list is refused");
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        // These steps are also unreachable from the entry, which refuses with the same
+        // code; the message is what shows the bound fired first.
+        assert!(
+            err.message.as_str().contains("too many steps"),
+            "the bound must fire before the reachability walk: {}",
+            err.message.as_str()
+        );
+    }
+
+    #[test]
+    fn a_step_declaring_more_outcomes_than_the_bound_is_refused() {
+        let outcomes: Vec<DecisionOutcome> = (0..=MAX_STEP_OUTCOMES)
+            .map(|i| {
+                DecisionOutcome::new(
+                    format!("out-{i}"),
+                    StepTransition::Terminal("done".to_string()),
+                )
+            })
+            .collect();
+        let proc = DecisionProcedure::new(
+            "proc-1",
+            "step-a",
+            vec![DecisionStep::new(
+                "step-a",
+                "q",
+                "c",
+                vec!["turn-1".to_string()],
+                outcomes,
+            )],
+        );
+        let err = proc
+            .validate(&turns())
+            .expect_err("an oversized outcome list is refused");
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        assert!(
+            err.message.as_str().contains("too many outcomes"),
+            "the refusal must name the SIZE class: {}",
+            err.message.as_str()
+        );
+    }
+
+    #[test]
+    fn a_step_citing_more_source_turns_than_the_bound_is_refused() {
+        let citations: Vec<String> = (0..=MAX_SOURCE_TURN_CITATIONS)
+            .map(|i| format!("turn-{i}"))
+            .collect();
+        let proc = DecisionProcedure::new(
+            "proc-1",
+            "step-a",
+            vec![DecisionStep::new(
+                "step-a",
+                "q",
+                "c",
+                citations,
+                vec![DecisionOutcome::new(
+                    "out",
+                    StepTransition::Terminal("done".to_string()),
+                )],
+            )],
+        );
+        let err = proc
+            .validate(&turns())
+            .expect_err("an oversized citation list is refused");
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        assert!(
+            err.message.as_str().contains("cites too many source turns"),
+            "the bound must fire before citation resolution: {}",
+            err.message.as_str()
+        );
+    }
+
+    // ── L2: the governance gate runs before payload shape ───────────────────────
+
+    #[test]
+    fn the_governance_gate_is_reported_ahead_of_the_payload_shape_gate() {
+        // Both would refuse: a foreign tenant AND a payload carrying no turn. The
+        // governance verdict is the one returned, so a caller failing tenant learns
+        // nothing about how its payload was judged. Named to match the sibling shard's
+        // test of the same property (`authoring_intent`).
+        let mut both_wrong = DistillationRequest::new(binding(), vec![], vec![]);
+        both_wrong.binding.tenant_id = "tenant-beta".to_string();
+        assert_eq!(
+            both_wrong
+                .admit(&context())
+                .expect_err("both gates would refuse")
+                .code,
+            SdkErrorCode::TenantMismatch
+        );
+    }
+
+    #[test]
+    fn an_unauthorized_caller_cannot_reach_payload_validation_at_all() {
+        // The same ordering stated as a cost property: an oversized payload from a
+        // caller who fails routing is refused on the ROUTING, so the collections are
+        // never walked.
+        let mut foreign_region =
+            DistillationRequest::new(binding(), many_turns(MAX_SESSION_TURNS + 1), vec![]);
+        foreign_region.binding.routing = RoutingEvidence::new("claude", "us-east", policy());
+        assert_eq!(
+            foreign_region
+                .admit(&context())
+                .expect_err("a region outside the policy is refused")
+                .code,
+            SdkErrorCode::RoutingDenied,
+            "routing is decided before the turn list is examined"
+        );
+    }
+
+    // ── M4: the response is content-BEARING, and the doc says so ────────────────
+
+    #[test]
+    fn a_distillation_response_carries_distilled_prose_by_construction() {
+        // Pins § Leak safety's corrected claim to observable behaviour: the REQUEST
+        // holds digests only, the RESPONSE holds authored prose. If a later change made
+        // the response content-free, this REDs and the doc paragraph is the thing to
+        // revisit.
+        let req = serde_json::to_string(&request()).expect("the request serializes");
+        assert!(
+            !req.contains("does the operator run it themselves?"),
+            "the request carries digest handles, not turn text: {req}"
+        );
+
+        let resp = serde_json::to_string(&response()).expect("the response serializes");
+        assert!(
+            resp.contains("does the operator run it themselves?"),
+            "the response's question is distilled prose: {resp}"
+        );
+        assert!(
+            resp.contains("the session names a shell invocation"),
+            "so is its criterion: {resp}"
+        );
     }
 
     // ── happy path ──────────────────────────────────────────────────────────────

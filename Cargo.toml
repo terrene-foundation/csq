@@ -82,7 +82,7 @@ sha2 = "0.10"
 # enterprise-only org-root ceremony to derive the org KEK from the XOR of the
 # participants' entropy shares. Already present transitively (Cargo.lock); promoting
 # to a direct workspace dep gives a stable public API surface and one version pin.
-hkdf = "0.12"
+hkdf = "0.13"
 unicode-normalization = "0.1"
 secrecy = { version = "0.10", features = ["serde"] }
 libc = "0.2"

@@ -5136,6 +5136,14 @@ fn spawn_one_shot_with_post_validate(
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_dir_all(handle_dir);
+            // csq still owns the exit code (nothing launched), so flush the
+            // audit record fail-loud here, exactly as `exec_or_spawn`'s
+            // spawn-error branch does: a total `.pending/` write failure exits
+            // EXIT_CODE_AUDIT_WRITE_FAILED instead of being lost behind the
+            // launch error.
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
             return Err(anyhow!("failed to launch claude: {e}"));
         }
     };
@@ -5296,6 +5304,14 @@ fn spawn_interactive_inherited(
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_dir_all(handle_dir);
+            // csq still owns the exit code (nothing launched), so flush the
+            // audit record fail-loud here, exactly as `exec_or_spawn`'s
+            // spawn-error branch does: a total `.pending/` write failure exits
+            // EXIT_CODE_AUDIT_WRITE_FAILED instead of being lost behind the
+            // launch error.
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
             return Err(anyhow!("failed to launch claude: {e}"));
         }
     };

@@ -30,10 +30,10 @@ services:
       # NOT reachable from the host even if published — a loopback bind
       # inside a container is only reachable from within that container's own
       # network namespace. Use `docker exec` to reach it, or explicitly set
-      # CSQ_LEDGER_AUTHORITY_BIND=0.0.0.0 + publish "8081:8081" if you need
+      # CSQ_LEDGER_AUTHORITY_BIND=0.0.0.0 + publish "127.0.0.1:8081:8081" if you need
       # host/external access, and put your own network control in front of
       # it. See docs/audit-sinks/csq-ledger.md § "Two listeners".
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       # The append-only log + signing key live here. For WORM enforcement,
       # back this with immutable storage (see the ops doc threat model).
@@ -41,7 +41,11 @@ services:
     environment:
       CSQ_LEDGER_DATA_DIR: /data
       CSQ_LEDGER_PORT: "8080"
+      # Explicit opt-in for the container interface. The image itself does NOT
+      # acknowledge non-loopback exposure. Publishing is host-loopback-only;
+      # the container network must also be trusted (peers can reach this bind).
       CSQ_LEDGER_BIND: "0.0.0.0"
+      CSQ_LEDGER_ALLOW_PUBLIC_BIND: "true"
       # Uncomment AFTER you have backed up /data/signing-key.pem to acknowledge
       # the key and clear the first-boot warning:
       # CSQ_LEDGER_SIGNING_KEY_PATH: /data/signing-key.pem

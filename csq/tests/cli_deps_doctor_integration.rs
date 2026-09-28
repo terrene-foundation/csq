@@ -19,6 +19,11 @@
 //! + whitelist to avoid inheriting live `CLAUDE_CONFIG_DIR`.
 
 use serde_json::Value;
+// PathBuf is only referenced (unqualified) inside the #[cfg(unix)]
+// write_stub/write_hang_stub helpers below -- gate the import to match,
+// or it is unused on non-unix targets (windows-gnu cross-clippy, #1 in
+// the same class as the manifest-relative fallback 6ce7bd56 fixed).
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
@@ -33,22 +38,9 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Binary path ──────────────────────────────────────────────────────────────
 
-fn csq_bin() -> PathBuf {
-    // Locate the built `csq` binary via the Cargo-provided env var.
-    // Falls back to a path relative to the workspace root for IDE runs.
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_csq") {
-        return PathBuf::from(p);
-    }
-    // Fallback: walk up from the test file's manifest dir.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target = manifest
-        .parent() // csq crate root -> workspace root
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("csq");
-    target
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::csq_bin;
 
 // ── Subprocess helper ────────────────────────────────────────────────────────
 
@@ -77,6 +69,9 @@ fn clean_cmd(path_override: Option<&str>) -> Command {
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     // Sandbox HOME and CLAUDE_HOME — never re-inject the parent's live values.
     cmd.env("HOME", sandbox_home());
+    // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
+    // test-utils-gated override is what actually sandboxes it there.
+    cmd.env("CSQ_HOME", sandbox_home());
     cmd.env("CLAUDE_HOME", sandbox_home());
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {

@@ -48,7 +48,7 @@ use crate::credentials::file as cred_file;
 use crate::credentials::mutex::AccountMutexTable;
 use crate::credentials::write_uuid_settings;
 use crate::daemon::identity_mint::{self, MintSummary};
-use crate::platform::fs::{atomic_replace, secure_dir, secure_file, secure_file_readonly};
+use crate::platform::fs::{atomic_replace, secure_dir, secure_file_readonly};
 use crate::providers::catalog::Surface;
 use crate::providers::codex::surface as codex_surface;
 use crate::types::AccountNum;
@@ -1024,9 +1024,12 @@ fn heal_copy_legacy_to_identity(
         }
     };
 
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate `std::fs::write` + `secure_file` pair
+    // would leave open — `bytes` is a byte-copy of a legacy credential file.
     let tmp = crate::platform::fs::unique_tmp_path(identity_path);
 
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, &bytes) {
         let _ = std::fs::remove_file(&tmp);
         warn!(
             error_kind = "heal_write_failed",
@@ -1036,19 +1039,6 @@ fn heal_copy_legacy_to_identity(
         );
         return Phase4HealOutcome::CopyFailed {
             error_kind: "heal_write_failed".to_string(),
-        };
-    }
-
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        warn!(
-            error_kind = "heal_secure_failed",
-            identity = %identity_path.display(),
-            "phase4 self-heal: secure_file failed: {}",
-            crate::error::redact_tokens(&e.to_string())
-        );
-        return Phase4HealOutcome::CopyFailed {
-            error_kind: "heal_secure_failed".to_string(),
         };
     }
 
@@ -1316,8 +1306,8 @@ fn floor_emit_is_retryable(e: &crate::audit::persist::AuditV2Error) -> bool {
 /// Per-drain tally for the `csq run` audit-floor outbox (`csq-runs/.pending/`),
 /// returned by [`drain_run_floor`] and copied into the reconciler's
 /// `ReconcileSummary` by the startup wrapper [`pass5_audit_drain`]. Extracted so
-/// the same drain runs on the periodic refresher-tick backstop (M6 an internal ticket shard B),
-/// not only at daemon start.
+/// the same drain runs on the periodic refresher-tick backstop (M6 an internal ticket shard B)
+/// and event-driven live recovery (an internal ticket), not only at daemon start.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct RunFloorDrainSummary {
     /// `.jsonl` files seen (excludes `.tmp.` in-flight writes and subdirs).
@@ -1334,13 +1324,13 @@ pub(crate) struct RunFloorDrainSummary {
 
 /// Drain the `csq run` audit-floor outbox (`csq-runs/.pending/*.jsonl`) onto the
 /// chain, returning a per-drain tally. Shared by the daemon-start reconciler
-/// (via [`pass5_audit_drain`]) and the periodic refresher-tick backstop (M6 an internal ticket
-/// shard B — [`crate::daemon::refresher`]). Best-effort: never panics, never
-/// propagates. Single-threaded-safe on both call sites (startup runs before socket
+/// (via [`pass5_audit_drain`]), the periodic refresher-tick backstop (M6 an internal ticket
+/// shard B — [`crate::daemon::refresher`]), and enterprise event-driven live
+/// recovery (an internal ticket). Best-effort: never propagates. Startup runs before socket
 /// bind; the periodic tick runs the drain under `spawn_blocking`, and each drained
-/// record's chain write is serialized by the `.chain-lock`, so a concurrent live
-/// `POST /api/audit/record` cannot double-append — every write is idempotent by
-/// filename + `run:<run_id>` dedup).
+/// record's chain write is serialized by the `.chain-lock`. Concurrent drains or
+/// live `POST /api/audit/record` cannot double-append — every write is idempotent
+/// by filename + `run:<run_id>` dedup.
 ///
 /// See spec 12 §12.7 and spec 04 §4.2.8.
 pub(crate) fn drain_run_floor(base_dir: &Path) -> RunFloorDrainSummary {

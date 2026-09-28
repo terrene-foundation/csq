@@ -24,7 +24,7 @@
 //!
 //! `{base}` is the grok CLI's chat-proxy base — `$GROK_CLI_CHAT_PROXY_BASE_URL`
 //! when set (the vendor's documented override for self-hosted proxies),
-//! else [`DEFAULT_CHAT_PROXY_BASE`].
+//! else `DEFAULT_CHAT_PROXY_BASE`.
 //!
 //! A live probe against `https://cli-chat-proxy.grok.com/v1/billing?format=credits`
 //! with a real slot's OIDC token (headers as above) returned **HTTP 200**.
@@ -90,7 +90,7 @@
 //!
 //! Precedence when both levels carry a non-null value for the same
 //! field: root wins — silently in the returned figure, but logged at
-//! `debug!` when the two disagree (see [`field`]). No live response has
+//! `debug!` when the two disagree (see `field`). No live response has
 //! ever carried the same field at both levels, so this is defensive,
 //! not observed behavior. A root-level JSON `null`, by contrast, does
 //! NOT shadow a valid nested value: it is treated as absent and the
@@ -99,13 +99,13 @@
 //!
 //! **This tolerance does NOT extend to the period window.** Unlike the
 //! credit/numeric/text fields above, `config.currentPeriod` is read by
-//! [`current_period_field`] directly at `config.currentPeriod.<key>` —
+//! `current_period_field` directly at `config.currentPeriod.<key>` —
 //! never at the response root. The live capture only ever nested it,
 //! and no root-level `currentPeriod` has been observed; widening the
 //! tolerance to an unobserved shape now would be exactly the
 //! fabrication this module's docs argue against elsewhere (C-N2, PR
 //! an internal ticket redteam). If a flat `currentPeriod` ever appears live, widen
-//! [`current_period_field`] then — not before.
+//! `current_period_field` then — not before.
 //!
 //! # Zero credits is real data, not "nothing to report"
 //!
@@ -146,7 +146,7 @@
 //! Per the journal-0135 design lock csq does **not** refresh native
 //! tokens (the vendor CLI self-refreshes in place). This poller is
 //! therefore read-only: an expired token yields `401` →
-//! [`PollError::Unauthorized`] → the slot keeps its previous row and
+//! `PollError::Unauthorized` → the slot keeps its previous row and
 //! enters cooldown. It never writes a fabricated zero.
 
 use crate::quota::{state as quota_state, AccountQuota, BalanceInfo};

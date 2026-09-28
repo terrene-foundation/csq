@@ -10,9 +10,10 @@ RFC 6962 Merkle inclusion proofs, and publishes a signed tree head
 **csq-ledger is INTERNAL-ONLY.** It is never exposed to the public internet —
 not directly, and not behind a reverse proxy either. Deploy it inside your own
 trusted network, reachable only by the csq daemons and verifiers that live
-there. This is enforced structurally, not left to a deployment note: revoke
-and verifier-bootstrap redemption are served from a SEPARATE listener that
-defaults to loopback-only (see "Two listeners" below).
+there. Both listeners default to loopback and require an explicit acknowledgement
+for any non-loopback bind. Revoke and verifier-bootstrap redemption are also
+served from a SEPARATE listener. These guards do not enforce network topology
+after acknowledgement or prevent proxy exposure (see "Two listeners" below).
 
 This guide covers Docker deployment, environment variables, wiring csq to
 anchor here, monitoring, the **threat model** (read this before deciding your
@@ -62,8 +63,8 @@ against. Treat it as load-bearing: deploying csq-ledger while believing it is
 docker run -d \
   --name csq-ledger \
   -v /var/lib/csq-ledger:/data \
-  -p 8080:8080 \
-  ghcr.io/terrene-foundation/csq-ledger:latest
+  -p 127.0.0.1:8080:8080 \
+  ghcr.io/terrene-foundation/csq-ledger:latest --bind 0.0.0.0 --allow-public-bind
 
 # Confirm it is serving:
 curl http://localhost:8080/v1/health
@@ -81,7 +82,8 @@ authority listener binds `127.0.0.1:8081` by default; even publishing
 loopback-bound process inside a container is only reachable from within that
 container's own network namespace. To revoke or redeem a verifier bootstrap,
 either `docker exec` into the container and call `127.0.0.1:8081` from there,
-or explicitly set `CSQ_LEDGER_AUTHORITY_BIND=0.0.0.0`, publish `8081`, and put
+or explicitly set `CSQ_LEDGER_AUTHORITY_BIND=0.0.0.0` with
+`CSQ_LEDGER_ALLOW_PUBLIC_BIND=true`, publish `127.0.0.1:8081:8081`, and put
 your own network control (firewall, separate VLAN) in front of it.
 
 ### docker-compose
@@ -118,14 +120,35 @@ sudo chown -R 65532:65532 /var/lib/csq-ledger
 | ----------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `CSQ_LEDGER_DATA_DIR`         | `/var/lib/csq-ledger` | Data directory (segment files, size marker, anchors, signing key).                                              |
 | `CSQ_LEDGER_PORT`             | `8080`                | TCP port for the READ/WRITE listener.                                                                           |
-| `CSQ_LEDGER_BIND`             | `0.0.0.0`             | Bind address for the READ/WRITE listener. Reachable within your internal network; never expose it publicly.     |
+| `CSQ_LEDGER_BIND`             | `127.0.0.1`             | Literal IP for the READ/WRITE listener. Loopback-only unless explicitly widened and acknowledged.     |
 | `CSQ_LEDGER_AUTHORITY_PORT`   | `8081`                | TCP port for the AUTHORITY listener (revoke, verifier-bootstraps).                                              |
 | `CSQ_LEDGER_AUTHORITY_BIND`   | `127.0.0.1`           | Bind address for the AUTHORITY listener. Loopback-only by default — widening it is an explicit operator choice. |
+| `CSQ_LEDGER_ALLOW_PUBLIC_BIND` | `false` | Explicitly acknowledge ANY non-loopback bind on either listener; does not add authentication. |
 | `CSQ_LEDGER_SIGNING_KEY_PATH` | _(unset)_             | Path to an operator-provisioned signing key. Setting it clears the first-boot WARN.                             |
 
 CLI flags mirror the env vars (`--data-dir`, `--port`, `--bind`,
-`--authority-port`, `--authority-bind`) plus the anchor flags
+`--authority-port`, `--authority-bind`, `--allow-public-bind`) plus the anchor flags
 (`--anchor-to-sink`, `--anchor-cadence`).
+
+Both listeners now default to loopback. Before creating keys/storage or starting
+anchor tasks, startup refuses **any** non-loopback IP (including RFC1918,
+IPv6 private, mapped IPv4, and wildcard IPs) with exit 78 unless
+`--allow-public-bind` or `CSQ_LEDGER_ALLOW_PUBLIC_BIND=true` is explicit.
+This is an exposure acknowledgement, NOT permission to deploy publicly or
+an authentication layer. Both listener flags accept **literal IP addresses only**:
+replace old hostnames (including `localhost`) with `127.0.0.1` or `::1`.
+IPv6 literals are unbracketed in flags; ports remain separate. Invalid literals
+exit 2. The validated typed socket addresses are bound directly, without DNS
+re-resolution.
+
+**Container migration:** the image no longer embeds a wildcard bind. To reach
+its read/write port through publishing, explicitly set `--bind 0.0.0.0
+--allow-public-bind` as above (or both corresponding env vars). The Compose
+example makes that acknowledgement explicitly and publishes only to host
+loopback. Container-network peers can still reach its wildcard listener; keep
+that network trusted. To widen either listener or host publishing, establish
+the trusted-network controls first. Never expose these unauthenticated routes
+to the public internet, even behind a reverse proxy.
 
 ### Two listeners: read/write and authority (H3)
 
@@ -142,7 +165,7 @@ csq-ledger binds and serves TWO independent HTTP listeners from one process:
   read/write port gets a plain 404, not a permission check.
 
 If you need to reach the authority listener from another host (e.g. a
-dedicated revocation console), widen `--authority-bind` explicitly and put
+dedicated revocation console), widen `--authority-bind` with `--allow-public-bind` explicitly and put
 your own network control (firewall rule, separate VLAN, bastion) in front of
 it — that is additive to, not a substitute for, the listener split.
 

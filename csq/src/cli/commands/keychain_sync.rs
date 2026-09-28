@@ -23,7 +23,10 @@ use std::path::Path;
 /// `keychain::sync_all_handle_dirs` (the same sweep the daemon runs post-refresh)
 /// so the command and the daemon stay byte-identical in behavior.
 pub fn handle(base_dir: &Path) -> Result<()> {
-    let (synced, skipped, failed) = csq_core::credentials::keychain::sync_all_handle_dirs(base_dir);
+    let (synced, skipped, failed) = csq_core::credentials::keychain::sync_all_handle_dirs(
+        base_dir,
+        &std::collections::HashMap::new(),
+    );
     println!("keychain-sync: synced={synced} skipped={skipped} failed={failed}");
     if synced > 0 {
         println!("Claude Code re-checks the keychain ~every 30s; active sessions recover shortly.");

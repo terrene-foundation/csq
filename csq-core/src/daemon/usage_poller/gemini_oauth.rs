@@ -86,7 +86,7 @@ pub type ProjectCache = Arc<Mutex<ProjectCacheState>>;
 pub struct ProjectCacheState {
     pub project: Option<CachedProject>,
     /// True between the moment we kick off `read_oauth_creds` in
-    /// `spawn_blocking` and the moment the [`InFlightGuard`] drops.
+    /// `spawn_blocking` and the moment the `InFlightGuard` drops.
     /// While true, subsequent ticks skip rather than spawn another
     /// blocking read.
     pub oauth_creds_read_in_flight: bool,

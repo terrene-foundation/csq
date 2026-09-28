@@ -410,7 +410,7 @@ pub fn move_account(
         } else {
             reason.to_string()
         };
-        let _ = op_emit::emit_outcome(
+        if let Err(e) = op_emit::emit_outcome(
             base_dir,
             &chain_id,
             EventKind::AccountMove,
@@ -419,7 +419,19 @@ pub fn move_account(
             OpOutcome::Failed {
                 reason: RedactedString::from_untrusted(scrubbed),
             },
-        );
+        ) {
+            // S-LOW-C (round 8): best-effort audit trail — the move already
+            // failed by this point, so a WARN is correct, not a propagated
+            // error. `e.fixed_tag()` is a fixed vocabulary.
+            tracing::warn!(
+                error_kind = "audit_outcome_emit_failed",
+                op = "move_slot",
+                audit_error_kind = e.fixed_tag(),
+                "move_slot: failed to emit AccountMove OUTCOME:Failed record \
+                 (op already failed; audit trail incomplete — the INTENT is \
+                 left as an orphan for scan_orphan_intents)"
+            );
+        }
     };
 
     // Step 5: rename config dir.
@@ -629,14 +641,26 @@ pub fn move_account(
     // Best-effort: if this fails the intent becomes a visible orphan detectable
     // by `scan_orphan_intents`. FIX-1: skip when intent was skipped.
     if intent_emitted {
-        let _ = op_emit::emit_outcome(
+        if let Err(e) = op_emit::emit_outcome(
             base_dir,
             &chain_id,
             EventKind::AccountMove,
             move_payload,
             correlation_id,
             OpOutcome::Ok,
-        );
+        ) {
+            // S-LOW-C (round 8): best-effort audit trail — the move already
+            // committed by this point, so a WARN is correct, not a
+            // propagated error. `e.fixed_tag()` is a fixed vocabulary.
+            tracing::warn!(
+                error_kind = "audit_outcome_emit_failed",
+                op = "move_slot",
+                audit_error_kind = e.fixed_tag(),
+                "move_slot: failed to emit AccountMove OUTCOME:Ok record \
+                 (op already committed; audit trail incomplete — the INTENT \
+                 is left as an orphan for scan_orphan_intents)"
+            );
+        }
     }
 
     Ok(MoveSummary {

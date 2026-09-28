@@ -29,6 +29,11 @@
 #                                  stdout. rc 0 = scan completed (possibly zero
 #                                  rows); rc 2 = the scan itself failed and the
 #                                  caller must report UNDETERMINED, never clean.
+#                                  Rows are emitted with every `#NNN-historical`
+#                                  token REMOVED, so `deferral_ids` below never
+#                                  sees an opted-out citation. Suppression is
+#                                  per-citation — other ids on the same row
+#                                  survive and are still resolved.
 #   deferral_ids                -> stdin: hit rows. stdout: sorted, unique,
 #                                  bare in-repo ids, one per line.
 
@@ -126,6 +131,73 @@ DEFERRAL_DEFER_RE='(\bnot yet\b|\bnot currently\b|\bunimplemented\b|\bnot implem
 # repo's prose habits — decides what a merge closes.
 DEFERRAL_CLOSING_KEYWORD_RE='\b(fixes|closes|resolves)\b[[:space:]]*#'
 
+# ── THE MARKER AXIS (an internal ticket) ─────────────────────────────────────────
+#
+# The prose vocabulary above is a DENYLIST over free-form English and cannot
+# close as a class: every phrase it misses needs the same measure-and-widen
+# cycle an internal ticket performed ("tracked in"/"tracked by"/"pending verified"). This
+# axis is the enumerable half. `TODO|FIXME|XXX|HACK` is a CLOSED set — a new
+# deferral written as `TODO(#N)` fires immediately, with no vocabulary change,
+# because the marker IS the deferral declaration rather than a description of
+# one. Both axes are retained: measured 2026-09-20, the marker family carries
+# 13 sites tree-wide (5 with a `#NNN` on the line, 4 with the marker adjacent
+# to the id), so marker-only would be a near-dormant gate — the union is what
+# keeps both the enumerable axis AND the existing prose findings.
+#
+# WHY `(^|[^`])` — A BACKTICK-QUOTED MARKER IS A *NAMING*, NOT A USE
+# ------------------------------------------------------------------
+# `instrument-discipline.md` MUST NOT: a token's presence is consistent with
+# assertion, negation, and quotation alike. csq-core/src/audit/eatp_canonical.rs
+# :413 reads:
+#
+#     // Was `TODO(an internal ticket/…)`. csq an internal ticket is CLOSED, so it could never have been
+#
+# `an internal ticket` IS closed, so a naive marker axis convicts this line — which is the
+# comment RECORDING that the citation was moved off the dead tracker. The
+# opening backtick is the structural signal: a marker immediately preceded by
+# one is being quoted, not used. Measured against the 5 marker+#NNN lines in
+# this tree, this discriminates them exactly (413 excluded; 409 and the two
+# `types.rs` cross-references kept, all citing the OPEN an internal ticket).
+DEFERRAL_MARKER_RE='(^|[^`])\b(TODO|FIXME|XXX|HACK)\b'
+
+# ── THE OPT-OUT MARKER: `#NNN-historical` (an internal ticket) ───────────────────
+#
+# A trailing `-historical` on the citation itself opts THAT citation out, for
+# a genuine provenance reference to a closed issue (e.g. "Origin: an internal ticket —
+# load_state_salvage..."). Suppression is PER CITATION, never per line and
+# never per file: `an internal ticket-historical` drops `an internal ticket` while any other `#NNN` on the
+# same line is still resolved. A file-level or line-level opt-out would rot
+# into a blind spot that also hides the NEXT deferral written in that file —
+# the exact failure `tooling-self-verification.md` Rule 5 names for gates that
+# stop discriminating.
+#
+# This marker is the ONLY legitimate way to silence a citation, and it is
+# greppable (`grep -rn '#[0-9]\+-historical'` enumerates every opt-out in the
+# tree). Its use is documented in the header of every gate that sources this
+# file.
+DEFERRAL_HISTORICAL_RE='#[0-9]+-historical([^A-Za-z0-9_]|$)'
+
+# Fixture trees are excluded STRUCTURALLY rather than by hand-maintained
+# allowlist, because an allowlist rots on the first new fixture directory.
+# Three rules, none of which names a specific file:
+#
+#   1. Any directory a project conventionally names for fixture data,
+#      wherever it appears.
+#   2. The eval-harness's subject-matter subdirectories. `coc-eval/`'s
+#      `suites/` files carry `#NNN` as PROMPT CONTENT — the string
+#      `an internal ticket` is sample text handed to a model, and `an internal ticket` is
+#      coincidentally a real MERGED PR on this repo, so a state check
+#      convicts eval fixture text that was never a citation at all
+#      (`coc-eval/suites/compliance.py:174`, `compliance_hard.py:92-93`,
+#      `coc-eval/tests/test_harness_leniency_canary.py:76`). `tests/` and
+#      `results/` are the harness's own tests and its RECORDED model
+#      transcripts. The gate's subject is csq's product code; the harness's
+#      prompts and recorded outputs are not product code, and no `#NNN`
+#      inside a prompt string is a live deferral.
+#   3. `fixtures/` etc. under `coc-eval/bench/` are covered by rule 1.
+DEFERRAL_FIXTURE_TREE_RE='/(fixtures|testdata|test-fixtures|__fixtures__|snapshots)/'
+DEFERRAL_EVAL_SUBJECT_RE='^\./coc-eval/(suites|tests|fixtures|results)/'
+
 # Emits `path:line:text` rows for every source line that cites a `#NNN` AND
 # carries deferral vocabulary. rc 2 (NOT 1, NOT 0) when the scan itself failed.
 deferral_scan_hits() {
@@ -166,7 +238,7 @@ deferral_scan_hits() {
     # (`tooling-self-verification.md` Rule 5), and at a 5-in-6 false-positive
     # rate the real finding is the one that gets skipped.
     printf '%s\n' "$raw" \
-        | grep -Ei "$DEFERRAL_DEFER_RE" \
+        | grep -Ei -e "$DEFERRAL_DEFER_RE" -e "$DEFERRAL_MARKER_RE" \
         | grep -v '/target/' \
         | grep -v '/workspaces/' \
         | grep -v '/node_modules/' \
@@ -177,7 +249,10 @@ deferral_scan_hits() {
         | grep -v '/site-packages/' \
         | grep -v '/coc-env/' \
         | grep -v '/vendor/' \
-        | grep -vEi "$DEFERRAL_CLOSING_KEYWORD_RE"
+        | grep -vE "$DEFERRAL_FIXTURE_TREE_RE" \
+        | grep -vE "$DEFERRAL_EVAL_SUBJECT_RE" \
+        | grep -vEi "$DEFERRAL_CLOSING_KEYWORD_RE" \
+        | sed -E "s/${DEFERRAL_HISTORICAL_RE}/\1/g"
 
     # The pipeline's own rc is meaningless here (a trailing `grep -v` exits 1
     # when it filters everything out, which is a CLEAN tree, not an error).

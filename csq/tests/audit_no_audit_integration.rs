@@ -23,7 +23,6 @@
 //!    so no `claude` binary is required. This is the user-path-verification
 //!    Rule 1 end-to-end check the H1 fix demands.
 
-use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -31,18 +30,9 @@ use tempfile::TempDir;
 // under cargo's parallel test load. Mirror the sibling run-integration suite.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn csq_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_csq") {
-        return PathBuf::from(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("csq")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::csq_bin;
 
 /// Per-binary sandbox `$HOME` — a single empty tempdir for the whole test
 /// process, so production paths that read `HOME` directly resolve inside the
@@ -63,6 +53,9 @@ fn clean_cmd(path_override: Option<&str>) -> Command {
     // operator's real login keychain (rules/test-hermeticity.md).
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     cmd.env("HOME", sandbox_home());
+    // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
+    // test-utils-gated override is what actually sandboxes it there.
+    cmd.env("CSQ_HOME", sandbox_home());
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {
             cmd.env(k, v);

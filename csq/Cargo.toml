@@ -3,7 +3,7 @@ name = "csq"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "csq — unified CLI + desktop for Claude Code multi-account management"
+description = "csq — governed execution layer for coding-agent CLIs, with a verifiable audit trail"
 # Binary application distributed via GitHub releases / Homebrew, never crates.io.
 # publish = false is also REQUIRED (not just cosmetic) for cargo-deny's
 # `[bans] allow-wildcard-paths = true` to exempt the workspace-internal path
@@ -44,6 +44,20 @@ test-utils = ["csq-core/test-utils"]
 # or `desktop` feature sets.
 rekor-sink = ["csq-core/rekor-sink"]
 csq-ledger-sink = ["csq-core/csq-ledger-sink"]
+# The remaining M07 catalog sinks. Each `resolve_anchor_sink` arm in
+# `cli/commands/daemon.rs` (and its desktop mirror in
+# `desktop/daemon_supervisor.rs`) is gated on the SAME feature name declared
+# here — without this forwarding, `csq-core`'s own feature (and therefore
+# `validate_sink_compiled_in`) could be enabled via `--features
+# csq-core/s3-sink` while this crate's `#[cfg(feature = "s3-sink")]` stayed
+# permanently false, so configuration would succeed and the daemon would
+# never anchor. See issue: `resolve_anchor_sink` silently dropped 5 of 7
+# catalogued sink kinds.
+s3-sink = ["csq-core/s3-sink"]
+azure-sink = ["csq-core/azure-sink"]
+gcp-sink = ["csq-core/gcp-sink"]
+azure-sql-sink = ["csq-core/azure-sql-sink"]
+customer-body-store-sink = ["csq-core/customer-body-store-sink"]
 desktop = [
   "dep:tauri",
   "dep:tauri-plugin-log",
@@ -66,8 +80,9 @@ anyhow.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 serde.workspace = true
 serde_json.workspace = true
+# Encode Codex -c sqlite_home paths without TOML injection or escaping bugs.
+toml.workspace = true
 secrecy.workspace = true
-dirs.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

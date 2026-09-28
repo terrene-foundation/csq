@@ -1017,6 +1017,41 @@ mod report_tests {
     }
 }
 
+/// The text-mode "clean" vs "PARTIAL — tail verified" line for a gap-free
+/// `VerifySummary` (the `historical_key_gaps.is_empty()` arm of
+/// [`handle_verify`]'s human-readable match). Factored out for testability,
+/// mirroring `csq doctor`'s `resolve_audit_chain_answer` split
+/// (`tooling-self-verification.md` Rule 2: exercise the actual decision, not
+/// a proxy for it).
+///
+/// Before 2026-09-13 the caller printed a bare "clean" whenever
+/// `historical_key_gaps` was empty, never consulting `limit_exceeded_count` —
+/// so a scan that examined only the chain's tail was indistinguishable from
+/// whole-chain coverage on the one audit surface that still lacked the fix
+/// `1a1d6976` / `a44d2685` / `314ae682` gave `csq doctor --json`,
+/// `csq audit verify --json`, and `GET /api/audit/health`. Under truncation
+/// `verify_chain` skips exactly the two ANTI-truncation checks (the genesis
+/// seq-0 requirement, and the first surviving record's `prev_hash`, seeded
+/// from that record and counted verified anyway), so the surviving window's
+/// first record is anchored to nothing — the same security gap those three
+/// commits closed on the other three surfaces. Wording mirrors `csq doctor`'s
+/// `audit_chain_line` PARTIAL text.
+fn verify_clean_or_tail_verified_line(summary: &csq_core::audit::VerifySummary) -> String {
+    if summary.limit_exceeded_count == 0 {
+        format!(
+            "audit verify: clean — {} v2 records verified, {} v1 skipped",
+            summary.verified_count, summary.skipped_v1_count
+        )
+    } else {
+        format!(
+            "audit verify: PARTIAL — tail verified; {} v2 record(s) verified, {} older \
+record(s), INCLUDING the genesis, were NOT verified. Run `csq audit verify --full` for \
+whole-chain coverage.",
+            summary.verified_count, summary.limit_exceeded_count
+        )
+    }
+}
+
 pub fn handle_verify(
     base_dir: &Path,
     full: bool,
@@ -1046,7 +1081,10 @@ pub fn handle_verify(
     {
         let health = csq_core::audit::AuditHealth::from_verify_result(&result);
         match &health {
+            // TailVerified clears alongside Verified/Degraded — outgrowing the
+            // record limit is not brokenness. Coverage is reported separately.
             csq_core::audit::AuditHealth::Verified
+            | csq_core::audit::AuditHealth::TailVerified { .. }
             | csq_core::audit::AuditHealth::Degraded { .. } => {
                 csq_core::audit::clear_chain_broken(base_dir);
             }
@@ -1128,10 +1166,7 @@ pub fn handle_verify(
     // Human-readable output.
     match &result {
         Ok(summary) if summary.historical_key_gaps.is_empty() => {
-            eprintln!(
-                "audit verify: clean — {} v2 records verified, {} v1 skipped",
-                summary.verified_count, summary.skipped_v1_count
-            );
+            eprintln!("{}", verify_clean_or_tail_verified_line(summary));
             if enterprise_licensed {
                 print_trust_plane_grade(&result);
             }
@@ -1180,8 +1215,9 @@ Repair tooling is forthcoming."
         Err(ref e @ csq_core::audit::LedgerError::KeyNotFound { ref key_id }) => {
             eprintln!(
                 "audit verify: PARTIAL — signing key `{key_id}` not found in \
-keychain. If you rotated keys, the outgoing key must be retained — see \
-`csq audit key-history`."
+keychain. If you rotated keys, the outgoing key must be retained: csq \
+cannot verify records signed by a key it no longer holds. Run `csq audit \
+verify --full` for the complete list of affected records."
             );
             std::process::exit(exit_code_for_error(e));
         }
@@ -1358,6 +1394,48 @@ mod tests {
         handle_config_sink(base, Some("none")).expect("set none");
         let cfg = AuditSinkConfig::load(base).expect("load after set");
         assert_eq!(cfg.sink, "none");
+    }
+
+    /// An untruncated clean scan is still plainly "clean" — the over-correction
+    /// guard for the fix below.
+    #[test]
+    fn verify_line_is_clean_when_untruncated() {
+        let summary = csq_core::audit::VerifySummary {
+            verified_count: 7,
+            limit_exceeded_count: 0,
+            ..Default::default()
+        };
+        let line = verify_clean_or_tail_verified_line(&summary);
+        assert!(line.contains("clean"), "expected clean, got: {line}");
+        assert!(
+            !line.contains("PARTIAL"),
+            "an untruncated scan must not read PARTIAL: {line}"
+        );
+    }
+
+    /// THE SECURITY GAP THIS CLOSES (2026-09-13, fourth instance). Before this
+    /// fix, `csq audit verify`'s human-readable text (no `--json`) fell into
+    /// the "clean" branch for any gap-free summary — regardless of
+    /// `limit_exceeded_count` — so a truncated scan printed a bare "clean"
+    /// while `csq doctor --json`, `csq audit verify --json`, and
+    /// `GET /api/audit/health` had already learned to disclose the same
+    /// truncation via `1a1d6976` / `a44d2685` / `314ae682`.
+    #[test]
+    fn verify_line_is_partial_when_truncated_no_gaps() {
+        let summary = csq_core::audit::VerifySummary {
+            verified_count: 10_000,
+            limit_exceeded_count: 1_660,
+            ..Default::default()
+        };
+        let line = verify_clean_or_tail_verified_line(&summary);
+        assert!(
+            line.contains("PARTIAL") && line.contains("1660"),
+            "a truncated scan must disclose PARTIAL + the skipped count: {line}"
+        );
+        assert!(
+            !line.starts_with("audit verify: clean"),
+            "a truncated scan must not print a bare clean: {line}"
+        );
     }
 }
 

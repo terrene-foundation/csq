@@ -94,7 +94,7 @@ impl AnchorTaskHandle {
     ///
     /// Returns immediately — the anchor is processed when the loop's
     /// `immediate_notify` `select!` arm fires (sub-second; NOT bounded by the
-    /// 30s [`POLL_INTERVAL`], which only paces the head-detection poll).
+    /// 30s `POLL_INTERVAL`, which only paces the head-detection poll).
     /// Non-blocking so M11 high-impact ops are not delayed by any in-progress
     /// anchor call.
     ///

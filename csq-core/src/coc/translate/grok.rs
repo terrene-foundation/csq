@@ -57,7 +57,7 @@ pub fn build_json_schema_string() -> String {
 ///
 /// Path-scoped rules (`FlatArtifact.paths` a real restriction, not the
 /// parser's `["**"]` catch-all default — see
-/// [`super::flatten::is_real_path_restriction`]) are NOT expressed as
+/// `super::flatten::is_real_path_restriction`) are NOT expressed as
 /// directory-scoped `AGENTS.md` files — the
 /// harness-decomposition report (§7.2 `scoped_agents_md`) proposed
 /// materializing a scoped rule under `$GROK_HOME/<dir-prefix>/AGENTS.md`,

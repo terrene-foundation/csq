@@ -5,7 +5,7 @@
 
 use crate::accounts::{discovery, AccountSource};
 use crate::credentials::{self, file as cred_file};
-use crate::quota::{state as quota_state, AccountQuota, UsageWindow};
+use crate::quota::{state as quota_state, AccountQuota, PollOutcome, PollerHealth, UsageWindow};
 use crate::types::AccountNum;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,8 @@ use tracing::{debug, warn};
 
 use super::{
     classify_transport_error, clear_backoff, clear_cooldown, in_cooldown, increase_backoff,
-    set_cooldown, set_cooldown_with_backoff, HttpGetFn, PollError, CALL_TIMEOUT,
-    MAX_ACCOUNTS_PER_TICK,
+    set_cooldown, set_cooldown_with_backoff, set_cooldown_with_backoff_and_retry_after,
+    HttpGetWithRetryAfterFn, PollError, CALL_TIMEOUT, MAX_ACCOUNTS_PER_TICK,
 };
 
 /// Anthropic base URL for OAuth usage.
@@ -29,7 +29,7 @@ pub(crate) const ANTHROPIC_BETA_HEADER: &str = "oauth-2025-04-20";
 /// Exposed `pub(crate)` for tests.
 pub(crate) async fn tick(
     base_dir: &std::path::Path,
-    http_get: &HttpGetFn,
+    http_get: &HttpGetWithRetryAfterFn,
     cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
 ) {
@@ -50,12 +50,42 @@ pub(crate) async fn tick(
 
         let account = match AccountNum::try_from(info.id) {
             Ok(a) => a,
-            Err(_) => continue,
+            Err(_) => {
+                // Discovery walks `config-*` directory names and parses the
+                // suffix as a bare u16 (no AccountNum bound applied at that
+                // layer) — a stray directory outside 1..=999 reaches here.
+                // No `poller_health` row is written for it: every other
+                // surface that could read one back (csq doctor, csq probe,
+                // csq status) already refuses this same slot id via its own
+                // `AccountNum::try_from`, so a health row here would be an
+                // orphan no diagnostic can ever address by slot number.
+                warn!(
+                    slot = info.id,
+                    error_kind = "anthropic_poller_invalid_slot",
+                    "usage poller: discovered slot id is not a valid account \
+                     number (1..=999); skipping"
+                );
+                continue;
+            }
         };
 
         // Cooldown check
         if in_cooldown(cooldowns, info.id) {
             skipped += 1;
+            let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+            if let Err(e) = record_poll_failure(
+                base_dir,
+                account,
+                PollOutcome::SkippedCooldown,
+                cooldown_until,
+            ) {
+                warn!(
+                    account = info.id,
+                    error_kind = "quota_health_write_failed",
+                    reason = %crate::error::redact_tokens(&e.to_string()),
+                    "usage poller: failed to persist poller health"
+                );
+            }
             continue;
         }
 
@@ -79,7 +109,29 @@ pub(crate) async fn tick(
             };
         let creds = match credentials::load(&canonical) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                warn!(
+                    account = info.id,
+                    error_kind = "anthropic_poller_credentials_unreadable",
+                    reason = %crate::error::redact_tokens(&e.to_string()),
+                    "usage poller: could not load this slot's credentials; skipping"
+                );
+                // No cooldown to record: there is nothing to "wait out"
+                // here (unlike a 401/429/timeout, which back off a live
+                // upstream response). The daemon simply retries next tick
+                // on the chance credentials appear (e.g. mid-login).
+                if let Err(e) =
+                    record_poll_failure(base_dir, account, PollOutcome::SkippedNoCredentials, None)
+                {
+                    warn!(
+                        account = info.id,
+                        error_kind = "quota_health_write_failed",
+                        reason = %crate::error::redact_tokens(&e.to_string()),
+                        "usage poller: failed to persist poller health"
+                    );
+                }
+                continue;
+            }
         };
         // Short-lived heap String passed into spawn_blocking; dropped
         // when the blocking task completes. Never logged or stored in
@@ -102,8 +154,45 @@ pub(crate) async fn tick(
         let poll_result = match poll_result {
             Ok(inner) => inner,
             Err(_elapsed) => {
+                // A TIMEOUT escalates the backoff exactly like an explicit 429.
+                // A hung call and a server that has stopped answering
+                // promptly under load are indistinguishable at this layer —
+                // both present as "no response within CALL_TIMEOUT" — so
+                // treating a timeout as strictly less serious than an
+                // explicit 429 would mean the ONE failure mode most likely
+                // to recur quickly is the one that backs off the least.
+                //
+                // The daemon's own log recorded 330 429s against this
+                // account as of 2026-09-06 (grep of this host's log, not an
+                // inference); a live unauthenticated probe against
+                // `/api/oauth/usage` on 2026-09-10 separately returned `429`
+                // with `retry-after: 2912`, but that probe carried no
+                // credential, so it establishes nothing about how the
+                // AUTHENTICATED poller path is treated — no throttle claim
+                // follows from it (`instrument-discipline.md` MUST-1). What
+                // is engineering-sound regardless of either number: with the
+                // plain `set_cooldown` this arm used before this fix, a
+                // repeated timeout retried on a flat 600s clock no matter
+                // how many times it had already failed, exactly the same gap
+                // the 429 arm below had.
+                //
+                // Over-backing-off on a genuine transient blip costs at most one
+                // stale poll interval and self-corrects: the success arm calls
+                // `clear_backoff`, so a single good poll resets the factor to 1.
                 warn!(account = info.id, "usage poller: call timed out after 30s");
-                set_cooldown(cooldowns, info.id);
+                increase_backoff(backoffs, info.id);
+                set_cooldown_with_backoff(cooldowns, backoffs, info.id);
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                if let Err(e) =
+                    record_poll_failure(base_dir, account, PollOutcome::Timeout, cooldown_until)
+                {
+                    warn!(
+                        account = info.id,
+                        error_kind = "quota_health_write_failed",
+                        reason = %crate::error::redact_tokens(&e.to_string()),
+                        "usage poller: failed to persist poller health"
+                    );
+                }
                 continue;
             }
         };
@@ -120,20 +209,80 @@ pub(crate) async fn tick(
                 clear_backoff(backoffs, info.id);
                 polled += 1;
             }
-            Ok(Err(PollError::RateLimited)) => {
-                warn!(account = info.id, "usage poller: 429 rate limited");
+            Ok(Err((PollError::RateLimited, retry_after))) => {
+                // `retry_after` is `Some(n)` only when the response carried a
+                // digits-only `retry-after` header (validated in the Node
+                // script that emitted it — see
+                // `http::get_bearer_node_with_retry_after`'s doc); anything
+                // else, including no header at all, normalises to `None`
+                // upstream and is handled identically to "absent" by
+                // `set_cooldown_with_backoff_and_retry_after` below (it takes
+                // the max of the backoff-scaled wait and the server's wait,
+                // so an absent/unparseable/shorter server value never
+                // shortens the existing backoff).
+                warn!(
+                    account = info.id,
+                    retry_after_secs = retry_after,
+                    "usage poller: 429 rate limited"
+                );
                 increase_backoff(backoffs, info.id);
-                set_cooldown_with_backoff(cooldowns, backoffs, info.id);
+                set_cooldown_with_backoff_and_retry_after(
+                    cooldowns,
+                    backoffs,
+                    info.id,
+                    retry_after,
+                );
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                record_and_warn_on_write_failure(
+                    base_dir,
+                    account,
+                    info.id,
+                    PollOutcome::RateLimited,
+                    cooldown_until,
+                );
             }
-            Ok(Err(PollError::Unauthorized)) => {
+            Ok(Err((PollError::Unauthorized, _))) => {
                 warn!(account = info.id, "usage poller: 401 unauthorized");
                 set_cooldown(cooldowns, info.id);
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                record_and_warn_on_write_failure(
+                    base_dir,
+                    account,
+                    info.id,
+                    PollOutcome::Unauthorized,
+                    cooldown_until,
+                );
             }
-            Ok(Err(PollError::Transport(_))) => {
-                debug!(account = info.id, "usage poller: transport error");
+            Ok(Err((PollError::Transport(_), _))) => {
+                // Raised from `debug!` to `warn!` (2026-09-12): this arm
+                // previously produced ZERO log output, which is how a
+                // slot polling a genuinely dead endpoint went silent for
+                // 70+ minutes with nothing in the daemon log to show it —
+                // the daemon only emits WARN and above. Throttled to
+                // "first occurrence, then on change of outcome" via
+                // `record_poll_failure`'s returned `changed` flag, so a
+                // sustained outage logs once per state transition rather
+                // than once every 5-minute tick for its whole duration.
                 set_cooldown(cooldowns, info.id);
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                if record_and_warn_on_write_failure(
+                    base_dir,
+                    account,
+                    info.id,
+                    PollOutcome::Transport,
+                    cooldown_until,
+                ) {
+                    warn!(
+                        account = info.id,
+                        error_kind = "anthropic_poll_transport_error",
+                        "usage poller: transport error — will not repeat this WARN \
+                         every tick while the failure persists unchanged"
+                    );
+                } else {
+                    debug!(account = info.id, "usage poller: transport error (repeat)");
+                }
             }
-            Ok(Err(PollError::BadUrl(_))) => {
+            Ok(Err((PollError::BadUrl(_), _))) => {
                 // Reachable for TWO distinct reasons (round-2 redteam
                 // R6-rust corrected this comment — it previously claimed
                 // "unreachable in practice"): (1) this poller's own URL is
@@ -157,18 +306,77 @@ pub(crate) async fn tick(
                     "usage poller: outbound url or token rejected pre-flight — check the account's stored credentials"
                 );
                 set_cooldown(cooldowns, info.id);
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                record_and_warn_on_write_failure(
+                    base_dir,
+                    account,
+                    info.id,
+                    PollOutcome::Transport,
+                    cooldown_until,
+                );
             }
-            Ok(Err(PollError::Parse(_))) => {
-                debug!(account = info.id, "usage poller: parse error");
+            Ok(Err((PollError::Parse(_), _))) => {
+                // Raised from `debug!` to `warn!` (2026-09-12) — same
+                // rationale and same first-occurrence throttle as the
+                // `Transport` arm above.
                 set_cooldown(cooldowns, info.id);
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                if record_and_warn_on_write_failure(
+                    base_dir,
+                    account,
+                    info.id,
+                    PollOutcome::Parse,
+                    cooldown_until,
+                ) {
+                    warn!(
+                        account = info.id,
+                        error_kind = "anthropic_poll_parse_error",
+                        "usage poller: response body did not parse as the expected \
+                         usage JSON shape — will not repeat this WARN every tick \
+                         while the failure persists unchanged"
+                    );
+                } else {
+                    debug!(account = info.id, "usage poller: parse error (repeat)");
+                }
             }
-            Ok(Err(PollError::HttpError(status))) => {
-                debug!(account = info.id, status, "usage poller: non-200 response");
+            Ok(Err((PollError::HttpError(status), _))) => {
+                // Raised from `debug!` to `warn!` (2026-09-12) — includes
+                // every 5xx and any other unexpected status (429/401 are
+                // handled by their own arms above). Same throttle.
                 set_cooldown(cooldowns, info.id);
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                if record_and_warn_on_write_failure(
+                    base_dir,
+                    account,
+                    info.id,
+                    PollOutcome::ServerError,
+                    cooldown_until,
+                ) {
+                    warn!(
+                        account = info.id,
+                        status,
+                        error_kind = "anthropic_poll_http_error",
+                        "usage poller: non-200 response — will not repeat this WARN \
+                         every tick while the failure persists unchanged"
+                    );
+                } else {
+                    debug!(
+                        account = info.id,
+                        status, "usage poller: non-200 response (repeat)"
+                    );
+                }
             }
             Err(_join_err) => {
                 warn!(account = info.id, "usage poller: task panicked");
                 set_cooldown(cooldowns, info.id);
+                let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
+                record_and_warn_on_write_failure(
+                    base_dir,
+                    account,
+                    info.id,
+                    PollOutcome::Panic,
+                    cooldown_until,
+                );
             }
         }
     }
@@ -184,23 +392,35 @@ pub(crate) struct UsageData {
 }
 
 /// Polls `/api/oauth/usage` for one Anthropic account.
+///
+/// Returns the classified [`PollError`] paired with the parsed
+/// `retry-after` value as a `(PollError, Option<u64>)` tuple, rather than
+/// widening [`PollError::RateLimited`] itself to carry the field: that
+/// variant is constructed at 9+ other poller call sites (grok, kimi,
+/// minimax, zai, deepseek, third_party, codex) that have no use for it
+/// and would each need an unrelated update for a payload only this
+/// module's caller reads. `retry_after` is `Some` only on the
+/// `RateLimited` arm below (the one case the server's header is
+/// meaningful for) and `None` on every other arm — including success,
+/// where there is no error to pair it with.
 pub(crate) fn poll_anthropic_usage(
     token: &str,
-    http_get: &HttpGetFn,
-) -> Result<UsageData, PollError> {
+    http_get: &HttpGetWithRetryAfterFn,
+) -> Result<UsageData, (PollError, Option<u64>)> {
     let url = format!("{ANTHROPIC_BASE_URL}/api/oauth/usage");
     let extra_headers = [("Anthropic-Beta", ANTHROPIC_BETA_HEADER)];
 
-    let (status, body) = http_get(&url, token, &extra_headers).map_err(classify_transport_error)?;
+    let (status, retry_after, body) =
+        http_get(&url, token, &extra_headers).map_err(|e| (classify_transport_error(e), None))?;
 
     match status {
         200 => {}
-        429 => return Err(PollError::RateLimited),
-        401 => return Err(PollError::Unauthorized),
-        other => return Err(PollError::HttpError(other)),
+        429 => return Err((PollError::RateLimited, retry_after)),
+        401 => return Err((PollError::Unauthorized, None)),
+        other => return Err((PollError::HttpError(other), None)),
     }
 
-    parse_usage_response(&body)
+    parse_usage_response(&body).map_err(|e| (e, None))
 }
 
 /// Parses the `/api/oauth/usage` JSON response into `UsageData`.
@@ -377,10 +597,7 @@ pub(crate) fn write_usage_to_quota(
         }
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    let now = now_epoch();
 
     quota.set(
         account.get(),
@@ -392,9 +609,140 @@ pub(crate) fn write_usage_to_quota(
         },
     );
 
+    // Health is written in the SAME `save_state` call as the quota row
+    // above (see `PollerHealth`'s doc) — a success can never leave a
+    // stale failure record behind, and a failure can never be
+    // misread against a since-refreshed quota row, because there is
+    // exactly one load-mutate-save cycle per tick per slot.
+    quota.set_health(
+        account.get(),
+        PollerHealth {
+            last_attempt_at: now,
+            last_outcome: PollOutcome::Ok,
+            consecutive_failures: 0,
+            cooldown_until: None,
+            next_retry_at: None,
+        },
+    );
+
     quota_state::save_state(base_dir, &quota)?;
     debug!(account = account.get(), "usage poller: quota file updated");
     Ok(())
+}
+
+/// Current wall-clock time as epoch seconds, `0.0` on a clock error
+/// (mirrors the existing tolerance in [`write_usage_to_quota`] and
+/// [`AccountQuota::updated_at`]'s "never polled" sentinel).
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Translates a slot's in-memory, monotonic-clock cooldown deadline into
+/// a wall-clock epoch for persistence. `Instant` carries no epoch of its
+/// own, so this is `now_epoch() + remaining_wait`, read from the SAME
+/// cooldown map `tick`'s in-memory gating already consults — never a
+/// second, independent computation of the wait duration.
+fn cooldown_remaining_epoch(
+    cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
+    account: u16,
+) -> Option<f64> {
+    super::cooldown_remaining(cooldowns, account)
+        .map(|remaining| now_epoch() + remaining.as_secs_f64())
+}
+
+/// Persists a non-success poll outcome for `account`, merging it into
+/// `quota.json`'s `poller_health` map under the SAME lock and
+/// [`quota_state::save_state`] call pattern as [`write_usage_to_quota`]'s
+/// success path — never a second lock acquisition for the same tick.
+///
+/// Returns `Ok(true)` when `outcome` differs from the slot's previously
+/// recorded outcome (including "no previous record" — first occurrence).
+/// Callers use this to throttle a WARN to "first occurrence, then on
+/// change of outcome" instead of firing on every tick a sustained outage
+/// persists (see `tick`'s Transport/Parse/HttpError arms). A caller that
+/// does not need the throttle (e.g. an outcome that already warns
+/// unconditionally) may ignore the return value.
+///
+/// `PollOutcome::SkippedCooldown` carries `consecutive_failures` forward
+/// unchanged rather than incrementing it — see that variant's doc.
+/// Every other outcome (including `SkippedNoCredentials`, which is a
+/// genuine failed attempt to reach a usable credential) increments it.
+fn record_poll_failure(
+    base_dir: &std::path::Path,
+    account: AccountNum,
+    outcome: PollOutcome,
+    cooldown_until: Option<f64>,
+) -> Result<bool, crate::error::CsqError> {
+    let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
+    let _guard = crate::platform::lock::lock_file(&lock_path)?;
+
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
+        Ok(qf) => qf,
+        Err(e) => {
+            warn!(
+                account = account.get(),
+                error_kind = "quota_load_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "usage poller: quota.json unreadable, skipping poller-health \
+                 write to avoid clobbering sibling rows"
+            );
+            return Ok(false);
+        }
+    };
+
+    let previous = quota.get_health(account.get()).copied();
+    let changed = previous.map(|h| h.last_outcome != outcome).unwrap_or(true);
+    let consecutive_failures = match outcome {
+        PollOutcome::SkippedCooldown => previous.map(|h| h.consecutive_failures).unwrap_or(0),
+        _ => previous
+            .map(|h| h.consecutive_failures)
+            .unwrap_or(0)
+            .saturating_add(1),
+    };
+
+    quota.set_health(
+        account.get(),
+        PollerHealth {
+            last_attempt_at: now_epoch(),
+            last_outcome: outcome,
+            consecutive_failures,
+            cooldown_until,
+            next_retry_at: cooldown_until,
+        },
+    );
+
+    quota_state::save_state(base_dir, &quota)?;
+    Ok(changed)
+}
+
+/// Convenience wrapper around [`record_poll_failure`] for `tick`'s match
+/// arms: logs (at `warn!`) if the health write itself fails, and returns
+/// the `changed` flag (`false` on write failure, so a throttled caller
+/// never suppresses its own WARN because persistence broke). Named
+/// `info_id` rather than reusing `account.get()` at call sites purely to
+/// match `tick`'s existing `info.id` log-field convention.
+fn record_and_warn_on_write_failure(
+    base_dir: &std::path::Path,
+    account: AccountNum,
+    info_id: u16,
+    outcome: PollOutcome,
+    cooldown_until: Option<f64>,
+) -> bool {
+    match record_poll_failure(base_dir, account, outcome, cooldown_until) {
+        Ok(changed) => changed,
+        Err(e) => {
+            warn!(
+                account = info_id,
+                error_kind = "quota_health_write_failed",
+                reason = %crate::error::redact_tokens(&e.to_string()),
+                "usage poller: failed to persist poller health"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -428,7 +776,7 @@ mod tests {
         credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
     }
 
-    fn mock_usage_success(counter: Arc<AtomicU32>) -> HttpGetFn {
+    fn mock_usage_success(counter: Arc<AtomicU32>) -> HttpGetWithRetryAfterFn {
         Arc::new(move |_url: &str, _token: &str, _headers: &[(&str, &str)]| {
             counter.fetch_add(1, Ordering::SeqCst);
             // Anthropic returns utilization as 0-100 percentage directly
@@ -436,21 +784,43 @@ mod tests {
                 "five_hour": { "utilization": 42.0, "resets_at": "2099-01-01T00:00:00Z" },
                 "seven_day": { "utilization": 15.0, "resets_at": "2099-01-14T00:00:00Z" }
             }"#;
-            Ok((200, body.to_vec()))
+            Ok((200, None, body.to_vec()))
         })
     }
 
-    fn mock_usage_429(counter: Arc<AtomicU32>) -> HttpGetFn {
+    /// 429 with no `retry-after` header — the "server didn't say" case.
+    fn mock_usage_429(counter: Arc<AtomicU32>) -> HttpGetWithRetryAfterFn {
         Arc::new(move |_url: &str, _token: &str, _headers: &[(&str, &str)]| {
             counter.fetch_add(1, Ordering::SeqCst);
-            Ok((429, b"rate limited".to_vec()))
+            Ok((429, None, b"rate limited".to_vec()))
         })
     }
 
-    fn mock_usage_401(counter: Arc<AtomicU32>) -> HttpGetFn {
+    /// 429 carrying a `retry-after` value, for the honoring tests below.
+    fn mock_usage_429_with_retry_after(
+        counter: Arc<AtomicU32>,
+        retry_after_secs: u64,
+    ) -> HttpGetWithRetryAfterFn {
         Arc::new(move |_url: &str, _token: &str, _headers: &[(&str, &str)]| {
             counter.fetch_add(1, Ordering::SeqCst);
-            Ok((401, b"unauthorized".to_vec()))
+            Ok((429, Some(retry_after_secs), b"rate limited".to_vec()))
+        })
+    }
+
+    fn mock_usage_401(counter: Arc<AtomicU32>) -> HttpGetWithRetryAfterFn {
+        Arc::new(move |_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok((401, None, b"unauthorized".to_vec()))
+        })
+    }
+
+    /// A socket/DNS-level failure — `classify_transport_error` buckets any
+    /// string that is not one of the shared `crate::http::ERR_*` pre-flight
+    /// constants as `PollError::Transport`.
+    fn mock_usage_transport_error(counter: Arc<AtomicU32>) -> HttpGetWithRetryAfterFn {
+        Arc::new(move |_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err("connection refused".to_string())
         })
     }
 
@@ -704,14 +1074,14 @@ mod tests {
         // Mock HTTP that captures the bearer token.
         let captured_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured_token_clone = Arc::clone(&captured_token);
-        let http: HttpGetFn =
+        let http: HttpGetWithRetryAfterFn =
             Arc::new(move |_url: &str, token: &str, _headers: &[(&str, &str)]| {
                 *captured_token_clone.lock().unwrap() = Some(token.to_string());
                 let body = br#"{
                 "five_hour": { "utilization": 42.0, "resets_at": "2099-01-01T00:00:00Z" },
                 "seven_day": { "utilization": 15.0, "resets_at": "2099-01-14T00:00:00Z" }
             }"#;
-                Ok((200, body.to_vec()))
+                Ok((200, None, body.to_vec()))
             });
 
         let cooldowns = Arc::new(Mutex::new(HashMap::new()));
@@ -753,6 +1123,39 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "cooldown should suppress"
+        );
+    }
+
+    /// End-to-end wiring check (the isolated `set_cooldown_with_backoff_and_retry_after`
+    /// unit tests in `mod.rs::cooldown_backoff_tests` cover the arithmetic;
+    /// this covers that `tick` actually threads the parsed `retry-after`
+    /// value through `poll_anthropic_usage` into that function). An
+    /// arbitrarily large retry-after (2000s -- a round test constant, not
+    /// tied to any specific measured value) on a factor-1 account (600s
+    /// backoff wait) must produce a cooldown far longer than 600s.
+    #[tokio::test]
+    async fn tick_429_with_retry_after_honors_server_wait() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        const SERVER_WAIT_SECS: u64 = 2000;
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_usage_429_with_retry_after(Arc::clone(&counter), SERVER_WAIT_SECS);
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cooldowns, &backoffs).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let wait = cooldowns
+            .lock()
+            .unwrap()
+            .get(&1)
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .expect("slot 1 should be in cooldown");
+        assert!(
+            wait.as_secs_f64() > super::super::FAILURE_COOLDOWN.as_secs_f64() * 3.0,
+            "tick must thread the server's {SERVER_WAIT_SECS}s retry-after              through to the cooldown, not the flat 600s (factor-1) backoff              wait; got {wait:?}"
         );
     }
 
@@ -860,6 +1263,244 @@ mod tests {
         assert!(
             v["accounts"].get("3").is_none(),
             "slot 3 write must have been skipped entirely, not persisted"
+        );
+        assert!(
+            v.get("poller_health").and_then(|h| h.get("3")).is_none(),
+            "a skipped write must not leave a poller_health row behind either \
+             — the two are written in the same save_state call"
+        );
+    }
+
+    // ─── poller health persistence (live production-incident fix) ───
+    //
+    // Slot 9 stopped updating for 70+ minutes with ZERO log output: the
+    // failure classes below (`debug!`-only) and the two `Err(_) =>
+    // continue` discards left no operator-visible trace of what the
+    // poller was doing. These tests pin the health record each outcome
+    // now leaves behind, and the throttle that keeps a sustained outage
+    // from flooding the log.
+
+    /// A slot inside an already-set cooldown is skipped without an HTTP
+    /// call, and that skip is itself recorded — with a `cooldown_until` in
+    /// the future, not a bare "we don't know" state.
+    #[tokio::test]
+    async fn tick_cooldown_skip_persists_skipped_cooldown_health_with_future_deadline() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_usage_success(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        // Prime an active cooldown directly, bypassing a real failure —
+        // `tick` must skip purely because of this, never call upstream.
+        cooldowns
+            .lock()
+            .unwrap()
+            .insert(1, Instant::now() + Duration::from_secs(120));
+
+        tick(dir.path(), &http, &cooldowns, &backoffs).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "an active cooldown must suppress the HTTP call entirely"
+        );
+
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        let health = quota.get_health(1).expect("health record for slot 1");
+        assert_eq!(health.last_outcome, PollOutcome::SkippedCooldown);
+        let cooldown_until = health
+            .cooldown_until
+            .expect("cooldown_until must be set for a cooldown skip");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(
+            cooldown_until > now,
+            "cooldown_until ({cooldown_until}) must be in the future (now={now})"
+        );
+    }
+
+    /// A 429 must be distinguishable from a 401 in the persisted health —
+    /// they have entirely different operator remedies (wait vs re-login).
+    #[tokio::test]
+    async fn tick_429_persists_rate_limited_not_unauthorized() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_usage_429(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cooldowns, &backoffs).await;
+
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        let health = quota.get_health(1).expect("health record for slot 1");
+        assert_eq!(health.last_outcome, PollOutcome::RateLimited);
+        assert_ne!(health.last_outcome, PollOutcome::Unauthorized);
+        assert_eq!(health.consecutive_failures, 1);
+    }
+
+    /// A transport (connect/DNS) failure — this outcome was `debug!`-only
+    /// and silently discarded before this fix (the slot-9 incident: zero
+    /// log lines for 70+ minutes). It must now be visible in the
+    /// persisted health.
+    #[tokio::test]
+    async fn tick_transport_error_persists_transport_health() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_usage_transport_error(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cooldowns, &backoffs).await;
+
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        let health = quota.get_health(1).expect("health record for slot 1");
+        assert_eq!(health.last_outcome, PollOutcome::Transport);
+        assert_eq!(health.consecutive_failures, 1);
+    }
+
+    /// `record_poll_failure`'s returned `changed` flag is the exact
+    /// boolean `tick`'s Transport/Parse/HttpError arms use to decide
+    /// whether to fire `warn!` this tick (see those arms). This pins the
+    /// throttle directly: first occurrence fires, an identical repeat is
+    /// suppressed, and a change of outcome fires again. (This codebase
+    /// has no tracing-capture test harness to assert the `warn!` macro
+    /// call itself fired; this is the direct unit-level test of the gate
+    /// that call is conditioned on — see the session report for why that
+    /// substitution was made.)
+    #[test]
+    fn record_poll_failure_changed_flag_gates_the_warn_throttle() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(1u16).unwrap();
+
+        let first = record_poll_failure(dir.path(), account, PollOutcome::Transport, None)
+            .expect("record must succeed against a fresh empty quota.json");
+        assert!(
+            first,
+            "first occurrence must report changed=true (warn fires)"
+        );
+
+        let second = record_poll_failure(dir.path(), account, PollOutcome::Transport, None)
+            .expect("record must succeed");
+        assert!(
+            !second,
+            "an identical repeated outcome must report changed=false (warn suppressed)"
+        );
+
+        let third = record_poll_failure(dir.path(), account, PollOutcome::Parse, None)
+            .expect("record must succeed");
+        assert!(
+            third,
+            "a change of outcome must report changed=true again (warn fires)"
+        );
+    }
+
+    /// The health row and the quota row for a successful poll are written
+    /// by the SAME `save_state` call inside `write_usage_to_quota` — they
+    /// share the one `now` computed in that function, so their timestamps
+    /// are not merely close, they are identical. A regression that split
+    /// this into two separate lock/load/save cycles (the shape this rule
+    /// exists to forbid) would make this equality flaky-to-failing.
+    #[tokio::test]
+    async fn tick_success_writes_quota_row_and_health_row_from_the_same_save() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_usage_success(Arc::clone(&counter));
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(dir.path(), &http, &cooldowns, &backoffs).await;
+
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        let q = quota.get(1).expect("quota row for slot 1");
+        let health = quota.get_health(1).expect("health row for slot 1");
+        assert_eq!(health.last_outcome, PollOutcome::Ok);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.cooldown_until.is_none());
+        assert_eq!(
+            q.updated_at, health.last_attempt_at,
+            "the quota row and the health row must share the exact same \
+             timestamp — they come from one `now` in one save_state call"
+        );
+    }
+
+    /// `consecutive_failures` climbs across repeated failures and resets
+    /// to 0 the moment a poll succeeds.
+    #[test]
+    fn consecutive_failures_increments_and_resets_to_zero_on_success() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        let account = AccountNum::try_from(1u16).unwrap();
+
+        record_poll_failure(dir.path(), account, PollOutcome::Transport, None).unwrap();
+        let h1 = quota_state::load_state(dir.path())
+            .unwrap()
+            .get_health(1)
+            .unwrap()
+            .consecutive_failures;
+        assert_eq!(h1, 1);
+
+        record_poll_failure(dir.path(), account, PollOutcome::ServerError, None).unwrap();
+        let h2 = quota_state::load_state(dir.path())
+            .unwrap()
+            .get_health(1)
+            .unwrap()
+            .consecutive_failures;
+        assert_eq!(h2, 2);
+
+        let usage = UsageData {
+            five_hour: None,
+            seven_day: None,
+        };
+        write_usage_to_quota(dir.path(), account, &usage).unwrap();
+        let after_success = quota_state::load_state(dir.path()).unwrap();
+        let h3 = after_success.get_health(1).unwrap();
+        assert_eq!(h3.consecutive_failures, 0, "success must reset the counter");
+        assert_eq!(h3.last_outcome, PollOutcome::Ok);
+    }
+
+    /// A `SkippedCooldown` re-observation of an already-failing slot must
+    /// NOT inflate `consecutive_failures` — it is the same failure still
+    /// being waited out, not a new attempt. See `PollerHealth::
+    /// consecutive_failures`'s doc for the full rationale.
+    #[test]
+    fn skipped_cooldown_carries_consecutive_failures_forward_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(1u16).unwrap();
+
+        record_poll_failure(dir.path(), account, PollOutcome::Unauthorized, None).unwrap();
+        record_poll_failure(dir.path(), account, PollOutcome::Unauthorized, None).unwrap();
+        let before = quota_state::load_state(dir.path())
+            .unwrap()
+            .get_health(1)
+            .unwrap()
+            .consecutive_failures;
+        assert_eq!(before, 2);
+
+        record_poll_failure(
+            dir.path(),
+            account,
+            PollOutcome::SkippedCooldown,
+            Some(123.0),
+        )
+        .unwrap();
+        let after = quota_state::load_state(dir.path())
+            .unwrap()
+            .get_health(1)
+            .unwrap()
+            .consecutive_failures;
+        assert_eq!(
+            after, before,
+            "a cooldown-skip re-observation must not inflate the failure count"
         );
     }
 }

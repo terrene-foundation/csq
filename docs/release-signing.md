@@ -91,7 +91,12 @@ This is the maintainer-box flow that runs BEFORE pushing the release tag, so the
 ### 1. Build the unsigned bundle
 
 ```bash
-cd ~/repos/csq
+cd ~/repos/dev/csq   # the ENTERPRISE repo. NOT ~/repos/csq —
+                     # that path still exists but is a stale COMMUNITY clone
+                     # (terrene-foundation/csq @ v2.16.2, Jun 19). Building
+                     # there signs the wrong edition at the wrong version and
+                     # publishes it under the new tag. `release-preflight.sh`
+                     # asserts this mechanically; run it before you start.
 BUILD_START=$(date +%s)              # freshness anchor — asserted below
 cd csq && npm install && cd -    # if not already installed
 
@@ -200,6 +205,18 @@ echo "Bundle freshness + version coherence + universal slices OK: v$PLIST_VERSIO
 ### 2. Sign the `.app`
 
 ```bash
+# Derived, never hardcoded. Both --sign sites below previously carried the
+# literal "Developer ID Application: Terrene Foundation (TEAMIDXXXX)" — a
+# placeholder that is BOTH missing "Limited" AND carries a fake team id, so
+# copy-pasting either block failed with `no identity found` mid-cut. Deriving it
+# means the doc cannot drift from the keychain again (scripts/dev-install.sh
+# already derived it; the doc did not). release-preflight.sh asserts it resolves.
+IDENTITY=$(security find-identity -v -p codesigning \
+  | grep "Developer ID Application: Terrene Foundation" | head -1 \
+  | sed 's/.*"\(.*\)"/\1/')
+[ -n "$IDENTITY" ] || { echo "no Terrene Developer ID identity in the keychain"; exit 1; }
+echo "signing as: $IDENTITY"
+
 APP_BUNDLE="target/universal-apple-darwin/release/bundle/macos/Code Squad Q.app"
 
 # ── Standalone CLI helper for the shim refresh (an internal ticket) ──────────────
@@ -225,7 +242,7 @@ codesign --force \
   --deep \
   --options runtime \
   --timestamp \
-  --sign "Developer ID Application: Terrene Foundation (TEAMIDXXXX)" \
+  --sign "$IDENTITY" \
   "$APP_BUNDLE"
 
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
@@ -302,19 +319,29 @@ path.** Assert the glob now resolves to exactly one file, it is
 SIGNED bundle, not a leftover unsigned one from §1).
 
 ```bash
+# NOTE: no `shopt`, no bash arrays. `shopt` is a bash builtin; under zsh
+# it errors and `set -e` aborts the block, which reads as a REAL gate
+# failure when nothing is wrong. zsh arrays are also 1-indexed, so
+# `${DMGS[0]}` is empty there regardless. `find` + line counting is
+# correct in both shells, and needs no nullglob (a non-match prints
+# nothing rather than the literal pattern).
 set -e
-shopt -s nullglob
-DMGS=( "$DMG_DIR/Code Squad Q_${VERSION}_"*.dmg )
-shopt -u nullglob
-if [ "${#DMGS[@]}" -ne 1 ]; then
-  echo "::error::Expected exactly 1 DMG for v$VERSION, found ${#DMGS[@]}:"
-  printf '::error::  %s\n' "${DMGS[@]}"
+DMG_LIST=$(mktemp)
+find "$DMG_DIR" -maxdepth 1 -type f -name "Code Squad Q_${VERSION}_*.dmg" \
+  -print > "$DMG_LIST"
+DMG_COUNT=$(wc -l < "$DMG_LIST" | tr -d ' ')
+if [ "$DMG_COUNT" -ne 1 ]; then
+  echo "::error::Expected exactly 1 DMG for v$VERSION, found $DMG_COUNT:"
+  sed 's/^/::error::  /' "$DMG_LIST"
   echo "::error::A stale DMG survived the rm -f glob (an internal journal entry)."
   echo "::error::Delete all but the just-built one and re-verify."
+  rm -f "$DMG_LIST"
   exit 1
 fi
-if [ "${DMGS[0]}" != "$DMG_PATH" ]; then
-  echo "::error::DMG path mismatch: built '${DMGS[0]}' but \$DMG_PATH is"
+DMG_FOUND=$(cat "$DMG_LIST")
+rm -f "$DMG_LIST"
+if [ "$DMG_FOUND" != "$DMG_PATH" ]; then
+  echo "::error::DMG path mismatch: built '$DMG_FOUND' but \$DMG_PATH is"
   echo "::error::'$DMG_PATH'. Expected _universal suffix from"
   echo "::error::--target universal-apple-darwin (an internal journal entry of"
   echo "::error::an internal workspace workspace)."
@@ -332,7 +359,7 @@ echo "DMG gate OK: one fresh DMG at $DMG_PATH wrapping the signed .app."
 
 ```bash
 codesign --force \
-  --sign "Developer ID Application: Terrene Foundation (TEAMIDXXXX)" \
+  --sign "$IDENTITY" \
   --timestamp \
   "$DMG_PATH"
 
@@ -641,32 +668,86 @@ Final set of maintainer-produced files for upload:
 
 ### 8. Upload to GitHub release (stable tag flow)
 
-For STABLE tags (`vX.Y.Z`, no suffix), the workflow skips the macOS branch of the `build-desktop` matrix entirely. The maintainer's three artifacts MUST be on the release BEFORE the workflow's publish job runs — the publish job validates their presence and fails closed if missing.
+For STABLE tags (`vX.Y.Z`, no suffix), the workflow skips the macOS branch of the `build-desktop` matrix entirely. The maintainer's three artifacts **and two artifact-bound `.edition` claims** MUST be on the release BEFORE the workflow's publish job runs — the publish job validates their presence, downloads all five, then runs the license refusal gate before flattening or publishing. Missing or unclassified candidates stop publication.
+
+The edition-claim migration intentionally rejects previous plaintext sidecars. Use
+`scripts/ci/emit-edition-sidecars.sh` from the **same release-oracle revision as
+the enterprise `$SHA` tagged below**, not an arbitrary community checkout or
+floating helper version. It scans the corresponding signed app's raw executable
+without executing it and hashes each FINAL bundle after signing, notarization,
+stapling, packaging and renaming. Do not hand-author an edition or reuse a claim
+after changing bundle bytes. These are trusted maintainer/build claims bound by
+SHA256, **not** proof that a bundle contains the scanned executable, compiled-key
+attestation, or signed provenance. Stable publication remains blocked until both
+current claims are supplied; this does not activate the production license key.
 
 ```bash
-# 1. Capture the EXACT commit SHA you're cutting from. `--target main`
+# 1. Capture the EXACT commit SHAs you're cutting from. `--target main`
 #    would create a tag-ref pointing at "wherever main is when gh runs";
 #    if main advances between draft-create and tag-push, the draft
 #    release and the pushed tag diverge to different commits. Pinning
 #    via SHA eliminates that race.
+#
+#    TWO SHAs, TWO REPOS — they are NOT interchangeable. This repo and
+#    terrene-foundation/csq have DISJOINT histories: the community tree
+#    is a one-way EXTRACT (see community-edition-extraction.md), not a
+#    fork sharing ancestry. An enterprise SHA therefore names no commit
+#    on the community repo, and passing one to --target there fails:
+#      $ gh api repos/terrene-foundation/csq/commits/<enterprise-sha>
+#      {"message":"No commit found for SHA: ...","status":"422"}
+#    Measured 2026-09-06 cutting v2.19.0: enterprise main 7d0adab2 -> 422,
+#    community main 760ffb7e -> OK. (v2.18.0: 028d63d7 vs 3f96c43a.)
+#
+#      SHA           -> ENTERPRISE commit; the tag is pushed here (step 4)
+#      COMMUNITY_SHA -> COMMUNITY commit; the draft --target pins it (step 2)
 VERSION="2.7.8"
 TAG="v${VERSION}"
+
+# Enterprise SHA — what the tag is pushed at.
 git fetch origin main
 SHA=$(git rev-parse origin/main)
-echo "Cutting $TAG at $SHA"
+
+# Community SHA — what the draft --target must pin. Read it from the
+# community repo directly. NEVER derive it with `git rev-parse` in this
+# checkout: that can only ever yield an enterprise commit, which is
+# exactly the 422 above.
+COMMUNITY_SHA=$(gh api repos/terrene-foundation/csq/commits/main --jq '.sha')
+if [ -z "$COMMUNITY_SHA" ]; then
+  echo "::error::Could not read community main SHA. Do NOT proceed —"
+  echo "::error::a draft created with the wrong --target either fails 422"
+  echo "::error::or pins the release to the wrong tree."
+  exit 1
+fi
+
+echo "Cutting $TAG at enterprise $SHA / community $COMMUNITY_SHA"
 
 # 2. Create the draft release pinned to that SHA.
+# --repo is EXPLICIT and load-bearing: release.yml validates the maintainer
+# artifacts against PUBLISH_REPO (terrene-foundation/csq), so a draft created
+# on the enterprise repo — which is what a bare `gh release create` does from
+# this checkout — is invisible to the publish job and fails it closed.
 gh release create "$TAG" \
+  --repo terrene-foundation/csq \
   --draft \
   --title "v${VERSION}" \
   --notes-file "docs/releases/v${VERSION}.md" \
-  --target "$SHA"
+  --target "$COMMUNITY_SHA"
 
-# 3. Upload the three macOS artifacts.
+# 3. Generate both claims using the matching trusted release-oracle source.
+# This checkout must contain the helper at the enterprise SHA captured above.
+# MAIN_BINARY comes from the signed app in steps 1/2, NOT another build's binary.
+[ "$(git rev-parse HEAD)" = "$SHA" ] || { echo 'Use the matching oracle checkout'; exit 1; }
+bash scripts/ci/emit-edition-sidecars.sh "$MAIN_BINARY" \
+  csq-desktop-macos.dmg csq-desktop-macos.app.tar.gz || exit $?
+
+# Upload the three macOS artifacts and both bound edition claims.
 gh release upload "$TAG" \
+  --repo terrene-foundation/csq \
   csq-desktop-macos.dmg \
   csq-desktop-macos.app.tar.gz \
-  csq-desktop-macos.app.tar.gz.sig
+  csq-desktop-macos.app.tar.gz.sig \
+  csq-desktop-macos.dmg.edition \
+  csq-desktop-macos.app.tar.gz.edition
 
 # 3a. MANDATORY regression gate — the upload landed BEFORE the tag push.
 #     The tag push (step 4) triggers the workflow; if the upload silently
@@ -676,7 +757,8 @@ gh release upload "$TAG" \
 set -e
 gh release view "$TAG" --repo terrene-foundation/csq \
   --json assets --jq '.assets[].name' > /tmp/csq-rel-assets.txt
-for f in csq-desktop-macos.dmg csq-desktop-macos.app.tar.gz csq-desktop-macos.app.tar.gz.sig; do
+for f in csq-desktop-macos.dmg csq-desktop-macos.app.tar.gz csq-desktop-macos.app.tar.gz.sig \
+         csq-desktop-macos.dmg.edition csq-desktop-macos.app.tar.gz.edition; do
   grep -qxF "$f" /tmp/csq-rel-assets.txt || {
     echo "::error::$f did NOT land on draft $TAG. Re-run step 3 before"
     echo "::error::pushing the tag — the workflow fails closed if it is"
@@ -685,15 +767,32 @@ for f in csq-desktop-macos.dmg csq-desktop-macos.app.tar.gz csq-desktop-macos.ap
     exit 1
   }
 done
-echo "Upload gate OK: 3 maintainer artifacts on draft $TAG; safe to tag."
+echo "Upload gate OK: 3 maintainer artifacts + 2 edition claims on draft $TAG; safe to tag."
 
 # 4. Push the tag at the SAME SHA — this triggers the Release workflow.
 git tag "$TAG" "$SHA"
 git push origin "$TAG"
 
-# 5. Monitor: the workflow's "Validate maintainer macOS artifacts" step
-#    confirms the three files are present and fails the release otherwise.
-gh run watch --repo terrene-foundation/csq
+# 5. Monitor. The Release workflow runs on THIS repo — the tag push above
+#    is what triggers it, and release.yml lives here.
+#    terrene-foundation/csq is only the PUBLISH TARGET and has no release
+#    workflow of its own (its runs are Test / binding-guard parity /
+#    daemon-twin parity), so watching it reports on unrelated community
+#    CI and never on this cut. Verified 2026-09-06.
+#
+#    NOTE — no `--repo` here, deliberately, and do not add one. Both
+#    commands then resolve to the CURRENT checkout, which is this repo when
+#    you run the runbook, so they are correct without naming it. Naming it
+#    is also not merely redundant: this file is published to the community
+#    tree, where the extraction's leak check 3 blocks the private repo's
+#    org as a private-access marker. Spelling it out here reds the Edition
+#    Seam Gate on every PR (it did, on 2026-09-07).
+#
+#    The run's "Validate maintainer macOS artifacts" step confirms the
+#    five files are present and fails the release otherwise.
+RUN_ID=$(gh run list --workflow release.yml \
+  --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run watch "$RUN_ID" --exit-status
 
 # 6. After the workflow completes, the release is ALREADY un-drafted by
 #    softprops/action-gh-release@v2 (the action's default is draft=false
@@ -701,10 +800,15 @@ gh run watch --repo terrene-foundation/csq
 #    This explicit un-draft is a no-op against the current workflow but
 #    is kept here as a fail-safe in case the workflow's softprops input
 #    is changed to `draft: true` in the future.
-gh release edit "$TAG" --draft=false 2>/dev/null || true
+#    --repo is load-bearing here for the same reason as step 2: the
+#    release object lives on the community repo. Without it this edits
+#    the ENTERPRISE repo, finds no release, and the `|| true` swallows
+#    the error — leaving the fail-safe permanently inert.
+gh release edit "$TAG" --repo terrene-foundation/csq --draft=false \
+  2>/dev/null || true
 ```
 
-(Gap from v2.7.8 cut, an internal journal entry: prior runbook treated step 6 as load-bearing for the §8a verification gate. In practice softprops auto-un-drafts, so §8a checks run post-publish. Recovery if §8a finds an issue: hotfix re-release at the next patch version. The workflow's pre-publish "Validate maintainer macOS artifacts" gate is the only check that fails closed and prevents publish.)
+(Gap from v2.7.8 cut, an internal journal entry: prior runbook treated step 6 as load-bearing for the §8a verification gate. In practice softprops auto-un-drafts, so §8a checks run post-publish. Recovery if §8a finds an issue: hotfix re-release at the next patch version. The workflow's pre-publish "Validate maintainer macOS artifacts" gate and the following license refusal gate fail closed before publish.)
 
 For PRERELEASE tags (`vX.Y.Z-rc.N`, `-alpha.N`, `-beta.N`), the workflow continues to use the ad-hoc-codesign fallback at `.github/workflows/release.yml` and produces the macOS artifacts itself. The maintainer does not need to sign RCs.
 

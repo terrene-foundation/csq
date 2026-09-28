@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod codex;
 pub mod gemini;
 pub mod login_capability;
+pub mod model_manifest;
 pub mod models;
 pub mod native;
 pub mod native_login;

@@ -409,10 +409,10 @@ fn reset_handle_dir_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
 /// edits), `--reset-handle-dir` removes it so the next `csq run` can
 /// re-inject a fresh value.
 ///
-/// Uses atomic_replace + secure_file (§5a cleanup) to ensure the file
+/// Uses atomic_replace + write_new_private (§5a cleanup) to ensure the file
 /// is never left in a half-written state.
 fn reset_handle_dir_gemini(base_dir: &Path, account: AccountNum) -> Result<()> {
-    use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+    use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 
     let gemini_dir = base_dir.join(format!("config-{}", account)).join(".gemini");
     let settings_path = gemini_dir.join("settings.json");
@@ -452,19 +452,14 @@ fn reset_handle_dir_gemini(base_dir: &Path, account: AccountNum) -> Result<()> {
     let updated =
         serde_json::to_string_pretty(&v).context("serialize updated Gemini settings.json")?;
 
-    // §5a atomic write with cleanup on every error branch.
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate std::fs::write + secure_file pair
+    // would leave open.
     let tmp = unique_tmp_path(&settings_path);
-    if let Err(e) = std::fs::write(&tmp, updated.as_bytes()) {
+    if let Err(e) = write_new_private(&tmp, updated.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow!(
             "write Gemini settings tmp {}: {e}",
-            redact_path(&tmp)
-        ));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!(
-            "secure_file Gemini settings tmp {}: {e}",
             redact_path(&tmp)
         ));
     }
@@ -985,6 +980,16 @@ fn handle_codex(
     // restart or periodic reconciliation tick.
     notify_daemon_cache_invalidation(base_dir);
 
+    // Ledger #5: join the new slot to the cross-slot session store. Placed on
+    // the SUCCESS path only, after the identity is minted, and advisory by
+    // construction — `share_after_login` returns a report, never a `Result`,
+    // so a migration problem cannot cost the operator the login they just
+    // completed. See `sessions::share_after_login` for the guard semantics.
+    eprintln!(
+        "{}",
+        super::sessions::share_after_login(base_dir, account, Surface::Codex)
+    );
+
     Ok(())
 }
 
@@ -1235,6 +1240,16 @@ fn handle_native(
     // Symmetric with handle_codex / handle_gemini_oauth — invalidate daemon
     // discovery_cache + refresh-status cache on every successful login surface.
     notify_daemon_cache_invalidation(base_dir);
+
+    // Ledger #5 — same success-path join as handle_codex. Today the kimi/grok
+    // live-writer guard cannot determine liveness, so this reports a SKIP and
+    // migrates nothing; that refusal is correct, and printing it is what stops
+    // it reading as a successful share.
+    eprintln!(
+        "{}",
+        super::sessions::share_after_login(base_dir, account, surface)
+    );
+
     eprintln!(
         "info: slot {account} bound to {} ({}). Run `csq run {account}` to start a session.",
         descriptor.display_name, descriptor.binary
@@ -1247,6 +1262,15 @@ fn handle_native(
 // well-known install paths so Finder-launched apps (the desktop
 // bundle) can find `claude` even when their `$PATH` is the minimal
 // Finder default.
+
+/// Pure diagnostic only: does not open a vault, acquire login locks, or probe.
+#[cfg(unix)]
+fn daemon_login_not_running_reason() -> String {
+    format!(
+        "csq daemon is not running — {}",
+        daemon::recovery::recovery_guidance()
+    )
+}
 
 /// Daemon-delegated paste-code login path (deprecated for CLI).
 ///
@@ -1293,10 +1317,7 @@ fn handle_paste_code(base_dir: &Path, account: AccountNum) -> Result<()> {
             socket_path
         }
         DetectResult::NotRunning => {
-            return Err(anyhow!(
-                "csq daemon is not running — start it with `csq daemon start` \
-                 or install the desktop app so the daemon runs in the background"
-            ));
+            return Err(anyhow!("{}", daemon_login_not_running_reason()));
         }
         DetectResult::Stale { reason } => {
             return Err(anyhow!("csq daemon is stale: {reason}"));
@@ -1470,6 +1491,34 @@ fn parse_login_response(body: &str) -> Result<DaemonLoginRequest> {
 /// an argv. Even so, we pass the URL as a single `arg()` entry, not
 /// via a shell string, so no shell parsing is involved.
 fn open_in_browser(url: &str) -> Result<()> {
+    // NON-INTERACTIVE GUARD (all platforms). Hijacking the operator's browser
+    // is only defensible when there is a human at this terminal to act on the
+    // page. A `csq login --provider codex` run from a script, a CI step, or an
+    // agent session still printed its "press Enter to continue" prompt AND
+    // opened `https://chatgpt.com/#settings/Security` in whatever browser
+    // happened to be frontmost — a prompt nobody can answer plus a stolen
+    // window, repeating on every invocation. Reported by the maintainer
+    // 2026-09-12: "why do you keep triggering [the ChatGPT security settings
+    // page] to pop on my browser?"
+    //
+    // Same predicate as the ToS prompt above (`stdin().is_terminal()` plus the
+    // integration-test bypass), so the two cannot disagree about whether a
+    // session is interactive. The caller's "open it manually" fallback already
+    // prints the URL, so a skipped open loses nothing.
+    //
+    // The Linux block below stays: it answers a DIFFERENT question — whether a
+    // GUI exists at all — and an interactive SSH session has a TTY and no
+    // display.
+    {
+        use std::io::IsTerminal;
+        if !(std::io::stdin().is_terminal() || super::cli::check_test_bypass()) {
+            return Err(anyhow!(
+                "not an interactive terminal — not opening a browser; \
+                 open this URL yourself: {url}"
+            ));
+        }
+    }
+
     // Headless Linux guard: if neither $DISPLAY (X11) nor $WAYLAND_DISPLAY
     // is set, there is no GUI session to deliver a URL to. Skipping the
     // spawn lets the caller's "open this URL manually" fallback fire
@@ -1746,6 +1795,17 @@ fn notify_daemon_cache_invalidation(base_dir: &Path) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_recovery_login_absent_daemon_requires_owner_verification() {
+        let text = daemon_login_not_running_reason();
+        assert!(text.contains("supervisor is unverified"));
+        assert!(text.contains("Only for a confirmed standalone foreground"));
+        assert!(text.contains("restarting the same old binary does not fix"));
+        assert!(!text.contains("daemon stop && csq daemon start"));
+        assert!(!text.contains("or install the desktop app"));
+    }
 
     // ── Daemon paste-code parser regression tests (deprecated path) ──
 

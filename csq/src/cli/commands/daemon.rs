@@ -54,6 +54,12 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
     // clear FIRST, before anything else can observe the sentinel.
     daemon::clear_stop_requested(base_dir);
 
+    // Say this BEFORE blocking in the foreground loop: once we block, the
+    // operator is watching a running daemon and will not see a late warning.
+    if let Some(warning) = unsupervised_start_advisory(launchd_job_is_loaded()) {
+        eprint!("{warning}");
+    }
+
     let pid_path = daemon::pid_file_path(base_dir);
 
     // Acquire PID file; errors if another daemon is already running.
@@ -160,6 +166,167 @@ fn build_daemon_runtime() -> Result<tokio::runtime::Runtime> {
         .context("failed to build tokio runtime for daemon")
 }
 
+/// The `csq audit verify` startup step's per-record duration floor (ms),
+/// measured on an UNLOADED host: `csq audit verify --full` verified an
+/// 11,449-record chain in 2462ms (2026-09, exit 0, clean — "11449 v2
+/// records verified, 0 v1 skipped"). 2462/11449 ≈ 0.215 ms/record. This is
+/// a FLOOR standing in for typical throughput — NOT a bound
+/// (`doc-property-claims.md` MUST-2) — and it EXCLUDES the EATP-chain
+/// reconciliation the daemon startup path runs inside the SAME
+/// `spawn_blocking` (`csq audit verify --full` does not touch the EATP
+/// chain), so the daemon's real per-record cost is this number plus an
+/// unmeasured EATP margin.
+const AUDIT_VERIFY_MS_PER_RECORD_FLOOR: f64 = 0.215;
+
+/// Margin applied to [`AUDIT_VERIFY_MS_PER_RECORD_FLOOR`] to size the
+/// DEFAULT verify timeout. ~7x the measured unloaded floor.
+///
+/// The margin is INFERENCE, not a direct measurement of the loaded case
+/// (`evidence-first-claims.md` MUST-4): the only two loaded data points on
+/// THIS code path are "5s (the old fixed default) was insufficient under
+/// host load ~100-190" and "30s (an operator override of
+/// `CSQ_AUDIT_VERIFY_TIMEOUT_SECS`) was sufficient" — a coarse bracket,
+/// not the tight healthy/dead pair `HEALTH_TIMEOUT` had. Absent a tight
+/// bracket for this code path, the corroborating evidence is
+/// `HEALTH_TIMEOUT`'s independently measured ~20x slowdown for a
+/// near-zero-cost health read under a comparable load
+/// (`csq-core/src/daemon/detect.rs`); 7x is deliberately SMALLER than
+/// that because audit verify is CPU-bound crypto work, whose throughput
+/// degrades under scheduling contention differently than an IO-wait
+/// latency spike does — the two are not the same mechanism, so
+/// borrowing the multiplier directly would overstate the case.
+const AUDIT_VERIFY_LOAD_MARGIN: f64 = 7.0;
+
+/// Absolute floor for the derived timeout — covers fixed per-run overhead
+/// (process/tokio-task spin-up, the EATP-chain check) on a chain too
+/// small for the per-record term to dominate. Equal to the ORIGINAL fixed
+/// default, which was adequate for small/fresh chains; only a LARGE chain
+/// under load exposed the insufficiency this constant no longer has to
+/// cover alone.
+const AUDIT_VERIFY_TIMEOUT_MIN_SECS: u64 = 5;
+
+/// Absolute ceiling for the derived timeout, independent of how large an
+/// operator sets `CSQ_AUDIT_VERIFY_LIMIT`. `csq daemon start` blocks on
+/// this step before binding its IPC socket — spec 12 §12.13.5's "never
+/// blocks daemon startup" governs the OUTCOME (every result maps to an
+/// `AuditHealth` and startup proceeds), not how long the outcome takes to
+/// arrive. An unbounded formula would let a large record-limit override
+/// turn a genuinely broken chain into a multi-minute "is the daemon even
+/// starting?" hang. An operator who needs longer than this for a real
+/// (not-hung) verify at their configured limit can still set
+/// `CSQ_AUDIT_VERIFY_TIMEOUT_SECS` explicitly — the explicit override
+/// always takes full precedence over this formula.
+const AUDIT_VERIFY_TIMEOUT_MAX_SECS: u64 = 60;
+
+/// Bounded attempt count for [`spawn_audit_verify_retry`]'s background
+/// retry after a startup `AuditHealth::Unknown` verdict.
+///
+/// UNRESOLVED-pending-measurement: no representative-host-load timing data
+/// exists for how many attempts a transient overload needs to clear. The
+/// one live incident that motivated this retry (a 40s startup timeout that
+/// left the audit subsystem fail-closed for 2h08m, cleared only by a
+/// restart) ran its host at load 165-256 for the ENTIRE window, so no
+/// measurement taken from it can separate "the chain verify is slow" from
+/// "the machine is saturated" (`instrument-discipline.md` MUST-1) — the
+/// data this constant would ideally be derived from does not exist. `5` is
+/// a conservative round number bounding worst-case retry duration and log
+/// volume; it is NOT a measured pass/fail boundary the way
+/// [`derive_audit_verify_timeout_secs`] is. Override via
+/// `CSQ_AUDIT_VERIFY_RETRY_MAX_ATTEMPTS` without a rebuild once real
+/// under-load timing data exists.
+const AUDIT_VERIFY_RETRY_MAX_ATTEMPTS: u32 = 5;
+
+/// Ceiling on the exponential backoff between retry attempts
+/// ([`audit_verify_retry_backoff_secs`]).
+///
+/// Also UNRESOLVED-pending-measurement in the sense above — chosen only to
+/// bound the worst case (attempt 5 would otherwise wait 16 * 2^4 = 256s at
+/// the default timeout, which this constant does not even need to clamp
+/// yet; it exists so a large `CSQ_AUDIT_VERIFY_LIMIT` override cannot turn
+/// the backoff schedule into an hours-long wait between attempts).
+const AUDIT_VERIFY_RETRY_BACKOFF_MAX_SECS: u64 = 600;
+
+/// Backoff before retry attempt `attempt` (0-indexed), in seconds.
+///
+/// Derived, not fabricated: rather than guessing a wait time (the timing
+/// data to derive one does not exist — see
+/// [`AUDIT_VERIFY_RETRY_MAX_ATTEMPTS`]'s doc), the base is pinned to the
+/// SAME already-justified quantity the verify attempt itself was budgeted
+/// against: `verify_timeout_secs`, this run's
+/// [`derive_audit_verify_timeout_secs`] output (or its explicit
+/// `CSQ_AUDIT_VERIFY_TIMEOUT_SECS` override). A verify that just timed out
+/// at its own budget is not worth re-running before at least that much
+/// time has passed again, doubling on each subsequent attempt, clamped at
+/// [`AUDIT_VERIFY_RETRY_BACKOFF_MAX_SECS`].
+fn audit_verify_retry_backoff_secs(attempt: u32, verify_timeout_secs: u64) -> u64 {
+    let shift = attempt.min(10); // guards the left-shift against overflow
+    verify_timeout_secs
+        .saturating_mul(1u64 << shift)
+        .min(AUDIT_VERIFY_RETRY_BACKOFF_MAX_SECS)
+}
+
+/// Derives the DEFAULT audit-verify startup timeout from the CONFIGURED
+/// `record_limit` — never from the actual (unknown-until-verified) chain
+/// length, and never from a fixed constant alone.
+///
+/// # Why `record_limit` is the right lever, and why its OWN default (10,000) stays unchanged
+///
+/// `record_limit` is a hard CAP on the verifier's work (`VerifyConfig`,
+/// `csq-core/src/audit/verify.rs`) — the verify task never processes more
+/// than `record_limit` records regardless of how long the chain actually
+/// is. Sizing the timeout off this cap, rather than off the specific
+/// 11,449-record chain that motivated this change, keeps the
+/// relationship correct as chains grow past whatever number happened to
+/// be measured today.
+///
+/// `record_limit`'s own default (10,000) is left UNCHANGED here — it is a
+/// separate, spec-anchored design decision ("spec 12 §12.13 — sufficient
+/// for 30 days of daily csq use", `csq-core/src/audit/verify.rs`
+/// `VerifyConfig::default`), not the cause of the timeout defect this
+/// function fixes: the timeout was too tight FOR THAT SAME 10,000-record
+/// cap under load, independent of whether 10,000 is the right number for
+/// coverage. Changing a spec-anchored default belongs in its own change,
+/// not folded into a timeout-sizing fix.
+///
+/// # Should a timeout (`AuditHealth::Unknown`) really disable the audit subsystem?
+///
+/// Considered and left AS-IS: `AuditHealth::Unknown` and `AuditHealth::Broken`
+/// are reported as DISTINCT variants at every operator surface (daemon
+/// log, `csq doctor`, `csq daemon status` — see `health.rs`'s per-arm
+/// logging), so "could not verify" is never silently relabeled "verified
+/// broken" — the three-way distinction `durable-instruments.md` MUST-2
+/// requires is intact at the REPORTING layer. `is_operational()` folding
+/// Unknown into the same "reject new writes" bucket as Broken is a
+/// separate, narrower question — a WRITE-GATING decision on a
+/// security-bearing path — and there the fail-closed answer is correct:
+/// per `guard-reader-writer-parity.md` MUST-2, an unreadable/unclassifiable
+/// guard input on a destructive or security-bearing path fails CLOSED, and
+/// appending new signed records onto a chain of UNKNOWN integrity is
+/// exactly that path.
+///
+/// # Derivation
+///
+/// `ceil(record_limit * AUDIT_VERIFY_MS_PER_RECORD_FLOOR *
+/// AUDIT_VERIFY_LOAD_MARGIN / 1000)`, clamped to
+/// `[AUDIT_VERIFY_TIMEOUT_MIN_SECS, AUDIT_VERIFY_TIMEOUT_MAX_SECS]`.
+///
+/// At the default `record_limit` of 10,000 this yields **16s**
+/// (`ceil(10_000 * 0.215 * 7.0 / 1000) = ceil(15.05) = 16`) — just over 3x
+/// the old fixed 5s default (which measurably failed under load on an
+/// 11,449-record chain) and just over half the 30s an operator found
+/// sufficient at a HIGHER `record_limit` override. That 30s data point
+/// does not bound this function's correctness at record_limit=10,000: the
+/// operator's actual chain (11,449 records) fell well inside their raised
+/// cap, so their 30s run was never driven by anywhere near their
+/// configured limit's worth of work. Both known data points sit outside
+/// this function's derived value with margin, in the direction that
+/// matters (above the known-insufficient 5s).
+pub(crate) fn derive_audit_verify_timeout_secs(record_limit: usize) -> u64 {
+    let ms = record_limit as f64 * AUDIT_VERIFY_MS_PER_RECORD_FLOOR * AUDIT_VERIFY_LOAD_MARGIN;
+    let secs = (ms / 1000.0).ceil() as u64;
+    secs.clamp(AUDIT_VERIFY_TIMEOUT_MIN_SECS, AUDIT_VERIFY_TIMEOUT_MAX_SECS)
+}
+
 /// One full run of the standalone csq daemon: license gate, bind the IPC
 /// transport, spawn every subsystem (refresher, usage poller, auto-rotate,
 /// CRL refresher, ledger writer, log GC, anchor, server), then block until
@@ -172,10 +339,441 @@ fn build_daemon_runtime() -> Result<tokio::runtime::Runtime> {
 ///
 /// MUST NOT acquire the PidFile — the caller owns it (foreground:
 /// [`handle_start`]; supervised: the `run_forever` loop).
+/// Runs one audit-chain verify attempt (op-chain full verify + the EATP
+/// side-pass) and returns the resulting `AuditHealth` + `records_unverified`,
+/// having also applied the `.chain-broken` sentinel side effects for that
+/// outcome. Used for BOTH the blocking startup call in [`run_daemon_session`]
+/// and each bounded background retry in [`spawn_audit_verify_retry`] after a
+/// startup `Unknown` -- the two callers differ only in WHEN they call this
+/// and what they do with an `Unknown` result (startup proceeds to socket
+/// bind regardless per spec 12 Section 12.13.5; a retry schedules another
+/// attempt or gives up). The verify logic, timeout derivation, and sentinel
+/// semantics are identical either way -- duplicating them is exactly the
+/// risk a retry path would otherwise reintroduce.
+async fn attempt_audit_verify(base_dir: &Path) -> (csq_core::audit::AuditHealth, u64) {
+    let record_limit: usize = std::env::var("CSQ_AUDIT_VERIFY_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    // FIX-5b: clamp timeout floor to 1s so CSQ_AUDIT_VERIFY_TIMEOUT_SECS=0
+    // (or an unparseable value) cannot silently suppress verification.
+    // Absent an explicit override, the default scales with the
+    // CONFIGURED record_limit — see `derive_audit_verify_timeout_secs`.
+    let timeout_secs: u64 = std::env::var("CSQ_AUDIT_VERIFY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or_else(|| derive_audit_verify_timeout_secs(record_limit));
+    let verify_cfg = csq_core::audit::VerifyConfig {
+        record_limit,
+        keychain_service: csq_core::audit::AUDIT_SIGNING_SERVICE_NAME.to_string(),
+    };
+    let base_for_verify = base_dir.to_path_buf();
+    let verify_future = tokio::task::spawn_blocking(move || {
+        // M3 §10.5 (W2a): reconcile the born-canonical EATP attestation
+        // chain's own `.chain-broken` sentinel inside the SAME
+        // spawn_blocking so the startup timeout covers both chains. Side
+        // pass — the EATP chain does not gate daemon startup (the op-chain
+        // result below is the authority). Inert until the EATP chain
+        // exists (`verify_chain_in` returns Ok(default) for absent
+        // `eatp-runs/`).
+        let eatp = csq_core::audit::verify_chain_in(
+            &base_for_verify,
+            &verify_cfg,
+            None,
+            csq_core::audit::ChainKind::Eatp,
+        );
+        csq_core::audit::reconcile_chain_sentinel(
+            &base_for_verify,
+            csq_core::audit::ChainKind::Eatp.runs_subdir(),
+            &eatp,
+        );
+        csq_core::audit::verify_chain(&base_for_verify, &verify_cfg, None)
+    });
+    // Set by the two Ok(Ok(Ok(summary))) arms below from
+    // `summary.limit_exceeded_count` — the count of oldest records
+    // (possibly including the genesis) the verifier SKIPPED because
+    // the chain exceeded `record_limit`. Zero for every other arm:
+    // Broken/Unknown never produced a summary to read the count from.
+    let mut records_unverified: u64 = 0;
+    let health = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        verify_future,
+    )
+    .await
+    {
+        // ── Verified / TailVerified / Degraded ──────────────────
+        //
+        // SINGLE PRODUCER. `AuditHealth::from_verify_result` owns the
+        // summary→verdict mapping for EVERY surface that reports audit
+        // health: `csq doctor --json`, `csq audit verify --json`, and —
+        // through the startup snapshot this function returns, which
+        // `daemon::server`'s `/api/audit/health` handler serves verbatim —
+        // `csq daemon status`.
+        //
+        // These two arms previously built `AuditHealth::Verified` by hand
+        // and never consulted `limit_exceeded_count`. So when 1a1d6976
+        // taught `from_verify_result` to return `TailVerified` on a
+        // truncated scan, the other two surfaces learned the distinction
+        // and THIS one did not: on the same chain, `csq doctor --json`
+        // said `tail_verified` while `GET /api/audit/health` still said
+        // `verified`. Adding a variant forces CONSUMERS to handle it
+        // (that is what the five match sites in 1a1d6976 were); it cannot
+        // make a hand-rolled PRODUCER emit it —
+        // `guard-reader-writer-parity.md` MUST NOT #2.
+        Ok(Ok(Ok(summary))) => {
+            records_unverified = summary.limit_exceeded_count;
+            let verified_count = summary.verified_count;
+            let health = csq_core::audit::AuditHealth::from_verify_result(&Ok(summary));
+            match &health {
+                csq_core::audit::AuditHealth::Verified => {
+                    tracing::info!(
+                        verified_count,
+                        records_unverified,
+                        "audit chain verified clean; proceeding to socket bind"
+                    );
+                }
+                csq_core::audit::AuditHealth::TailVerified { skipped } => {
+                    tracing::warn!(
+                        audit_verify_tail_only = true,
+                        verified_count,
+                        skipped = *skipped,
+                        "audit chain TAIL-VERIFIED — the {skipped} oldest record(s), \
+                         INCLUDING the genesis, were NOT scanned, so the surviving \
+                         window's first record is anchored to nothing. Proceeding to \
+                         socket bind; the audit subsystem stays operational. Raise \
+                         CSQ_AUDIT_VERIFY_LIMIT above the chain length for whole-chain \
+                         coverage."
+                    );
+                }
+                csq_core::audit::AuditHealth::Degraded { gaps } => {
+                    for gap in gaps {
+                        tracing::warn!(
+                            audit_verify_historical_key_gap = true,
+                            key_id = gap.key_id.as_str(),
+                            first_seq = gap.first_seq,
+                            last_seq = gap.last_seq,
+                            count = gap.count,
+                            "audit chain: historical signing key absent from keychain — \
+                             signature verification degraded for this key's records; \
+                             chain-linking verified end-to-end"
+                        );
+                    }
+                    tracing::warn!(
+                        gap_count = gaps.len(),
+                        "audit chain DEGRADED (historical-key gaps); proceeding to socket \
+                         bind — audit subsystem remains operational"
+                    );
+                }
+                // Unreachable by construction: `from_verify_result` maps an
+                // `Ok(summary)` to Verified / TailVerified / Degraded only —
+                // the error verdicts come from the `Err` arm below. Enumerated
+                // rather than wildcarded so a future variant still forces a
+                // decision at this call site.
+                csq_core::audit::AuditHealth::Broken { .. }
+                | csq_core::audit::AuditHealth::Unknown { .. } => {
+                    tracing::warn!(
+                        error_kind = "audit_verify_verdict_unexpected",
+                        "audit verify mapped a clean summary to an error verdict"
+                    );
+                }
+            }
+            health
+        }
+
+        // ── LedgerError: Broken (fatal) OR Unknown (transient) ────
+        // KeychainUnavailable (a transient keychain ACCESS error) maps
+        // to Unknown, NOT Broken — surface it as DEFERRED, not BROKEN,
+        // and do not fabricate an integrity-failure tag.
+        Ok(Ok(Err(ref e))) => {
+            let health = csq_core::audit::AuditHealth::from_ledger_error(e);
+            match &health {
+                csq_core::audit::AuditHealth::Unknown { reason } => {
+                    tracing::error!(
+                        error_kind = reason.as_str(),
+                        "audit chain verify could not read the signing key \
+                                 (keychain locked / access-denied) — audit subsystem \
+                                 fail-closed this run; token-refresh and quota-polling \
+                                 continue. Run `csq audit migrate-keys` to make the key \
+                                 daemon-readable."
+                    );
+                    eprintln!(
+                        "csq daemon: AUDIT VERIFY DEFERRED — the signing key is \
+present but the keychain could not be read (locked / access-denied). The chain is NOT \
+broken. Token-refresh and quota-polling are unaffected; audit anchoring/emit are disabled \
+this run. Run `csq audit migrate-keys` to make the key daemon-readable."
+                    );
+                }
+                _ => {
+                    let error_kind =
+                        if let csq_core::audit::AuditHealth::Broken { ref error_kind, .. } = health
+                        {
+                            error_kind.clone()
+                        } else {
+                            "audit_chain_integrity_failure".to_string()
+                        };
+                    tracing::error!(
+                        error_kind = error_kind.as_str(),
+                        "audit chain BROKEN — audit subsystem will fail-closed; \
+                                 token-refresh and quota-polling continue normally. \
+                                 Run `csq audit verify --full` for diagnosis."
+                    );
+                    eprintln!(
+                        "csq daemon: AUDIT CHAIN BROKEN ({error_kind}). \
+Token-refresh and quota-polling are unaffected. \
+Audit anchoring and new audit-record emits are disabled until the chain is repaired. \
+Run `csq audit verify --full` for diagnosis."
+                    );
+                }
+            }
+            health
+        }
+
+        // ── Task panicked ────────────────────────────────────────
+        // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
+        Ok(Err(join_err)) => {
+            tracing::error!(
+                        error_kind = "audit_verify_task_panicked",
+                        "audit verify task panicked: {join_err} — \
+                         could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
+                    );
+            eprintln!(
+                "csq daemon: AUDIT VERIFY TASK PANICKED. \
+Could not confirm chain soundness this attempt. Audit anchoring and new audit-record \
+emits are disabled until a verify attempt succeeds. `csq audit verify --full` reports whether \
+the chain itself is sound, but running it does NOT change this daemon's gate -- only a later \
+successful verify (the daemon's own bounded background retry, or a `csq daemon` restart) does."
+            );
+            csq_core::audit::AuditHealth::Unknown {
+                reason: "audit_verify_task_panicked".to_string(),
+            }
+        }
+
+        // ── Timeout ───────────────────────────────────────────────
+        // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
+        Err(_timeout) => {
+            tracing::error!(
+                        error_kind = "audit_verify_timeout",
+                        timeout_secs = timeout_secs,
+                        "audit chain verify timed out after {timeout_secs}s — \
+                         could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
+                    );
+            eprintln!(
+                "csq daemon: AUDIT VERIFY TIMED OUT after {timeout_secs}s. \
+Could not confirm chain soundness this attempt. Audit anchoring and new audit-record \
+emits are disabled until a verify attempt succeeds. `csq audit verify --full` reports whether \
+the chain itself is sound, but running it does NOT change this daemon's gate -- only a later \
+successful verify (the daemon's own bounded background retry, or a `csq daemon` restart) does."
+            );
+            csq_core::audit::AuditHealth::Unknown {
+                reason: "audit_verify_timeout".to_string(),
+            }
+        }
+    };
+
+    // FIX-1/FIX-2: set or clear the .chain-broken sentinel so
+    // CLI-side writers (op_emit, rotate, anchor) are also gated.
+    // FIX-2: Unknown (timeout/panic) leaves the sentinel UNCHANGED —
+    // a transient verify failure must not produce a durable write-lockout.
+    // Only Broken (a real LedgerError) sets the sentinel.
+    match &health {
+        // TailVerified clears alongside Verified/Degraded — outgrowing the
+        // record limit is not brokenness. Coverage is reported separately.
+        csq_core::audit::AuditHealth::Verified
+        | csq_core::audit::AuditHealth::TailVerified { .. }
+        | csq_core::audit::AuditHealth::Degraded { .. } => {
+            csq_core::audit::clear_chain_broken(base_dir);
+        }
+        csq_core::audit::AuditHealth::Broken { error_kind, .. } => {
+            csq_core::audit::set_chain_broken(base_dir, error_kind);
+        }
+        csq_core::audit::AuditHealth::Unknown { .. } => {
+            // Transient condition — do not set a durable sentinel.
+            // The in-RAM audit_health still gates daemon emit/anchor.
+        }
+    }
+
+    (health, records_unverified)
+}
+
+/// Bounded background retry for a startup `AuditHealth::Unknown` verdict.
+///
+/// Returns `None` when `startup_health` is already operational (nothing to
+/// retry). Otherwise spawns a task that retries [`attempt_audit_verify`] on
+/// an exponential backoff ([`audit_verify_retry_backoff_secs`]), up to
+/// [`AUDIT_VERIFY_RETRY_MAX_ATTEMPTS`] (env-overridable via
+/// `CSQ_AUDIT_VERIFY_RETRY_MAX_ATTEMPTS`), and PROMOTES `shared` in place —
+/// via the [`csq_core::audit::SharedAuditHealth`] lock — the first time an
+/// attempt returns Verified or Degraded. Every live handler reads `shared`
+/// fresh per request, so promotion re-arms the audit subsystem (emit +
+/// mcp-gate + anchor-request routes) on the very next request with no
+/// daemon restart, per `crate::audit::health`'s module doc.
+///
+/// On promotion, if an anchor sink is configured and the anchor task was
+/// never started at daemon startup (it is skipped precisely when health is
+/// not operational — see the M14 anchor-task spawn site above), this also
+/// starts it. There is no separate registration path back into
+/// `run_daemon_session`'s `subsystems` vec for a task spawned after that
+/// vec is built, so this function's own returned task holds the anchor
+/// task's `JoinHandle` itself and stays alive until `shutdown` fires —
+/// satisfying the CONTRACT (an internal ticket redteam LOW-1) that every tracked
+/// subsystem idle-loops on `shutdown` rather than returning early: an early
+/// return here (with the anchor task still running) would both read as a
+/// spurious daemon-session fault AND detach the anchor task from the
+/// session's shutdown drain.
+///
+/// If the retry budget is exhausted without a definitive result,
+/// `audit_health` stays `Unknown` permanently for the rest of this daemon
+/// process's life — recoverable only by a `csq daemon` restart, or by a
+/// `csq audit verify` / `csq doctor` run (those affect the `.chain-broken`
+/// sentinel other writers gate on, but do NOT reach back into this
+/// already-running daemon's in-RAM `audit_health`).
+fn spawn_audit_verify_retry(
+    startup_health: &csq_core::audit::AuditHealth,
+    base_dir: PathBuf,
+    shared: csq_core::audit::SharedAuditHealth,
+    anchor_sink: Option<Arc<dyn csq_core::audit::LedgerSink>>,
+    anchor_sink_cfg: csq_core::audit::AuditSinkConfig,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Option<daemon::supervise::Subsystem> {
+    if startup_health.is_operational() {
+        return None;
+    }
+
+    let max_attempts: u32 = std::env::var("CSQ_AUDIT_VERIFY_RETRY_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &u32| *v > 0)
+        .unwrap_or(AUDIT_VERIFY_RETRY_MAX_ATTEMPTS);
+
+    let join = tokio::spawn(async move {
+        let mut anchor_join: Option<tokio::task::JoinHandle<()>> = None;
+
+        for attempt in 0..max_attempts {
+            // Re-derive the verify budget each attempt so an operator env
+            // change between attempts takes effect the same as it would on
+            // a fresh restart.
+            let record_limit: usize = std::env::var("CSQ_AUDIT_VERIFY_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000);
+            let verify_timeout_secs: u64 = std::env::var("CSQ_AUDIT_VERIFY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|v| v.max(1))
+                .unwrap_or_else(|| derive_audit_verify_timeout_secs(record_limit));
+            let backoff = audit_verify_retry_backoff_secs(attempt, verify_timeout_secs);
+
+            tracing::info!(
+                attempt = attempt + 1,
+                max_attempts,
+                backoff_secs = backoff,
+                "audit verify background retry: waiting before next attempt"
+            );
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
+            }
+            if shutdown.is_cancelled() {
+                return;
+            }
+
+            let (new_health, records_unverified) = attempt_audit_verify(&base_dir).await;
+            let operational = new_health.is_operational();
+            tracing::info!(
+                attempt = attempt + 1,
+                max_attempts,
+                operational,
+                records_unverified,
+                "audit verify background retry attempt completed"
+            );
+
+            if operational {
+                {
+                    let mut guard = shared.write().expect("audit health lock poisoned");
+                    *guard = new_health.clone();
+                }
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    "audit health PROMOTED out of Unknown by background retry — audit \
+                     subsystem (anchoring + record emit) is re-armed WITHOUT a daemon \
+                     restart"
+                );
+                eprintln!(
+                    "csq daemon: AUDIT HEALTH RESTORED after {} background retry \
+attempt(s). Audit anchoring and audit-record emits are re-enabled; no restart was \
+needed.",
+                    attempt + 1
+                );
+
+                if let Some(sink) = anchor_sink.clone() {
+                    anchor_join = daemon::spawn_anchor_task(
+                        base_dir.clone(),
+                        anchor_sink_cfg.clone(),
+                        sink,
+                        shutdown.clone(),
+                    )
+                    .map(|h| h.join);
+                    if anchor_join.is_some() {
+                        tracing::info!(
+                            "audit anchor task started post-promotion (was skipped at \
+                             daemon startup because the chain was not yet operational)"
+                        );
+                    }
+                }
+                break;
+            }
+
+            if attempt + 1 == max_attempts {
+                tracing::error!(
+                    error_kind = "audit_verify_retry_exhausted",
+                    max_attempts,
+                    "audit verify background retry EXHAUSTED its bounded attempt budget \
+                     without a definitive result — audit_health remains Unknown; the \
+                     audit subsystem stays fail-closed until a `csq daemon` restart"
+                );
+                eprintln!(
+                    "csq daemon: AUDIT VERIFY RETRY EXHAUSTED after {max_attempts} \
+attempts without a definitive result. Audit anchoring and audit-record emits remain \
+disabled. Restart `csq daemon` to re-attempt from a clean process, or run `csq audit \
+verify --full` / `csq doctor` to check whether the chain itself is sound (neither \
+changes this daemon's in-RAM gate — only a restart or a later successful background \
+retry does)."
+                );
+            }
+        }
+
+        // CONTRACT (an internal ticket redteam LOW-1): never return before `shutdown` fires.
+        // An early return here reads as a subsystem fault (restarts the whole
+        // daemon session) and, if `anchor_join` is `Some`, detaches the anchor
+        // task's handle from the session's shutdown drain while the task itself
+        // keeps running undrained. Whether promotion succeeded, failed, or the
+        // anchor task is now the thing keeping this alive, idle on shutdown.
+        match anchor_join {
+            Some(handle) => {
+                if let Err(e) = handle.await {
+                    tracing::error!(
+                        error_kind = "audit_anchor_task_panicked_post_promotion",
+                        "audit anchor task (started post-promotion) exited: {e}"
+                    );
+                }
+            }
+            None => shutdown.cancelled().await,
+        }
+    });
+
+    Some(("audit_verify_retry", join))
+}
+
 async fn run_daemon_session(
     base_dir: PathBuf,
     cancel: tokio_util::sync::CancellationToken,
 ) -> std::result::Result<(), String> {
+    // `keychain-fix-r11.md` S-LOW-3: install the redacting panic hook before
+    // any subsystem starts. Idempotent (`std::sync::Once`) so the supervised
+    // loop's in-process session restarts never stack a second hook.
+    daemon::panic_hook::install();
+
     // Enterprise license gate for the daemon-hosted governance / audit /
     // EATP stack (task #77 shard 3). STARTUP variant (structural validity +
     // definitive revocation, no liveness deny) so a licensed-but-offline-
@@ -294,195 +892,28 @@ async fn run_daemon_session(
         // itself (a broken chain is already written) and it collaterally
         // took down refresh + polling — both unrelated to audit integrity.
         //
-        // The verify step is wrapped in a `tokio::time::timeout` (default
-        // 5s, configurable). On timeout: `AuditHealth::Unknown` with
-        // reason "audit_verify_timeout" — audit subsystem fails closed.
-        let audit_health: csq_core::audit::AuditHealth = {
-            // FIX-5b: clamp timeout floor to 1s so CSQ_AUDIT_VERIFY_TIMEOUT_SECS=0
-            // (or an unparseable value) cannot silently suppress verification.
-            let timeout_secs: u64 = std::env::var("CSQ_AUDIT_VERIFY_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|v| v.max(1))
-                .unwrap_or(5);
-            let record_limit: usize = std::env::var("CSQ_AUDIT_VERIFY_LIMIT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10_000);
-            let verify_cfg = csq_core::audit::VerifyConfig {
-                record_limit,
-                keychain_service: csq_core::audit::AUDIT_SIGNING_SERVICE_NAME.to_string(),
-            };
-            let base_for_verify = base_dir_for_runtime.clone();
-            let verify_future = tokio::task::spawn_blocking(move || {
-                // M3 §10.5 (W2a): reconcile the born-canonical EATP attestation
-                // chain's own `.chain-broken` sentinel inside the SAME
-                // spawn_blocking so the startup timeout covers both chains. Side
-                // pass — the EATP chain does not gate daemon startup (the op-chain
-                // result below is the authority). Inert until the EATP chain
-                // exists (`verify_chain_in` returns Ok(default) for absent
-                // `eatp-runs/`).
-                let eatp = csq_core::audit::verify_chain_in(
-                    &base_for_verify,
-                    &verify_cfg,
-                    None,
-                    csq_core::audit::ChainKind::Eatp,
-                );
-                csq_core::audit::reconcile_chain_sentinel(
-                    &base_for_verify,
-                    csq_core::audit::ChainKind::Eatp.runs_subdir(),
-                    &eatp,
-                );
-                csq_core::audit::verify_chain(&base_for_verify, &verify_cfg, None)
-            });
-            let health = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                verify_future,
-            )
-            .await
-            {
-                // ── Clean: all records sig-verified ─────────────────────
-                Ok(Ok(Ok(summary))) if summary.historical_key_gaps.is_empty() => {
-                    tracing::info!(
-                        verified_count = summary.verified_count,
-                        "audit chain verified clean; proceeding to socket bind"
-                    );
-                    csq_core::audit::AuditHealth::Verified
-                }
+        // The verify step is wrapped in a `tokio::time::timeout` — default
+        // sized by `derive_audit_verify_timeout_secs` from the configured
+        // record_limit (16s at the 10,000-record default; see that
+        // function's doc for the measured floor + margin it rests on),
+        // explicit-override-able via `CSQ_AUDIT_VERIFY_TIMEOUT_SECS`. On
+        // timeout: `AuditHealth::Unknown` with reason
+        // "audit_verify_timeout" — audit subsystem fails closed.
 
-                // ── Degraded: historical-key gaps (Option B) ─────────────
-                Ok(Ok(Ok(summary))) => {
-                    for gap in &summary.historical_key_gaps {
-                        tracing::warn!(
-                            audit_verify_historical_key_gap = true,
-                            key_id = gap.key_id.as_str(),
-                            first_seq = gap.first_seq,
-                            last_seq = gap.last_seq,
-                            count = gap.count,
-                            "audit chain: historical signing key absent from keychain — \
-                                 signature verification degraded for this key's records; \
-                                 chain-linking verified end-to-end"
-                        );
-                    }
-                    tracing::warn!(
-                        gap_count = summary.historical_key_gaps.len(),
-                        "audit chain DEGRADED (historical-key gaps); proceeding to socket \
-                             bind — audit subsystem remains operational"
-                    );
-                    csq_core::audit::AuditHealth::Degraded {
-                        gaps: summary.historical_key_gaps,
-                    }
-                }
+        let (audit_health, audit_records_unverified) =
+            attempt_audit_verify(&base_dir_for_runtime).await;
 
-                // ── LedgerError: Broken (fatal) OR Unknown (transient) ────
-                // KeychainUnavailable (a transient keychain ACCESS error) maps
-                // to Unknown, NOT Broken — surface it as DEFERRED, not BROKEN,
-                // and do not fabricate an integrity-failure tag.
-                Ok(Ok(Err(ref e))) => {
-                    let health = csq_core::audit::AuditHealth::from_ledger_error(e);
-                    match &health {
-                        csq_core::audit::AuditHealth::Unknown { reason } => {
-                            tracing::error!(
-                                error_kind = reason.as_str(),
-                                "audit chain verify could not read the signing key \
-                                     (keychain locked / access-denied) — audit subsystem \
-                                     fail-closed this run; token-refresh and quota-polling \
-                                     continue. Run `csq audit migrate-keys` to make the key \
-                                     daemon-readable."
-                            );
-                            eprintln!(
-                                "csq daemon: AUDIT VERIFY DEFERRED — the signing key is \
-present but the keychain could not be read (locked / access-denied). The chain is NOT \
-broken. Token-refresh and quota-polling are unaffected; audit anchoring/emit are disabled \
-this run. Run `csq audit migrate-keys` to make the key daemon-readable."
-                            );
-                        }
-                        _ => {
-                            let error_kind = if let csq_core::audit::AuditHealth::Broken {
-                                ref error_kind,
-                                ..
-                            } = health
-                            {
-                                error_kind.clone()
-                            } else {
-                                "audit_chain_integrity_failure".to_string()
-                            };
-                            tracing::error!(
-                                error_kind = error_kind.as_str(),
-                                "audit chain BROKEN — audit subsystem will fail-closed; \
-                                     token-refresh and quota-polling continue normally. \
-                                     Run `csq audit verify --full` for diagnosis."
-                            );
-                            eprintln!(
-                                "csq daemon: AUDIT CHAIN BROKEN ({error_kind}). \
-Token-refresh and quota-polling are unaffected. \
-Audit anchoring and new audit-record emits are disabled until the chain is repaired. \
-Run `csq audit verify --full` for diagnosis."
-                            );
-                        }
-                    }
-                    health
-                }
-
-                // ── Task panicked ────────────────────────────────────────
-                // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
-                Ok(Err(join_err)) => {
-                    tracing::error!(
-                            error_kind = "audit_verify_task_panicked",
-                            "audit verify task panicked: {join_err} — \
-                             could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
-                        );
-                    eprintln!(
-                        "csq daemon: AUDIT VERIFY TASK PANICKED. \
-Could not confirm chain soundness. Audit anchoring and new audit-record emits are disabled. \
-Run `csq audit verify --full` for diagnosis."
-                    );
-                    csq_core::audit::AuditHealth::Unknown {
-                        reason: "audit_verify_task_panicked".to_string(),
-                    }
-                }
-
-                // ── Timeout ───────────────────────────────────────────────
-                // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
-                Err(_timeout) => {
-                    tracing::error!(
-                            error_kind = "audit_verify_timeout",
-                            timeout_secs = timeout_secs,
-                            "audit chain verify timed out after {timeout_secs}s — \
-                             could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
-                        );
-                    eprintln!(
-                        "csq daemon: AUDIT VERIFY TIMED OUT after {timeout_secs}s. \
-Could not confirm chain soundness. Audit anchoring and new audit-record emits are disabled. \
-Run `csq audit verify --full` for diagnosis."
-                    );
-                    csq_core::audit::AuditHealth::Unknown {
-                        reason: "audit_verify_timeout".to_string(),
-                    }
-                }
-            };
-
-            // FIX-1/FIX-2: set or clear the .chain-broken sentinel so
-            // CLI-side writers (op_emit, rotate, anchor) are also gated.
-            // FIX-2: Unknown (timeout/panic) leaves the sentinel UNCHANGED —
-            // a transient verify failure must not produce a durable write-lockout.
-            // Only Broken (a real LedgerError) sets the sentinel.
-            match &health {
-                csq_core::audit::AuditHealth::Verified
-                | csq_core::audit::AuditHealth::Degraded { .. } => {
-                    csq_core::audit::clear_chain_broken(&base_dir_for_runtime);
-                }
-                csq_core::audit::AuditHealth::Broken { error_kind, .. } => {
-                    csq_core::audit::set_chain_broken(&base_dir_for_runtime, error_kind);
-                }
-                csq_core::audit::AuditHealth::Unknown { .. } => {
-                    // Transient condition — do not set a durable sentinel.
-                    // The in-RAM audit_health still gates daemon emit/anchor.
-                }
-            }
-
-            health
-        };
+        // The shared handle exists so a FUTURE retry task can promote the
+        // verdict out of `Unknown` without a daemon restart (the defect: a
+        // single startup timeout left this host's audit subsystem refusing
+        // emits for 2h08m, and only a restart cleared it). See
+        // `spawn_audit_verify_retry` below, wired in once `anchor_sink` is
+        // resolved — the retry task also owns starting the anchor task on
+        // promotion. The local `audit_health` binding stays a plain enum so
+        // the start-time consumers (`is_operational` at the anchor-task
+        // branch and the readiness log) read the startup snapshot only; the
+        // shared cell is what a later promotion updates.
+        let audit_health_shared = csq_core::audit::new_shared(audit_health.clone());
 
         // an internal ticket — resolve the active transparency-log sink ONCE so both the
         // anchor HTTP handler (RouterState.anchor_sink, for synchronous
@@ -502,7 +933,8 @@ Run `csq audit verify --full` for diagnosis."
             base_dir: Arc::new(base_dir_for_runtime.clone()),
             oauth_store: Some(Arc::clone(&oauth_store)),
             gemini_consumer: gemini_consumer.clone(),
-            audit_health: audit_health.clone(),
+            audit_health: Arc::clone(&audit_health_shared),
+            audit_records_unverified,
             anchor_sink: anchor_sink.clone(),
             // an internal ticket — seed the interactive enforcement registry from the
             // fail-closed §10.5 activation gate (absent → empty/503).
@@ -519,7 +951,9 @@ Run `csq audit verify --full` for diagnosis."
                     Some(crate::kailash_governor::make_governor_factory()),
                     // T-M4.5 — inject the lifecycle-audit-sink factory so every
                     // session records a signed Delegate-lifecycle audit trail.
-                    Some(crate::kailash_audit_sink::make_audit_sink_factory()),
+                    Some(crate::kailash_audit_sink::make_audit_sink_factory(
+                        &base_dir_for_runtime,
+                    )),
                 );
                 // M3 §10.5 W2b — inject the EATP born-canonical genesis guard.
                 // Classifies the genesis record on every session open; non-BornCanonical
@@ -604,6 +1038,13 @@ Run `csq audit verify --full` for diagnosis."
                     Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
                         http::get_bearer_node(url, token, headers)
                     });
+                // Anthropic-only sibling transport that additionally
+                // captures the `retry-after` response header (see
+                // `csq-core/src/daemon/usage_poller/mod.rs::HttpGetWithRetryAfterFn`).
+                let http_get_retry_after: daemon::HttpGetWithRetryAfterFn =
+                    Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+                        http::get_bearer_node_with_retry_after(url, token, headers)
+                    });
                 let http_post_probe: daemon::HttpPostProbeFn =
                     Arc::new(|url: &str, headers: &[(String, String)], body: &str| {
                         http::post_json_with_headers(url, headers, body)
@@ -611,6 +1052,7 @@ Run `csq audit verify --full` for diagnosis."
                 let usage_poller = daemon::spawn_usage_poller(
                     base_dir_for_runtime.clone(),
                     http_get,
+                    http_get_retry_after,
                     http_post_probe,
                     gemini_consumer.clone(),
                     shutdown.clone(),
@@ -714,16 +1156,37 @@ Run `csq audit verify --full` for diagnosis."
                 // (KeyRotate, IdentityMint, ReleaseAuth) via head-kind detection.
                 //
                 // Audit-subsystem fail-closed: when `audit_health` is Broken
-                // or Unknown the anchor task is NOT started. Appending new
-                // anchor records to a broken chain is pointless and potentially
-                // misleading. Logs a WARN so the operator can see why anchoring
-                // is inactive. The operator repairs the chain (csq audit verify
-                // --full) and restarts the daemon to resume anchoring.
+                // or Unknown the anchor task is NOT started at startup.
+                // Appending new anchor records to a chain of unconfirmed
+                // integrity is pointless and potentially misleading. Logs a
+                // WARN so the operator can see why anchoring is inactive.
+                //
+                // Broken vs Unknown differ in what happens next: `Broken` is
+                // a definitive `LedgerError` — nothing in-process will change
+                // that verdict, so a repair (`csq audit verify --full`) plus
+                // a restart is the only path back. `Unknown` (timeout /
+                // panic) is NOT definitive — `spawn_audit_verify_retry`
+                // (wired below via `audit_verify_retry_handle`) is already
+                // retrying in the background and starts this same anchor
+                // task itself the moment it promotes the chain to
+                // Verified/Degraded, with no restart required.
                 let anchor_handle = if !audit_health.is_operational() {
+                    let retry_note = match &audit_health {
+                        csq_core::audit::AuditHealth::Unknown { .. } => {
+                            "a bounded background retry is running (see `csq daemon \
+                             status`); it starts anchoring automatically on promotion, \
+                             no restart needed. If the retry exhausts its budget, \
+                             restart the daemon after repairing the chain."
+                        }
+                        _ => {
+                            "restart the daemon after repairing the chain \
+                              (`csq audit verify --full` for diagnosis)."
+                        }
+                    };
                     tracing::warn!(
                         error_kind = "audit_anchor_skipped_broken_chain",
-                        "audit anchor task NOT started — chain is not operational \
-                             (audit_health={:?}). Restart daemon after repairing the chain.",
+                        "audit anchor task NOT started at startup — chain is not \
+                             operational (audit_health={:?}). {retry_note}",
                         audit_health
                     );
                     None
@@ -739,6 +1202,21 @@ Run `csq audit verify --full` for diagnosis."
                         )
                     })
                 };
+
+                // Bounded background retry for a startup `Unknown` verdict
+                // (started only after the socket bind succeeded, so a bind
+                // failure below never leaves an orphaned retry task running
+                // against a daemon that is about to exit). `None` when
+                // startup already produced Verified/Degraded — nothing to
+                // retry. Pushed into `subsystems` below.
+                let audit_verify_retry_handle = spawn_audit_verify_retry(
+                    &audit_health,
+                    base_dir_for_runtime.clone(),
+                    Arc::clone(&audit_health_shared),
+                    anchor_sink.clone(),
+                    anchor_sink_cfg.clone(),
+                    shutdown.clone(),
+                );
 
                 // Collect every long-lived subsystem into a uniform set so
                 // the session can watch them for premature exit AND drain
@@ -776,6 +1254,9 @@ Run `csq audit verify --full` for diagnosis."
                 subsystems.push(("license_crl_refresher", crl_refresher.join));
                 if let Some(handle) = anchor_handle {
                     subsystems.push(("audit_anchor", handle.join));
+                }
+                if let Some(entry) = audit_verify_retry_handle {
+                    subsystems.push(entry);
                 }
 
                 // Block until EITHER a graceful stop (`cancel` fires: the
@@ -848,6 +1329,20 @@ Run `csq audit verify --full` for diagnosis."
 /// - `"csq-ledger"` → `csq_core::audit::impls::csq_ledger_sink::CsqLedgerSink`
 ///   (feature `csq-ledger-sink`). `reqwest`-backed; connects to `audit-sink.json`
 ///   default URL `http://127.0.0.1:8080` unless the operator overrides.
+/// - `"s3"` → `S3ObjectLockSink` (feature `s3-sink`), `"azure"` → `AzureImmutableBlobSink`
+///   (feature `azure-sink`), `"gcp"` → `GcpBucketLockSink` (feature `gcp-sink`),
+///   `"azure-sql"` → `AzureSqlLedgerSink` (feature `azure-sql-sink`) — all four are
+///   M07 in-memory mock substrates (`crate::audit::impls::sinks::{s3,azure,gcp,azure_sql}`).
+/// - `"customer-body-store"` → `CustomerBodyStoreSink` (feature `customer-body-store-sink`),
+///   `reqwest`-backed, POSTs to `audit-sink.json`'s configured operator endpoint.
+///
+/// Every arm above is feature-gated in BOTH this crate's `Cargo.toml` (which
+/// forwards to the matching `csq-core` feature) and in `csq-core`'s own
+/// feature table (`validate_sink_compiled_in`). A sink name recognised by
+/// `AuditSinkConfig::set_sink` but missing its `#[cfg(feature = ...)]` arm
+/// here falls to the catch-all below and is reported, never silently
+/// dropped (issue: `resolve_anchor_sink` previously had arms for only 2 of
+/// the 7 catalogued sink kinds).
 fn resolve_anchor_sink(
     sink_cfg: &csq_core::audit::AuditSinkConfig,
 ) -> Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> {
@@ -898,6 +1393,131 @@ fn resolve_anchor_sink(
             }
         }
 
+        #[cfg(feature = "s3-sink")]
+        "s3" => match csq_core::audit::impls::sinks::s3::S3ObjectLockSink::with_defaults() {
+            Ok(s) => {
+                // HONEST LABEL (mirrors rekor's — see the comment above): the
+                // M07 S3ObjectLockSink is an in-memory mock substrate. Nothing
+                // leaves this process; `append` still returns `Ok`, and a
+                // signed ReplicationAck still lands in the chain. Operators
+                // MUST NOT treat this as durable WORM/Object-Lock storage
+                // until a real `aws-sdk-s3` client replaces the mock.
+                tracing::warn!(
+                    event = "anchor_sink_mock_backend",
+                    sink = "s3",
+                    "s3 sink uses the in-memory M07 substrate (non-persistent); \
+                     real AWS S3 Object Lock client is a pending follow-up"
+                );
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "anchor_sink_init_failed",
+                    sink = "s3",
+                    error = %e,
+                    "s3 sink initialisation failed — anchor task not started"
+                );
+                None
+            }
+        },
+
+        #[cfg(feature = "azure-sink")]
+        "azure" => {
+            match csq_core::audit::impls::sinks::azure::AzureImmutableBlobSink::with_defaults() {
+                Ok(s) => {
+                    // HONEST LABEL (mirrors rekor's): in-memory mock substrate,
+                    // nothing leaves this process. See the s3 arm above for
+                    // the full rationale.
+                    tracing::warn!(
+                        event = "anchor_sink_mock_backend",
+                        sink = "azure",
+                        "azure sink uses the in-memory M07 substrate (non-persistent); \
+                         real Azure Immutable Blob Storage client is a pending follow-up"
+                    );
+                    Some(std::sync::Arc::new(s))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "anchor_sink_init_failed",
+                        sink = "azure",
+                        error = %e,
+                        "azure sink initialisation failed — anchor task not started"
+                    );
+                    None
+                }
+            }
+        }
+
+        #[cfg(feature = "gcp-sink")]
+        "gcp" => match csq_core::audit::impls::sinks::gcp::GcpBucketLockSink::with_defaults() {
+            Ok(s) => {
+                // HONEST LABEL (mirrors rekor's): in-memory mock substrate,
+                // nothing leaves this process. See the s3 arm above for
+                // the full rationale.
+                tracing::warn!(
+                    event = "anchor_sink_mock_backend",
+                    sink = "gcp",
+                    "gcp sink uses the in-memory M07 substrate (non-persistent); \
+                     real GCP Cloud Storage Bucket Lock client is a pending follow-up"
+                );
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "anchor_sink_init_failed",
+                    sink = "gcp",
+                    error = %e,
+                    "gcp sink initialisation failed — anchor task not started"
+                );
+                None
+            }
+        },
+
+        #[cfg(feature = "azure-sql-sink")]
+        "azure-sql" => {
+            match csq_core::audit::impls::sinks::azure_sql::AzureSqlLedgerSink::with_defaults() {
+                Ok(s) => {
+                    // HONEST LABEL (mirrors rekor's): in-memory mock substrate,
+                    // nothing leaves this process. See the s3 arm above for
+                    // the full rationale.
+                    tracing::warn!(
+                        event = "anchor_sink_mock_backend",
+                        sink = "azure-sql",
+                        "azure-sql sink uses the in-memory M07 substrate (non-persistent); \
+                         real Azure SQL ledger-table client is a pending follow-up"
+                    );
+                    Some(std::sync::Arc::new(s))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "anchor_sink_init_failed",
+                        sink = "azure-sql",
+                        error = %e,
+                        "azure-sql sink initialisation failed — anchor task not started"
+                    );
+                    None
+                }
+            }
+        }
+
+        #[cfg(feature = "customer-body-store-sink")]
+        "customer-body-store" => {
+            match csq_core::audit::impls::sinks::customer_body_store::CustomerBodyStoreSink::new(
+                csq_core::audit::impls::sinks::customer_body_store::CustomerBodyStoreConfig::default(),
+            ) {
+                Ok(s) => Some(std::sync::Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "anchor_sink_init_failed",
+                        sink = "customer-body-store",
+                        error = %e,
+                        "customer-body-store sink initialisation failed — anchor task not started"
+                    );
+                    None
+                }
+            }
+        }
+
         other => {
             tracing::warn!(
                 event = "anchor_sink_not_compiled",
@@ -934,6 +1554,9 @@ pub fn handle_stop(base_dir: &Path) -> Result<()> {
     match daemon::stop_daemon(&pid_path) {
         Ok(pid) => {
             eprintln!("csq daemon stopped (PID {pid})");
+            if let Some(note) = managed_stop_advisory(launchd_job_is_loaded()) {
+                eprint!("{note}");
+            }
             Ok(())
         }
         Err(csq_core::error::DaemonError::NotRunning { .. }) => {
@@ -976,6 +1599,45 @@ pub fn handle_stop(base_dir: &Path) -> Result<()> {
 /// Returns Ok(()) in all cases so `csq daemon status` never fails
 /// for informational queries. Exit code reflects status for shell
 /// scripting: 0 = running, 1 = stopped/stale.
+/// Surfaces the daemon's own audit-chain verdict on `csq daemon status`.
+///
+/// WHY: on 2026-09-12 this host's audit subsystem sat `Unknown` for 2h08m
+/// after a single startup verify timeout — refusing emits and never starting
+/// the anchor task — while `csq daemon status` printed only running/PID/
+/// socket/posture. The state existed and no surface an operator would think
+/// to check carried it. `csq doctor` had it; `daemon status`, the command the
+/// misleading remedies actually told people to run, did not.
+///
+/// Reads the SAME channel doctor reads (`audit_health::try_daemon_audit_health`
+/// → `GET /api/audit/health` on the daemon socket) rather than a second route,
+/// per `diagnostic-surface-parity.md`. A failed query prints the REASON rather
+/// than nothing or a guess: "could not read" and "healthy" must never render
+/// the same (`durable-instruments.md` — could-not-measure is a third outcome,
+/// not silence).
+fn print_audit_health_line(base_dir: &Path) {
+    match super::audit_health::try_daemon_audit_health(base_dir) {
+        Ok((health, unverified)) => {
+            let detail = if unverified > 0 {
+                format!(" ({unverified} record(s) unverified)")
+            } else {
+                String::new()
+            };
+            eprintln!("  Audit:    {health:?}{detail}");
+            if !health.is_operational() {
+                eprintln!(
+                    "            audit emits and anchoring are DISABLED while this is \
+                     not operational."
+                );
+            }
+        }
+        Err(reason) => {
+            // Not "healthy" and not silence — the operator is told the read
+            // did not happen, and why.
+            eprintln!("  Audit:    unknown to this command — {reason}");
+        }
+    }
+}
+
 pub fn handle_status(base_dir: &Path) -> Result<()> {
     let pid_path = daemon::pid_file_path(base_dir);
 
@@ -985,6 +1647,8 @@ pub fn handle_status(base_dir: &Path) -> Result<()> {
             eprintln!("  PID:      {pid}");
             eprintln!("  PID file: {}", pid_path.display());
             eprintln!("  Socket:   {}", daemon::socket_path(base_dir).display());
+            print_posture_lines(base_dir);
+            print_audit_health_line(base_dir);
             Ok(())
         }
         DaemonStatus::Stale { pid } => {
@@ -1163,9 +1827,105 @@ pub fn handle_uninstall(_base_dir: &Path) -> Result<()> {
 
 // ── macOS launchd ─────────────────────────────────────────────────────────────
 
+/// The managed launchd job's label. The plist builder emits this same literal;
+/// `launchd_label_matches_plist` pins the two together so this probe can never
+/// drift into confidently answering about a job that does not exist.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const LAUNCHD_LABEL: &str = csq_core::daemon::recovery::LAUNCHD_LABEL;
+
+/// True when a MANAGED launchd job is currently LOADED for this user.
+///
+/// `launchctl list <label>` exits 0 when the job is loaded and non-zero when it
+/// is not (measured 2026-09-12 on macOS 25.6: 0 loaded, 113 for an unknown
+/// label), so the probe discriminates — it is not a check that answers the same
+/// way under both hypotheses (`instrument-discipline.md` MUST-1).
+///
+/// A probe that cannot RUN at all (no `launchctl`, spawn refused) answers
+/// `false`. That is the conservative direction: csq stays silent rather than
+/// printing recovery advice naming a supervisor that may not exist.
+#[cfg(target_os = "macos")]
+fn launchd_job_is_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .arg("list")
+        .arg(LAUNCHD_LABEL)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_job_is_loaded() -> bool {
+    false
+}
+
+/// Advisory printed after a SUCCESSFUL `csq daemon stop` on a machine whose
+/// daemon is launchd-managed.
+///
+/// Pure so it is testable without a live launchd: the caller supplies the
+/// probe's answer. Returns `None` when unmanaged — an unmanaged stop needs no
+/// explanation.
+///
+/// WHY THIS EXISTS: the managed plist sets `KeepAlive={SuccessfulExit:false}`,
+/// which respawns the daemon on a CRASH and deliberately NOT after a clean
+/// stop (that "stopped stays stopped" behaviour is intended — see
+/// `build_launchd_plist`). The gap was never the policy; it was that `stop`
+/// printed "csq daemon stopped" and said nothing about having just disarmed
+/// the supervisor, so the refresher stayed off silently until tokens expired
+/// and every CLI demanded a fresh login. Observed 2026-09-12.
+fn managed_stop_advisory(managed: bool) -> Option<String> {
+    if !managed {
+        return None;
+    }
+    Some(format!(
+        "\nNOTE: this machine runs the daemon under a MANAGED launchd job.\n\
+         \x20     Its KeepAlive policy respawns the daemon on a CRASH but NOT after a\n\
+         \x20     clean stop, so it will stay stopped. The token refresher and usage\n\
+         \x20     pollers are now OFF; tokens expire while they are off, and the CLIs\n\
+         \x20     will eventually require a fresh login.\n\n\
+         \x20     {}\n",
+        csq_core::daemon::recovery::recovery_guidance_for(
+            csq_core::daemon::recovery::RecoveryPlatform::MacOs,
+            csq_core::daemon::recovery::DaemonHost::Launchd,
+        )
+    ))
+}
+
+/// Advisory printed BEFORE an unsupervised `csq daemon start` on a machine whose
+/// daemon is launchd-managed.
+///
+/// Pure, for the same reason as [`managed_stop_advisory`].
+///
+/// WHY THIS EXISTS: `handle_start` runs the daemon in the FOREGROUND, as a child
+/// of the invoking shell. Started from a terminal tab, an agent session, or a
+/// background job, it dies when that parent dies — and launchd will not revive
+/// it, because it only respawns on a crash exit and never saw one. The operator
+/// sees "csq daemon started" and reasonably believes supervision was restored.
+/// Observed 2026-09-12: a `stop` + foreground `start` pair left the machine with
+/// no refresher at all once the session ended.
+fn unsupervised_start_advisory(managed: bool) -> Option<String> {
+    if !managed {
+        return None;
+    }
+    Some(format!(
+        "WARNING: a MANAGED launchd job exists for this daemon, and this start\n\
+         \x20        BYPASSES it. The daemon below is a child of the current shell and\n\
+         \x20        dies with it — when the terminal tab, agent session, or background\n\
+         \x20        job that started it exits. launchd will NOT revive it: it respawns\n\
+         \x20        only on a crash exit, and a parent's death is not one it sees.\n\n\
+         \x20     {}\n",
+        csq_core::daemon::recovery::recovery_guidance_for(
+            csq_core::daemon::recovery::RecoveryPlatform::MacOs,
+            csq_core::daemon::recovery::DaemonHost::Launchd,
+        )
+    ))
+}
+
 #[cfg(target_os = "macos")]
 fn launchd_plist_path() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
+    let home =
+        csq_core::platform::home::home_dir().context("could not determine home directory")?;
     Ok(home
         .join("Library")
         .join("LaunchAgents")
@@ -1221,7 +1981,7 @@ pub fn build_launchd_plist(exe: &Path, log_path: &Path) -> String {
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Adaptive</string>
 	<key>StandardOutPath</key>
 	<string>{log_str}</string>
 	<key>StandardErrorPath</key>
@@ -1304,7 +2064,8 @@ pub fn ensure_managed_daemon_plist() -> Result<ManagedPlistOutcome> {
     let plist_path = launchd_plist_path()?;
     let exe = resolve_managed_daemon_exe()
         .context("could not resolve a managed-daemon binary path (no CLI shim available)")?;
-    let home = dirs::home_dir().context("could not determine home directory")?;
+    let home =
+        csq_core::platform::home::home_dir().context("could not determine home directory")?;
     // Same helper the detached mode uses, so the two cannot drift onto
     // different files and leave an operator reading a log nothing writes.
     let log_path = daemon_log_path(&home.join(".claude").join("accounts"));
@@ -1424,7 +2185,8 @@ fn platform_uninstall() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn systemd_unit_path() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
+    let home =
+        csq_core::platform::home::home_dir().context("could not determine home directory")?;
     Ok(home
         .join(".config")
         .join("systemd")
@@ -1628,9 +2390,493 @@ async fn wait_for_shutdown() {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// Renders the daemon's refresh posture for `csq daemon status`.
+///
+/// A follower is a deliberate, operator-set state, so it is stated on every
+/// status read rather than only when something is wrong; a follower that has
+/// gone stale (no leader is covering it) additionally lists the expired slots,
+/// because the alternative is an unexplained 401 later. The leader default is
+/// printed as a single quiet line so the common single-host case stays terse.
+fn print_posture_lines(base_dir: &Path) {
+    use csq_core::daemon::posture::{self, PostureSource};
+
+    let eff = posture::load(base_dir);
+    eprintln!("  Posture:  {}", eff.posture.as_str());
+
+    if let PostureSource::Unreadable(ref why) = eff.source {
+        eprintln!(
+            "            ! {} is unreadable ({why}) — this host has stood down to",
+            posture::POSTURE_FILE_NAME
+        );
+        eprintln!("              follower and will NOT refresh tokens. Fix or delete the file.");
+    }
+
+    if !eff.is_follower() {
+        return;
+    }
+
+    eprintln!("            This host never refreshes OAuth tokens; a leader host does.");
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let expired = posture::expired_slots(base_dir, now_ms);
+    if expired.is_empty() {
+        return;
+    }
+    eprintln!(
+        "            ! {} slot(s) have an EXPIRED token — no leader is covering them:",
+        expired.len()
+    );
+    for e in &expired {
+        eprintln!(
+            "                slot {} ({}) expired {}m ago",
+            e.slot,
+            e.surface,
+            e.expired_for_secs / 60
+        );
+    }
+    eprintln!("            → start/repair the leader daemon, or run");
+    eprintln!("              `csq daemon posture leader` to make THIS host the refresher.");
+}
+
+/// Runs `csq daemon posture [leader|follower]`.
+///
+/// With no role, prints the current posture and where it came from. With a
+/// role, persists it to `<base_dir>/daemon-posture.json`. The running daemon
+/// re-reads that file on its next refresher tick (≤5 minutes), so no restart
+/// is needed — and unlike a CLI flag or a plist environment entry, the setting
+/// survives the desktop app rewriting the LaunchAgent plist.
+pub fn handle_posture(base_dir: &Path, role: Option<&str>) -> Result<()> {
+    use csq_core::daemon::posture::{self, DaemonPosture, PostureSource};
+
+    let Some(role) = role else {
+        let eff = posture::load(base_dir);
+        println!("{}", eff.posture.as_str());
+        match eff.source {
+            PostureSource::Default => eprintln!(
+                "  source: default (no {} on disk)",
+                posture::POSTURE_FILE_NAME
+            ),
+            PostureSource::File => {
+                eprintln!("  source: {}", posture::posture_path(base_dir).display())
+            }
+            PostureSource::Unreadable(why) => eprintln!(
+                "  source: {} is UNREADABLE ({why}); stood down to follower",
+                posture::posture_path(base_dir).display()
+            ),
+        }
+        return Ok(());
+    };
+
+    let posture_value = match role.to_ascii_lowercase().as_str() {
+        "leader" => DaemonPosture::Leader,
+        "follower" => DaemonPosture::Follower,
+        // Fail loudly on an unrecognised role rather than defaulting: silently
+        // picking one would leave the operator believing they had set the other.
+        other => {
+            anyhow::bail!("unknown posture {other:?} — expected `leader` or `follower`");
+        }
+    };
+
+    posture::save(base_dir, posture_value)
+        .with_context(|| format!("writing {}", posture::posture_path(base_dir).display()))?;
+
+    println!("{}", posture_value.as_str());
+    match posture_value {
+        DaemonPosture::Follower => {
+            eprintln!("  This host will stop refreshing OAuth tokens within one refresher");
+            eprintln!("  tick (≤5 min). Usage polling, IPC, handle-dir sweep and keychain");
+            eprintln!("  sync are unaffected. Make sure another host is the leader.");
+        }
+        DaemonPosture::Leader => {
+            eprintln!("  This host will refresh OAuth tokens within one refresher tick");
+            eprintln!("  (≤5 min). Ensure no OTHER host sharing these accounts is also a");
+            eprintln!("  leader — two leaders invalidate each other's refresh tokens.");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    /// Structural guard: BOTH daemon twins MUST map an audit-verify summary to
+    /// an `AuditHealth` through the shared producer
+    /// `AuditHealth::from_verify_result`, never by constructing a clean verdict
+    /// by hand.
+    ///
+    /// THE DEFECT THIS GUARDS (2026-09-13). `1a1d6976` taught
+    /// `from_verify_result` to return `TailVerified { skipped }` on a truncated
+    /// scan, and named three machine-readable surfaces it would make agree:
+    /// `csq doctor --json`, `csq audit verify --json`, and
+    /// `GET /api/audit/health`. It reached the first two, which call
+    /// `from_verify_result`. It did NOT reach the third: the daemon's startup
+    /// snapshot — which `daemon::server::audit_health_handler` serves verbatim
+    /// and `csq daemon status` prints — was built by two hand-written arms in
+    /// these twins that never consulted `limit_exceeded_count`. On the same
+    /// chain, `doctor` said `tail_verified` while `/api/audit/health` said
+    /// `verified`.
+    ///
+    /// The reason it looked complete is worth keeping: that commit rested on
+    /// the new variant forcing five `match` sites to declare their handling.
+    /// Exhaustiveness binds CONSUMERS of a type; it cannot make a hand-rolled
+    /// PRODUCER emit a variant (`guard-reader-writer-parity.md` MUST NOT #2).
+    /// So no compiler check could have caught this, and none will catch its
+    /// recurrence — hence a structural guard.
+    ///
+    /// WHAT THIS INSTRUMENT CAN AND CANNOT DISCRIMINATE
+    /// (`instrument-discipline.md` MUST-1). It REDs when a twin stops calling
+    /// `from_verify_result`, and when either twin gains a line that constructs
+    /// `Verified` / `TailVerified` / `Degraded` outside a `match` pattern. It
+    /// is lexical, so it does NOT prove the call is on the startup path, and it
+    /// does not see a construction assembled indirectly (via a helper, or a
+    /// `let` bound elsewhere). It scans production code only — it stops at the
+    /// `#[cfg(test)]` boundary, where fixtures legitimately construct verdicts.
+    ///
+    /// A line counts as a pattern (not a construction) when it contains `=>`,
+    /// or begins with `|`, or is followed by a line beginning with `|` — the
+    /// three shapes the real `match` arms take. A tail-expression construction
+    /// is followed by `}`, so it is flagged.
+    #[test]
+    fn daemon_twins_produce_audit_health_through_the_shared_mapper() {
+        const TWINS: [&str; 2] = [
+            "src/cli/commands/daemon.rs",
+            "src/desktop/daemon_supervisor.rs",
+        ];
+        const VARIANTS: [&str; 3] = [
+            "AuditHealth::Verified",
+            "AuditHealth::TailVerified",
+            "AuditHealth::Degraded",
+        ];
+
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut violations: Vec<String> = Vec::new();
+
+        for twin in TWINS {
+            let path = manifest_dir.join(twin);
+            // Normalize line endings: a Windows checkout with `core.autocrlf`
+            // turns `\n#[cfg(test)]\n` into `\n#[cfg(test)]\r\n`, the boundary
+            // below is never found, the TEST fixtures are scanned as production,
+            // and they are flagged for constructing verdicts (measured on the
+            // Windows runner 2026-09-25). `.gitattributes` now pins `*.rs` to LF;
+            // this keeps the scan correct on a checkout made before that.
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("daemon twin {twin} unreadable: {e}"))
+                .replace("\r\n", "\n");
+
+            // Production code only: fixtures below the test boundary
+            // legitimately construct verdicts.
+            let production = match content.find("\n#[cfg(test)]\n") {
+                Some(idx) => &content[..idx],
+                None => &content[..],
+            };
+
+            assert!(
+                production.contains("from_verify_result"),
+                "daemon twin {twin} no longer calls AuditHealth::from_verify_result — \
+                 its audit-health verdict is being produced some other way. Every twin \
+                 MUST share the one producer, or the surfaces that report audit health \
+                 drift apart (see this test's doc comment)."
+            );
+
+            let lines: Vec<&str> = production.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                if !VARIANTS.iter().any(|v| trimmed.contains(v)) {
+                    continue;
+                }
+                if trimmed.contains("=>") || trimmed.starts_with('|') {
+                    continue;
+                }
+                let next_is_alternation = lines[i + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty() && !l.starts_with("//"))
+                    .is_some_and(|l| l.starts_with('|'));
+                if next_is_alternation {
+                    continue;
+                }
+                violations.push(format!("{twin}:{}: {trimmed}", i + 1));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "daemon twin(s) construct an AuditHealth verdict by hand instead of \
+             deriving it from AuditHealth::from_verify_result. A hand-built verdict \
+             cannot learn a new variant, which is exactly how a truncated scan kept \
+             reporting whole-chain `Verified` on GET /api/audit/health after the other \
+             two surfaces were fixed. Offending line(s):\n{}",
+            violations.join("\n")
+        );
+    }
+
+    // ── launchd advisories (PURE — compiled on every platform) ──────────
+    //
+    // Deliberately OUTSIDE `mod macos`: `managed_stop_advisory` and
+    // `unsupervised_start_advisory` are not cfg-gated, so gating their tests
+    // to macOS would leave them unexercised on Linux and Windows while still
+    // reporting a green suite. A test that does not RUN is not evidence
+    // (`instrument-discipline.md` MUST-2) — these were written inside the
+    // macOS module first and 616 tests were "filtered out" with zero matches.
+    #[test]
+    fn advisories_are_silent_when_unmanaged() {
+        // An unmanaged machine gets no launchd advice — naming a supervisor
+        // that does not exist would send the operator to a command that fails.
+        assert!(managed_stop_advisory(false).is_none());
+        assert!(unsupervised_start_advisory(false).is_none());
+    }
+
+    #[test]
+    fn managed_stop_advisory_names_the_consequence_and_the_recovery() {
+        let note = managed_stop_advisory(true).expect("managed stop must advise");
+        // The CONSEQUENCE: not merely "it stopped", but that it stays stopped
+        // and what that costs. This is the sentence whose absence cost a
+        // machine its refresher on 2026-09-12.
+        assert!(
+            note.contains("NOT after a"),
+            "must say it does not auto-restart: {note}"
+        );
+        assert!(
+            note.contains("stay stopped"),
+            "must say it stays stopped: {note}"
+        );
+        assert!(note.contains("expire"), "must name the token cost: {note}");
+        // The RECOVERY, exact and runnable.
+        assert!(
+            note.contains("launchctl kickstart -k") && note.contains(LAUNCHD_LABEL),
+            "must give the runnable recovery command: {note}"
+        );
+    }
+
+    #[test]
+    fn unsupervised_start_advisory_names_the_shell_lifetime_trap() {
+        let warning =
+            unsupervised_start_advisory(true).expect("managed + foreground start must warn");
+        assert!(
+            warning.contains("BYPASSES"),
+            "must say it bypasses launchd: {warning}"
+        );
+        assert!(
+            warning.contains("dies with it"),
+            "must say the daemon dies with the shell: {warning}"
+        );
+        assert!(
+            warning.contains("NOT revive"),
+            "must say launchd will not revive it: {warning}"
+        );
+        assert!(
+            warning.contains("launchctl kickstart -k") && warning.contains(LAUNCHD_LABEL),
+            "must give the supervised alternative: {warning}"
+        );
+    }
+
+    #[test]
+    fn daemon_recovery_advisories_verify_loaded_executable_before_restart() {
+        for text in [
+            managed_stop_advisory(true).unwrap(),
+            unsupervised_start_advisory(true).unwrap(),
+        ] {
+            assert!(
+                text.find("correct the intended service executable")
+                    .unwrap()
+                    < text.find("launchctl kickstart").unwrap()
+            );
+            assert!(text.contains("restarting the same old binary does not fix"));
+            assert!(text.contains("Program/ProgramArguments[0]"));
+            assert!(!text.contains("daemon stop && csq daemon start"));
+            eprintln!("{text}");
+        }
+    }
+
     use super::*;
+
+    // ── audit-verify startup timeout derivation (Defect 1) ─────────────
+
+    /// At the record_limit DEFAULT (10,000), the derived timeout must be
+    /// strictly greater than the old fixed 5s default that measurably
+    /// failed under load on an 11,449-record chain (host load ~100-190),
+    /// and strictly less than the 30s an operator found sufficient at a
+    /// HIGHER record_limit override — the interval this function's value
+    /// is required to clear, per the two measured data points.
+    #[test]
+    fn default_record_limit_clears_the_known_insufficient_5s_with_margin() {
+        let secs = derive_audit_verify_timeout_secs(10_000);
+        assert!(
+            secs > 5,
+            "5s measurably failed under load on an 11,449-record chain; \
+             the derived default must clear it: got {secs}s"
+        );
+        assert_eq!(
+            secs, 16,
+            "ceil(10_000 * 0.215 * 7.0 / 1000) = ceil(15.05) = 16; got {secs}"
+        );
+    }
+
+    /// A near-zero record_limit must not derive a near-zero timeout — fixed
+    /// per-run overhead (process/tokio-task spin-up, the EATP-chain check)
+    /// exists regardless of record count, so the MIN floor must bind.
+    #[test]
+    fn tiny_record_limit_clamps_to_the_min_floor() {
+        assert_eq!(
+            derive_audit_verify_timeout_secs(1),
+            AUDIT_VERIFY_TIMEOUT_MIN_SECS
+        );
+        assert_eq!(
+            derive_audit_verify_timeout_secs(0),
+            AUDIT_VERIFY_TIMEOUT_MIN_SECS
+        );
+    }
+
+    /// A large `CSQ_AUDIT_VERIFY_LIMIT` override (the exact shape of the
+    /// value the maintainer set to work around Defect 2) must not derive
+    /// an unbounded startup-blocking timeout — the MAX ceiling must bind
+    /// so a misconfigured cap cannot turn a genuinely hung verify into a
+    /// multi-minute "is the daemon even starting?" wait.
+    #[test]
+    fn large_record_limit_override_clamps_to_the_max_ceiling() {
+        assert_eq!(
+            derive_audit_verify_timeout_secs(100_000),
+            AUDIT_VERIFY_TIMEOUT_MAX_SECS
+        );
+    }
+
+    /// The derivation is monotone non-decreasing in record_limit within the
+    /// unclamped region — a larger configured cap must never derive a
+    /// SMALLER timeout than a smaller one.
+    #[test]
+    fn timeout_is_monotone_in_record_limit() {
+        let small = derive_audit_verify_timeout_secs(1_000);
+        let default = derive_audit_verify_timeout_secs(10_000);
+        let large = derive_audit_verify_timeout_secs(30_000);
+        assert!(small <= default, "{small} <= {default}");
+        assert!(default <= large, "{default} <= {large}");
+    }
+
+    // ── audit-verify background retry (bounded, never wedges past shutdown) ──
+    //
+    // What is and is not covered here, stated plainly (per
+    // `user-path-verification.md` / `instrument-discipline.md`): the pure
+    // backoff derivation and the "already operational -> no retry spawned"
+    // and "shutdown cancels promptly" contracts are exercised directly below
+    // and are deterministic. Full end-to-end promotion (startup Unknown ->
+    // later attempt Verified -> `is_operational()` flips true on the shared
+    // handle -> anchor task starts) is NOT covered by a fast unit test here:
+    // `attempt_audit_verify` calls the real `verify_chain` against the
+    // filesystem with no injection seam, so forcing a genuine `Unknown` on
+    // the first attempt and a genuine `Verified` on a later one deterministically
+    // (without sleeping for a real multi-second timeout, which would be slow
+    // and load-sensitive exactly the way the originating incident was) would
+    // require either a dependency-injection refactor of `attempt_audit_verify`
+    // (out of this shard's scope — that function is deliberately shared,
+    // unforked, with the blocking startup path per its own doc) or an
+    // `#[ignore]`d slow/flaky test. Recorded here rather than silently omitted.
+
+    /// Backoff before attempt 0 is exactly `verify_timeout_secs` (the base
+    /// case), and it doubles on each subsequent attempt.
+    #[test]
+    fn retry_backoff_doubles_from_the_verify_timeout() {
+        let base = 16;
+        assert_eq!(audit_verify_retry_backoff_secs(0, base), 16);
+        assert_eq!(audit_verify_retry_backoff_secs(1, base), 32);
+        assert_eq!(audit_verify_retry_backoff_secs(2, base), 64);
+        assert_eq!(audit_verify_retry_backoff_secs(3, base), 128);
+    }
+
+    /// The backoff schedule is clamped at
+    /// `AUDIT_VERIFY_RETRY_BACKOFF_MAX_SECS` — an operator's large
+    /// `CSQ_AUDIT_VERIFY_LIMIT` override must not turn the retry loop into an
+    /// hours-long wait between attempts.
+    #[test]
+    fn retry_backoff_is_clamped() {
+        let huge_base = 10_000;
+        assert_eq!(
+            audit_verify_retry_backoff_secs(5, huge_base),
+            AUDIT_VERIFY_RETRY_BACKOFF_MAX_SECS
+        );
+        // The shift itself must not overflow for a pathological attempt count.
+        assert_eq!(
+            audit_verify_retry_backoff_secs(u32::MAX, huge_base),
+            AUDIT_VERIFY_RETRY_BACKOFF_MAX_SECS
+        );
+    }
+
+    /// RED without the fix: before this change, a startup `Unknown` had no
+    /// path back to operational short of a restart — there was no retry
+    /// function to call at all. GREEN with it: an already-operational
+    /// startup result spawns NOTHING (`None`) — the retry exists only to
+    /// cover the `Unknown` case, never to duplicate work on a healthy chain.
+    #[test]
+    fn no_retry_spawned_when_startup_already_operational() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let shared = csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let handle = spawn_audit_verify_retry(
+                &csq_core::audit::AuditHealth::Verified,
+                std::env::temp_dir(),
+                shared,
+                None,
+                csq_core::audit::AuditSinkConfig::default(),
+                shutdown,
+            );
+            assert!(
+                handle.is_none(),
+                "an already-operational startup result must not spawn a retry task"
+            );
+        });
+    }
+
+    /// CONTRACT (an internal ticket redteam LOW-1) proof: the retry task idle-loops on
+    /// `shutdown` rather than returning early on its own (it never reads as
+    /// a spurious daemon-session fault) — but it MUST still react to
+    /// `shutdown` PROMPTLY rather than blocking for its full backoff/attempt
+    /// budget. Cancelling `shutdown` immediately after spawn must let the
+    /// task's `JoinHandle` resolve well within one test-timeout window, long
+    /// before the (multi-second, in a real daemon) first backoff would have
+    /// elapsed on its own.
+    #[tokio::test]
+    async fn retry_task_exits_promptly_on_shutdown_without_promoting() {
+        let shared = csq_core::audit::new_shared(csq_core::audit::AuditHealth::Unknown {
+            reason: "audit_verify_timeout".to_string(),
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_audit_verify_retry(
+            &csq_core::audit::AuditHealth::Unknown {
+                reason: "audit_verify_timeout".to_string(),
+            },
+            std::env::temp_dir(),
+            std::sync::Arc::clone(&shared),
+            None,
+            csq_core::audit::AuditSinkConfig::default(),
+            shutdown.clone(),
+        )
+        .expect("an Unknown startup result must spawn a retry task");
+
+        // Cancel immediately — well before the real backoff (>=
+        // AUDIT_VERIFY_TIMEOUT_MIN_SECS == 5s) could ever elapse.
+        shutdown.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.1)
+            .await
+            .expect("retry task must exit promptly on shutdown, not wedge")
+            .expect("retry task must not panic on the shutdown path");
+
+        // No attempt ever ran (cancelled during the pre-attempt backoff
+        // sleep), so the shared handle must still read Unknown — shutdown
+        // must never be misread as a promotion.
+        assert!(
+            !shared.read().expect("lock").is_operational(),
+            "a cancelled-before-first-attempt retry must not promote audit_health"
+        );
+    }
 
     // ── detached-mode logging (the observability defect) ──────────────
 
@@ -1760,6 +3006,20 @@ mod tests {
         }
 
         #[test]
+        fn launchd_label_matches_plist() {
+            // Parity guard: the probe's label and the plist's label are two
+            // separate literals. If they drift, `launchctl list` answers about a
+            // job that does not exist and BOTH advisories go silent forever —
+            // failing open on exactly the state they exist to announce
+            // (`guard-reader-writer-parity.md` MUST-1).
+            let plist = build_launchd_plist(Path::new("/bin/csq"), Path::new("/tmp/csq.log"));
+            assert!(
+                plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")),
+                "probe label `{LAUNCHD_LABEL}` is absent from the generated plist: {plist}"
+            );
+        }
+
+        #[test]
         fn plist_contains_daemon_start_supervised_args() {
             // Arrange
             let exe = exe_path();
@@ -1876,8 +3136,26 @@ mod tests {
             );
         }
 
+        /// `ProcessType` MUST be `Adaptive`, never `Background`.
+        ///
+        /// launchd throttles `Background` jobs hard — low CPU/IO priority, and
+        /// on a loaded machine they are descheduled for long stretches. That is
+        /// correct for maintenance work and WRONG for csq's daemon, whose whole
+        /// job is a 5-minute token-refresh cycle plus synchronous IPC for
+        /// `csq status` / `csq run`. Observed starving at load 190-280 on the
+        /// maintainer host; `Adaptive` starts Background and is promoted to
+        /// Interactive when the job is actually working, which is the shape
+        /// this daemon needs.
+        ///
+        /// This assertion previously required `Background` — it pinned the
+        /// defect, so every hand-repair of the plist was reverted by the next
+        /// desktop launch (which rewrites it from this template). Both halves
+        /// are on the record: `internal-design-docs`
+        /// § HOST CONFIG CHANGED sets Adaptive and carries the measurement
+        /// above, and `.../HANDOFF-2026-09-12-windows-link-parity.md` § 3
+        /// records it back on `Background` the next day.
         #[test]
-        fn plist_sets_process_type_background() {
+        fn plist_sets_process_type_adaptive_not_background() {
             // Arrange
             let exe = exe_path();
             let log = log_path();
@@ -1887,8 +3165,12 @@ mod tests {
 
             // Assert
             assert!(
-                plist.contains("<string>Background</string>"),
-                "ProcessType not Background: {plist}"
+                plist.contains("<key>ProcessType</key>\n\t<string>Adaptive</string>"),
+                "ProcessType must be Adaptive: {plist}"
+            );
+            assert!(
+                !plist.contains("<string>Background</string>"),
+                "ProcessType must NOT be Background (launchd starves it): {plist}"
             );
         }
 
@@ -2283,6 +3565,363 @@ mod tests {
                 "csq-ledger",
                 "resolved csq-ledger sink must report name()==\"csq-ledger\""
             );
+        }
+    }
+
+    // ── regression: the 5 sink kinds `resolve_anchor_sink` previously had NO
+    // arm for at all (s3, azure, gcp, azure-sql, customer-body-store) ─────────
+    //
+    // Before this fix, `resolve_anchor_sink` matched only `"rekor"` and
+    // `"csq-ledger"`; every other catalogued sink name — even with its
+    // feature compiled in — fell to the catch-all `other` arm and returned
+    // `None`. Configuration (`AuditSinkConfig::set_sink`, gated by
+    // `validate_sink_compiled_in`, which DOES have an arm for all 7 kinds)
+    // would succeed, `csq doctor` would render the sink as active, and the
+    // daemon would never spawn an anchor task. This test proves each of the
+    // 5 missing kinds now resolves to `Some` when its feature is compiled —
+    // it RED's against the pre-fix resolver (which has no arm, so these
+    // sub-tests could not even reach a `Some` branch; run without the fix
+    // and each assertion below fails with `None`).
+    #[test]
+    fn resolve_anchor_sink_resolves_all_seven_catalogued_kinds() {
+        use csq_core::audit::AuditSinkConfig;
+
+        #[cfg(feature = "s3-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "s3".to_string(),
+                ..Default::default()
+            };
+            let result = resolve_anchor_sink(&cfg);
+            assert!(
+                result.is_some(),
+                "sink=\"s3\" must resolve to Some when s3-sink feature is compiled"
+            );
+            assert_eq!(result.unwrap().name(), "s3");
+        }
+        #[cfg(not(feature = "s3-sink"))]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "s3".to_string(),
+                ..Default::default()
+            };
+            assert!(resolve_anchor_sink(&cfg).is_none());
+        }
+
+        #[cfg(feature = "azure-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "azure".to_string(),
+                ..Default::default()
+            };
+            let result = resolve_anchor_sink(&cfg);
+            assert!(
+                result.is_some(),
+                "sink=\"azure\" must resolve to Some when azure-sink feature is compiled"
+            );
+            assert_eq!(result.unwrap().name(), "azure");
+        }
+        #[cfg(not(feature = "azure-sink"))]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "azure".to_string(),
+                ..Default::default()
+            };
+            assert!(resolve_anchor_sink(&cfg).is_none());
+        }
+
+        #[cfg(feature = "gcp-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "gcp".to_string(),
+                ..Default::default()
+            };
+            let result = resolve_anchor_sink(&cfg);
+            assert!(
+                result.is_some(),
+                "sink=\"gcp\" must resolve to Some when gcp-sink feature is compiled"
+            );
+            assert_eq!(result.unwrap().name(), "gcp");
+        }
+        #[cfg(not(feature = "gcp-sink"))]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "gcp".to_string(),
+                ..Default::default()
+            };
+            assert!(resolve_anchor_sink(&cfg).is_none());
+        }
+
+        #[cfg(feature = "azure-sql-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "azure-sql".to_string(),
+                ..Default::default()
+            };
+            let result = resolve_anchor_sink(&cfg);
+            assert!(
+                result.is_some(),
+                "sink=\"azure-sql\" must resolve to Some when azure-sql-sink feature is compiled"
+            );
+            assert_eq!(result.unwrap().name(), "azure-sql");
+        }
+        #[cfg(not(feature = "azure-sql-sink"))]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "azure-sql".to_string(),
+                ..Default::default()
+            };
+            assert!(resolve_anchor_sink(&cfg).is_none());
+        }
+
+        #[cfg(feature = "customer-body-store-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "customer-body-store".to_string(),
+                ..Default::default()
+            };
+            let result = resolve_anchor_sink(&cfg);
+            assert!(
+                result.is_some(),
+                "sink=\"customer-body-store\" must resolve to Some when \
+                 customer-body-store-sink feature is compiled"
+            );
+            assert_eq!(result.unwrap().name(), "customer-body-store");
+        }
+        #[cfg(not(feature = "customer-body-store-sink"))]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "customer-body-store".to_string(),
+                ..Default::default()
+            };
+            assert!(resolve_anchor_sink(&cfg).is_none());
+        }
+    }
+
+    // ── regression: a resolved sink's WIRING reaches the spawn site ────────
+    //
+    // `resolve_anchor_sink_resolves_all_seven_catalogued_kinds` proves the
+    // resolver returns `Some`. That is necessary but not sufficient — a
+    // `Some` that never reaches `daemon::spawn_anchor_task` at all (the real
+    // production call site, gated on `if let Some(sink) = anchor_sink`)
+    // would reproduce the original defect with better-looking code. This
+    // test proves, per new kind, using the REAL production functions (not a
+    // reimplementation):
+    //
+    // 1. the resolved sink's `append`/`verify_at` round-trip through the
+    //    trait boundary without erroring or panicking (the panic case is
+    //    exactly what `customer_body_store_live_transport_does_not_panic_in_async_context`,
+    //    csq-core, exists to catch — see that test's doc comment);
+    // 2. `csq_core::daemon::spawn_anchor_task` accepts the resolved sink and
+    //    returns `Some(handle)` — i.e. a background task is actually
+    //    spawned. Before `6861cac4`, `resolve_anchor_sink` returned `None`
+    //    for these kinds, so this call site was never reached at all.
+    //
+    // WHAT THIS TEST DOES **NOT** PROVE (named per `instrument-discipline.md`
+    // MUST-1 — a security review of the prior name, "…_actually_anchors",
+    // correctly flagged it as over-claiming): for `s3`/`azure`/`gcp`/
+    // `azure-sql` (and `rekor`), the current `LedgerSink` impl is an
+    // in-memory `Mutex<HashMap<..>>` mock substrate whose `append` cannot
+    // fail — `Ok(SinkReceipt)` is UNCONDITIONAL, nothing leaves the process,
+    // and this test's green result is IDENTICAL whether the sink durably
+    // anchors or silently drops everything. It cannot discriminate that
+    // property, because no mock-backed kind can ever red it. The property
+    // "this sink is mock-backed, not a durable witness" is proven instead
+    // by `sink_config::tests::is_mock_backed_sink_matches_the_current_catalog_state`
+    // (csq-core) and surfaced to the operator via `SinkDoctorSnapshot::mock_backend`
+    // + the `anchor_sink_mock_backend` WARN at resolve time — NOT by this test.
+    #[tokio::test]
+    #[allow(unused_imports)]
+    async fn resolve_anchor_sink_new_kinds_reach_the_spawn_site() {
+        use csq_core::audit::anchor::test_helpers::sample_signed_record;
+        use csq_core::audit::AuditSinkConfig;
+
+        #[cfg(feature = "s3-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "s3".to_string(),
+                ..Default::default()
+            };
+            let sink = resolve_anchor_sink(&cfg).expect("s3 must resolve to Some");
+            assert_eq!(sink.name(), "s3");
+
+            let record = sample_signed_record(0, "01JZ000000000000000000S3S3");
+            let receipt = sink
+                .append(&record)
+                .await
+                .expect("s3 sink append must succeed");
+            assert_eq!(receipt.sink.as_str(), "s3");
+            let fetched = sink
+                .verify_at(&record.record_id)
+                .await
+                .expect("s3 sink verify_at must find the appended record");
+            assert_eq!(fetched.record_id, record.record_id);
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let handle =
+                daemon::spawn_anchor_task(dir.path().to_path_buf(), cfg, sink, shutdown.clone());
+            assert!(
+                handle.is_some(),
+                "spawn_anchor_task must spawn a task for a resolved s3 sink"
+            );
+            shutdown.cancel();
+            if let Some(h) = handle {
+                let _ = h.join.await;
+            }
+        }
+
+        #[cfg(feature = "azure-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "azure".to_string(),
+                ..Default::default()
+            };
+            let sink = resolve_anchor_sink(&cfg).expect("azure must resolve to Some");
+            assert_eq!(sink.name(), "azure");
+
+            let record = sample_signed_record(0, "01JZ000000000000000000ARAR");
+            let receipt = sink
+                .append(&record)
+                .await
+                .expect("azure sink append must succeed");
+            assert_eq!(receipt.sink.as_str(), "azure");
+            let fetched = sink
+                .verify_at(&record.record_id)
+                .await
+                .expect("azure sink verify_at must find the appended record");
+            assert_eq!(fetched.record_id, record.record_id);
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let handle =
+                daemon::spawn_anchor_task(dir.path().to_path_buf(), cfg, sink, shutdown.clone());
+            assert!(
+                handle.is_some(),
+                "spawn_anchor_task must spawn a task for a resolved azure sink"
+            );
+            shutdown.cancel();
+            if let Some(h) = handle {
+                let _ = h.join.await;
+            }
+        }
+
+        #[cfg(feature = "gcp-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "gcp".to_string(),
+                ..Default::default()
+            };
+            let sink = resolve_anchor_sink(&cfg).expect("gcp must resolve to Some");
+            assert_eq!(sink.name(), "gcp");
+
+            let record = sample_signed_record(0, "01JZ000000000000000000GPGP");
+            let receipt = sink
+                .append(&record)
+                .await
+                .expect("gcp sink append must succeed");
+            assert_eq!(receipt.sink.as_str(), "gcp");
+            let fetched = sink
+                .verify_at(&record.record_id)
+                .await
+                .expect("gcp sink verify_at must find the appended record");
+            assert_eq!(fetched.record_id, record.record_id);
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let handle =
+                daemon::spawn_anchor_task(dir.path().to_path_buf(), cfg, sink, shutdown.clone());
+            assert!(
+                handle.is_some(),
+                "spawn_anchor_task must spawn a task for a resolved gcp sink"
+            );
+            shutdown.cancel();
+            if let Some(h) = handle {
+                let _ = h.join.await;
+            }
+        }
+
+        #[cfg(feature = "azure-sql-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "azure-sql".to_string(),
+                ..Default::default()
+            };
+            let sink = resolve_anchor_sink(&cfg).expect("azure-sql must resolve to Some");
+            assert_eq!(sink.name(), "azure-sql");
+
+            let record = sample_signed_record(0, "01JZ000000000000000000SQSQ");
+            let receipt = sink
+                .append(&record)
+                .await
+                .expect("azure-sql sink append must succeed");
+            assert_eq!(receipt.sink.as_str(), "azure-sql");
+            let fetched = sink
+                .verify_at(&record.record_id)
+                .await
+                .expect("azure-sql sink verify_at must find the appended record");
+            assert_eq!(fetched.record_id, record.record_id);
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let handle =
+                daemon::spawn_anchor_task(dir.path().to_path_buf(), cfg, sink, shutdown.clone());
+            assert!(
+                handle.is_some(),
+                "spawn_anchor_task must spawn a task for a resolved azure-sql sink"
+            );
+            shutdown.cancel();
+            if let Some(h) = handle {
+                let _ = h.join.await;
+            }
+        }
+
+        #[cfg(feature = "customer-body-store-sink")]
+        {
+            let cfg = AuditSinkConfig {
+                sink: "customer-body-store".to_string(),
+                ..Default::default()
+            };
+            let sink = resolve_anchor_sink(&cfg).expect("customer-body-store must resolve to Some");
+            assert_eq!(sink.name(), "customer-body-store");
+
+            // Unlike the 4 in-memory mock sinks above, `resolve_anchor_sink`
+            // constructs `CustomerBodyStoreSink` with its LIVE `reqwest`
+            // transport (`CustomerBodyStoreConfig::default()`'s
+            // `http://127.0.0.1:8080`, per its doc comment — this sink is the
+            // operator-residency control and genuinely dials a real
+            // endpoint). No such endpoint is listening in this test, so the
+            // append/verify_at round trip cannot succeed here — the property
+            // this block proves is instead the one this fix's own regression
+            // test (`customer_body_store_live_transport_does_not_panic_in_async_context`,
+            // csq-core) exists for: calling `append`/`verify_at` on the LIVE
+            // sink from a real async runtime returns an ordinary
+            // `SinkError::Unreachable`, not a panic. Before that fix, this
+            // call would have PANICKED the whole test with tokio's "Cannot
+            // drop a runtime in a context where blocking is not allowed" —
+            // `reqwest::blocking` called inline on an async worker thread.
+            let record = sample_signed_record(0, "01JZ000000000000000000CBCB");
+            let append_result = sink.append(&record).await;
+            assert!(
+                matches!(
+                    append_result,
+                    Err(csq_core::audit::SinkError::Unreachable { .. })
+                ),
+                "expected Unreachable (no live endpoint), got {append_result:?}"
+            );
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let handle =
+                daemon::spawn_anchor_task(dir.path().to_path_buf(), cfg, sink, shutdown.clone());
+            assert!(
+                handle.is_some(),
+                "spawn_anchor_task must spawn a task for a resolved customer-body-store sink"
+            );
+            shutdown.cancel();
+            if let Some(h) = handle {
+                let _ = h.join.await;
+            }
         }
     }
 }

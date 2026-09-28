@@ -21,8 +21,8 @@
 //! - Request bodies are piped via stdin, never via argv, so refresh
 //!   tokens don't appear in `ps` output.
 //! - The caller-supplied URL is interpolated into the spawned script as
-//!   a JSON-encoded string literal ([`js_url_literal`]), guarded by a
-//!   codepoint allowlist ([`url_has_unsafe_js_chars`]) that rejects
+//!   a JSON-encoded string literal (`js_url_literal`), guarded by a
+//!   codepoint allowlist (`url_has_unsafe_js_chars`) that rejects
 //!   quotes, backslash, CR/LF, ASCII control codepoints, and
 //!   U+2028/U+2029 before the value ever reaches the script text.
 //! - `node`'s stderr on a failed request is routed through
@@ -37,12 +37,13 @@
 //!   hex) and a URL's userinfo password do not match `redact_tokens`'
 //!   patterns and could still surface in this string if a future
 //!   change ever echoed them (round-2 redteam L2 — the userinfo case
-//!   is separately closed by [`build_get_bearer_script`]'s
+//!   is separately closed by `build_get_bearer_script`'s
 //!   `uncaughtException` guard, at the script layer, not by
 //!   `redact_tokens`).
 
 pub mod codex;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -285,7 +286,7 @@ pub fn post_json_probe(
 /// `https_only(true)` only checks the scheme, not the authority, so a
 /// URL like `https://api.minimax.chat@evil.example/v1` would read as
 /// the vendor while sending the live credential to `evil.example`.
-/// See [`reject_userinfo`].
+/// See `reject_userinfo`.
 ///
 /// # Errors
 ///
@@ -343,7 +344,7 @@ pub fn post_json_with_headers(
 /// # Security
 ///
 /// `url` is rejected outright if it carries userinfo or fails to parse
-/// (round-7 redteam A-M1 — see [`reject_userinfo`]). This is the
+/// (round-7 redteam A-M1 — see `reject_userinfo`). This is the
 /// production transport behind the phase2b direct-API moat
 /// (`phase2b/clients.rs::ReqwestTransport::post`), which carries the
 /// caller's unwrapped 3P provider API key in `headers` — the exact
@@ -418,7 +419,7 @@ pub fn post_json_with_headers_capped(
 ///   values — reqwest rejects CRLF injection, but callers should
 ///   never pass user-controlled strings.
 /// - `url` is rejected outright if it carries userinfo or fails to parse
-///   (round-7 redteam A-M1 — see [`reject_userinfo`]). reqwest folds URL
+///   (round-7 redteam A-M1 — see `reject_userinfo`). reqwest folds URL
 ///   userinfo into a `Basic`-auth `Authorization` header (which this
 ///   function then OVERWRITES with the real bearer token via a second
 ///   `.header("Authorization", ...)` call — but by then the connection
@@ -752,7 +753,7 @@ fn resolve_js_runtime() -> Option<String> {
 /// diagnostic callers (e.g. `csq doctor`) that want to surface a
 /// "no JS runtime found" warning. Intentionally uncached — doctor is
 /// a one-shot command, and the HTTP client has its own memoized
-/// [`find_js_runtime`] for hot paths.
+/// `find_js_runtime` for hot paths.
 pub fn js_runtime_path() -> Option<String> {
     resolve_js_runtime()
 }
@@ -1002,7 +1003,7 @@ process.stdin.on('end', () => {{
 /// `url` is rejected outright if it carries userinfo or fails to parse
 /// (round-2 redteam H2 — `post_json_node`'s stdin body is an OAuth
 /// authorization-code / refresh-token exchange payload, a live credential
-/// just as much as a bearer header). See [`reject_userinfo`].
+/// just as much as a bearer header). See `reject_userinfo`.
 pub fn post_json_node(url: &str, body: &str) -> Result<Vec<u8>, String> {
     if !url.starts_with("https://") {
         return Err(ERR_HTTPS_REQUIRED.into());
@@ -1066,8 +1067,11 @@ process.stdin.on('end', () => {{
     let data = [];
     res.on('data', c => data.push(c));
     res.on('end', () => {{
-      // First line: Date header value (empty if absent). Then body.
-      process.stdout.write(dateHeader + '\n');
+      // First line: `<status> <date>` (status = res.statusCode; date is
+      // empty when the header is absent, but the separating space is
+      // always emitted so the parser can split on the first space
+      // unconditionally). Then body.
+      process.stdout.write(res.statusCode + ' ' + dateHeader + '\n');
       process.stdout.write(Buffer.concat(data));
     }});
   }});
@@ -1080,33 +1084,94 @@ process.stdin.on('end', () => {{
     )
 }
 
+/// Full response from [`post_json_node_with_date`]: the HTTP status
+/// code, the response body, and the `Date` header (if any).
+///
+/// `Debug` is hand-written, NOT derived: `body` is the raw upstream
+/// response, which for the OAuth token endpoints this transport serves
+/// may contain an echoed refresh token or other credential fragments
+/// in an error envelope (see the module-level `# Security` note and
+/// [`post_form`]'s credential-safety warning). The derive would print
+/// `body` verbatim on any `{:?}` — a `tracing::debug!(?resp)` or a
+/// panic message — so it is rendered as a byte count instead.
+pub struct NodeHttpResponse {
+    /// The HTTP status code (`res.statusCode`). Never a default:
+    /// [`post_json_node_with_date`] parses the status line strictly and
+    /// returns `Err` when it is missing or non-numeric, so a value here was
+    /// always read from the response. ([`post_json_node`] has no
+    /// status-reporting path and never constructs this type.)
+    pub status: u16,
+    /// The raw response body, byte-for-byte identical to what
+    /// [`post_json_node`] returns.
+    pub body: Vec<u8>,
+    /// The response `Date` header, if present.
+    pub date: Option<String>,
+}
+
+impl fmt::Debug for NodeHttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeHttpResponse")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .field("date", &self.date)
+            .finish()
+    }
+}
+
+/// Parses the `<status> <date>` first line written by
+/// [`build_post_with_date_script`] onto stdout ahead of the response
+/// body.
+///
+/// `status` MUST be present and parse as `u16` — a missing or
+/// unparseable status is an `Err`, never a default (a silently-defaulted
+/// status previously made the Codex 429 rate-limit gate unreachable in
+/// production: every call site passed a literal `200`, so
+/// `classify_error` never saw a real status and the `429` match arm in
+/// `refresh/check.rs::broker_codex_check` could never fire). `date` is
+/// everything after the first space, treated as absent when empty (the
+/// script always emits the separating space even when the header is
+/// missing, so splitting unconditionally on the first space is safe).
+fn parse_status_date_line(line: &str) -> Result<(u16, Option<String>), String> {
+    let mut parts = line.splitn(2, ' ');
+    let status_str = parts.next().unwrap_or("");
+    let status: u16 = status_str
+        .parse()
+        .map_err(|_| format!("invalid status in node output: {status_str:?}"))?;
+    let date = match parts.next() {
+        Some(rest) if !rest.is_empty() => Some(rest.to_string()),
+        _ => None,
+    };
+    Ok((status, date))
+}
+
 /// POSTs a JSON body to `url` using a Node.js subprocess and also
-/// captures the response `Date` header.
+/// captures the response status code and `Date` header.
 ///
 /// Behaves identically to [`post_json_node`] (HTTPS-only, body-via-
-/// stdin, returns body bytes on any HTTP status) but additionally
-/// returns the `Date` response header as `Option<String>` for
-/// callers that need server clock-skew detection (PR-C4 INV-P01:
-/// daemon Codex refresher emits `clock_skew_detected` when local
-/// time differs from server `Date` by > 5 min).
+/// stdin, returns the response body on any HTTP status) but
+/// additionally returns the HTTP status code and the `Date` response
+/// header via [`NodeHttpResponse`], for callers that need to classify
+/// the response by status (e.g. Codex's `429` rate-limit path) or need
+/// server clock-skew detection (PR-C4 INV-P01: daemon Codex refresher
+/// emits `clock_skew_detected` when local time differs from server
+/// `Date` by > 5 min).
 ///
-/// Wire format on stdout:
+/// Wire format on stdout (produced by `build_post_with_date_script`):
 ///
-/// - First line: server `Date` header value (empty line if absent).
+/// - First line: `<status> <date>` — see `parse_status_date_line`.
 /// - Remaining bytes: response body, byte-for-byte identical to what
 ///   [`post_json_node`] returns.
 ///
 /// Splitting on the first `\n` keeps body bytes lossless even if the
-/// body itself contains newlines (JSON-pretty-printed responses).
+/// body itself contains newlines (JSON-pretty-printed responses). A
+/// missing or unparseable status/date line is a transport `Err`, not a
+/// defaulted status — see `parse_status_date_line`.
 ///
 /// `url` is rejected outright if it carries userinfo or fails to parse
 /// (round-2 redteam H2 — same rationale as [`post_json_node`], this
 /// function's stdin body is also a live-credential-bearing OAuth exchange
-/// payload). See [`reject_userinfo`].
-pub fn post_json_node_with_date(
-    url: &str,
-    body: &str,
-) -> Result<(Vec<u8>, Option<String>), String> {
+/// payload). See `reject_userinfo`.
+pub fn post_json_node_with_date(url: &str, body: &str) -> Result<NodeHttpResponse, String> {
     if !url.starts_with("https://") {
         return Err(ERR_HTTPS_REQUIRED.into());
     }
@@ -1146,17 +1211,12 @@ pub fn post_json_node_with_date(
     let newline_pos = stdout
         .iter()
         .position(|&b| b == b'\n')
-        .ok_or("missing date line in node output")?;
-    let date_str = std::str::from_utf8(&stdout[..newline_pos])
-        .map_err(|_| "invalid date line")?
-        .to_string();
-    let date = if date_str.is_empty() {
-        None
-    } else {
-        Some(date_str)
-    };
+        .ok_or("missing status/date line in node output")?;
+    let first_line = std::str::from_utf8(&stdout[..newline_pos])
+        .map_err(|_| "invalid status/date line".to_string())?;
+    let (status, date) = parse_status_date_line(first_line)?;
     let body = stdout[newline_pos + 1..].to_vec();
-    Ok((body, date))
+    Ok(NodeHttpResponse { status, body, date })
 }
 
 /// Debug-only upper bound on the encoded stdin payload
@@ -1375,9 +1435,236 @@ pub fn get_bearer_node(
     Ok((status, body))
 }
 
+/// Builds the Node.js script body for
+/// [`get_bearer_node_with_retry_after`].
+///
+/// Identical to [`build_get_bearer_script`] except for what the
+/// response handler writes to stdout: this variant adds a `retry-after`
+/// line between the status line and the body. See
+/// [`get_bearer_node_with_retry_after`]'s doc for why that line's
+/// content is restricted to `/^\d+$/` (or empty) INSIDE this script,
+/// before it ever reaches Rust.
+fn build_get_bearer_with_retry_after_script(url_literal: &str) -> String {
+    format!(
+        r#"
+process.on('uncaughtException', () => {{ process.stderr.write('script_error'); process.exit(1); }});
+const https = require('https');
+const url = new URL({url_literal});
+let input = '';
+process.stdin.on('data', c => input += c);
+process.stdin.on('end', () => {{
+  const {{ token, extra }} = JSON.parse(input);
+  const headers = {{...extra, 'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}};
+  const req = https.request(url, {{
+    method: 'GET',
+    headers,
+    timeout: {NODE_TIMEOUT_MS}
+  }}, res => {{
+    let data = [];
+    res.on('data', c => data.push(c));
+    res.on('end', () => {{
+      const body = Buffer.concat(data);
+      // retry-after is SERVER-controlled. Emit it ONLY when it is a
+      // delay-seconds value (RFC 9110 10.2.3, digits only) -- an
+      // HTTP-date form or anything else is dropped, never forwarded.
+      // This is the emission-time guarantee the Rust-side wire-format
+      // doc depends on: only ASCII digits (or nothing) can ever occupy
+      // this line, so no value the header could carry can desync the
+      // two-newline framing below.
+      const ra = res.headers['retry-after'];
+      const raLine = (typeof ra === 'string' && /^\d+$/.test(ra)) ? ra : '';
+      // First line of stdout: status code. Second: retry-after (or
+      // empty). Rest: body.
+      process.stdout.write(res.statusCode + '\n');
+      process.stdout.write(raLine + '\n');
+      process.stdout.write(body);
+    }});
+  }});
+  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
+  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+  req.end();
+}});
+"#
+    )
+}
+
+/// GETs a URL with a Bearer token using a Node.js subprocess, like
+/// [`get_bearer_node`], but additionally captures the response's
+/// `retry-after` header as a delay-seconds value.
+///
+/// # Why a sibling function, not an extended [`get_bearer_node`]
+///
+/// `HttpGetFn` (the closure type that wraps `get_bearer_node`'s
+/// `(u16, Vec<u8>)` signature) is threaded through every usage-poller
+/// surface -- codex, kimi, grok, zai, minimax, deepseek, third_party,
+/// the refresher, `custodian.rs`, and every mock in their test suites.
+/// Only the Anthropic usage poller needs `retry-after`: csq had no code
+/// path that read the header on ANY 429 response, and honoring a
+/// server-stated wait is correct on its own merits whenever the server
+/// sends one — independent of how often that happens in practice for
+/// any particular host or account. Widening the shared return type would
+/// force every one of those unrelated call sites and mocks to grow a
+/// field they never read. See
+/// `csq-core/src/daemon/usage_poller/mod.rs`'s
+/// `HttpGetWithRetryAfterFn`, which wraps this function and is wired
+/// ONLY into the Anthropic poller.
+///
+/// # Wire format: why `retry-after` is validated in JavaScript, not Rust
+///
+/// This is the RESPONSE-side analogue of the hazard documented on
+/// [`get_bearer_node`] for the REQUEST side (MED-1, an internal ticket redteam):
+/// there, an attacker-controlled `token` containing an embedded
+/// newline could desynchronise a newline-delimited stdin protocol and
+/// override a header. Here, `retry-after` is SERVER-controlled rather
+/// than ours, and the stdout wire format below is newline-delimited
+/// (status line, retry-after line, body) -- so the same hazard shape
+/// applies in the opposite direction: a malicious or misconfigured
+/// origin could inject arbitrary bytes, including embedded newlines,
+/// into the `retry-after` header value and desynchronise the Rust-side
+/// parser's two-newline body offset.
+///
+/// The fix is the same principle applied at the opposite end: the
+/// script in `build_get_bearer_with_retry_after_script` matches the
+/// header value against `/^\d+$/` and writes EITHER that validated
+/// digit run OR an empty string -- never the raw header value. No byte
+/// the origin sends can reach the wire format un-validated, so no
+/// value of that header can ever contain a newline (or anything else)
+/// by the time it crosses the process boundary. Re-validating in Rust
+/// AFTER the bytes have already been spliced into the byte stream
+/// would be checking a format that was already unsafe to construct;
+/// checking in JS, at the point of emission, is what makes the
+/// guarantee structural.
+///
+/// # Returns
+///
+/// `(status_code, retry_after_seconds, body_bytes)`. `retry_after_seconds`
+/// is `Some(n)` only when the header was present and matched
+/// `^\d+$`; an absent header, an HTTP-date value, or any other
+/// non-digit content are ALL normalised to `None` here (as is a digit
+/// run too large for `u64`, e.g. from a malformed origin) -- this
+/// function reports "did the server give us a wait time we could use",
+/// not "was the header present". Callers that need to distinguish
+/// those cases do not exist today; if one arises, thread the raw
+/// string through instead of collapsing it here.
+pub fn get_bearer_node_with_retry_after(
+    url: &str,
+    token: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, Option<u64>, Vec<u8>), String> {
+    if !url.starts_with("https://") {
+        return Err(ERR_HTTPS_REQUIRED.into());
+    }
+    if url_has_unsafe_js_chars(url) {
+        tracing::warn!(
+            error_kind = "url_rejected_unsafe_js_chars",
+            "node http transport: rejected outbound url containing disallowed characters"
+        );
+        return Err(ERR_URL_UNSAFE_CHARS.into());
+    }
+    // Mirrors get_bearer_node's token guard: belt-and-braces against a
+    // future edit reintroducing raw stdin interpolation. See that
+    // function's doc for the full rationale, including the C1 control
+    // range and U+2028/U+2029 line separators.
+    if token.chars().any(|c| {
+        matches!(c, '\r' | '\n' | '\u{2028}' | '\u{2029}')
+            || (c as u32) < 0x20
+            || (0x7F..=0x9F).contains(&(c as u32))
+    }) {
+        return Err(ERR_TOKEN_UNSAFE_CHARS.into());
+    }
+    // See get_bearer_node's doc for why an unparseable url is rejected
+    // outright rather than left to Node's `new URL(...)`.
+    reject_userinfo(url)?;
+
+    let runtime = find_js_runtime()?;
+    let url_literal = js_url_literal(url)?;
+    let payload_json = bearer_stdin_payload(token, extra_headers)?;
+    let script = build_get_bearer_with_retry_after_script(&url_literal);
+
+    let mut child = std::process::Command::new(&runtime)
+        .arg("-e")
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
+
+    write_stdin_or_reap(&mut child, payload_json.as_bytes())?;
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(node_failure_error(&output.stderr));
+    }
+
+    let stdout = output.stdout;
+    let first_nl = stdout
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or("missing status line in node output")?;
+    let status_str = std::str::from_utf8(&stdout[..first_nl]).map_err(|_| "invalid status line")?;
+    let status: u16 = status_str
+        .parse()
+        .map_err(|_| format!("invalid status code: {status_str}"))?;
+
+    let rest = &stdout[first_nl + 1..];
+    let second_nl = rest
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or("missing retry-after line in node output")?;
+    let retry_after_str =
+        std::str::from_utf8(&rest[..second_nl]).map_err(|_| "invalid retry-after line")?;
+    // Empty is the script's explicit "absent or unparseable" sentinel.
+    // An empty string also fails `str::parse::<u64>`, so folding this
+    // into the parse-failure branch below would behave identically --
+    // both yield `None` -- but this keeps "the header wasn't there"
+    // and "the header was present but corrupt" distinguishable in the
+    // reasoning even though callers only observe `None` either way.
+    let retry_after = if retry_after_str.is_empty() {
+        None
+    } else {
+        retry_after_str.parse::<u64>().ok()
+    };
+
+    let body = rest[second_nl + 1..].to_vec();
+
+    Ok((status, retry_after, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parse_status_date_line ────────────────────────────────────
+
+    #[test]
+    fn parse_status_date_line_status_and_date() {
+        let (status, date) = parse_status_date_line("429 Tue, 22 Apr 2026 14:32:01 GMT").unwrap();
+        assert_eq!(status, 429);
+        assert_eq!(date.as_deref(), Some("Tue, 22 Apr 2026 14:32:01 GMT"));
+    }
+
+    #[test]
+    fn parse_status_date_line_no_date_is_none() {
+        // The script always emits the separating space even when the
+        // Date header is absent.
+        let (status, date) = parse_status_date_line("200 ").unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(date, None);
+    }
+
+    #[test]
+    fn parse_status_date_line_rejects_empty_line() {
+        assert!(parse_status_date_line("").is_err());
+    }
+
+    #[test]
+    fn parse_status_date_line_rejects_non_numeric_status() {
+        assert!(parse_status_date_line("abc x").is_err());
+    }
 
     #[test]
     fn client_constructs_without_panic() {
@@ -2189,6 +2476,80 @@ mod tests {
         let result = get_bearer_node("https://example.com/x", "tok\u{85}en", &[]);
         assert!(result.is_err(), "C1-control-bearing token must be rejected");
         assert_eq!(result.unwrap_err(), ERR_TOKEN_UNSAFE_CHARS);
+    }
+
+    // ── get_bearer_node_with_retry_after: pre-flight guards mirror
+    // get_bearer_node's (see that function's tests above for the full
+    // rationale on each) ────────────────────────────────────────────
+
+    #[test]
+    fn get_bearer_node_with_retry_after_rejects_url_with_userinfo() {
+        let result = get_bearer_node_with_retry_after(
+            "https://cli-chat-proxy.grok.com@evil.example/v1",
+            "tok",
+            &[],
+        );
+        assert!(result.is_err(), "userinfo url must be rejected");
+        assert!(
+            result.unwrap_err().contains("userinfo"),
+            "error must name userinfo as the rejection reason"
+        );
+    }
+
+    #[test]
+    fn get_bearer_node_with_retry_after_rejects_token_with_embedded_newline() {
+        let attack_token = "real-token\n{\"Authorization\":\"Bearer attacker\"}";
+        let result = get_bearer_node_with_retry_after(
+            "https://example.com/api/oauth/usage",
+            attack_token,
+            &[],
+        );
+        assert!(result.is_err(), "newline-bearing token must be rejected");
+        assert_eq!(result.unwrap_err(), ERR_TOKEN_UNSAFE_CHARS);
+    }
+
+    #[test]
+    fn get_bearer_node_with_retry_after_rejects_url_with_disallowed_chars() {
+        let result = get_bearer_node_with_retry_after(
+            "https://evil.example/');process.exit(1);//",
+            "tok",
+            &[],
+        );
+        assert!(result.is_err(), "single-quote url must be rejected");
+        assert_eq!(result.unwrap_err(), ERR_URL_UNSAFE_CHARS);
+    }
+
+    /// The security-critical claim on
+    /// [`get_bearer_node_with_retry_after`]'s doc is that the SCRIPT
+    /// itself -- not a Rust-side check -- restricts the `retry-after`
+    /// line to a validated digit run. Asserted directly on the generated
+    /// script text (mirrors `build_get_bearer_script_spreads_extra_before_authorization`
+    /// above, which pins a different composition property the same way):
+    /// no live node or network needed to prove the regex is present and
+    /// that a non-matching value is normalised to an EMPTY line rather
+    /// than forwarded verbatim.
+    #[test]
+    fn build_get_bearer_with_retry_after_script_validates_header_as_digits_only() {
+        let script = build_get_bearer_with_retry_after_script("\"https://example.com/\"");
+        assert!(
+            script.contains(r"/^\d+$/.test(ra)"),
+            "script must gate emission on a digits-only regex match: {script}"
+        );
+        assert!(
+            script.contains(
+                "const raLine = (typeof ra === 'string' && /^\\d+$/.test(ra)) ? ra : '';"
+            ),
+            "a non-matching (or absent) header must normalise to an EMPTY \
+             string, never the raw header value, so the wire format's \
+             two-newline framing cannot be desynchronised: {script}"
+        );
+        assert!(
+            script.contains("process.stdout.write(res.statusCode + '\\n');")
+                && script.contains("process.stdout.write(raLine + '\\n');")
+                && script.contains("process.stdout.write(body);"),
+            "wire format must be status-line, then retry-after-line, then \
+             body, in that order: {script}"
+        );
     }
 
     #[test]

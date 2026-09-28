@@ -445,7 +445,7 @@ fn build_outcome_record(kind: EventKind, payload: EventPayload, now_ts: &str) ->
 /// Append a single locally-produced outcome record (`kind` + `payload`) to the
 /// Op audit chain, signing it when a chain-signing cutoff is active (else an
 /// unsigned pre-cutoff record, mirroring [`anchor_head`]'s
-/// [`load_signing_key_if_active`] fallback). The writer assigns `seq`,
+/// `load_signing_key_if_active` fallback). The writer assigns `seq`,
 /// `prev_hash`, `canonical_hash`, and `ts`; the caller supplies only `now_ts`
 /// (stamped into the record before the writer overwrites `ts`, kept for callers
 /// that stamp their own producer-clock field inside the payload).

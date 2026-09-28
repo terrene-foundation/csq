@@ -17,7 +17,7 @@ use crate::error::CredentialError;
 use serde_json::{Map, Value};
 use std::path::Path;
 
-/// Marks the onboarding flag in `config_dir/.claude.json` so CC's setup
+/// Marks the onboarding flag in `<config_dir>/.claude.json` so CC's setup
 /// wizard doesn't run again.
 ///
 /// Preserves any existing fields in `.claude.json`. If the file doesn't
@@ -47,15 +47,17 @@ pub fn mark_onboarding_complete(config_dir: &Path) -> Result<(), CredentialError
     })?;
 
     // Atomic write with §5a cleanup: .claude.json carries CC session
-    // metadata (oauthAccount, GrowthBook flags, recent dirs) — not OAuth
-    // tokens directly, but partial-failure leaves session state at
-    // umask 0o644 which is a downgrade from the user's default privacy.
+    // metadata (oauthAccount email, GrowthBook flags, recent dirs) — this
+    // site had NO secure_file step at all, so the file used to be left
+    // permanently at umask-default 0o644 (not merely a transient window).
+    // `write_new_private` creates the tmp file at 0o600 at creation, and
+    // that mode carries through `atomic_replace`'s rename.
     let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(CredentialError::Io {
             path: tmp,
-            source: e,
+            source: std::io::Error::other(e.to_string()),
         });
     }
     if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &path) {

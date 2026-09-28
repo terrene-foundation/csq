@@ -12,6 +12,9 @@
 
 #![cfg(unix)]
 
+#[path = "../src/daemon/test_socket_fixture.rs"]
+mod test_socket_fixture;
+
 use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
 use csq_core::daemon::{
     cache::TtlCache,
@@ -30,6 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use test_socket_fixture::{UnixSocketFixture, UnixSocketPath};
 
 /// PR-G4a: every live-IPC happy-path test now must provision the
 /// slot before posting events — the H2 gate refuses unprovisioned
@@ -49,7 +53,8 @@ fn make_router_state(base: &Path) -> RouterState {
         base_dir: Arc::new(base.to_path_buf()),
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
-        audit_health: csq_core::audit::AuditHealth::Verified,
+        audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
+        audit_records_unverified: 0,
         anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
@@ -83,7 +88,8 @@ where
     F: FnOnce(std::path::PathBuf) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let sock = base.join("csq-test.sock");
+    let socket = UnixSocketPath::new().unwrap();
+    let sock = socket.path();
     let (handle, join) = serve(&sock, make_router_state(base)).await.unwrap();
 
     f(sock.clone()).await;
@@ -237,8 +243,8 @@ async fn client_invalidate_cache_clears_discovery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_connect_fails_after_shutdown() {
-    let dir = TempDir::new().unwrap();
-    let sock = dir.path().join("csq-test.sock");
+    let dir = UnixSocketFixture::new().unwrap();
+    let sock = dir.socket_path();
 
     let (handle, join) = serve(&sock, make_router_state(dir.path())).await.unwrap();
 
@@ -327,7 +333,7 @@ async fn gemini_event_live_ipc_then_ndjson_drain_does_not_double_count() {
     use csq_core::daemon::usage_poller::gemini as gemini_consumer;
     use csq_core::providers::gemini::capture::append_event;
 
-    let dir = TempDir::new().unwrap();
+    let dir = UnixSocketFixture::new().unwrap();
     provision_gemini_slot(dir.path(), 6);
     let envelope = EventEnvelope::new(
         AccountNum::try_from(6u16).unwrap(),
@@ -343,14 +349,15 @@ async fn gemini_event_live_ipc_then_ndjson_drain_does_not_double_count() {
         base_dir: Arc::new(dir.path().to_path_buf()),
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: gemini_consumer::GeminiConsumerState::default(),
-        audit_health: csq_core::audit::AuditHealth::Verified,
+        audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
+        audit_records_unverified: 0,
         anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     };
     let consumer = state.gemini_consumer.clone();
 
-    let sock = dir.path().join("csq-dual.sock");
+    let sock = dir.socket_path();
     let (handle, join) = serve(&sock, state).await.unwrap();
     let resp = http_post_unix_json(&sock, "/api/gemini/event", &body).unwrap();
     assert_eq!(resp.status, 204);

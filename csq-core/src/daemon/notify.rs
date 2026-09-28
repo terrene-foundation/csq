@@ -182,13 +182,8 @@ const WINDOWS_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `#[cfg(unix)]`: PathBuf is used ONLY by the two `#[cfg(unix)]` listener
-    // tests below, so an unconditional import is an `unused_imports` error
-    // under `-D warnings` on the Windows lane — which is the one lane this
-    // module exists to fix. Caught by
-    // `cargo clippy --target x86_64-pc-windows-gnu`, not by any Unix gate.
     #[cfg(unix)]
-    use std::path::PathBuf;
+    use crate::daemon::test_socket_fixture::UnixSocketFixture;
 
     /// Non-vacuity + behavior: with no daemon running at all (fresh tempdir,
     /// nothing bound), both notify calls MUST return without panicking or
@@ -235,8 +230,8 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
 
-        let dir = tempfile::tempdir().unwrap();
-        let sock: PathBuf = dir.path().join("notify-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let listener = UnixListener::bind(&sock).unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -270,8 +265,8 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
 
-        let dir = tempfile::tempdir().unwrap();
-        let sock: PathBuf = dir.path().join("notify-test-body.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let listener = UnixListener::bind(&sock).unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel::<String>();

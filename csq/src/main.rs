@@ -96,7 +96,25 @@ fn main() {
                     .spawn(|| match cli::run() {
                         Ok(()) => 0,
                         Err(e) => {
-                            eprintln!("Error: {e:?}");
+                            // L3: `{e:?}` renders anyhow's FULL causal chain —
+                            // every `.context()` layer plus the root cause —
+                            // which can embed a raw absolute path from deep
+                            // inside csq-core (e.g. `CredentialError::RepointFailed`'s
+                            // `{path}`, `CredentialError::Io`'s `{path}`, or a
+                            // `PlatformError::LockContention`/`LockTimeout`
+                            // folded into an `io::Error::other(other.to_string())`
+                            // by `session::handle_dir::commit_prepared_handle_settings`).
+                            // Redacting the operator's `$HOME` prefix at THIS
+                            // single chokepoint — every CLI command's error
+                            // exit, not just `csq swap`'s — is simpler and
+                            // more complete than hunting down every nested
+                            // `Display` impl that might embed a path.
+                            eprintln!(
+                                "Error: {}",
+                                csq_core::cli_deps::sanitize::redact_home_anywhere(&format!(
+                                    "{e:?}"
+                                ))
+                            );
                             1
                         }
                     })

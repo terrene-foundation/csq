@@ -44,6 +44,9 @@
 
 #![cfg(unix)]
 
+#[path = "../src/daemon/test_socket_fixture.rs"]
+mod test_socket_fixture;
+
 use csq_core::audit::persist::{gen_run_id, AuditRecord, Decision, ResultState, Surface};
 use csq_core::daemon::startup_reconciler::run_reconciler;
 use csq_core::daemon::{
@@ -56,7 +59,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
+use test_socket_fixture::UnixSocketFixture;
 
 // ── Load test configuration ──────────────────────────────────────────────────
 
@@ -90,7 +93,8 @@ fn make_router_state(base: &Path) -> RouterState {
         base_dir: Arc::new(base.to_path_buf()),
         oauth_store: Some(Arc::new(OAuthStateStore::new())),
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
-        audit_health: csq_core::audit::AuditHealth::Verified,
+        audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
+        audit_records_unverified: 0,
         anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
@@ -200,9 +204,9 @@ fn write_pending_record(pending_dir: &Path, run_id: &str, body: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn load_test_all_records_eventually_persisted() {
-    let dir = TempDir::new().unwrap();
+    let dir = UnixSocketFixture::new().unwrap();
     let base = dir.path().to_path_buf();
-    let sock_path = base.join("csq-load-test.sock");
+    let sock_path = dir.socket_path();
 
     // Start the real daemon server.
     let (handle, join_handle) = serve(&sock_path, make_router_state(&base)).await.unwrap();
@@ -321,9 +325,9 @@ async fn load_test_all_records_eventually_persisted() {
 /// Smoke test: a single audit record round-trips via the real daemon IPC route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_record_single_round_trip_via_daemon() {
-    let dir = TempDir::new().unwrap();
+    let dir = UnixSocketFixture::new().unwrap();
     let base = dir.path().to_path_buf();
-    let sock_path = base.join("csq-audit-smoke.sock");
+    let sock_path = dir.socket_path();
 
     let (handle, join_handle) = serve(&sock_path, make_router_state(&base)).await.unwrap();
 

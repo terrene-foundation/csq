@@ -106,6 +106,15 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read context metadata from the same runtime snapshot path as model commands.
+fn model_context_window(base_dir: &Path, model: &str) -> Result<Option<u64>> {
+    let manifest = csq_core::providers::model_manifest::ModelManifest::load(base_dir)?;
+    Ok(manifest
+        .catalog()
+        .find(model)
+        .and_then(|row| row.context_window))
+}
+
 /// Builds the rich statusline using the parsed CC stdin + a git
 /// probe in the workspace directory. Returns `None` when stdin is
 /// empty / unparseable and there's nothing rich to add — the caller
@@ -143,10 +152,15 @@ fn build_rich_line(
                 .ok()
                 .filter(|m| !m.is_empty())
         });
-    ctx.ctx_window_true = model_id.and_then(|m| {
-        csq_core::providers::ModelCatalog::default_catalog()
-            .find(&m)
-            .and_then(|mi| mi.context_window)
+    ctx.ctx_window_true = model_id.and_then(|m| match model_context_window(base_dir, &m) {
+        Ok(window) => window,
+        Err(error) => {
+            tracing::warn!(
+                error_kind = "model_manifest_invalid",
+                "model context unavailable: {error}"
+            );
+            None
+        }
     });
     ctx.git = parse_workspace_dir(stdin_buf)
         .as_deref()
@@ -226,38 +240,87 @@ fn git_status(dir: &str) -> Option<GitStatus> {
     };
 
     // Stage 3: dirty? `git diff --quiet` returns 0 clean, 1 dirty.
-    // Any other status (missing binary, aborted) → treat as clean
-    // rather than inventing a dirty flag.
-    let worktree_dirty = Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .arg("diff")
-        .arg("--quiet")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.code() == Some(1))
-        .unwrap_or(false);
-    let index_dirty = Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .arg("diff")
-        .arg("--cached")
-        .arg("--quiet")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.code() == Some(1))
-        .unwrap_or(false);
+    // THREE outcomes, not two: `Some(false)` (clean), `Some(true)`
+    // (dirty), or `None` when git could not answer at all — spawn
+    // failure, or any exit that is neither 0 nor 1. That last case
+    // covers a missing binary, an aborted diff (exit 128), AND a
+    // signal-killed git process (`ExitStatus::code()` returns `None`
+    // on Unix) — the collapse that made this function report a
+    // confident `dirty: false` for a killed-under-load git process,
+    // indistinguishable from a genuinely clean repo (an internal ticket).
+    // `None` is NOT inferred to be clean here; only the render site
+    // in `quota::format::rich_statusline` decides how to DISPLAY an
+    // unmeasured repo, and it deliberately renders `None` the same as
+    // clean — see that function's doc for why display and knowledge
+    // are different questions.
+    let diff_dirty = |status: std::io::Result<std::process::ExitStatus>| -> Option<bool> {
+        match status.ok().and_then(|s| s.code()) {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        }
+    };
+    let worktree_dirty = diff_dirty(
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("diff")
+            .arg("--quiet")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    );
+    let index_dirty = diff_dirty(
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("diff")
+            .arg("--cached")
+            .arg("--quiet")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    );
+    // A confirmed dirty from EITHER side wins even if the other side
+    // could not be measured — dirty is dirty. Only when neither side
+    // confirms dirty AND at least one side is unmeasured does the
+    // combined result become `None` rather than a confident `false`.
+    let dirty = match (worktree_dirty, index_dirty) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    };
 
-    Some(GitStatus {
-        branch,
-        dirty: worktree_dirty || index_dirty,
-    })
+    Some(GitStatus { branch, dirty })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_manifest_statusline_context_reads_updates_and_rejects_invalid_data() {
+        use csq_core::providers::model_manifest::{manifest_path, ModelManifest};
+        let base = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            super::model_context_window(base.path(), "deepseek-flash[1m]").unwrap(),
+            Some(1_000_000)
+        );
+        let mut manifest = ModelManifest::bundled();
+        manifest
+            .models
+            .iter_mut()
+            .find(|m| m.id == "deepseek-flash")
+            .unwrap()
+            .context_window = Some(2_000_000);
+        let path = manifest_path(base.path());
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            super::model_context_window(base.path(), "deepseek-flash[1m]").unwrap(),
+            Some(2_000_000)
+        );
+        std::fs::write(path, b"invalid").unwrap();
+        assert!(super::model_context_window(base.path(), "deepseek-flash[1m]").is_err());
+    }
+
     use super::*;
     use tempfile::TempDir;
 
@@ -312,6 +375,16 @@ mod tests {
 
     #[test]
     fn git_status_none_outside_repo() {
+        // MUST hold the WORKSPACE-WIDE lock: this test spawns `git`, which is
+        // resolved through the process-global PATH, and sibling tests in this
+        // same `csq --lib` binary set `PATH` to "" and to a fixture dir
+        // (`csq/src/desktop/commands/mod.rs`) under that same lock. A reader
+        // that skips it races a mid-flight mutation, `Command::new("git")`
+        // fails to spawn, `git_status` returns None via `.ok()?`, and the
+        // assertion below reads as "not in a repo". Reader side of
+        // `test-hermeticity.md` MUST-1b/1c — mutating nothing is not the same
+        // as not participating in the race.
+        let _guard = env_guard();
         // A non-existent dir shouldn't be probed.
         assert!(git_status("/definitely/not/a/real/path/12345").is_none());
 
@@ -322,6 +395,16 @@ mod tests {
 
     #[test]
     fn git_status_clean_repo_reports_branch_not_dirty() {
+        // MUST hold the WORKSPACE-WIDE lock: this test spawns `git`, which is
+        // resolved through the process-global PATH, and sibling tests in this
+        // same `csq --lib` binary set `PATH` to "" and to a fixture dir
+        // (`csq/src/desktop/commands/mod.rs`) under that same lock. A reader
+        // that skips it races a mid-flight mutation, `Command::new("git")`
+        // fails to spawn, `git_status` returns None via `.ok()?`, and the
+        // assertion below reads as "not in a repo". Reader side of
+        // `test-hermeticity.md` MUST-1b/1c — mutating nothing is not the same
+        // as not participating in the race.
+        let _guard = env_guard();
         let tmp = TempDir::new().unwrap();
         run_git(tmp.path(), &["init", "-q", "--initial-branch=main"]);
         // Fresh repo with no commits is still considered "in a repo".
@@ -332,11 +415,25 @@ mod tests {
 
         let g = git_status(tmp.path().to_str().unwrap()).expect("in repo → Some");
         assert_eq!(g.branch, "main");
-        assert!(!g.dirty, "freshly-committed repo should be clean");
+        assert_eq!(
+            g.dirty,
+            Some(false),
+            "freshly-committed repo should be clean"
+        );
     }
 
     #[test]
     fn git_status_reports_worktree_dirty() {
+        // MUST hold the WORKSPACE-WIDE lock: this test spawns `git`, which is
+        // resolved through the process-global PATH, and sibling tests in this
+        // same `csq --lib` binary set `PATH` to "" and to a fixture dir
+        // (`csq/src/desktop/commands/mod.rs`) under that same lock. A reader
+        // that skips it races a mid-flight mutation, `Command::new("git")`
+        // fails to spawn, `git_status` returns None via `.ok()?`, and the
+        // assertion below reads as "not in a repo". Reader side of
+        // `test-hermeticity.md` MUST-1b/1c — mutating nothing is not the same
+        // as not participating in the race.
+        let _guard = env_guard();
         let tmp = TempDir::new().unwrap();
         run_git(tmp.path(), &["init", "-q", "--initial-branch=main"]);
         std::fs::write(tmp.path().join("README"), "hello").unwrap();
@@ -346,11 +443,21 @@ mod tests {
         std::fs::write(tmp.path().join("README"), "hello + new").unwrap();
 
         let g = git_status(tmp.path().to_str().unwrap()).unwrap();
-        assert!(g.dirty, "worktree edit should flip dirty=true");
+        assert_eq!(g.dirty, Some(true), "worktree edit should flip dirty=true");
     }
 
     #[test]
     fn git_status_reports_staged_dirty() {
+        // MUST hold the WORKSPACE-WIDE lock: this test spawns `git`, which is
+        // resolved through the process-global PATH, and sibling tests in this
+        // same `csq --lib` binary set `PATH` to "" and to a fixture dir
+        // (`csq/src/desktop/commands/mod.rs`) under that same lock. A reader
+        // that skips it races a mid-flight mutation, `Command::new("git")`
+        // fails to spawn, `git_status` returns None via `.ok()?`, and the
+        // assertion below reads as "not in a repo". Reader side of
+        // `test-hermeticity.md` MUST-1b/1c — mutating nothing is not the same
+        // as not participating in the race.
+        let _guard = env_guard();
         let tmp = TempDir::new().unwrap();
         run_git(tmp.path(), &["init", "-q", "--initial-branch=main"]);
         std::fs::write(tmp.path().join("README"), "hello").unwrap();
@@ -361,7 +468,66 @@ mod tests {
         run_git(tmp.path(), &["add", "NEW"]);
 
         let g = git_status(tmp.path().to_str().unwrap()).unwrap();
-        assert!(g.dirty, "staged file should flip dirty=true");
+        assert_eq!(g.dirty, Some(true), "staged file should flip dirty=true");
+    }
+
+    /// an internal ticket / an internal ticket row 18 regression guard: `git diff --quiet` can exit with
+    /// something other than 0 or 1 — on Unix a signal-killed git process makes
+    /// `ExitStatus::code()` return `None`; a repo whose index git cannot parse
+    /// (this test's reproduction) makes it exit 128. Both must land on
+    /// `dirty: None` ("could not measure"), never on the same `Some(false)` a
+    /// genuinely clean repo reports. Without this case the suite cannot tell
+    /// `Option<bool>` apart from a `bool` that happens to be right today —
+    /// deleting the `None` arm and collapsing it into `Some(false)` must RED
+    /// this test (proven by mutation, not asserted).
+    ///
+    /// WHY A CORRUPT INDEX AND NOT AN UNREADABLE FILE. The first version of
+    /// this test chmod'd a tracked file to `0o000`. That is NOT portable and
+    /// shipped red: macOS git cannot hash the file and exits 128, but Linux
+    /// git treats it as modified and exits 1, so the assertion read
+    /// `Some(true)` on ubuntu and enterprise CI while passing locally. An
+    /// unparseable index is a fatal in git's index-reading path on every
+    /// platform, needs no permission semantics, and therefore also needs no
+    /// root guard — root parses a corrupt index exactly as badly as anyone
+    /// else, whereas `0o000` is bypassed by DAC_OVERRIDE.
+    ///
+    /// Stages 1 and 2 of `git_status` still succeed: `rev-parse --git-dir`
+    /// and `branch --show-current` read HEAD and the gitdir, never the index.
+    /// Only stage 3 fails, which is precisely the arm under test.
+    #[test]
+    fn git_status_reports_none_when_diff_cannot_measure() {
+        // MUST hold the WORKSPACE-WIDE lock: this test spawns `git`, which is
+        // resolved through the process-global PATH, and sibling tests in this
+        // same `csq --lib` binary set `PATH` to "" and to a fixture dir
+        // (`csq/src/desktop/commands/mod.rs`) under that same lock. A reader
+        // that skips it races a mid-flight mutation, `Command::new("git")`
+        // fails to spawn, `git_status` returns None via `.ok()?`, and the
+        // assertion below reads as "not in a repo". Reader side of
+        // `test-hermeticity.md` MUST-1b/1c — mutating nothing is not the same
+        // as not participating in the race.
+        let _guard = env_guard();
+        let tmp = TempDir::new().unwrap();
+        run_git(tmp.path(), &["init", "-q", "--initial-branch=main"]);
+        let readme = tmp.path().join("README");
+        std::fs::write(&readme, "hello").unwrap();
+        run_git(tmp.path(), &["add", "README"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+
+        // Replace the index with bytes git cannot parse. `git diff --quiet`
+        // then exits 128 ("bad index file") — neither 0 (clean) nor 1
+        // (dirty) — reproducing the same "git ran but could not answer"
+        // shape a signal-killed process produces, deterministically and
+        // without depending on filesystem permission semantics.
+        std::fs::write(tmp.path().join(".git").join("index"), b"NOT-A-GIT-INDEX").unwrap();
+
+        let g = git_status(tmp.path().to_str().unwrap())
+            .expect("in a repo → Some, even when diff could not measure");
+        assert_eq!(
+            g.dirty, None,
+            "git diff exited non-0/1 on an unparseable index — must report \
+             None (could not measure), not a confident Some(false) \
+             indistinguishable from clean, nor Some(true)"
+        );
     }
 
     #[test]

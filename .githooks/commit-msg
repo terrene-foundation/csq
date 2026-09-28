@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# csq commit-msg hook — stamp direct commits on an integration branch.
+#
+# Every non-merge commit that reaches the integration branch must record where
+# it came from (scripts/landing/check-trailers.sh refuses the push otherwise).
+# A commit made DIRECTLY on dev or main — docs, formatting, registry edits — has
+# no source branch, so it records that fact:
+#     Landed-From: direct
+# Commits landed from a branch by scripts/landing/land.sh already carry
+# Landed-From / Landed-Partial and are left untouched. On any other branch this
+# hook does nothing.
+#
+# WIRING: same as pre-push — `git config core.hooksPath .githooks` once per clone.
+set -uo pipefail
+MSG_FILE="${1:-}"
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+
+BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+case "$BRANCH" in dev|main) ;; *) exit 0 ;; esac
+
+EXISTING="$(git interpret-trailers --parse < "$MSG_FILE" | grep -E '^(Landed-From|Landed-Partial):' || true)"
+[ -n "$EXISTING" ] && exit 0
+
+git interpret-trailers --in-place --trailer "Landed-From: direct" "$MSG_FILE"

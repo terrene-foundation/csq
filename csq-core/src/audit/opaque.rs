@@ -17,16 +17,20 @@
 //! # The fix (Design B — taxonomy untouched)
 //!
 //! Neither `EventKind`, `EventPayload`, nor any of their ~25 exhaustive-match
-//! consumers change — so the canonical form of every KNOWN record is
-//! byte-identical by construction and no deployed chain regresses. Instead, when
-//! the typed parse fails, the verifier falls back to parsing an [`OpaqueRecord`]
-//! that captures every structural field typed and the `payload` + optional EATP
-//! blobs VERBATIM via [`RawValue`]. The record then runs the SAME five integrity
-//! checks (chain_id, seq-monotonicity, prev_hash link, canonical_hash recompute,
-//! Ed25519 signature) plus the multi-sig inner threshold check — ONLY the typed
-//! payload SEMANTICS are deferred. An unknown-kind record whose signature and
-//! hash-chain verify is reported OPAQUE-BUT-INTACT (WARN + counted); a
-//! signature- or hash-INVALID unknown record stays `IntegrityBroken`.
+//! consumers change — valid typed known-record canonical bytes remain
+//! unchanged. Malformed recognized records formerly admitted as opaque are now
+//! deliberately rejected, not treated as a compatibility guarantee. When
+//! the typed parse fails, the verifier permits an [`OpaqueRecord`] ONLY when
+//! its top-level kind is genuinely unknown to EventKind. A recognized kind with
+//! invalid typed fields remains IntegrityBroken: payload consistency, strict
+//! fields and known guarded-operation semantics must not be downgraded. The
+//! opaque representation captures every structural field typed and the payload
+//! plus optional EATP blobs VERBATIM via [`RawValue`]. Both variants use the
+//! common integrity pipeline (chain id, sequence, link, hash, signature and
+//! multi-sig dispatch), retaining its historical-key, pre-cutoff and tail-window
+//! policies. Unknown typed payload semantics and unknown op-class membership
+//! are deferred. Successfully verified opaque records are warned and counted;
+//! failures in applicable hash/signature checks remain verification errors.
 //!
 //! # Why `RawValue` and not `serde_json::Value`
 //!
@@ -52,7 +56,10 @@
 //!
 //! # Scope boundary (honest)
 //!
-//! This path handles a NEW `EventKind` within the EXISTING v2 record envelope. A
+//! This path handles a NEW `EventKind` within the EXISTING v2 record envelope.
+//! Known-kind records retain SignedRecord's strict shape/versioned evolution
+//! contract; unknown fields or invalid typed annotations do not make their kind
+//! unknown. Genuinely unknown kinds keep the raw-byte compatibility below. A
 //! record carrying a NEW top-level CANONICAL field (a v2→v3 envelope change) is
 //! NOT reconstructable by an older reader (it cannot know where the field sits in
 //! canonical order) and correctly stays `IntegrityBroken` — that is a

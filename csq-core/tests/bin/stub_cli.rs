@@ -1,8 +1,11 @@
 //! Configurable test-fixture stub binary for cli_deps integration tests.
 //!
 //! Usage:
+//!
+//! ```text
 //!   stub-cli --stdout <str> --exit-code <N> --hang-ms <N> --emit-bytes <N>
 //!             --capture-argv <path>
+//! ```
 //!
 //! All flags are optional and can be combined.
 //!

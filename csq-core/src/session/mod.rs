@@ -4,12 +4,14 @@
 //! has its own credentials, current account marker, and settings, while
 //! sharing history/commands/skills via symlinks.
 
+pub mod codex_supervisor;
 pub mod handle_dir;
 pub mod isolation;
 pub mod merge;
 pub mod settings;
 pub mod setup;
 pub mod share_audit;
+pub mod shared_state;
 
 pub use handle_dir::{
     create_handle_dir, create_handle_dir_codex, create_handle_dir_codex_named,

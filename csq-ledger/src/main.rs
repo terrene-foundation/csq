@@ -33,6 +33,20 @@ async fn main() {
 /// The fallible body. Returns `Err(exit_code)` on a fatal startup error.
 async fn run() -> Result<(), i32> {
     let config = Config::parse();
+    if let Err(reason) = config.validate_bind_posture() {
+        error!(error = %reason, "refusing non-loopback listener");
+        return Err(78); // EX_CONFIG, before any key/storage/anchor side effects.
+    }
+    if config.allow_public_bind {
+        warn!("non-loopback bind acknowledged; listeners have NO authentication and MUST remain inside a trusted network");
+    }
+
+    // Fresh deployments may name a directory that does not exist yet. Key
+    // creation precedes storage recovery, so create it here (after validation).
+    if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
+        error!(error = %e, "failed to create ledger data directory");
+        return Err(74);
+    }
 
     // ── Load or generate the checkpoint signing key (decision 2) ─────────────
     let env_override = std::env::var(SIGNING_KEY_PATH_ENV).ok();
@@ -112,17 +126,17 @@ async fn run() -> Result<(), i32> {
     // firewall it more tightly than the read/write traffic. See
     // `server::mod` doc "Two listeners, two routers" + spec 17 §17.3.
     let addr = config.socket_addr();
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
             error!(error = %e, addr = %addr, "failed to bind read/write listener");
             return Err(74);
         }
     };
-    info!(addr = %addr, "csq-ledger read/write listener");
+    info!(addr = %listener.local_addr().map_err(|_| 74)?, "csq-ledger read/write listener");
 
     let authority_addr = config.authority_socket_addr();
-    let authority_listener = match tokio::net::TcpListener::bind(&authority_addr).await {
+    let authority_listener = match tokio::net::TcpListener::bind(authority_addr).await {
         Ok(l) => l,
         Err(e) => {
             error!(error = %e, addr = %authority_addr, "failed to bind authority listener");
@@ -130,7 +144,7 @@ async fn run() -> Result<(), i32> {
         }
     };
     info!(
-        addr = %authority_addr,
+        addr = %authority_listener.local_addr().map_err(|_| 74)?,
         "csq-ledger authority listener (revoke, verifier-bootstraps; internal-only by default)"
     );
 

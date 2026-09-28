@@ -403,6 +403,29 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
                     );
                     let _ = e;
                 }
+                // `keychain-fix-r9.md` D-Q2: a fresh `csq login` grant starts
+                // a NEW token-history segment for this identity — clearing
+                // whatever fingerprints an EARLIER grant left behind, so an
+                // old-grant token is no longer recognised as "known" by
+                // `keychain::decide_cc_keychain_write` rule 2. The fresh
+                // grant was already written to the canonical UUID-keyed
+                // credentials file (`credentials::save_canonical_for`, which
+                // runs BEFORE `finalize_login` — see this function's own
+                // top-level doc) and its own `record_write` call already
+                // appended it onto the OLD segment; this call is what
+                // actually starts the new one. Best-effort and non-fatal, the
+                // same as every other step in this block: an unreadable or
+                // non-Anthropic canonical file simply means no segment reset
+                // happens this login, never a hard failure.
+                let uuid_creds_path =
+                    crate::accounts::identity_store::credentials_path_for(base_dir, uuid);
+                if let Ok(raw) = std::fs::read_to_string(&uuid_creds_path) {
+                    if let Some(fp) =
+                        crate::credentials::token_history::fingerprint_from_raw_json(&raw)
+                    {
+                        crate::credentials::token_history::start_new_segment(base_dir, uuid, fp);
+                    }
+                }
             }
             None => {
                 if let Err(e) = markers::write_csq_account_legacy(&config_dir, account) {
@@ -609,7 +632,10 @@ pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, Co
     // (subprocess, paste-code, race). Account-agnostic sweep; the
     // newer-than-keychain guard no-ops unaffected dirs. Best-effort; never blocks
     // login. Test-safe: a base with no `term-*` dirs sweeps nothing.
-    let _ = crate::credentials::keychain::sync_all_handle_dirs(base_dir);
+    let _ = crate::credentials::keychain::sync_all_handle_dirs(
+        base_dir,
+        &std::collections::HashMap::new(),
+    );
 
     // GH an internal ticket (CLOSED, shipped): ACT on the marker binding captured
     // earlier — left un-acted until this point — before the mint above.
@@ -927,6 +953,99 @@ mod tests {
                 .access_token
                 .expose_secret(),
             "HIGH-2: UUID credentials must carry the same access_token as live creds"
+        );
+    }
+
+    /// `keychain-fix-r10.md` T-d: `finalize_login` must actually invoke
+    /// `token_history::start_new_segment` — proven end to end (no mock;
+    /// `start_new_segment` is not an injectable seam) by pre-seeding the
+    /// identity's history with an OLD grant's fingerprint before login, then
+    /// asserting it is GONE afterward and only the fresh grant's fingerprint
+    /// remains. If `finalize_login` never called `start_new_segment`, the
+    /// old fingerprint would still be present (this call's own
+    /// `save_canonical_for` → `record_write` path only APPENDS, it never
+    /// clears).
+    ///
+    /// RED: commenting out `finalize_login`'s `start_new_segment` call makes
+    /// this assertion fail — the old grant's fingerprint survives alongside
+    /// the new one instead of being cleared.
+    #[test]
+    fn finalize_login_starts_a_new_token_history_segment() {
+        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let uuid = fixture_uuid_for_slot(1);
+
+        let config_dir = base.join("config-1");
+        let claude_json_path = config_dir.join(".claude.json");
+        fs::write(
+            &claude_json_path,
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+
+        let old_refresh_token = "sk-ant-ort01-OLD-GRANT";
+        let old_fp = crate::credentials::token_history::fingerprint_from_raw_json(&format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"{old_refresh_token}"}}}}"#
+        ))
+        .unwrap();
+        // Pre-seed the identity's history with the OLD grant, as though a
+        // prior login/refresh had recorded it — requires the identity dir to
+        // already exist (S-N-2), so plant it first.
+        let identity_creds_path = uuid_creds_path(base, uuid);
+        std::fs::create_dir_all(identity_creds_path.parent().unwrap()).unwrap();
+        crate::credentials::token_history::append_history(base, uuid, old_fp);
+        assert!(
+            crate::credentials::token_history::read_history(base, uuid).contains(&old_fp),
+            "test precondition: the old grant must be recorded before login"
+        );
+
+        let new_grant = crate::credentials::CredentialFile::Anthropic(
+            crate::credentials::AnthropicCredentialFile {
+                claude_ai_oauth: crate::credentials::OAuthPayload {
+                    access_token: crate::types::AccessToken::new("sk-ant-oat01-new-grant".into()),
+                    refresh_token: crate::types::RefreshToken::new("sk-ant-ort01-new-grant".into()),
+                    expires_at: 4102444800000,
+                    scopes: vec!["user:inference".into()],
+                    subscription_type: Some("max".into()),
+                    rate_limit_tier: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                extra: std::collections::HashMap::new(),
+            },
+        );
+        let live_creds_path = config_dir.join(".credentials.json");
+        credentials::save(&live_creds_path, &new_grant).unwrap();
+        // Every REAL production caller calls `save_canonical_for` (via
+        // `read_fresh_after_login`) BEFORE `finalize_login` — this is what
+        // actually seeds `identities/<UUID>/credentials.json`, which is the
+        // file `finalize_login`'s own `start_new_segment` call reads to
+        // compute the fingerprint it starts the new segment at. Skipping
+        // this step (as an earlier draft of this test did) leaves that file
+        // absent, so `finalize_login`'s `std::fs::read_to_string` fails and
+        // the whole `start_new_segment` call is silently never reached —
+        // not a bug in `finalize_login`, but an unrealistic test fixture.
+        crate::credentials::file::save_canonical_for(base, account, &new_grant).unwrap();
+        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
+
+        let result = finalize_login(base, account);
+        assert!(result.is_ok(), "finalize_login must succeed: {:?}", result);
+
+        let history = crate::credentials::token_history::read_history(base, uuid);
+        assert!(
+            !history.contains(&old_fp),
+            "the OLD grant's fingerprint must be cleared by a new segment start, got {history:?}"
+        );
+        let new_fp = crate::credentials::token_history::fingerprint_from_raw_json(
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"sk-ant-ort01-new-grant"}}"#,
+        )
+        .unwrap();
+        assert!(
+            history.contains(&new_fp),
+            "the fresh grant's fingerprint must be present, got {history:?}"
         );
     }
 

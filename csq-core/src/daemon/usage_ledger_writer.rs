@@ -53,6 +53,8 @@ pub struct WriteReport {
     pub slots_rolled_off: usize,
     /// Slots whose `write_all` failed (logged, non-fatal).
     pub write_failures: usize,
+    /// Manifest could not be loaded; no ledger was written or rolled off.
+    pub manifest_load_failures: usize,
 }
 
 /// Handle to a running usage-ledger writer task.
@@ -76,10 +78,22 @@ pub fn run_once(
     base_dir: &Path,
     now: chrono::DateTime<chrono::Utc>,
 ) -> WriteReport {
-    let pairs = aggregator::aggregate(claude_home, base_dir, now, |slot: AccountNum| {
+    let pairs = match aggregator::aggregate(claude_home, base_dir, now, |slot: AccountNum| {
         crate::providers::settings::model_id_for_slot(base_dir, slot.get())
             .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
-    });
+    }) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            warn!(
+                error_kind = "usage_manifest_load_failed",
+                "usage-ledger manifest load failed; existing ledgers retained: {error:#}"
+            );
+            return WriteReport {
+                manifest_load_failures: 1,
+                ..WriteReport::default()
+            };
+        }
+    };
 
     // Group by slot, then full-replace each slot's ledger with its current
     // events. Full-replace is idempotent: re-running over the same transcripts
@@ -303,6 +317,7 @@ where
                             events_written = r.events_written,
                             slots_rolled_off = r.slots_rolled_off,
                             write_failures = r.write_failures,
+                            manifest_load_failures = r.manifest_load_failures,
                             "usage-ledger-writer tick complete"
                         ),
                         Err(e) => warn!(
@@ -379,6 +394,196 @@ mod tests {
     fn now() -> chrono::DateTime<chrono::Utc> {
         use chrono::TimeZone;
         chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap()
+    }
+
+    fn runtime_manifest_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let home = TempDir::new().unwrap();
+        let claude_home = home.path().join(".claude");
+        let base = claude_home.join("accounts");
+        fixture(
+            &claude_home,
+            &base,
+            11,
+            "manifest",
+            "fixture-manifest",
+            "2026-07-07T10:00:00Z",
+            1_000_000,
+            1_000_000,
+        );
+        let transcript = claude_home.join("projects/-work-manifest/fixture-manifest.jsonl");
+        let original = std::fs::read_to_string(&transcript).unwrap();
+        std::fs::write(
+            &transcript,
+            original.replace("claude-sonnet-4-6", "claude-manifest-fixture"),
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(now().into())
+            .unwrap();
+        (home, claude_home, base, transcript)
+    }
+
+    fn runtime_manifest_value(input_rate: f64) -> serde_json::Value {
+        let mut manifest =
+            serde_json::to_value(crate::providers::model_manifest::ModelManifest::bundled())
+                .unwrap();
+        manifest["revision"] = serde_json::json!(format!("private-fixture-{input_rate}"));
+        manifest["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "claude-manifest-fixture", "name": "Private fixture", "provider": "claude",
+                "context_window": 1_000_000, "output_limit": 4096, "aliases": []
+            }));
+        manifest["rates"].as_array_mut().unwrap().push(serde_json::json!({
+            "match_kind": "exact", "patterns": ["claude-manifest-fixture"], "strip_context_hint": false,
+            "epochs": [{"start_unix": null, "end_unix": null,
+                "rate": {"input_per_1m_usd": input_rate, "output_per_1m_usd": 2.0,
+                    "cache_read_per_1m_usd": null, "cache_write_per_1m_usd": null}, "peak": null}],
+            "evidence": "Private synthetic fixture, not vendor pricing"
+        }));
+        manifest
+    }
+
+    #[test]
+    fn runtime_manifest_writer_reloads_new_model_and_changed_rate_without_restart() {
+        let _env = crate::platform::test_env::lock();
+        let (_home, claude_home, base, transcript) = runtime_manifest_fixture();
+        let account = AccountNum::try_from(11u16).unwrap();
+        let original_transcript = std::fs::read(&transcript).unwrap();
+        assert_eq!(run_once(&claude_home, &base, now()).events_written, 1);
+        assert_eq!(
+            ledger::read_all(&base, account).unwrap().events[0].cost_usd_estimate,
+            None
+        );
+        for (input_rate, expected) in [(1.0, 3.0), (4.0, 6.0)] {
+            let manifest = runtime_manifest_value(input_rate);
+            std::fs::write(
+                base.join("model-rates.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let report = run_once(&claude_home, &base, now());
+            assert_eq!(report.manifest_load_failures, 0);
+            assert_eq!(report.events_written, 1);
+            let events = ledger::read_all(&base, account).unwrap().events;
+            assert_eq!(events[0].model, "claude-manifest-fixture");
+            assert_eq!(events[0].cost_usd_estimate, Some(expected));
+            assert_eq!(ledger::summarize(&events, now()).unestimated_cost_count, 0);
+        }
+        assert_eq!(std::fs::read(&transcript).unwrap(), original_transcript);
+    }
+
+    #[test]
+    fn runtime_manifest_aggregate_uses_one_snapshot_during_concurrent_file_change() {
+        let _env = crate::platform::test_env::lock();
+        let (_home, claude_home, base, transcript) = runtime_manifest_fixture();
+        let second = transcript.with_file_name("fixture-manifest-second.jsonl");
+        let source = std::fs::read_to_string(&transcript).unwrap();
+        std::fs::write(
+            &second,
+            source.replace("fixture-manifest", "fixture-manifest-second"),
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(second)
+            .unwrap()
+            .set_modified(now().into())
+            .unwrap();
+        let manifest_path = base.join("model-rates.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&runtime_manifest_value(1.0)).unwrap(),
+        )
+        .unwrap();
+        let mut calls = 0;
+        let events = aggregator::aggregate(&claude_home, &base, now(), |_| {
+            calls += 1;
+            // The callback runs after snapshot loading, while events are being
+            // converted. A mid-cycle update belongs to the next cycle only.
+            std::fs::write(&manifest_path, "{").unwrap();
+            "ignored-transcript-has-model".to_string()
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|(_, event)| event.cost_usd_estimate == Some(3.0)));
+        assert!(aggregator::aggregate(&claude_home, &base, now(), |_| String::new()).is_err());
+    }
+
+    #[test]
+    fn runtime_manifest_writer_invalid_present_file_preserves_active_and_rolloff_ledger_bytes() {
+        let _env = crate::platform::test_env::lock();
+        let (_home, claude_home, base, transcript) = runtime_manifest_fixture();
+        let account = AccountNum::try_from(11u16).unwrap();
+        assert_eq!(run_once(&claude_home, &base, now()).events_written, 1);
+        let path = ledger::ledger_path(&base, account);
+        let original = std::fs::read(&path).unwrap();
+        // Both syntactically broken and semantically invalid present files must
+        // stop before publish, including the no-transcript rolloff path.
+        for malformed in [
+            "{",
+            r#"{"schema_version":999,"revision":"invalid","models":[],"rates":[]}"#,
+        ] {
+            std::fs::write(base.join("model-rates.json"), malformed).unwrap();
+            let report = run_once(&claude_home, &base, now());
+            assert_eq!(
+                report,
+                WriteReport {
+                    manifest_load_failures: 1,
+                    ..WriteReport::default()
+                }
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        std::fs::remove_file(transcript).unwrap();
+        let report = run_once(&claude_home, &base, now());
+        assert_eq!(
+            report,
+            WriteReport {
+                manifest_load_failures: 1,
+                ..WriteReport::default()
+            }
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        // Removing the invalid override restores normal bundled behavior, not
+        // an indefinitely poisoned writer: now a real rolloff is legitimate.
+        std::fs::remove_file(base.join("model-rates.json")).unwrap();
+        assert_eq!(run_once(&claude_home, &base, now()).slots_rolled_off, 1);
+    }
+
+    #[test]
+    fn runtime_manifest_writer_unknown_historical_epoch_remains_unpriced() {
+        let _env = crate::platform::test_env::lock();
+        let (_home, claude_home, base, _transcript) = runtime_manifest_fixture();
+        let mut manifest = runtime_manifest_value(1.0);
+        let rule = manifest["rates"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap();
+        // This fixture session precedes the only declared epoch. No current
+        // price may be guessed for its historical timestamp.
+        rule["epochs"][0]["start_unix"] = serde_json::json!(now().timestamp());
+        std::fs::write(
+            base.join("model-rates.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let report = run_once(&claude_home, &base, now());
+        assert_eq!(report.manifest_load_failures, 0);
+        assert_eq!(report.events_written, 1);
+        let events = ledger::read_all(&base, AccountNum::try_from(11u16).unwrap())
+            .unwrap()
+            .events;
+        assert_eq!(events[0].cost_usd_estimate, None);
+        assert_eq!(ledger::summarize(&events, now()).unestimated_cost_count, 1);
     }
 
     #[test]
@@ -475,6 +680,10 @@ mod tests {
             cost_usd_estimate: Some(0.5),
             source: ledger::UsageSource::ProjectsJsonl,
             project_path: None,
+            snapshots_collapsed: 0,
+            finalization_divergent: false,
+            from_subagent: false,
+            unidentified: false,
         };
         ledger::write_all(&base_dir, slot, std::slice::from_ref(&stale)).unwrap();
         assert!(!ledger::read_all(&base_dir, slot).unwrap().events.is_empty());
@@ -533,6 +742,10 @@ mod tests {
             cost_usd_estimate: Some(0.5),
             source: ledger::UsageSource::ProjectsJsonl,
             project_path: None,
+            snapshots_collapsed: 0,
+            finalization_divergent: false,
+            from_subagent: false,
+            unidentified: false,
         };
         ledger::write_all(&base_dir, slot, std::slice::from_ref(&stale)).unwrap();
         assert!(uuid_ledger.exists(), "ledger must land at the UUID path");
@@ -614,6 +827,10 @@ mod tests {
             cost_usd_estimate: Some(0.01),
             source: ledger::UsageSource::ProjectsJsonl,
             project_path: None,
+            snapshots_collapsed: 0,
+            finalization_divergent: false,
+            from_subagent: false,
+            unidentified: false,
         };
         ledger::write_all(&base_dir, stale_slot, std::slice::from_ref(&stale)).unwrap();
 

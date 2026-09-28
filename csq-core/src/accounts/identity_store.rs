@@ -124,6 +124,90 @@ pub fn usage_ledger_path_for(base: &Path, id: IdentityId) -> PathBuf {
     identity_path(base, id).join("usage.ndjson")
 }
 
+/// Returns `<base>/identities/<uuid>/token-history`.
+///
+/// Bounded per-identity history of the SHA-256 fingerprints (never the raw
+/// tokens themselves) of every Anthropic refresh token this identity's
+/// canonical store has held — see `crate::credentials::token_history`
+/// (`pub(crate)`, so not linkable from this public doc). Absence means "no
+/// history recorded yet" (a fresh identity, or one minted before this file
+/// existed), which callers MUST treat as a graceful, non-fatal empty history
+/// rather than an error.
+pub fn token_history_path_for(base: &Path, id: IdentityId) -> PathBuf {
+    identity_path(base, id).join("token-history")
+}
+
+/// `keychain-fix-r11.md` D-5: returns `<base>/identities/<uuid>.removed` — a
+/// TOMBSTONE for a logged-out identity, deliberately a SIBLING of
+/// `identities/<uuid>/` (never inside it), so it SURVIVES `logout_account`'s
+/// `remove_dir_all` of the identity dir itself.
+///
+/// **The gap this closes.** `credentials::file::save_uuid_credentials` is
+/// the single canonical-store chokepoint for the refresher, backsync, the
+/// custodian's adopt path, AND login — and it unconditionally
+/// `create_dir_all`s the identity dir if absent, because a FRESH login
+/// legitimately needs that on first provisioning. `logout_account` removes
+/// the identity dir with no lock shared with any of those writers, so a
+/// refresher tick (or backsync, or an in-flight adopt) racing a logout can
+/// silently RECREATE the just-removed identity dir and write a token into
+/// it — resurrecting a credential the operator just logged out. Absent vs.
+/// removed are indistinguishable to `create_dir_all` alone; this tombstone
+/// is the third state a writer can check for. `is_identity_removed`/
+/// `mark_identity_removed`/`clear_identity_removed_marker` are the
+/// read/write/clear primitives; `logout_account` writes the marker in the
+/// SAME step it removes the dir, `save_uuid_credentials` refuses to write
+/// (fail closed) when it is present, and a fresh authorization event for
+/// that SAME uuid (`daemon::identity_mint::mint_for_login`) clears it —
+/// a legitimate new login supersedes a stale removal.
+pub fn identity_removed_marker_path(base: &Path, id: IdentityId) -> PathBuf {
+    identities_dir(base).join(format!("{}.removed", id.to_canonical_string()))
+}
+
+/// `true` iff `id` was logged out and no subsequent login has cleared the
+/// tombstone. Absence of the marker file (including any read error — a
+/// missing `identities/` dir, permission failure) reads as "not removed",
+/// which is the correct default for a fresh identity that was never logged
+/// out at all.
+pub fn is_identity_removed(base: &Path, id: IdentityId) -> bool {
+    identity_removed_marker_path(base, id).is_file()
+}
+
+/// Writes the tombstone for `id`. Best-effort (`security.md` Rule 3: logged,
+/// never fatal to the logout it is part of) — the marker holds no secret, so
+/// a plain empty-file create is sufficient; no atomic-replace ceremony is
+/// needed for a file whose only meaningful state is "exists or not".
+pub fn mark_identity_removed(base: &Path, id: IdentityId) {
+    let path = identity_removed_marker_path(base, id);
+    if let Err(e) = std::fs::write(&path, b"") {
+        tracing::warn!(
+            error_kind = "identity_removed_marker_write_failed",
+            "logout: could not write the identity-removed tombstone for this \
+             uuid; a concurrent writer racing this logout could resurrect \
+             the credential: {}",
+            crate::error::redact_tokens(&e.to_string())
+        );
+    }
+}
+
+/// Clears `id`'s tombstone, if any — called by a fresh authorization event
+/// for the SAME uuid, which supersedes a stale removal. Best-effort:
+/// `remove_file`'s `NotFound` is the common case (nothing to clear) and any
+/// other failure is logged, non-fatal (never blocks the login it is part
+/// of).
+pub fn clear_identity_removed_marker(base: &Path, id: IdentityId) {
+    let path = identity_removed_marker_path(base, id);
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                error_kind = "identity_removed_marker_clear_failed",
+                "login: could not clear a prior identity-removed tombstone \
+                 for this uuid (non-fatal): {}",
+                crate::error::redact_tokens(&e.to_string())
+            );
+        }
+    }
+}
+
 /// Returns `<base>/store-version`.
 ///
 /// The store-version sentinel is the Phase 1 idempotency marker: presence
@@ -184,6 +268,121 @@ pub struct IdentityPaths {
     /// identity-keyed paths were returned.  `false` for legacy-only installs
     /// or any slot that has not yet been through the A++ mint pass.
     pub is_identity_keyed: bool,
+}
+
+/// The credential file a forced keychain write (`csq swap` A1,
+/// `daemon::auto_rotate` A1) must read the NEW account's token from —
+/// resolved through [`account_to_identity_paths`], the SAME chokepoint
+/// [`crate::session::handle_dir::repoint_handle_dir`] uses to pick its
+/// post-repoint symlink target (M3-4/M3-7). Never source this token from a
+/// hardcoded `config-{N}/.credentials.json` guess instead — M3-7 retired
+/// csq's own writer to that legacy path for any UUID-keyed slot, so a stale
+/// or absent config-N copy would silently mirror the WRONG (or no) token
+/// into the keychain for such a slot (`guard-reader-writer-parity.md`
+/// MUST-1: this reader must recognise every form a writer — here,
+/// `repoint_handle_dir` — targets).
+///
+/// UUID-keyed slot -> `identities/<UUID>/credentials.json`; legacy slot (no
+/// `profiles.json` mapping) -> `config-<N>/.credentials.json`, which CC's
+/// own `claude auth login` subprocess still writes directly (M3-7 retired
+/// only csq's writers, not CC's).
+pub fn credential_file_for_slot_write(base: &Path, account: crate::types::AccountNum) -> PathBuf {
+    account_to_identity_paths(base, account).credentials_path
+}
+
+/// F5: the raw `.credentials.json` content of the account being switched
+/// TO, read through [`credential_file_for_slot_write`] — the SAME resolver
+/// `repoint_handle_dir` uses to pick its post-repoint symlink target.
+///
+/// `csq swap`'s same-surface ClaudeCode route and `daemon::auto_rotate`'s
+/// tick both need exactly this before a v4 forced keychain write (A1); both
+/// used to inline `std::fs::read_to_string(credential_file_for_slot_write(..))
+/// .ok()` independently, which is the shape `guard-reader-writer-parity.md`
+/// MUST-1 warns against — two readers of the same state that can silently
+/// drift apart (e.g. one forgetting the identity-aware resolver and falling
+/// back to a hardcoded `config-{N}/.credentials.json` guess). One function,
+/// used by both, makes that drift a compile-time impossibility.
+///
+/// Outcome of reading an account's own canonical credential file for a
+/// forced keychain write / reconcile decision (H1). `read_to_string(..).ok()`
+/// alone cannot distinguish "the file does not exist / cannot be read" from
+/// "the file exists but holds no live Anthropic token" (a 3P/Codex-only
+/// slot, or one whose token has expired) — both used to fold into the same
+/// `None`, which is fine for a caller that only asks "is there a token to
+/// write" (every EXISTING caller — see [`TargetToken::as_valid_str`]) but is
+/// exactly the distinction `reconcile_keychain_to_marker`'s rule 4 fallback
+/// needs when deciding whether the marker account's OWN canonical token can
+/// be trusted at all before it is used to overwrite X.
+/// Deliberately does NOT `#[derive(Debug)]` (`credential-type-hygiene.md`
+/// Rule 1): `Valid` carries the raw credential JSON, which contains a live
+/// OAuth access+refresh token pair. The manual impl below redacts it; see
+/// `target_token_debug_redacts_valid`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TargetToken {
+    /// The file was read and its content is a live (non-expired) Anthropic
+    /// `claudeAiOauth` token.
+    Valid(String),
+    /// The file was read, but its content is not a live Anthropic token —
+    /// missing `claudeAiOauth` entirely (e.g. a 3P/Codex-only slot) or one
+    /// whose `expiresAt` has already passed.
+    ExpiredOrInvalid,
+    /// The file itself could not be read (absent, permissions, non-UTF-8).
+    Unreadable,
+}
+
+impl std::fmt::Debug for TargetToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetToken::Valid(_) => f.debug_tuple("Valid").field(&"[REDACTED]").finish(),
+            TargetToken::ExpiredOrInvalid => write!(f, "ExpiredOrInvalid"),
+            TargetToken::Unreadable => write!(f, "Unreadable"),
+        }
+    }
+}
+
+impl TargetToken {
+    /// The raw JSON when [`TargetToken::Valid`], else `None` — the view
+    /// every pre-H1 caller needs: they only ever asked "is there a token to
+    /// write", never the unreadable/expired distinction.
+    pub fn as_valid_str(&self) -> Option<&str> {
+        match self {
+            TargetToken::Valid(s) => Some(s.as_str()),
+            TargetToken::ExpiredOrInvalid | TargetToken::Unreadable => None,
+        }
+    }
+}
+
+/// Returns [`TargetToken::Unreadable`] when the file cannot be read (absent,
+/// permissions, non-UTF-8); [`TargetToken::ExpiredOrInvalid`] when it reads
+/// but is not a live Anthropic token; [`TargetToken::Valid`] otherwise.
+///
+/// `keychain-fix-r8.md` C-F2 (doc correction — `doc-property-claims.md`
+/// MUST-1: the prior wording here asserted a property this function's own
+/// only variable-latency caller does not have): the previous sentence
+/// claimed every caller only needs [`TargetToken::as_valid_str`] because
+/// `force_sync_account_changed`'s `None` arm "already re-validates
+/// expiry/shape on its own, so folding `ExpiredOrInvalid` and `Unreadable`
+/// into `None` there changes nothing" — that is FALSE for
+/// `daemon::auto_rotate::tick`, which reads this AFTER acquiring a lock that
+/// can wait up to ~20s: a target selected as `Valid` before the lock can
+/// become `ExpiredOrInvalid`/`Unreadable` by the time the tick reads it
+/// here, and `force_sync_account_changed_with_executor` treats a `None`
+/// credentials string identically to "the target is POSITIVELY
+/// non-Anthropic" (`crate::credentials::keychain::Intended::Strip`'s own
+/// contract) — collapsing the two is exactly what that function's
+/// `Intended::Strip` doc says must never happen. `tick` MUST (and does, as
+/// of C-F2) check `matches!(target_creds, TargetToken::Valid(_))` itself
+/// and refuse the rotation rather than let an untrustworthy-but-Anthropic
+/// target reach `Intended::Strip`.
+pub fn target_token_for_forced_write(base: &Path, target: crate::types::AccountNum) -> TargetToken {
+    let raw = match std::fs::read_to_string(credential_file_for_slot_write(base, target)) {
+        Ok(s) => s,
+        Err(_) => return TargetToken::Unreadable,
+    };
+    match crate::credentials::keychain::anthropic_expiry_ms(&raw) {
+        Some(ms) if ms > crate::credentials::keychain::now_ms() => TargetToken::Valid(raw),
+        _ => TargetToken::ExpiredOrInvalid,
+    }
 }
 
 /// Resolves an account number to its canonical identity paths.
@@ -415,6 +614,32 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
+    /// S-LOW-1 / `credential-type-hygiene.md` Rule 1: `TargetToken::Valid`
+    /// carries a live `.credentials.json` payload. Its manual `Debug` MUST
+    /// print a placeholder and MUST NOT print the token bytes; the
+    /// non-`Valid` variants print their plain names unchanged.
+    #[test]
+    fn target_token_debug_redacts_valid() {
+        let valid = TargetToken::Valid(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-NOTREALTOKu9x","refreshToken":"sk-ant-ort01-NOTREALTOKu9x","expiresAt":4102444800000}}"#
+                .to_string(),
+        );
+        let debug = format!("{valid:?}");
+        assert!(
+            debug.contains("REDACTED"),
+            "Debug output must contain a redaction placeholder: {debug}"
+        );
+        assert!(
+            !debug.contains("NOTREALTOKu9x"),
+            "Debug output must NOT contain the token bytes: {debug}"
+        );
+        assert_eq!(
+            format!("{:?}", TargetToken::ExpiredOrInvalid),
+            "ExpiredOrInvalid"
+        );
+        assert_eq!(format!("{:?}", TargetToken::Unreadable), "Unreadable");
+    }
+
     #[test]
     fn new_v4_is_unique_across_1000_invocations() {
         let mut seen = HashSet::with_capacity(1000);
@@ -535,6 +760,190 @@ mod tests {
             PathBuf::from(
                 "/tmp/accounts/identities/550e8400-e29b-41d4-a716-446655440000/identity.json"
             )
+        );
+    }
+
+    // ── Finding #1 (kc-v4 correctness review): the forced-write token
+    // source MUST resolve through the SAME identity-aware path
+    // `repoint_handle_dir` targets, not a hardcoded `config-N/.credentials.json`
+    // guess — M3-7 retired csq's own writer to that legacy path for any
+    // UUID-keyed slot, so it can be stale or absent entirely while the
+    // identity file is the live, correct token.
+    #[test]
+    fn credential_file_for_slot_write_uses_identity_path_when_config_n_is_absent() {
+        // Arrange: a UUID-mapped slot whose config-N/.credentials.json does
+        // not exist at all (simulating M3-7's retired legacy writer), while
+        // identities/<UUID>/credentials.json holds the live token.
+        let dir = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let base = dir.path();
+        let slot = crate::types::AccountNum::try_from(1u16).unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+
+        // Remove the legacy config-N copy the fixture wrote, and write a
+        // DISTINCT, distinguishable token at the identity path.
+        std::fs::remove_file(base.join("config-1").join(".credentials.json"))
+            .expect("remove legacy config-N credentials");
+        let identity_creds_path = credentials_path_for(base, uuid);
+        std::fs::create_dir_all(identity_creds_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &identity_creds_path,
+            r#"{"claudeAiOauth":{"accessToken":"IDENTITY-LIVE-TOKEN"}}"#,
+        )
+        .expect("write identity credentials");
+
+        // Act
+        let resolved = credential_file_for_slot_write(base, slot);
+        let resolved_content = std::fs::read_to_string(&resolved);
+
+        // Assert: the resolver targets the identity path (not the absent
+        // config-N path), and its content is the live identity token.
+        assert_eq!(resolved, identity_creds_path);
+        assert_eq!(
+            resolved_content.unwrap(),
+            r#"{"claudeAiOauth":{"accessToken":"IDENTITY-LIVE-TOKEN"}}"#
+        );
+    }
+
+    // ── Finding #1 continued: config-N present but STALE (an old snapshot),
+    // identity path is still what MUST be read.
+    #[test]
+    fn credential_file_for_slot_write_uses_identity_path_over_stale_config_n() {
+        let dir = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let base = dir.path();
+        let slot = crate::types::AccountNum::try_from(1u16).unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+
+        // config-N/.credentials.json is left as the fixture's STALE stub;
+        // identities/<UUID>/credentials.json gets a distinguishable fresh token.
+        let identity_creds_path = credentials_path_for(base, uuid);
+        std::fs::create_dir_all(identity_creds_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &identity_creds_path,
+            r#"{"claudeAiOauth":{"accessToken":"IDENTITY-FRESH-TOKEN"}}"#,
+        )
+        .expect("write identity credentials");
+
+        let resolved = credential_file_for_slot_write(base, slot);
+        let resolved_content = std::fs::read_to_string(&resolved).unwrap();
+
+        assert_eq!(resolved, identity_creds_path);
+        assert!(resolved_content.contains("IDENTITY-FRESH-TOKEN"));
+        assert!(!resolved_content.contains("stub-access-token-1"));
+    }
+
+    /// F5: `target_token_for_forced_write` MUST return the fresh
+    /// identity-keyed token, not the stale `config-N` copy sitting right
+    /// next to it — the exact scenario `csq swap`'s and `auto_rotate`'s v4
+    /// forced write both need before a keychain write. This test goes RED
+    /// if the function is ever changed to read `config-N/.credentials.json`
+    /// directly instead of going through the shared resolver.
+    #[test]
+    fn target_token_for_forced_write_prefers_fresh_identity_over_stale_config_n() {
+        let dir = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let base = dir.path();
+        let slot = crate::types::AccountNum::try_from(1u16).unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+
+        // config-N/.credentials.json is left as the fixture's STALE stub
+        // (contains "stub-access-token-1"); identities/<UUID>/credentials.json
+        // gets a distinguishable fresh token.
+        let identity_creds_path = credentials_path_for(base, uuid);
+        std::fs::create_dir_all(identity_creds_path.parent().unwrap()).unwrap();
+        let far_future = crate::credentials::keychain::now_ms() + 365 * 24 * 60 * 60 * 1000;
+        std::fs::write(
+            &identity_creds_path,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"FORCED-WRITE-FRESH-TOKEN","expiresAt":{far_future}}}}}"#
+            ),
+        )
+        .expect("write identity credentials");
+
+        let token = target_token_for_forced_write(base, slot)
+            .as_valid_str()
+            .expect("target_token_for_forced_write must read the identity-keyed file as Valid")
+            .to_string();
+
+        assert!(
+            token.contains("FORCED-WRITE-FRESH-TOKEN"),
+            "must return the fresh identity token, got: {token}"
+        );
+        assert!(
+            !token.contains("stub-access-token-1"),
+            "must NOT return the stale config-N stub, got: {token}"
+        );
+    }
+
+    /// H1: `target_token_for_forced_write` MUST distinguish "the file could
+    /// not be read at all" from "the file was read but is not a live
+    /// Anthropic token" — the pre-H1 `read_to_string(..).ok()` folded both
+    /// into the same `None`, and `reconcile_keychain_to_marker`'s rule 4
+    /// fallback needs to say "this file cannot be trusted", which requires
+    /// telling the two apart.
+    ///
+    /// RED proof (quoted in the PR/journal): with the classification
+    /// collapsed back to `raw.contains("claudeAiOauth")` alone (no expiry
+    /// check, no distinct `Unreadable` case — the pre-H1 shape), this test
+    /// fails on the EXPIRED case:
+    ///   assertion `left == right` failed
+    ///     left: ExpiredOrInvalid
+    ///    right: Valid("{\"claudeAiOauth\":{\"accessToken\":\"EXPIRED-TOKEN\",\"expiresAt\":1}}")
+    #[test]
+    fn target_token_for_forced_write_distinguishes_unreadable_from_expired_invalid_from_valid() {
+        let dir = crate::testing::identity_fixtures::coexisting_fixture(3);
+        let base = dir.path();
+        let far_future = crate::credentials::keychain::now_ms() + 365 * 24 * 60 * 60 * 1000;
+
+        // Slot 1: a live, non-expired token -> Valid.
+        let slot1 = crate::types::AccountNum::try_from(1u16).unwrap();
+        let uuid1 = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+        let path1 = credentials_path_for(base, uuid1);
+        std::fs::create_dir_all(path1.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path1,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"LIVE-TOKEN","refreshToken":"LIVE-REFRESH","expiresAt":{far_future}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        // Slot 2: present but EXPIRED -> ExpiredOrInvalid, never Valid.
+        let slot2 = crate::types::AccountNum::try_from(2u16).unwrap();
+        let uuid2 = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let path2 = credentials_path_for(base, uuid2);
+        std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path2,
+            r#"{"claudeAiOauth":{"accessToken":"EXPIRED-TOKEN","refreshToken":"EXPIRED-REFRESH","expiresAt":1}}"#,
+        )
+        .unwrap();
+
+        // Slot 3: present but no `claudeAiOauth` at all (a 3P/Codex-only
+        // slot) -> ExpiredOrInvalid, never Valid, never a crash.
+        let slot3 = crate::types::AccountNum::try_from(3u16).unwrap();
+        let uuid3 = crate::testing::identity_fixtures::fixture_uuid_for_slot(3);
+        let path3 = credentials_path_for(base, uuid3);
+        std::fs::create_dir_all(path3.parent().unwrap()).unwrap();
+        std::fs::write(&path3, r#"{"tokens":{"access_token":"codex-only"}}"#).unwrap();
+
+        assert!(matches!(
+            target_token_for_forced_write(base, slot1),
+            TargetToken::Valid(_)
+        ));
+        assert_eq!(
+            target_token_for_forced_write(base, slot2),
+            TargetToken::ExpiredOrInvalid
+        );
+        assert_eq!(
+            target_token_for_forced_write(base, slot3),
+            TargetToken::ExpiredOrInvalid
+        );
+
+        // A slot whose file does not exist at all -> Unreadable, distinct
+        // from both of the above.
+        let slot4 = crate::types::AccountNum::try_from(4u16).unwrap();
+        assert_eq!(
+            target_token_for_forced_write(base, slot4),
+            TargetToken::Unreadable
         );
     }
 

@@ -312,7 +312,8 @@ mod tests {
             base_dir: Arc::new(std::path::PathBuf::from(r"C:\Temp\csq-test")),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
-            audit_health: crate::audit::AuditHealth::Verified,
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
             anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(

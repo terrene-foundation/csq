@@ -1,0 +1,17 @@
+{
+  "id": "corr-id-4",
+  "models": [
+    {
+      "aliases": ["alias"],
+      "context_window": 1048576,
+      "is_default": false,
+      "model_id": "model",
+      "model_name": "Model",
+      "output_limit": 8192,
+      "provider_id": "provider",
+      "provider_name": "Provider"
+    }
+  ],
+  "ok": true,
+  "schema": "csq.models.v1"
+}

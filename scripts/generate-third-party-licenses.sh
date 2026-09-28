@@ -19,6 +19,19 @@
 # published artifact, NOT the primary gate.
 set -euo pipefail
 
+# Resolve a VERIFIED python3 before the structural checks below (see
+# scripts/lib/resolve-python.sh). A bare `python3` inherits whatever the
+# operator's PATH resolves to, and a stub that exits 0 without running the
+# program would make those checks vacuous over this published artifact.
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/resolve-python.sh" || {
+  echo "FATAL: cannot source scripts/lib/resolve-python.sh (next to this script)." >&2
+  echo "       The interpreter probe is unavailable, so no verified python3 can be" >&2
+  echo "       resolved. A missing tool lib is NOT a clean run." >&2
+  exit 70
+}
+PY="$(resolve_python3)" || exit 70
+
 OUT="${1:-THIRD-PARTY-LICENSES.md}"
 case "$OUT" in
   *.md) ;;
@@ -74,7 +87,7 @@ cargo about generate \
 #       body prose that merely references a copyleft license.
 #   (b) no token-shaped secret (attribution text is published — mirror generate-sbom.sh).
 #   (c) the file is non-trivial and well-formed.
-python3 - "$TMP" <<'PY'
+"$PY" - "$TMP" <<'PY'
 import re, sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()

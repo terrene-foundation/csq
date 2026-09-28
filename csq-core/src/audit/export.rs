@@ -930,6 +930,309 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    /// Interpreter resolution for the tests below that shell out to Python.
+    ///
+    /// These tests previously hardcoded `Command::new("python3")`. That name
+    /// is not universal: the Windows CI leg only passed because a `python3`
+    /// shim had been placed on the runner by hand, so the gate was green for a
+    /// reason no other host reproduces. Resolution is now explicit and its
+    /// failure mode is a loud error rather than a skip — a skip keyed on what
+    /// the host happens to return turns a real failure green
+    /// (`test-skip-discipline`), and a silent fallback is
+    /// `zero-tolerance.md` Rule 3.
+    mod python {
+        use std::ffi::OsString;
+        use std::path::{Path, PathBuf};
+
+        /// Operator override: an absolute path to the interpreter to use.
+        pub const PYTHON_ENV_VAR: &str = "CSQ_PYTHON";
+
+        /// The host surface resolution depends on, injected so the unit tests
+        /// below never depend on what is installed on the machine running them
+        /// (`test-hermeticity`).
+        pub trait Probe {
+            /// Value of `$CSQ_PYTHON`, if set.
+            fn env_override(&self) -> Option<OsString>;
+            /// Whether `path` exists and is executable by this process.
+            fn is_executable(&self, path: &Path) -> bool;
+            /// Resolve `name` against `PATH`.
+            fn find_in_path(&self, name: &str) -> Option<PathBuf>;
+            /// Whether `<path> --version` reports a major version of 3.
+            fn reports_python3(&self, path: &Path) -> bool;
+        }
+
+        /// Resolve an interpreter, in precedence order:
+        ///
+        /// 1. `$CSQ_PYTHON` — an explicit operator override. If it is set but
+        ///    not executable this is an ERROR, not a fall-through: the
+        ///    operator asked for a specific interpreter and quietly using a
+        ///    different one would hide their mistake behind a passing run.
+        /// 2. `python3` on `PATH`.
+        /// 3. `python` on `PATH`, but ONLY if it reports Python 3. A Python 2
+        ///    `python` is rejected — every script these tests run is Python-3
+        ///    only, so accepting it would trade a clear "not found" for a
+        ///    syntax error thousands of lines from the cause.
+        /// 4. Nothing found — an error naming `CSQ_PYTHON`, so the reader is
+        ///    told how to fix it rather than only what failed.
+        ///
+        /// Step 2 does not version-probe `python3`: that name is reserved by
+        /// PEP 394 for a Python 3 interpreter, and it is step 3's ambiguous
+        /// `python` that the probe exists to disambiguate.
+        pub fn resolve_with(probe: &dyn Probe) -> Result<PathBuf, String> {
+            if let Some(raw) = probe.env_override() {
+                let path = PathBuf::from(&raw);
+                if probe.is_executable(&path) {
+                    return Ok(path);
+                }
+                return Err(format!(
+                    "${PYTHON_ENV_VAR} is set to {} but that is not an executable file. \
+                     Point ${PYTHON_ENV_VAR} at a Python 3 interpreter, or unset it to \
+                     resolve one from PATH.",
+                    path.display()
+                ));
+            }
+
+            if let Some(found) = probe.find_in_path("python3") {
+                return Ok(found);
+            }
+
+            if let Some(found) = probe.find_in_path("python") {
+                // A bare `python` is Python 2 on enough hosts that accepting it
+                // unprobed is how a Python-2 interpreter silently runs a
+                // Python-3 script. `python3` above is version-reserved by PEP
+                // 394 and needs no probe; this name does.
+                if probe.reports_python3(&found) {
+                    return Ok(found);
+                }
+                return Err(format!(
+                    "found `python` at {} but it does not report Python 3, and these \
+                     tests require a Python 3 interpreter. Install python3, or set \
+                     ${PYTHON_ENV_VAR} to the path of one.",
+                    found.display()
+                ));
+            }
+
+            Err(format!(
+                "no Python 3 interpreter found: neither `python3` nor a Python 3 \
+                 `python` is on PATH. Set ${PYTHON_ENV_VAR} to the path of one."
+            ))
+        }
+
+        /// The real host: `PATH` via the repo's own walker, and a `--version`
+        /// probe of the candidate binary.
+        pub struct HostProbe;
+
+        impl Probe for HostProbe {
+            fn env_override(&self) -> Option<OsString> {
+                match std::env::var_os(PYTHON_ENV_VAR) {
+                    // An empty value is "unset" — an exported-but-blank var is
+                    // an accident, not a request for the empty path.
+                    Some(v) if v.is_empty() => None,
+                    other => other,
+                }
+            }
+
+            fn is_executable(&self, path: &Path) -> bool {
+                let Ok(meta) = std::fs::metadata(path) else {
+                    return false;
+                };
+                if !meta.is_file() {
+                    return false;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }
+
+            fn find_in_path(&self, name: &str) -> Option<PathBuf> {
+                crate::cli_deps::install_path::find_in_path(name)
+            }
+
+            fn reports_python3(&self, path: &Path) -> bool {
+                let Ok(out) = std::process::Command::new(path).arg("--version").output() else {
+                    return false;
+                };
+                // Python 2.7 writes `--version` to stderr, Python 3 to stdout.
+                // Read both, or a Python 2 binary looks like a silent one.
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                text.push(' ');
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                major_version_is_3(&text)
+            }
+        }
+
+        /// `true` iff `text` carries a `Python <major>...` banner with major
+        /// exactly 3. Parses the major version rather than matching the string
+        /// `"Python 3"`, so a future `Python 30` cannot pass as Python 3.
+        pub fn major_version_is_3(text: &str) -> bool {
+            let Some(rest) = text.split("Python ").nth(1) else {
+                return false;
+            };
+            let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            matches!(major.parse::<u32>(), Ok(3))
+        }
+
+        /// A `Command` for the resolved interpreter.
+        ///
+        /// Panics with the resolver's actionable message when no interpreter
+        /// is available. A panic is the intended outcome: these tests assert
+        /// on Python's behaviour, so without an interpreter there is nothing
+        /// to assert and reporting success would be a false green.
+        pub fn command() -> std::process::Command {
+            let exe = resolve_with(&HostProbe).unwrap_or_else(|e| panic!("{e}"));
+            std::process::Command::new(exe)
+        }
+    }
+
+    mod python_resolver_tests {
+        use super::python::{self, Probe};
+        use std::ffi::OsString;
+        use std::path::{Path, PathBuf};
+
+        /// A fully synthetic host. Every answer is stated by the test, so no
+        /// case depends on what is installed on the machine running it.
+        struct FakeProbe {
+            env: Option<OsString>,
+            /// Paths this host considers executable.
+            executable: Vec<PathBuf>,
+            /// `PATH` lookups that succeed, as (name, resolved path).
+            on_path: Vec<(&'static str, PathBuf)>,
+            /// Paths whose `--version` reports Python 3.
+            python3: Vec<PathBuf>,
+        }
+
+        impl FakeProbe {
+            fn empty() -> Self {
+                Self {
+                    env: None,
+                    executable: Vec::new(),
+                    on_path: Vec::new(),
+                    python3: Vec::new(),
+                }
+            }
+        }
+
+        impl Probe for FakeProbe {
+            fn env_override(&self) -> Option<OsString> {
+                self.env.clone()
+            }
+            fn is_executable(&self, path: &Path) -> bool {
+                self.executable.iter().any(|p| p == path)
+            }
+            fn find_in_path(&self, name: &str) -> Option<PathBuf> {
+                self.on_path
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, p)| p.clone())
+            }
+            fn reports_python3(&self, path: &Path) -> bool {
+                self.python3.iter().any(|p| p == path)
+            }
+        }
+
+        /// `$CSQ_PYTHON` wins over a `python3` that is also on PATH.
+        #[test]
+        fn env_override_takes_precedence_over_path() {
+            let pinned = PathBuf::from("/opt/pinned/python3.13");
+            let probe = FakeProbe {
+                env: Some(OsString::from(&pinned)),
+                executable: vec![pinned.clone()],
+                on_path: vec![("python3", PathBuf::from("/usr/bin/python3"))],
+                ..FakeProbe::empty()
+            };
+            assert_eq!(python::resolve_with(&probe), Ok(pinned));
+        }
+
+        /// A set-but-broken override is an error, never a quiet fall-through
+        /// to the `python3` that is sitting right there on PATH.
+        #[test]
+        fn env_override_set_but_not_executable_errors_instead_of_falling_back() {
+            let probe = FakeProbe {
+                env: Some(OsString::from("/opt/pinned/missing")),
+                on_path: vec![("python3", PathBuf::from("/usr/bin/python3"))],
+                ..FakeProbe::empty()
+            };
+            let err = python::resolve_with(&probe).expect_err("must not fall back to PATH");
+            assert!(err.contains("CSQ_PYTHON"), "error must name the var: {err}");
+            assert!(
+                err.contains("/opt/pinned/missing"),
+                "error must name the bad value: {err}"
+            );
+        }
+
+        /// With no override, `python3` on PATH is used.
+        #[test]
+        fn falls_back_to_python3_on_path() {
+            let probe = FakeProbe {
+                on_path: vec![("python3", PathBuf::from("/usr/bin/python3"))],
+                ..FakeProbe::empty()
+            };
+            assert_eq!(
+                python::resolve_with(&probe),
+                Ok(PathBuf::from("/usr/bin/python3"))
+            );
+        }
+
+        /// No `python3`, but a `python` that reports Python 3 — accepted.
+        #[test]
+        fn accepts_bare_python_when_it_reports_python3() {
+            let py = PathBuf::from("/usr/local/bin/python");
+            let probe = FakeProbe {
+                on_path: vec![("python", py.clone())],
+                python3: vec![py.clone()],
+                ..FakeProbe::empty()
+            };
+            assert_eq!(python::resolve_with(&probe), Ok(py));
+        }
+
+        /// THE discriminating case. A host with no `python3` and a Python 2
+        /// `python` must produce an error. Without this the resolver is only
+        /// "try both names", which is exactly the bug on a legacy host: the
+        /// Python 2 binary is found, every script fails on Python 3 syntax,
+        /// and the cause is thousands of lines from the symptom.
+        #[test]
+        fn rejects_bare_python_that_reports_python2() {
+            let py = PathBuf::from("/usr/bin/python");
+            let probe = FakeProbe {
+                on_path: vec![("python", py.clone())],
+                // Deliberately NOT in `python3`: this host's `python` is 2.x.
+                ..FakeProbe::empty()
+            };
+            let err = python::resolve_with(&probe).expect_err("Python 2 must be rejected");
+            assert!(
+                err.contains("does not report Python 3"),
+                "error must say why it was rejected: {err}"
+            );
+            assert!(err.contains("CSQ_PYTHON"), "error must name the var: {err}");
+        }
+
+        /// Nothing anywhere — an error naming the override var, never a skip.
+        #[test]
+        fn absent_interpreter_errors_naming_the_env_var() {
+            let err = python::resolve_with(&FakeProbe::empty())
+                .expect_err("absence must be an error, not a silent pass");
+            assert!(err.contains("CSQ_PYTHON"), "error must name the var: {err}");
+        }
+
+        /// The version parse reads the major version, so neither a Python 2
+        /// banner nor a `Python 30` can pass as Python 3, and a Python 2
+        /// banner is recognised wherever the interpreter printed it.
+        #[test]
+        fn major_version_parse_discriminates_python2_from_python3() {
+            assert!(python::major_version_is_3("Python 3.13.0\n"));
+            assert!(python::major_version_is_3(" Python 3.9.6"));
+            assert!(!python::major_version_is_3("Python 2.7.18\n"));
+            assert!(!python::major_version_is_3("Python 30.1.0"));
+            assert!(!python::major_version_is_3(""));
+        }
+    }
+
     fn svc_name(tag: &str) -> String {
         format!("csq-audit-export-test-{}-{}", std::process::id(), tag)
     }
@@ -1052,7 +1355,7 @@ b = json.dumps(view, separators=(",",":"), ensure_ascii=False).encode()
 print(hashlib.sha256(b).hexdigest())
 "#
         );
-        let out = std::process::Command::new("python3")
+        let out = python::command()
             .arg("-c")
             .arg(&py)
             .output()
@@ -1193,7 +1496,7 @@ print("MISSING" if missing else ("NOVEC" if not has_vectors else "OK"))
 "#,
             out.to_string_lossy()
         );
-        let r = std::process::Command::new("python3")
+        let r = python::command()
             .arg("-c")
             .arg(&py)
             .output()
@@ -1431,7 +1734,7 @@ print("OK")
                 .join("canonical_form_vectors/vectors.json")
                 .to_string_lossy()
         );
-        let r = std::process::Command::new("python3")
+        let r = python::command()
             .arg("-c")
             .arg(&py)
             .output()
@@ -2112,7 +2415,7 @@ print("READY " + str(srv.server_address[1]), flush=True)
 srv.serve_forever()
 "#
         );
-        let mut child = std::process::Command::new("python3")
+        let mut child = python::command()
             .arg("-c")
             .arg(&py)
             .stdout(std::process::Stdio::piped())
@@ -2588,7 +2891,7 @@ the canonical_hash; stdout: {stdout}"
             tar_path.to_string_lossy(),
             dest.to_string_lossy()
         );
-        let r = std::process::Command::new("python3")
+        let r = python::command()
             .arg("-c")
             .arg(&py)
             .output()

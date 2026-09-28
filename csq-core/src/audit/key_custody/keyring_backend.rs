@@ -545,9 +545,11 @@ fn write_roster_floor_to_file_store(base_dir: &std::path::Path, chain_id: &str, 
 /// without propagating the error.
 ///
 /// Design constraints:
-/// - MUST NOT use `SeedEntryPayload` (it has `#[serde(deny_unknown_fields)]`).
-///   Reads and writes via `serde_json::Value` so the new field is additive and
-///   older binaries reading the same entry silently ignore it.
+/// - Typed read-modify-write through `SeedEntryPayload`; foreign JSON and
+///   legacy bare-hex entries are left untouched. The floor field is optional
+///   for current readers. Pre-field binaries with `deny_unknown_fields` can
+///   reject the extended payload; this is NOT universal downgrade compatibility
+///   (spec 12 §12.16).
 /// - MUST stay inside the chain lock at the call site (roster install holds
 ///   `_chain_lock` across this call).
 /// - Called after `chain.json` is successfully saved — if the keychain is
@@ -702,7 +704,7 @@ pub enum KeyLoadOutcome {
 /// This is the single primitive every read site (verify, sign, doctor, export)
 /// MUST use instead of a bare `load_from_keychain`, because it classifies
 /// access-vs-absence. It performs NO writes (the verifier's read-only invariant
-/// — migration is an explicit operation, see [`super::migrate`]).
+/// — migration is an explicit operation, see `super::migrate`).
 pub fn try_load_signing_key(
     base_dir: &std::path::Path,
     service: &str,
@@ -834,7 +836,7 @@ pub fn generate_and_store_dual(
 
 /// Persist a caller-provided `seed` (e.g. rotation's in-memory incoming key) to
 /// BOTH stores (file primary + keychain anchor). File-first analog of
-/// [`LocalSigningKey::store_generated`].
+/// `LocalSigningKey::store_generated`.
 pub fn store_dual(
     base_dir: &std::path::Path,
     service: &str,
@@ -948,7 +950,7 @@ pub fn preserve_dual(
 /// Read the co-located signing cutoff from the **file store** active slot
 /// (primary). Returns `Ok(None)` when the file is a legacy bare-hex seed (no
 /// embedded cutoff) OR when the file is absent — the caller distinguishes via
-/// [`file_store::exists`] if needed. The keychain cutoff is read separately
+/// `file_store::exists` if needed. The keychain cutoff is read separately
 /// (`load_embedded_cutoff`) by `verify_chain` Step-0 for the integrity-anchor
 /// cross-check.
 pub fn load_embedded_cutoff_file_first(

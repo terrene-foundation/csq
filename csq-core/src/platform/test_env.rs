@@ -70,6 +70,41 @@ use std::sync::{Mutex, MutexGuard};
 
 static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Item 4 (D-F3, signal-test harness hazards): serializes every test in
+/// this WORKSPACE (not just this crate) that mutates PROCESS-WIDE signal
+/// disposition — raw `libc::signal(SIGINT/SIGTERM/SIGHUP/SIGUSR1, ..)`
+/// calls in `cli_deps::auto_update::InterruptSignalGuard`,
+/// `csq::cli::commands::codex_supervise::drive_child`'s
+/// `SIGTERM_FLAG`/`SIGHUP_FLAG`/`SIGUSR1_FLAG` machinery, and the desktop
+/// `daemon_supervisor` SIGTERM bridge (which additionally registers via
+/// `tokio`'s `signal-hook-registry` — a mechanism a raw `libc::signal()`
+/// call elsewhere in this workspace silently OVERWRITES for the remainder
+/// of the process, since both ultimately contend for the same kernel
+/// per-process disposition table).
+///
+/// Signal disposition is process-wide, not per-thread, so `cargo test`'s
+/// default parallel runner would otherwise let any two of the above race
+/// on the SAME underlying kernel state — including across the CRATE
+/// boundary this function exists to cross (`auto_update.rs`'s own
+/// `SIGNAL_TEST_LOCK` doc, before this function existed, recorded that its
+/// module-local mutex could not be shared with `codex_supervise`'s for
+/// exactly this reason). A single shared mutex, callable from any crate in
+/// the workspace, is what closes that gap.
+static SIGNAL_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Acquires the shared signal-test mutex. See `SIGNAL_TEST_MUTEX`'s doc
+/// for the full set of call sites this MUST serialize against. Poisoning
+/// is recovered silently, same rationale as [`lock`].
+pub fn signal_lock() -> MutexGuard<'static, ()> {
+    match SIGNAL_TEST_MUTEX.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            SIGNAL_TEST_MUTEX.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// Acquires the shared env-test mutex. Blocks until any other test
 /// mutating process-global env releases it. Returns a guard that
 /// auto-releases on drop — hold it for the entire test body.
@@ -114,11 +149,41 @@ pub fn lock() -> MutexGuard<'static, ()> {
 /// suite off the developer's real Keychain (`feedback_no_security_w_on_cc_keychain`).
 #[cfg(test)]
 pub(crate) fn with_in_memory_secret_backend<R>(f: impl FnOnce() -> R) -> R {
-    let guard = lock();
-    with_in_memory_secret_backend_locked(&guard, f)
+    with_secret_backend("in-memory", f)
 }
 
-/// The body of [`with_in_memory_secret_backend`], taking the shared lock by
+/// Runs `f` with `CSQ_SECRET_BACKEND` set to `value`, holding [`lock`] for
+/// the whole call and restoring the previous value on the way out (including
+/// on unwind) — the general form of [`with_in_memory_secret_backend`],
+/// sharing its lock and its restore guarantee.
+///
+/// `in-memory` is not the only backend state a test needs to pin.
+/// [`crate::platform::secret::open_default_vault`] also has a FAILURE branch:
+/// an unrecognised value is rejected outright by `is_known_override`, on
+/// EVERY platform. That is the only pin that reproduces the
+/// vault-cannot-open arm of `binding_guard::clear_detected_marker_binding`
+/// deterministically off Linux, whose native vaults (macOS Keychain, Windows
+/// credential manager) always open — a `file` pin does not: it is Linux-only
+/// and errors on macOS, while SUCCEEDING on the very Linux hosts the arm is
+/// about. an internal ticket.
+#[cfg(test)]
+pub(crate) fn with_secret_backend<R>(value: &str, f: impl FnOnce() -> R) -> R {
+    let guard = lock();
+    with_secret_backend_locked(&guard, value, f)
+}
+
+/// [`with_in_memory_secret_backend`]'s locked body — the `in-memory` special
+/// case of [`with_secret_backend_locked`], kept as a named wrapper because
+/// this module's own self-tests call it directly.
+#[cfg(test)]
+fn with_in_memory_secret_backend_locked<R>(
+    lock: &MutexGuard<'static, ()>,
+    f: impl FnOnce() -> R,
+) -> R {
+    with_secret_backend_locked(lock, "in-memory", f)
+}
+
+/// The body of [`with_secret_backend`], taking the shared lock by
 /// REFERENCE rather than acquiring it.
 ///
 /// The split exists so this module's own self-tests can observe the
@@ -131,8 +196,9 @@ pub(crate) fn with_in_memory_secret_backend<R>(f: impl FnOnce() -> R) -> R {
 /// the ambient value outside the lock and went RED on the full-suite run
 /// while passing under a module filter.
 #[cfg(test)]
-fn with_in_memory_secret_backend_locked<R>(
+fn with_secret_backend_locked<R>(
     _lock: &MutexGuard<'static, ()>,
+    value: &str,
     f: impl FnOnce() -> R,
 ) -> R {
     /// Restores `CSQ_SECRET_BACKEND` in `Drop` — i.e. on the panicking
@@ -155,7 +221,7 @@ fn with_in_memory_secret_backend_locked<R>(
     let _restore = Restore {
         prev: std::env::var_os("CSQ_SECRET_BACKEND"),
     };
-    unsafe { std::env::set_var("CSQ_SECRET_BACKEND", "in-memory") };
+    unsafe { std::env::set_var("CSQ_SECRET_BACKEND", value) };
     f()
 }
 

@@ -119,14 +119,28 @@ impl VerifyFailureDetail {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct VerifyPayload {
-    /// `"ok"` | `"partial_historical"` | `"partial"` | `"integrity_failure"` — the
-    /// verdict status.
+    /// `"ok"` | `"partial_historical"` | `"partial_truncated"` | `"partial"` |
+    /// `"integrity_failure"` — the verdict status.
+    ///
+    /// `"partial_truncated"` means the scan stopped short of the whole chain: the
+    /// oldest `skipped_truncated_count` records — the genesis among them — were
+    /// never examined, so the oldest record that WAS examined is anchored to
+    /// nothing. Like `"partial_historical"` it rides `ok: true` and exit 0: a
+    /// chain that has simply outgrown the verifier's record limit is not a tamper
+    /// signal. A consumer that requires whole-chain coverage MUST test this status
+    /// (or `skipped_truncated_count`), not `ok`.
     pub status: &'static str,
     /// v2 records chain-linked without error (includes historical-key gap records
     /// whose chain-linking verified but whose signatures were skipped).
     pub verified_count: u64,
     /// v1 records skipped (not counted toward failures).
     pub skipped_v1_count: u64,
+    /// Records the verifier did NOT examine because the chain exceeded its
+    /// record limit — the oldest records, INCLUDING the genesis. Non-zero
+    /// exactly when `status == "partial_truncated"`. Omitted when `0`, so the
+    /// wire shape for a whole-chain scan is byte-identical to the pre-field one.
+    #[serde(skip_serializing_if = "u64_is_zero")]
+    pub skipped_truncated_count: u64,
     /// Records verified opaque-but-intact (an `EventKind` a newer csq added).
     /// Omitted when `0` (the common case).
     #[serde(skip_serializing_if = "u64_is_zero")]
@@ -177,6 +191,7 @@ impl VerifyPayload {
             status,
             verified_count,
             skipped_v1_count,
+            skipped_truncated_count: 0,
             unknown_kind_count: 0,
             historical_key_gaps: Vec::new(),
             failure_detail: None,
@@ -191,6 +206,13 @@ impl VerifyPayload {
     #[must_use]
     pub fn with_unknown_kind_count(mut self, count: u64) -> Self {
         self.unknown_kind_count = count;
+        self
+    }
+
+    /// Set `skipped_truncated_count` (omitted from the wire when `0`).
+    #[must_use]
+    pub fn with_skipped_truncated_count(mut self, count: u64) -> Self {
+        self.skipped_truncated_count = count;
         self
     }
 
@@ -245,6 +267,7 @@ mod tests {
                 status: "ok",
                 verified_count: 7,
                 skipped_v1_count: 0,
+                skipped_truncated_count: 0,
                 unknown_kind_count: 0,
                 historical_key_gaps: vec![],
                 failure_detail: None,
@@ -267,6 +290,11 @@ mod tests {
         assert!(v.get("failure_detail").is_none(), "ok verdict omits detail");
         // zero/empty/None fields are omitted, keeping the common wire shape minimal.
         assert!(v.get("unknown_kind_count").is_none());
+        assert!(
+            v.get("skipped_truncated_count").is_none(),
+            "a whole-chain scan must not carry skipped_truncated_count — the wire \
+             shape stays byte-identical to the pre-field one"
+        );
         assert!(v.get("trust_plane_grade").is_none());
     }
 
@@ -280,6 +308,7 @@ mod tests {
                 status: "integrity_failure",
                 verified_count: 0,
                 skipped_v1_count: 0,
+                skipped_truncated_count: 0,
                 unknown_kind_count: 0,
                 historical_key_gaps: vec![VerifyKeyGap {
                     key_id: "ed25519:aa".to_string(),

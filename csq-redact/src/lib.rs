@@ -103,7 +103,7 @@ const JWT_SEGMENT_MIN_BODY: usize = 17;
 ///    access/refresh token prefixes; any occurrence in a string is a real
 ///    credential.
 ///
-/// 2. **Prefix-with-body tokens** — prefixes in [`TOKEN_PREFIXES_WITH_BODY`]
+/// 2. **Prefix-with-body tokens** — prefixes in `TOKEN_PREFIXES_WITH_BODY`
 ///    followed by at least the class's minimum body length. Covers `sk-*`
 ///    (Anthropic + 3P API keys), `sess-*` (OpenAI session tokens), and `rt_*`
 ///    (Codex refresh tokens). Short strings like `sk-short` or `rt_queue_size`
@@ -115,7 +115,7 @@ const JWT_SEGMENT_MIN_BODY: usize = 17;
 ///    intact.
 ///
 /// 4. **JWT triple-segment** — `eyJ<b64url>+.eyJ<b64url>+.<b64url>+` where
-///    each segment body is ≥[`JWT_SEGMENT_MIN_BODY`] chars. Covers OpenAI
+///    each segment body is ≥`JWT_SEGMENT_MIN_BODY` chars. Covers OpenAI
 ///    Codex access_token and id_token (both JWTs per an internal journal entry live
 ///    capture). The `eyJ` prefix is the base64url encoding of `{"` — any
 ///    JWT header or payload opens with a JSON object and therefore this

@@ -3,11 +3,11 @@
 
 :root {
   /* Dark mode (default for desktop app) */
-  --bg-primary: #1A1918;
+  --bg-primary: #1a1918;
   --bg-secondary: #242320;
-  --bg-tertiary: #3A3835;
-  --text-primary: #E0DDD8;
-  --text-secondary: #9A958F;
+  --bg-tertiary: #3a3835;
+  --text-primary: #e0ddd8;
+  --text-secondary: #9a958f;
   /* F3 (i-audit/i-harden) — #6B6358 measured 2.61-2.66:1 on --bg-secondary,
      well under the 4.5:1 AA floor. Lightness raised, hue/saturation held —
      #938A7C measures 4.62:1 on #242320. This token drives TokenBadge's
@@ -15,44 +15,49 @@
      .native-quota-label, .gemini-quota-na, .reset-info countdowns, and the
      inactive .sort-pill (all consume var(--text-tertiary), so this single
      edit covers every callsite). */
-  --text-tertiary: #938A7C;
-  --border: #3A3835;
-  --accent: #D9A55C;
-  --accent-hover: #E8C48A;
-  --accent-low: #1F1A10;
-  --green: #4CC49A;
-  --yellow: #E08050;
-  --red: #E8675C;
-  --info: #6BAED6;
+  --text-tertiary: #938a7c;
+  --border: #3a3835;
+  --accent: #d9a55c;
+  --accent-hover: #e8c48a;
+  --accent-low: #1f1a10;
+  --green: #4cc49a;
+  --yellow: #e08050;
+  --red: #e8675c;
+  --info: #6baed6;
   --surface: #242320;
 
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
+  --font-sans:
+    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", monospace;
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg-primary: #FFFFFF;
-    --bg-secondary: #EFECE7;
-    --bg-tertiary: #D5D0C8;
-    --text-primary: #2E2E2C;
-    --text-secondary: #6B6358;
+    --bg-primary: #ffffff;
+    --bg-secondary: #efece7;
+    --bg-tertiary: #d5d0c8;
+    --text-primary: #2e2e2c;
+    --text-secondary: #6b6358;
     /* F3 — #9E968E measured 2.47-2.50:1 on --bg-secondary. Lightness
        lowered, hue/saturation held — #706860 measures 4.64:1 on #EFECE7. */
     --text-tertiary: #706860;
-    --border: #D5D0C8;
-    --accent: #805A10;
-    --accent-hover: #6B4C0D;
-    --accent-low: #FDF8EF;
-    --green: #186E52;
-    --yellow: #A0421E;
-    --red: #B5443A;
-    --info: #3A6B8A;
-    --surface: #EFECE7;
+    --border: #d5d0c8;
+    --accent: #805a10;
+    --accent-hover: #6b4c0d;
+    --accent-low: #fdf8ef;
+    --green: #186e52;
+    --yellow: #a0421e;
+    --red: #b5443a;
+    --info: #3a6b8a;
+    --surface: #efece7;
   }
 }
 
-* { margin: 0; padding: 0; box-sizing: border-box; }
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
 body {
   font-family: var(--font-sans);
   background: var(--bg-primary);

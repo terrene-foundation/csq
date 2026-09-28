@@ -1135,10 +1135,18 @@ pub fn save_manual_account(
     base_dir: &Path,
     info: AccountInfo,
 ) -> Result<(), crate::error::ConfigError> {
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
+    // `secure_file` below is now a redundant (but harmless) re-chmod, kept
+    // so the three-closure injectable failure-branch test structure
+    // (redteam-discipline.md Rule 5) stays unchanged for the `secure` and
+    // `replace` branches.
     save_manual_account_inner(
         base_dir,
         info,
-        |tmp, bytes| std::fs::write(tmp, bytes),
+        |tmp, bytes| {
+            crate::platform::fs::write_new_private(tmp, bytes)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
         crate::platform::fs::secure_file,
         crate::platform::fs::atomic_replace,
     )
@@ -2261,7 +2269,7 @@ mod tests {
     #[test]
     fn per_slot_rejects_non_config_dirs() {
         let dir = TempDir::new().unwrap();
-        // `other-9/settings.json` with a valid 3P binding.
+        // `<fixture_root>/other-9/settings.json` with a valid 3P binding.
         let other = dir.path().join("other-9");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(

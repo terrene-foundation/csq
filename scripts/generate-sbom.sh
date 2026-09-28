@@ -16,6 +16,19 @@
 # licenses but does not itself gate them.
 set -euo pipefail
 
+# Resolve a VERIFIED python3 before the assertions below (see
+# scripts/lib/resolve-python.sh). A bare `python3` inherits whatever the
+# operator's PATH resolves to, and a stub that exits 0 without running the
+# program would let those assertions "pass" over input they never read.
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/resolve-python.sh" || {
+  echo "FATAL: cannot source scripts/lib/resolve-python.sh (next to this script)." >&2
+  echo "       The interpreter probe is unavailable, so no verified python3 can be" >&2
+  echo "       resolved. A missing tool lib is NOT a clean run." >&2
+  exit 70
+}
+PY="$(resolve_python3)" || exit 70
+
 OUT="${1:?usage: generate-sbom.sh <output-file.cdx.json>}"
 # Enforce the .cdx.json suffix so $OUT can never collide with the per-member
 # `csq-sbom.json` files the cleanup below deletes.
@@ -47,7 +60,7 @@ find . -name 'csq-sbom.json' -not -path './target/*' -delete 2>/dev/null || true
 
 # Sanity + defense-in-depth: assert CycloneDX rooted at `csq`, and no
 # token-shaped secret for ANY provider csq integrates (SBOMs are published).
-python3 - "$OUT" <<'PY'
+"$PY" - "$OUT" <<'PY'
 import json, re, sys
 d = json.load(open(sys.argv[1]))
 assert d.get("bomFormat") == "CycloneDX", f"not a CycloneDX SBOM: {d.get('bomFormat')}"

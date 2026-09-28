@@ -25,8 +25,15 @@ Usage::
         --base-ref main \\
         [--pr-title "feat: foo"] [--pr-admin-approved]
 
+The head SHA-256 companion is checked against exact baseline bytes BEFORE
+any immutability-policy bypass. Missing both companions is allowed only before
+either snapshot is recorded. Removal and invalid head seals cannot be bypassed;
+adding the first companion requires [init-baselines]. Its target is compared as
+opaque text, never opened or interpreted by a shell.
+
 For tests, ``--base-content`` and ``--head-content`` accept JSON file paths
-to bypass git.
+to bypass git. Companion overrides are explicit or adjacent to these private
+fixtures; canonical companions are never consulted in fixture mode.
 
 Exit codes:
     0   Conformant
@@ -36,6 +43,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -55,38 +63,54 @@ INIT_TAG_RE = re.compile(r"\[init-baselines\]", re.IGNORECASE)
 BREAK_TAG_RE = re.compile(r"\[breaking-baselines\]", re.IGNORECASE)
 
 
-def _git_show(ref: str, path: str) -> str | None:
+def _git_result(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    """Local Git read with explicit failure; no oracle error becomes absence."""
     try:
-        result = subprocess.run(
-            ["git", "show", f"{ref}:{path}"],
+        return subprocess.run(
+            ["git", *args],
             cwd=str(REPO_ROOT),
             capture_output=True,
-            text=True,
             check=False,
             timeout=30,
         )
-    except (FileNotFoundError, OSError):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OSError("baseline Git oracle unavailable") from exc
+
+
+def _resolve_base_ref(base_ref: str) -> str:
+    refs = [base_ref] if "/" in base_ref else [base_ref, f"origin/{base_ref}"]
+    for ref in refs:
+        result = _git_result(
+            ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"]
+        )
+        if result.returncode == 0:
+            revision = result.stdout.strip()
+            if re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision):
+                return revision.decode("ascii")
+            raise OSError("baseline Git oracle returned an invalid commit identity")
+    raise OSError("baseline Git base revision is unavailable")
+
+
+def _read_git_optional(revision: str, path: str) -> bytes | None:
+    # Only a successful tree enumeration can establish that this path is absent.
+    listed = _git_result(
+        ["ls-tree", "--name-only", "-z", "--full-tree", revision, "--", path]
+    )
+    if listed.returncode != 0:
+        raise OSError("baseline Git tree oracle unavailable")
+    if not listed.stdout:
         return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
+    if listed.stdout != path.encode("utf-8") + b"\0":
+        raise OSError("baseline Git tree oracle returned ambiguous membership")
+    blob = _git_result(["show", f"{revision}:{path}"])
+    if blob.returncode != 0:
+        raise OSError("baseline Git blob oracle unavailable")
+    return blob.stdout
 
 
-def _read_base_text(base_ref: str, path: str) -> str | None:
-    """Read `path` at the base ref, falling back to its remote-tracking ref.
-
-    `actions/checkout` checks out only the PR ref locally; the base branch
-    (`github.base_ref`, a bare name like `main`) exists only as the
-    remote-tracking ref `origin/main`. Without the fallback `git show main:…`
-    fails on CI, so the gate misfires into Mode (b) ("baselines.json added")
-    on EVERY normal PR that touches a trigger path — falsely demanding
-    `[init-baselines]`. The fallback is skipped when `base_ref` already names
-    a remote/SHA (contains `/`), so `origin/origin/main` is never attempted.
-    """
-    text = _git_show(base_ref, path)
-    if text is None and "/" not in base_ref:
-        text = _git_show(f"origin/{base_ref}", path)
-    return text
+def _read_base_text(base_ref: str, path: str) -> bytes | None:
+    """Resolve local/remote base once; absent path is distinct from unreadable Git."""
+    return _read_git_optional(_resolve_base_ref(base_ref), path)
 
 
 def _diff_protected_cells(base: dict, head: dict) -> list[str]:
@@ -127,6 +151,61 @@ def _has_init_blocks(d: dict) -> bool:
     return d.get("v2_3_1") is not None and d.get("phase_2a_locked") is not None
 
 
+def _read_optional_bytes(path: Path) -> bytes | None:
+    return path.read_bytes() if path.exists() else None
+
+
+def _read_base_checksum(base_ref: str, path: str) -> bytes | None:
+    """Read historical seal bytes without decoding even a malformed old seal.
+
+    Only presence matters for removal/init checks; valid head bytes can repair
+    arbitrary old contents. Mirror the base-ref fallback used for JSON input.
+    """
+    return _read_git_optional(_resolve_base_ref(base_ref), path)
+
+
+def _validate_checksum(
+    base: dict,
+    head: dict,
+    base_seal: bytes | None,
+    head_seal: bytes | None,
+    head_bytes: bytes,
+    target: str,
+    pr_title: str,
+) -> tuple[bool, str]:
+    """Validate integrity before any policy bypass; never open a parsed target.
+
+    The companion authenticates baseline bytes only, not profiles or recording
+    provenance. Until recording, missing BOTH companions is an explicit legacy
+    transition; either snapshot key present ends that transition. A bad base
+    companion may be repaired, but a present head companion is always checked.
+    """
+    if head_seal is None:
+        if base_seal is not None:
+            return False, "SHA-256 companion removed; no bypass permitted"
+        if any(
+            d.get(key) is not None for d in (base, head) for key in PROTECTED_BLOCKS
+        ):
+            return False, "recorded baseline requires a SHA-256 companion"
+        return True, "unrecorded transition: both SHA-256 companions absent"
+
+    # Accept the standard text or binary sha256sum line, and nothing else:
+    # no extra targets, blank/duplicate lines, whitespace prefixes or escapes.
+    pattern = rb"([0-9a-f]{64}) [ *]" + re.escape(target.encode("utf-8")) + rb"\n?"
+    match = re.fullmatch(pattern, head_seal)
+    if match is None:
+        return (
+            False,
+            "malformed SHA-256 companion or wrong target; expected one canonical target line",
+        )
+    expected = hashlib.sha256(head_bytes).hexdigest().encode("ascii")
+    if match.group(1) != expected:
+        return False, "SHA-256 companion mismatch for exact head baseline bytes"
+    if base_seal is None and not INIT_TAG_RE.search(pr_title):
+        return False, "first SHA-256 companion requires [init-baselines]"
+    return True, "SHA-256 companion matches exact head baseline bytes"
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--base-ref", type=str, default="main")
@@ -145,25 +224,62 @@ def main(argv: list[str] | None = None) -> int:
         help="Test override: path to head content JSON.",
     )
     p.add_argument(
+        "--base-checksum-content",
+        type=Path,
+        default=None,
+        help="Private fixture companion; requires both content overrides.",
+    )
+    p.add_argument(
+        "--head-checksum-content",
+        type=Path,
+        default=None,
+        help="Private fixture companion; requires both content overrides.",
+    )
+    p.add_argument(
         "--repo-relative-path",
         type=str,
         default="coc-eval/baselines.json",
     )
     args = p.parse_args(argv)
 
-    if args.base_content is not None and args.head_content is not None:
-        base_present = (
-            args.base_content.exists() and args.base_content.read_text().strip()
+    fixture_mode = args.base_content is not None and args.head_content is not None
+    if (args.base_content is None) != (args.head_content is None) or (
+        not fixture_mode and (args.base_checksum_content or args.head_checksum_content)
+    ):
+        sys.stderr.write(
+            "error: fixture overrides require both --base-content and --head-content\n"
         )
-        head_present = (
-            args.head_content.exists() and args.head_content.read_text().strip()
-        )
-        base_text = args.base_content.read_text() if base_present else None
-        head_text = args.head_content.read_text() if head_present else None
-    else:
-        base_text = _read_base_text(args.base_ref, args.repo_relative_path)
-        head_path = REPO_ROOT / args.repo_relative_path
-        head_text = head_path.read_text() if head_path.exists() else None
+        return EXIT_MISCONFIG
+    try:
+        if fixture_mode:
+            # Missing adjacent fixture seals mean absent; NEVER read canonical
+            # seals when baseline content is overridden by a private fixture.
+            base_bytes = _read_optional_bytes(args.base_content)
+            head_bytes = _read_optional_bytes(args.head_content)
+            base_text = base_bytes if base_bytes and base_bytes.strip() else None
+            head_text = head_bytes if head_bytes and head_bytes.strip() else None
+            base_seal = _read_optional_bytes(
+                args.base_checksum_content
+                or args.base_content.with_name(args.base_content.name + ".sha256")
+            )
+            head_seal = _read_optional_bytes(
+                args.head_checksum_content
+                or args.head_content.with_name(args.head_content.name + ".sha256")
+            )
+        else:
+            # Both historical files use ONE resolved commit, even if refs move.
+            revision = _resolve_base_ref(args.base_ref)
+            base_text = _read_git_optional(revision, args.repo_relative_path)
+            head_text = _read_optional_bytes(REPO_ROOT / args.repo_relative_path)
+            base_seal = _read_git_optional(
+                revision, args.repo_relative_path + ".sha256"
+            )
+            head_seal = _read_optional_bytes(
+                REPO_ROOT / (args.repo_relative_path + ".sha256")
+            )
+    except OSError as exc:
+        sys.stderr.write(f"error: cannot read baseline/checksum inputs: {exc}\n")
+        return EXIT_MISCONFIG
 
     if head_text is None:
         sys.stderr.write(
@@ -174,9 +290,33 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         head = json.loads(head_text)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         sys.stderr.write(f"error: head {args.repo_relative_path}: invalid JSON: {e}\n")
         return EXIT_MISCONFIG
+
+    try:
+        base = json.loads(base_text) if base_text and base_text.strip() else {}
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        sys.stderr.write(
+            f"error: base {args.repo_relative_path}: invalid JSON: {exc}\n"
+        )
+        return EXIT_MISCONFIG
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        sys.stderr.write("error: baseline top level must be an object\n")
+        return EXIT_MISCONFIG
+    checksum_ok, checksum_message = _validate_checksum(
+        base,
+        head,
+        base_seal,
+        head_seal,
+        head_text,
+        args.repo_relative_path,
+        args.pr_title,
+    )
+    if not checksum_ok:
+        sys.stderr.write(f"error: {checksum_message}\n")
+        return EXIT_VIOLATION
+    sys.stdout.write(f"OK: {checksum_message}\n")
 
     if base_text is None or not base_text.strip():
         # Mode (b): no base; this is the first time the file is added.
@@ -190,12 +330,6 @@ def main(argv: list[str] | None = None) -> int:
             "error: baselines.json added but PR title lacks [init-baselines].\n"
         )
         return EXIT_VIOLATION
-
-    try:
-        base = json.loads(base_text)
-    except json.JSONDecodeError as e:
-        sys.stderr.write(f"error: base {args.repo_relative_path}: invalid JSON: {e}\n")
-        return EXIT_MISCONFIG
 
     base_has_init = _has_init_blocks(base)
     head_has_init = _has_init_blocks(head)

@@ -130,7 +130,7 @@ pub fn clear_stop_requested(base_dir: &Path) {
 /// supervisor hosts (standalone `--supervised`, or the desktop
 /// in-process loop) is asking. A missing or unreadable sentinel reads as
 /// `false` (existence-only check — the file has no content the gate
-/// depends on; [`STOP_REQUESTED_PAYLOAD`] is diagnostic-only).
+/// depends on; `STOP_REQUESTED_PAYLOAD` is diagnostic-only).
 pub fn is_stop_requested(base_dir: &Path) -> bool {
     sentinel_path(base_dir).exists()
 }

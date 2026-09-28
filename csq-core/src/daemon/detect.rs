@@ -14,7 +14,8 @@
 //!    - timeout → `Unhealthy("socket connect timeout")` — daemon is
 //!      alive but overloaded; caller falls back with a stderr
 //!      warning
-//! 4. Send `GET /api/health` (200ms timeout)
+//! 4. Send `GET /api/health` (4s timeout — see `HEALTH_TIMEOUT` for why that
+//!    bound and not a tighter one; it is derived from BOTH measured states)
 //!    - success → `Healthy`
 //!    - timeout / parse error → `Unhealthy(reason)`
 //!
@@ -45,8 +46,8 @@ pub enum DetectResult {
     /// stale-daemon-after-csq-upgrade footgun (csq upgraded on disk,
     /// daemon still running pre-upgrade binary, CLI silently consumes
     /// stale `/api/accounts` etc.) is the originating failure mode for
-    /// this field; an empty string means the daemon predates the
-    /// version handshake and MUST also be treated as a mismatch.
+    /// this field; an empty string means the version handshake was
+    /// missing or invalid and MUST also be treated as a mismatch.
     Healthy {
         pid: u32,
         socket_path: PathBuf,
@@ -72,22 +73,22 @@ pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Returns `Some(reason)` if the daemon's reported version does NOT
 /// match this binary's `CARGO_PKG_VERSION`, signalling a stale-daemon
 /// drift the caller MUST fall back from. `None` means the versions
-/// match (or both are empty in some edge case, which is also a
-/// no-act). The returned string is suitable for direct stderr
+/// match. The returned string is suitable for direct stderr
 /// rendering — it names both versions and the remediation.
 pub fn version_drift_reason(daemon_version: &str) -> Option<String> {
     if daemon_version == CLI_VERSION {
         return None;
     }
-    if daemon_version.is_empty() {
-        return Some(format!(
-            "daemon predates the version handshake (CLI v{CLI_VERSION}); \
-             run `csq daemon stop && csq daemon start` to refresh"
-        ));
-    }
+    let mismatch = if daemon_version.is_empty() {
+        format!("daemon version handshake is missing or invalid (CLI v{CLI_VERSION})")
+    } else if !is_semver_shaped(daemon_version) {
+        format!("daemon reported an invalid version (CLI v{CLI_VERSION})")
+    } else {
+        format!("daemon v{daemon_version} differs from CLI v{CLI_VERSION}")
+    };
     Some(format!(
-        "daemon v{daemon_version} differs from CLI v{CLI_VERSION}; \
-         run `csq daemon stop && csq daemon start` to refresh"
+        "{mismatch}; {}",
+        super::recovery::recovery_guidance()
     ))
 }
 
@@ -96,7 +97,7 @@ pub fn version_drift_reason(daemon_version: &str) -> Option<String> {
 /// predates the version field, the body is malformed, the field
 /// is missing, OR the field contains characters outside the
 /// semver-shape allowlist `[A-Za-z0-9.+-]`. Every empty-string return
-/// routes to the same "predates handshake" branch in
+/// routes to the same "missing or invalid handshake" branch in
 /// [`version_drift_reason`] so the caller gets a uniform fall-back
 /// signal.
 ///
@@ -146,8 +147,55 @@ fn is_semver_shaped(s: &str) -> bool {
 /// Health-check read/write timeout per GAP-9. Applied to the socket
 /// after connect via `set_read_timeout`/`set_write_timeout` so the
 /// HTTP/1.1 exchange cannot hang longer than this.
+///
+/// # Why 4s, and not the 200ms this used to be
+///
+/// A timeout is only a measurement if it SEPARATES the two outcomes it exists
+/// to separate, with a stated margin on each side. Both were measured on a
+/// loaded maintainer host (2026-09-10, load average 83-280):
+///
+/// | daemon state                         | `/api/health` response       | host load |
+/// |--------------------------------------|------------------------------|-----------|
+/// | wedged / CPU-starved (unschedulable) | never — not within 5000 ms   | 280       |
+/// | healthy, machine heavily loaded      | 147 ms median, 1274 ms max   | 83-115    |
+/// | healthy, machine MORE heavily loaded | 135 ms median, **2918 ms** max | 192     |
+///
+/// The third row arrived an hour after the first two and is why this constant is
+/// 4s and not the 2s the first re-derivation chose. 2s was picked from a worst
+/// case of 1274 ms — a MEASURED TYPICAL standing in for a BOUND, which is the
+/// error this very comment exists to warn about (`doc-property-claims.md`
+/// MUST-2). One more sample at a higher load produced 2918 ms and 1 refusal in
+/// 11 on a demonstrably healthy daemon. Do not repeat the mistake by treating
+/// 2918 ms as the ceiling either: it is the worst seen so far, not a proven max.
+///
+/// 4s is chosen to sit between the two OBSERVED regions with margin on each:
+/// ~1.1s above the worst healthy response, and BELOW the 5000 ms window in which
+/// the starved daemon provably never answered — so the evidence covers the bound
+/// from both directions rather than extrapolating past it.
+///
+/// 200 ms fell INSIDE the healthy range, so it could not tell the two apart: it
+/// reported a demonstrably-serving daemon as unhealthy and refused codex spawns
+/// on working slots (`Codex spawn refused — csq daemon is unhealthy: health
+/// read: Resource temporarily unavailable (os error 35)`) while `csq doctor`
+/// on the same daemon said healthy. A gate that cannot discriminate gets
+/// overridden, and then so does the next one — `tooling-self-verification.md`
+/// Rule 3, `instrument-discipline.md` MUST-1.
+///
+/// The cost of the larger bound is that a truly dead daemon takes 4s rather than
+/// 200ms to report — paid ONLY on the failure path, where the caller is about to
+/// print an error and stop anyway. The cost of the smaller bound was refusing
+/// live slots, paid on the SUCCESS path. Paying on the path that already failed
+/// is strictly better than paying on the one that worked.
+///
+/// This does NOT make csq correct on an overloaded host; it makes csq stop
+/// misreporting one. A machine at load 192 is the actual defect, and no timeout
+/// value fixes it.
+///
+/// If a future change makes the health handler do real work, this constant must
+/// be re-derived from fresh measurements of BOTH states — not adjusted until a
+/// test passes.
 #[cfg(unix)]
-const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Runs the 4-step detection protocol.
 ///
@@ -393,7 +441,7 @@ fn windows_health_check(pid: u32, pipe_path: &Path) -> DetectResult {
     //   - Opening with `FILE_FLAG_OVERLAPPED`
     //
     // For M8-03, we accept the blocking behavior. The daemon is expected
-    // to respond within microseconds, and the 200ms SLA is met in the
+    // to respond within microseconds, and the HEALTH_TIMEOUT budget is met in the
     // common case. A full async health check is available via
     // `client_windows::http_get_pipe` for callers with a tokio runtime.
 
@@ -556,20 +604,21 @@ mod tests {
             "missing CLI version: {reason}"
         );
         assert!(
-            reason.contains("daemon stop") && reason.contains("daemon start"),
+            reason.contains("executable versus PATH-selected CLI executable is unverified")
+                && reason.contains("restarting the same old binary does not fix"),
             "missing remediation: {reason}"
         );
     }
 
-    /// Empty `daemon_version` means the daemon predates the version
-    /// field in `/api/health`'s body parser. Treated as drift —
+    /// Empty `daemon_version` means the health parser could not recover a
+    /// valid version (including old daemons without the field). Treated as drift —
     /// otherwise an old daemon serving stale data passes silently.
     #[test]
     fn version_drift_reason_treats_empty_as_drift() {
         let reason = version_drift_reason("").expect("expected drift");
         assert!(
-            reason.contains("predates"),
-            "missing predates hint: {reason}"
+            reason.contains("handshake is missing or invalid"),
+            "missing handshake uncertainty: {reason}"
         );
         assert!(reason.contains(CLI_VERSION));
     }
@@ -823,7 +872,8 @@ mod tests {
             base_dir: std::sync::Arc::new(dir.path().to_path_buf()),
             oauth_store: None,
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
-            audit_health: crate::audit::AuditHealth::Verified,
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
             anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: std::sync::Arc::new(
@@ -927,7 +977,8 @@ mod tests {
             base_dir: std::sync::Arc::new(dir.path().to_path_buf()),
             oauth_store: None,
             gemini_consumer: crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
-            audit_health: crate::audit::AuditHealth::Verified,
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
             anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: std::sync::Arc::new(

@@ -14,7 +14,7 @@
 //! [`read_fresh_after_login`] closes the race:
 //!   1. reads BOTH the keychain and `.credentials.json` on each attempt,
 //!   2. keeps whichever Anthropic credential is **login-fresh** — minted
-//!      within [`MINT_WINDOW_MS`] of the expected CC access-token expiry
+//!      within `MINT_WINDOW_MS` of the expected CC access-token expiry
 //!      (`now + CC_ACCESS_TOKEN_TTL_MS`). This is a bounded, zero-network
 //!      liveness signal: a dead-but-later-expiry keychain token whose TTL
 //!      is anomalously longer than the expected 5-hour CC TTL cannot be
@@ -128,7 +128,26 @@ impl std::error::Error for FreshLoginError {}
 pub fn read_fresh_after_login(config_dir: &Path) -> Result<CredentialFile, FreshLoginError> {
     let file_path = config_dir.join(".credentials.json");
     read_fresh_after_login_with(
-        || keychain::read(config_dir),
+        || {
+            // Explicit migration to the classified boundary
+            // (`guard-reader-writer-parity.md` MUST-1/MUST-2,
+            // `doc-property-claims.md` MUST-1): `NotFound` ("asked, item
+            // absent") and `CouldNotAsk` ("could not complete the ask") are
+            // collapsed identically HERE, on purpose — this closure feeds a
+            // bounded retry loop (see module docs) that reads
+            // `.credentials.json` on the SAME attempt regardless of why the
+            // keychain candidate was missing, and retries on the next
+            // attempt either way. A future caller that needs to tell the two
+            // apart (e.g. to distinguish "never logged in" from "keychain
+            // unreachable, degraded diagnosis") must not copy this collapse —
+            // match on `KeychainRead` directly instead.
+            match keychain::read_classified(config_dir) {
+                keychain::KeychainRead::Found(c) => Some(*c),
+                keychain::KeychainRead::NotFound | keychain::KeychainRead::CouldNotAsk { .. } => {
+                    None
+                }
+            }
+        },
         || file::load(&file_path).ok(),
         DEFAULT_ATTEMPTS,
         |_attempt| std::thread::sleep(BACKOFF),

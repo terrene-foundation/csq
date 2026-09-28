@@ -26,18 +26,9 @@ use tempfile::TempDir;
 
 // ── Binary path ──────────────────────────────────────────────────────────────
 
-fn csq_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_csq") {
-        return PathBuf::from(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("csq")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::csq_bin;
 
 // ── Hermetic subprocess helper (rules/test-hermeticity.md MUST 2) ─────────────
 
@@ -59,6 +50,9 @@ fn clean_cmd() -> Command {
     // operator's real login keychain (rules/test-hermeticity.md).
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     cmd.env("HOME", sandbox_home());
+    // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
+    // test-utils-gated override is what actually sandboxes it there.
+    cmd.env("CSQ_HOME", sandbox_home());
     cmd.env("CLAUDE_HOME", sandbox_home());
     for k in [
         "PATH",

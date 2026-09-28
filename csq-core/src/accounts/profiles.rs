@@ -24,7 +24,7 @@
 use crate::accounts::identity_store::{self, IdentityId};
 use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::error::ConfigError;
-use crate::platform::fs::{atomic_replace, secure_file};
+use crate::platform::fs::atomic_replace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -96,8 +96,8 @@ pub struct ProfilesFile {
     /// Identity-class labels for non-OAuth slots (3P API keys, Codex).
     /// Slot number (as string, e.g. "9") → identity label literal:
     ///   "apikey:<provider_id>"    for 3P API-key slots
-    ///   "codex-<N>/<id-prefix>"   for Codex OAuth slots
-    ///   "gemini-<N>/<id>"         reserved for future Gemini integration
+    ///   `"codex-<N>/<id-prefix>"`   for Codex OAuth slots
+    ///   `"gemini-<N>/<id>"`         reserved for future Gemini integration
     /// Distinct from `by_slot_label` (user rename) so backfill + rename
     /// do not collide.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -312,10 +312,11 @@ pub fn load(path: &Path) -> Result<ProfilesFile, ConfigError> {
 /// The write pipeline follows security.md MUST Rule 5a and MUST Rule 5:
 /// every failure branch removes the tmp file before propagating the error,
 /// because profiles.json carries email PII + provider metadata.
-/// The `secure_file` step propagates failure (fail-closed) — a permission
-/// failure leaves the token-bearing tmp at umask default; the only safe
-/// response is to remove the tmp and surface the error. Mirrors the
-/// fail-closed posture in `third_party::bind_provider_to_slot`.
+/// `write_new_private` creates the tmp file at 0o600 AT CREATION, so there
+/// is no separate post-write chmod step left to fail independently — any
+/// write failure (including on a read-only parent) is surfaced and the tmp
+/// file is removed before propagating. Mirrors the fail-closed posture in
+/// `third_party::bind_provider_to_slot`.
 pub fn save(path: &Path, profiles: &ProfilesFile) -> Result<(), ConfigError> {
     let json = serde_json::to_string_pretty(profiles).map_err(|e| ConfigError::InvalidJson {
         path: path.to_path_buf(),
@@ -327,24 +328,15 @@ pub fn save(path: &Path, profiles: &ProfilesFile) -> Result<(), ConfigError> {
     }
 
     let tmp = crate::platform::fs::unique_tmp_path(path);
-    // §5a cleanup: profiles.json carries email + method + provider PII.
-    // Partial-failure leaves PII-bearing tmp at umask 0o644.
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    // §5a: profiles.json carries email + method + provider PII.
+    // `write_new_private` creates the tmp file at 0o600 AT CREATION
+    // (`create_new` + `mode(0o600)`), closing the window a separate
+    // `std::fs::write` + `secure_file` pair used to leave open.
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ConfigError::InvalidJson {
             path: tmp,
             reason: format!("write: {e}"),
-        });
-    }
-
-    // SECURITY: propagate (not `.ok()`) — a silent permission failure would
-    // publish the PII-bearing tmp at umask default, potentially world-readable.
-    // Fail closed. §5a: remove tmp before propagating on any failure.
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("secure_file: {e}"),
         });
     }
 
@@ -609,8 +601,8 @@ pub fn remove_slot_mapping(
 /// # §5a compliance
 ///
 /// Labels are user-visible strings, not secrets. The `save()` helper already
-/// performs §5a-compliant atomic write + `secure_file`. No additional cleanup
-/// is needed at this layer.
+/// performs §5a-compliant atomic write via `write_new_private`. No
+/// additional cleanup is needed at this layer.
 pub fn set_slot_label(
     _lock: &ProfilesFileLock,
     base_dir: &Path,
@@ -2488,17 +2480,17 @@ mod tests {
 
     // ─── M10 security regression test ─────────────────────────────────────────
 
-    /// M10 regression: `save` returns `Err` when `secure_file` fails (fail-closed
-    /// posture), AND leaves no `.tmp.` artifact on disk (§5a compliance).
+    /// M10 regression: `save` returns `Err` under a read-only parent directory
+    /// (fail-closed posture), AND leaves no `.tmp.` artifact on disk (§5a
+    /// compliance).
     ///
-    /// Uses the read-only parent directory technique: on Unix, making the parent
-    /// directory read-only prevents both `write` AND any rename/chmod operations,
-    /// which forces `secure_file` to fail on some platforms. However, since
-    /// `write` fails first under a read-only parent, this test primarily validates
-    /// the §5a no-tmp-leak guarantee end-to-end (covering both the `write` and
-    /// `secure_file` failure paths structurally). The fail-closed `secure_file`
-    /// change is additionally validated by the code inspection: the `.ok()` is
-    /// gone and replaced with fail-closed propagation.
+    /// Uses the read-only parent directory technique: on Unix, making the
+    /// parent directory read-only prevents `write_new_private`'s `open()`
+    /// call from creating the tmp file at all, so `save` fails at the write
+    /// step and the §5a no-tmp-leak guarantee is what this test pins.
+    /// (`save` no longer has a separate `secure_file` step — since M-tmp-0600,
+    /// `write_new_private` sets mode 0o600 at creation, so there is no
+    /// post-write chmod left to fail independently.)
     ///
     /// The canonical §5a regression fixture is
     /// `crate::platform::fs::assert_no_tmp_leak_on_readonly_parent`.

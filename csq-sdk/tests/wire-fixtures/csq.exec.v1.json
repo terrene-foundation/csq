@@ -1,0 +1,16 @@
+{
+  "finish_reason": "tool_use",
+  "finish_reason_raw": "tool_use",
+  "id": "corr-id-1",
+  "model": "claude-opus-4-8",
+  "ok": true,
+  "provider": "claude",
+  "schema": "csq.exec.v1",
+  "text": "the model's output text",
+  "usage": {
+    "cache_creation_input_tokens": 16,
+    "cache_read_input_tokens": 8,
+    "input_tokens": 120,
+    "output_tokens": 48
+  }
+}

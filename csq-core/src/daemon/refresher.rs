@@ -106,7 +106,7 @@ pub const STARTUP_DELAY: Duration = Duration::from_secs(3);
 /// whichever fires first: a monotonic floor (`Instant::elapsed() >= interval`,
 /// immune to wall-clock changes — preserves the old `sleep(interval)` behavior
 /// for the normal and backward-clock-jump cases) or a wall-clock (`SystemTime`)
-/// deadline (see [`next_wait_chunk`], which the monotonic clock pause hides, so
+/// deadline (see `next_wait_chunk`, which the monotonic clock pause hides, so
 /// it is the channel that catches host sleep/wake). After the host wakes, the
 /// wall clock has jumped past the deadline, so the next tick fires within one
 /// probe granularity (≤30s) instead of ≤5 minutes. Smaller = faster post-wake
@@ -229,8 +229,9 @@ pub type HttpPostFn = Arc<dyn Fn(&str, &str) -> Result<Vec<u8>, String> + Send +
 /// Date-aware sibling of [`HttpPostFn`] used by the Codex refresh
 /// path. Returns `(body, Option<Date header>)` — the Date header
 /// drives spec 07 §7.5 INV-P01 clock-skew detection.
-pub type HttpPostFnCodex =
-    Arc<dyn Fn(&str, &str) -> Result<(Vec<u8>, Option<String>), String> + Send + Sync + 'static>;
+pub type HttpPostFnCodex = Arc<
+    dyn Fn(&str, &str) -> Result<crate::http::NodeHttpResponse, String> + Send + Sync + 'static,
+>;
 
 /// Handle to a running refresher task. Drop does NOT cancel —
 /// callers must explicitly cancel the `CancellationToken` passed
@@ -336,14 +337,31 @@ async fn run_loop(
     }
 
     loop {
-        // Run one tick.
-        tick(
-            &base_dir,
-            &http_post,
-            &http_post_codex,
-            &cache,
-            &cooldowns,
-            &backoffs,
+        // Run one tick, isolated in its own task (round 9, S-C-1 / D-F1): a
+        // bug anywhere on the tick's call graph (the `harvest_gate`
+        // `blocking_lock`-on-a-worker panic fixed alongside this change is
+        // one instance, but not the only possible one) must never again be
+        // able to silently and PERMANENTLY kill this `run_loop` task.
+        //
+        // `keychain-fix-r10.md` C-B3: `run_loop`'s task IS observed and
+        // restarted in production — `daemon.rs`'s and `daemon_supervisor.rs`'s
+        // `subsystems` lists register `refresher.join` as a supervised member,
+        // and ANY return from it (clean exit or an unwound panic) restarts
+        // the WHOLE daemon session (every subsystem, not just this one).
+        // `run_tick_supervised`'s per-tick isolation is what makes that outer
+        // restart a rare last resort rather than the routine response to one
+        // bad tick: a session-wide restart drops in-flight IPC connections,
+        // resets every OTHER subsystem's warm state, and costs the daemon's
+        // full startup sequence — the task boundary here is CHEAPER, logging
+        // the JoinError and continuing to the next scheduled tick instead of
+        // paying for that.
+        run_tick_supervised(
+            base_dir.clone(),
+            Arc::clone(&http_post),
+            Arc::clone(&http_post_codex),
+            Arc::clone(&cache),
+            Arc::clone(&cooldowns),
+            Arc::clone(&backoffs),
         )
         .await;
 
@@ -362,9 +380,14 @@ async fn run_loop(
             // A panic in the blocking sweep task surfaces as a JoinError. Log it
             // (it does not kill the refresher loop) so a real outbox-drain
             // incident is debuggable rather than silently swallowed.
+            //
+            // `keychain-fix-r11.md` D-3: JoinError's Display can carry the
+            // panic's own message (tokio's impl), and this task's call graph
+            // is credential-adjacent — fixed tag + `is_panic` only, never
+            // the raw Display.
             tracing::warn!(
                 error_kind = "seam_held_sweep_task_panicked",
-                error = %e,
+                panicked = e.is_panic(),
                 "held-provenance sweep task panicked"
             );
         }
@@ -412,6 +435,93 @@ async fn run_loop(
                 }
                 _ = tokio::time::sleep(chunk) => {}
             }
+        }
+    }
+}
+
+/// Runs one [`tick`] inside its own `tokio::spawn`'d task and awaits it,
+/// converting a panic anywhere on the tick's call graph into a `JoinError`
+/// instead of unwinding into `run_loop`'s own task.
+///
+/// `keychain-fix-r10.md` C-B3: `run_loop`'s task IS observed in production —
+/// `daemon.rs`'s and `daemon_supervisor.rs`'s `subsystems` lists both watch
+/// `RefresherHandle::join` and restart the WHOLE daemon session on any
+/// unwound panic reaching it — but that outer restart is a session-wide,
+/// every-subsystem, full-startup-sequence remedy. Before THIS wrapper
+/// existed, a single panicking call — the
+/// `harvest_gate::mark_rate_limited_from_refresher` `blocking_lock`-on-a-worker
+/// bug (round 9, S-C-1 / D-F1) was one, but not the only possible one —
+/// would have unwound past `run_loop` and forced exactly that expensive
+/// outer restart for what is, per-tick, a fully recoverable fault. This
+/// wrapper is the CHEAPER remedy: isolate the one bad tick, log it, and
+/// keep every other subsystem's warm state and every live IPC connection
+/// intact.
+///
+/// `base_dir` is taken by value (cheap `PathBuf` clone) and the remaining
+/// arguments by `Arc` clone so the spawned task can be `'static`; `tick`
+/// itself still takes references, borrowed from the clones inside the
+/// spawned future.
+#[allow(clippy::too_many_arguments)]
+async fn run_tick_supervised(
+    base_dir: PathBuf,
+    http_post: HttpPostFn,
+    http_post_codex: HttpPostFnCodex,
+    cache: Arc<TtlCache<u16, RefreshStatus>>,
+    cooldowns: Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: Arc<Mutex<HashMap<u16, u32>>>,
+) {
+    // Kept for the panic-recovery sweep below — `base_dir` itself is moved
+    // into the spawned task.
+    let base_dir_for_panic_sync = base_dir.clone();
+
+    let result = tokio::spawn(async move {
+        tick(
+            &base_dir,
+            &http_post,
+            &http_post_codex,
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+    })
+    .await;
+
+    if let Err(join_err) = result {
+        // `keychain-fix-r10.md` S-L-2: a `JoinError` for a panic can carry the
+        // panic's own message (tokio's `Display` includes it when the panic
+        // payload downcasts to `String`/`&str`) — NOT opaque, so redact
+        // before logging, same as every other error path in this tick's call
+        // graph that touches credential material.
+        tracing::error!(
+            error_kind = "refresher_tick_panicked",
+            panicked = join_err.is_panic(),
+            error = %crate::error::redact_tokens(&join_err.to_string()),
+            "refresher tick panicked; refresher loop survives and will retry at the next interval"
+        );
+
+        // `keychain-fix-r10.md` C-I1: a tick that panicked mid-way may have
+        // already refreshed and written one or more accounts' tokens to
+        // disk BEFORE the panic — `tick_impl`'s own post-loop keychain
+        // sweep (`sync_refreshed_keychains`, gated on `any_anthropic_refreshed`)
+        // never ran for THIS tick, since the panic unwound before reaching
+        // it. Without this, CC would keep reading the PRE-rotation token
+        // from its keychain-first read (spec 01 §1.4) until the NEXT tick
+        // happens to refresh the same account again. An empty `refreshed`
+        // map means "no fingerprint hints" — `sync_all_handle_dirs` sweeps
+        // EVERY live handle dir unconditionally rather than only ones this
+        // (aborted) tick knows it touched, since we cannot know which
+        // account(s) got as far as their disk write before the panic.
+        if let Err(sync_join_err) = tokio::task::spawn_blocking(move || {
+            sync_refreshed_keychains(&base_dir_for_panic_sync, &std::collections::HashMap::new());
+        })
+        .await
+        {
+            tracing::warn!(
+                error_kind = "post_panic_keychain_sync_task_panicked",
+                panicked = sync_join_err.is_panic(),
+                "post-panic keychain sync task itself panicked (non-fatal)"
+            );
         }
     }
 }
@@ -535,8 +645,54 @@ pub(crate) fn run_held_sweep_tick(base_dir: &std::path::Path) {
 /// refresher unit test) sweeps nothing, so no keychain syscall fires under
 /// `cargo test`; on non-macOS the write is a no-op stub. An aggregate failure is
 /// logged with a fixed tag; it never affects the refresh outcome.
-fn sync_refreshed_keychains(base_dir: &std::path::Path) {
-    let (_synced, _skipped, failed) = crate::credentials::keychain::sync_all_handle_dirs(base_dir);
+// `keychain-fix-r10.md` C-I1: process-wide (not thread-local) storage — this
+// function runs inside `tokio::task::spawn_blocking`, a genuine OS thread
+// distinct from whatever thread a test's assertion runs on, so a
+// thread-local counter would never be visible to the test.
+//
+// `keychain-fix-r11.md` D-7: keyed PER BASE_DIR, not a single shared total.
+// The prior single `AtomicU32`'s own doc comment claimed "interleaving from
+// unrelated parallel tests... cannot produce a false positive" — false: with
+// `cargo test`'s default parallel runner, a DIFFERENT test's tick (any test
+// that refreshes an account and triggers its OWN, legitimate
+// `sync_refreshed_keychains` call) can increment the SAME global counter in
+// the window between this test's `_before`/`_after` reads, making
+// `sync_calls_after > sync_calls_before` true even with the recovery sync
+// path DELETED — exactly the false pass this test's own RED depends on not
+// happening. Keying per `base_dir` (each test uses its own `TempDir`) closes
+// that hole: no other test's tick ever shares this test's path.
+#[cfg(test)]
+static SYNC_REFRESHED_KEYCHAINS_CALLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn sync_refreshed_keychains_call_count_for_test(base_dir: &std::path::Path) -> u32 {
+    SYNC_REFRESHED_KEYCHAINS_CALLS
+        .lock()
+        .unwrap()
+        .get(base_dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn sync_refreshed_keychains(
+    base_dir: &std::path::Path,
+    refreshed: &std::collections::HashMap<
+        AccountNum,
+        crate::credentials::token_history::Fingerprint,
+    >,
+) {
+    #[cfg(test)]
+    {
+        *SYNC_REFRESHED_KEYCHAINS_CALLS
+            .lock()
+            .unwrap()
+            .entry(base_dir.to_path_buf())
+            .or_insert(0) += 1;
+    }
+    let (_synced, _skipped, failed) =
+        crate::credentials::keychain::sync_all_handle_dirs(base_dir, refreshed);
     if failed > 0 {
         tracing::warn!(
             error_kind = "cc_keychain_sync_failed",
@@ -546,11 +702,86 @@ fn sync_refreshed_keychains(base_dir: &std::path::Path) {
     }
 }
 
+// `keychain-fix-r10.md` C-I1/C-T-a: test-only panic hook, thread-local
+// (mirrors `auto_rotate.rs`'s `PRE_LOCK_TEST_HOOK`) since it is set and
+// consumed on the SAME test thread that drives the tick — never touched
+// concurrently. Reset to `None` by every test that sets it.
+#[cfg(test)]
+thread_local! {
+    static TICK_TEST_PANIC_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_tick_test_panic_hook_for_test(hook: Option<Box<dyn FnMut()>>) {
+    TICK_TEST_PANIC_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_tick_test_panic_hook() {
+    TICK_TEST_PANIC_HOOK.with(|c| {
+        if let Some(hook) = c.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_tick_test_panic_hook() {}
+
+/// `keychain-fix-r11.md` D-7: RAII guard for [`TICK_TEST_PANIC_HOOK`] — resets
+/// the thread-local to `None` on `Drop`, which fires on EVERY exit path
+/// including an unwinding panic (e.g. a failed `.expect(...)` earlier in the
+/// test body), not only the test's last line. The prior pattern (a bare
+/// `set_tick_test_panic_hook_for_test(None)` call at the end of the test)
+/// never ran if an assertion above it panicked, leaving the hook installed
+/// for whichever LATER test happens to reuse the same OS thread from the
+/// test harness's thread pool — a real cross-test leak, not a hypothetical
+/// one, since `cargo test` recycles threads across `#[test]` functions.
+#[cfg(test)]
+pub(crate) struct TickTestPanicHookGuard;
+
+#[cfg(test)]
+impl TickTestPanicHookGuard {
+    pub(crate) fn install(hook: Box<dyn FnMut()>) -> Self {
+        set_tick_test_panic_hook_for_test(Some(hook));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TickTestPanicHookGuard {
+    fn drop(&mut self) {
+        set_tick_test_panic_hook_for_test(None);
+    }
+}
+
+/// `keychain-fix-r10.md` S-M-1/C-B2: whether the token REFRESH call
+/// (`broker_check`) should be skipped this tick. Gated ONLY on
+/// `refresh_rate_limited_this_tick` — a 429 observed on THIS tick's OWN
+/// refresh-endpoint call for an earlier account. It is deliberately NOT
+/// gated on the shared, IP-wide validation gate (`rate_limited_this_tick`,
+/// seeded from `harvest_gate_is_rate_limited()` and set by the custodian's
+/// own `/api/oauth/profile` validate call): that gate is evidence the
+/// VALIDATION endpoint is throttled, which is a different endpoint from the
+/// refresh (token) endpoint, and is not evidence the refresh endpoint is
+/// also throttled. Merging the two flags previously meant an account whose
+/// custodian validate call (or an unrelated account's earlier validate
+/// call, or even a stale cross-tick observation) hit a 429 would never
+/// refresh an expiring token this tick — silently, with no HTTP attempt and
+/// no log line distinguishing "genuinely rate-limited on refresh" from
+/// "some validation call somewhere hit a 429".
+fn refresh_should_be_skipped(refresh_rate_limited_this_tick: bool, needs_refresh: bool) -> bool {
+    refresh_rate_limited_this_tick && needs_refresh
+}
+
 /// Runs a single refresher tick — discover accounts, check each
 /// one, update cache, manage cooldowns.
 ///
 /// Exposed `pub(crate)` so tests can drive a single tick without
-/// spawning the whole loop.
+/// spawning the whole loop. Thin wrapper over [`tick_impl`] that seeds the
+/// validation-only gate from the REAL process-wide singleton
+/// (`harvest_gate_is_rate_limited`) — production's only entrypoint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn tick(
     base_dir: &std::path::Path,
@@ -560,7 +791,77 @@ pub(crate) async fn tick(
     cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
 ) {
-    info!("refresher tick starting");
+    tick_impl(
+        base_dir,
+        http_post,
+        http_post_codex,
+        cache,
+        cooldowns,
+        backoffs,
+        crate::daemon::server::harvest_gate_is_rate_limited(),
+    )
+    .await
+}
+
+/// `keychain-fix-r10.md` S-M-1/C-B2: the real body of [`tick`], with the
+/// validation-only gate's SEED made an explicit parameter rather than read
+/// unconditionally from `harvest_gate_is_rate_limited()`'s process-wide
+/// singleton. Tests MUST NOT call `harvest_gate_is_rate_limited` /
+/// `harvest_gate_mark_rate_limited` directly (see `server.rs`'s
+/// `ip_rate_limit_gate` doc: that singleton is shared with every OTHER test
+/// in this binary) — this seam is what lets a test exercise "the
+/// validation-only gate is already set at tick start" hermetically, with a
+/// value scoped to the one call, instead of mutating global state that
+/// would leak into every other refresher test in this process for the
+/// gate's 600s cooldown.
+#[allow(clippy::too_many_arguments)]
+async fn tick_impl(
+    base_dir: &std::path::Path,
+    http_post: &HttpPostFn,
+    http_post_codex: &HttpPostFnCodex,
+    cache: &Arc<TtlCache<u16, RefreshStatus>>,
+    cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
+    initial_rate_limited_this_tick: bool,
+) {
+    // `keychain-fix-r10.md` C-I1/C-T-a: a test-only panic point placed
+    // directly in `tick_impl`'s own body — deliberately OUTSIDE every
+    // `spawn_blocking` this function uses internally (those already convert
+    // a panic into a `JoinError` that `tick_impl` itself handles, per
+    // `spawn_survives_a_panicking_tick_and_continues_refreshing`'s doc, so a
+    // panic there never reaches `run_tick_supervised`'s own boundary at
+    // all). This is what makes `run_tick_supervised`'s OWN supervision layer
+    // — the outer `tokio::spawn` in that function — independently testable:
+    // a panic here unwinds straight up through `tick_impl` and `tick`,
+    // exactly like the ORIGINAL D-F1 bug class this file's module doc
+    // describes, and is caught only by `run_tick_supervised`'s wrapper.
+    run_tick_test_panic_hook();
+
+    // Refresh posture, re-read every tick so an operator can flip a host
+    // between leader and follower without restarting the daemon (and without
+    // racing the desktop supervisor, which respawns it). Follower mode gates
+    // the two refresh call sites below — `broker_check` and
+    // `broker_codex_check` — and NOTHING else in this tick: discovery, the
+    // keychain custodian, the cache writes, the keychain sweep, the outbox
+    // drains and the held-provenance sweep all run identically. See
+    // `crate::daemon::posture` for why the switch is a persisted file rather
+    // than a CLI flag or env var.
+    let posture = crate::daemon::posture::load(base_dir);
+    if let crate::daemon::posture::PostureSource::Unreadable(ref why) = posture.source {
+        // Never swallowed (zero-tolerance.md Rule 3): a posture file that
+        // exists but cannot be read forces the stand-down, and the operator
+        // has to be told which file and why, on every tick it persists.
+        warn!(
+            error_kind = "daemon_posture_unreadable",
+            posture = posture.posture.as_str(),
+            reason = %why,
+            "daemon posture file unreadable; standing down to follower (no refreshes)"
+        );
+    }
+    info!(
+        posture = posture.posture.as_str(),
+        "refresher tick starting"
+    );
 
     // Discover all refreshable accounts across surfaces.
     //
@@ -593,11 +894,37 @@ pub(crate) async fn tick(
 
     let mut processed = 0usize;
     let mut skipped_cooldown = 0usize;
-    // Stop processing remaining accounts after any rate limit.
-    // Anthropic rate-limits per IP, so if one request is throttled
-    // the rest will be too — sending them just amplifies the
-    // condition and extends the rate-limit window.
-    let mut rate_limited_this_tick = false;
+    // `keychain-fix-r10.md` S-M-1/C-B2: TWO flags, deliberately not one.
+    //
+    // `rate_limited_this_tick` gates ONLY the custodian's read-only
+    // VALIDATION call (`/api/oauth/profile`, D-F6). Anthropic rate-limits
+    // per IP, so if one validation request is throttled the rest will be
+    // too — sending them just amplifies the condition and extends the
+    // rate-limit window. Seeded from the shared, IP-wide gate (`server.rs`'s
+    // `harvest_gate` module, via `tick`'s `initial_rate_limited_this_tick`
+    // parameter) rather than starting `false` every tick — a 429 observed
+    // moments ago by the on-demand harvest route or by auto-rotate is
+    // honoured immediately here too, instead of this tick re-discovering it
+    // the hard way via its own throttled request.
+    let mut rate_limited_this_tick = initial_rate_limited_this_tick;
+    // `refresh_rate_limited_this_tick` gates the token REFRESH call
+    // (`broker_check`) — see `refresh_should_be_skipped`'s doc for why this
+    // is a SEPARATE flag rather than reusing `rate_limited_this_tick` above.
+    // Deliberately NOT seeded from the shared gate: the refresh endpoint is
+    // a different endpoint from validation, so only a 429 observed on THIS
+    // tick's OWN refresh call (below) may set it.
+    let mut refresh_rate_limited_this_tick = false;
+    // `codex_rate_limited_this_tick` (`keychain-fix-r11.md` D-2): Codex's
+    // refresh endpoint is a DIFFERENT upstream from Anthropic's, so a 429
+    // observed on a Codex account's own `broker_codex_check` call gates
+    // only LATER Codex refreshes THIS tick — it must never set
+    // `rate_limited_this_tick` above, which is Anthropic-validation-only
+    // (`harvest_gate`'s custodian call talks to Anthropic, not Codex, so a
+    // Codex-endpoint 429 says nothing about whether that Anthropic call
+    // would also be throttled). Deliberately not seeded from any shared
+    // gate — Codex has none — and reset every tick like
+    // `refresh_rate_limited_this_tick`.
+    let mut codex_rate_limited_this_tick = false;
 
     let mut codex_processed = 0usize;
     // Set when any Anthropic account's store token changed this tick — by a real
@@ -606,10 +933,30 @@ pub(crate) async fn tick(
     // (`sync_refreshed_keychains`), which redistributes the new token to every live
     // handle dir's keychain.
     let mut any_anthropic_refreshed = false;
+    // round 7c D2: each refreshed/adopted account's PRE-refresh identity
+    // (raw `.credentials.json` content read before the custodian's adopt or
+    // broker_check's refresh landed), so the post-tick sweep can recognize a
+    // keychain item CC self-refreshed BEFORE this tick's write as "known"
+    // (`KnownTokens::sweep_pre_refresh`) rather than an unmatched foreign
+    // login. `None` (unreadable pre-refresh canonical) is simply omitted.
+    //
+    // `keychain-fix-r8.md` S-LOW-1: a FINGERPRINT, not the raw credential
+    // JSON — this map previously held the full pre-refresh
+    // `.credentials.json` string (token bytes and all) for the duration of
+    // the tick, solely to support an identity comparison `decide_cc_
+    // keychain_write` can do just as well against a fingerprint (the same
+    // primitive `token_history` already fingerprints every canonical write
+    // with).
+    let mut refreshed: std::collections::HashMap<
+        AccountNum,
+        crate::credentials::token_history::Fingerprint,
+    > = std::collections::HashMap::new();
 
-    // Custodian (Option A) validation transport: the SAME Node `/api/oauth/usage`
-    // GET the usage poller uses (Cloudflare-safe — `discovery_cloudflare_tls_fingerprint`).
-    // Built once per tick; cheap Arc clone per account.
+    // Custodian (Option A) validation transport: a Node-subprocess GET
+    // against `/api/oauth/profile` (Cloudflare-safe —
+    // `discovery_cloudflare_tls_fingerprint`), NOT `/api/oauth/usage` — that
+    // is the usage poller's own endpoint, a different one. `keychain-fix-r10.md`
+    // C-docs. Built once per tick; cheap Arc clone per account.
     let http_get: crate::daemon::usage_poller::HttpGetFn =
         Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
             crate::http::get_bearer_node(url, token, headers)
@@ -687,6 +1034,40 @@ pub(crate) async fn tick(
                 .unwrap_or(0);
             let expires_at_ms = exp_secs.saturating_mul(1000);
 
+            // Follower: never present this slot's refresh token upstream.
+            // `broker_codex_check` owns the real refresh decision, so this
+            // re-derives the same 2h pre-expiry window purely to LABEL the
+            // cache record — the gate itself is unconditional, so a drift in
+            // that window can only mislabel, never leak a refresh.
+            if posture.is_follower() {
+                let due = is_due_for_refresh(expires_at_ms);
+                record_follower_skip(cache, info.id, "codex", expires_at_ms, due);
+                codex_processed += 1;
+                continue;
+            }
+
+            // `keychain-fix-r11.md` D-2: a Codex 429 earlier this tick
+            // gates only LATER Codex refreshes — never the Anthropic
+            // validation flag (see `codex_rate_limited_this_tick`'s doc
+            // above).
+            let codex_needs_refresh = is_due_for_refresh(expires_at_ms);
+            if refresh_should_be_skipped(codex_rate_limited_this_tick, codex_needs_refresh) {
+                debug!(
+                    account = info.id,
+                    surface = "codex",
+                    "codex refresh endpoint rate-limited earlier this tick, skipping refresh"
+                );
+                let status = RefreshStatus {
+                    account: info.id,
+                    last_result: "rate_limited".to_string(),
+                    expires_at_ms,
+                    checked_at_secs: now_secs(),
+                };
+                cache.set(info.id, status);
+                codex_processed += 1;
+                continue;
+            }
+
             let base = base_dir.to_path_buf();
             let http = Arc::clone(http_post_codex);
             let result = tokio::task::spawn_blocking(move || {
@@ -719,7 +1100,10 @@ pub(crate) async fn tick(
                             );
                             increase_backoff(backoffs, info.id);
                             set_cooldown(cooldowns, info.id);
-                            rate_limited_this_tick = true;
+                            // D-2: Codex-endpoint 429 gates only LATER
+                            // Codex refreshes this tick — never the
+                            // Anthropic-only validation flag.
+                            codex_rate_limited_this_tick = true;
                         }
                         BrokerResult::Skipped => {}
                         BrokerResult::Valid | BrokerResult::Refreshed => {
@@ -748,10 +1132,13 @@ pub(crate) async fn tick(
                     codex_processed += 1;
                 }
                 Err(join_err) => {
+                    // S-L-2: a JoinError's Display can carry the panic's own
+                    // message — not opaque; redact before logging.
                     warn!(
                         account = info.id,
                         surface = "codex",
-                        error = %join_err,
+                        panicked = join_err.is_panic(),
+                        error = %crate::error::redact_tokens(&join_err.to_string()),
                         "codex refresh task panicked"
                     );
                     set_cooldown(cooldowns, info.id);
@@ -898,6 +1285,24 @@ pub(crate) async fn tick(
                 continue;
             }
         };
+        // round 7c D2: captured BEFORE either the custodian's adopt or
+        // broker_check's refresh can change `canonical`'s content — the
+        // sweep's `sweep_pre_refresh` needs this account's identity as it
+        // was before whichever mutation fires below.
+        //
+        // NIT (`keychain-fix-r9.md`): fingerprint HERE, at the read, and
+        // drop the raw string immediately — the fingerprint (a `Copy`
+        // 32-byte hash) is all either usage site below needs, and both
+        // sites are reached only AFTER a network await (the custodian's
+        // `spawn_blocking` validate call, or `broker_check`'s own refresh
+        // call). Holding the raw credential JSON (token bytes and all) in
+        // scope across those awaits keeps it live in memory for the
+        // duration of a network round-trip for no reason; computing the
+        // fingerprint up front and letting the `String` drop here shortens
+        // that window to the read itself.
+        let pre_refresh_fp = std::fs::read_to_string(&canonical)
+            .ok()
+            .and_then(|raw| crate::credentials::token_history::fingerprint_from_raw_json(&raw));
 
         // ── Keychain custodian (Option A): harvest → validate → adopt ─────────
         // Before the refresh decision, adopt the freshest LIVE token across this
@@ -907,7 +1312,8 @@ pub(crate) async fn tick(
         // store + other sessions on a now-dead token), the daemon harvests that
         // fresh token and levels the account to it — instead of fighting CC's
         // per-session refresh. Only a server-confirmed-live token (200 on
-        // /api/oauth/usage) is adopted (an internal journal entry); a rotated-dead candidate
+        // /api/oauth/profile — `keychain-fix-r10.md` C-docs) is adopted
+        // (an internal journal entry); a rotated-dead candidate
         // (401, future expiresAt) is discarded. Runs in `spawn_blocking`: harvest
         // does `security` subprocess reads and validate does a node-subprocess
         // HTTPS call, both blocking. broker_check below re-reads the (possibly
@@ -915,11 +1321,17 @@ pub(crate) async fn tick(
         // refreshes a near-expiry adopted one (strictly better than skipping it).
         //
         // Gated on `!rate_limited_this_tick`: validate issues a live GET to
-        // /api/oauth/usage, which shares Anthropic's per-IP Cloudflare limit with the
-        // refresh endpoint. Once any account this tick has been throttled, the
-        // custodian MUST also stand down — it is a best-effort optimization, and the
-        // next un-throttled tick re-levels. A custodian-observed 429 itself sets the
-        // flag so subsequent accounts short-circuit too.
+        // /api/oauth/profile. Once any account this tick has observed a 429 on
+        // THAT endpoint (via this custodian call, the shared cross-surface
+        // gate, or — belt-and-braces — this tick's own refresh-endpoint 429),
+        // the custodian MUST also stand down — it is a best-effort
+        // optimization, and the next un-throttled tick re-levels. A
+        // custodian-observed 429 itself sets `rate_limited_this_tick` so
+        // subsequent accounts' VALIDATION calls short-circuit too.
+        // `keychain-fix-r10.md` S-M-1/C-B2: this gate is validation-only — it
+        // does NOT stand down the REFRESH call below, which is gated by the
+        // separate `refresh_rate_limited_this_tick` instead (see
+        // `refresh_should_be_skipped`'s doc).
         if !rate_limited_this_tick {
             if let Some(uuid) =
                 crate::accounts::profiles::resolve_slot_to_uuid(&canonical_base, account.get())
@@ -942,6 +1354,9 @@ pub(crate) async fn tick(
                         // Store token changed via adopt → live handle dirs need the new
                         // token redistributed by the post-loop sweep.
                         any_anthropic_refreshed = true;
+                        if let Some(fp) = pre_refresh_fp {
+                            refreshed.insert(account, fp);
+                        }
                         // Re-read the post-adopt expiry so `needs_refresh`, the
                         // rate-limited-skip status, and the cache record below reflect
                         // the freshly adopted token rather than the pre-adopt (often
@@ -954,9 +1369,29 @@ pub(crate) async fn tick(
                     }
                     Ok(ReconcileOutcome::RateLimited) => {
                         // The custodian's own validate was throttled — propagate to the
-                        // tick's cross-account backoff so the remaining accounts (and
-                        // this account's broker_check) stand down.
+                        // tick's cross-account VALIDATION gate so remaining accounts'
+                        // custodian calls stand down. `keychain-fix-r10.md` S-M-1/C-B2:
+                        // this does NOT stand down this or any other account's
+                        // broker_check refresh — a validation-endpoint 429 is not
+                        // evidence the separate refresh endpoint is throttled (see
+                        // `refresh_should_be_skipped`'s doc).
                         rate_limited_this_tick = true;
+                        // C-F5/S-MEDIUM-2 (`keychain-fix-r8.md`), D-F6: share
+                        // this observation with the shared, IP-wide gate
+                        // (`server.rs`'s `harvest_gate` module) so an
+                        // on-demand harvest, a later auto-rotate tick, and
+                        // this refresher's own later ticks all return
+                        // `busy`/skip with no HTTP call against an endpoint
+                        // already known to be throttling this daemon's IP.
+                        // Sync: no `.await` needed (see
+                        // `harvest_gate_mark_rate_limited`'s doc — round 9,
+                        // S-C-1 / D-F1: the PRIOR per-account
+                        // `blocking_lock`-on-a-tokio-Mutex implementation
+                        // panicked when called from exactly this async
+                        // context; moving the state onto a plain
+                        // `std::sync::Mutex` removes the footgun rather than
+                        // working around one call site).
+                        crate::daemon::server::harvest_gate_mark_rate_limited(account);
                     }
                     Ok(_) => {}
                     Err(join_err) => {
@@ -969,6 +1404,16 @@ pub(crate) async fn tick(
                             panicked = join_err.is_panic(),
                             "custodian reconcile task failed (non-fatal)"
                         );
+                        // `keychain-fix-r11.md` D-3: `reconcile_account` may have
+                        // ALREADY adopted a harvested token into the canonical
+                        // store before panicking on a LATER step (e.g. the
+                        // post-adopt re-read) — the panic tells us the task
+                        // didn't finish cleanly, not that it wrote nothing.
+                        // Conservatively flag the tick for the post-loop
+                        // keychain sweep so a real write is never stranded
+                        // behind a panicked task; the sweep's newer-than-
+                        // keychain guard makes an unnecessary sweep a no-op.
+                        any_anthropic_refreshed = true;
                     }
                 }
             }
@@ -979,18 +1424,28 @@ pub(crate) async fn tick(
         // skip the HTTP call but still record the status so the
         // dashboard shows something. Valid tokens are always processed
         // because they don't make HTTP requests.
-        let needs_refresh = {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            expires_at_ms < now_ms + (crate::refresh::check::REFRESH_WINDOW_SECS * 1000)
-        };
+        let needs_refresh = is_due_for_refresh(expires_at_ms);
 
-        if rate_limited_this_tick && needs_refresh {
+        // Follower: never present this slot's refresh token upstream. Gated
+        // BEFORE the rate-limit short-circuit so the cache label is always
+        // `follower_skipped` for a follower — a follower that never calls the
+        // refresh endpoint must not be reported as `rate_limited` just because
+        // the custodian's read-only validate was throttled earlier this tick.
+        //
+        // The custodian above already ran, and deliberately so: it only
+        // harvests + validates a token some local CC session minted, which
+        // cannot rotate a refresh token. A follower still levels up to the
+        // freshest local token; it just never asks Anthropic for a new one.
+        if posture.is_follower() {
+            record_follower_skip(cache, info.id, "anthropic", expires_at_ms, needs_refresh);
+            processed += 1;
+            continue;
+        }
+
+        if refresh_should_be_skipped(refresh_rate_limited_this_tick, needs_refresh) {
             debug!(
                 account = info.id,
-                "rate-limited earlier this tick, skipping refresh"
+                "refresh endpoint rate-limited earlier this tick, skipping refresh"
             );
             let status = RefreshStatus {
                 account: info.id,
@@ -1028,9 +1483,18 @@ pub(crate) async fn tick(
                         // backoff would delay recovery after re-login.
                     }
                     BrokerResult::RateLimited => {
-                        // Rate-limited by Anthropic. Set a cooldown
-                        // with exponential backoff and stop processing
-                        // remaining accounts this tick.
+                        // Rate-limited by Anthropic on THIS tick's OWN
+                        // refresh (token) call. Set a cooldown with
+                        // exponential backoff and stop refreshing remaining
+                        // accounts this tick (`refresh_rate_limited_this_tick`
+                        // — see `refresh_should_be_skipped`'s doc). Also
+                        // marks the validation-only `rate_limited_this_tick`:
+                        // a refresh-endpoint 429 is still evidence this
+                        // daemon's IP is presently throttled by Cloudflare,
+                        // so the custodian's read-only validate call should
+                        // stand down too — this direction (refresh 429 also
+                        // gates validation) was never the bug; only the
+                        // reverse (validation 429 gating refresh) was.
                         let factor = get_backoff(backoffs, info.id);
                         let effective = FAILURE_COOLDOWN * factor;
                         warn!(
@@ -1042,6 +1506,7 @@ pub(crate) async fn tick(
                         increase_backoff(backoffs, info.id);
                         set_cooldown(cooldowns, info.id);
                         rate_limited_this_tick = true;
+                        refresh_rate_limited_this_tick = true;
                     }
                     BrokerResult::Skipped => {
                         // Another process holds the refresh lock.
@@ -1064,6 +1529,9 @@ pub(crate) async fn tick(
                         // (see `sync_refreshed_keychains`).
                         if matches!(broker_result, BrokerResult::Refreshed) {
                             any_anthropic_refreshed = true;
+                            if let Some(fp) = pre_refresh_fp {
+                                refreshed.insert(account, fp);
+                            }
                         }
                     }
                 }
@@ -1095,10 +1563,27 @@ pub(crate) async fn tick(
                 processed += 1;
             }
             Err(join_err) => {
-                // JoinError is opaque and does not carry token
-                // data, so it's safe to log directly.
-                warn!(account = info.id, error = %join_err, "refresh task panicked");
+                // `keychain-fix-r10.md` S-L-2: JoinError is NOT opaque — its
+                // `Display` includes the panic's own message when the panic
+                // payload downcasts to `String`/`&str` (tokio's `JoinError`
+                // impl), and `broker_check`'s call graph handles credential
+                // material, so redact before logging rather than assume
+                // safety.
+                warn!(
+                    account = info.id,
+                    panicked = join_err.is_panic(),
+                    error = %crate::error::redact_tokens(&join_err.to_string()),
+                    "refresh task panicked"
+                );
                 set_cooldown(cooldowns, info.id);
+                // `keychain-fix-r11.md` D-3: `broker_check` may have already
+                // written a refreshed token to the canonical store before
+                // panicking on a LATER step — see the custodian's identical
+                // reasoning above. Flag the tick for the post-loop keychain
+                // sweep so a real write is never stranded behind a panicked
+                // task; the sweep's newer-than-keychain guard makes an
+                // unnecessary sweep a no-op.
+                any_anthropic_refreshed = true;
                 // Write a "panic" entry so `/api/refresh-status`
                 // shows something for this account instead of
                 // silently omitting it.  Without this, the
@@ -1123,19 +1608,31 @@ pub(crate) async fn tick(
     // refresh, so idle ticks pay nothing.
     //
     // Runs in `spawn_blocking`: the sweep shells one or more `security`
-    // subprocesses per live handle dir (synchronous, no timeout), and the daemon
-    // runtime has only 2 worker threads — a direct call would tie up half the
-    // runtime and delay socket IPC (mirrors `run_held_sweep_tick`'s wrapper).
+    // subprocesses per live handle dir, synchronous but NOT unbounded — every
+    // `security` call it can issue is bounded at `KEYCHAIN_OP_TIMEOUT +
+    // MIN_POST_EXIT_GRACE` = 5.25s (see `write_raw`'s doc for the derivation),
+    // and each dir's own per-handle-dir lock wait is separately bounded at
+    // ~20.25s (`HANDLE_LOCK_BOUND_ATTEMPTS`'s doc) — so a single dir's worst
+    // case is bounded (lock wait + up to 3 bounded calls), but the SWEEP AS A
+    // WHOLE is unbounded in the number of live handle dirs it walks
+    // sequentially, so its total wall-clock scales with handle-dir count. The
+    // daemon runtime has only 2 worker threads — a direct call would tie up
+    // half the runtime and delay socket IPC (mirrors `run_held_sweep_tick`'s
+    // wrapper), which is why this still runs off the async runtime even
+    // though no individual step blocks forever.
     if any_anthropic_refreshed {
         let sweep_base = base_dir.to_path_buf();
+        let sweep_refreshed = refreshed;
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            sync_refreshed_keychains(&sweep_base);
+            sync_refreshed_keychains(&sweep_base, &sweep_refreshed);
         })
         .await
         {
+            // `keychain-fix-r11.md` D-3: fixed tag + `is_panic` only — the
+            // same JoinError-Display concern as the sibling sweep above.
             tracing::warn!(
                 error_kind = "cc_keychain_sync_task_panicked",
-                error = %e,
+                panicked = e.is_panic(),
                 "post-refresh CC keychain sweep task panicked (non-fatal)"
             );
         }
@@ -1144,6 +1641,77 @@ pub(crate) async fn tick(
     info!(
         processed,
         skipped_cooldown, codex_processed, "refresher tick complete"
+    );
+}
+
+/// Cache label written for a slot the refresher declined to refresh because
+/// this daemon is a follower. Distinct from `"skipped"` (another process holds
+/// the refresh lock) and from `"valid"` (token is fresh, nothing to do) — an
+/// operator reading `/api/refresh-status` must be able to tell "nobody
+/// refreshed this because I told this host not to" apart from both.
+pub const FOLLOWER_SKIP_LABEL: &str = "follower_skipped";
+
+/// True when `expires_at_ms` falls inside the pre-expiry refresh window a
+/// leader would act on. Shared by the two follower gates so both label their
+/// cache records against the same window the leader path uses.
+fn is_due_for_refresh(expires_at_ms: u64) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    expires_at_ms < now_ms + (crate::refresh::check::REFRESH_WINDOW_SECS * 1000)
+}
+
+/// Record a follower's declined refresh, and escalate when the token is not
+/// merely due but ALREADY EXPIRED.
+///
+/// The two log levels are the operator contract for follower mode. `due` is
+/// routine — the leader host is expected to renew it and this host will pick
+/// the new token up. EXPIRED means no leader did, so this host is running
+/// unattended and the next API call 401s. That case gets a WARN with a fixed
+/// `error_kind` rather than being folded into the routine path, because a
+/// follower going stale must be a stated condition and not a mystery
+/// (zero-tolerance.md Rule 3).
+///
+/// Slot id comes from the caller's own per-slot loop state — channel (a) of
+/// `account-terminal-separation.md` MUST Rule 1. No new slot-id channel.
+fn record_follower_skip(
+    cache: &Arc<TtlCache<u16, RefreshStatus>>,
+    account: u16,
+    surface: &'static str,
+    expires_at_ms: u64,
+    due: bool,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let expired = expires_at_ms != 0 && expires_at_ms < now_ms;
+    if expired {
+        warn!(
+            account,
+            surface,
+            error_kind = "follower_credential_expired",
+            expired_for_secs = (now_ms - expires_at_ms) / 1000,
+            "follower mode: stored token has EXPIRED and this host never \
+             refreshes — the leader host is not covering this slot. Either \
+             start/repair the leader daemon, or make this host the leader \
+             (`csq daemon posture leader`)."
+        );
+    } else if due {
+        debug!(
+            account,
+            surface, "follower mode: refresh due, deferring to the leader host"
+        );
+    }
+    cache.set(
+        account,
+        RefreshStatus {
+            account,
+            last_result: FOLLOWER_SKIP_LABEL.to_string(),
+            expires_at_ms,
+            checked_at_secs: now_secs(),
+        },
     );
 }
 
@@ -1216,7 +1784,8 @@ mod tests {
         // other refresher test (tempdir base, no handle dirs) never touches the
         // real keychain. A panic-free return on an empty base proves it.
         let dir = TempDir::new().unwrap();
-        sync_refreshed_keychains(dir.path()); // must not panic / touch keychain
+        sync_refreshed_keychains(dir.path(), &std::collections::HashMap::new());
+        // must not panic / touch keychain
     }
 
     /// `next_wait_chunk` caps the sub-sleep at `probe`, returns the short tail
@@ -1431,13 +2000,34 @@ mod tests {
         })
     }
 
+    /// Mock HTTP closure that PANICS on its first invocation, then always
+    /// succeeds. Used to prove `run_tick_supervised` isolates a panic
+    /// anywhere on the tick call graph to a single tick, rather than
+    /// killing `run_loop`'s own task permanently (round 9, S-C-1 / D-F1).
+    fn panicking_then_success(counter: Arc<AtomicU32>) -> HttpPostFn {
+        Arc::new(move |_url: &str, _body: &str| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                panic!("injected panic: simulated refresher-tick failure");
+            }
+            Ok(
+                br#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":18000}"#
+                    .to_vec(),
+            )
+        })
+    }
+
     /// No-op Codex HTTP transport for Anthropic-only tests. Counts
     /// calls so a misrouted Anthropic refresh hitting the Codex
     /// closure is detectable.
     fn noop_codex_http(counter: Arc<AtomicU32>) -> HttpPostFnCodex {
         Arc::new(move |_url: &str, _body: &str| {
             counter.fetch_add(1, Ordering::SeqCst);
-            Ok((b"{}".to_vec(), None))
+            Ok(crate::http::NodeHttpResponse {
+                status: 200,
+                body: b"{}".to_vec(),
+                date: None,
+            })
         })
     }
 
@@ -1461,7 +2051,11 @@ mod tests {
             let body = format!(
                 r#"{{"access_token":"{access}","refresh_token":"rt_new","expires_in":3600}}"#
             );
-            Ok((body.into_bytes(), None))
+            Ok(crate::http::NodeHttpResponse {
+                status: 200,
+                body: body.into_bytes(),
+                date: None,
+            })
         })
     }
 
@@ -1732,6 +2326,196 @@ mod tests {
         let status = cache.get(&1).unwrap();
         assert_eq!(status.account, 1);
         assert_eq!(status.last_result, "refreshed");
+    }
+
+    // ── follower-mode gate (two-host refresh-token war) ───────────────────
+    //
+    // The pair below is the discriminating instrument: the SAME fixture (an
+    // expired Anthropic credential — unambiguously inside the 2h refresh
+    // window) is driven through a tick twice, differing ONLY in the posture
+    // file. Leader must issue exactly one refresh; follower must issue zero.
+    // Either test alone is vacuous — a zero-call assertion passes on any base
+    // that simply has no accounts, and a one-call assertion passes with the
+    // gate deleted. Read them together.
+
+    #[tokio::test]
+    async fn tick_in_leader_posture_refreshes_a_due_credential() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+        crate::daemon::posture::save(dir.path(), crate::daemon::posture::DaemonPosture::Leader)
+            .unwrap();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "leader posture must refresh a due credential"
+        );
+        assert_eq!(cache.get(&1).unwrap().last_result, "refreshed");
+    }
+
+    #[tokio::test]
+    async fn tick_in_follower_posture_does_not_refresh_a_due_credential() {
+        let dir = TempDir::new().unwrap();
+        // Identical fixture to the leader test above: expired => due.
+        install_account(dir.path(), 1, 0);
+        crate::daemon::posture::save(dir.path(), crate::daemon::posture::DaemonPosture::Follower)
+            .unwrap();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let codex_counter = Arc::new(AtomicU32::new(0));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::clone(&codex_counter)),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "follower posture must NOT present a refresh token upstream"
+        );
+        assert_eq!(
+            codex_counter.load(Ordering::SeqCst),
+            0,
+            "follower must not reach the codex transport either"
+        );
+        // The slot is still REPORTED — a follower polls and serves; it just
+        // does not refresh. A silent omission would be indistinguishable from
+        // a crashed refresher.
+        let status = cache
+            .get(&1)
+            .expect("follower still records a status for the slot");
+        assert_eq!(status.last_result, FOLLOWER_SKIP_LABEL);
+        assert_eq!(status.account, 1);
+    }
+
+    #[tokio::test]
+    async fn tick_in_follower_posture_does_not_refresh_a_due_codex_credential() {
+        let dir = TempDir::new().unwrap();
+        // install_codex_account writes an access_token with no parseable exp,
+        // so exp resolves to 0 => due (and expired).
+        install_codex_account(dir.path(), 3);
+        crate::daemon::posture::save(dir.path(), crate::daemon::posture::DaemonPosture::Follower)
+            .unwrap();
+
+        let codex_counter = Arc::new(AtomicU32::new(0));
+        let anthropic_counter = Arc::new(AtomicU32::new(0));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(
+            dir.path(),
+            &counting_success(Arc::clone(&anthropic_counter)),
+            &counting_codex_success(Arc::clone(&codex_counter)),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+
+        assert_eq!(
+            codex_counter.load(Ordering::SeqCst),
+            0,
+            "follower posture must NOT refresh a codex credential"
+        );
+        assert_eq!(cache.get(&3).unwrap().last_result, FOLLOWER_SKIP_LABEL);
+    }
+
+    /// The leader default is what every pre-existing install gets: no posture
+    /// file at all. Guards against a regression that made the gate fire on the
+    /// absent-file path and silently stopped every single-host daemon from
+    /// refreshing.
+    #[tokio::test]
+    async fn tick_with_no_posture_file_refreshes_as_leader() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+        assert!(
+            !crate::daemon::posture::posture_path(dir.path()).exists(),
+            "fixture precondition: no posture file"
+        );
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(
+            dir.path(),
+            &counting_success(Arc::clone(&counter)),
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "absent posture file must keep the historical leader behaviour"
+        );
+    }
+
+    /// A posture file that exists but cannot be parsed stands down rather than
+    /// silently reverting to refreshing — the whole point of the fail
+    /// direction documented in `crate::daemon::posture`.
+    #[tokio::test]
+    async fn tick_with_corrupt_posture_file_stands_down_and_does_not_refresh() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+        std::fs::write(
+            crate::daemon::posture::posture_path(dir.path()),
+            "{ truncated",
+        )
+        .unwrap();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(
+            dir.path(),
+            &counting_success(Arc::clone(&counter)),
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "a corrupt posture file must not silently re-enable refreshes"
+        );
+        assert_eq!(cache.get(&1).unwrap().last_result, FOLLOWER_SKIP_LABEL);
     }
 
     #[tokio::test]
@@ -2015,6 +2799,208 @@ mod tests {
         assert!(handle.cache.get(&1).is_some());
     }
 
+    /// Round 9, S-C-1 / D-F1: before `run_tick_supervised` existed, a panic
+    /// anywhere on the tick call graph that was NOT already individually
+    /// wrapped in its own `spawn_blocking` + `JoinError` handling (the
+    /// `harvest_gate` `blocking_lock`-on-a-worker bug fixed alongside this
+    /// test was the concrete instance) unwound straight through `run_loop`'s
+    /// own task. `keychain-fix-r10.md` C-B3: that task IS observed and
+    /// restarted in production (`daemon.rs`/`daemon_supervisor.rs`'s
+    /// `subsystems` lists watch `RefresherHandle::join`) — but only via a
+    /// session-wide restart of EVERY subsystem, which is what would have
+    /// paid for one bad tick without this wrapper.
+    ///
+    /// This drives a real `spawn_with_config` loop through a tick whose HTTP
+    /// transport panics, and asserts the loop is STILL ALIVE to shut down
+    /// cleanly on cancellation. It does NOT assert a second, recovered
+    /// reconcile call — `broker_check`'s OWN `spawn_blocking` call already
+    /// catches this specific panic as a `JoinError` (see `tick`'s
+    /// `Err(join_err) => { ...; set_cooldown(...) }` arm) and enters the
+    /// account into `FAILURE_COOLDOWN` (10 minutes), exactly as it would for
+    /// any other `broker_check` failure — that pre-existing behaviour is
+    /// unaffected by `run_tick_supervised` and is not what this test is
+    /// checking. What `run_tick_supervised` additionally guarantees — that
+    /// `run_loop` survives a panic NOT already caught by an inner call's own
+    /// protection — is proven by the mechanism-level test immediately below,
+    /// which does not depend on tick()'s specific call graph.
+    #[tokio::test]
+    async fn spawn_survives_a_panicking_tick_and_continues_refreshing() {
+        let dir = TempDir::new().unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = panicking_then_success(Arc::clone(&counter));
+        let shutdown = CancellationToken::new();
+
+        install_account(dir.path(), 1, 0);
+
+        let cache = Arc::new(TtlCache::with_default_age());
+        let handle = spawn_with_config(
+            dir.path().to_path_buf(),
+            cache,
+            http,
+            noop_codex_http(Arc::new(AtomicU32::new(0))),
+            shutdown.clone(),
+            Duration::from_millis(50), // short interval; only the first tick matters here
+            Duration::from_millis(0),  // no startup delay
+        );
+
+        // Poll for the first (panicking) tick to have actually run, rather
+        // than a fixed sleep.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counter.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("expected the panicking tick to run within 5s");
+        shutdown.cancel();
+
+        // The load-bearing assertion: `run_loop`'s own task did NOT panic —
+        // it is still alive to observe cancellation and exit cleanly. Before
+        // this fix, an unprotected panic on this call graph would have
+        // unwound straight through `run_loop` and this `.expect` would fire
+        // with "refresher panicked".
+        tokio::time::timeout(Duration::from_secs(2), handle.join)
+            .await
+            .expect("refresher did not shut down in time")
+            .expect("refresher panicked");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "exactly one HTTP attempt — broker_check's OWN spawn_blocking \
+             catches this panic as a JoinError and enters cooldown, so a \
+             second tick within this short test window correctly does NOT \
+             retry yet"
+        );
+        let status = handle
+            .cache
+            .get(&1)
+            .expect("the panicking tick must still have recorded a cache entry");
+        assert_eq!(
+            status.last_result, "panic",
+            "a broker_check panic surfaces via tick()'s OWN dedicated \
+             \"panic\" cache status (distinct from a generic \"error\") \
+             and cooldown — run_tick_supervised changes nothing about \
+             THIS already-protected path"
+        );
+    }
+
+    /// `keychain-fix-r10.md` C-I1/C-T-a: a panic placed directly in
+    /// `tick_impl`'s own body (via `TICK_TEST_PANIC_HOOK`, OUTSIDE every
+    /// `spawn_blocking` `tick_impl` uses internally) proves TWO things
+    /// `spawn_survives_a_panicking_tick_and_continues_refreshing` cannot,
+    /// because that test's panic is caught by `broker_check`'s OWN inner
+    /// `spawn_blocking` before ever reaching `run_tick_supervised`'s
+    /// boundary: (1) `run_tick_supervised`'s outer supervision genuinely
+    /// fires (a second tick runs, `handle.join` returns `Ok`), and (2) the
+    /// panic-recovery keychain sync (this round's fix) actually ran.
+    ///
+    /// RED: reverting `run_tick_supervised` to the pre-fix shape (no
+    /// panic-recovery sync call) makes the `sync_calls_after >
+    /// sync_calls_before` assertion fail — the delta is `0`, not `>= 1`,
+    /// because nothing else in an idle tick with no refreshed accounts ever
+    /// calls `sync_refreshed_keychains`.
+    ///
+    /// `keychain-fix-r11.md` D-7: the counter is keyed on THIS test's own
+    /// `dir.path()` (see `SYNC_REFRESHED_KEYCHAINS_CALLS`'s doc — a shared
+    /// process-wide total let an unrelated parallel test's own legitimate
+    /// sync call mask the very regression this RED is supposed to catch),
+    /// and the panic hook is installed via [`TickTestPanicHookGuard`] so it
+    /// is reset on every exit path, including an early `.expect(...)` panic,
+    /// not only the test's last line.
+    #[tokio::test]
+    async fn run_tick_supervised_recovers_keychain_sync_after_a_panic() {
+        let dir = TempDir::new().unwrap();
+        let shutdown = CancellationToken::new();
+
+        // No accounts installed: an idle tick (no refresh, no
+        // `any_anthropic_refreshed`) never calls `sync_refreshed_keychains`
+        // on its own, so any call observed below is definitely the
+        // panic-recovery path, not the tick's ordinary post-loop sweep.
+        let hook_fired = Arc::new(AtomicU32::new(0));
+        let hook_fired_for_closure = Arc::clone(&hook_fired);
+        let _hook_guard = TickTestPanicHookGuard::install(Box::new(move || {
+            let n = hook_fired_for_closure.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                panic!("keychain-fix-r10.md C-I1/C-T-a: injected first-tick panic");
+            }
+        }));
+
+        let sync_calls_before = sync_refreshed_keychains_call_count_for_test(dir.path());
+
+        let cache = Arc::new(TtlCache::with_default_age());
+        let handle = spawn_with_config(
+            dir.path().to_path_buf(),
+            cache,
+            counting_success(Arc::new(AtomicU32::new(0))),
+            noop_codex_http(Arc::new(AtomicU32::new(0))),
+            shutdown.clone(),
+            Duration::from_millis(30), // short interval so a second tick runs promptly
+            Duration::from_millis(0),  // no startup delay
+        );
+
+        // Poll for a SECOND hook invocation — proof the loop survived the
+        // first tick's panic and reached a second tick, rather than a fixed
+        // sleep hoping the timing lines up.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hook_fired.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected a second tick to run within 5s");
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(2), handle.join)
+            .await
+            .expect("refresher did not shut down in time")
+            .expect("refresher panicked — run_tick_supervised did not isolate it");
+
+        // `_hook_guard` resets the thread-local hook when it drops at the
+        // end of this scope — no manual reset call needed (and none would
+        // run anyway if an assertion above had panicked first).
+
+        let sync_calls_after = sync_refreshed_keychains_call_count_for_test(dir.path());
+        assert!(
+            sync_calls_after > sync_calls_before,
+            "a panicked tick must trigger the panic-recovery keychain sync \
+             (before={sync_calls_before}, after={sync_calls_after})"
+        );
+    }
+
+    /// The mechanism `run_tick_supervised` relies on, proven directly and
+    /// independent of `tick()`'s own call graph: `tokio::spawn` converts a
+    /// panicking future into `Err(JoinError)` when awaited, rather than
+    /// unwinding into the awaiting task. This round's `tick()` already
+    /// individually wraps every one of ITS OWN blocking sub-calls
+    /// (`broker_check`, the custodian, the held-sweep, the outbox drain) in
+    /// exactly this pattern, so an http-transport panic never reaches
+    /// `run_tick_supervised`'s OWN boundary at all — see
+    /// `spawn_survives_a_panicking_tick_and_continues_refreshing`'s doc.
+    /// `run_tick_supervised` is the SAME pattern applied one layer further
+    /// out, defending against a panic in code that is NOT (yet, or ever)
+    /// individually wrapped — exactly the shape of the original D-F1 bug
+    /// (`harvest_gate_mark_rate_limited`, called directly with no
+    /// `spawn_blocking` around it at all, before that fix).
+    ///
+    /// RED: there is no code to delete to red this one — it is a proof
+    /// about `tokio::spawn` itself, which `run_tick_supervised` composes
+    /// unchanged. `rules/instrument-discipline.md` MUST-2 requires exactly
+    /// this admission for a test that cannot red by mutation of this crate's
+    /// own code.
+    #[tokio::test]
+    async fn a_panic_inside_spawn_is_caught_as_joinerror_not_propagated() {
+        let result = tokio::spawn(async {
+            panic!("injected: mechanism proof, not a real bug");
+        })
+        .await;
+        assert!(
+            matches!(&result, Err(e) if e.is_panic()),
+            "a panicking spawned future must surface as Err(JoinError) to \
+             the awaiting task, never as a propagating unwind"
+        );
+    }
+
     /// Mock HTTP closure that returns a rate-limit error.
     fn counting_rate_limit(counter: Arc<AtomicU32>) -> HttpPostFn {
         Arc::new(move |_url: &str, _body: &str| {
@@ -2107,6 +3093,192 @@ mod tests {
         assert!(
             in_cooldown(&cooldowns, &backoffs, 1),
             "backoff×2 cooldown should still be active after base cooldown elapses"
+        );
+    }
+
+    /// Mock Codex HTTP closure that always returns a real 429 (the fixed
+    /// shape a Node-transport call now surfaces via `NodeHttpResponse`).
+    fn counting_codex_rate_limit(counter: Arc<AtomicU32>) -> HttpPostFnCodex {
+        Arc::new(move |_url: &str, _body: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::http::NodeHttpResponse {
+                status: 429,
+                body: br#"{"error":{"code":"rate_limit_exceeded"}}"#.to_vec(),
+                date: None,
+            })
+        })
+    }
+
+    /// End-to-end regression for the defect this fix closes: before
+    /// `parse_refresh_response` used the REAL status, every call site
+    /// passed a literal `200`, so `broker_codex_check` could never observe
+    /// a genuine upstream 429 as `BrokerResult::RateLimited` — it fell
+    /// through to `BrokerResult::Failed` instead, and this tick's own
+    /// `codex_rate_limited_this_tick` gate (`keychain-fix-r11.md` D-2,
+    /// wired at the call site above) never had a `RateLimited` result to
+    /// react to. Two expired Codex accounts, both hitting an always-429
+    /// mock: the first sets the gate, the second must be skipped.
+    ///
+    /// RED: reverting `parse_refresh_response`'s `Some(429) => ...` arm
+    /// back to shape-based classification (status ignored) makes this
+    /// test fail — both accounts attempt a refresh (`counter == 2`)
+    /// because the second slot's `codex_rate_limited_this_tick` gate is
+    /// never set (a shape-based 429 with no recognizable envelope falls
+    /// through to `CodexHttpError::MalformedResponse`, not `Upstream`,
+    /// so `broker_codex_check` never returns `BrokerResult::RateLimited`).
+    #[tokio::test]
+    async fn tick_codex_rate_limit_stops_remaining_codex_accounts() {
+        let dir = TempDir::new().unwrap();
+        install_codex_account(dir.path(), 1);
+        install_codex_account(dir.path(), 2);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http_codex = counting_codex_rate_limit(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(
+            dir.path(),
+            // No Anthropic accounts installed in this fixture; unused.
+            &counting_success(Arc::new(AtomicU32::new(0))),
+            &http_codex,
+            &cache,
+            &cooldowns,
+            &backoffs,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "codex rate-limited tick must stop after first 429, not attempt \
+             remaining codex accounts"
+        );
+    }
+
+    /// `keychain-fix-r10.md` S-M-1/C-B2: a validation-only 429 (the shared,
+    /// IP-wide gate seeded at tick start — a stale cross-tick observation,
+    /// an on-demand harvest route's own 429, or an auto-rotate 429) must
+    /// NEVER skip the refresh (token) call. Only a 429 observed on THIS
+    /// tick's own refresh-endpoint call may do that (see the sibling test
+    /// below). Drives `tick_impl` directly with
+    /// `initial_rate_limited_this_tick = true` — never
+    /// `harvest_gate_is_rate_limited`/`harvest_gate_mark_rate_limited`
+    /// directly, which would mutate the process-wide singleton every OTHER
+    /// refresher test in this binary also reads (see `server.rs`'s
+    /// `ip_rate_limit_gate` doc).
+    ///
+    /// RED: reverting `refresh_should_be_skipped(refresh_rate_limited_this_tick,
+    /// needs_refresh)` back to the pre-fix `rate_limited_this_tick &&
+    /// needs_refresh` (i.e. reusing the validation flag for the refresh
+    /// decision) makes this account's refresh call skipped —
+    /// `counter.load()` comes back `0` instead of the required `1`. Verified
+    /// by executing that exact mutation locally: `cargo test -p csq-core --lib
+    /// daemon::refresher::tests::tick_validation_only_gate_does_not_skip_refresh`
+    /// failed with `assertion `left == right` failed: a validation-only 429
+    /// must not skip the refresh call\n  left: 0\n right: 1` before the
+    /// mutation was reverted.
+    #[tokio::test]
+    async fn tick_validation_only_gate_does_not_skip_refresh() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick_impl(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+            /* initial_rate_limited_this_tick = */ true,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a validation-only 429 must not skip the refresh call"
+        );
+        let status = cache.get(&1).expect("cache entry must exist");
+        assert_eq!(
+            status.last_result, "refreshed",
+            "the refresh must actually run (not the rate_limited short-circuit \
+             label) when only the validation gate, not the refresh gate, is set"
+        );
+    }
+
+    /// `keychain-fix-r11.md` D-3: `broker_check`'s own `spawn_blocking` may
+    /// panic AFTER it has already written a refreshed token to the
+    /// canonical credential store (e.g. on a later step such as the
+    /// post-refresh re-read) — the resulting `Err(join_err)` tells us the
+    /// task didn't finish cleanly, not that it wrote nothing. This account's
+    /// tick must therefore still flag `any_anthropic_refreshed`, so the
+    /// post-loop keychain sweep runs and CC's keychain-first read picks up
+    /// whatever the panicked task actually wrote — rather than being
+    /// silently stranded until the NEXT tick happens to refresh the same
+    /// account again.
+    ///
+    /// The counter this test reads is keyed on THIS test's OWN `dir.path()`
+    /// (D-7) — a shared process-wide total would let a concurrently running,
+    /// unrelated test's OWN legitimate sync call mask the exact regression
+    /// this RED exists to catch.
+    ///
+    /// RED: removing `any_anthropic_refreshed = true;` from the
+    /// `Err(join_err)` arm makes the sweep-call delta `0` instead of `>= 1`.
+    /// Verified by executing that exact mutation locally: `cargo test -p
+    /// csq-core --lib
+    /// daemon::refresher::tests::tick_broker_check_panic_still_triggers_keychain_sweep`
+    /// failed with `assertion failed: sync_calls_after > sync_calls_before`
+    /// (both `0`) before the line was restored.
+    #[tokio::test]
+    async fn tick_broker_check_panic_still_triggers_keychain_sweep() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = panicking_then_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        let sync_calls_before = sync_refreshed_keychains_call_count_for_test(dir.path());
+
+        tick_impl(
+            dir.path(),
+            &http,
+            &noop_codex_http(Arc::new(AtomicU32::new(0))),
+            &cache,
+            &cooldowns,
+            &backoffs,
+            /* initial_rate_limited_this_tick = */ false,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the panicking transport must have been invoked exactly once"
+        );
+        let status = cache.get(&1).expect("cache entry must exist");
+        assert_eq!(
+            status.last_result, "panic",
+            "broker_check's own spawn_blocking must have caught the panic as \
+             a JoinError, not propagated it"
+        );
+
+        let sync_calls_after = sync_refreshed_keychains_call_count_for_test(dir.path());
+        assert!(
+            sync_calls_after > sync_calls_before,
+            "a panicked broker_check task must still trigger the keychain \
+             sweep, in case it wrote a token before panicking \
+             (before={sync_calls_before}, after={sync_calls_after})"
         );
     }
 

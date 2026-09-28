@@ -275,27 +275,35 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
             // free when it isn't.
             let _ = csq_core::credentials::keychain::sweep_pending_clears_opportunistic(base_dir);
 
-            // CC reads OAuth keychain-first (memory discovery_cc_keychain_first_credential_read);
-            // mirror the fresh token into the keychain item keyed by CLAUDE_CONFIG_DIR.
-            // Best-effort — a keychain miss falls back to the symlinked file (SSH/non-macOS).
-            //
-            // `_account_changed` variant, not the plain sweep one — this is a FRESH
-            // handle dir, and its canonicalized path can collide with a stale item
-            // left by a since-removed account (PID reuse, or an unconfirmed
-            // `csq logout` keychain clear — security review 1386 H2). The plain
-            // `sync_handle_dir` newer-than-keychain guard could otherwise PRESERVE
-            // that wrong-account item; `_account_changed` always overwrites/clears.
+            // v4 A2 ("switch now or say so"): `csq exec` always creates a
+            // FRESH handle dir, so a readable X gets a FORCED write; a write
+            // failure or a lock timeout/failure means this exec does NOT
+            // spawn — a fresh dir with a colliding stale item from PID reuse
+            // must not launch against the wrong account. F4: Inaccessible
+            // (exit 36: locked, no GUI) → proceed without the mirror (CC in
+            // the same environment cannot read the keychain either and
+            // falls back to the symlinked `.credentials.json`, spec 01
+            // §1.4); anything else unreadable → refuse.
+            // F3/KC4-3: a canonicalize FAILURE (unlike a readable-keychain
+            // Unreadable result) means we cannot even name this dir's
+            // absolute path, so "CC falls back to the symlinked
+            // .credentials.json" does not follow — refuse to spawn rather
+            // than proceed against an unverified path.
             if handle_dir_is_canonical {
-                let _ = csq_core::credentials::keychain::sync_handle_dir_account_changed(
+                if let Err(msg) = csq_core::credentials::keychain::force_sync_for_launch(
+                    base_dir,
                     &handle_dir_abs,
-                );
+                ) {
+                    return Err(SdkError::trusted(
+                        SdkErrorCode::SpawnFailed,
+                        format!("csq exec: {msg}"),
+                    ));
+                }
             } else {
-                tracing::warn!(
-                    error_kind = "keychain_sync_canonicalize_failed",
-                    "csq exec: could not canonicalize this handle dir's path — \
-                     the keychain mirror was NOT written (non-fatal — exec \
-                     continues; CC falls back to the symlinked .credentials.json)"
-                );
+                return Err(SdkError::trusted(
+                    SdkErrorCode::SpawnFailed,
+                    "csq exec: keychain item could not be located; retry the launch".to_string(),
+                ));
             }
 
             let outcome = spawn_capture(
@@ -598,7 +606,7 @@ fn resolve_slot(base_dir: &Path, args: &ExecArgs) -> Result<(AccountNum, ExecSur
 /// (DeepSeek/Kimi-bearer/Z.AI/MiniMax/Ollama, `ANTHROPIC_BASE_URL` pinned via
 /// `config-<N>/settings.json`) and cloud-Claude (Vertex/Bedrock) slots are NOT
 /// excluded here — both spawn `claude`, which reads its pinned env from
-/// `CLAUDE_CONFIG_DIR/settings.json` at its own startup (see module docs
+/// `<CLAUDE_CONFIG_DIR>/settings.json` at its own startup (see module docs
 /// "Claude/3P"), so they correctly fall through to `true`. Mirrors
 /// `run::surface_cli_for_slot`'s classification without exposing that private
 /// helper.
@@ -990,7 +998,7 @@ fn parse_outcome(
 /// settings::render`] — the SAME mechanism the capability-layer spawn path
 /// (`providers::gemini::probe::reassert_settings_drift_with_system_instruction`,
 /// used by `csq run`'s with-layer arm) uses to inject a system prompt for
-/// gemini-cli. gemini-cli reads its config from `GEMINI_CLI_HOME/settings.json` at
+/// gemini-cli. gemini-cli reads its config from `<GEMINI_CLI_HOME>/.gemini/settings.json` at
 /// its own startup — there is no `--model`/`--system` argv flag; this settings-file
 /// injection point is gemini-cli's real mechanism (mirrors how a Claude 3P slot's
 /// `ANTHROPIC_BASE_URL` flows through `config-N/settings.json`, module docs
@@ -2297,5 +2305,112 @@ mod tests {
         let err =
             resolve_slot(tmp.path(), &args(Some("p"), false, None, Some("deepseek"))).unwrap_err();
         assert_eq!(err.code, SdkErrorCode::NoHealthySlot);
+    }
+
+    /// [`keychain-fix-r8c.md`'s NIT] routing half: `csq exec` always
+    /// creates a FRESH handle dir and forces the mirror write via the same
+    /// `force_sync_for_launch` → `force_sync_for_launch_locked` →
+    /// `force_sync_account_changed` chain as `csq run` — mirrors that
+    /// file's identical regression guard
+    /// (`foreign_login_unharvested_routes_through_force_sync_account_changed_for_a_fresh_launch_dir`)
+    /// for the OTHER launch site named by the finding. X holds a valid
+    /// Anthropic login this call cannot identify as the account it is about
+    /// to bind, which must classify as `ForeignLoginUnharvested` (rule 3),
+    /// never a silent write.
+    ///
+    /// NOTE on scope: see `run.rs`'s twin test for why this drives
+    /// `force_sync_account_changed` directly rather than the public
+    /// `force_sync_for_launch` wrapper (whose own top-level
+    /// `keychain_mirror_disabled_now()` check runs BEFORE the
+    /// test-installed-executor override and unconditionally short-circuits
+    /// under `cfg(feature = "test-utils")`) — the message text itself
+    /// (produced by keychain.rs's private `decide_launch_disposition`) was
+    /// verified by direct source inspection to already carry the C-F1
+    /// wording, no "just refreshed" text remaining at either
+    /// `ForeignLoginUnharvested` arm.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_login_unharvested_routes_through_force_sync_account_changed_for_a_fresh_launch_dir()
+    {
+        use csq_core::accounts::identity_store;
+        use csq_core::credentials::keychain::{
+            clear_test_keychain_executor, set_test_keychain_executor, ForcedSyncResult,
+            RawContentClassification, ScriptedKeychainExecutor,
+        };
+        use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::testing::identity_fixtures::write_uuid_account_marker;
+        use csq_core::types::{AccessToken, RefreshToken};
+
+        let _env_lock = csq_core::platform::test_env::lock();
+        let base = tempfile::TempDir::new().unwrap();
+        let claude_home = tempfile::TempDir::new().unwrap();
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let uuid = write_uuid_account_marker(base.path(), &config_dir, 1);
+        let own_cf = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-1".into()),
+                refresh_token: RefreshToken::new("rt-1".into()),
+                expires_at: 4_102_444_800_000, // year 2100 (feedback_no_test_timebombs)
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(
+            &identity_store::credentials_path_for(base.path(), uuid),
+            &own_cf,
+        )
+        .unwrap();
+        let own_raw = serde_json::to_string(&own_cf).unwrap();
+
+        let pid = std::process::id();
+        let handle_dir =
+            csq_core::session::create_handle_dir(base.path(), claude_home.path(), account, pid)
+                .unwrap();
+        let (handle_dir_abs, is_canonical) =
+            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+        assert!(is_canonical, "fixture: canonicalize must succeed");
+
+        // X holds a valid Anthropic identity from a DIFFERENT, unknown
+        // account — no history entry matches it, so decide_cc_keychain_write
+        // classifies it as rule 3 (ForeignLoginUnharvested).
+        let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-FOREIGN".into()),
+                refresh_token: RefreshToken::new("rt-FOREIGN".into()),
+                expires_at: 4_102_444_800_000,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let foreign_json = serde_json::to_string(&foreign).unwrap();
+        let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
+            RawContentClassification::Content(foreign_json),
+        ));
+        set_test_keychain_executor(exec);
+
+        // Mirrors force_sync_for_launch_locked's own call exactly: base,
+        // handle_dir_abs, and `Some(own_raw)` (what a real `csq exec` reads
+        // from handle_dir_abs/.credentials.json — this account's own token).
+        let result = csq_core::credentials::keychain::force_sync_account_changed(
+            base.path(),
+            &handle_dir_abs,
+            Some(&own_raw),
+        );
+        clear_test_keychain_executor();
+
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::ForeignLoginUnharvested)),
+            "an unmatched foreign login on a fresh launch dir must classify as \
+             ForeignLoginUnharvested (rule 3), never a silent write: {result:?}"
+        );
     }
 }

@@ -34,7 +34,7 @@ pub(crate) static OAUTH_ERROR_TYPES: &[&str] = &[
 ];
 
 /// Extracts an RFC 6749 §5.2 OAuth error-type string from a JSON response
-/// body, returning a `&'static str` from [`OAUTH_ERROR_TYPES`] on match.
+/// body, returning a `&'static str` from `OAUTH_ERROR_TYPES` on match.
 ///
 /// Returns `None` when:
 /// - The body is not valid JSON
@@ -44,7 +44,7 @@ pub(crate) static OAUTH_ERROR_TYPES: &[&str] = &[
 ///
 /// # Security
 ///
-/// The returned `&str` is a pointer into [`OAUTH_ERROR_TYPES`], NOT into
+/// The returned `&str` is a pointer into `OAUTH_ERROR_TYPES`, NOT into
 /// the `body` argument. This is the primary defense against prompt
 /// injection: an attacker who controls the upstream response body cannot
 /// exfiltrate arbitrary content through this function even if they can
@@ -192,6 +192,59 @@ pub enum CredentialError {
         #[source]
         source: std::io::Error,
     },
+
+    /// S2: `repoint_handle_dir`'s rename-loop failure, carrying whether its
+    /// OWN best-effort rollback (`rollback_repoint`) reported full success.
+    /// A caller combines this with its own disk-state check
+    /// (`session::handle_dir::handle_dir_symlinks_are_consistent`) via
+    /// [`CredentialError::repoint_rolled_back`] — a rollback attempt having
+    /// RUN is not evidence it SUCCEEDED, and the disk check alone cannot see
+    /// every failure mode a rollback can hit (e.g. a restore whose own
+    /// `create_symlink` call fails).
+    ///
+    /// S-H1/D-F1: also returned when `repoint_handle_dir`'s FINAL step —
+    /// committing the prepared `settings.json` into place, after every
+    /// `ACCOUNT_BOUND_ITEMS` symlink (including `.csq-account`) has already
+    /// been renamed — fails. That failure is folded into the SAME rollback
+    /// path as a mid-loop rename failure precisely so it is reported through
+    /// this variant (and never through a bare `Corrupt`/`Io`, whose
+    /// `repoint_rolled_back()` is `None` — see that method's doc comment for
+    /// why a `None` there would have been misread as "nothing to worry
+    /// about" by v5's `credentials::keychain::repoint_left_mixed_links`
+    /// (B3) — the current consumer of this method, which checks
+    /// `== Some(false)` specifically — while the account had in fact fully
+    /// switched with its symlinks left mixed across two accounts).
+    #[error("repoint failed on {path}: {source}")]
+    RepointFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+        rolled_back: bool,
+    },
+
+    /// K3: `repoint_handle_dir`'s S7 pre-flight refusal — a REAL file (not a
+    /// symlink) already occupies where an `ACCOUNT_BOUND_ITEMS` symlink
+    /// belongs. This fires BEFORE any mutation in `repoint_handle_dir`, so
+    /// (unlike [`CredentialError::RepointFailed`]) there is nothing to roll
+    /// back: the disk is exactly as it was before the call. A caller that
+    /// treats this the same as a failed-and-maybe-rolled-back repoint prints
+    /// "your terminal may be partially switched — run `csq swap N` again",
+    /// which loops forever here — retrying does not remove the blocking
+    /// file. Carries the item name so the caller can name it in the operator
+    /// message instead.
+    #[error("{item} exists but is not a symlink — refusing to repoint over a real file")]
+    RepointRefusedRealFile { item: &'static str },
+
+    /// `keychain-fix-r11.md` D-5: `credentials::file::save_uuid_credentials`
+    /// refuses to write because this identity carries a REMOVAL tombstone
+    /// (`accounts::identity_store::is_identity_removed`) — `csq logout`
+    /// removed this identity's dir, and no subsequent login has cleared the
+    /// marker. Without this refusal, a refresher tick / backsync / adopt
+    /// racing the logout (none of them share a lock with it) would silently
+    /// RECREATE the just-removed identity dir and resurrect a logged-out
+    /// credential.
+    #[error("identity {uuid} was logged out — refusing to write a credential into it")]
+    IdentityRemoved { uuid: String },
 }
 
 impl CredentialError {
@@ -208,6 +261,69 @@ impl CredentialError {
             CredentialError::Io { .. } => "credentials_io",
             CredentialError::InvalidAccount(_) => "credentials_invalid_account",
             CredentialError::NoCredentials(_) => "credentials_none",
+            CredentialError::RepointFailed { .. } => "credentials_repoint_failed",
+            CredentialError::RepointRefusedRealFile { .. } => "credentials_repoint_refused",
+            CredentialError::IdentityRemoved { .. } => "credentials_identity_removed",
+        }
+    }
+
+    /// S2: `Some(true)`/`Some(false)` for [`CredentialError::RepointFailed`]
+    /// (whether ITS OWN best-effort rollback fully succeeded), `Some(true)`
+    /// for [`CredentialError::RepointRefusedRealFile`] (a pre-mutation
+    /// refusal — never rolled back because it never needed to be), and
+    /// `None` for every OTHER variant — I2: an earlier revision of this doc
+    /// summarized the second case as folding into the `None` arm below,
+    /// which the match arm two lines down has never actually done.
+    ///
+    /// **Precise meaning of `None` (S-H1/D-F1):** `None` means, and MUST
+    /// only ever mean, "`repoint_handle_dir` failed BEFORE any mutation of
+    /// `handle_dir` — there was nothing to roll back". It does NOT mean, and
+    /// MUST NEVER be read as, "the repoint may have partially mutated the
+    /// disk and rollback status is simply unknown". Every OTHER
+    /// `repoint_handle_dir` refusal that reaches this arm fires before any
+    /// mutation (not a term dir, missing target config, missing
+    /// `.csq-account` in the target, a non-symlink item, a lock failure, a
+    /// failure preparing the new settings.json content) — "rolled back" is
+    /// not the right question for any of them, because nothing was ever
+    /// mutated. This is precisely why every OTHER kind of failure once ANY
+    /// `ACCOUNT_BOUND_ITEMS` symlink has moved — including the final
+    /// settings.json commit — MUST be reported through
+    /// [`CredentialError::RepointFailed`], never as a bare `Corrupt`/`Io`:
+    /// v5's `credentials::keychain::repoint_left_mixed_links` (B3) checks
+    /// this method's result via `== Some(false)` (not the deleted v4-era
+    /// `daemon::auto_rotate`-side `.unwrap_or(true)` combinator this doc
+    /// used to cite — that call site no longer exists), so a `None`
+    /// returned once mutation had already started would NEVER equal
+    /// `Some(false)` and would therefore be read as "links are NOT mixed"
+    /// regardless of what was actually left on disk (the S-H1/D-F1 bug this
+    /// comment documents the fix for). A caller combines a genuine `None`
+    /// with its own disk-state check
+    /// (`session::handle_dir::handle_dir_symlinks_are_consistent`, the
+    /// OTHER half of `repoint_left_mixed_links`'s `||`); that combination
+    /// is sound only because `None` is reserved for the pre-mutation case.
+    pub fn repoint_rolled_back(&self) -> Option<bool> {
+        match self {
+            CredentialError::RepointFailed { rolled_back, .. } => Some(*rolled_back),
+            // K3: a pre-mutation refusal never touched the disk, so there is
+            // nothing to roll back — `Some(true)` (never rolled back, never
+            // needed to be) rather than `None`, so a caller combining this
+            // with its own disk check is not depending on that check ALSO
+            // correctly reading "nothing changed" for this specific refusal.
+            CredentialError::RepointRefusedRealFile { .. } => Some(true),
+            _ => None,
+        }
+    }
+
+    /// K3: the `ACCOUNT_BOUND_ITEMS` name blocked by a real file, when this
+    /// error is [`CredentialError::RepointRefusedRealFile`]. `None` for
+    /// every other variant — a caller uses this to name the offending item
+    /// in the operator message instead of the generic "may be partially
+    /// switched" line, which loops on this specific refusal (retrying does
+    /// not remove the blocking file).
+    pub fn repoint_refused_item(&self) -> Option<&'static str> {
+        match self {
+            CredentialError::RepointRefusedRealFile { item } => Some(item),
+            _ => None,
         }
     }
 
@@ -229,6 +345,14 @@ impl CredentialError {
             CredentialError::Io { path, source } => {
                 format!("io error on {}: {source}", redact_path(path))
             }
+            CredentialError::RepointFailed {
+                path,
+                source,
+                rolled_back,
+            } => format!(
+                "repoint failed on {}: {source} (rolled_back={rolled_back})",
+                redact_path(path)
+            ),
             other => other.to_string(),
         }
     }
@@ -260,13 +384,81 @@ mod credential_error_kind_tag_tests {
             .error_kind_tag(),
             CredentialError::InvalidAccount("a".into()).error_kind_tag(),
             CredentialError::NoCredentials(1).error_kind_tag(),
+            CredentialError::RepointFailed {
+                path: PathBuf::from("/x"),
+                source: io::Error::other("z"),
+                rolled_back: true,
+            }
+            .error_kind_tag(),
+            CredentialError::RepointRefusedRealFile {
+                item: ".current-account",
+            }
+            .error_kind_tag(),
         ]
         .into_iter()
         .collect();
         assert_eq!(
             tags.len(),
-            5,
+            7,
             "each CredentialError variant must yield a distinct tag"
+        );
+    }
+
+    // S2: repoint_rolled_back is Some(..) ONLY for RepointFailed, and
+    // carries its exact bool through — every other variant reports None
+    // so a caller's "combine with the disk check" conservatively falls
+    // back to the disk check alone.
+    #[test]
+    fn repoint_rolled_back_is_some_only_for_repoint_failed() {
+        assert_eq!(
+            CredentialError::RepointFailed {
+                path: PathBuf::from("/x"),
+                source: io::Error::other("z"),
+                rolled_back: true,
+            }
+            .repoint_rolled_back(),
+            Some(true)
+        );
+        assert_eq!(
+            CredentialError::RepointFailed {
+                path: PathBuf::from("/x"),
+                source: io::Error::other("z"),
+                rolled_back: false,
+            }
+            .repoint_rolled_back(),
+            Some(false)
+        );
+        assert_eq!(
+            CredentialError::Io {
+                path: PathBuf::from("/x"),
+                source: io::Error::other("z"),
+            }
+            .repoint_rolled_back(),
+            None
+        );
+    }
+
+    /// K3: the pre-mutation S7 refusal reports `repoint_rolled_back() ==
+    /// Some(true)` (nothing was ever mutated) AND names the blocked item via
+    /// `repoint_refused_item()` — the two together are what let a caller
+    /// print "nothing was changed" plus a message naming the specific file,
+    /// instead of the generic loop-inducing "may be partially switched".
+    #[test]
+    fn repoint_refused_real_file_reports_rolled_back_true_and_names_item() {
+        let e = CredentialError::RepointRefusedRealFile {
+            item: ".current-account",
+        };
+        assert_eq!(e.repoint_rolled_back(), Some(true));
+        assert_eq!(e.repoint_refused_item(), Some(".current-account"));
+
+        // Every other variant reports None for the item name.
+        assert_eq!(
+            CredentialError::Io {
+                path: PathBuf::from("/x"),
+                source: io::Error::other("z"),
+            }
+            .repoint_refused_item(),
+            None
         );
     }
 }
@@ -310,7 +502,7 @@ pub enum BrokerError {
     RefreshTokenInvalid { account: u16 },
 
     // M3-7 fix-wave R1 H4: `AllSiblingsDead` and `RecoveryFailed` were sibling-
-    // recovery error variants. Sibling recovery is retired (`broker/check.rs`
+    // recovery error variants. Sibling recovery is retired (`refresh/check.rs`
     // post-M3-7 has no fanout path), so these variants have no production
     // construction sites. Deleted per zero-tolerance Rule 5.
     /// Codex OAuth returned `code: "token_expired"`.
@@ -703,5 +895,53 @@ mod tests {
                  got a slice into the input instead of the static constant"
             );
         }
+    }
+
+    /// L3: `CredentialError::RepointFailed`'s `#[error("repoint failed on
+    /// {path}: {source}")]` Display bakes the raw absolute path in
+    /// unconditionally — this is the exact shape `csq swap`'s error chain
+    /// carries up through `anyhow::Error`'s `.context()` chain to
+    /// `main.rs`'s `eprintln!("Error: {e:?}")`. Redacting the CLI's
+    /// operator-facing `HOME`-like prefix at that single print chokepoint
+    /// (`csq_core::cli_deps::sanitize::redact_home_anywhere`) MUST remove
+    /// it from the fully-rendered chain, mid-string (not just at position
+    /// 0 — `anyhow`'s `{:?}` prints "outer: inner: leaf", so the path sits
+    /// mid-sentence).
+    #[test]
+    fn repoint_failed_display_path_is_redacted_by_the_cli_print_chokepoint() {
+        let home_like = std::path::PathBuf::from("/Users/test-operator-home");
+        let leaked_path = home_like.join(".claude/accounts/term-99001/settings.json");
+
+        let inner = CredentialError::RepointFailed {
+            path: leaked_path.clone(),
+            source: std::io::Error::other("disk full"),
+            rolled_back: false,
+        };
+        let chained: anyhow::Error = anyhow::Error::new(inner)
+            .context("csq swap: terminal on 3, keychain could not be updated");
+        let rendered_debug = format!("{chained:?}");
+        assert!(
+            rendered_debug.contains(&leaked_path.display().to_string()),
+            "sanity: the fixture must actually reproduce the leak before \
+             redaction — got: {rendered_debug}"
+        );
+
+        // Simulate the redaction chokepoint main.rs applies, with a
+        // HOME-like env var pointed at the SAME prefix the leaked path
+        // carries. test-isolation.md/test_env's shared lock serializes
+        // this against every other test in the binary that mutates HOME.
+        let _env_guard = crate::platform::test_env::lock();
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home_like);
+        let redacted = crate::cli_deps::sanitize::redact_home_anywhere(&rendered_debug);
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            !redacted.contains(&home_like.display().to_string()),
+            "the operator's HOME-like prefix must not survive redaction: {redacted}"
+        );
     }
 }

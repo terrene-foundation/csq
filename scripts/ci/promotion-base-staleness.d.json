@@ -1,0 +1,59 @@
+{
+  "$comment": [
+    "Declaration for scripts/verify/promotion-base-staleness.sh — edit THIS,",
+    "never the script's internals, so there is exactly one place a ref name lives.",
+    "",
+    "WHY THIS EXISTS — a real near-miss, 2026-09-10.",
+    "Promotion an internal ticket ('promote(dev->main)') was opened while `dev` was at one",
+    "tip. Two hours later an internal ticket merged DIRECTLY into `main`, so `main`",
+    "acquired 3 commits that `dev` did not have. an internal ticket sat open, still",
+    "describing itself as promoting N commits, with its base moved underneath",
+    "it. Nothing detected this. It was caught by hand, only because a full ref",
+    "census happened to compare origin/dev..origin/main in the non-obvious",
+    "direction.",
+    "",
+    "THE ASYMMETRY IS THE WHOLE BUG. Everyone measures main..dev — how much is",
+    "waiting to promote. Almost nobody measures dev..main — what main gained",
+    "that dev lacks. The second is the dangerous one, and it reads zero in the",
+    "healthy case, so its absence from a dashboard is invisible. promotion-drift",
+    "measures the first direction; this gate measures the second."
+  ],
+
+  "trunk_ref": "refs/remotes/origin/dev",
+  "$why_trunk": [
+    "The integration trunk work is promoted FROM. It must FULLY CONTAIN the",
+    "target, or the promotion merges a base that has moved."
+  ],
+
+  "target_ref": "refs/remotes/origin/main",
+  "$why_target": [
+    "The branch being promoted TO. Anything that lands here directly — a hotfix,",
+    "an admin merge, a revert — is exactly what this gate exists to catch,",
+    "because it is invisible to every count taken in the usual direction."
+  ],
+
+  "$why_no_threshold": [
+    "This gate has no tunable number, deliberately. ONE commit on main that dev",
+    "lacks already means the promotion base has moved; there is no 'a little",
+    "stale is fine' regime to encode. The remedy is always the same and always",
+    "cheap: back-merge main into dev, then promote. A threshold here would only",
+    "be a place to hide the failure."
+  ],
+
+  "$why_first_parent": [
+    "Counts are reported as INDEPENDENT LANDINGS (--first-parent) alongside raw",
+    "commits, matching scripts/verify/promotion-drift.sh exactly. Debug-on-red",
+    "cost scales with the number of independent changes in a batch, not with how",
+    "many commits each carried. Measured on csq 2026-09-10: origin/main..",
+    "origin/dev was 13 raw but 9 first-parent — raw overstates by 1.44x."
+  ],
+
+  "$why_freshness_is_fatal": [
+    "A remote-tracking ref only updates on fetch. A run against a STALE",
+    "origin/main reports GREEN while main has in fact moved — which is this",
+    "gate reproducing the exact bug it exists to catch. So the gate FETCHES",
+    "first, and a fetch it cannot complete is UNDETERMINED (exit 2), never a",
+    "pass. PBS_NO_FETCH=1 exists only for fixtures whose refs ARE ground truth;",
+    "it downgrades the freshness claim in the output rather than hiding it."
+  ]
+}

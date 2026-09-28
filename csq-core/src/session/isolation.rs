@@ -205,8 +205,19 @@ fn ensure_symlink(target: &Path, link: &Path) -> Result<(), std::io::Error> {
     create_symlink(target, link)
 }
 
-/// Creates a symlink. On Unix uses `symlink`, on Windows uses a directory junction
-/// (via `mklink /J`) for directories, falling back to copy for files.
+/// Creates a link from `link` to `target`.
+///
+/// On Unix this is always a real symlink. On Windows it is a real symlink
+/// when the process can make one (Developer Mode, or
+/// `SeCreateSymbolicLinkPrivilege`), and otherwise degrades — a directory
+/// junction for directories, a hard link or copy for files.
+///
+/// The degraded file shapes do NOT deliver link semantics: a writer that
+/// replaces the target via tmp-file + rename (which `atomic_replace` does)
+/// leaves a hard link pointing at the orphaned old file, and a copy was
+/// never connected at all. A caller that REQUIRES the link to keep
+/// resolving across such a write must verify the result is a symlink and
+/// refuse otherwise — see `session::shared_state::link_slot_to_shared`.
 ///
 /// Public alias for use by `handle_dir` module.
 pub fn create_symlink_pub(target: &Path, link: &Path) -> Result<(), std::io::Error> {
@@ -246,7 +257,22 @@ fn create_symlink_windows(target: &Path, link: &Path) -> Result<(), std::io::Err
         return Ok(());
     }
 
-    // Files: try hardlink, fall back to copy
+    // Files: a REAL symlink first. `symlink_file` succeeds when the process
+    // holds `SeCreateSymbolicLinkPrivilege` or Developer Mode is on, and it
+    // is the only shape that survives the caller replacing the target via
+    // tmp-file + rename. Hard link and copy remain as degraded fallbacks
+    // for hosts with neither, and callers that cannot tolerate the
+    // degradation verify the resulting shape themselves.
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "file symlink unavailable (no Developer Mode / SeCreateSymbolicLinkPrivilege), \
+                 degrading to hard link or copy"
+            );
+        }
+    }
     match std::fs::hard_link(target, link) {
         Ok(()) => Ok(()),
         Err(_) => std::fs::copy(target, link).map(|_| ()),

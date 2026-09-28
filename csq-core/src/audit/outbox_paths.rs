@@ -48,6 +48,57 @@ pub fn mcp_gate_outbox_dir(base: &Path) -> PathBuf {
 /// misclassifies — an MCP-gate decision body.
 pub const MCP_GATE_OUTBOX_SUBDIR: &str = ".pending-mcp-gate";
 
+/// Hard admission capacity for MCP pending evidence; shared with community doctor.
+/// Existing records are never evicted to admit another decision.
+pub const MCP_GATE_OUTBOX_MAX_PENDING: usize = 1_000;
+/// Per-record admission budget, including worst-case JSON escaping of the two
+/// 512-byte identifiers. The enterprise writer compile-time checks this against
+/// its field validator; doctor reads the same byte authority in both editions.
+pub const MCP_GATE_PENDING_MAX_BYTES: usize = 6_400;
+pub const MCP_GATE_OUTBOX_MAX_BYTES: u64 =
+    (MCP_GATE_OUTBOX_MAX_PENDING * MCP_GATE_PENDING_MAX_BYTES) as u64;
+
+#[derive(Debug, Default)]
+pub struct McpGateAdmissionUsage {
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+impl McpGateAdmissionUsage {
+    pub fn admission_problem(&self, additional_bytes: usize) -> Option<&'static str> {
+        (self.entries >= MCP_GATE_OUTBOX_MAX_PENDING
+            || self.bytes.saturating_add(additional_bytes as u64) > MCP_GATE_OUTBOX_MAX_BYTES)
+            .then_some("mcp_gate_pending_capacity")
+    }
+}
+
+/// Conservative shared inspection, not an admission reservation: writers call
+/// this while holding their admission lock; doctor observes a point-in-time
+/// snapshot. Unknown/stale regular files count. No symlink/directory traversal,
+/// deletion or conversion of unreadable metadata to a healthy zero count.
+pub fn inspect_mcp_gate_admission(base: &Path) -> Result<McpGateAdmissionUsage, &'static str> {
+    let dir = mcp_gate_outbox_dir(base);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err("mcp_gate_pending_unsafe_directory"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(McpGateAdmissionUsage::default())
+        }
+        Err(_) => return Err("mcp_gate_pending_stat"),
+    }
+    let mut usage = McpGateAdmissionUsage::default();
+    for entry in std::fs::read_dir(dir).map_err(|_| "mcp_gate_pending_readdir")? {
+        let path = entry.map_err(|_| "mcp_gate_pending_readdir")?.path();
+        let meta = std::fs::symlink_metadata(path).map_err(|_| "mcp_gate_pending_stat")?;
+        if !meta.is_file() {
+            return Err("mcp_gate_pending_unsafe_entry");
+        }
+        usage.entries = usage.entries.saturating_add(1);
+        usage.bytes = usage.bytes.saturating_add(meta.len());
+    }
+    Ok(usage)
+}
+
 /// Subdir under `csq-runs/` holding the M18 provenance-seam quarantine custody
 /// set: `csq-runs/.pending/provenance/`. Written by the seam ingest/quarantine
 /// path; counted by `csq doctor`'s `seam_pending_provenance_count`.

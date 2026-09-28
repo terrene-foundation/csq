@@ -194,7 +194,7 @@ fn run_probe_within(cli: SurfaceCli, timeout: Duration) -> CliStatus {
 }
 
 /// Test-only: run the probe with an explicit wall-clock budget, bypassing the
-/// process-lifetime [`CACHE`] entirely.
+/// process-lifetime `CACHE` entirely.
 ///
 /// The cache key is `SurfaceCli` alone — it carries no timeout — so a
 /// short-budget probe must neither read nor write it. Writing would poison the
@@ -205,7 +205,7 @@ fn run_probe_within(cli: SurfaceCli, timeout: Duration) -> CliStatus {
 /// Gated on `feature = "test-utils"` rather than `cfg(test)` because the
 /// integration-test binary links `csq-core` as an ordinary library dependency
 /// and never compiles under this crate's own `cfg(test)` — the same reason
-/// [`probe_timeout`]'s test-budget override is gated that way.
+/// `probe_timeout`'s test-budget override is gated that way.
 ///
 /// Unlike [`probe`], this does NOT honour `CSQ_CLI_DEPS_PROBE_DISABLE`: a test
 /// that asks for the subprocess path wants the subprocess path, and must not be

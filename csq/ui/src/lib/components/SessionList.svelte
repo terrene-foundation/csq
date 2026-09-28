@@ -13,14 +13,27 @@
     config_dir: string;
     account_id: number | null;
     account_label: string | null;
-    five_hour_pct: number;
-    seven_day_pct: number;
-    /// Whether the two percentages above are MEASUREMENTS. False when the
-    /// bound account has no quota row, or a row with no usage window at all
-    /// (a balance-metered slot like DeepSeek). The percentages are then
-    /// wire-format `0.0` defaults, and rendering them as `0%` styled healthy
-    /// is a confident wrong answer. Optional so an older backend that
-    /// predates the field degrades to the previous behaviour rather than
+    /// `null` when this session's bound account has no 5-hour window at
+    /// all — distinct from a measured `0`. C6 (journal
+    /// `operator-surfaces`, same class as C2's `AccountView.five_hour_pct`):
+    /// `has_quota` below is an OR of both windows, so a row with only a
+    /// `seven_day` window still reports `has_quota=true` while
+    /// `five_hour_pct` is `null`. Never coerce to `0` before rendering.
+    five_hour_pct: number | null;
+    /// `null` when this session's bound account has no 7-day window at
+    /// all. Same caveat as `five_hour_pct` above, same fix.
+    seven_day_pct: number | null;
+    /// Whether this row carries a usage window AT ALL (either label).
+    /// False when the bound account has no quota row, or a row with no
+    /// usage window at all (a balance-metered slot like DeepSeek) — this
+    /// gates the single "quota: n/a" fallback badge below.
+    ///
+    /// `true` does NOT mean BOTH windows are present, only that at least
+    /// one is — `five_hour_pct`/`seven_day_pct` being `number | null` is
+    /// what lets each badge independently render its own window's
+    /// absence instead of a fabricated `0%` (C6, journal
+    /// `operator-surfaces`). Optional so an older backend that predates
+    /// the field degrades to the previous behaviour rather than
     /// rendering every badge as pending.
     has_quota?: boolean;
     started_at: number | null;
@@ -313,24 +326,45 @@
               {/if}
               {#if session.has_quota === false}
                 <!--
-                  The bound account has no observable usage window — a
-                  balance-metered slot (DeepSeek), or one not yet polled.
-                  `five_hour_pct`/`seven_day_pct` are `0.0` only because that
-                  is the wire-format default, NOT a measured "0% used", so a
-                  `0%` badge styled healthy is indistinguishable from a real
-                  reading. Render the honest pending state instead — the same
-                  precedent AccountList.svelte uses for `has_quota === false`.
+                  The bound account has no observable usage window AT ALL —
+                  a balance-metered slot (DeepSeek), or one not yet polled.
+                  Render the honest pending state instead of a `0%` badge —
+                  the same precedent AccountList.svelte uses for
+                  `has_quota === false`.
                 -->
                 <span class="quota-badge quota-badge-na" data-testid="session-quota-na">
                   quota: n/a
                 </span>
               {:else}
-                <span class="quota-badge {quotaClass(session.five_hour_pct)}">
-                  5h:{session.five_hour_pct > 0 && session.five_hour_pct < 1 ? '<1' : Math.round(session.five_hour_pct)}%
-                </span>
-                <span class="quota-badge {quotaClass(session.seven_day_pct)}">
-                  7d:{session.seven_day_pct > 0 && session.seven_day_pct < 1 ? '<1' : Math.round(session.seven_day_pct)}%
-                </span>
+                <!--
+                  C6 (journal `operator-surfaces`, same class as C2):
+                  `has_quota === true` here means the ROW matched at least
+                  one window, not that BOTH did — a weekly-only plan can
+                  have a `seven_day` window and no `five_hour` one. Each
+                  badge below independently renders its OWN window's
+                  `null` as the empty-vocabulary text ("idle" for 5h, "—"
+                  for 7d — the SAME words `csq status`/AccountList.svelte
+                  use via `emptyLabel`) rather than inheriting a fabricated
+                  0% from the other window's presence.
+                -->
+                {#if session.five_hour_pct !== null}
+                  <span class="quota-badge {quotaClass(session.five_hour_pct)}">
+                    5h:{session.five_hour_pct > 0 && session.five_hour_pct < 1 ? '<1' : Math.round(session.five_hour_pct)}%
+                  </span>
+                {:else}
+                  <span class="quota-badge quota-badge-na" data-testid="session-quota-5h-na">
+                    5h:idle
+                  </span>
+                {/if}
+                {#if session.seven_day_pct !== null}
+                  <span class="quota-badge {quotaClass(session.seven_day_pct)}">
+                    7d:{session.seven_day_pct > 0 && session.seven_day_pct < 1 ? '<1' : Math.round(session.seven_day_pct)}%
+                  </span>
+                {:else}
+                  <span class="quota-badge quota-badge-na" data-testid="session-quota-7d-na">
+                    7d:—
+                  </span>
+                {/if}
               {/if}
             </div>
           </div>

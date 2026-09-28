@@ -16,8 +16,8 @@
 //! `{base}` is `https://api.kimi.com/coding` (the same host the slot's
 //! own `ANTHROPIC_BASE_URL` already targets for completions), honoured
 //! via the vendor's `KIMI_CODE_BASE_URL` override. The kimi-code CLI
-//! binary contains the path verbatim: `return \`${kimiCodeBaseUrl()}/usages\``
-//! where `kimiCodeBaseUrl()` defaults to `https://api.kimi.com/coding/v1`.
+//! binary contains the path verbatim: ``return `${kimiCodeBaseUrl()}/usages` ``
+//! where `kimiCodeBaseUrl()` defaults to <https://api.kimi.com/coding/v1>.
 //!
 //! A live probe with a real `sk-kimi-…` slot credential returned
 //! **HTTP 200 with NO cookie** — Bearer alone suffices. The earlier
@@ -66,7 +66,7 @@
 //!
 //! - **3P bearer slot** (e.g. slot 13): `sk-kimi-…` API key read from
 //!   `config-<N>/settings.json` (`env.ANTHROPIC_AUTH_TOKEN`) via
-//!   [`super::third_party::load_3p_api_key_for_slot`]. Discovered via
+//!   `super::third_party::load_3p_api_key_for_slot`. Discovered via
 //!   `accounts::discovery::discover_all` filtered to
 //!   `ThirdParty { provider: "Kimi" }`.
 //! - **Native kimi-code CLI slot** (e.g. slot 14): OAuth `access_token`

@@ -98,7 +98,14 @@ pub enum HttpMethod {
 /// A transport for the sink's HTTP calls. Production wires `reqwest`; tests
 /// inject an in-memory mock so the conformance harness runs without a live
 /// endpoint. Returns `(status_code, body_bytes)` or a transport error string.
-type Transport = Box<
+///
+/// `Arc` (not `Box`) so `append`/`verify_at` can clone it into
+/// `tokio::task::spawn_blocking` — the production transport is the BLOCKING
+/// `reqwest` client and must not run on a tokio worker thread. Mirrors
+/// [`crate::audit::impls::csq_ledger_sink`]'s `Transport` exactly (an internal ticket
+/// redteam B1 adjudicated this class for that sink; this sink's live
+/// transport did not get the same treatment until this fix).
+type Transport = std::sync::Arc<
     dyn Fn(HttpMethod, String, Option<Vec<u8>>) -> Result<(u16, Vec<u8>), String> + Send + Sync,
 >;
 
@@ -134,7 +141,7 @@ impl CustomerBodyStoreSink {
         let url = config.url.clone();
         let base = config.url;
         let token = config.auth_token;
-        let transport: Transport = Box::new(move |method, path, body| {
+        let transport: Transport = std::sync::Arc::new(move |method, path, body| {
             live_request(&base, token.as_ref(), method, &path, body)
         });
         Ok(Self {
@@ -162,7 +169,7 @@ impl CustomerBodyStoreSink {
     pub fn mock_in_memory() -> Self {
         let store: std::sync::Arc<Mutex<HashMap<String, Vec<u8>>>> =
             std::sync::Arc::new(Mutex::new(HashMap::new()));
-        let transport: Transport = Box::new(move |method, path, body| match method {
+        let transport: Transport = std::sync::Arc::new(move |method, path, body| match method {
             HttpMethod::Post => {
                 let body = body.ok_or_else(|| "missing POST body".to_string())?;
                 let record: SignedRecord =
@@ -201,11 +208,24 @@ impl LedgerSink for CustomerBodyStoreSink {
         let body = serde_json::to_vec(record).map_err(|e| SinkError::Internal {
             message: RedactedString::from_untrusted(e.to_string()),
         })?;
-        // POST to the bare endpoint (empty path → base URL).
-        let (status, _resp) = (self.transport)(HttpMethod::Post, String::new(), Some(body))
-            .map_err(|e| SinkError::Unreachable {
-                message: RedactedString::from_untrusted(e),
-            })?;
+        // POST to the bare endpoint (empty path → base URL). The transport
+        // closure runs `reqwest::blocking` under the live constructor (see
+        // `live_request`), which is NOT safe to call inline on an async
+        // worker thread — `spawn_blocking` moves it onto the blocking pool,
+        // where a nested blocking-runtime is legal.
+        let transport = std::sync::Arc::clone(&self.transport);
+        let (status, _resp) = tokio::task::spawn_blocking(move || {
+            transport(HttpMethod::Post, String::new(), Some(body))
+        })
+        .await
+        .map_err(|e| SinkError::Internal {
+            message: RedactedString::from_trusted(format!(
+                "customer body store transport task panicked: {e}"
+            )),
+        })?
+        .map_err(|e| SinkError::Unreachable {
+            message: RedactedString::from_untrusted(e),
+        })?;
         if !(200..300).contains(&status) {
             return Err(SinkError::Rejected {
                 message: RedactedString::from_trusted(format!(
@@ -230,10 +250,18 @@ impl LedgerSink for CustomerBodyStoreSink {
 
     async fn verify_at(&self, id: &RecordId) -> Result<SignedRecord, SinkError> {
         let path = format!("/{}", id.as_str());
+        let transport = std::sync::Arc::clone(&self.transport);
         let (status, resp) =
-            (self.transport)(HttpMethod::Get, path, None).map_err(|e| SinkError::Unreachable {
-                message: RedactedString::from_untrusted(e),
-            })?;
+            tokio::task::spawn_blocking(move || transport(HttpMethod::Get, path, None))
+                .await
+                .map_err(|e| SinkError::Internal {
+                    message: RedactedString::from_trusted(format!(
+                        "customer body store transport task panicked: {e}"
+                    )),
+                })?
+                .map_err(|e| SinkError::Unreachable {
+                    message: RedactedString::from_untrusted(e),
+                })?;
         if status == 404 {
             return Err(SinkError::NotFound {
                 record_id: id.clone(),
@@ -255,10 +283,23 @@ impl LedgerSink for CustomerBodyStoreSink {
     }
 }
 
-/// Live `reqwest` transport used in production. Uses the blocking client inside
-/// the async trait body's call (the `LedgerSink::append` future is awaited on the
-/// daemon's sink path, which already offloads blocking work). `token` is exposed
-/// only here, transiently, to build the `Authorization` header.
+/// Live `reqwest` transport used in production. Uses `reqwest::blocking`
+/// deliberately — a fresh blocking `Client` is built per call and driven to
+/// completion synchronously.
+///
+/// **This function MUST be called from `tokio::task::spawn_blocking`, never
+/// inline on an async worker thread** (`doc-property-claims.md` MUST-1: a
+/// prior version of this comment asserted the offload "already" happened at
+/// the caller — it did not, and calling this inline from `append`/`verify_at`
+/// panicked every invocation with `reqwest::blocking`'s "Cannot drop a
+/// runtime in a context where blocking is not allowed", because
+/// `reqwest::blocking::ClientBuilder::build()` constructs and tears down its
+/// own internal current-thread runtime, which is illegal on a thread that
+/// already has a tokio runtime entered. `LedgerSink::append`/`verify_at` now
+/// wrap the call in `spawn_blocking`, which runs on tokio's dedicated
+/// blocking-pool thread — no runtime is entered there, so the nested
+/// construction is legal). `token` is exposed only here, transiently, to
+/// build the `Authorization` header.
 fn live_request(
     base: &str,
     token: Option<&SecretString>,
@@ -359,7 +400,7 @@ mod tests {
         // A transport that returns 500 on POST → `SinkError::Rejected`, NOT a
         // panic and NOT a silent success.
         let transport: Transport =
-            Box::new(|_method, _path, _body| Ok((500, b"upstream error".to_vec())));
+            std::sync::Arc::new(|_method, _path, _body| Ok((500, b"upstream error".to_vec())));
         let sink =
             CustomerBodyStoreSink::with_mock_transport("http://x".to_string(), transport).unwrap();
         let record = sample("01JZ00000000000000000000Z2");
@@ -373,12 +414,50 @@ mod tests {
         // A transport-layer failure (connection refused, DNS, etc.) →
         // `SinkError::Unreachable`, message redacted.
         let transport: Transport =
-            Box::new(|_method, _path, _body| Err("connection refused".to_string()));
+            std::sync::Arc::new(|_method, _path, _body| Err("connection refused".to_string()));
         let sink =
             CustomerBodyStoreSink::with_mock_transport("http://x".to_string(), transport).unwrap();
         let record = sample("01JZ00000000000000000000Z3");
         let result = sink.append(&record).await;
         assert!(matches!(result, Err(SinkError::Unreachable { .. })));
+    }
+
+    /// Regression: the LIVE constructor's transport (`reqwest::blocking`,
+    /// via `live_request`) MUST NOT panic when `append`/`verify_at` are
+    /// awaited from a genuine async runtime — which is how every real
+    /// caller (the daemon's anchor task) invokes a `LedgerSink`.
+    ///
+    /// Before this fix, `(self.transport)(...)` was called INLINE inside
+    /// the async fn body, so `reqwest::blocking::ClientBuilder::build()`
+    /// panicked with "Cannot drop a runtime in a context where blocking is
+    /// not allowed" on every single invocation — `CustomerBodyStoreSink`
+    /// was wired but could never actually anchor a record.
+    /// `tokio::task::spawn_blocking` in `append`/`verify_at` now offloads
+    /// the blocking call to tokio's blocking pool, where the nested
+    /// runtime construction is legal.
+    ///
+    /// This test does not need a live endpoint to prove the fix: dialing
+    /// `127.0.0.1:8080` with nothing listening produces a connection-refused
+    /// `SinkError::Unreachable` — a NORMAL error return. The defect this
+    /// test reds on is a PANIC (a wedged/aborted task), not that error.
+    #[tokio::test]
+    async fn customer_body_store_live_transport_does_not_panic_in_async_context() {
+        let sink = CustomerBodyStoreSink::new(CustomerBodyStoreConfig::default())
+            .expect("live constructor must succeed");
+        let record = sample("01JZ000000000000000000CB99");
+
+        // Must return an Err (connection refused), not panic / abort the task.
+        let append_result = sink.append(&record).await;
+        assert!(
+            matches!(append_result, Err(SinkError::Unreachable { .. })),
+            "expected Unreachable (connection refused), got {append_result:?}"
+        );
+
+        let verify_result = sink.verify_at(&record.record_id).await;
+        assert!(
+            matches!(verify_result, Err(SinkError::Unreachable { .. })),
+            "expected Unreachable (connection refused), got {verify_result:?}"
+        );
     }
 
     /// `test customer_body_store_debug_redacts_token`

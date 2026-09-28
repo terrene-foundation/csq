@@ -84,7 +84,14 @@ if [ -z "$ROOT" ]; then
     ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git repo and no REPO_ROOT given"
 fi
 [ -d "$ROOT" ] || die "REPO_ROOT '$ROOT' is not a directory"
-command -v python3 >/dev/null 2>&1 || die "python3 not on PATH (needed to decode epochs)"
+# Resolve a VERIFIED python3 (scripts/lib/resolve-python.sh): EXECUTE it and check
+# the ANSWER, never `command -v`. `command -v` PASSES on a stub that exits 0
+# without running the program (the 2026-09-20 pyenv incident) — and this gate's
+# ENTIRE verdict is the decoder's output, so a stub yields an empty scan that
+# prints CLEAN. An unverifiable interpreter is UNDETERMINED (2), never 0.
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/resolve-python.sh" || die "cannot source scripts/lib/resolve-python.sh — no verified python3 can be resolved"
+PY="$(resolve_python3)" || die "no working python3 (needed to decode epochs)"
 
 # Horizon: `testing.md` Rule 1's own bar — "reject any value that decodes to a
 # date within 5 years of when the test was written". Anything nearer is a bomb
@@ -104,7 +111,7 @@ LOOKBACK_YEARS=2
 # with quoting still active. One unpaired `'` — an English possessive is enough
 # — makes the whole script die with "unexpected EOF while looking for matching".
 # Cost when hit on 2026-08-08: the gate exited 2 on every run until spotted.
-OUT="$(python3 - "$ROOT" "$HORIZON_YEARS" "$LOOKBACK_YEARS" <<'PY'
+OUT="$("$PY" - "$ROOT" "$HORIZON_YEARS" "$LOOKBACK_YEARS" <<'PY'
 import datetime, os, re, sys
 
 root, horizon_years, lookback_years = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])

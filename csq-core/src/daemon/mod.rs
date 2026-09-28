@@ -28,6 +28,28 @@
 //! service) live in `csq::cli::commands::daemon`. The Tauri-tray
 //! in-process daemon lives in `csq::desktop::daemon_supervisor`.
 
+/// Outcome of `POST /api/harvest-account` (round 7c D3) as seen by a CLI
+/// caller — cross-platform (both `client::harvest_account` (unix) and
+/// `client_windows::harvest_account` construct it), so it lives here rather
+/// than in either platform module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarvestAccountOutcome {
+    /// A live token was harvested and adopted into the account's store.
+    Adopted,
+    /// Nothing needed harvesting (no live candidate, store already
+    /// freshest, or every candidate was dead/ineligible).
+    NothingToHarvest,
+    /// A candidate beat the store but its ownership could not be confirmed
+    /// — nothing was adopted (fail-closed).
+    OwnershipUnknown,
+    /// The daemon is processing (rate-limited upstream, a transient
+    /// validation failure, or a lock contention) — retry.
+    Busy,
+    /// The daemon is not running, unreachable, or the connection/response
+    /// itself failed.
+    Unavailable,
+}
+
 /// M14 — Daemon tokio task for periodic external anchoring.
 ///
 /// Spawns a background loop that fires [`crate::audit::anchor::anchor_head`]
@@ -58,8 +80,16 @@ pub mod migrate_legacy_api_key_helper;
 /// stale" notification; CLI command handlers call `notify::cache_invalidation`
 /// / `notify::slot_swap` instead of inlining a per-platform copy.
 pub mod notify;
+/// Process-wide panic hook (`keychain-fix-r11.md` S-LOW-3) — replaces the
+/// default hook so a daemon panic's payload is redacted before it ever
+/// reaches a log, instead of being printed to stderr verbatim.
+pub mod panic_hook;
 pub mod paths;
 pub mod pid;
+/// Daemon refresh posture (leader vs follower) — see the module docs for the
+/// two-host refresh-token war this exists to end.
+pub mod posture;
+pub mod recovery;
 pub mod refresher;
 pub mod startup_reconciler;
 /// Explicit-stop sentinel (an internal ticket) — makes `csq daemon stop` honest
@@ -84,6 +114,8 @@ pub mod server_windows;
 /// Unix `SIGTERM` path; keeps the drain semantics identical across platforms.
 #[cfg(windows)]
 pub mod shutdown_windows;
+#[cfg(all(test, unix))]
+mod test_socket_fixture;
 
 pub use anchor_task::{spawn as spawn_anchor_task, AnchorTaskHandle};
 pub use auto_rotate::{spawn as spawn_auto_rotate, AutoRotateHandle};
@@ -105,16 +137,20 @@ pub use stop_sentinel::{clear_stop_requested, is_stop_requested, set_stop_reques
 pub use usage_ledger_writer::{
     spawn as spawn_usage_ledger_writer, WriterHandle as UsageLedgerWriterHandle,
 };
-pub use usage_poller::{spawn as spawn_usage_poller, HttpGetFn, HttpPostProbeFn, PollerHandle};
+pub use usage_poller::{
+    spawn as spawn_usage_poller, HttpGetFn, HttpGetWithRetryAfterFn, HttpPostProbeFn, PollerHandle,
+};
 
 #[cfg(unix)]
 pub use client::{
-    http_get_unix, http_get_unix_with_timeout, http_post_unix, http_post_unix_json,
-    http_post_unix_json_with_headers, notify_slot_swap, DaemonClientError, DaemonResponse,
-    DEFAULT_TIMEOUT,
+    harvest_account, http_get_unix, http_get_unix_with_timeout, http_post_unix,
+    http_post_unix_json, http_post_unix_json_with_headers, notify_slot_swap, DaemonClientError,
+    DaemonResponse, DEFAULT_TIMEOUT,
 };
+#[cfg(windows)]
+pub use client_windows::harvest_account;
 // Cross-platform router types.
-pub use server::{router, HealthResponse, ServerHandle};
+pub use server::{router, AuditHealthResponse, HealthResponse, ServerHandle};
 // Unix-only listener entry point.
 #[cfg(unix)]
 pub use server::serve;

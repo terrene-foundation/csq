@@ -314,6 +314,15 @@ pub fn mint_for_login(
             (IdentityId::new_v4(), false)
         };
 
+    // `keychain-fix-r11.md` D-5: a fresh authorization event for THIS uuid
+    // supersedes any prior logout — clear its removal tombstone (if any)
+    // now, under the SAME `_lock` this mint runs under, so
+    // `credentials::file::save_uuid_credentials` (which checks the marker
+    // before every canonical write) is unblocked before this login's own
+    // credential write reaches it. A no-op (best-effort `remove_file`,
+    // `NotFound` is the common case) for a uuid that was never removed.
+    crate::accounts::identity_store::clear_identity_removed_marker(base_dir, uuid);
+
     // WRITE ORDER (R2-HIGH-1 fix, symmetric with mint_slot A-CRIT-1 fix):
     // mapping FIRST, then identity.json.
     // The _lock witness is forwarded to enforce the compile-time lock-held
@@ -860,10 +869,17 @@ fn write_identity_json(dest: &Path, content: &str) -> Result<(), ConfigError> {
         })?;
     }
 
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
+    // `secure_file` below is now a redundant (but harmless) re-chmod, kept
+    // so the three-closure injectable failure-branch test structure stays
+    // unchanged for the `secure` and `replace` branches.
     write_identity_json_inner(
         dest,
         content,
-        |tmp, body| std::fs::write(tmp, body),
+        |tmp, body| {
+            crate::platform::fs::write_new_private(tmp, body)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
         |tmp| secure_file(tmp).map_err(|e| std::io::Error::other(e.to_string())),
         |tmp, dst| atomic_replace(tmp, dst).map_err(|e| std::io::Error::other(e.to_string())),
     )

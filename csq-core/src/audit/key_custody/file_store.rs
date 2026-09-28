@@ -69,18 +69,18 @@
 //!
 //! # Permissions — 0o600 files, 0o700 dirs
 //!
-//! Files are written via the canonical `unique_tmp_path → write → secure_file →
-//! atomic_replace` §5a pipeline with tmp cleanup on every failure branch (the
-//! payload contains the private seed). The `keys/` and `keys/<chain_id>/`
-//! directories are created at 0o700 via `secure_dir` so credential filenames
-//! are not enumerable by other users.
+//! Files are written via the canonical `unique_tmp_path → write_new_private
+//! (0o600 at creation) → atomic_replace` §5a pipeline with tmp cleanup on
+//! every failure branch (the payload contains the private seed). The
+//! `keys/` and `keys/<chain_id>/` directories are created at 0o700 via
+//! `secure_dir` so credential filenames are not enumerable by other users.
 
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
 use crate::audit::key_custody::KeyCustodyError;
-use crate::platform::fs::{atomic_replace, secure_dir, secure_file, unique_tmp_path};
+use crate::platform::fs::{atomic_replace, secure_dir, unique_tmp_path, write_new_private};
 
 /// Which key slot within a chain's keystore.
 ///
@@ -160,9 +160,9 @@ fn ensure_parent_dir(
 /// bare-hex string) to the file store at `(chain_id, slot)`.
 ///
 /// The payload is private-key material; the write follows the §5a pipeline
-/// (`unique_tmp_path → write → secure_file(0o600) → atomic_replace`) with
-/// `remove_file(&tmp)` on EVERY failure branch so a crash mid-write cannot
-/// leave the seed readable at a umask-default mode.
+/// (`unique_tmp_path → write_new_private(0o600 at creation) → atomic_replace`)
+/// with `remove_file(&tmp)` on EVERY failure branch so a crash mid-write
+/// cannot leave the seed readable at a umask-default mode.
 ///
 /// `payload` is taken as `&Zeroizing<String>` so the caller's copy is zeroed on
 /// drop; this function does not retain it past the write.
@@ -181,14 +181,12 @@ pub fn store_payload(
     let path = seed_file_path(base_dir, chain_id, slot);
     let tmp = unique_tmp_path(&path);
 
-    // §5a: write → secure → replace, clean up tmp on every failure branch.
-    if let Err(e) = std::fs::write(&tmp, payload.as_bytes()) {
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate write + secure_file pair would leave
+    // open for this private-key-material tmp file.
+    if let Err(e) = write_new_private(&tmp, payload.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(KeyCustodyError::ChainIo(format!("seed file write: {e}")));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(KeyCustodyError::ChainIo(format!("seed file secure: {e}")));
     }
     if let Err(e) = atomic_replace(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);

@@ -15,6 +15,8 @@ use csq_core::providers::codex::surface as codex_surface;
 use csq_core::refresh::sentinel::is_broker_failed;
 use csq_core::session;
 use csq_core::types::AccountNum;
+
+use super::codex_supervise;
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -54,63 +56,6 @@ pub(crate) fn append_launch_log(base_dir: &Path, event: &str, account: AccountNu
     }
 }
 
-/// Mirror the bound account's Anthropic credential into the macOS keychain
-/// item Claude Code reads for `handle_dir_abs`
-/// (`credentials::keychain::sync_handle_dir`).
-///
-/// Current CC reads OAuth credentials KEYCHAIN-FIRST from that per-config-dir
-/// item, falling back to the symlinked `.credentials.json` when the keychain
-/// item is ABSENT (empirically confirmed: with the item absent, a running CC
-/// still picks up a swapped account from the repointed file). The mirror keeps
-/// the keychain copy fresh so a keychain-first read sees the current token.
-/// Best-effort: a keychain failure is logged (INFO, not WARN — see
-/// `sync_cc_keychain`) and never blocks the launch; account-switch still works
-/// via the file fallback. No-op for 3P/Codex handle dirs (no `claudeAiOauth`
-/// credential) and on non-macOS (CC reads the file directly there).
-///
-/// `account_changed` MUST be true when the handle dir's account BINDING just
-/// changed (`csq swap` repointed its symlinks) — that bypasses the
-/// newer-than-keychain guard (which compares only expiry and would otherwise
-/// leave the PREVIOUS account's token in place → 401) and clears a stale item
-/// when the new slot has no valid token.
-///
-/// `csq run` ALSO passes `true`, even though it creates a fresh `term-<pid>`
-/// handle dir. A "fresh" dir has no item that TRULY belongs to it, but its
-/// canonicalized path can COLLIDE with a stale item left by a since-removed
-/// account bound to a handle dir at the same path (PID reuse; or — a real
-/// gap named in security review 1386, closed for logout but with a residual
-/// window on the keychain-clear side — a `csq logout` whose keychain clear
-/// could not be confirmed, e.g. a locked keychain). Passing `false` here
-/// would let the newer-than-keychain guard PRESERVE that stale, wrong-account
-/// item if its expiry happens to be later than the new session's fresh
-/// token — the account-terminal-separation resurrection this whole area
-/// exists to prevent. `true` makes the guard structurally unable to do that:
-/// it always overwrites with the valid current token, or clears when there
-/// is none.
-pub(crate) fn sync_cc_keychain(handle_dir_abs: &Path, account_changed: bool) {
-    let result = if account_changed {
-        csq_core::credentials::keychain::sync_handle_dir_account_changed(handle_dir_abs)
-    } else {
-        csq_core::credentials::keychain::sync_handle_dir(handle_dir_abs)
-    };
-    if let Err(e) = result {
-        // Best-effort mirror — INFO, not WARN. Claude Code reads the keychain
-        // item when present but FALLS BACK to the symlinked `.credentials.json`
-        // (which run/swap repoint) when it is absent, so a failed mirror does NOT
-        // break account switching. The common cause is a non-interactive session
-        // (SSH/tmux) that can't answer the macOS authorization prompt for an
-        // ACL-set keychain item. Surfacing the redacted reason (visible under
-        // `CSQ_LOG=info`) replaces the prior alarming per-swap WARN, which made a
-        // harmless, expected condition look like a broken swap.
-        tracing::info!(
-            error_kind = "cc_keychain_mirror_skipped",
-            reason = %csq_core::error::redact_tokens(&e.to_string()),
-            "Claude Code keychain mirror not updated (best-effort); swap/run fall back \
-             to the credential file — account switch still works, no action needed"
-        );
-    }
-}
-
 /// Exit code when `csq run` cannot spawn a Codex slot because the
 /// daemon is not running (INV-P02). Distinct from anyhow's default 1
 /// so scripts can detect "daemon-down" vs other launch failures.
@@ -121,7 +66,7 @@ const EXIT_CODE_DAEMON_REQUIRED: i32 = 2;
 /// failure) and `2` (daemon-required) so monitoring tools can detect an
 /// audit-write failure programmatically. The launched operation already
 /// completed; only the audit record was lost.
-const EXIT_CODE_AUDIT_WRITE_FAILED: i32 = 3;
+pub(crate) const EXIT_CODE_AUDIT_WRITE_FAILED: i32 = 3;
 
 /// Exit code when `csq run` refuses to spawn a codex/gemini subprocess because
 /// the M6 T6.1 spawn-boundary governance gate returned `Block`/`Escalate`, OR
@@ -253,44 +198,12 @@ pub fn handle(
         );
         crate::cli::audit_emit::AuditEmitter::disabled()
     } else {
-        use csq_core::audit::{AuditRecord, Decision, ResultState};
-        let run_id = csq_core::audit::gen_run_id();
-        let socket_path = csq_core::daemon::socket_path(base_dir);
-        let pending_dir = base_dir.join("csq-runs").join(".pending");
-        // Operation label surfaced in the fail-loud remediation message so the
-        // operator knows WHICH run's record was lost.
-        let operation = format!("csq run account {}", account.get());
-        let record = AuditRecord {
-            schema_version: "1".to_string(),
-            run_id,
-            fixture_sha256: "0".repeat(64),
-            coc_sha256: "0".repeat(64),
-            csq_version: env!("CARGO_PKG_VERSION").to_string(),
-            cli_version: "unknown".to_string(),
-            // M19b: the ACTUAL dispatched surface (determined once above), not a
-            // hardcoded `cc`. 3P slots dispatch through the Claude binary
-            // (network-layer redirect) so they map to `cc` — correct.
-            surface: audit_surface_for(surface_for_preflight),
-            model: "unknown".to_string(),
-            // start_ts: captured before any spawn — correct.
-            start_ts: start_ts.clone(),
-            // end_ts: updated after spawn returns or before exec.
-            end_ts: start_ts.clone(),
-            // result_state/decision: updated after spawn returns.
-            // Bypass/Degraded are the safe defaults for the exec-replace path
-            // (layer is OFF — no rule validation ran).
-            result_state: ResultState::Degraded,
-            score_delta_vs_baseline: None,
-            rule_ids_cited_original: vec![],
-            rule_ids_cited_after_repair: vec![],
-            rule_ids_dropped_invalid_format: 0,
-            decision: Decision::Bypass,
-            // M6 T6.1: filled by the spawn-boundary gate (codex/gemini,
-            // enterprise) just before spawn; stays `None` for cc/3P (in-loop
-            // gated) and ungoverned spawns.
-            spawn_gate: None,
-        };
-        crate::cli::audit_emit::AuditEmitter::new(record, socket_path, pending_dir, operation)
+        build_audit_emitter(
+            base_dir,
+            audit_surface_for(surface_for_preflight),
+            format!("csq run account {}", account.get()),
+            start_ts.clone(),
+        )
     };
 
     // ── Pre-flight probe (PR-MCD2.5, spec/13 §3, R1-H5) ─────────────────────
@@ -366,6 +279,8 @@ pub fn handle(
             coc_cache_enabled,
             rest,
             &mut audit_emitter,
+            /* is_relaunch */ false,
+            /* swap_correlation */ None,
         );
     }
 
@@ -668,6 +583,107 @@ fn surface_cli_for_slot(base_dir: &Path, account: AccountNum) -> SurfaceCli {
 /// call sites and their tests keep reading in csq's own vocabulary.
 fn audit_surface_for(surface: SurfaceCli) -> csq_core::audit::Surface {
     surface.audit_surface()
+}
+
+/// Shared [`crate::cli::audit_emit::AuditEmitter`] constructor — the SAME
+/// construction `launch_codex`'s caller (`csq run`, via `handle`) and `csq
+/// swap`'s exec-replace path both use, so an audited spawn cannot silently
+/// drift into an un-audited one on either surface (cross-slot swap-resume
+/// governing task, item 1: "swap's call site carries no AuditEmitter").
+///
+/// `start_ts` MUST be captured by the caller BEFORE any spawn step (both
+/// `end_ts` and `start_ts` are seeded from it; the M6 T6.1 gate / spawn path
+/// update `end_ts` later via the setter methods). Defaults mirror the
+/// exec-replace-safe posture: `ResultState::Degraded` + `Decision::Bypass`
+/// (no rule validation has run yet), `spawn_gate: None` (filled by the M6
+/// T6.1 gate just before spawn when governed).
+pub(crate) fn build_audit_emitter(
+    base_dir: &Path,
+    surface: csq_core::audit::Surface,
+    operation: String,
+    start_ts: String,
+) -> crate::cli::audit_emit::AuditEmitter {
+    use csq_core::audit::{AuditRecord, Decision, ResultState};
+    let run_id = csq_core::audit::gen_run_id();
+    let socket_path = csq_core::daemon::socket_path(base_dir);
+    let pending_dir = base_dir.join("csq-runs").join(".pending");
+    let record = AuditRecord {
+        schema_version: "1".to_string(),
+        run_id,
+        fixture_sha256: "0".repeat(64),
+        coc_sha256: "0".repeat(64),
+        csq_version: env!("CARGO_PKG_VERSION").to_string(),
+        cli_version: "unknown".to_string(),
+        surface,
+        model: "unknown".to_string(),
+        start_ts: start_ts.clone(),
+        end_ts: start_ts,
+        result_state: ResultState::Degraded,
+        score_delta_vs_baseline: None,
+        rule_ids_cited_original: vec![],
+        rule_ids_cited_after_repair: vec![],
+        rule_ids_dropped_invalid_format: 0,
+        decision: Decision::Bypass,
+        spawn_gate: None,
+    };
+    crate::cli::audit_emit::AuditEmitter::new(record, socket_path, pending_dir, operation)
+}
+
+/// M6 T6.1 shared spawn-boundary governance gate for a governed CODEX spawn —
+/// the SAME function `launch_codex` (`csq run`) and `csq swap`'s exec-replace
+/// path both call, so the two spawn surfaces cannot drift out of parity
+/// (cross-slot swap-resume governing task, item 1: "governance bypass" —
+/// `exec_codex_after_binding` used to skip this gate entirely because swap's
+/// call site carried no `AuditEmitter`/`OperatingEnvelope`).
+///
+/// Evaluates the gate via [`crate::cli::commands::spawn_gate::evaluate_spawn`], records the verdict
+/// on `audit_emitter` (`Proceed`/`Ungoverned`) or records the refusal, flushes
+/// the audit record fail-loud, and returns `Err` (`Refuse`) — callers MUST NOT
+/// tombstone or exec anything after an `Err` from this function. `Ungoverned`
+/// and `Proceed` both return `Ok`, threading the advisory path-scope env
+/// (T6.4) and the resolved envelope (for the M6 T6.2 Shard 3a MCP-proxy
+/// rewrite — the SAME envelope, no second `load_spawn_envelope` read;
+/// redteam R1 finding 1.1).
+/// Return type of [`evaluate_codex_spawn_gate`]: the advisory path-scope env
+/// (T6.4) plus the resolved operating envelope (for the M6 T6.2 Shard 3a
+/// MCP-proxy rewrite). A named alias per clippy::type_complexity.
+#[cfg(feature = "enterprise")]
+pub(crate) type CodexSpawnGateOutcome = (
+    Vec<(String, String)>,
+    Option<Box<csq_trust_contract::OperatingEnvelope>>,
+);
+
+#[cfg(feature = "enterprise")]
+pub(crate) fn evaluate_codex_spawn_gate(
+    base_dir: &Path,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<CodexSpawnGateOutcome> {
+    use crate::cli::commands::spawn_gate;
+    use csq_core::daemon::interactive_live::SpawnGate;
+    let (gate, gate_env) =
+        spawn_gate::evaluate_spawn(base_dir, csq_trust_contract::SpawnCli::Codex);
+    match gate {
+        SpawnGate::Ungoverned => Ok((Vec::new(), None)),
+        SpawnGate::Proceed {
+            verdict,
+            action_id,
+            path_scope_env,
+        } => {
+            audit_emitter.set_spawn_gate("codex", &action_id, spawn_gate::verdict_tag(verdict));
+            Ok((path_scope_env, gate_env))
+        }
+        SpawnGate::Refuse { reason, action_id } => {
+            use csq_core::audit::{Decision, ResultState};
+            audit_emitter.set_spawn_gate("codex", &action_id, reason);
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            Err(anyhow!(
+                "csq run codex refused by operating envelope ({reason})"
+            ))
+        }
+    }
 }
 
 /// `csq run N --native` dispatch (P0-B). Drives the native governed loop against
@@ -1015,7 +1031,7 @@ fn native_artifacts_present(surface: Surface, cwd: &Path, project_root: Option<&
     // matching `coc::fallback::agents_md_walk_up`, the legacy resolver that
     // actually produced the `CocSource` in this branch. Without the climb this
     // gate was NARROWER than the resolver feeding it: the loader walked up to
-    // find `repo/AGENTS.md` and keep the layer active, while the gate refused
+    // find `<project>/AGENTS.md` and keep the layer active, while the gate refused
     // to look past `cwd` and so reported "no native artifacts" for a project
     // that plainly has one. `$HOME/CLAUDE.md`, if an operator has it, is
     // genuine CC-native global content and SHOULD suppress — unlike the bare
@@ -1179,15 +1195,27 @@ fn launch_anthropic(
     // the CLAUDE_CONFIG_DIR path below — not from the symlinked
     // `.credentials.json`. Mirror the bound account's current token into it so
     // CC picks up the fresh credential (it re-checks the keychain ~every 30s).
+    // v4 A2 ("switch now or say so"): `csq run` always creates a FRESH
+    // handle dir, so a readable X gets a FORCED write; a write failure or a
+    // lock timeout/failure means this launch does NOT proceed — a fresh
+    // dir with a colliding stale item from PID reuse must not launch
+    // against the wrong account. F4: Inaccessible (exit 36: locked, no
+    // GUI) → proceed without the mirror (CC in the same environment cannot
+    // read the keychain either and falls back to the symlinked
+    // `.credentials.json`, spec 01 §1.4); anything else unreadable →
+    // refuse.
+    // F3/KC4-3: a canonicalize FAILURE (unlike a readable-keychain Unreadable
+    // result) means we cannot even name this dir's absolute path, so "CC
+    // falls back to the symlinked .credentials.json" does not follow —
+    // refuse to launch rather than proceed against an unverified path.
     if handle_dir_is_canonical {
-        sync_cc_keychain(&handle_dir_abs, true);
+        if let Err(msg) =
+            csq_core::credentials::keychain::force_sync_for_launch(base_dir, &handle_dir_abs)
+        {
+            anyhow::bail!("csq run: {msg}");
+        }
     } else {
-        tracing::warn!(
-            error_kind = "keychain_sync_canonicalize_failed",
-            "csq run: could not canonicalize this handle dir's path — the \
-             keychain mirror was NOT written (non-fatal — launch continues; \
-             CC falls back to the symlinked .credentials.json)"
-        );
+        anyhow::bail!("csq run: keychain item could not be located; retry the launch");
     }
 
     println!("Launching claude for account {} (term-{})...", account, pid);
@@ -1413,7 +1441,7 @@ fn launch_anthropic(
 /// `env_clear + allowlist` is a PR-C3c-follow-up hardening target;
 /// today's env_remove set matches PR-C3b's login spawn.
 #[allow(clippy::too_many_arguments)]
-fn launch_codex(
+pub(crate) fn launch_codex(
     base_dir: &Path,
     account: AccountNum,
     capability_layer_enabled: bool,
@@ -1424,8 +1452,24 @@ fn launch_codex(
     coc_cache_enabled: bool,
     rest: &[String],
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    // FM-5: `false` for the primary `csq run`/`csq exec` entrypoint (via
+    // `handle`, below), `true` when this call is a cross-slot swap RELAUNCH
+    // (`codex_supervise::run_supervised`'s `relaunch` closure recursing back
+    // in). Gates whether `require_daemon_healthy` and the capability-layer
+    // preflight failure return `Err` (so the relaunch closure — and, via it,
+    // FM-6's flush + recovery-message logic — can catch it) or keep their
+    // original `process::exit` with a distinct, script-facing exit code
+    // (`EXIT_CODE_DAEMON_REQUIRED`) — see `require_daemon_healthy`'s doc
+    // comment for the exit-code-fidelity trade-off this preserves on the
+    // primary path.
+    is_relaunch: bool,
+    // PRIMARY DIRECTIVE (round 6): `Some(_)` iff this call IS the relaunch
+    // half of an accepted cross-slot swap — see
+    // `codex_supervise::run_supervised`'s `swap_correlation` doc for what it
+    // gates. `None` for the primary (non-swap) entrypoint.
+    swap_correlation: Option<csq_core::session::codex_supervisor::SwapAuditCorrelation>,
 ) -> Result<()> {
-    require_daemon_healthy(base_dir, audit_emitter)?;
+    require_daemon_healthy(base_dir, audit_emitter, is_relaunch)?;
     verify_codex_config_toml(base_dir, account)?;
     verify_codex_canonical_is_regular_file(base_dir, account)?;
 
@@ -1506,6 +1550,16 @@ fn launch_codex(
                 audit_emitter.set_result(ResultState::Fail, Decision::Reject);
                 fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
             }
+            // FM-5: on a RELAUNCH, return Err (same S-F3/C-F2 rationale as
+            // the M6 spawn-gate Err path just below) so the swap's relaunch
+            // closure — not this whole process — owns the failure, and
+            // FM-6's flush + `csq run N -- resume <id>` recovery message can
+            // run instead of a bare exit that leaves the ORIGINAL session's
+            // fate unclear. The primary `csq run` entrypoint keeps the
+            // original `process::exit` with the StageError's own exit code.
+            if is_relaunch {
+                return Err(err.into());
+            }
             std::process::exit(err.exit_code() as i32);
         }
     };
@@ -1531,33 +1585,22 @@ fn launch_codex(
     let (codex_spawn_scope_env, codex_gate_env): (
         Vec<(String, String)>,
         Option<Box<csq_trust_contract::OperatingEnvelope>>,
-    ) = {
-        use crate::cli::commands::spawn_gate;
-        use csq_core::daemon::interactive_live::SpawnGate;
-        let (gate, gate_env) =
-            spawn_gate::evaluate_spawn(base_dir, csq_trust_contract::SpawnCli::Codex);
-        let scope = match gate {
-            SpawnGate::Ungoverned => Vec::new(),
-            SpawnGate::Proceed {
-                verdict,
-                action_id,
-                path_scope_env,
-            } => {
-                audit_emitter.set_spawn_gate("codex", &action_id, spawn_gate::verdict_tag(verdict));
-                path_scope_env
-            }
-            SpawnGate::Refuse { reason, action_id } => {
-                eprintln!("error: csq run codex refused by operating envelope ({reason})");
-                use csq_core::audit::{Decision, ResultState};
-                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                audit_emitter.set_spawn_gate("codex", &action_id, reason);
-                audit_emitter.set_end_ts(end_ts);
-                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
-                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
-                std::process::exit(EXIT_CODE_SPAWN_BLOCKED);
-            }
-        };
-        (scope, gate_env)
+    ) = match evaluate_codex_spawn_gate(base_dir, audit_emitter) {
+        Ok(v) => v,
+        Err(e) => {
+            // S-F3/C-F2: return Err rather than `process::exit` so a caller
+            // driving this launch as a cross-slot swap RELAUNCH (the
+            // `relaunch` closure below, invoked via
+            // `codex_supervise::run_supervised`) can catch this and print
+            // its own recovery hint instead of the whole csq process dying
+            // out from under a swap that should have left the ORIGINAL
+            // session alone. The plain `csq run` entrypoint (`handle`,
+            // above `launch_codex` in this file) still surfaces this as a
+            // process exit — just through the ordinary `Result` error path
+            // rather than a `process::exit` call made from inside here.
+            eprintln!("error: {e}");
+            return Err(e);
+        }
     };
     #[cfg(not(feature = "enterprise"))]
     let codex_spawn_scope_env: Vec<(String, String)> = Vec::new();
@@ -1597,41 +1640,18 @@ fn launch_codex(
     // `strip_sensitive_env` scrubs CODEX_HOME from the parent env
     // (H1 fix) — if we set it first it would get env_remove'd right
     // back out.
-    let mut cmd = Command::new(codex_surface::CLI_BINARY);
-    strip_sensitive_env(&mut cmd);
-    // Codex does not read CLAUDE_CONFIG_DIR today, but a parent csq
-    // shell will have it set — scrub so a future codex-cli cannot
-    // accidentally resolve a Claude state dir. Mirrors PR-C3b login
-    // spawn's posture.
-    cmd.env_remove("CLAUDE_CONFIG_DIR");
-    cmd.env_remove("CLAUDE_HOME");
-    cmd.env(codex_surface::HOME_ENV_VAR, &handle_dir_abs);
-
-    // 2026-05-15 sandbox bug fix: pass sandbox/approval flags derived
-    // from user-global ~/.codex/config.toml at spawn. Codex CLI's
-    // policy precedence treats CLI flags as authoritative for the
-    // strict policy layer; merging keys into config-N/config.toml
-    // alone produced sessions where the model still had to request
-    // escalation despite the file having approval_policy = "never" +
-    // sandbox_mode = "danger-full-access".
     //
-    // GH an internal ticket: the derived FULL-BYPASS flag
-    // (`--dangerously-bypass-approvals-and-sandbox`) is a TERMINAL override —
-    // a later `-s read-only` in the passthrough cannot undo it (it is not a
-    // `-s` value, so codex's last-wins argparse does not apply). So a caller
-    // driving a sandboxed one-shot (`csq run N -- exec -s read-only …`) could
-    // not downscope. Fix: when the caller's passthrough ALREADY specifies a
-    // sandbox / approval policy (or `--ignore-user-config`), suppress the
-    // derived flags entirely so the caller's explicit policy is the ONLY one
-    // codex sees. Otherwise inject as before (BEFORE `rest`, last-wins for the
-    // granular `-a`/`-s` case).
-    if !codex_surface::caller_overrides_sandbox(rest) {
-        let derived_flags = codex_surface::derive_spawn_flags(
-            codex_surface::read_user_global_config_toml().as_deref(),
-        );
-        cmd.args(&derived_flags);
-    }
-    cmd.args(rest);
+    // Cross-slot swap-resume shard S3 (parity, item 3 of the governing
+    // task): the flag/env-stripping + sandbox-flag-derivation sequence
+    // below is factored into `build_codex_exec_command` so
+    // `swap.rs::exec_codex_after_binding` — which still `exec()`s in-process
+    // rather than routing through this function's supervised spawn — builds
+    // an identical `Command` on this axis. See that function's doc comment
+    // for exactly what it does and does NOT share (spawn gate, MCP proxy
+    // rewrite, and the capability-layer preflight above stay `launch_codex`
+    // -only; they need an `AuditEmitter` and a resolved operating envelope
+    // that call site does not carry).
+    let mut cmd = build_codex_exec_command(base_dir, account, &handle_dir_abs, rest)?;
 
     // M6 T6.4: inject the advisory path-scope env (empty unless the gate returned
     // Conditional with a declared path-scope). codex does NOT natively enforce
@@ -1648,8 +1668,15 @@ fn launch_codex(
 
     match layer_control {
         LayerControl::Inherit => {
-            // Layer-bypass result shape; exec_or_spawn handles platform-
-            // conditional end_ts + flush (PR-CA10c R1 redteam HIGH fix).
+            // Layer-bypass result shape. Cross-slot swap-resume shard S2:
+            // this path no longer calls `exec_or_spawn` on unix — it spawns
+            // codex as a supervised child via `codex_supervise::run_supervised`
+            // below, which owns the platform-conditional end_ts + flush for
+            // every non-swap exit (mirroring PR-CA10c R1 redteam HIGH fix's
+            // original intent). On a cross-slot swap, `run_supervised`
+            // instead finalizes/flushes THIS emitter itself as a handed-off
+            // swap before relaunching with a fresh one (C-F3/S-F4) — see
+            // that function's `Outcome::SwapRequested` handling.
             use csq_core::audit::{Decision, ResultState};
 
             // M6 T6.2 Shard 3a: even on the layer-bypass path, a governed codex
@@ -1668,7 +1695,79 @@ fn launch_codex(
             }
 
             audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
-            exec_or_spawn(cmd, &handle_dir, audit_emitter)
+            // Cross-slot swap-resume shard S2: codex is supervised (spawn +
+            // wait, never `exec` on unix) rather than exec-replaced, so a
+            // `csq swap` shelled out from INSIDE this codex session can hand
+            // the swap back to THIS process. `relaunch` recurses into
+            // `launch_codex` itself for the target slot — its own spawn
+            // point reaches back into `codex_supervise::run_supervised` for
+            // the new child, so "the new child is supervised the same way"
+            // without an explicit loop here. See `codex_supervise`'s module
+            // doc for the full contract with `csq swap` (shard S3).
+            let relaunch = move |target_slot: u16,
+                                 thread_id: Option<&str>,
+                                 swap_correlation: Option<
+                csq_core::session::codex_supervisor::SwapAuditCorrelation,
+            >,
+                                 audit_emitter: &mut crate::cli::audit_emit::AuditEmitter|
+                  -> Result<()> {
+                let target_account = AccountNum::try_from(target_slot)
+                    .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
+                let new_rest = codex_supervise::relaunch_rest(target_slot, thread_id, rest);
+                launch_codex(
+                    base_dir,
+                    target_account,
+                    capability_layer_enabled,
+                    layer_is_auto,
+                    toggles,
+                    debug,
+                    bench_mode,
+                    coc_cache_enabled,
+                    &new_rest,
+                    audit_emitter,
+                    /* is_relaunch */ true,
+                    swap_correlation,
+                )
+            };
+            // F8: held across the whole supervised run (spawn through
+            // however long this codex child lives), not just the spawn
+            // syscall — `csq sessions share`'s EXCLUSIVE migration lock
+            // must not retarget the session store this child is actively
+            // reading/writing to for as long as it is alive, not merely
+            // at the instant it was spawned. Each recursive `launch_codex`
+            // relaunch call reaches this SAME match arm and acquires its
+            // own SHARED guard, so first launch and every relaunch are
+            // covered uniformly. `ShareError`'s messages carry no secrets
+            // (lock-contention/IO text over session-store paths only).
+            let _codex_share_lock =
+                csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
+                    .map_err(|e| anyhow!("{e}"))?;
+            // F2 (round 5) / D-F9 (round 7): `make_validate_relaunch`
+            // captures the EXACT same invocation values the `relaunch`
+            // closure above already captures — see its own doc, and
+            // `validate_codex_relaunch_target`'s, for what this validates.
+            // D-F6 close-out (round 8): `base_dir`/`toggles` are cloned
+            // (`to_path_buf()` / `Copy` deref) into the closure's OWNED
+            // captures — see `make_validate_relaunch`'s doc for why this is
+            // what makes the closure `Send + Sync + 'static`.
+            let validate_relaunch = make_validate_relaunch(
+                base_dir.to_path_buf(),
+                capability_layer_enabled,
+                layer_is_auto,
+                *toggles,
+                debug,
+                coc_cache_enabled,
+            );
+            codex_supervise::run_supervised(
+                cmd,
+                &handle_dir,
+                base_dir,
+                validate_relaunch,
+                is_relaunch,
+                swap_correlation,
+                audit_emitter,
+                relaunch,
+            )
         }
         LayerControl::WithLayer {
             mode,
@@ -1763,22 +1862,87 @@ fn launch_codex(
                 // materialization and `Command::spawn`. GUARDED by the same
                 // condition as the materialization (redteam R1 finding 3.1): when
                 // NEITHER instructions nor an MCP policy applies, no materialization
-                // ran and `handle_dir/config.toml` is still the symlink
+                // ran and `<handle_dir>/config.toml` is still the symlink
                 // `create_handle_dir_codex` planted — re-stating it would spuriously
                 // fail-closed with a bogus "became a symlink (TOCTOU)" refusal.
                 // Symmetric with the Inherit arm's guarded re-stat.
                 verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
             }
-            let result = spawn_with_layer(
-                cmd,
-                &handle_dir,
-                mode,
-                class,
-                rule_ids_in_scope.clone(),
-                toggles,
-                debug,
-                audit_emitter,
-            );
+            // Cross-slot swap-resume shard S2: `SpawnMode::Interactive` is
+            // supervised (see the Inherit arm above for the full rationale
+            // and the `codex_supervise` module doc for the swap contract).
+            // `SpawnMode::OneShot` (capability-layer `--print`-shaped
+            // capture + post-validate) has no interactive terminal a user
+            // could shell out `csq swap` from, so it is left on the
+            // existing `spawn_one_shot_with_post_validate` path unchanged
+            // — bypassing `spawn_with_layer`'s dispatch wrapper directly
+            // rather than editing that shared (claude-and-codex) function.
+            let result = match mode {
+                SpawnMode::OneShot => spawn_one_shot_with_post_validate(
+                    cmd,
+                    &handle_dir,
+                    class,
+                    rule_ids_in_scope.clone(),
+                    toggles,
+                    debug,
+                    audit_emitter,
+                ),
+                SpawnMode::Interactive => {
+                    let relaunch =
+                        move |target_slot: u16,
+                              thread_id: Option<&str>,
+                              swap_correlation: Option<
+                            csq_core::session::codex_supervisor::SwapAuditCorrelation,
+                        >,
+                              audit_emitter: &mut crate::cli::audit_emit::AuditEmitter|
+                              -> Result<()> {
+                            let target_account = AccountNum::try_from(target_slot)
+                                .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
+                            let new_rest =
+                                codex_supervise::relaunch_rest(target_slot, thread_id, rest);
+                            launch_codex(
+                                base_dir,
+                                target_account,
+                                capability_layer_enabled,
+                                layer_is_auto,
+                                toggles,
+                                debug,
+                                bench_mode,
+                                coc_cache_enabled,
+                                &new_rest,
+                                audit_emitter,
+                                /* is_relaunch */ true,
+                                swap_correlation,
+                            )
+                        };
+                    // F8: see the Inherit-branch call site's identical
+                    // comment — held across the whole supervised run.
+                    let _codex_share_lock =
+                        csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
+                            .map_err(|e| anyhow!("{e}"))?;
+                    // F2 (round 5): see the Inherit-branch call site's
+                    // identical comment. D-F6 close-out (round 8): see the
+                    // same call site's comment on the owned-capture clone.
+                    let validate_relaunch = make_validate_relaunch(
+                        base_dir.to_path_buf(),
+                        capability_layer_enabled,
+                        layer_is_auto,
+                        *toggles,
+                        debug,
+                        coc_cache_enabled,
+                    );
+                    codex_supervise::run_supervised(
+                        cmd,
+                        &handle_dir,
+                        base_dir,
+                        validate_relaunch,
+                        is_relaunch,
+                        swap_correlation,
+                        audit_emitter,
+                        relaunch,
+                    )
+                }
+            };
             // WithLayer path: spawn+wait, so Drop fires normally. Populate
             // audit fields reflecting the actual post-spawn outcome.
             //
@@ -1796,6 +1960,92 @@ fn launch_codex(
             result
         }
     }
+}
+
+/// Builds a codex `Command` carrying the SAME env-stripping, sandbox/approval
+/// flag derivation, and passthrough-arg handling that `launch_codex` uses for
+/// its own spawn (`codex_command` + the GH an internal ticket sandbox-flag block that used
+/// to live inline in `launch_codex`). Cross-slot swap-resume shard S3 (item 3
+/// of the governing task) factored this out so
+/// `swap.rs::exec_codex_after_binding` — which must `exec()` a fresh codex
+/// binary in-process (it runs from a plain shell, not a supervised session,
+/// so there is no live supervisor to hand a spawn+wait off to) — builds an
+/// identical process image on the flag/env axis instead of the bare
+/// `Command::new(CLI_BINARY)` it used before this shard.
+///
+/// Deliberately does NOT itself run the JWT-exp pre-flight
+/// (`check_codex_token_freshness`), evaluate the M6 T6.1 spawn gate, or
+/// resolve the M6 T6.2 MCP-proxy rewrite — those need an `&mut AuditEmitter`
+/// and (for the gate) a resolved `OperatingEnvelope` that THIS function's
+/// call site does not carry. This is no longer a silent or reported gap:
+/// `swap::exec_codex_after_binding` now runs the token-freshness check
+/// itself, and receives the gate verdict + MCP rewrite from ITS OWN caller
+/// (`exec_replace_swap`, which calls `evaluate_codex_spawn_gate` before the
+/// Step-2 tombstone and `resolve_codex_mcp_rewrite` after Step 3) as plain,
+/// cfg-independent arguments — see that function's doc comment for the exact
+/// sequencing that closed this parity gap (cross-slot swap-resume shard S3).
+pub(crate) fn build_codex_exec_command(
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    rest: &[String],
+) -> Result<Command> {
+    let mut cmd = codex_command(base_dir, account, handle_dir)?;
+
+    // 2026-05-15 sandbox bug fix: pass sandbox/approval flags derived
+    // from user-global ~/.codex/config.toml at spawn. Codex CLI's
+    // policy precedence treats CLI flags as authoritative for the
+    // strict policy layer; merging keys into config-N/config.toml
+    // alone produced sessions where the model still had to request
+    // escalation despite the file having approval_policy = "never" +
+    // sandbox_mode = "danger-full-access".
+    //
+    // GH an internal ticket: the derived FULL-BYPASS flag
+    // (`--dangerously-bypass-approvals-and-sandbox`) is a TERMINAL override —
+    // a later `-s read-only` in the passthrough cannot undo it (it is not a
+    // `-s` value, so codex's last-wins argparse does not apply). So a caller
+    // driving a sandboxed one-shot (`csq run N -- exec -s read-only …`) could
+    // not downscope. Fix: when the caller's passthrough ALREADY specifies a
+    // sandbox / approval policy (or `--ignore-user-config`), suppress the
+    // derived flags entirely so the caller's explicit policy is the ONLY one
+    // codex sees. Otherwise inject as before (BEFORE `rest`, last-wins for the
+    // granular `-a`/`-s` case).
+    if !codex_surface::caller_overrides_sandbox(rest) {
+        let derived_flags = codex_surface::derive_spawn_flags(
+            codex_surface::read_user_global_config_toml().as_deref(),
+        );
+        cmd.args(&derived_flags);
+    }
+    cmd.args(rest);
+    Ok(cmd)
+}
+
+/// Keep authentication and governance in the terminal handle, but put SQLite
+/// state directly in the persistent slot directory. Discovering existing DBs
+/// for symlinking cannot cover a fresh slot or a new upstream schema version:
+/// Codex creates those DBs in the handle, and normal child-exit cleanup deletes
+/// them before the daemon's promotion-on-reap gets a chance to preserve them.
+/// This made slot 12 re-index 16 GB of shared rollouts on every launch.
+///
+/// `sqlite_home` is Codex's native state-location setting. It covers future DB
+/// names without a schema-version allowlist and survives materialized CoC
+/// config overlays. An explicit later `-c` in the user's passthrough still wins.
+fn codex_command(base_dir: &Path, account: AccountNum, handle_dir: &Path) -> Result<Command> {
+    let config = codex_surface::config_toml_path(base_dir, account);
+    let sqlite_home = std::fs::canonicalize(config.parent().expect("slot config has a parent"))
+        .context("resolve persistent Codex SQLite directory")?;
+    let sqlite_home = sqlite_home
+        .to_str()
+        .ok_or_else(|| anyhow!("Codex SQLite directory is not UTF-8"))?;
+    // TOML encoding is essential for spaces, quotes and Windows backslashes.
+    let sqlite_value = toml::Value::String(sqlite_home.to_owned());
+    let mut cmd = Command::new(codex_surface::CLI_BINARY);
+    strip_sensitive_env(&mut cmd);
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+    cmd.env_remove("CLAUDE_HOME");
+    cmd.env(codex_surface::HOME_ENV_VAR, handle_dir);
+    cmd.arg("-c").arg(format!("sqlite_home={sqlite_value}"));
+    Ok(cmd)
 }
 
 /// PR-CA8 commit 2 + M6 T6.2 Shard 3a: materialize `term-<pid>/config.toml`
@@ -1820,7 +2070,7 @@ fn launch_codex(
 /// Idiom: `unique_tmp_path → write → secure_file → atomic_replace`, with
 /// `let _ = remove_file(&tmp);` cleanup on every error branch per
 /// `.claude/rules/security.md` §5a.
-fn materialize_handle_config_toml(
+pub(crate) fn materialize_handle_config_toml(
     base_dir: &Path,
     account: AccountNum,
     handle_dir: &Path,
@@ -1828,7 +2078,7 @@ fn materialize_handle_config_toml(
     mcp_wrap: Option<(&str, &Path)>,
 ) -> Result<Vec<String>> {
     use csq_core::coc::translate::codex_merge::merge_instructions_via_toml_value;
-    use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+    use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
     use std::collections::BTreeMap;
 
     // PATH-BUILDER: constructs the config-N/config.toml path to read CC's
@@ -1880,13 +2130,14 @@ fn materialize_handle_config_toml(
     let target = handle_dir.join("config.toml");
     let tmp = unique_tmp_path(&target);
 
-    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate write + secure_file pair would leave
+    // open — the handle-dir config.toml's `[mcp_servers.*]` table may
+    // carry user-configured MCP auth (same class as
+    // `providers::codex::surface::write_config_toml_with_global`).
+    if let Err(e) = write_new_private(&tmp, content.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow!("write {}: {e}", redact_path(&tmp)));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!("secure_file {}: {e}", redact_path(&tmp)));
     }
     // atomic_replace is rename(2) on Unix / retry-loop MoveFileExW on
     // Windows; both atomically replace whatever was at `target`
@@ -1908,7 +2159,7 @@ fn materialize_handle_config_toml(
 /// is NOT routed through the governance proxy — the stdio proxy cannot interpose an
 /// HTTP/SSE transport, so its tool-calls run un-gated (spec 25 §25.11). Server
 /// names only; no host paths, so no redaction needed.
-fn warn_skipped_remote_mcp(skipped: &[String]) {
+pub(crate) fn warn_skipped_remote_mcp(skipped: &[String]) {
     for name in skipped {
         eprintln!(
             "note: codex MCP server '{name}' uses a remote (url) transport — its tool-calls are \
@@ -1940,7 +2191,7 @@ fn warn_skipped_remote_mcp(skipped: &[String]) {
 /// `discovery_csq_symlink_breaks_mode_detect`). Fail-CLOSED: an unresolvable binary
 /// or a failed snapshot write aborts the launch rather than spawning un-gated MCP.
 #[cfg(feature = "enterprise")]
-fn resolve_codex_mcp_rewrite(
+pub(crate) fn resolve_codex_mcp_rewrite(
     gate_env: Option<&csq_trust_contract::OperatingEnvelope>,
     handle_dir_abs: &Path,
 ) -> Result<Option<(String, std::path::PathBuf)>> {
@@ -1971,16 +2222,15 @@ fn resolve_codex_mcp_rewrite(
 }
 
 /// PR-CA8 round-1 C4: post-materialization re-stat. Refuses any non-
-/// regular-file at `handle_dir/config.toml` immediately before
-/// `Command::spawn`. Closes the TOCTOU window between
-/// `atomic_replace` returning and codex starting up — a same-user
-/// attacker who unlinks our regular file and replaces it with a
-/// symlink to attacker content would otherwise inject system-prompt
-/// instructions into codex.
+/// regular-file at `<handle_dir>/config.toml` immediately before
+/// `Command::spawn`. Detects a non-regular substitution present at check time:
+/// a same-user attacker could replace the materialized file with a symlink to
+/// attacker-controlled system-prompt content. This re-stat is not atomic with
+/// spawn or Codex's later read; it does not eliminate that TOCTOU window.
 ///
 /// Mirrors the existing `verify_codex_canonical_is_regular_file`
 /// posture (line ~393). Fail-closed on symlink; user re-runs.
-fn verify_codex_handle_config_toml_is_regular_file(handle_dir: &Path) -> Result<()> {
+pub(crate) fn verify_codex_handle_config_toml_is_regular_file(handle_dir: &Path) -> Result<()> {
     let path = handle_dir.join("config.toml");
     let meta = std::fs::symlink_metadata(&path).with_context(|| {
         format!(
@@ -2418,7 +2668,7 @@ fn copy_dir_into(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// MAY acquire that lock here too, but the cost (~100ms hold on every
 /// `csq run`) is not justified by the rarity of the race in practice (daemon
 /// refreshes 5-min cadence; user launches are seconds).
-fn check_codex_token_freshness(
+pub(crate) fn check_codex_token_freshness(
     auth_json_path: &std::path::Path,
     account: AccountNum,
     now_secs: u64,
@@ -2558,6 +2808,265 @@ fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+/// Resolves the auth.json-shaped credential path a pre-spawn/pre-relaunch
+/// freshness check should read for `account`, mirroring
+/// [`verify_codex_canonical_is_regular_file`]'s UUID-keyed-then-legacy
+/// resolution order. Unlike that function, this does NOT require the path
+/// to exist or be a regular file — [`check_codex_token_freshness`] already
+/// treats a missing/unreadable file as non-fatal, and callers of THIS
+/// function (the swap-target pre-check, which runs before a real handle dir
+/// for the target exists) need a best-effort path, not an assertion.
+#[cfg(unix)]
+fn codex_auth_json_path_for_slot(base_dir: &Path, account: AccountNum) -> std::path::PathBuf {
+    if let Some(uuid) = csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get())
+    {
+        let uuid_path =
+            csq_core::accounts::identity_store::credentials_codex_path_for(base_dir, uuid);
+        if uuid_path.exists() {
+            return uuid_path;
+        }
+    }
+    file::canonical_path_for(base_dir, account, Surface::Codex)
+}
+
+/// S-F3/C-F2: validates a cross-slot swap request's TARGET slot BEFORE the
+/// current codex child is torn down. Runs the same admission checks
+/// `launch_codex` runs before its own spawn — the daemon-health check
+/// (FM-5, re-run here even though the CURRENT session already required a
+/// healthy daemon to exist: the daemon can go down BETWEEN the current
+/// session's launch and this relaunch attempt, and `drive_child`'s SIGUSR1
+/// handler calls this BEFORE tearing the current child down, so a
+/// daemon-down refusal here is the only chance to leave that child
+/// running rather than discovering the same refusal one recursive
+/// `launch_codex` call later, after the teardown), account-number
+/// validation, the config + credential-regular-file checks, the JWT-exp
+/// pre-flight, and (on enterprise builds) the M6 T6.1 spawn-boundary gate
+/// — MINUS the actual spawn.
+///
+/// The M6 gate is evaluated against a throwaway [`crate::cli::audit_emit::AuditEmitter::disabled`]
+/// emitter, never the live session's own emitter: this is an ADMISSION CHECK
+/// that may be refused, and a refused check must not mutate the still-running
+/// original session's audit record with a verdict about a slot it never
+/// actually spawned onto. The AUTHORITATIVE gate evaluation + audit recording
+/// happens exactly once, inside the real recursive `launch_codex` call that
+/// runs only after this check has passed.
+///
+/// Called from `codex_supervise::drive_child` on every `SIGUSR1` with a
+/// pending, structurally-valid (`SwapRequest::parse`-accepted) request —
+/// i.e. AFTER `take_swap_request` has already consumed the request file, so
+/// an `Err` here does not leave the request wedged for a retry: the caller's
+/// contract is "print the reason and keep the current codex running."
+///
+/// F2 (round 5): `toggles`, `debug`, and `coc_cache_enabled` are the SAME
+/// values the ORIGINAL `csq run` invocation resolved — `launch_codex` builds
+/// a `validate` closure over its own captured invocation and passes that
+/// closure (not these bools re-derived) into `run_supervised` /
+/// `drive_child`, which calls it here with EXACTLY those values on every
+/// `SIGUSR1`. Before this fix this function re-read `toggles` fresh from
+/// disk (`load_capability_layer_toggles(base_dir)`, which is BLIND to any
+/// value the desktop tray or a `--capability-layer` flag had already
+/// resolved for the live session — a stale/absent-on-disk read only
+/// coincidentally matched the real invocation) and hardcoded
+/// `debug = false, coc_cache_enabled = true` regardless of the real
+/// invocation's actual values.
+#[cfg(unix)]
+pub(crate) fn validate_codex_relaunch_target(
+    base_dir: &Path,
+    target_slot: u16,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    coc_cache_enabled: bool,
+) -> Result<AccountNum> {
+    // S-L1: the SAME enterprise license gate `csq run`'s own `handle`
+    // enforces before doing anything else (task #77 shard 3) — a relaunch
+    // is a fresh dispatch onto a (possibly different) account and must be
+    // gated identically, not merely inherit the ORIGINAL session's
+    // already-passed check from however long ago that was.
+    #[cfg(feature = "enterprise")]
+    super::super::enforce_enterprise_license(base_dir)?;
+
+    // FM-5: refuse a swap onto ANY target while the daemon is down/stale/
+    // unhealthy — the SAME check `require_daemon_healthy` runs at the top of
+    // `launch_codex`, added here so the relaunch path (which re-enters
+    // `launch_codex` and hits that check too, but only AFTER the CURRENT
+    // child has already been torn down) gets a chance to refuse BEFORE
+    // `drive_child`'s SIGUSR1 handler calls `graceful_stop` on the still-
+    // running original session. Non-exiting by construction (this function
+    // has never called `process::exit`) — `Err` here already reaches
+    // `drive_child`'s existing refusal branch, which prints the reason and
+    // leaves the current child untouched (S-F3/C-F2).
+    if let Some(reason) = codex_daemon_refusal(&daemon::detect_daemon(base_dir)) {
+        return Err(anyhow!(reason));
+    }
+
+    let account = AccountNum::try_from(target_slot)
+        .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
+
+    // S-L1: the SAME 3P-collision refusal `handle` runs before dispatch — a
+    // target slot whose on-disk state is incoherent (a 3P provider binding
+    // present AND a Codex/Gemini canonical symlink also present, e.g. from a
+    // logout race) must be refused here too, not discovered only after the
+    // current session has already been torn down.
+    let is_third_party = discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .any(|a| a.id == account.get() && matches!(a.source, AccountSource::ThirdParty { .. }));
+    let target_surface = surface_cli_for_slot(base_dir, account);
+    if is_third_party && target_surface != SurfaceCli::Claude {
+        return Err(anyhow!(
+            "slot {target_slot} is in an inconsistent state \
+             (3P provider binding present AND Codex/Gemini canonical symlink present). \
+             Run `csq logout {target_slot}` to repair, then `csq login {target_slot} --provider <X>` \
+             to re-bind."
+        ));
+    }
+    // S-L1: a cross-slot Codex swap can only ever target a Codex slot — the
+    // same surface-routing invariant `handle`'s dispatch ladder enforces
+    // (only a `SurfaceCli::Codex` slot reaches `launch_codex` at all).
+    // Refusing here, before teardown, surfaces a target-slot mixup as a
+    // named error instead of leaving the caller's config/credential checks
+    // below to fail with a less specific message.
+    if is_third_party {
+        return Err(anyhow!(
+            "account {target_slot} is a third-party provider slot, not a Codex slot — \
+             cross-slot Codex swap cannot target it"
+        ));
+    }
+    if target_surface != SurfaceCli::Codex {
+        return Err(anyhow!(
+            "account {target_slot} is not a Codex slot — cross-slot Codex swap cannot target it"
+        ));
+    }
+
+    verify_codex_config_toml(base_dir, account)?;
+    verify_codex_canonical_is_regular_file(base_dir, account)?;
+
+    let auth_json_path = codex_auth_json_path_for_slot(base_dir, account);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    check_codex_token_freshness(&auth_json_path, account, now_secs)?;
+
+    #[cfg(feature = "enterprise")]
+    {
+        let mut scratch_emitter = crate::cli::audit_emit::AuditEmitter::disabled();
+        evaluate_codex_spawn_gate(base_dir, &mut scratch_emitter)
+            .map_err(|e| anyhow!("account {target_slot} spawn gate refused the swap: {e}"))?;
+    }
+
+    // C-R4-4 (completed, governing task item 3): run the SAME
+    // capability-layer preflight `launch_codex` runs before its own spawn,
+    // HERE — before `drive_child`'s caller tears the current, still-running
+    // child down. Before the C-R4-4 fix, a `.coc/` load failure surfaced
+    // only inside the RECURSIVE `launch_codex` call the relaunch closure
+    // makes, which happens strictly AFTER `graceful_stop(child)` has
+    // already killed the original session — so the failure killed the
+    // session it was supposed to leave untouched on refusal, with nothing
+    // left to fall back to.
+    //
+    // F2 (round 5): `capability_layer_enabled`, `layer_is_auto`, `toggles`,
+    // `debug`, and `coc_cache_enabled` are ALL now threaded through from the
+    // ORIGINAL `csq run` invocation's own resolved intent, via the `validate`
+    // closure `launch_codex` builds and passes into `run_supervised` — so
+    // this preflight validates against the EXACT intent the real,
+    // flag-respecting relaunch will run under, not an approximation of it.
+    // `rest` (the passthrough argv) is deliberately NOT threaded:
+    // `run_capability_layer_preflight` only consults it for FR-CL
+    // bench-mode/rule-scope decisions, and the real recursive
+    // `launch_codex` call re-derives `rest` from the swap request's own
+    // `relaunch_rest` output regardless — this admission check's own `rest`
+    // value has no bearing on whether the swap is ADMITTED.
+    if let Err(e) = run_capability_layer_preflight(
+        base_dir,
+        account,
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        Surface::Codex,
+        coc_cache_enabled,
+        &[],
+    ) {
+        return Err(anyhow!(
+            "capability-layer check refused the swap to account {target_slot}: {e}"
+        ));
+    }
+
+    Ok(account)
+}
+
+/// D-F9 (round 7): builds the `validate` closure `codex_supervise::
+/// run_supervised` calls on every `SIGUSR1` with a pending swap request —
+/// a thin `move` wrapper over [`validate_codex_relaunch_target`] that
+/// captures the SAME invocation values (`capability_layer_enabled`,
+/// `layer_is_auto`, `toggles`, `debug`, `coc_cache_enabled`) `launch_codex`
+/// already resolved for THIS call, so a relaunch's admission preflight
+/// validates under the exact intent the real, flag-respecting relaunch
+/// will run under (F2, round 5's doc on [`validate_codex_relaunch_target`]
+/// — unchanged by this extraction).
+///
+/// Extracted because `launch_codex`'s `LayerControl::Inherit` and
+/// `LayerControl::WithLayer` arms each built a BYTE-IDENTICAL closure
+/// inline — the two copies had already drifted apart once (one carried a
+/// stale doc-comment reference the other didn't) before this fix. A single
+/// function is the only way the two call sites cannot drift again.
+///
+/// D-F6 close-out (round 8): `base_dir` and `toggles` are now taken BY
+/// VALUE (`PathBuf` / `CapabilityLayerToggles`, the latter `Copy`) rather
+/// than borrowed — the returned closure captures owned data and is
+/// therefore `Send + Sync + 'static`, not merely `'a`. This is what lets
+/// `codex_supervise::drive_child` run it on a detached WORKER THREAD
+/// (`recv_timeout(budget)` against the thread's result channel) instead of
+/// blocking its own poll loop for the call's entire, internally-unbounded
+/// duration — see that function's doc comment for the full rationale. The
+/// caller (`launch_codex`) already owns or can cheaply clone both values
+/// (`base_dir.to_path_buf()`; `toggles` derefs, `Copy`).
+#[cfg(unix)]
+pub(crate) fn make_validate_relaunch(
+    base_dir: PathBuf,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: CapabilityLayerToggles,
+    debug: bool,
+    coc_cache_enabled: bool,
+) -> impl Fn(u16) -> Result<AccountNum> + Send + Sync + 'static {
+    move |slot: u16| -> Result<AccountNum> {
+        validate_codex_relaunch_target(
+            &base_dir,
+            slot,
+            capability_layer_enabled,
+            layer_is_auto,
+            &toggles,
+            debug,
+            coc_cache_enabled,
+        )
+    }
+}
+
+/// Non-unix stand-in: `validate_codex_relaunch_target` is `#[cfg(unix)]`
+/// (it needs unix-only ancestry/signal helpers transitively — see the
+/// Inherit-branch call site's own doc), and `run_supervised` never calls
+/// `validate` at all on non-unix (documented gap — swap has no non-unix
+/// analog), so a stub that would only ever fire where it is provably
+/// unreachable is sufficient here. Same by-value signature as the unix arm
+/// (D-F6 close-out, round 8) so both cfg variants type-check identically
+/// against `run_supervised`'s `Send + Sync + 'static` bound.
+#[cfg(not(unix))]
+pub(crate) fn make_validate_relaunch(
+    _base_dir: PathBuf,
+    _capability_layer_enabled: bool,
+    _layer_is_auto: bool,
+    _toggles: CapabilityLayerToggles,
+    _debug: bool,
+    _coc_cache_enabled: bool,
+) -> impl Fn(u16) -> Result<AccountNum> + Send + Sync + 'static {
+    |_slot: u16| -> Result<AccountNum> {
+        Err(anyhow!("codex cross-slot swap validation is unix-only"))
+    }
 }
 
 /// Requires the daemon to be `Healthy` before a Codex spawn. Spec 07
@@ -3256,10 +3765,10 @@ fn refuse_native_marker_symlink(
 ///   `[compat.claude]` cell suppresses `.claude/agents/` subagent
 ///   discovery (the `agents` cell name is a false friend — see
 ///   `GrokSpawnPayload::compat_cells_disabled`'s doc comment). So a
-///   project carrying `.claude/agents/REVIEW.md` and no `.coc/` resolves
+///   project carrying `<project>/.claude/agents/REVIEW.md` and no `.coc/` resolves
 ///   through the legacy chain to a `CocSet` containing `REVIEW`, and
 ///   `emit_grok_native` would write `$GROK_HOME/agents/csq-REVIEW.md`
-///   while Grok independently loads `.claude/agents/REVIEW.md` — same
+///   while Grok independently loads `<project>/.claude/agents/REVIEW.md` — same
 ///   body, two names, two subagents with near-identical `description:`
 ///   competing for automatic selection. The `csq-` prefix that prevents a
 ///   FILENAME collision is exactly what hides the duplicate from Grok's
@@ -3896,9 +4405,39 @@ fn map_spawn_error(
     }
 }
 
+/// FM-5: `is_relaunch` gates whether a refusal `return Err`s (so a cross-slot
+/// swap relaunch's caller — `codex_supervise`'s `relaunch` closure, and via
+/// it FM-6's flush + recovery-message handling — can catch this instead of
+/// the whole csq process dying out uncleanly) or keeps the original
+/// `process::exit` with the distinct, script-facing
+/// `EXIT_CODE_DAEMON_REQUIRED` this function's own doc comment documents. On
+/// the primary `csq run` entrypoint (`is_relaunch = false`) the exit-code
+/// fidelity is preserved exactly as before; on a relaunch the top-level
+/// `cli::run()` error handler in `main.rs` maps ANY `Err` to a generic exit
+/// 1 — the same fidelity trade-off `evaluate_codex_spawn_gate`'s
+/// pre-existing Err path already makes for the M6 spawn gate.
+///
+/// C-R4-4: precisely what this function's `Err` return does and does NOT
+/// preserve on a relaunch (`doc-property-claims.md`: the prior wording here
+/// implied returning `Err` "left the ORIGINAL session alone," which is
+/// false for THIS call site). On a relaunch, `launch_codex` — and this
+/// check at its top — runs from inside the recursive call the supervisor's
+/// `relaunch` closure makes AFTER `drive_child`'s `graceful_stop(child)` has
+/// ALREADY torn the original codex child down; by the time this function's
+/// `Err` path executes here, there is no original session left to preserve.
+/// Its actual job at THIS position is narrower: avoid a raw `process::exit`
+/// that would bypass the audit emitter's flush, and let FM-6's recovery-hint
+/// message reach the user describing how to get back to the (already
+/// terminated) conversation. The check that DOES keep the original session
+/// alive on refusal is the SEPARATE, earlier one — this file's own
+/// `validate_codex_relaunch_target`, which runs its own `codex_daemon_refusal`
+/// call (and, per C-R4-4, its own capability-layer preflight) BEFORE
+/// `drive_child` calls `graceful_stop` at all. That is the function whose
+/// `Err` genuinely leaves the current codex child untouched.
 fn require_daemon_healthy(
     base_dir: &Path,
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    is_relaunch: bool,
 ) -> Result<()> {
     // M06 fail-loud (H1): every "Codex spawn refused" branch below uses
     // `process::exit`, which bypasses the owning emitter's `Drop` in
@@ -3913,46 +4452,47 @@ fn require_daemon_healthy(
         fail_loud_on_audit_write_failure(emitter.try_flush_now());
     };
 
-    match daemon::detect_daemon(base_dir) {
-        DetectResult::Healthy { daemon_version, .. } => {
-            // A long-running daemon spawned from a pre-upgrade binary
-            // may carry stale Codex provider config or token-refresh
-            // logic. Spec 07 §7.5 INV-P02 puts the daemon on the
-            // refresh hot path for Codex, so refusing the spawn is
-            // safer than risking a refresh against a stale endpoint.
-            if let Some(reason) = daemon::version_drift_reason(&daemon_version) {
-                eprintln!("Codex spawn refused — {reason}.");
-                flush_refused(audit_emitter);
-                std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
-            }
-            Ok(())
+    if let Some(reason) = codex_daemon_refusal(&daemon::detect_daemon(base_dir)) {
+        eprintln!("{reason}");
+        flush_refused(audit_emitter);
+        if is_relaunch {
+            return Err(anyhow!("{reason}"));
         }
-        DetectResult::NotRunning => {
-            eprintln!(
-                "Codex spawn refused — csq daemon is not running.\n\
-                 The daemon must own token refresh for Codex (spec 07 §7.5 INV-P02);\n\
-                 start it with `csq daemon start` or install the desktop app."
-            );
-            flush_refused(audit_emitter);
-            std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
-        }
-        DetectResult::Stale { reason } => {
-            eprintln!(
-                "Codex spawn refused — csq daemon is stale: {reason}.\n\
-                 Restart with `csq daemon stop && csq daemon start`."
-            );
-            flush_refused(audit_emitter);
-            std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
-        }
-        DetectResult::Unhealthy { reason } => {
-            eprintln!(
-                "Codex spawn refused — csq daemon is unhealthy: {reason}.\n\
-                 Inspect logs with `csq daemon status` and restart if needed."
-            );
-            flush_refused(audit_emitter);
-            std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
-        }
+        std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
     }
+    Ok(())
+}
+
+/// Pure operator-output and admission decision, shared by the real spawn gate
+/// and private fixtures. A healthy socket never waives version compatibility.
+///
+/// C-R4-3: `pub(crate)` (was private) so `swap.rs`'s `handoff_to_supervisor`
+/// can run the SAME daemon-health check before writing a swap request,
+/// rather than letting a daemon-down refusal surface only later, silently,
+/// inside the supervisor's own relaunch attempt.
+pub(crate) fn codex_daemon_refusal(result: &DetectResult) -> Option<String> {
+    let reason = match result {
+        DetectResult::Healthy { daemon_version, .. } => {
+            // Spec 07 §7.5 INV-P02: the daemon owns the Codex refresh hot path.
+            daemon::version_drift_reason(daemon_version)?
+        }
+        DetectResult::NotRunning => format!(
+            "csq daemon is not running. The daemon must own token refresh for Codex \
+             (spec 07 §7.5 INV-P02). {}",
+            daemon::recovery::recovery_guidance()
+        ),
+        // Detection reasons can contain private socket/PID paths or raw OS
+        // errors. Preserve the category, not the untrusted diagnostic body.
+        DetectResult::Stale { .. } => format!(
+            "csq daemon is stale (PID/socket verification failed). {}",
+            daemon::recovery::recovery_guidance()
+        ),
+        DetectResult::Unhealthy { .. } => format!(
+            "csq daemon is unhealthy (socket/health verification failed). Inspect `csq daemon status`. {}",
+            daemon::recovery::recovery_guidance()
+        ),
+    };
+    Some(format!("Codex spawn refused — {reason}"))
 }
 
 /// Caller-side dispatch instruction returned by
@@ -4104,6 +4644,125 @@ fn record_root_seen(project_root: &Path, roots_seen_path: Option<&Path>) {
     }
 }
 
+// F10 (round 5): test-only injection seam for the `.coc/` walk's cwd —
+// mirrors `swap.rs`'s `COUNT_CODEX_ANCESTORS_OVERRIDE` pattern (a
+// thread-local, not the real process cwd, so it is safe under `cargo
+// test`'s default parallel runner: each test thread gets its own override,
+// and a reused harness thread always starts from "no override" via the
+// RAII guard's `Drop`).
+#[cfg(test)]
+thread_local! {
+    static COC_PREFLIGHT_CWD_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// `pub(crate)` (not merely private): item 5 (D-F3, worker-thread
+// hermeticity) needs `codex_supervise::drive_child` to be able to
+// re-install this override, by value, on a brand-new worker thread it
+// spawns — see `coc_preflight_cwd_override_snapshot` below for the reader
+// half of that seam.
+#[cfg(test)]
+pub(crate) struct CocPreflightCwdOverrideGuard;
+
+#[cfg(test)]
+impl Drop for CocPreflightCwdOverrideGuard {
+    fn drop(&mut self) {
+        COC_PREFLIGHT_CWD_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Forces `run_capability_layer_preflight`'s `.coc/` walk to use `path`
+/// (instead of the real process cwd) on THIS thread until the returned
+/// guard drops. See [`COC_PREFLIGHT_CWD_OVERRIDE`]'s doc for why this
+/// exists instead of `std::env::set_current_dir`.
+///
+/// `pub(crate)`: also called from `codex_supervise::drive_child`'s worker
+/// thread (item 5) to re-install a snapshot taken via
+/// [`coc_preflight_cwd_override_snapshot`] — a thread-local set on the
+/// CALLING thread is otherwise invisible to that brand-new OS thread.
+#[cfg(test)]
+pub(crate) fn force_coc_preflight_cwd(path: PathBuf) -> CocPreflightCwdOverrideGuard {
+    COC_PREFLIGHT_CWD_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    CocPreflightCwdOverrideGuard
+}
+
+/// Item 5 (D-F3, worker-thread hermeticity): reads [`COC_PREFLIGHT_CWD_OVERRIDE`]
+/// on the CALLING thread without disturbing it, so a caller about to spawn a
+/// new OS thread (`codex_supervise::drive_child`'s validate worker) can carry
+/// whatever override this thread currently has installed across the spawn
+/// boundary via [`force_coc_preflight_cwd`]. Returns `None` when no override
+/// is installed on this thread — the worker then runs with no override
+/// either, exactly matching what this thread would have seen.
+///
+/// `unix`-only: its callers (`codex_supervise::drive_child` and that
+/// module's tests) are `#[cfg(unix)]`.
+#[cfg(all(test, unix))]
+pub(crate) fn coc_preflight_cwd_override_snapshot() -> Option<PathBuf> {
+    COC_PREFLIGHT_CWD_OVERRIDE.with(|c| c.borrow().clone())
+}
+
+// (round 6, item 3): a SECOND test-only seam, alongside the cwd-path
+// override above — this one forces `resolve_coc_preflight_cwd` to return
+// `Err` directly, rather than a path that then resolves successfully. The
+// override above cannot reach this: `run_capability_layer_preflight` (see
+// its doc, F10 round 5) catches every `.coc/`-CONTENT failure internally
+// and downgrades it to `Ok(LayerControl::Inherit)` — the ONLY reachable
+// `Err` on this admission path is `resolve_coc_preflight_cwd`'s own `?` at
+// the top of that function, before any content is even read. Forcing
+// exactly that call gives `enabled=true` a genuine `Err` outcome distinct
+// from `enabled=false`'s `Ok` (that flag's hot-path short-circuit returns
+// `Ok(Inherit)` BEFORE ever calling `resolve_coc_preflight_cwd` at all) —
+// the discriminator `validate_codex_relaunch_target`'s and
+// `launch_codex`'s validate-closure tests need.
+#[cfg(test)]
+thread_local! {
+    static COC_PREFLIGHT_CWD_FORCE_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct CocPreflightCwdErrOverrideGuard;
+
+#[cfg(test)]
+impl Drop for CocPreflightCwdErrOverrideGuard {
+    fn drop(&mut self) {
+        COC_PREFLIGHT_CWD_FORCE_ERR.with(|c| c.set(false));
+    }
+}
+
+/// Forces `resolve_coc_preflight_cwd` to return `Err` on THIS thread until
+/// the returned guard drops. See [`COC_PREFLIGHT_CWD_FORCE_ERR`]'s doc.
+/// `pub(crate)` (not merely private) so `codex_supervise::tests` — which
+/// exercises `validate_codex_relaunch_target` and the `launch_codex`-shaped
+/// `default_validate` closure against the SAME admission path from a
+/// different file — can install it too.
+#[cfg(test)]
+pub(crate) fn force_coc_preflight_cwd_err() -> CocPreflightCwdErrOverrideGuard {
+    COC_PREFLIGHT_CWD_FORCE_ERR.with(|c| c.set(true));
+    CocPreflightCwdErrOverrideGuard
+}
+
+#[cfg(test)]
+fn resolve_coc_preflight_cwd() -> Result<PathBuf, csq_core::capability_layer::StageError> {
+    if COC_PREFLIGHT_CWD_FORCE_ERR.with(|c| c.get()) {
+        return Err(csq_core::capability_layer::StageError::ScaffoldFailed {
+            reason: "forced test error (COC_PREFLIGHT_CWD_FORCE_ERR)".to_string(),
+        });
+    }
+    if let Some(p) = COC_PREFLIGHT_CWD_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Ok(p);
+    }
+    std::env::current_dir().map_err(|e| csq_core::capability_layer::StageError::ScaffoldFailed {
+        reason: format!("could not resolve CWD for .coc/ walk: {e}"),
+    })
+}
+
+#[cfg(not(test))]
+fn resolve_coc_preflight_cwd() -> Result<PathBuf, csq_core::capability_layer::StageError> {
+    std::env::current_dir().map_err(|e| csq_core::capability_layer::StageError::ScaffoldFailed {
+        reason: format!("could not resolve CWD for .coc/ walk: {e}"),
+    })
+}
+
 /// Capability-layer pre-flight (PR-CA6b wire-up). Resolves `.coc/`
 /// from the project root (CWD walk) and runs the pre-spawn pipeline
 /// when the user opted in via `--capability-layer`.
@@ -4149,11 +4808,14 @@ fn run_capability_layer_preflight(
     // the prior first-pull trust gate was retracted (`.coc/` is files
     // in the user's repo, equivalent to `.claude/`); the version-grace
     // state lives at `<base_dir>/coc-version-grace.json`.
-    let cwd = std::env::current_dir().map_err(|e| {
-        csq_core::capability_layer::StageError::ScaffoldFailed {
-            reason: format!("could not resolve CWD for .coc/ walk: {e}"),
-        }
-    })?;
+    //
+    // F10 (round 5): `resolve_coc_preflight_cwd` is a THREAD-LOCAL test
+    // seam (see its doc) rather than a real `std::env::current_dir()` call
+    // under `#[cfg(test)]` — the process-global cwd is unsafe to mutate
+    // under `cargo test`'s default parallel runner (unlike this crate's
+    // existing `COUNT_CODEX_ANCESTORS_OVERRIDE` pattern in `swap.rs`, which
+    // this mirrors).
+    let cwd = resolve_coc_preflight_cwd()?;
     let base_dir = super::claude_home().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
     let with_warmth = match load_coc_with_timing(&cwd, &base_dir, coc_cache_enabled) {
         Ok(o) => o,
@@ -4678,7 +5340,7 @@ fn spawn_interactive_inherited(
 /// NOT route through here — they keep the best-effort WARN posture because the
 /// operation already completed and there is no exit code left to own (see
 /// `audit_emit.rs` fail-loud split doc-comment and spec 12 §12.4).
-fn fail_loud_on_audit_write_failure(
+pub(crate) fn fail_loud_on_audit_write_failure(
     result: std::result::Result<(), crate::cli::audit_emit::AuditEmitError>,
 ) {
     if let Err(e) = result {
@@ -4983,7 +5645,8 @@ fn handle_bench_mode_layer_only(
     );
 
     // 3. Audit record.
-    let home = dirs::home_dir().context("could not determine home directory")?;
+    let home =
+        csq_core::platform::home::home_dir().context("could not determine home directory")?;
     let csq_home = home.join(".csq");
     std::fs::create_dir_all(&csq_home).context("failed to create ~/.csq")?;
     let audit_path = csq_home.join("bench-mode-audits.jsonl");
@@ -5215,6 +5878,50 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn daemon_recovery_run_refuses_drift_and_missing_handshake_but_admits_matching_version() {
+        for version in ["2.5.0", "", "bad\n/Users/private/token"] {
+            let state = DetectResult::Healthy {
+                pid: 123,
+                socket_path: PathBuf::from("/private/fixture.sock"),
+                daemon_version: version.into(),
+            };
+            let output = codex_daemon_refusal(&state).expect("drift must refuse");
+            assert!(output.starts_with("Codex spawn refused"));
+            assert!(output.contains("restarting the same old binary does not fix"));
+            assert!(output.contains("supervisor is unverified"));
+            assert!(!output.contains("/Users/private"));
+            assert!(!output.contains("/private/fixture.sock"));
+            eprintln!("{output}");
+        }
+        assert!(codex_daemon_refusal(&DetectResult::Healthy {
+            pid: 123,
+            socket_path: PathBuf::from("/private/fixture.sock"),
+            daemon_version: daemon::CLI_VERSION.into(),
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn daemon_recovery_run_unavailable_siblings_require_owner_verification() {
+        for state in [
+            DetectResult::NotRunning,
+            DetectResult::Stale {
+                reason: "stale /Users/private/token\nBearer secret".into(),
+            },
+            DetectResult::Unhealthy {
+                reason: "timeout /Users/private/token\nBearer secret".into(),
+            },
+        ] {
+            let output = codex_daemon_refusal(&state).expect("unavailable must refuse");
+            assert!(output.contains("supervisor is unverified"));
+            assert!(output.contains("Only for a confirmed standalone foreground"));
+            assert!(!output.contains("daemon stop && csq daemon start"));
+            assert!(!output.contains("/Users/private"));
+            assert!(!output.contains("Bearer secret"));
+        }
+    }
+
     fn acc(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
     }
@@ -5365,7 +6072,7 @@ mod tests {
         // Byte-exact, INCLUDING the provenance boundary: this is the consumer's
         // view of the emitted artifact from a different crate, so pinning the
         // literal here is what makes the wire format a cross-crate contract
-        // rather than an internal detail of `wrap_rule_provenance` (which is
+        // rather than an internal detail of `wrap_coc_provenance` (which is
         // `pub(crate)` in csq-core and unreachable from this test).
         assert_eq!(
             std::fs::read_to_string(rd.join("csq-coc/coc-RULE-UNSCOPED.md")).unwrap(),
@@ -5974,6 +6681,163 @@ mod tests {
         let slot = acc(5);
         codex_surface::write_config_toml(dir.path(), slot, Some("gpt-5.4")).unwrap();
         verify_codex_config_toml(dir.path(), slot).expect("precondition should pass");
+    }
+
+    #[test]
+    fn codex_command_persists_new_sqlite_schema_outside_handle() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-12");
+        let handle = dir.path().join("term-123");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        let cmd = codex_command(dir.path(), acc(12), &handle).unwrap();
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-c");
+        let parsed: toml::Value = toml::from_str(args[1].to_str().unwrap()).unwrap();
+        let state_dir = Path::new(parsed["sqlite_home"].as_str().unwrap());
+        assert_eq!(state_dir, std::fs::canonicalize(&config).unwrap());
+        assert!(
+            cmd.get_envs().any(|(key, value)| {
+                key == codex_surface::HOME_ENV_VAR && value == Some(handle.as_os_str())
+            }),
+            "authentication must remain bound to the terminal handle"
+        );
+        // No database existed at provisioning time. A future schema name
+        // created at the delivered sqlite_home must survive normal cleanup.
+        std::fs::write(state_dir.join("state_999.sqlite"), b"new schema").unwrap();
+        std::fs::remove_dir_all(&handle).unwrap();
+        assert_eq!(
+            std::fs::read(config.join("state_999.sqlite")).unwrap(),
+            b"new schema"
+        );
+    }
+
+    #[test]
+    fn codex_command_sqlite_directory_is_slot_scoped() {
+        let dir = TempDir::new().unwrap();
+        let mut homes = Vec::new();
+        for slot in [11, 12] {
+            std::fs::create_dir(dir.path().join(format!("config-{slot}"))).unwrap();
+            let cmd = codex_command(dir.path(), acc(slot), &dir.path().join("term-1")).unwrap();
+            let arg = cmd.get_args().nth(1).unwrap().to_str().unwrap();
+            let parsed: toml::Value = toml::from_str(arg).unwrap();
+            homes.push(parsed["sqlite_home"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(
+            homes[0], homes[1],
+            "never redirect another slot's live database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_command_sqlite_path_is_toml_escaped() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("space quote\" backslash\\");
+        let config = base.join("config-12");
+        std::fs::create_dir_all(&config).unwrap();
+        let cmd = codex_command(&base, acc(12), &base.join("term-1")).unwrap();
+        let arg = cmd.get_args().nth(1).unwrap().to_str().unwrap();
+        let parsed: toml::Value = toml::from_str(arg).unwrap();
+        assert_eq!(
+            Path::new(parsed["sqlite_home"].as_str().unwrap()),
+            std::fs::canonicalize(config).unwrap()
+        );
+        assert_eq!(
+            parsed.as_table().unwrap().len(),
+            1,
+            "path cannot inject config keys"
+        );
+    }
+
+    // ── `build_codex_exec_command` — the shared flag/env helper
+    // `launch_codex` and `swap::exec_codex_after_binding` both call
+    // (cross-slot swap-resume shard S3, item 3) ─────────────────────────
+
+    #[test]
+    fn build_codex_exec_command_carries_the_same_env_strip_as_codex_command() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-12");
+        let handle = dir.path().join("term-123");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+
+        let cmd = build_codex_exec_command(dir.path(), acc(12), &handle, &[]).unwrap();
+        assert!(
+            cmd.get_envs().any(|(key, value)| {
+                key == codex_surface::HOME_ENV_VAR && value == Some(handle.as_os_str())
+            }),
+            "must set CODEX_HOME exactly as codex_command does"
+        );
+        // `strip_sensitive_env` + the explicit removes run inside
+        // `codex_command` — assert the CLAUDE_CONFIG_DIR removal reached
+        // this command too (env_remove shows up as `Some(None)` in
+        // `get_envs` — a key explicitly cleared, not merely absent).
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == "CLAUDE_CONFIG_DIR" && value.is_none()),
+            "must remove CLAUDE_CONFIG_DIR exactly as codex_command does"
+        );
+    }
+
+    #[test]
+    fn build_codex_exec_command_derives_sandbox_flags_like_launch_codex_did_inline() {
+        // Mirrors the GH an internal ticket derivation `launch_codex` used to build inline
+        // — moving it into `build_codex_exec_command` must not change its
+        // outcome: an empty `rest` with no global config still derives no
+        // flags (nothing to derive from), while a `rest` that already
+        // specifies a sandbox policy suppresses derivation entirely.
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-7");
+        let handle = dir.path().join("term-7");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+
+        let rest = vec!["-s".to_string(), "read-only".to_string()];
+        let cmd = build_codex_exec_command(dir.path(), acc(7), &handle, &rest).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // The caller's own `-s read-only` must be the ONLY sandbox flag —
+        // `caller_overrides_sandbox` must have suppressed derivation.
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "-s").count(),
+            1,
+            "caller-supplied sandbox flag must not be duplicated by derivation: {args:?}"
+        );
+        assert!(args.contains(&"read-only".to_string()));
+    }
+
+    /// Parity, by construction: both `launch_codex`'s spawn and
+    /// `swap::exec_codex_after_binding`'s exec build their `Command` through
+    /// THIS SAME function with the SAME `(base_dir, account, handle_dir,
+    /// rest)` — so two calls with identical inputs must produce identical
+    /// argv/env, and any future flag added to one caller is automatically
+    /// present for the other (parity by construction, not a second
+    /// hand-maintained list — mirrors
+    /// `codex_supervise::tests::relaunch_parity_shares_flags_with_the_initial_launch`'s
+    /// framing for the supervised-relaunch half of this same shard).
+    #[test]
+    fn build_codex_exec_command_is_deterministic_across_call_sites() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-3");
+        let handle = dir.path().join("term-3");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        let rest = vec!["resume".to_string(), "--last".to_string()];
+
+        // Stand-in for `launch_codex`'s own call site.
+        let from_launch = build_codex_exec_command(dir.path(), acc(3), &handle, &rest).unwrap();
+        // Stand-in for `swap::exec_codex_after_binding`'s call site.
+        let from_swap = build_codex_exec_command(dir.path(), acc(3), &handle, &rest).unwrap();
+
+        assert_eq!(
+            format!("{from_launch:?}"),
+            format!("{from_swap:?}"),
+            "both call sites must build byte-identical commands"
+        );
     }
 
     /// **2026-05-26 post-A++ run-dispatch regression (host slot 8).** A Codex
@@ -6651,6 +7515,214 @@ mod tests {
         );
     }
 
+    /// [`keychain-fix-r8c.md`'s NIT] routing half: `csq run`'s launch call
+    /// (`force_sync_for_launch` → `force_sync_for_launch_locked` →
+    /// `force_sync_account_changed`) reaches
+    /// `ForcedSyncResult::ForeignLoginUnharvested` for a FRESH handle dir
+    /// whose keychain item X holds a valid Anthropic login from a
+    /// DIFFERENT, unknown account — the exact classification whose operator
+    /// message the NIT concerns (it must never assert "Claude Code just
+    /// refreshed" as fact, per `keychain-fix-r8.md` C-F1's retraction).
+    ///
+    /// NOTE on scope (STALE as of `keychain-fix-r8d.md` item 2 — kept for
+    /// history, corrected below): this comment used to say
+    /// `force_sync_for_launch`'s own top-level `keychain_mirror_disabled_now()`
+    /// short-circuit was checked BEFORE the test-installed-executor override,
+    /// unlike its sibling entry points `force_sync_account_changed`/
+    /// `reconcile_keychain_to_marker`, so it could not be driven to its `Err`
+    /// arms from a test in THIS crate. `force_sync_for_launch` now checks the
+    /// override FIRST, matching its siblings — see
+    /// `foreign_login_unharvested_routes_through_force_sync_for_launch_directly`
+    /// below, which drives the SAME scenario through `force_sync_for_launch`
+    /// itself. This test is UNCHANGED and kept alongside it: it still pins
+    /// the routing through `force_sync_account_changed` directly, and the
+    /// message text itself is produced by keychain.rs's private
+    /// `decide_launch_disposition` and was verified by direct source
+    /// inspection to already carry the C-F1 wording at both call sites
+    /// (`ForeignLoginUnharvested`'s arms in `decide_swap_disposition` and
+    /// `decide_launch_disposition`) — no "just refreshed" text remains.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_login_unharvested_routes_through_force_sync_account_changed_for_a_fresh_launch_dir()
+    {
+        use csq_core::accounts::identity_store;
+        use csq_core::credentials::keychain::{
+            clear_test_keychain_executor, set_test_keychain_executor, ForcedSyncResult,
+            RawContentClassification, ScriptedKeychainExecutor,
+        };
+        use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::testing::identity_fixtures::write_uuid_account_marker;
+        use csq_core::types::{AccessToken, RefreshToken};
+
+        let _env_lock = csq_core::platform::test_env::lock();
+        let base = tempfile::TempDir::new().unwrap();
+        let claude_home = tempfile::TempDir::new().unwrap();
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let uuid = write_uuid_account_marker(base.path(), &config_dir, 1);
+        let own_cf = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-1".into()),
+                refresh_token: RefreshToken::new("rt-1".into()),
+                expires_at: 4_102_444_800_000, // year 2100 (feedback_no_test_timebombs)
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(
+            &identity_store::credentials_path_for(base.path(), uuid),
+            &own_cf,
+        )
+        .unwrap();
+        let own_raw = serde_json::to_string(&own_cf).unwrap();
+
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+        let (handle_dir_abs, is_canonical) =
+            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+        assert!(is_canonical, "fixture: canonicalize must succeed");
+
+        // X holds a valid Anthropic identity from a DIFFERENT, unknown
+        // account — no history entry matches it, so decide_cc_keychain_write
+        // classifies it as rule 3 (ForeignLoginUnharvested), same as swap's
+        // (d)/(e) cases.
+        let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-FOREIGN".into()),
+                refresh_token: RefreshToken::new("rt-FOREIGN".into()),
+                expires_at: 4_102_444_800_000,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let foreign_json = serde_json::to_string(&foreign).unwrap();
+        let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
+            RawContentClassification::Content(foreign_json),
+        ));
+        set_test_keychain_executor(exec);
+
+        // Mirrors force_sync_for_launch_locked's own call exactly: base,
+        // handle_dir_abs, and `Some(own_raw)` (what a real launch reads from
+        // handle_dir_abs/.credentials.json — this account's own token).
+        let result = csq_core::credentials::keychain::force_sync_account_changed(
+            base.path(),
+            &handle_dir_abs,
+            Some(&own_raw),
+        );
+        clear_test_keychain_executor();
+
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::ForeignLoginUnharvested)),
+            "an unmatched foreign login on a fresh launch dir must classify as \
+             ForeignLoginUnharvested (rule 3), never a silent write: {result:?}"
+        );
+    }
+
+    /// `keychain-fix-r8d.md` item 2: the launch-level test the prior test's
+    /// NOTE said could not exist — drives `force_sync_for_launch` ITSELF
+    /// (not `force_sync_account_changed` directly) to its
+    /// `ForeignLoginUnharvested` `Err` arm, now that it checks the
+    /// test-installed-executor override BEFORE its
+    /// `keychain_mirror_disabled_now()` short-circuit, matching its siblings.
+    ///
+    /// RED proof (quoted in the commit): reverting `force_sync_for_launch`
+    /// to check `keychain_mirror_disabled_now()` first makes this test fail
+    /// with `left: Ok(true), right: Err("the keychain holds a login...")`
+    /// — the override is installed but never consulted, and the trivial
+    /// `Ok(true)` short-circuit fires instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_login_unharvested_routes_through_force_sync_for_launch_directly() {
+        use csq_core::accounts::identity_store;
+        use csq_core::credentials::keychain::{
+            clear_test_keychain_executor, set_test_keychain_executor, RawContentClassification,
+            ScriptedKeychainExecutor,
+        };
+        use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::testing::identity_fixtures::write_uuid_account_marker;
+        use csq_core::types::{AccessToken, RefreshToken};
+
+        let _env_lock = csq_core::platform::test_env::lock();
+        let base = tempfile::TempDir::new().unwrap();
+        let claude_home = tempfile::TempDir::new().unwrap();
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let uuid = write_uuid_account_marker(base.path(), &config_dir, 1);
+        let own_cf = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-1".into()),
+                refresh_token: RefreshToken::new("rt-1".into()),
+                expires_at: 4_102_444_800_000, // year 2100 (feedback_no_test_timebombs)
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(
+            &identity_store::credentials_path_for(base.path(), uuid),
+            &own_cf,
+        )
+        .unwrap();
+
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+        let (handle_dir_abs, is_canonical) =
+            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+        assert!(is_canonical, "fixture: canonicalize must succeed");
+
+        // X holds a valid Anthropic identity from a DIFFERENT, unknown
+        // account — same shape as the sibling test above.
+        let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-FOREIGN".into()),
+                refresh_token: RefreshToken::new("rt-FOREIGN".into()),
+                expires_at: 4_102_444_800_000,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let foreign_json = serde_json::to_string(&foreign).unwrap();
+        let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
+            RawContentClassification::Content(foreign_json),
+        ));
+        set_test_keychain_executor(exec);
+
+        // The REAL launch entry point — `force_sync_for_launch`, not
+        // `force_sync_account_changed` directly.
+        let result =
+            csq_core::credentials::keychain::force_sync_for_launch(base.path(), &handle_dir_abs);
+        clear_test_keychain_executor();
+
+        assert_eq!(
+            result,
+            Err(
+                "the keychain holds a login csq could not identify as this account's own; \
+                 nothing was changed — if it belongs to a different account, run `csq login \
+                 <n>` for that account to establish ownership, then retry the launch"
+                    .to_string()
+            ),
+            "force_sync_for_launch must reach the ForeignLoginUnharvested Err arm, not the \
+             trivial Ok(true) short-circuit, when a test executor is installed"
+        );
+    }
+
     // ============================================================
     // Wave 3 kimi/grok host-isolation warning (spec 08 MED-03)
     // ============================================================
@@ -6933,8 +8005,8 @@ mod tests {
         assert_eq!(skipped, vec!["remote".to_string()]);
 
         // Handle-dir config.toml has the github server routed through the proxy.
-        // (String assertions — the `csq` crate does not depend on `toml`; the
-        // structural TOML shape is pinned by the csq-core `mcp_rewrite` unit tests.)
+        // String assertions here; csq-core `mcp_rewrite` unit tests pin the
+        // structural TOML shape.
         let written = std::fs::read_to_string(handle_dir.join("config.toml")).unwrap();
         assert!(
             written.contains(&format!("command = \"{csq_bin}\"")),
@@ -7210,6 +8282,21 @@ mod tests {
             .expect("expected one STAGE_COC_LOAD_COLD timing");
         assert_eq!(cold.result, StageResult::Applied);
         assert!(cold.elapsed_ns > 0, "cold-load timing must be non-zero");
+    }
+
+    /// `LayerControl` (and `StageError`, transitively via `enum
+    /// PreSpawnState`) does not derive `Debug`, so a `{:?}` on
+    /// `run_capability_layer_preflight`'s result does not compile. This is
+    /// a manual, variant-only description for assertion failure messages —
+    /// no field payload, just enough to distinguish which arm was reached.
+    fn describe_layer_control_result(
+        r: &Result<LayerControl, csq_core::capability_layer::StageError>,
+    ) -> &'static str {
+        match r {
+            Ok(LayerControl::Inherit) => "Ok(Inherit)",
+            Ok(LayerControl::WithLayer { .. }) => "Ok(WithLayer{..})",
+            Err(_) => "Err(..)",
+        }
     }
 
     /// Build a minimal `.coc/` with COC.lock. Per an internal journal entry the
@@ -7649,5 +8736,149 @@ mod tests {
         assert!(tmp_path.exists(), "file must exist before cleanup");
         let _ = std::fs::remove_file(&tmp_path);
         assert!(!tmp_path.exists(), "file must not exist after cleanup");
+    }
+
+    // ── F10 (round 5): `enabled` genuinely changes `run_capability_layer_
+    //    preflight`'s decision, discriminated by OBSERVED VARIANT rather
+    //    than Ok/Err ─────────────────────────────────────────────────────
+    //
+    // The pair this replaces (`relaunch_validation_honors_original_
+    // invocation_{disabled,enabled}_layer`, in `codex_supervise.rs`) both
+    // asserted only `result.is_ok()` — and EVERY reachable outcome of
+    // `run_capability_layer_preflight` on this admission path is `Ok(..)`:
+    // every `.coc/`-content failure (load error, version-refused, a
+    // malformed lock) is caught internally and converted to
+    // `Ok(LayerControl::Inherit)` (FR-RUN-04's fail-open contract — see the
+    // `Err(e) => { eprintln!(...); return Ok(LayerControl::Inherit) }` arm
+    // above), and with `rest = &[]` (this admission check's fixed
+    // passthrough — see `validate_codex_relaunch_target`'s doc) neither the
+    // classifier nor the scaffold/mcp-gate stages have a reachable `Err`
+    // path either. So no `.coc/` fixture — malformed or otherwise — can
+    // make this function return `Err` here, and a hardcoded `(true, true)`
+    // would pass BOTH the old tests identically to the real threaded
+    // values: they were not discriminating tests. The genuinely observable
+    // discriminator is the returned `LayerControl` VARIANT: `enabled=false`
+    // is `Inherit` regardless of what's on disk; `enabled=true` against a
+    // REAL, present `.coc/` is `WithLayer`.
+    #[test]
+    fn capability_layer_preflight_enabled_flag_changes_the_returned_variant() {
+        // Process-global CLAUDE_HOME (this function's `.coc/` cache root
+        // comes from `super::claude_home()`, NOT its own `_base_dir` param)
+        // — serialize per `test-hermeticity.md`.
+        let _lock = csq_core::platform::test_env::lock();
+        let had = std::env::var_os("CLAUDE_HOME");
+        let cache_dir = TempDir::new().expect("tempdir for CLAUDE_HOME");
+        // SAFETY: test_env::lock serializes env mutation per rules/testing.md.
+        unsafe {
+            std::env::set_var("CLAUDE_HOME", cache_dir.path());
+        }
+
+        let coc_dir = TempDir::new().expect("tempdir for .coc/");
+        build_coc_dir(
+            coc_dir.path(),
+            b"{\"v\":1,\"key\":\"f10-preflight-variant\"}",
+        );
+        let _cwd_guard = force_coc_preflight_cwd(coc_dir.path().to_path_buf());
+
+        let account = AccountNum::try_from(21u16).unwrap();
+        let toggles = CapabilityLayerToggles::default();
+
+        // RED against a hardcoded `(true, true)`: this call is IDENTICAL
+        // for both assertions below except `enabled`, so a hardcoded value
+        // that ignores its argument makes one of the two assertions fail.
+        let disabled = run_capability_layer_preflight(
+            coc_dir.path(),
+            account,
+            /* enabled */ false,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        let disabled_desc = describe_layer_control_result(&disabled);
+        assert!(
+            matches!(disabled, Ok(LayerControl::Inherit)),
+            "enabled=false must be Inherit regardless of a present .coc/, got {disabled_desc}"
+        );
+
+        let enabled = run_capability_layer_preflight(
+            coc_dir.path(),
+            account,
+            /* enabled */ true,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        let enabled_desc = describe_layer_control_result(&enabled);
+        assert!(
+            matches!(enabled, Ok(LayerControl::WithLayer { .. })),
+            "enabled=true against a REAL, present .coc/ must engage the \
+             layer (WithLayer), not fall back to Inherit — got {enabled_desc}"
+        );
+
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match had {
+                Some(v) => std::env::set_var("CLAUDE_HOME", v),
+                None => std::env::remove_var("CLAUDE_HOME"),
+            }
+        }
+    }
+
+    // ── round 6, item 3: `force_coc_preflight_cwd_err` genuinely
+    //    discriminates `enabled` at the LOWEST level (this is the seam
+    //    `codex_supervise::tests` reuses one layer up) ────────────────────
+    #[test]
+    fn run_capability_layer_preflight_propagates_err_only_when_enabled_true() {
+        let account = AccountNum::try_from(22u16).unwrap();
+        let toggles = CapabilityLayerToggles::default();
+        let _err_guard = force_coc_preflight_cwd_err();
+
+        // enabled=false short-circuits BEFORE ever calling
+        // `resolve_coc_preflight_cwd` (the hot-path check in
+        // `run_capability_layer_preflight`, above) — the forced Err must
+        // never be reached.
+        let disabled = run_capability_layer_preflight(
+            Path::new("/unused"),
+            account,
+            /* enabled */ false,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        assert!(
+            matches!(disabled, Ok(LayerControl::Inherit)),
+            "enabled=false must short-circuit to Ok(Inherit) before the cwd \
+             resolution the forced-Err seam targets even runs: {}",
+            describe_layer_control_result(&disabled)
+        );
+
+        // enabled=true reaches `resolve_coc_preflight_cwd()?` directly —
+        // the ONE reachable Err on this admission path (see that function's
+        // doc) — and must propagate it rather than downgrading to Inherit.
+        let enabled = run_capability_layer_preflight(
+            Path::new("/unused"),
+            account,
+            /* enabled */ true,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        assert!(
+            enabled.is_err(),
+            "enabled=true must propagate the forced cwd-resolution Err: {}",
+            describe_layer_control_result(&enabled)
+        );
     }
 }

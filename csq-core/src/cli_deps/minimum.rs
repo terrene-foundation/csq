@@ -167,11 +167,26 @@ pub fn upgrade_command(cli: SurfaceCli, manager: InstallManager) -> Option<Vec<S
         (SurfaceCli::Claude, InstallManager::ClaudeNativeInstaller) => None,
         // Self-managed CLIs update via their own subcommand — no curl-bash,
         // no package manager. `kimi upgrade` / `grok update` (spec/13 §6).
+        //
+        // UNLIKE the npm/brew rows above, these argv entries are NOT
+        // range-pinned (S-F7): the vendor's own updater decides what "latest"
+        // means, with no `>=M.m.p <N.0.0` ceiling csq can enforce. A
+        // `kimi upgrade` MAY install a new major version. This is an
+        // accepted owner decision (every managed CLI auto-updates "like
+        // Claude Code", which has no such ceiling either) — see
+        // `auto_update.rs` module docs and `cli_deps_gate::warn_if_major_crossed`.
         (SurfaceCli::Kimi, InstallManager::SelfManaged) => {
             Some(vec!["kimi".into(), "upgrade".into()])
         }
         (SurfaceCli::Grok, InstallManager::SelfManaged) => {
             Some(vec!["grok".into(), "update".into()])
+        }
+        // OpenAI's standalone installer ships its own updater — no npm,
+        // no curl-bash. `codex update` (see install_path.rs classifier).
+        // Not range-pinned, same as the Kimi/Grok rows above — see the note
+        // on those two arms.
+        (SurfaceCli::Codex, InstallManager::SelfManaged) => {
+            Some(vec!["codex".into(), "update".into()])
         }
         (_, InstallManager::Unknown) => None,
         _ => None,
@@ -318,6 +333,16 @@ mod tests {
         assert_eq!(
             upgrade_command(SurfaceCli::Grok, InstallManager::SelfManaged),
             Some(vec!["grok".into(), "update".into()])
+        );
+    }
+
+    #[test]
+    fn upgrade_command_codex_self_managed_uses_native_subcommand() {
+        // OpenAI's standalone installer ships its own `codex update`
+        // subcommand — no npm involved once classified SelfManaged.
+        assert_eq!(
+            upgrade_command(SurfaceCli::Codex, InstallManager::SelfManaged),
+            Some(vec!["codex".into(), "update".into()])
         );
     }
 

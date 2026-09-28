@@ -142,7 +142,7 @@ pub fn get_ollama_models() -> Vec<String> {
 ///
 /// Returns `None` only if none of the known paths exist AND the
 /// `OLLAMA_BIN` override is unset. Callers surface this as an
-/// "ollama not found — install via https://ollama.com" error.
+/// "ollama not found — install via <https://ollama.com>" error.
 pub fn find_ollama_bin() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("OLLAMA_BIN") {
         let p = PathBuf::from(&override_path);

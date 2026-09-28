@@ -6,10 +6,10 @@
 //! (on-disk layout) and §7.3.3 (login sequence); any drift between
 //! the spec and this module is a spec violation.
 
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{atomic_replace, unique_tmp_path};
 use crate::providers;
 use crate::types::AccountNum;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Binary name csq spawns for a Codex-surface slot. The full spawn
@@ -214,7 +214,7 @@ pub fn render_config_toml(model: Option<&str>) -> String {
 /// slots.
 ///
 /// Merge rules:
-/// 1. csq-controlled keys (see [`CSQ_CONTROLLED_KEYS`]) always come from
+/// 1. csq-controlled keys (see `CSQ_CONTROLLED_KEYS`) always come from
 ///    csq. The sole csq-controlled key is `cli_auth_credentials_store`.
 /// 2. `model` is conditional. When `model` is `Some(m)` — the explicit
 ///    `csq models set codex` choice, or a preserved prior explicit choice —
@@ -415,9 +415,11 @@ pub fn caller_overrides_sandbox(rest: &[String]) -> bool {
 /// contents of [`render_config_toml_with_global`], re-reading the
 /// user-global `~/.codex/config.toml` at call time. Creates the parent
 /// `config-<N>/` directory if missing. File permissions are set to
-/// 0o600 via [`secure_file`] — the pre-seed contains no secrets but
-/// keeps the directory's permission story uniform with the other
-/// credential-adjacent files csq writes.
+/// 0o600 at creation via
+/// [`write_new_private_synced`](crate::platform::fs::write_new_private_synced)
+/// — the rendered TOML may carry user-configured MCP server auth under
+/// `[mcp_servers.*]`, and keeps the directory's permission story uniform
+/// with the other credential-adjacent files csq writes.
 ///
 /// Used by the login path and by the daemon startup reconciler to
 /// repair drift after a manual edit. Idempotent.
@@ -466,11 +468,13 @@ pub fn write_config_toml_with_global(
     let tmp = unique_tmp_path(&target);
     let contents = render_config_toml_with_global(model, user_global);
 
-    if let Err(e) = write_and_sync(&tmp, contents.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = secure_file(&tmp) {
+    // §5a: `write_new_private_synced` creates the tmp file at 0o600 at
+    // creation (closing the window a separate `write_and_sync` +
+    // `secure_file` pair left open — config.toml's `[mcp_servers.*]` table
+    // may carry user-configured MCP auth) AND fsyncs before returning,
+    // preserving `write_and_sync`'s durability guarantee for this file
+    // (immediately consumed by a spawned Codex subprocess).
+    if let Err(e) = crate::platform::fs::write_new_private_synced(&tmp, contents.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(io::Error::other(e.to_string()));
     }
@@ -627,12 +631,6 @@ pub(crate) fn extract_model_key(toml: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
 }
 
 #[cfg(test)]

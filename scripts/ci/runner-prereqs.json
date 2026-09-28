@@ -32,11 +32,7 @@
     "tauri-linux": {
       "why": "Desktop bundle build (release.yml build-desktop, edition-seam enterprise-build).",
       "binaries": [],
-      "packages": [
-        "libwebkit2gtk-4.1-dev",
-        "librsvg2-dev",
-        "patchelf"
-      ],
+      "packages": ["libwebkit2gtk-4.1-dev", "librsvg2-dev", "patchelf"],
       "needs_sudo": false
     },
     "harness-sandbox": {

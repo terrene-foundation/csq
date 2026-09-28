@@ -221,6 +221,22 @@ where
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("create {}", config_dir.display()))?;
+    // Link a genuinely fresh slot before creating an ordinary empty sessions
+    // directory. This publishes only absent local symlinks to existing shared
+    // targets; it never merges or rewrites history while other slots are live.
+    // Existing local entries remain ineligible and retain the migration guard.
+    if crate::session::shared_state::attach_slot_to_existing_shared(
+        base_dir,
+        crate::providers::catalog::Surface::Codex,
+        account,
+        false,
+    )
+    .is_err()
+    {
+        // Session sharing is advisory, never an authentication prerequisite.
+        // Keep any published links; never fall back to destructive migration.
+        tracing::warn!("fresh Codex shared-store attachment deferred");
+    }
     let sessions_dir = surface::sessions_dir(base_dir, account);
     std::fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("create {}", sessions_dir.display()))?;
@@ -751,7 +767,7 @@ mod tests {
         ExitStatus::from_raw(1)
     }
 
-    /// Writes a valid Codex auth.json into `config_dir/auth.json`, as
+    /// Writes a valid Codex auth.json into `<config_dir>/auth.json`, as
     /// codex-cli would after a successful device-auth login. Mirrors
     /// the shape documented on `CodexCredentialFile`.
     fn stub_codex_auth_json(config_dir: &Path, account_id: &str) {
@@ -828,6 +844,213 @@ mod tests {
         assert!(!base.join("config-2/auth.json").exists());
         // Label carries the account-id prefix.
         assert_eq!(outcome.label, "codex-2/acct");
+    }
+
+    /// Pins ambient configuration and the secret backend for these login fixtures.
+    /// Restores both overrides on unwind while holding the workspace env lock.
+    struct FreshSlotTestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: [Option<std::ffi::OsString>; 2],
+    }
+
+    impl FreshSlotTestEnv {
+        fn new(base: &std::path::Path) -> Self {
+            let lock = crate::platform::test_env::lock();
+            let previous = [
+                std::env::var_os("CODEX_USER_CONFIG"),
+                std::env::var_os("CSQ_SECRET_BACKEND"),
+            ];
+            let config = base.join("TEST-INPUT-user-config.toml");
+            std::fs::write(&config, "# TEST INPUT: isolated user configuration\n").unwrap();
+            // SAFETY: the shared workspace env lock is held until Drop restores values.
+            unsafe {
+                std::env::set_var("CODEX_USER_CONFIG", config);
+                std::env::set_var("CSQ_SECRET_BACKEND", "in-memory");
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for FreshSlotTestEnv {
+        fn drop(&mut self) {
+            for (name, previous) in ["CODEX_USER_CONFIG", "CSQ_SECRET_BACKEND"]
+                .into_iter()
+                .zip(self.previous.iter())
+            {
+                // SAFETY: the shared workspace env lock remains held during restoration.
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    // Native Unix fixture; Windows symlink privilege/runtime is a separate contract.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_slot_links_existing_shared_store_before_vendor_login() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(22);
+        provision_uuid_for_account(base, 22);
+        let shared = base.join("shared-state/codex");
+        for entry in crate::session::shared_state::CODEX_SHARED.shared {
+            let target = shared.join(entry.relpath);
+            match entry.kind {
+                crate::session::shared_state::EntryKind::Dir => {
+                    std::fs::create_dir_all(target).unwrap()
+                }
+                crate::session::shared_state::EntryKind::File => {
+                    std::fs::create_dir_all(&shared).unwrap();
+                    std::fs::write(target, b"TEST INPUT shared history\n").unwrap();
+                }
+            }
+        }
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge keychain"),
+            |config_dir| {
+                for entry in crate::session::shared_state::CODEX_SHARED.shared {
+                    let local = config_dir.join(entry.relpath);
+                    assert!(
+                        local.is_symlink(),
+                        "fresh entry must be linked BEFORE vendor login: {}",
+                        entry.relpath
+                    );
+                    assert_eq!(
+                        std::fs::read_link(local).unwrap(),
+                        shared.join(entry.relpath)
+                    );
+                }
+                stub_codex_auth_json(config_dir, "TEST-INPUT-fresh-slot");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+        for entry in crate::session::shared_state::CODEX_SHARED.shared {
+            if entry.kind == crate::session::shared_state::EntryKind::File {
+                assert_eq!(
+                    std::fs::read(shared.join(entry.relpath)).unwrap(),
+                    b"TEST INPUT shared history\n"
+                );
+            }
+        }
+    }
+
+    // Native Unix fixture; Windows symlink privilege/runtime is a separate contract.
+    #[cfg(unix)]
+    #[test]
+    fn shared_attachment_error_does_not_block_vendor_login() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(23);
+        provision_uuid_for_account(base, 23);
+        // Deterministic ENOTDIR at shared-target metadata lookup, not a
+        // permission test that can vacuously pass under a privileged runner.
+        std::fs::write(
+            base.join("shared-state"),
+            b"TEST INPUT wrong-shaped shared root",
+        )
+        .unwrap();
+        let spawned = std::cell::Cell::new(false);
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge keychain"),
+            |config_dir| {
+                spawned.set(true);
+                assert!(config_dir.join("codex-sessions").is_dir());
+                assert!(!config_dir.join("codex-sessions").is_symlink());
+                stub_codex_auth_json(config_dir, "TEST-INPUT-sharing-error");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+        assert!(spawned.get());
+        assert_eq!(
+            std::fs::read(base.join("shared-state")).unwrap(),
+            b"TEST INPUT wrong-shaped shared root"
+        );
+    }
+
+    #[test]
+    fn existing_slot_history_is_not_migrated_before_vendor_login() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(22);
+        provision_uuid_for_account(base, 22);
+        let shared = base.join("shared-state/codex");
+        for entry in crate::session::shared_state::CODEX_SHARED.shared {
+            let target = shared.join(entry.relpath);
+            match entry.kind {
+                crate::session::shared_state::EntryKind::Dir => {
+                    std::fs::create_dir_all(target).unwrap()
+                }
+                crate::session::shared_state::EntryKind::File => {
+                    std::fs::create_dir_all(&shared).unwrap();
+                    std::fs::write(target, b"TEST INPUT shared history\n").unwrap();
+                }
+            }
+        }
+        let local_sessions = base.join("config-22/codex-sessions");
+        std::fs::create_dir_all(&local_sessions).unwrap();
+        std::fs::write(
+            local_sessions.join("TEST-INPUT-local.jsonl"),
+            b"TEST INPUT private history\n",
+        )
+        .unwrap();
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge keychain"),
+            |config_dir| {
+                let local = config_dir.join("codex-sessions");
+                assert!(!local.is_symlink());
+                assert_eq!(
+                    std::fs::read(local.join("TEST-INPUT-local.jsonl")).unwrap(),
+                    b"TEST INPUT private history\n"
+                );
+                assert!(!shared
+                    .join("codex-sessions/TEST-INPUT-local.jsonl")
+                    .exists());
+                stub_codex_auth_json(config_dir, "TEST-INPUT-existing-slot");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+        assert!(!local_sessions.is_symlink());
+        assert_eq!(
+            std::fs::read(local_sessions.join("TEST-INPUT-local.jsonl")).unwrap(),
+            b"TEST INPUT private history\n"
+        );
+        assert!(!shared
+            .join("codex-sessions/TEST-INPUT-local.jsonl")
+            .exists());
     }
 
     #[test]

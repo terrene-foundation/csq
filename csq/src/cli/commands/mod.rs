@@ -1,14 +1,24 @@
 //! Subcommand handlers for the csq CLI.
 
 pub mod audit;
+pub(crate) mod audit_health;
 pub mod classify;
 pub mod cli;
 pub(crate) mod cli_deps_gate;
+/// Codex process supervisor for `csq run`'s interactive Codex launch paths
+/// (cross-slot swap-resume shard S2) — see the module's own doc comment.
+pub(crate) mod codex_supervise;
 pub mod completions;
 pub mod daemon;
 pub mod dev_identity;
 pub mod doctor;
 pub mod exec;
+/// Shared `#[cfg(test)]` fixture: a fake, minimally-responsive daemon for
+/// tests gated on `daemon::detect_daemon` reporting `Healthy` (governing
+/// task item 4 — hoisted out of duplicated copies in `codex_supervise` and
+/// `swap`'s own test modules).
+#[cfg(test)]
+pub(crate) mod fake_daemon_test_support;
 pub mod inspect_coc;
 pub mod install;
 pub mod keychain_sync;
@@ -22,6 +32,7 @@ pub mod repair;
 pub mod rmkey;
 pub mod roster;
 pub mod run;
+pub mod sessions;
 pub mod setkey;
 pub mod status;
 pub mod statusline;
@@ -71,7 +82,8 @@ pub fn base_dir() -> Result<PathBuf> {
         return overridden;
     }
 
-    let home = dirs::home_dir().context("could not determine home directory")?;
+    let home =
+        csq_core::platform::home::home_dir().context("could not determine home directory")?;
     Ok(home.join(".claude").join("accounts"))
 }
 
@@ -83,7 +95,8 @@ pub fn claude_home() -> Result<PathBuf> {
     if let Some(overridden) = validated_env_override("CLAUDE_HOME") {
         return overridden;
     }
-    let home = dirs::home_dir().context("could not determine home directory")?;
+    let home =
+        csq_core::platform::home::home_dir().context("could not determine home directory")?;
     Ok(home.join(".claude"))
 }
 

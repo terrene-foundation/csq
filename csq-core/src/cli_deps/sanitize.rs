@@ -131,30 +131,126 @@ pub fn redact_path(p: &std::path::Path) -> String {
 /// Per `rules/operator-surface-verification.md` Rule 1 / `tauri-commands.md`
 /// MUST-3. Returns the input unchanged when `$HOME` is unset or empty.
 pub fn redact_home_anywhere(s: &str) -> String {
+    let Some(home_str) = resolved_home_string() else {
+        return s.to_string();
+    };
+    let literal = home_str.trim_end_matches(is_path_sep);
+    // Also redact the CANONICALIZED home (a symlinked `$HOME`, or macOS's
+    // `/tmp` -> `/private/tmp`): a path canonicalized before being
+    // formatted into an error carries the resolved form, not the literal
+    // `$HOME` value. The LONGER needle runs first so a canonical form that
+    // CONTAINS the literal one (e.g. `/private/tmp/h` vs `/tmp/h`) is not
+    // half-rewritten by the shorter pass before it can match.
+    match canonical_home_string() {
+        Some(canon) => {
+            let canon = canon.trim_end_matches(is_path_sep);
+            if canon.is_empty() || canon == literal {
+                redact_needle_anywhere(s, literal)
+            } else if canon.len() >= literal.len() {
+                redact_needle_anywhere(&redact_needle_anywhere(s, canon), literal)
+            } else {
+                redact_needle_anywhere(&redact_needle_anywhere(s, literal), canon)
+            }
+        }
+        None => redact_needle_anywhere(s, literal),
+    }
+}
+
+/// Resolves the operator's home directory as a `String` — `$HOME`, falling
+/// back to `$USERPROFILE` on Windows only (mirrors [`redact_home_prefix`]'s
+/// resolution). Returns `None` when unset or not valid UTF-8; callers treat
+/// that as "nothing to redact", never as an error.
+// `pub(crate)`: item 7's `redact_reason` reorder fix needs the literal
+// needle directly (not only via `redact_home_anywhere`'s already-applied
+// pass) to decide whether it or `canonical_home_string()` should run
+// first.
+pub(crate) fn resolved_home_string() -> Option<String> {
     let home = std::env::var_os("HOME").or_else(|| {
         if cfg!(windows) {
             std::env::var_os("USERPROFILE")
         } else {
             None
         }
-    });
-    let Some(home) = home else {
-        return s.to_string();
-    };
-    let Some(home_str) = home.to_str() else {
-        return s.to_string();
-    };
-    let home_trimmed = home_str.trim_end_matches(is_path_sep);
-    if home_trimmed.is_empty() {
+    })?;
+    home.to_str().map(str::to_string)
+}
+
+/// Resolves the operator's home directory the same way
+/// [`resolved_home_string`] does, then canonicalizes it (resolves symlinks —
+/// e.g. macOS's `/tmp` -> `/private/tmp`, or a symlinked home directory).
+///
+/// `pub(crate)` — used by [`crate::audit::op_emit::redact_reason`] so an
+/// `io::Error`'s `Display` chain that embeds the OS-RESOLVED path (which
+/// does not literally match `$HOME`) is still caught. Returns `None` when
+/// unset, not valid UTF-8, or the canonicalize call itself fails (a
+/// nonexistent home directory, permission denied) — callers fall back to
+/// the literal-`$HOME` pass alone rather than erroring.
+pub(crate) fn canonical_home_string() -> Option<String> {
+    let home = resolved_home_string()?;
+    std::fs::canonicalize(&home)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+}
+
+/// The shared boundary-safe matching loop behind [`redact_home_anywhere`]:
+/// replaces every occurrence of `needle` found anywhere in `s` with `~`
+/// (exact match) or `~/` (followed by a path separator), leaving a
+/// needle that is merely a PREFIX of a longer path component (e.g. `needle`
+/// = `/Users/jack` against `/Users/jackson`) untouched, so a name collision
+/// never corrupts unrelated text.
+///
+/// Trims trailing path separators off `needle` before matching (so a
+/// caller passing e.g. `$HOME=/root/` still matches `/root/.nvm/node`
+/// correctly) and does NOTHING — returns `s` unchanged — when the trimmed
+/// needle is empty. This is what makes a degenerate needle (an unset home
+/// directory, or `HOME=/`, whose only separator IS the trailing one) safe:
+/// `"/".trim_end_matches(is_path_sep)` is `""`, and an empty needle would
+/// otherwise match at every byte offset, replacing every path separator in
+/// `s` with `~/` and destroying it — the return-unchanged guard is load-
+/// bearing, not defensive.
+///
+/// `pub(crate)` — the second call site is
+/// [`crate::audit::op_emit::redact_reason`]'s canonical-`$HOME` pass.
+pub(crate) fn redact_needle_anywhere(s: &str, needle: &str) -> String {
+    let needle_trimmed = needle.trim_end_matches(is_path_sep);
+    if needle_trimmed.is_empty() {
         return s.to_string();
     }
 
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(idx) = rest.find(home_trimmed) {
+    while let Some(idx) = rest.find(needle_trimmed) {
         let (before, after_match) = rest.split_at(idx);
-        let after = &after_match[home_trimmed.len()..];
+        let after = &after_match[needle_trimmed.len()..];
         out.push_str(before);
+        // Item 7 (S-LOW-2): the RIGHT-boundary check below (`after` is
+        // empty or starts with a separator) was the only boundary this
+        // function checked. A genuine absolute-path needle (every real
+        // needle here: `$HOME` or its canonicalized form) starts with its
+        // OWN leading separator, so requiring the PRECEDING byte to
+        // ALSO be a separator is too strict — it would reject the
+        // overwhelmingly common case of a path appearing after plain
+        // prose ("failed to write /Users/jack/x", preceded by a space).
+        // The genuine hazard is narrower: the preceding byte is an
+        // ALPHANUMERIC character, which would make the match a SUFFIX of
+        // a longer, unrelated identifier with no separator of its own
+        // between the two (e.g. `needle` = `Users/jack` recurring inside
+        // `DataUsers/jack` — right after `Data`, no separator, a real
+        // word-boundary violation). Whitespace, punctuation, another
+        // separator, or the start of the string are all safe left
+        // boundaries; only "looks like the same contiguous word/path
+        // component" is not. (`out`'s last char is checked, not just this
+        // iteration's `before`, so a boundary carried over from a prior
+        // non-matching iteration is still seen correctly.)
+        let left_ok = !matches!(out.chars().last(), Some(c) if c.is_alphanumeric());
+        if !left_ok {
+            // Same non-boundary handling as the right-boundary "keep and
+            // resume" branch below: not a real match, make forward
+            // progress without touching the text.
+            out.push_str(needle_trimmed);
+            rest = after;
+            continue;
+        }
         if after.is_empty() {
             out.push('~');
             rest = after;
@@ -169,7 +265,7 @@ pub fn redact_home_anywhere(s: &str) -> String {
             // Not a real boundary (e.g. the match is a prefix of a longer
             // component like `/Users/jackson`) — keep the literal text and
             // resume scanning right after it so we make forward progress.
-            out.push_str(home_trimmed);
+            out.push_str(needle_trimmed);
             rest = after;
         }
     }
@@ -194,6 +290,51 @@ pub fn redact_display<E: std::fmt::Display>(e: E) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S-LOW-4: `$HOME` set to a SYMLINK into a real tempdir (mirrors macOS's
+    /// `/tmp` -> `/private/tmp`, and any tempdir-backed `$HOME` in a test
+    /// harness). A path canonicalized before being formatted into an error
+    /// (`std::fs::canonicalize`) carries the RESOLVED target, not the
+    /// symlink `$HOME` value — `redact_home_anywhere` must catch that form
+    /// too, not just the literal `$HOME` string.
+    #[test]
+    #[cfg(unix)]
+    fn redact_home_anywhere_redacts_canonicalized_symlinked_home() {
+        let real_dir = tempfile::tempdir().expect("real tempdir");
+        let real_target = real_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize real dir");
+        let parent = real_target
+            .parent()
+            .expect("tempdir has a parent")
+            .to_path_buf();
+        let link_name = format!("redact-home-symlink-test-{}", std::process::id());
+        let link_path = parent.join(&link_name);
+        std::os::unix::fs::symlink(&real_target, &link_path).expect("create symlink");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_home(Some(link_path.to_str().unwrap()), || {
+                // The code under test canonicalizes $HOME/subdir before
+                // formatting it into an error, which resolves through the
+                // symlink to `real_target/subdir` — the exact shape a
+                // `std::fs::canonicalize` call on a path under a
+                // symlinked $HOME would produce.
+                let canonicalized_child = real_target.join("accounts/rotation.json");
+                let msg = format!(
+                    "invalid JSON in {}: unexpected EOF",
+                    canonicalized_child.display()
+                );
+                let redacted = redact_home_anywhere(&msg);
+                assert_eq!(
+                    redacted, "invalid JSON in ~/accounts/rotation.json: unexpected EOF",
+                    "canonicalized $HOME form must be redacted, not just the literal symlink path"
+                );
+            });
+        }));
+        let _ = std::fs::remove_file(&link_path);
+        result.expect("test body panicked");
+    }
 
     #[test]
     fn strips_osc52_escape_sequence() {
@@ -293,14 +434,26 @@ mod tests {
         // round-6 redteam discovery.
         let _g = crate::platform::test_env::lock();
         let prior = std::env::var_os("HOME");
+        // `resolved_home_string` falls back to USERPROFILE on Windows, so
+        // "no home" must clear that too or the fallback answers instead.
+        let prior_userprofile = std::env::var_os("USERPROFILE");
         match home {
             Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
+            None => {
+                std::env::remove_var("HOME");
+                if cfg!(windows) {
+                    std::env::remove_var("USERPROFILE");
+                }
+            }
         }
         let out = f();
         match prior {
             Some(p) => std::env::set_var("HOME", p),
             None => std::env::remove_var("HOME"),
+        }
+        match prior_userprofile {
+            Some(p) => std::env::set_var("USERPROFILE", p),
+            None => std::env::remove_var("USERPROFILE"),
         }
         out
     }
@@ -557,6 +710,102 @@ mod tests {
             let out = redact_display(msg);
             assert!(!out.contains("/Users/jack"), "path leaked: {out}");
             assert!(!out.contains("sk-ant-oat01"), "token leaked: {out}");
+        });
+    }
+
+    /// S-LOW-A / C-B5 (round 8b): `HOME=/` must be a no-op, never a
+    /// destructive replace-every-separator pass. `"/".trim_end_matches(
+    /// is_path_sep)` is `""`, and `redact_needle_anywhere`'s empty-needle
+    /// guard is what makes this safe — pinning it here at the
+    /// `redact_home_anywhere` public entry point, not just on the shared
+    /// helper directly.
+    #[test]
+    fn redact_home_anywhere_is_not_destructive_when_home_is_root() {
+        with_home(Some("/"), || {
+            let raw = "atomic replace at /var/tmp/a: rename /var/tmp/a.tmp -> /var/tmp/a failed";
+            assert_eq!(
+                redact_home_anywhere(raw),
+                raw,
+                "HOME=/ must not corrupt every path separator in the input"
+            );
+        });
+    }
+
+    /// S-LOW-A / C-B5 (round 8b): `canonical_home_string` resolves a
+    /// symlinked home directory to its real target, DIFFERENT from the
+    /// literal `$HOME` value — the case `redact_reason`'s canonical-home
+    /// pass exists to catch (`op_emit::redact_reason`'s test of the same
+    /// name covers the full scrub; this pins the resolver alone).
+    #[cfg(unix)]
+    #[test]
+    fn canonical_home_string_resolves_a_symlinked_home_and_differs_from_the_literal() {
+        use std::os::unix::fs::symlink;
+
+        let _g = crate::platform::test_env::lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real-home");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("home-link");
+        symlink(&real, &link).unwrap();
+        let expected = std::fs::canonicalize(&real).unwrap();
+
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", &link);
+        let canon = canonical_home_string();
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let canon = canon.expect("a real, existing home directory must canonicalize");
+        assert_eq!(canon, expected.to_str().unwrap());
+        assert_ne!(
+            canon,
+            link.to_str().unwrap(),
+            "canonical form must differ from the literal (symlinked) HOME"
+        );
+    }
+
+    // ── item 7 (S-LOW-2): a match needs a LEFT boundary too, not only the
+    //    right-boundary check this function already had ─────────────────
+    //
+    // RED — EXECUTED: with the `left_ok` check (and its `if !left_ok`
+    // early-continue) removed from `redact_needle_anywhere`, `cargo test
+    // -p csq-core --lib \
+    // cli_deps::sanitize::tests::redact_needle_anywhere_requires_a_left_boundary_too \
+    // -- --exact` failed on the first assertion:
+    // `left: "/System/Volumes/Data~/jack/file"
+    //  right: "/System/Volumes/DataUsers/jack/file"` — the needle
+    // `Users/jack` matched mid-component (right after `Data`, with no
+    // separator before it) and was redacted anyway, because only the
+    // RIGHT side of the match was ever checked. GREEN with `left_ok`
+    // restored.
+    #[test]
+    fn redact_needle_anywhere_requires_a_left_boundary_too() {
+        // `Users/jack` (no leading separator) matches inside
+        // `DataUsers/jack` at a position preceded by `a` (the end of
+        // `Data`) — a real, right-boundary-confirmed match (`/file`
+        // follows) with NO genuine left boundary. Must be left untouched.
+        assert_eq!(
+            redact_needle_anywhere("/System/Volumes/DataUsers/jack/file", "Users/jack"),
+            "/System/Volumes/DataUsers/jack/file",
+            "a match with no left boundary (mid-component) must not be redacted"
+        );
+        // The SAME needle at a genuine left boundary (preceded by `/`,
+        // i.e. the start of a real path component) IS redacted.
+        assert_eq!(
+            redact_needle_anywhere("/System/Volumes/Data/Users/jack/file", "Users/jack"),
+            "/System/Volumes/Data/~/file",
+            "the same needle at a genuine left boundary must still be redacted"
+        );
+    }
+
+    /// `canonical_home_string` must not panic or error when `HOME` is
+    /// unset — mirrors `redact_home_anywhere`'s unset-HOME contract.
+    #[test]
+    fn canonical_home_string_returns_none_when_home_is_unset() {
+        with_home(None, || {
+            assert_eq!(canonical_home_string(), None);
         });
     }
 }

@@ -31,6 +31,7 @@ use csq_core::credentials::{
     self, file as cred_file, CodexCredentialFile, CodexTokensFile, CredentialFile,
 };
 use csq_core::daemon::{self, server, server_windows, HttpPostFn, HttpPostFnCodex, TtlCache};
+use csq_core::http::NodeHttpResponse;
 use csq_core::providers::catalog::Surface;
 use csq_core::testing::identity_fixtures::fixture_uuid_for_slot;
 use csq_core::types::AccountNum;
@@ -161,7 +162,8 @@ async fn windows_named_pipe_surface_dispatch_refresher_cycle() {
         base_dir: Arc::new(base.to_path_buf()),
         oauth_store: None,
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
-        audit_health: csq_core::audit::AuditHealth::Verified,
+        audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
+        audit_records_unverified: 0,
         anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
@@ -232,7 +234,11 @@ async fn windows_named_pipe_surface_dispatch_refresher_cycle() {
     let body_arc = Arc::new(body);
     let http_post_codex: HttpPostFnCodex = Arc::new(move |_url: &str, _body: &str| {
         codex_c.fetch_add(1, Ordering::SeqCst);
-        Ok(((*body_arc).clone().into_bytes(), None))
+        Ok(NodeHttpResponse {
+            status: 200,
+            body: (*body_arc).clone().into_bytes(),
+            date: None,
+        })
     });
 
     // 5. Spawn the refresher with a 60s interval and 0 startup delay

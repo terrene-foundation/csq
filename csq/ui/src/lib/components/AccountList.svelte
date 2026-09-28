@@ -28,15 +28,26 @@
     has_credentials: boolean;
     /// True when `quota.json` holds a row for this slot whose surface
     /// matches the slot's own dispatch shape (HIGH-1, an internal ticket redteam).
-    /// `false` means no row has been polled yet — `five_hour_pct` /
-    /// `seven_day_pct` are `0.0` as a serialization default, NOT a
-    /// measured "0% used". Optional (backend always sends it; the `?`
-    /// only lets older test fixtures omit it and default to the
-    /// has-data rendering path).
+    /// `false` means no row has been polled at all yet — render the
+    /// "Checking usage…" pending state. Optional (backend always sends
+    /// it; the `?` only lets older test fixtures omit it and default to
+    /// the has-data rendering path).
+    ///
+    /// ROW-level, not per-window: `true` only means SOME window
+    /// matched, not that BOTH did (C2, journal `operator-surfaces`) — a
+    /// slot can have a `seven_day` window and no `five_hour` one and
+    /// still report `has_quota=true`. Use `five_hour_pct`/`seven_day_pct`
+    /// being `null` to detect the absence of that SPECIFIC window.
     has_quota?: boolean;
-    five_hour_pct: number;
+    /// `null` when this slot's quota row carries no 5-hour window at
+    /// all — distinct from a measured `0`. Render via `UsageBar`, which
+    /// shows `emptyLabel` instead of a bar for the `null` case; never
+    /// coerce to `0` before passing it down.
+    five_hour_pct: number | null;
     five_hour_resets_in: number | null;
-    seven_day_pct: number;
+    /// `null` when this slot's quota row carries no 7-day window at
+    /// all. Same caveat as `five_hour_pct` above, same fix.
+    seven_day_pct: number | null;
     seven_day_resets_in: number | null;
     updated_at: number;
     token_status: string;
@@ -364,7 +375,7 @@
   let resetRank = $derived.by((): Map<number, number> => {
     const ranked = new Map<number, number>();
     const candidates = accounts
-      .filter(a => a.seven_day_resets_in != null && a.seven_day_resets_in > 0 && a.seven_day_pct < 99.5)
+      .filter(a => a.seven_day_resets_in != null && a.seven_day_resets_in > 0 && a.seven_day_pct != null && a.seven_day_pct < 99.5)
       .sort((a, b) => a.seven_day_resets_in! - b.seven_day_resets_in!);
     if (candidates.length < 2) return ranked;
     let rank = 1;
@@ -952,8 +963,8 @@
                 uses for the 5h/7d gate (commands/mod.rs).
               -->
               <div class="usage-bars">
-                <UsageBar label="5h" pct={account.five_hour_pct} stale={isStale(account)} />
-                <UsageBar label="7d" pct={account.seven_day_pct} stale={isStale(account)} />
+                <UsageBar label="5h" pct={account.five_hour_pct} stale={isStale(account)} emptyLabel="idle" />
+                <UsageBar label="7d" pct={account.seven_day_pct} stale={isStale(account)} emptyLabel="—" />
               </div>
               {#if isStale(account)}
                 <!-- F1: the daemon may be stopped or this slot's poll
@@ -1017,20 +1028,30 @@
               HIGH-1 (an internal ticket redteam): `has_quota === false` means no
               quota.json row has been matched for this slot yet — the
               daemon hasn't polled it (fresh slot, or a poll cycle away).
-              `five_hour_pct`/`seven_day_pct` are `0.0` only because that
-              is the wire-format default, NOT a measured "0% used" — a
-              bare 0%-width bar here would be indistinguishable from
-              "quota exhausted" or "genuinely unused". Render an honest
-              pending state instead, matching the `balance-pending`
-              precedent above (redteam an internal ticket F4).
+              Render an honest pending state instead, matching the
+              `balance-pending` precedent above (redteam an internal ticket F4).
+
+              This is the WHOLE-ROW pending state, distinct from C2
+              below: a row CAN exist (`has_quota === true`) while still
+              carrying no window for one of the two labels — that case
+              is handled per-bar by `UsageBar`'s `pct === null` branch,
+              not here.
             -->
             <div class="usage-bars-pending" data-testid="usage-bars-pending">
               <span class="quota-pending-label">Checking usage…</span>
             </div>
           {:else}
+            <!--
+              C2 (journal `operator-surfaces`): `has_quota === true` here
+              means the ROW matched, not that BOTH windows are present.
+              `five_hour_pct` / `seven_day_pct` are `number | null` — a
+              `null` reaches `UsageBar` as-is and renders `emptyLabel`
+              ("idle" / "—", matching `csq status`'s vocabulary) instead
+              of a fabricated 0%-width bar.
+            -->
             <div class="usage-bars">
-              <UsageBar label="5h" pct={account.five_hour_pct} stale={isStale(account)} />
-              <UsageBar label="7d" pct={account.seven_day_pct} stale={isStale(account)} />
+              <UsageBar label="5h" pct={account.five_hour_pct} stale={isStale(account)} emptyLabel="idle" />
+              <UsageBar label="7d" pct={account.seven_day_pct} stale={isStale(account)} emptyLabel="—" />
             </div>
             {#if isStale(account)}
               <!-- F1 (CRITICAL): the #1 correctness defect this shard

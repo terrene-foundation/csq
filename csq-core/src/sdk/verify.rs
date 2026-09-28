@@ -1,5 +1,5 @@
 //! `csq.verify.v1` builder — maps the internal chain-verify result onto the public
-//! `csq-sdk` [`VerifyPayload`](super::VerifyPayload) DTO, supplying `EDITION`.
+//! `csq-sdk` [`VerifyPayload`] DTO, supplying `EDITION`.
 //!
 //! This op wraps the existing chain-integrity verdict ([`crate::audit::VerifyJsonOutput`],
 //! spec 12 §12.13.5) in the shared SDK envelope so a consumer discovers it via
@@ -71,6 +71,7 @@ fn payload_from_json_output(
 ) -> VerifyPayload {
     let mut payload = VerifyPayload::new(o.status, o.verified_count, o.skipped_v1_count, edition)
         .with_unknown_kind_count(o.unknown_kind_count)
+        .with_skipped_truncated_count(o.skipped_truncated_count)
         .with_historical_key_gaps(
             o.historical_key_gaps
                 .into_iter()
@@ -160,6 +161,141 @@ mod tests {
         assert_eq!(v["status"], "partial_historical");
         assert_eq!(v["historical_key_gaps"][0]["count"], 3);
         assert!(v.get("failure_detail").is_none());
+    }
+
+    /// THE SECURITY GAP THIS CLOSES (2026-09-13, second instance).
+    ///
+    /// `to_json_output` never consulted `limit_exceeded_count`, so a scan that
+    /// examined only the chain's tail reported a bare `"ok"` — and, unlike
+    /// `GET /api/audit/health` (which at least carried `records_unverified`
+    /// alongside), this payload had NO field disclosing it at all.
+    /// `skipped_v1_count` counts v1-schema records, not truncated ones.
+    ///
+    /// Under truncation `verify_chain` skips exactly the two ANTI-truncation
+    /// checks — the genesis seq-0 requirement, and the first record's `prev_hash`
+    /// link (seeded FROM the record itself, then counted as verified) — so the
+    /// oldest surviving record is anchored to nothing and deletion of the oldest
+    /// records is undetectable. A CI job gating on `status == "ok"` passed.
+    #[test]
+    fn truncated_scan_is_not_reported_as_a_whole_chain_ok() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 10_000,
+            limit_exceeded_count: 1_660,
+            ..VerifySummary::default()
+        });
+        let env = build_verify_envelope(&result, true, None);
+        let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(
+            v["status"], "partial_truncated",
+            "a tail-only scan MUST NOT report the whole-chain status"
+        );
+        assert_eq!(
+            v["skipped_truncated_count"], 1_660,
+            "the payload must disclose how many oldest records went unexamined"
+        );
+        // Deliberately ok:true / exit 0, matching the `partial_historical`
+        // precedent: outgrowing the record limit is a coverage fact, not a tamper
+        // signal, and failing it would fire on every chain past the limit. A
+        // consumer needing whole-chain coverage tests `status`, never `ok`.
+        assert_eq!(v["ok"], true, "truncation is not a tamper signal");
+        assert!(v.get("failure_detail").is_none());
+    }
+
+    /// An untruncated clean scan stays plainly `"ok"` with the new field omitted —
+    /// the over-correction guard. Without this, a fix that always reported
+    /// truncation would also pass the test above.
+    #[test]
+    fn untruncated_clean_scan_is_still_plain_ok_with_the_field_omitted() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 7,
+            limit_exceeded_count: 0,
+            ..VerifySummary::default()
+        });
+        let line = build_verify_envelope(&result, true, None)
+            .to_line()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(
+            !line.contains("skipped_truncated_count"),
+            "a whole-chain scan must keep the pre-field wire shape: {line}"
+        );
+    }
+
+    /// PRECEDENCE PARITY. `to_json_output` (this surface) and
+    /// `AuditHealth::from_verify_result` (`csq doctor --json` +
+    /// `GET /api/audit/health`) are INDEPENDENT producers reading the same
+    /// `VerifySummary`. Nothing in the type system ties them together — which is
+    /// precisely how they came to disagree in the first place. This pins their
+    /// classification of the same summary to each other across all four cases.
+    #[test]
+    fn verify_status_and_audit_health_classify_the_same_summary_alike() {
+        use crate::audit::AuditHealth;
+
+        let gap = || KeyGap {
+            key_id: "ed25519:aa".to_string(),
+            first_seq: 1,
+            last_seq: 3,
+            count: 3,
+        };
+
+        // (summary, expected verify status, expected AuditHealth discriminant)
+        let cases: Vec<(VerifySummary, &str, &str)> = vec![
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    ..VerifySummary::default()
+                },
+                "ok",
+                "verified",
+            ),
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    limit_exceeded_count: 5,
+                    ..VerifySummary::default()
+                },
+                "partial_truncated",
+                "tail_verified",
+            ),
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    historical_key_gaps: vec![gap()],
+                    ..VerifySummary::default()
+                },
+                "partial_historical",
+                "degraded",
+            ),
+            // BOTH conditions: each producer must resolve the tie the SAME way —
+            // gaps outrank truncation, because a gap carries per-gap detail an
+            // operator acts on.
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    limit_exceeded_count: 5,
+                    historical_key_gaps: vec![gap()],
+                    ..VerifySummary::default()
+                },
+                "partial_historical",
+                "degraded",
+            ),
+        ];
+
+        for (summary, want_status, want_health) in cases {
+            let result: Result<VerifySummary, LedgerError> = Ok(summary);
+            let out = crate::audit::to_json_output(&result);
+            let health = AuditHealth::from_verify_result(&result);
+            let health_tag = serde_json::to_value(&health).unwrap()["status"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                out.status, want_status,
+                "verify --json status for {result:?}"
+            );
+            assert_eq!(health_tag, want_health, "AuditHealth for {result:?}");
+        }
     }
 
     #[test]

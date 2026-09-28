@@ -3,7 +3,8 @@
 use super::mutex::AccountMutexTable;
 use super::CredentialFile;
 use crate::accounts::identity_store::{
-    credentials_codex_path_for, credentials_path_for, settings_path_for, IdentityId,
+    credentials_codex_path_for, credentials_path_for, is_identity_removed, settings_path_for,
+    IdentityId,
 };
 use crate::accounts::profiles;
 use crate::error::CredentialError;
@@ -69,17 +70,12 @@ pub fn save(path: &Path, creds: &CredentialFile) -> Result<(), CredentialError> 
     // cleanup, an early `?` leaves an OAuth-token-bearing file at
     // umask-default (typically 0o644) until the next GC. Same B2 class
     // closed elsewhere in an internal journal entry
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CredentialError::Io {
-            path: tmp,
-            source: e,
-        });
-    }
-
-    // Set permissions on the temp file BEFORE rename so the credential
-    // file is never world-readable at its final path.
-    if let Err(e) = secure_file(&tmp) {
+    //
+    // `write_new_private` creates the tmp file at 0o600 AT CREATION
+    // (`create_new` + `mode(0o600)`), so the separate `secure_file` step
+    // this pipeline used to need is now redundant — there is no window
+    // where the tmp file exists at umask-default mode.
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(CredentialError::Io {
             path: tmp,
@@ -122,12 +118,12 @@ fn resolve_uuid_for_account(base_dir: &Path, account: AccountNum) -> Option<Iden
 /// writes `subscription_type: None` silently destroys the user's Max tier, and CC
 /// falls back to Sonnet with no error message (FM-1.1).
 ///
-/// This is a shared helper used at both:
-/// 1. The UUID-keyed write in `save_canonical_for` (M2-2 new site).
-/// 2. The daemon refresher (existing guard in `broker/sync.rs` + `broker/fanout.rs`).
+/// The UUID persistence helpers below call this guard. The daemon refresh path
+/// in `refresh/check.rs` and backsync in `refresh/sync.rs` both persist through
+/// `save_canonical_for`; backsync also preserves metadata from its locked read.
+/// The former `broker::fanout` reader is retired, not a current caller.
 ///
-/// By centralising the guard here, both write sites use identical logic — no
-/// "duplicated surface" failure mode where one site drifts.
+/// Centralising the final write-side guard keeps UUID persistence consistent.
 ///
 /// # Arguments
 /// - `incoming`: the freshly-exchanged credential (may carry `None` for sub-fields)
@@ -262,6 +258,20 @@ fn save_uuid_credentials(
 ) -> Result<(), CredentialError> {
     let uuid_path = credentials_path_for(base_dir, uuid);
 
+    // `keychain-fix-r11.md` D-5: refuse to write into an identity `csq
+    // logout` has removed. `logout_account` does not share a lock with this
+    // function (the refresher, backsync, and the custodian's adopt path all
+    // call it concurrently with no coordination), so without this check a
+    // write racing a logout would silently RECREATE the just-removed
+    // identity dir below and resurrect the credential the operator logged
+    // out. Checked BEFORE any I/O; a legitimate fresh login for this SAME
+    // uuid clears the marker first (`daemon::identity_mint::mint_for_login`).
+    if is_identity_removed(base_dir, uuid) {
+        return Err(CredentialError::IdentityRemoved {
+            uuid: uuid.to_string(),
+        });
+    }
+
     // Subscription-metadata preservation guard (FM-1.1).
     let creds_to_write = preserve_subscription_metadata(creds, &uuid_path);
 
@@ -295,14 +305,35 @@ fn save_uuid_credentials(
 
     let tmp = crate::platform::fs::unique_tmp_path(&uuid_path);
 
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // so the paired `secure_file` closure below is now a redundant (but
+    // harmless) re-chmod — kept as-is so the three-closure injectable
+    // failure-branch test structure (`redteam-discipline.md` Rule 5) stays
+    // unchanged for the `secure` and `replace` branches.
     write_uuid_credentials_inner(
         &tmp,
         &uuid_path,
         json.as_bytes(),
-        |p, b| std::fs::write(p, b),
+        |p, b| {
+            crate::platform::fs::write_new_private(p, b)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
         |p| secure_file(p).map_err(|e| std::io::Error::other(e.to_string())),
         |t, f| atomic_replace(t, f).map_err(|e| std::io::Error::other(e.to_string())),
-    )
+    )?;
+
+    // `keychain-fix-r8.md` C-F1 (PRIMARY DIRECTIVE): every canonical-store
+    // writer records the token it just wrote into this identity's bounded
+    // history — `save_uuid_credentials` is THE chokepoint for the refresher
+    // (`refresh::check`), backsync (`refresh::sync`), custodian adopt
+    // (`save_canonical_for_if_fresher`), and login/store
+    // (`accounts::login`), so recording here covers all of them without
+    // touching each call site individually. Best-effort and non-fatal
+    // (`token_history::append_history`'s own doc) — a history-write failure
+    // must never fail the credential write it is merely recording.
+    super::token_history::record_write(base_dir, uuid, &creds_to_write);
+
+    Ok(())
 }
 
 // ── End M2-2 helpers ──────────────────────────────────────────────────────────
@@ -370,12 +401,12 @@ where
 
 /// Writes Codex credentials to the UUID-keyed path
 /// `identities/<UUID>/credentials-codex.json` (parallel to
-/// [`save_uuid_credentials`] for the Anthropic surface).
+/// `save_uuid_credentials` for the Anthropic surface).
 ///
 /// Called BEFORE the legacy `credentials/codex-<N>.json` write in
 /// [`save_canonical_for`], per SEC-2.7 write order: identity FIRST.
 ///
-/// Applies [`preserve_subscription_metadata`] against the existing UUID-path
+/// Applies `preserve_subscription_metadata` against the existing UUID-path
 /// file before writing — a no-op on Codex variants (Codex has no
 /// `subscription_type` / `rate_limit_tier`), but the call site retains
 /// structural parity with the Anthropic chokepoint and tolerates any future
@@ -389,7 +420,7 @@ where
 ///
 /// §5a: the tmp file carries the Codex tokens payload (`access_token`,
 /// `refresh_token`, `id_token` — JWT-bearing). Every failure branch in
-/// [`save_codex_canonical_for_uuid_inner`] calls `remove_file(&tmp)` before
+/// `save_codex_canonical_for_uuid_inner` calls `remove_file(&tmp)` before
 /// propagating.
 pub fn save_codex_canonical_for_uuid(
     base_dir: &Path,
@@ -435,11 +466,18 @@ pub fn save_codex_canonical_for_uuid(
 
     let tmp = crate::platform::fs::unique_tmp_path(&uuid_path);
 
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
+    // `secure_file` below is now a redundant (but harmless) re-chmod, kept
+    // so the three-closure injectable failure-branch test structure stays
+    // unchanged for the `secure` and `replace` branches.
     save_codex_canonical_for_uuid_inner(
         &tmp,
         &uuid_path,
         json.as_bytes(),
-        |p, b| std::fs::write(p, b),
+        |p, b| {
+            crate::platform::fs::write_new_private(p, b)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
         |p| secure_file(p).map_err(|e| std::io::Error::other(e.to_string())),
         |t, f| atomic_replace(t, f).map_err(|e| std::io::Error::other(e.to_string())),
     )
@@ -539,7 +577,7 @@ where
 /// # Security
 ///
 /// §5a: the tmp file may carry `ANTHROPIC_AUTH_TOKEN` from the slot's 3P env
-/// block. Every failure branch in [`save_uuid_settings_inner`] calls
+/// block. Every failure branch in `save_uuid_settings_inner` calls
 /// `remove_file(&tmp)` before propagating.
 pub fn save_uuid_settings(
     base_dir: &Path,
@@ -569,11 +607,18 @@ pub fn save_uuid_settings(
 
     let tmp = crate::platform::fs::unique_tmp_path(&uuid_path);
 
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
+    // `secure_file` below is now a redundant (but harmless) re-chmod, kept
+    // so the three-closure injectable failure-branch test structure stays
+    // unchanged for the `secure` and `replace` branches.
     save_uuid_settings_inner(
         &tmp,
         &uuid_path,
         bytes,
-        |p, b| std::fs::write(p, b),
+        |p, b| {
+            crate::platform::fs::write_new_private(p, b)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
         |p| secure_file(p).map_err(|e| std::io::Error::other(e.to_string())),
         |t, f| atomic_replace(t, f).map_err(|e| std::io::Error::other(e.to_string())),
     )
@@ -603,26 +648,42 @@ pub fn write_uuid_settings(
 ///    process-global [`AccountMutexTable`]. Serialises concurrent
 ///    writers within one process; cross-process serialisation is the
 ///    flock'd `refresh-lock` path in [`crate::refresh::check`].
-/// 3. Writes the canonical file atomically (atomic_replace + 0o600
-///    via [`secure_file`], identical to [`save`]).
-/// 4. For [`Surface::Codex`] only, flips the canonical file to 0o400
-///    after the write — the canonical Codex credential file lives at
-///    0o400 outside narrow refresh windows per INV-P08. Anthropic
-///    canonicals stay at 0o600 (unchanged behaviour).
+/// 3. Delegates to the UUID-keyed writer for the resolved surface
+///    (`save_uuid_credentials` / [`save_codex_canonical_for_uuid`]).
+///    Each secures its tmp file to 0o600 via [`secure_file`] BEFORE
+///    `atomic_replace` renames it over the target, so 0o600 is the mode
+///    that lands on disk — `atomic_replace` overwrites the target's
+///    inode, so a prior file's mode is neither inherited nor an
+///    obstacle. The identity dir itself is restricted to 0o700
+///    (`secure_dir`).
 ///
-/// **M3-7 retirement:** the prior step 5 (live-mirror write into
-/// `config-<N>/.credentials.json`) is retired. Handle dirs read
-/// credentials through their `.credentials.json` symlink which (post
-/// M3-3/M3-4) resolves to `identities/<UUID>/credentials.json`. The
-/// `config-N` mirror is no longer a credential reader for any
-/// production code path. See the writer-surface retirement table in
+/// **M4-12: there is NO post-write 0o400 flip on this path.** The prior
+/// step 4 (flip the Codex canonical to 0o400 after the write, cited as
+/// the active INV-P08 guarantee) described the RETIRED numeric writer
+/// and is no longer performed here for ANY surface — the inline
+/// `M4-12` note in the body below records its removal, and two tests
+/// pin the current behaviour:
+/// `save_canonical_for_codex_uuid_path_at_0o600_with_uuid` and
+/// `save_canonical_for_claude_code_leaves_uuid_path_at_0o600`. Codex
+/// and Anthropic canonicals both land at 0o600.
+///
+/// **M3-7 retirement, stated precisely:** the prior step 5 (live-mirror
+/// write into `config-<N>/.credentials.json`) is retired — this function
+/// writes no `config-N` file. Handle dirs resolve their
+/// `.credentials.json` symlink to `identities/<UUID>/credentials.json`
+/// (post M3-3/M3-4), so `config-N` is not the credential source for a
+/// handle dir. It is NOT true, however, that `config-N` has no
+/// production reader at all: `accounts::login` still loads
+/// `cred_file::live_path(..)` to adopt credentials CC wrote there, and
+/// `accounts::logout::logout_account` derives `config-N/` from the same
+/// helper. Separately, the legacy NUMERIC canonical
+/// (`credentials/<N>.json`, built by [`canonical_path_for`]) remains a
+/// production READ fallback for pre-mapping installs — see
+/// `refresh::sync`, `refresh::check`, and `providers::native`. Both
+/// helpers' own docs already say "retained for READ paths"; only this
+/// summary overstated the retirement. See the writer-surface retirement
+/// table in
 /// `internal-design-docs`.
-///
-/// The 0o600-first-then-0o400 ordering matters on POSIX: `atomic_replace`
-/// overwrites the target's inode, so the newly-written tmp file's mode
-/// (set by [`secure_file`] before rename) is what lands on disk. A
-/// prior-file-at-0o400 state is therefore not a writability obstacle.
-/// The post-write flip to 0o400 is the active INV-P08 guarantee.
 pub fn save_canonical_for(
     base_dir: &Path,
     account: AccountNum,
@@ -1897,6 +1958,130 @@ mod tests {
         assert_eq!(
             mode, 0o700,
             "MED-1: identities/<UUID>/ must be 0o700 after write; got 0o{mode:03o}"
+        );
+    }
+
+    /// `keychain-fix-r11.md` D-5: `save_uuid_credentials` MUST refuse to
+    /// recreate an identity dir `csq logout` removed — simulated here by
+    /// writing the tombstone directly (`mark_identity_removed`), the exact
+    /// state `logout_account` leaves behind, without needing a real
+    /// concurrent race. A refresher tick / backsync / adopt racing a genuine
+    /// logout would otherwise silently resurrect the credential.
+    ///
+    /// RED: dropping the `is_identity_removed` check in
+    /// `save_uuid_credentials` makes this assertion fail — the write
+    /// succeeds and recreates the identity dir instead of refusing.
+    #[cfg(unix)]
+    #[test]
+    fn save_uuid_credentials_refuses_a_removed_identity() {
+        use crate::accounts::identity_store::{
+            credentials_path_for as uuid_creds_path, mark_identity_removed,
+        };
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        let uuid_path = uuid_creds_path(base, uuid);
+        let identity_dir = uuid_path.parent().unwrap().to_path_buf();
+
+        // Simulate exactly what `logout_account` leaves behind: the
+        // identity dir removed, the tombstone written.
+        std::fs::remove_dir_all(&identity_dir).unwrap();
+        mark_identity_removed(base, uuid);
+        assert!(!identity_dir.exists(), "test precondition");
+
+        let result = save_canonical_for(base, account, &sample_creds());
+
+        assert!(
+            matches!(result, Err(CredentialError::IdentityRemoved { .. })),
+            "a canonical write for a removed identity must be refused, got {result:?}"
+        );
+        assert!(
+            !identity_dir.exists(),
+            "the refusal must not recreate the identity dir — resurrecting a \
+             logged-out credential"
+        );
+    }
+
+    /// Sibling of the refusal test: a FRESH login for the SAME uuid clears
+    /// the tombstone (`clear_identity_removed_marker`), which is what
+    /// `daemon::identity_mint::mint_for_login` does under the profiles lock
+    /// — after clearing, the canonical write proceeds normally.
+    #[cfg(unix)]
+    #[test]
+    fn save_uuid_credentials_proceeds_after_tombstone_cleared() {
+        use crate::accounts::identity_store::{
+            clear_identity_removed_marker, credentials_path_for as uuid_creds_path,
+            mark_identity_removed,
+        };
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        let uuid_path = uuid_creds_path(base, uuid);
+        let identity_dir = uuid_path.parent().unwrap().to_path_buf();
+
+        std::fs::remove_dir_all(&identity_dir).unwrap();
+        mark_identity_removed(base, uuid);
+        clear_identity_removed_marker(base, uuid);
+
+        let result = save_canonical_for(base, account, &sample_creds());
+
+        assert!(
+            result.is_ok(),
+            "a cleared tombstone must unblock the canonical write, got {result:?}"
+        );
+        assert!(
+            identity_dir.exists(),
+            "the write must legitimately (re)create the identity dir once the \
+             tombstone is cleared — a fresh login is not a resurrection"
+        );
+    }
+
+    /// `keychain-fix-r8.md` C-F1 (PRIMARY DIRECTIVE) — writer-level proof that
+    /// `save_uuid_credentials` is a chokepoint for `token_history::record_write`:
+    /// every canonical-store write appends the written token's fingerprint to
+    /// `identities/<UUID>/token-history`. This is the assertion `decide_rule2_*`
+    /// in `keychain.rs` depends on being true in production — those tests
+    /// exercise the pure decision function directly against a hand-built
+    /// history, so only THIS test proves the history is actually populated by
+    /// the real write path rather than merely by test fixtures.
+    #[test]
+    fn save_canonical_for_appends_token_history() {
+        use crate::accounts::identity_store::token_history_path_for;
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        // Arrange
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        let account = AccountNum::try_from(2u16).unwrap();
+        let uuid = fixture_uuid_for_slot(2);
+        let history_path = token_history_path_for(base, uuid);
+        assert!(
+            !history_path.exists(),
+            "precondition: no token-history file before the write"
+        );
+
+        // Act
+        save_canonical_for(base, account, &sample_creds()).unwrap();
+
+        // Assert: the write appended a fingerprint of the token just written.
+        let history = crate::credentials::token_history::read_history_for_slot(base, account);
+        assert_eq!(
+            history.len(),
+            1,
+            "save_canonical_for must append exactly one history entry per write"
+        );
+        let expected_fp =
+            crate::credentials::token_history::fingerprint_from_credential_file(&sample_creds())
+                .expect("sample_creds is Anthropic and has a refresh token");
+        assert_eq!(
+            history[0], expected_fp,
+            "the appended fingerprint must match the token actually written"
         );
     }
 

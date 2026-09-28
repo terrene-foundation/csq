@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::accounts::identity_store::settings_path_for;
 use crate::accounts::profiles;
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
-use crate::session::merge::MODEL_KEYS;
+use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 use crate::types::AccountNum;
 use serde_json::Value;
 
@@ -90,27 +89,21 @@ pub fn write_slot_model_with_uuid_routing(
             )
         })?;
 
-    for key in MODEL_KEYS {
-        env.insert((*key).to_string(), Value::String(model_id.to_string()));
-    }
+    crate::session::merge::set_model_env(env, model_id);
 
     let json = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("serialize slot settings: {e}"))?;
 
     let tmp = unique_tmp_path(&settings_path);
-    // §5a: settings.json may carry ANTHROPIC_AUTH_TOKEN — clean up tmp on
-    // every error branch so a partial write doesn't leak the token at
-    // umask-default 0o644.
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    // §5a: settings.json may carry ANTHROPIC_AUTH_TOKEN. `write_new_private`
+    // creates the tmp file at 0o600 at creation, closing the window a
+    // separate std::fs::write + secure_file pair left open.
+    if let Err(e) = write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
             "write tmp {}: {e}",
             crate::cli_deps::sanitize::redact_path(&tmp)
         ));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("secure_file: {e}"));
     }
     if let Err(e) = atomic_replace(&tmp, &settings_path) {
         let _ = std::fs::remove_file(&tmp);
@@ -135,6 +128,7 @@ fn legacy_settings_path(base_dir: &Path, slot: AccountNum) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::merge::MODEL_KEYS;
     use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
     use tempfile::TempDir;
 

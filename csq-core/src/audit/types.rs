@@ -73,6 +73,25 @@ pub enum IdError {
     },
 }
 
+impl IdError {
+    /// Item 8 (S-LOW-3): a fixed-vocabulary `error_kind` tag for operator
+    /// surfaces, mirroring `AuditV2Error::fixed_tag` and
+    /// `CredentialError::error_kind_tag`. This type's `Display` is already
+    /// documented safe to surface (no offending-input echo), but callers
+    /// like `SwapAuditCorrelation::write_outcome_once` log a fixed
+    /// `error_kind` STRING per failure site already — this is the field-
+    /// level tag for the error VALUE itself, so a log line never needs a
+    /// raw `%e` Display interpolation to say which shape of `IdError` fired.
+    pub fn fixed_tag(&self) -> &'static str {
+        match self {
+            IdError::Empty { .. } => "id_empty",
+            IdError::Length { .. } => "id_length_out_of_range",
+            IdError::Charset { .. } => "id_disallowed_charset",
+            IdError::Shape { .. } => "id_shape_mismatch",
+        }
+    }
+}
+
 /// Errors from a [`crate::audit::traits::SigningKey`] operation.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1258,6 +1277,27 @@ pub struct OutputCapturePayload {
 }
 
 /// Payload for [`EventKind::AccountSwap`].
+///
+/// Carries only the two slots. Round 7 (D-F3/S-M-1) added an optional
+/// `nonce` field here to bind the codex supervisor's correlated OUTCOME
+/// write to the specific `SwapRequest` that authorized it. Round 8
+/// (C-B1/C-B2) RETRACTED that field: `#[serde(deny_unknown_fields)]` means a
+/// pre-round-7 binary's strict parse of an INTENT carrying the new field
+/// fails outright, and `verify_chain`/`scan_orphan_intents` treat an
+/// unparseable non-v1 line as chain CORRUPTION — marking the WHOLE chain
+/// broken and every later record unaudited, not merely this one record. The
+/// nonce also added no real protection: it travels in plaintext on a
+/// same-user-readable chain, so an attacker able to plant a forged INTENT
+/// can read the genuine nonce off an adjacent real one just as easily.
+///
+/// The request nonce itself (`SwapRequest::nonce`) still exists and still
+/// binds a `SwapVerdict` to its originating request
+/// (`codex_supervisor::take_swap_verdict`) — it is simply never embedded in
+/// this payload. What DOES still authorize a supervisor-side correlated
+/// OUTCOME write is described on `verify_swap_correlation`'s own doc: chain
+/// identity (the matched INTENT lives on the CURRENT genesis chain) and,
+/// once the chain has an established signing key, that INTENT's own
+/// signature — not a nonce carried on the payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AccountSwapPayload {
@@ -2419,6 +2459,48 @@ mod hex_array_64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── item 8 (S-LOW-3): `IdError::fixed_tag` must return a DISTINCT tag
+    //    per variant, mirroring `CredentialError::error_kind_tag`'s own
+    //    distinctness test — this is the mapping
+    //    `SwapAuditCorrelation::write_outcome_once`'s correlation_id arm
+    //    now logs instead of a raw `%e` Display interpolation ────────────
+    //
+    // RED — EXECUTED: with the `Shape` arm changed to return the SAME tag
+    // as `Charset` ("id_disallowed_charset"), `cargo test -p csq-core --lib
+    // audit::types::tests::id_error_fixed_tag_distinct_per_variant --
+    // --exact` failed: `assertion failed: tags.len() == unique.len()`
+    // — 4 tags collapsed to 3 uniques. GREEN with the distinct tags
+    // restored.
+    #[test]
+    fn id_error_fixed_tag_distinct_per_variant() {
+        let tags = [
+            IdError::Empty { field: "x" }.fixed_tag(),
+            IdError::Length {
+                field: "x",
+                got: 1,
+                min: 1,
+                max: 2,
+            }
+            .fixed_tag(),
+            IdError::Charset {
+                field: "x",
+                what: "CRLF",
+            }
+            .fixed_tag(),
+            IdError::Shape {
+                field: "x",
+                shape: "uuid",
+            }
+            .fixed_tag(),
+        ];
+        let unique: std::collections::HashSet<_> = tags.iter().collect();
+        assert_eq!(
+            tags.len(),
+            unique.len(),
+            "every IdError variant must map to a DISTINCT fixed tag, got {tags:?}"
+        );
+    }
 
     /// M3 §10.5 W3 (H3): `EatpAuthority::new_typed` admits ONLY the three opaque
     /// identifiers and emits them as a 3-key string object — no field can carry a

@@ -261,14 +261,17 @@ fn patch_settings_json(claude_home: &Path) -> Result<()> {
         }),
     );
 
-    // Atomic write via temp file + rename. §5a cleanup: settings.json
-    // may carry user hooks / API keys depending on the user's prior
-    // customizations; partial failure must not leave a tmp at umask 0o644.
+    // Atomic write via temp file + rename. §5a: settings.json may carry
+    // user hooks / API keys depending on the user's prior customizations.
+    // This site had NO secure_file step at all, so the tmp (and, via
+    // atomic_replace, the final file) was left PERMANENTLY at umask-default
+    // mode, not merely transiently. `write_new_private` creates the tmp
+    // file at 0o600 at creation, closing that outright.
     let json = serde_json::to_string_pretty(&value)?;
     let tmp = csq_core::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = csq_core::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("writing temp file {}", tmp.display()));
+        return Err(anyhow!(e)).with_context(|| format!("writing temp file {}", tmp.display()));
     }
     if let Err(e) = csq_core::platform::fs::atomic_replace(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -454,12 +457,14 @@ fn strip_legacy_statusline_from_file(settings_path: &Path) -> Result<bool> {
 
     obj.remove("statusLine");
 
-    // §5a cleanup: settings.json may carry user hooks / API keys.
+    // §5a: settings.json may carry user hooks / API keys. This site had NO
+    // secure_file step at all (permanently umask-default, not merely a
+    // transient window) — `write_new_private` closes it outright.
     let json = serde_json::to_string_pretty(&value)?;
     let tmp = csq_core::platform::fs::unique_tmp_path(settings_path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = csq_core::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("writing temp file {}", tmp.display()));
+        return Err(anyhow!(e)).with_context(|| format!("writing temp file {}", tmp.display()));
     }
     if let Err(e) = csq_core::platform::fs::atomic_replace(&tmp, settings_path) {
         let _ = std::fs::remove_file(&tmp);

@@ -236,6 +236,20 @@ async fn http_post_pipe_impl(
     parse_response(&buf)
 }
 
+/// `POST /api/harvest-account` (round 7c D3) — Windows twin of
+/// `client::harvest_account`. This module has no wired named-pipe request
+/// path yet (every `pub fn` above is a private response-parsing helper; no
+/// production caller opens a pipe here today), so this deliberately always
+/// reports [`super::HarvestAccountOutcome::Unavailable`] rather than half
+/// wiring a pipe round-trip for one route. `csq swap`/`auto_rotate`'s D4/D5
+/// callers already treat `Unavailable` as a real, handled outcome (fail
+/// closed when the item holds an unmatched valid token; proceed otherwise),
+/// so this is a correct answer, not a stub masquerading as one — it is the
+/// true state of this platform's client until a real pipe transport lands.
+pub fn harvest_account(_sock_path: &Path, _account: u16) -> super::HarvestAccountOutcome {
+    super::HarvestAccountOutcome::Unavailable
+}
+
 /// Validates `path_and_query` for HTTP request-line safety.
 ///
 /// Rejects CRLF characters (`\r`, `\n`) to prevent HTTP header

@@ -2,7 +2,7 @@
 //! record of which Anthropic account a Claude Code session authenticated as.
 //!
 //! Claude Code writes `oauthAccount.emailAddress` into each session's
-//! `CLAUDE_CONFIG_DIR/.claude.json` on `/login`. It is the ONLY local record of
+//! `<CLAUDE_CONFIG_DIR>/.claude.json` on `/login`. It is the ONLY local record of
 //! which account a session is actually on (the keychain token itself is
 //! account-anonymous). Two consumers depend on it:
 //!
@@ -63,7 +63,7 @@ pub enum OauthAccountState {
     ///   or its `emailAddress` missing / empty;
     /// - a non-object JSON value (array / scalar) with real content;
     /// - an UNPARSEABLE non-empty file;
-    /// - a file past [`MAX_CLAUDE_JSON_BYTES`] the gate refuses to read.
+    /// - a file past `MAX_CLAUDE_JSON_BYTES` the gate refuses to read.
     ///
     /// On an authenticated (credential-bound) session ALL of these make the gate
     /// refuse every adoption for the account — the credential refresh war returns
@@ -136,7 +136,7 @@ pub fn read_oauth_email(handle_dir: &Path) -> Option<String> {
 /// need to parse + modify + rewrite it (e.g. the swap-time `oauthAccount` reconcile,
 /// an internal ticket). `None` on absent / oversized / unreadable — callers skip (never
 /// clobber a file they cannot safely round-trip). Single-sources the
-/// [`MAX_CLAUDE_JSON_BYTES`] bound so a modify-in-place caller never buffers an
+/// `MAX_CLAUDE_JSON_BYTES` bound so a modify-in-place caller never buffers an
 /// unbounded file.
 pub fn read_raw(handle_dir: &Path) -> Option<String> {
     read_bounded_claude_json(&handle_dir.join(".claude.json"))

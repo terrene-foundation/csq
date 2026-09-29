@@ -203,6 +203,51 @@ describe("AccountList", () => {
     expect(pending?.textContent).toContain("Checking usage");
   });
 
+  // C2 (journal `operator-surfaces`): a ROW can match (`has_quota=true`)
+  // while carrying a window for only ONE of the two labels — e.g. a
+  // weekly-only plan with a `seven_day` window and no `five_hour` one.
+  // Before this fix, `AccountView.five_hour_pct` was sourced from the
+  // lossy `five_hour_pct()` Rust accessor, so the absent window and a
+  // real 0% reading were both `0` on the wire and rendered identically.
+  // This pins the fix: the absent window renders "idle" (the SAME
+  // vocabulary `csq status` uses via `AccountStatus::quota_block`'s
+  // `empty_label` parameter), and the present window still renders its
+  // real percentage — the two must NOT look the same.
+  it("C2: a row with only a 7-day window renders the absent 5-hour window as idle, not 0%", async () => {
+    const weeklyOnlyAccount = {
+      ...ACCOUNT_1,
+      id: 22,
+      label: "WeeklyOnly",
+      has_quota: true,
+      five_hour_pct: null,
+      five_hour_resets_in: null,
+      seven_day_pct: 12.0,
+      seven_day_resets_in: 86400,
+      // Fresh, not stale — ACCOUNT_1's fixed 2023 `updated_at` would make
+      // BOTH bars carry `data-testid="usage-bar-stale"` (stale wins over
+      // empty in UsageBar's testid), masking the exact "empty" testid
+      // this test asserts on. Staleness is a separate concern (see the
+      // `isStale`/F1 tests elsewhere) — isolate it here.
+      updated_at: Math.floor(Date.now() / 1000),
+    };
+    setupMocks({ get_accounts: [weeklyOnlyAccount] });
+    const { container } = render(AccountList);
+    await settle();
+    // Not the whole-row pending state — a row DID match.
+    expect(
+      container.querySelector('[data-testid="usage-bars-pending"]'),
+    ).toBeNull();
+    const bars = container.querySelector(".usage-bars") as HTMLElement;
+    expect(bars).not.toBeNull();
+    expect(
+      bars.querySelector('[data-testid="usage-bar-empty"]'),
+    ).not.toBeNull();
+    expect(bars.textContent).toContain("idle");
+    expect(bars.textContent).toContain("12%");
+    // The absent 5h window must never be fabricated as a real "0%" reading.
+    expect(bars.textContent).not.toContain("0%");
+  });
+
   it("has_quota===true (or absent, for backward-compatible fixtures) still renders the ordinary bars", async () => {
     const { container } = render(AccountList);
     await settle();

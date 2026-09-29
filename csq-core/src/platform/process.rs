@@ -12,7 +12,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
 }
 
 /// Walks the parent process tree from the current process up to
-/// [`MAX_PARENT_DEPTH`] levels, looking for a Claude Code process.
+/// `MAX_PARENT_DEPTH` levels, looking for a Claude Code process.
 ///
 /// Returns the PID of the first ancestor whose command matches
 /// [`is_cc_command`], or `None` if no CC process is found.
@@ -235,15 +235,16 @@ pub fn spawn_csq_named_test_process(
 pub fn is_cc_command(cmd: &str) -> bool {
     let cmd_lower = cmd.to_lowercase();
 
-    // Direct binary match
-    if cmd_lower == "claude" {
+    if cc_program_matches(&cmd_lower) {
         return true;
     }
-
-    // Path ending in /claude or \claude (with optional .exe)
-    let stripped = cmd_lower.trim_end_matches(".exe");
-    if stripped.ends_with("/claude") || stripped.ends_with("\\claude") {
-        return true;
+    // Linux reports the full argv (`/proc/<pid>/cmdline`, NUL-joined into
+    // spaces), so `claude --resume <id>` must match on its FIRST token —
+    // the same treatment `is_csq_command` already gives csq's own name.
+    if let Some((first, _)) = cmd_lower.trim().split_once(char::is_whitespace) {
+        if cc_program_matches(first) {
+            return true;
+        }
     }
 
     // Node running claude (npm global install form):
@@ -256,6 +257,13 @@ pub fn is_cc_command(cmd: &str) -> bool {
     }
 
     false
+}
+
+/// True when `program` (already lowercased) is the `claude` binary: the bare
+/// name, or a path ending in `/claude` / `\\claude`, with an optional `.exe`.
+fn cc_program_matches(program: &str) -> bool {
+    let stripped = program.trim_end_matches(".exe");
+    stripped == "claude" || stripped.ends_with("/claude") || stripped.ends_with("\\claude")
 }
 
 // ── Unix implementation ───────────────────────────────────────────────
@@ -518,6 +526,17 @@ mod tests {
     fn bogus_pid_is_dead() {
         // PID 99999999 is extremely unlikely to exist
         assert!(!is_pid_alive(99_999_999));
+    }
+
+    #[test]
+    fn is_cc_command_matches_linux_full_argv() {
+        // Linux `/proc/<pid>/cmdline` joined with spaces: argv0 plus args.
+        assert!(is_cc_command(
+            "claude --resume 01a0d8a0-e67b-7c3d-9e1f-000000000000"
+        ));
+        assert!(is_cc_command("/home/u/.local/bin/claude -p hello"));
+        assert!(!is_cc_command("claudette --resume x"));
+        assert!(!is_cc_command("vim claude"));
     }
 
     #[test]

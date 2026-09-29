@@ -2,7 +2,7 @@
 //!
 //! The `start` side of the lifecycle (acquire PID, install signal
 //! handlers, block until shutdown) is owned by the CLI command
-//! handler in `csq-cli/src/commands/daemon.rs` because it requires a
+//! handler in `csq/src/cli/commands/daemon.rs` because it requires a
 //! tokio runtime and is tied to process lifetime. This module exposes
 //! the testable, pure primitives: status inspection and remote stop.
 

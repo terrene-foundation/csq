@@ -4,9 +4,9 @@
 //! This crate is the **public wire contract** (Apache-2.0, crates.io) that external
 //! integrators parse. It holds the base envelope, the closed error/finish vocabularies,
 //! the reusable completion body, the provider output adapters, the schema constants,
-//! and the op payload DTOs (`CapabilitiesPayload`, `VerifyPayload` + its sub-DTOs). It
-//! depends only on `csq-redact` (the redaction leaf) and serde — **zero** dependency on
-//! csq-core, the daemon, credentials, or the moat.
+//! and the op payload DTOs (`CapabilitiesPayload`, `ModelsPayload`, `VerifyPayload`
+//! and its sub-DTOs). It depends only on `csq-redact` (the redaction leaf) and serde —
+//! **zero** dependency on csq-core, the daemon, credentials, or the moat.
 //!
 //! The APP (`csq-core` / the `csq` binary) owns everything that is not wire-shape:
 //! the `EDITION` discriminant (passed IN to the payload DTOs, never a feature flag in
@@ -44,6 +44,7 @@ pub mod authoring_session;
 pub mod capabilities;
 pub mod envelope;
 pub mod error;
+pub mod models;
 pub mod verify;
 
 pub use adapter::parse_claude_json;
@@ -74,6 +75,7 @@ pub use capabilities::{
 };
 pub use envelope::{emit, Completion, Envelope, FinishReason, Usage};
 pub use error::{SdkError, SdkErrorCode};
+pub use models::{ModelEntry, ModelsPayload};
 pub use verify::{VerifyFailureDetail, VerifyKeyGap, VerifyPayload};
 
 // ── Contract-change policy for every SCHEMA_* constant below (an internal ticket Track B) ──
@@ -136,10 +138,12 @@ pub const SCHEMA_LOGIN_V1: &str = "csq.login.v1";
 /// Names the wire contract for [`authoring_session::AuthoringSessionRequest`] /
 /// [`authoring_session::AuthoringSessionResponse`], whose payloads carry the five
 /// identity/routing invariants validated by
-/// [`authoring_session::SessionContext`]. This major is NOT yet an executable op — it
-/// is deliberately absent from the build's advertised capability list until an
-/// operation grounded on it exists, so a consumer is never told a capability this
-/// build cannot execute (an internal ticket's advertise-only-when-executable criterion).
+/// [`authoring_session::SessionContext`]. This major is an IN-PROCESS capability, not a
+/// `csq <verb> --json` op: `csq-core`'s `sdk::capabilities::authoring_capabilities`
+/// advertises it under `sdk`, while `authoring_capabilities_are_not_advertised_as_cli_ops`
+/// pins it OUT of `ops[]`. It is advertised only because this build runs it end to end —
+/// `every_advertised_capability_has_an_executed_path_in_this_build` executes every
+/// advertised id and REDs on one it cannot (the advertise-only-when-executable criterion).
 pub const SCHEMA_AUTHORING_SESSION_V1: &str = "csq.authoring_session.v1";
 
 /// `csq.authoring_intent.v1` — one turn of a governed multi-turn intent session
@@ -147,11 +151,10 @@ pub const SCHEMA_AUTHORING_SESSION_V1: &str = "csq.authoring_session.v1";
 ///
 /// Names the wire contract for [`authoring_intent::IntentTurnRequest`] /
 /// [`authoring_intent::IntentTurnResponse`], which ride the
-/// [`SCHEMA_AUTHORING_SESSION_V1`] binding and add the turn itself. Like that
-/// major, this is NOT yet an executable op — it is deliberately absent from the
-/// build's advertised capability list until an operation grounded on it exists, so
-/// a consumer is never told a capability this build cannot execute (an internal ticket's
-/// advertise-only-when-executable criterion).
+/// [`SCHEMA_AUTHORING_SESSION_V1`] binding and add the turn itself. Like that major, it
+/// is an IN-PROCESS capability advertised under `sdk` and deliberately kept out of
+/// `ops[]`, and it is advertised only because this build runs it end to end — both
+/// halves are pinned by tests in `csq-core/src/sdk/capabilities.rs`.
 pub const SCHEMA_AUTHORING_INTENT_V1: &str = "csq.authoring_intent.v1";
 /// `csq.authoring_distill.v1` — distillation + form-factor inference over a bound
 /// authoring session (an internal ticket).
@@ -161,10 +164,10 @@ pub const SCHEMA_AUTHORING_INTENT_V1: &str = "csq.authoring_intent.v1";
 /// [`SCHEMA_AUTHORING_SESSION_V1`] binding: the request's five invariants are validated
 /// by [`authoring_session::SessionContext::admit`] and the response's by
 /// [`authoring_session::SessionContext::accept_response`], so this major adds a payload
-/// shape and adds no second copy of those checks. Like the envelope it rides, it is NOT
-/// yet an executable op and is deliberately absent from the build's advertised
-/// capability list until an operation grounded on it exists (an internal ticket's
-/// advertise-only-when-executable criterion).
+/// shape and adds no second copy of those checks. Like the envelope it rides, it is an
+/// IN-PROCESS capability advertised under `sdk` and deliberately kept out of `ops[]`,
+/// advertised only because this build runs it end to end — both halves are pinned by
+/// tests in `csq-core/src/sdk/capabilities.rs`.
 pub const SCHEMA_AUTHORING_DISTILL_V1: &str = "csq.authoring_distill.v1";
 
 /// The authoritative session-memory request/response family — [`MemoryReadRequest`],

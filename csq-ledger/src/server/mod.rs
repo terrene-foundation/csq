@@ -11,8 +11,7 @@
 //! independent listeners, sharing one [`AppState`]:
 //!
 //! - [`build_read_router`] — submit + all read routes. Bound per `--bind` /
-//!   `--port` (defaults to all interfaces, for reachability within the
-//!   operator's internal network).
+//!   `--port` (defaults to `127.0.0.1`, loopback-only).
 //! - [`build_authority_router`] — revoke + verifier-bootstrap redemption.
 //!   Bound per `--authority-bind` / `--authority-port`, defaulting to
 //!   `127.0.0.1` (loopback-only) so an operator who does nothing beyond the
@@ -30,11 +29,11 @@
 //! # Authn
 //!
 //! No per-request authentication (per the milestone scope). Access control is
-//! network topology, not an in-process check: the read listener is reachable
-//! from wherever the operator's internal network places it, and the authority
-//! listener additionally requires the operator to have opted the bind address
-//! out of loopback-only. The server is the storage + proof primitive, not an
-//! internet-facing access-control plane.
+//! network topology, not per-request identity: both listeners default to
+//! loopback, and startup refuses any non-loopback bind without the shared
+//! `--allow-public-bind` acknowledgement. After opting in, the operator MUST
+//! keep both listeners inside a trusted network. The server is the storage +
+//! proof primitive, not an internet-facing access-control plane.
 //!
 //! # No secrets in responses (rules/tauri-commands.md MUST-3, security.md)
 //!

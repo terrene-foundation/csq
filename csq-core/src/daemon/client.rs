@@ -46,6 +46,43 @@ use std::time::Duration;
 /// may do real work (e.g., PKCE generation on `/api/login/{N}`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// C-F5 (`keychain-fix-r8.md`), D-F7 (`keychain-fix-r9.md`): dedicated
+/// timeout for `POST /api/harvest-account`, wider than [`DEFAULT_TIMEOUT`]
+/// because the work this route runs via `spawn_blocking`
+/// (`custodian::reconcile_account`) chains real, individually-bounded I/O
+/// rather than the sub-millisecond work every other route does:
+///
+/// - up to an ASSUMED worst case of 4 keychain reads, each bounded by
+///   `credentials::keychain`'s private `KEYCHAIN_OP_TIMEOUT` +
+///   `MIN_POST_EXIT_GRACE` = 5.25s at this revision (see that module's own
+///   `run_bounded` doc — the grace is a real floor on the child-exit wait,
+///   not merely `KEYCHAIN_OP_TIMEOUT` alone) — one per live handle dir this
+///   account is bound to, freshest-first;
+/// - up to `custodian::MAX_VALIDATIONS_PER_RECONCILE`
+///   (2) of those candidates going on to a live validation call
+///   (`GET /api/oauth/profile` — NOT `/api/oauth/usage`; see
+///   `custodian::verify_token_owner`'s own doc for why this endpoint, not
+///   that one — over the node-subprocess transport bounded by
+///   `http::mod`'s `NODE_TIMEOUT_MS` = 15s at this revision) before
+///   `reconcile_account` either adopts one or gives up — the freshest
+///   candidate, then (on a 401) the next-freshest. Since D-F7, this cap
+///   is ENFORCED BY CODE (`reconcile_candidates_inner` stops and returns
+///   `SkippedUnknown` once reached), not merely assumed here.
+///
+/// `4*5.25 + 2*15 = 21 + 30 = 51s`, plus a margin of 10s for scheduling
+/// jitter and the server-side per-account gate's own bookkeeping
+/// (`server::harvest_gate`) = 61s. The keychain-read COUNT (4) is still a
+/// DOCUMENTED WORST-CASE ASSUMPTION, not a proven bound
+/// (`rules/doc-property-claims.md` MUST-1/2) — an account with more than 4
+/// simultaneously live terminals can still exceed it; the assumption is
+/// written here, by name, so a future change to that count updates this
+/// constant deliberately rather than by accident. The validation-call COUNT
+/// (2), unlike the read count, is no longer an assumption — see above. Do
+/// not mistake the 61s figure for a measured typical: the typical case is a
+/// fraction of a second (see `server::harvest_gate`'s own per-account
+/// minimum-interval note).
+pub const HARVEST_TIMEOUT: Duration = Duration::from_secs(61);
+
 /// Maximum response body we will buffer from the daemon. 64 KiB is
 /// orders of magnitude larger than any current route's JSON payload
 /// (even `/api/accounts` with all 999 slots populated is under 200
@@ -248,11 +285,75 @@ pub fn notify_slot_swap(sock_path: &Path, from: u16, to: u16) -> Result<(), Daem
     }
 }
 
+/// `POST /api/harvest-account` (round 7c D3) — asks the daemon to run the
+/// custodian's existing harvest→validate→adopt path for `account` NOW,
+/// synchronously, rather than waiting for its next refresh tick. Used by
+/// `csq swap`/`auto_rotate`'s D5/D4 "harvest before the per-dir lock" step:
+/// a keychain item matching no known account (`WriteDecision::RefuseUnharvested`)
+/// may be a login CC itself just self-refreshed, and this is the one channel
+/// that can adopt it before the caller re-decides under the lock.
+///
+/// Absent/unreachable socket, a malformed response, or any transport error
+/// all map to [`super::HarvestAccountOutcome::Unavailable`] — the caller's
+/// job is to decide what "the daemon could not confirm this" means for ITS
+/// operation (D5: refuse if the item holds an unmatched valid token; proceed
+/// otherwise), not this function's.
+pub fn harvest_account(sock_path: &Path, account: u16) -> super::HarvestAccountOutcome {
+    use super::HarvestAccountOutcome;
+    if !sock_path.exists() {
+        return HarvestAccountOutcome::Unavailable;
+    }
+    let body = format!(r#"{{"account":{account}}}"#);
+    match http_post_unix_impl_with_timeout(
+        sock_path,
+        "/api/harvest-account",
+        Some(&body),
+        &[],
+        HARVEST_TIMEOUT,
+    ) {
+        Ok(resp) if resp.status == 200 => {
+            if resp.body.contains("\"outcome\":\"adopted\"") {
+                HarvestAccountOutcome::Adopted
+            } else if resp.body.contains("\"outcome\":\"ownership_unknown\"") {
+                HarvestAccountOutcome::OwnershipUnknown
+            } else if resp.body.contains("\"outcome\":\"busy\"") {
+                HarvestAccountOutcome::Busy
+            } else {
+                // "nothing_to_harvest", or an unrecognized future outcome
+                // string — neither is a reason to refuse the caller's
+                // switch, so this is the safe default.
+                HarvestAccountOutcome::NothingToHarvest
+            }
+        }
+        Ok(_) | Err(_) => HarvestAccountOutcome::Unavailable,
+    }
+}
+
 fn http_post_unix_impl(
     sock_path: &Path,
     path_and_query: &str,
     json_body: Option<&str>,
     extra_headers: &[(&str, &str)],
+) -> Result<DaemonResponse, DaemonClientError> {
+    http_post_unix_impl_with_timeout(
+        sock_path,
+        path_and_query,
+        json_body,
+        extra_headers,
+        DEFAULT_TIMEOUT,
+    )
+}
+
+/// Same as [`http_post_unix_impl`] but with a caller-specified timeout —
+/// C-F5 (`keychain-fix-r8.md`): `/api/harvest-account` needs a wider budget
+/// than [`DEFAULT_TIMEOUT`] (see [`HARVEST_TIMEOUT`]'s doc for the
+/// derivation), and every OTHER route keeps using the 2s default unchanged.
+fn http_post_unix_impl_with_timeout(
+    sock_path: &Path,
+    path_and_query: &str,
+    json_body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    timeout: Duration,
 ) -> Result<DaemonResponse, DaemonClientError> {
     validate_path_and_query(path_and_query)?;
 
@@ -271,10 +372,10 @@ fn http_post_unix_impl(
 
     let mut stream = UnixStream::connect(sock_path).map_err(DaemonClientError::Connect)?;
     stream
-        .set_read_timeout(Some(DEFAULT_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(DaemonClientError::Io)?;
     stream
-        .set_write_timeout(Some(DEFAULT_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(DaemonClientError::Io)?;
 
     let request = match json_body {
@@ -400,6 +501,62 @@ pub(crate) fn parse_response(buf: &[u8]) -> Result<DaemonResponse, DaemonClientE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::test_socket_fixture::UnixSocketFixture;
+
+    /// C-F5 (`keychain-fix-r8.md`), D-F7 (`keychain-fix-r9.md`): the timeout
+    /// arithmetic named in `HARVEST_TIMEOUT`'s doc — `4*5.25 + 2*15 = 51s`
+    /// plus a 10s margin — pinned so a change to any input updates the
+    /// constant deliberately.
+    ///
+    /// The validation-call factor (`2`) is derived from the REAL enforcing
+    /// constant, [`crate::daemon::custodian::MAX_VALIDATIONS_PER_RECONCILE`]
+    /// — not restated as a bare literal — because D-F7 made that cap
+    /// code-enforced rather than merely assumed. The keychain-read factors
+    /// (`4` candidates, `5.25s` per read) remain restated literals: their
+    /// source constants (`KEYCHAIN_OP_TIMEOUT`, `MIN_POST_EXIT_GRACE` in
+    /// `credentials::keychain`) are private to a sibling module this PR does
+    /// not own, so this test cannot import them
+    /// (`doc-property-claims.md` MUST-1: a measured value is never a bound —
+    /// this asserts the STATED arithmetic for those two factors, not a
+    /// re-derivation; see the D-F7 cap test in `custodian.rs` for the piece
+    /// that IS behaviorally exercised rather than merely asserted as
+    /// arithmetic).
+    #[test]
+    fn harvest_timeout_matches_its_documented_derivation() {
+        let keychain_read_worst_case_secs = 5.25; // KEYCHAIN_OP_TIMEOUT + MIN_POST_EXIT_GRACE
+        let assumed_max_candidates = 4.0;
+        let validation_call_secs = 15.0; // NODE_TIMEOUT_MS
+        let max_validations = crate::daemon::custodian::MAX_VALIDATIONS_PER_RECONCILE as f64;
+        let margin_secs = 10.0;
+        let expected_secs = assumed_max_candidates * keychain_read_worst_case_secs
+            + max_validations * validation_call_secs
+            + margin_secs;
+        assert_eq!(
+            expected_secs, 61.0,
+            "sanity-check the arithmetic itself before comparing against the constant"
+        );
+        assert_eq!(
+            HARVEST_TIMEOUT,
+            Duration::from_secs(expected_secs as u64),
+            "HARVEST_TIMEOUT must equal its documented derivation \
+             (4*5.25 + 2*15 = 51s, + 10s margin = 61s)"
+        );
+        assert!(
+            HARVEST_TIMEOUT > DEFAULT_TIMEOUT,
+            "the harvest route's budget must exceed every other route's 2s default"
+        );
+    }
+
+    // round 7c D3
+    #[test]
+    fn harvest_account_unreachable_socket_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("does-not-exist.sock");
+        assert_eq!(
+            harvest_account(&sock, 1),
+            super::super::HarvestAccountOutcome::Unavailable
+        );
+    }
 
     #[test]
     fn parse_minimal_200_ok() {
@@ -499,8 +656,8 @@ mod tests {
     fn http_get_unix_round_trip() {
         use std::os::unix::net::UnixListener;
         use std::thread;
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let path = dir.socket_path();
         let listener = UnixListener::bind(&path).unwrap();
 
         let server = thread::spawn(move || {
@@ -535,8 +692,8 @@ mod tests {
     fn http_post_unix_round_trip() {
         use std::os::unix::net::UnixListener;
         use std::thread;
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let path = dir.socket_path();
         let listener = UnixListener::bind(&path).unwrap();
 
         let server = thread::spawn(move || {

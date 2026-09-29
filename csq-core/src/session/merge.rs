@@ -116,13 +116,35 @@ pub fn set_model(settings: &Value, model_id: &str) -> Value {
             .or_insert_with(|| Value::Object(Map::new()));
 
         if let Some(env) = env_obj.as_object_mut() {
-            for key in MODEL_KEYS {
-                env.insert(key.to_string(), Value::String(model_id.to_string()));
-            }
+            set_model_env(env, model_id);
         }
     }
 
     settings
+}
+
+/// Shared explicit-selection writer for global and UUID/legacy slot settings.
+/// Known DeepSeek Flash subagents also retain their 1M context, but independent
+/// custom/Pro choices and absent subagent keys are not overwritten or invented.
+pub(crate) fn set_model_env(env: &mut Map<String, Value>, model_id: &str) {
+    let endpoint = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str);
+    let model_id =
+        crate::providers::models::claude_code_model_selector(model_id, endpoint).to_string();
+    let subagent = env
+        .get("CLAUDE_CODE_SUBAGENT_MODEL")
+        .and_then(Value::as_str)
+        .map(|model| {
+            crate::providers::models::claude_code_model_selector(model, endpoint).to_string()
+        });
+    for key in MODEL_KEYS {
+        env.insert((*key).to_string(), Value::String(model_id.clone()));
+    }
+    if let Some(subagent) = subagent {
+        env.insert(
+            "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
+            Value::String(subagent),
+        );
+    }
 }
 
 #[cfg(test)]

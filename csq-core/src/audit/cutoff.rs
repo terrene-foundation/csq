@@ -90,7 +90,7 @@ pub struct AnchorRef {
 /// On-disk `CUTOFF.json` shape.
 ///
 /// Field order is significant: it is the declaration order the canonical
-/// pre-image ([`CanonicalCutoffView`]) and the embedded `verify` script both
+/// pre-image (`CanonicalCutoffView`) and the embedded `verify` script both
 /// reproduce. `signature` is excluded from the pre-image; `cutoff_hash` is
 /// forced to the 64-zero genesis sentinel while hashing.
 #[derive(Debug, Clone, Serialize)]

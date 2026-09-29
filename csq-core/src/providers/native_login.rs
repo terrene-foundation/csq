@@ -308,7 +308,7 @@ where
 /// search inside `Command::new`.
 ///
 /// Ends in the same verify-then-write-marker sequence as
-/// [`login_native_with`] ([`finish_native_login`]) so both entry points
+/// [`login_native_with`] (`finish_native_login`) so both entry points
 /// share one postcondition: a marker exists **iff** the vendor's
 /// credential file exists.
 pub fn login_native_cli(base_dir: &Path, slot: AccountNum, surface: Surface) -> Result<()> {

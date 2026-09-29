@@ -3,7 +3,7 @@
 //! # What this is — and what it is NOT
 //!
 //! This module is a *projection*, not an adoption. csq's own session-custody
-//! chain ([`crate::audit::types::SignedRecord`] + [`persist::canonical_bytes_for`])
+//! chain ([`crate::audit::types::SignedRecord`] + `persist::canonical_bytes_for`)
 //! is unchanged and remains the sovereign authority over csq's 14
 //! [`crate::audit::types::EventKind`] session-custody events (CsqRun,
 //! OAuthRefresh, KeyRotate, …). Those events are NOT EATP authorization-envelope

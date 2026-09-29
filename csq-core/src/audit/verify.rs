@@ -65,13 +65,20 @@
 //! - **Daemon startup** (M05 PRIMARY DIRECTIVE): before socket bind.
 //! - **`csq audit verify` CLI** (M05): operator-facing chain health check.
 //!
-//! # Sentinel decision (per M05 directive)
+//! # Sentinel (superseded M05 decision)
 //!
-//! M05 does NOT introduce a persistent sentinel file for chain-broken state.
-//! `verify_chain` runs at every daemon start and exits on failure — no
-//! on-disk flag is needed because every start re-verifies. The
-//! `sentinel-clearing-parity.md` rule is vacuously satisfied: no sentinel
-//! is introduced, so there are no setter/clearer pairs to wire.
+//! M05 originally decided NOT to introduce a persistent sentinel file for
+//! chain-broken state, on the grounds that `verify_chain` re-verifies at
+//! every daemon start regardless. A later milestone introduced one anyway
+//! (`.chain-broken`, `audit/health.rs`: `set_chain_broken_in` /
+//! `clear_chain_broken_in` / `is_chain_broken_in` /
+//! `reconcile_chain_sentinel`), per-chain via `runs_subdir` (so `csq-runs/`
+//! and `eatp-runs/` each carry their own sentinel), set/cleared from the same
+//! four verify→sentinel callsites this file's `verify_chain_in` doc names
+//! (daemon startup, `csq audit verify`, `csq doctor`, desktop daemon) — an
+//! operator-visible durable flag between re-verifies, not a replacement for
+//! them. The `sentinel-clearing-parity.md` rule therefore has real
+//! setter/clearer pairs to keep in sync; it is no longer vacuously satisfied.
 
 use crate::audit::authority::registry::{resolve_registry, AuthorityRegistry};
 use crate::audit::key_custody::chain_state::ChainState;
@@ -84,7 +91,9 @@ use crate::audit::key_custody::{file_store, KeySlot};
 use crate::audit::multi_sig::verify_record_multi_sig;
 use crate::audit::persist::{canonical_bytes_for, sha256_hex, ChainKind};
 use crate::audit::traits::SigningKey;
-use crate::audit::types::{KeyId, LedgerError, RedactedString, Sha256Hex, SignedRecord};
+use crate::audit::types::{
+    Ed25519PublicKey, EventKind, KeyId, LedgerError, RedactedString, Sha256Hex, SignedRecord,
+};
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::path::Path;
 use tracing::{error, info, warn};
@@ -120,6 +129,84 @@ impl Default for VerifyConfig {
     }
 }
 
+/// Recomputes a [`SignedRecord`]'s `canonical_hash` from its own content —
+/// the EXACT construction `verify_chain`'s Check 4 uses (see
+/// [`RecordView::canonical_bytes_sentinel`]'s `Typed` arm, which now calls
+/// this same function): clone the record, reset `canonical_hash` to the
+/// genesis sentinel, then `canonical_bytes_for` the result. Shared so a
+/// caller verifying a single record off-chain
+/// ([`verify_record_signature`]) and the whole-chain walk agree on exactly
+/// one definition of "this record's real, tamper-evident hash" — never two
+/// independently-maintained copies that can drift.
+fn canonical_bytes_sentinel_for(record: &SignedRecord) -> Vec<u8> {
+    let mut record_for_hash = record.clone();
+    record_for_hash.canonical_hash = crate::audit::types::Sha256Hex::genesis();
+    canonical_bytes_for(&record_for_hash)
+}
+
+/// Verifies ONE record's Ed25519 signature against a known, TRUSTED
+/// `pubkey`, using the exact digest/verify_strict construction this
+/// module's "Unified signing contract" doc block (above) describes:
+/// recompute `canonical_hash` from the record's own content (the SAME
+/// Check-4 construction `verify_chain` uses — `canonical_bytes_sentinel_for`),
+/// require it match the record's stored `canonical_hash`, then
+/// sign/verify the 32 raw bytes of that hash, never the 64-char hex string.
+///
+/// # S-CRITICAL-1 (round 9)
+///
+/// Earlier versions of this function verified the signature against
+/// whatever `canonical_hash` the record itself CLAIMED, without ever
+/// recomputing it from content. That let a forged record graft a genuine
+/// record's `canonical_hash` + `signature` + `key_id` onto changed payload
+/// bytes (e.g. a different `correlation_id` or `from_slot`/`to_slot`) and
+/// still verify — the signature was checked against a hash that no longer
+/// described the record's actual content. The recompute-and-compare below
+/// closes that: any change to the record's content changes the recomputed
+/// hash, which then fails to match the stored one, before the signature is
+/// even inspected.
+///
+/// Unlike [`verify_chain`] / [`verify_chain_in`], this does NOT walk the
+/// chain and does NOT check `prev_hash`/`seq` linking, and it does NOT
+/// resolve a key by `key_id` from the keychain/key-custody store — the
+/// CALLER is responsible for resolving `pubkey` from a trusted source
+/// (the same file-store/keychain custody `verify_chain` reads via
+/// `try_load_signing_key`) BEFORE calling this function; passing a pubkey
+/// read from a same-user-editable file (e.g. `chain.json`'s own `pubkey`
+/// field) defeats the whole check, since an attacker with local write
+/// access can simply overwrite that file with their own key. Exists for a
+/// caller that already holds the specific TRUSTED pubkey it expects ONE
+/// record to be signed by (`verify_swap_correlation`, round 8 S-MEDIUM-1 /
+/// round 9 S-CRITICAL-1) and needs the underlying crypto primitive without
+/// paying for (or duplicating) whole-chain verification.
+///
+/// Returns `false` on any malformed input (non-hex or wrong-length
+/// `canonical_hash`, an unparseable `pubkey`) rather than panicking — the
+/// caller's contract is "does this record's signature check out", and a
+/// malformed record trivially does not. Also returns `false` when the
+/// recomputed `canonical_hash` does not match the record's stored value —
+/// the record's content was tampered with, regardless of what its
+/// signature says.
+pub fn verify_record_signature(record: &SignedRecord, pubkey: &Ed25519PublicKey) -> bool {
+    // S-CRITICAL-1: recompute BEFORE verify_strict, and require equality.
+    let expected_hash = sha256_hex(&canonical_bytes_sentinel_for(record));
+    if record.canonical_hash.as_str() != expected_hash {
+        return false;
+    }
+    let Ok(digest_bytes) = hex::decode(record.canonical_hash.as_str()) else {
+        return false;
+    };
+    if digest_bytes.len() != 32 {
+        return false;
+    }
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey.0) else {
+        return false;
+    };
+    let dalek_sig = Signature::from_bytes(&record.signature.0);
+    verifying_key
+        .verify_strict(&digest_bytes, &dalek_sig)
+        .is_ok()
+}
+
 /// A contiguous run of records whose signatures were skipped because the
 /// signing key that produced them is a historical (rotated-out) key no longer
 /// present in the keychain.
@@ -132,7 +219,7 @@ impl Default for VerifyConfig {
 /// Gaps are accumulated in [`VerifySummary::historical_key_gaps`] when the
 /// missing key's ID differs from `chain.json`'s current active `signing_key_id`.
 /// A missing *current* key still produces a fatal `LedgerError::KeyNotFound`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyGap {
     /// The `key_id` that was required but not found in the keychain.
     pub key_id: String,
@@ -191,21 +278,15 @@ pub struct VerifySummary {
     /// Keychain `roster_version_floor` anchor status for this run (DETECTOR,
     /// never fatal — see [`RosterFloorAnchorStatus`]).
     ///
-    /// `Confirmed` = keychain and `chain.json` floors agree;
-    /// `Unconfirmed` = no keychain entry, keychain locked, or no roster
-    /// installed (floor is `None` in both sources — nothing to compare);
-    /// `Mismatch` = keychain floor differs from `chain.json` floor (possible
-    /// rollback attempt). Surfaced by `csq doctor`; NEVER changes
-    /// `AuditHealth` or `is_operational()`.
-    ///
-    /// `None` when no roster is installed (`chain.json` `roster_version_floor`
-    /// is `None`). Serialized as `null` / omitted in doctor output via
-    /// `#[serde(skip_serializing_if = "Option::is_none")]` at the doctor layer.
+    /// `Confirmed` = both floors present and equal, or both observed absent;
+    /// `Unconfirmed` = one-sided absence or unreadable keychain;
+    /// `Mismatch` = unequal present floors (possible rollback attempt).
+    /// These are nonfatal detector statuses, not enforcement inputs.
     pub roster_floor_anchor: RosterFloorAnchorStatus,
-    /// Whether `chain.json` carries a `roster_version_floor` at all — i.e.
-    /// whether a roster has ever been installed. Consumers (doctor) gate the
-    /// floor-anchor field on this so a no-roster install omits it instead of
-    /// reporting a vacuous `confirmed` (default `false`).
+    /// Whether either the file or the readable keychain carries a roster floor.
+    /// Doctor gates its optional field on this; anchor-only evidence must not
+    /// disappear merely because the file's floor field was deleted. False is
+    /// absence of observed floor evidence, not proof no roster was ever installed.
     pub roster_floor_present: bool,
     /// M3a — cutoff-aware verification-levels-populated signal.
     ///
@@ -312,16 +393,16 @@ pub enum KeychainAnchorStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RosterFloorAnchorStatus {
     /// The keychain and `chain.json` both have a `roster_version_floor` value
-    /// and they AGREE. Full rollback-detection coverage this run.
+    /// and they AGREE. Agreement is not proof that neither copy was tampered with.
     ///
-    /// Also used when both sources have `None` (no roster installed — nothing
-    /// to disagree about).
+    /// Also used when both sources are observed absent (nothing to compare).
+    /// A missing file-side floor alone is NOT proof the keychain has no floor.
     #[default]
     Confirmed,
     /// The keychain anchor could not be read this run (locked / absent /
     /// no entry / legacy), OR exactly one source has `None` and the other
-    /// does not (partial install state). Rollback-detection is `chain.json`-only
-    /// this run. NON-fatal.
+    /// does not (partial install or missing-field state). Agreement cannot be
+    /// established this run; enforcement still uses the file floor. NON-fatal.
     Unconfirmed,
     /// The keychain `roster_version_floor` EXISTS, is readable, and DISAGREES
     /// with `chain.json` `roster_version_floor`. Possible rollback of `chain.json`
@@ -507,9 +588,10 @@ fn emit_roster_floor_anchor_status(chain_id: &str, status: RosterFloorAnchorStat
 ///
 /// Returns the [`RosterFloorAnchorStatus`]:
 /// - `Confirmed` when both agree (including both `None`).
-/// - `Unconfirmed` when the keychain is unreadable or the keychain entry has no
-///   `roster_version_floor` yet (pre-write).
+/// - `Unconfirmed` for unreadable keychain or one-sided floor absence.
 /// - `Mismatch` when both are `Some` and they disagree.
+///
+/// The returned bool tracks floor evidence in EITHER source for doctor visibility.
 ///
 /// Side-effect: emits an ERROR log on `Mismatch` via
 /// [`emit_roster_floor_anchor_status`].
@@ -517,44 +599,33 @@ fn check_roster_floor_anchor(
     service: &str,
     chain_id: &str,
     chain_json_floor: Option<u64>,
-) -> RosterFloorAnchorStatus {
+) -> (RosterFloorAnchorStatus, bool) {
     use RosterFloorAnchorStatus::*;
 
-    // No roster installed: floor is None on both sides. No discrepancy possible.
-    let Some(cj_floor) = chain_json_floor else {
-        return Confirmed;
-    };
-
-    // Read the keychain entry for the active slot.
-    let keychain_floor_opt: Option<u64> = match load_embedded_cutoff(service, chain_id) {
+    // Always inspect the independent copy, including when the file field was
+    // deleted. An absent file field is not evidence the keychain has no floor.
+    let keychain_floor = match load_embedded_cutoff(service, chain_id) {
         Ok(Some(ec)) => ec.roster_version_floor,
-        // Absent, legacy, or inaccessible: cannot compare → Unconfirmed.
-        Ok(None) | Err(_) => {
-            return Unconfirmed;
-        }
+        Ok(None) => None, // legacy seed without an embedded floor
+        Err(crate::audit::key_custody::KeyCustodyError::Keychain(keyring::Error::NoEntry)) => None,
+        Err(_) => return (Unconfirmed, chain_json_floor.is_some()),
     };
-
-    match keychain_floor_opt {
-        // Keychain entry exists but was written before this field was added:
-        // no floor stored yet → Unconfirmed (not a mismatch).
-        None => Unconfirmed,
-        Some(kc_floor) => {
-            let status = if kc_floor == cj_floor {
-                Confirmed
-            } else {
-                Mismatch
-            };
-            emit_roster_floor_anchor_status(chain_id, status);
-            status
-        }
-    }
+    let present = chain_json_floor.is_some() || keychain_floor.is_some();
+    let status = match (chain_json_floor, keychain_floor) {
+        (None, None) => Confirmed,
+        (Some(file), Some(anchor)) if file == anchor => Confirmed,
+        (Some(_), Some(_)) => Mismatch,
+        _ => Unconfirmed,
+    };
+    emit_roster_floor_anchor_status(chain_id, status);
+    (status, present)
 }
 
 /// M3a — per-record verification-level fold helper.
 ///
 /// Updates the cutoff-aware fold accumulators for one verified record.
 /// Called at every `summary.verified_count += 1` site in `verify_chain`
-/// (including the three early-`continue` paths) so the fold is exhaustive.
+/// (including historical-key-gap paths) so the fold is exhaustive.
 ///
 /// `first_leveled_seq` tracks the seq of the first leveled record seen.
 /// `levels_contiguous` flips to `false` if any post-cutoff record has
@@ -663,11 +734,7 @@ impl RecordView {
     /// position — the Check-4 self-referential recompute pre-image.
     fn canonical_bytes_sentinel(&self) -> Vec<u8> {
         match self {
-            RecordView::Typed(r) => {
-                let mut record_for_hash = (**r).clone();
-                record_for_hash.canonical_hash = Sha256Hex::genesis();
-                canonical_bytes_for(&record_for_hash)
-            }
+            RecordView::Typed(r) => canonical_bytes_sentinel_for(r),
             RecordView::Opaque(o) => crate::audit::opaque::canonical_bytes_for_opaque_check4(o),
         }
     }
@@ -736,13 +803,19 @@ pub fn verify_chain(
 /// `<chain_id>.jsonl` log, and `.chain-broken` sentinel. The signing-key custody
 /// resolution keys off the per-chain `chain_id` read from that chain's
 /// `chain.json` (and `base_dir`), so verifying the EATP chain finds its own key
-/// seed — provided the EATP genesis writer (W2b) established it under the EATP
-/// `chain_id`. An absent chain (`chain.json` missing) is trivially clean.
+/// seed — established by `eatp_audit_init` (`audit/key_custody/init.rs`) under
+/// the EATP `chain_id`, before the genesis write, under the same `.chain-lock`
+/// sidecar the genesis writer itself holds. An absent chain (`chain.json`
+/// missing) is trivially clean.
 ///
-/// W2a resolves the prior W2-BLOCKER: this verifier (and the four
+/// W2a resolved the prior W2-BLOCKER: this verifier (and the four
 /// verify→sentinel callsites — daemon startup, `csq audit verify`, `csq doctor`,
-/// desktop daemon) now verify `eatp-runs/` too, so the first production EATP
-/// write (W2b) lands onto a chain that IS verified end-to-end.
+/// desktop daemon) verify `eatp-runs/` too, so both production EATP writers —
+/// the genesis (`csq audit init` → `emit_eatp_genesis`,
+/// `csq/src/cli/commands/audit.rs`) and the per-session-close attestation
+/// append (`run_eatp_session_close_attestor`, `csq/src/kailash_eatp_attest.rs`,
+/// wired from both `csq daemon start` and the desktop in-process supervisor) —
+/// land onto a chain that IS verified end-to-end.
 pub fn verify_chain_in(
     base_dir: &Path,
     config: &VerifyConfig,
@@ -860,10 +933,10 @@ pub fn verify_chain_in(
     //
     // Compare chain.json `roster_version_floor` with the keychain-anchored copy
     // (written best-effort by roster-install). A same-UID attacker can lower the
-    // FS-side chain.json floor, but cannot silently rewrite the keychain entry —
-    // so a Mismatch is a rollback-attempt signal.
-    let roster_floor_present = chain_state.roster_version_floor.is_some();
-    let roster_floor_anchor = check_roster_floor_anchor(
+    // FS-side chain.json floor. A readable retained anchor can detect that
+    // change; altering/deleting both copies remains outside this detector's
+    // guarantee. No claim that a same-UID keychain entry is immutable.
+    let (roster_floor_anchor, roster_floor_present) = check_roster_floor_anchor(
         &config.keychain_service,
         chain_id,
         chain_state.roster_version_floor,
@@ -1011,7 +1084,24 @@ pub fn verify_chain_in(
         let record: RecordView = match serde_json::from_str::<SignedRecord>(raw_line) {
             Ok(r) => RecordView::Typed(Box::new(r)),
             Err(_) => match serde_json::from_str::<crate::audit::opaque::OpaqueRecord>(raw_line) {
-                Ok(o) => RecordView::Opaque(Box::new(o)),
+                Ok(o) => {
+                    // an internal ticket: only a genuinely unknown taxonomy tag may defer
+                    // typed semantics. A recognized kind retains strict fields
+                    // and known guarded-operation policy after a parse failure.
+                    if serde_json::from_value::<EventKind>(serde_json::Value::String(
+                        o.kind.clone(),
+                    ))
+                    .is_ok()
+                    {
+                        return Err(LedgerError::IntegrityBroken {
+                            seq: o.seq,
+                            reason: RedactedString::from_trusted(
+                                "known record kind has invalid typed fields",
+                            ),
+                        });
+                    }
+                    RecordView::Opaque(Box::new(o))
+                }
                 Err(_) => {
                     // Unrecognised format — treat as IntegrityBroken.
                     return Err(LedgerError::IntegrityBroken {
@@ -1075,52 +1165,35 @@ pub fn verify_chain_in(
 
         // === Check 3: unbroken hash chain ===
         let expected_prev_hash = match prev_canonical_bytes.as_ref() {
-            None => {
-                if summary.limit_exceeded_count > 0 {
-                    // Mid-chain start: we cannot verify the hash chain link for
-                    // the first record in the tail window without loading the
-                    // record immediately before it. Skip this check for the
-                    // first record only.
-                    // Seed prev_canonical_bytes so subsequent records CAN be checked.
-                    prev_canonical_bytes = Some(record.canonical_bytes_link());
-                    prev_seq = Some(record.seq());
-                    summary.head_seq = record.seq();
-                    summary.verified_count += 1;
-                    // M3a: fold verification level.
-                    m3a_fold_record(
-                        record.seq(),
-                        record.verification_level().as_ref(),
-                        &mut first_leveled_seq,
-                        &mut levels_contiguous,
-                        #[cfg(feature = "enterprise")]
-                        &mut summary.verification_level_summary,
-                    );
-                    continue;
-                }
-                Sha256Hex::GENESIS.to_string()
-            }
-            Some(bytes) => sha256_hex(bytes),
+            // Only the incoming link is unmeasurable at a truncated boundary.
+            // Do NOT advance or count here: enter the normal per-record pipeline,
+            // retaining its historical-key-gap/pre-cutoff policies (an internal ticket).
+            None if summary.limit_exceeded_count > 0 => None,
+            None => Some(Sha256Hex::GENESIS.to_string()),
+            Some(bytes) => Some(sha256_hex(bytes)),
         };
-        if record.prev_hash().as_str() != expected_prev_hash {
-            // R2-RS-1: `expected_prev_hash` comes from our own `sha256_hex()`,
-            // which always produces 64 lowercase hex chars — `try_new` cannot
-            // fail on it. We avoid the round-trip to eliminate any silent
-            // genesis downgrade on the diagnostic error path: if `try_new`
-            // somehow failed we would emit the wrong `expected_prev` in the
-            // error message, masking the real break point from the operator.
-            let expected = Sha256Hex::try_new(&expected_prev_hash).map_err(|_| {
-                LedgerError::IntegrityBroken {
+        if let Some(expected_prev_hash) = expected_prev_hash {
+            if record.prev_hash().as_str() != expected_prev_hash {
+                // R2-RS-1: `expected_prev_hash` comes from our own `sha256_hex()`,
+                // which always produces 64 lowercase hex chars — `try_new` cannot
+                // fail on it. We avoid the round-trip to eliminate any silent
+                // genesis downgrade on the diagnostic error path: if `try_new`
+                // somehow failed we would emit the wrong `expected_prev` in the
+                // error message, masking the real break point from the operator.
+                let expected = Sha256Hex::try_new(&expected_prev_hash).map_err(|_| {
+                    LedgerError::IntegrityBroken {
+                        seq: record.seq(),
+                        reason: crate::audit::types::RedactedString::from_trusted(
+                            "internal: sha256_hex produced malformed output",
+                        ),
+                    }
+                })?;
+                return Err(LedgerError::ChainBroken {
                     seq: record.seq(),
-                    reason: crate::audit::types::RedactedString::from_trusted(
-                        "internal: sha256_hex produced malformed output",
-                    ),
-                }
-            })?;
-            return Err(LedgerError::ChainBroken {
-                seq: record.seq(),
-                expected_prev: expected,
-                actual_prev: record.prev_hash().clone(),
-            });
+                    expected_prev: expected,
+                    actual_prev: record.prev_hash().clone(),
+                });
+            }
         }
 
         // === Check 4: canonical_hash recompute (R1-SEC-2 / R1-DEEP-7 fix) ===
@@ -1549,9 +1622,15 @@ pub fn verify_chain_in(
 #[derive(Debug, serde::Serialize)]
 pub struct VerifyJsonOutput {
     /// Verification status:
-    /// - `"ok"` — clean: all records chain-linked and signature-verified.
+    /// - `"ok"` — clean: the WHOLE chain was examined; all records chain-linked
+    ///   and signature-verified.
     /// - `"partial_historical"` — degraded: some records chain-linked but signature
     ///   verification skipped for a contiguous historical-key prefix.
+    /// - `"partial_truncated"` — the scan stopped short of the whole chain: the
+    ///   oldest `skipped_truncated_count` records, INCLUDING the genesis, were
+    ///   never examined (see `VerifyConfig::record_limit`). Rides `ok: true` and
+    ///   exit 0, like `"partial_historical"` — outgrowing the record limit is a
+    ///   coverage fact, not a tamper signal.
     /// - `"integrity_failure"` — fatal: `ChainBroken` / `InvalidSignature` /
     ///   `IntegrityBroken` / `HistoricalKeyAtHead` / `GapAfterVerifiedSegment`.
     /// - `"partial"` — `KeyNotFound` (current active key genuinely absent) OR
@@ -1563,6 +1642,22 @@ pub struct VerifyJsonOutput {
     pub verified_count: u64,
     /// Number of v1 records skipped (not counted toward failures).
     pub skipped_v1_count: u64,
+    /// Number of records the verifier did NOT examine because the chain exceeded
+    /// `VerifyConfig::record_limit` — the OLDEST records, genesis among them.
+    /// Mirrors `VerifySummary::limit_exceeded_count`.
+    ///
+    /// This field exists because its absence was a security gap: before it, a
+    /// truncated scan reported a bare `"ok"` with nothing anywhere in the payload
+    /// indicating the genesis had never been checked. Under truncation
+    /// `verify_chain` skips exactly the two ANTI-truncation checks — the genesis
+    /// seq-0 requirement, and the first record's incoming `prev_hash` link. Its own
+    /// normal authentication pipeline runs before counting or seeding the next
+    /// link, retaining historical-gap/pre-cutoff policies. The oldest record has
+    /// no verified incoming link, so a deletion of the oldest records
+    /// is undetectable. Omitted when `0`, so a whole-chain scan's wire shape is
+    /// byte-identical to the pre-field one.
+    #[serde(skip_serializing_if = "u64_is_zero")]
+    pub skipped_truncated_count: u64,
     /// GH an internal ticket — number of records verified OPAQUE-BUT-INTACT because they carry
     /// an `EventKind` a NEWER csq added (signature + hash-chain verified; typed
     /// payload semantics deferred). Included in `verified_count`; surfaced here so
@@ -1575,8 +1670,9 @@ pub struct VerifyJsonOutput {
     /// Omitted (not serialized) when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub historical_key_gaps: Vec<VerifyJsonKeyGap>,
-    /// Typed failure detail when `status != "ok"` and `status != "partial_historical"`.
-    /// `None` for clean and degraded-historical verification.
+    /// Typed failure detail for the negative verdicts only (`"partial"` /
+    /// `"integrity_failure"`). `None` for `"ok"`, `"partial_historical"`, and
+    /// `"partial_truncated"` — all three are `Ok(summary)` outcomes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_detail: Option<VerifyFailureDetail>,
     /// M2 T2.5 — trust-plane conformance grade (`"COMPATIBLE"` / `"CONFORMANT"`
@@ -1665,7 +1761,7 @@ pub struct VerifyFailureDetail {
     ///
     /// **Leak-safety invariant (redteam R1, security L1).** This field crosses the
     /// operator stdout boundary (`csq audit verify --json`, incl. the SDK
-    /// `csq.verify.v1` envelope). Every arm of [`VerifyFailureDetail::from_ledger_error`]
+    /// `csq.verify.v1` envelope). Every arm of `VerifyFailureDetail::from_ledger_error`
     /// MUST interpolate ONLY (a) shape-validated identifiers (`KeyId` = `ed25519:<hex>`,
     /// `RecordId`, `Sha256Hex`, `u64` seqs) or (b) already-`RedactedString` sub-fields.
     /// A NEW `LedgerError` variant that carries a raw path / upstream body MUST route its
@@ -1821,17 +1917,14 @@ fn u64_is_zero(n: &u64) -> bool {
 
 pub fn to_json_output(result: &Result<VerifySummary, LedgerError>) -> VerifyJsonOutput {
     match result {
-        Ok(summary) if summary.historical_key_gaps.is_empty() => VerifyJsonOutput {
-            status: "ok",
-            verified_count: summary.verified_count,
-            skipped_v1_count: summary.skipped_v1_count,
-            unknown_kind_count: summary.unknown_kind_count,
-            historical_key_gaps: Vec::new(),
-            failure_detail: None,
-            trust_plane_grade: trust_plane_grade_str(result),
-            verification_level_summary: verification_level_summary_for_output(result),
-        },
-        Ok(summary) => {
+        // Ordering is deliberate and MUST match `AuditHealth::from_verify_result`:
+        // historical-key gaps outrank truncation, because a gap carries per-gap
+        // detail an operator acts on. The two functions are independent producers
+        // reading the same `VerifySummary` for different surfaces
+        // (`csq audit verify --json` here, `csq doctor --json` +
+        // `GET /api/audit/health` there); if their precedence diverges, two
+        // surfaces classify one chain differently.
+        Ok(summary) if !summary.historical_key_gaps.is_empty() => {
             // Non-empty historical_key_gaps: chain-linked but degraded.
             let json_gaps = summary
                 .historical_key_gaps
@@ -1847,6 +1940,7 @@ pub fn to_json_output(result: &Result<VerifySummary, LedgerError>) -> VerifyJson
                 status: "partial_historical",
                 verified_count: summary.verified_count,
                 skipped_v1_count: summary.skipped_v1_count,
+                skipped_truncated_count: summary.limit_exceeded_count,
                 unknown_kind_count: summary.unknown_kind_count,
                 historical_key_gaps: json_gaps,
                 failure_detail: None,
@@ -1854,6 +1948,35 @@ pub fn to_json_output(result: &Result<VerifySummary, LedgerError>) -> VerifyJson
                 verification_level_summary: verification_level_summary_for_output(result),
             }
         }
+        // Truncated scan -> NOT `"ok"`. Before 2026-09-13 this arm did not exist
+        // and `limit_exceeded_count` was never read here, so a tail-only scan
+        // reported a bare `"ok"` with NOTHING in the payload disclosing that the
+        // genesis went unexamined. `csq doctor --json` learned the distinction in
+        // 1a1d6976 via `AuditHealth::TailVerified`; this surface did not, because
+        // it is a separate hand-written producer that no exhaustiveness check
+        // reaches (`guard-reader-writer-parity.md` MUST NOT #2).
+        Ok(summary) if summary.limit_exceeded_count > 0 => VerifyJsonOutput {
+            status: "partial_truncated",
+            verified_count: summary.verified_count,
+            skipped_v1_count: summary.skipped_v1_count,
+            skipped_truncated_count: summary.limit_exceeded_count,
+            unknown_kind_count: summary.unknown_kind_count,
+            historical_key_gaps: Vec::new(),
+            failure_detail: None,
+            trust_plane_grade: trust_plane_grade_str(result),
+            verification_level_summary: verification_level_summary_for_output(result),
+        },
+        Ok(summary) => VerifyJsonOutput {
+            status: "ok",
+            verified_count: summary.verified_count,
+            skipped_v1_count: summary.skipped_v1_count,
+            skipped_truncated_count: 0,
+            unknown_kind_count: summary.unknown_kind_count,
+            historical_key_gaps: Vec::new(),
+            failure_detail: None,
+            trust_plane_grade: trust_plane_grade_str(result),
+            verification_level_summary: verification_level_summary_for_output(result),
+        },
         Err(e) => {
             let status = match e {
                 LedgerError::KeyNotFound { .. } | LedgerError::KeychainUnavailable { .. } => {
@@ -1865,6 +1988,7 @@ pub fn to_json_output(result: &Result<VerifySummary, LedgerError>) -> VerifyJson
                 status,
                 verified_count: 0,
                 skipped_v1_count: 0,
+                skipped_truncated_count: 0,
                 unknown_kind_count: 0,
                 historical_key_gaps: Vec::new(),
                 failure_detail: Some(VerifyFailureDetail::from_ledger_error(e)),
@@ -1916,6 +2040,330 @@ mod tests {
             !json.contains("trust_plane_grade"),
             "an ungradeable chain must omit the field; got: {json}"
         );
+    }
+
+    // Private actual signed-chain admission proof; no host keys or daemon.
+    mod known_kind_opaque_rejection {
+        use super::*;
+
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Shape {
+            Known,
+            Unknown,
+            MalformedPayload,
+            MismatchedKind,
+            InvalidLevel,
+            InvalidPhase,
+            ExtraField,
+            MalformedWithV1Text,
+        }
+
+        fn check_shape(shape: Shape, limit: usize) {
+            let _lock = crate::platform::test_env::lock();
+            let _restore = RestoreEnv(
+                ["CSQ_AUDIT_EDITION", "CSQ_AUDIT_ROSTER_ROOT_PUBKEY"]
+                    .into_iter()
+                    .map(|name| (name, std::env::var_os(name)))
+                    .collect(),
+            );
+            std::env::remove_var("CSQ_AUDIT_EDITION");
+            std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+            // setup_signed_chain installs ProcessOnly keyring BEFORE audit_init.
+            let chain_id = "01JZ0000000000000000000K01";
+            let (tmp, svc, key) = setup_signed_chain("known_kind_admission", chain_id);
+            let mut head = sample_v2_record("K02");
+            head.chain_id = RecordId::try_new(chain_id).unwrap();
+            head.key_id = key.key_id();
+            let first = seal_known(head, &key);
+            let first_record: SignedRecord = serde_json::from_str(&first).unwrap();
+            let prev = sha256_hex(&canonical_bytes_for(&first_record));
+
+            let mut record = sample_v2_record("K03");
+            record.chain_id = RecordId::try_new(chain_id).unwrap();
+            record.seq = 1;
+            record.prev_hash = Sha256Hex::try_new(&prev).unwrap();
+            record.key_id = key.key_id();
+            let valid = seal_known(record, &key);
+            let second = if matches!(shape, Shape::Known) {
+                valid
+            } else {
+                let mut value: serde_json::Value = serde_json::from_str(&valid).unwrap();
+                match shape {
+                    Shape::Unknown => {
+                        value["kind"] = "future_admission_v9".into();
+                        value["payload"] = serde_json::json!({
+                            "kind": "future_admission_v9",
+                            "data": {"schema_version": "1", "future": true}
+                        });
+                    }
+                    Shape::MalformedPayload => value["payload"]["data"] = serde_json::json!({}),
+                    Shape::MismatchedKind => value["kind"] = "key_rotate".into(),
+                    Shape::InvalidLevel => value["verification_level"] = "FUTURE_LEVEL".into(),
+                    Shape::InvalidPhase => {
+                        value["op_phase"] = serde_json::json!({"phase": "future"})
+                    }
+                    Shape::ExtraField => value["future_noncanonical"] = true.into(),
+                    Shape::MalformedWithV1Text => {
+                        value["payload"]["data"] = serde_json::json!({"schema_version": "1"});
+                    }
+                    Shape::Known => unreachable!(),
+                }
+                assert!(serde_json::from_value::<SignedRecord>(value.clone()).is_err());
+                // Seal the actual raw malformed/future content correctly. Failure
+                // must come from admission, not an unrelated bad hash/signature.
+                value["canonical_hash"] = Sha256Hex::GENESIS.into();
+                let opaque = serde_json::from_value(value.clone()).unwrap();
+                let hash = sha256_hex(&crate::audit::opaque::canonical_bytes_for_opaque_check4(
+                    &opaque,
+                ));
+                value["canonical_hash"] = hash.clone().into();
+                value["signature"] =
+                    serde_json::to_value(key.sign(&hex32(&hash)).unwrap()).unwrap();
+                serde_json::to_string(&value).unwrap()
+            };
+            // Real legacy v1 remains skipped, while the second record can carry
+            // the same schema_version:1 substring in a genuine v2 envelope.
+            write_jsonl(
+                tmp.path(),
+                chain_id,
+                &[
+                    r#"{"schema_version":"1","run_id":"legacy"}"#.into(),
+                    first,
+                    second,
+                ],
+            );
+            let result = verify_chain(
+                tmp.path(),
+                &VerifyConfig {
+                    record_limit: limit,
+                    keychain_service: svc.clone(),
+                },
+                None,
+            );
+            match shape {
+                Shape::Known | Shape::Unknown => assert!(matches!(&result, Ok(summary)
+                    if summary.verified_count == limit.min(2) as u64
+                    && summary.skipped_v1_count == 1
+                    && summary.unknown_kind_count == u64::from(matches!(shape, Shape::Unknown))),
+                    "valid compatibility control shape={shape:?} limit={limit}: {result:?}"),
+                _ => assert!(matches!(&result, Err(LedgerError::IntegrityBroken { reason, .. })
+                    if reason.as_str() == "known record kind has invalid typed fields"),
+                    "known-kind typed failure must not become opaque shape={shape:?} limit={limit}: {result:?}"),
+            }
+            LocalSigningKey::delete_from_keychain(&svc, chain_id).unwrap();
+        }
+
+        fn both_windows(shape: Shape) {
+            for limit in [1, 100] {
+                check_shape(shape, limit);
+            }
+        }
+
+        #[test]
+        fn valid_known_and_genuinely_unknown_records_remain_accepted() {
+            both_windows(Shape::Known);
+            both_windows(Shape::Unknown);
+        }
+        #[test]
+        fn malformed_known_payload_is_rejected() {
+            both_windows(Shape::MalformedPayload);
+        }
+        #[test]
+        fn known_kind_payload_mismatch_is_rejected() {
+            both_windows(Shape::MismatchedKind);
+        }
+        #[test]
+        fn invalid_known_typed_policy_fields_are_rejected() {
+            both_windows(Shape::InvalidLevel);
+            both_windows(Shape::InvalidPhase);
+        }
+        #[test]
+        fn known_kind_extra_top_level_field_is_rejected() {
+            both_windows(Shape::ExtraField);
+        }
+        #[test]
+        fn malformed_known_v2_with_v1_substring_is_not_skipped() {
+            both_windows(Shape::MalformedWithV1Text);
+        }
+    }
+
+    // Private signed records; no OS keychain, vendor, daemon or host files.
+    mod tail_boundary {
+        use super::*;
+
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Damage {
+            None,
+            Content,
+            Signature,
+            Unsigned,
+            MultiSig,
+        }
+
+        fn check_window(opaque: bool, limit: usize, damage: Damage) {
+            let _guard = crate::platform::test_env::lock();
+            let _restore = RestoreEnv(
+                ["CSQ_AUDIT_EDITION", "CSQ_AUDIT_ROSTER_ROOT_PUBKEY"]
+                    .into_iter()
+                    .map(|name| (name, std::env::var_os(name)))
+                    .collect(),
+            );
+            std::env::remove_var("CSQ_AUDIT_EDITION");
+            std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+            let chain_id = "01JZ0000000000000000000T01";
+            let (tmp, svc, key) = setup_signed_chain("tail_boundary", chain_id);
+            let mut lines = Vec::new();
+            let mut prev = Sha256Hex::GENESIS.to_string();
+            for seq in 0..3 {
+                let mut value = if opaque {
+                    build_signed_unknown(
+                        chain_id,
+                        "01JZ0000000000000000000T02",
+                        seq,
+                        &prev,
+                        "future_tail_event",
+                        &key,
+                        None,
+                    )
+                } else {
+                    let mut record = sample_v2_record("T02");
+                    record.chain_id = RecordId::try_new(chain_id).unwrap();
+                    record.seq = seq;
+                    record.prev_hash = Sha256Hex::try_new(&prev).unwrap();
+                    record.key_id = key.key_id();
+                    record.canonical_hash = Sha256Hex::genesis();
+                    serde_json::from_str(&seal_known(record, &key)).unwrap()
+                };
+                if seq as usize == 3 - limit {
+                    match damage {
+                        Damage::None => {}
+                        Damage::Content => value["ts"] = "2101-01-01T00:00:00Z".into(),
+                        Damage::Signature => value["signature"] = "0".repeat(128).into(),
+                        Damage::Unsigned | Damage::MultiSig => {
+                            if matches!(damage, Damage::Unsigned) {
+                                value["key_id"] = PLACEHOLDER_KEY_ID.into();
+                                value["signature"] = "0".repeat(128).into();
+                            } else {
+                                value["authority"] = serde_json::json!({"multi_sig": "invalid"});
+                            }
+                            // Pass Check 4 so this specifically reaches cutoff/multisig.
+                            value["canonical_hash"] = Sha256Hex::GENESIS.into();
+                            let bytes = if opaque {
+                                let r = serde_json::from_value(value.clone()).unwrap();
+                                crate::audit::opaque::canonical_bytes_for_opaque_check4(&r)
+                            } else {
+                                let r = serde_json::from_value(value.clone()).unwrap();
+                                canonical_bytes_for(&r)
+                            };
+                            let hash = sha256_hex(&bytes);
+                            value["canonical_hash"] = hash.clone().into();
+                            if matches!(damage, Damage::MultiSig) {
+                                value["signature"] =
+                                    serde_json::to_value(key.sign(&hex32(&hash)).unwrap()).unwrap();
+                            }
+                        }
+                    }
+                }
+                // The successor genuinely links to the victim's stored content;
+                // a failure cannot be credited to an unrelated broken link.
+                prev = if opaque {
+                    opaque_link_hash(&value)
+                } else {
+                    let r = serde_json::from_value(value.clone()).unwrap();
+                    sha256_hex(&canonical_bytes_for(&r))
+                };
+                lines.push(serde_json::to_string(&value).unwrap());
+            }
+            write_jsonl(tmp.path(), chain_id, &lines);
+            let result = verify_chain(
+                tmp.path(),
+                &VerifyConfig {
+                    record_limit: limit,
+                    keychain_service: svc.clone(),
+                },
+                None,
+            );
+            let victim = (3 - limit) as u64;
+            match damage {
+                Damage::None => assert!(
+                    matches!(&result, Ok(s) if
+                    s.verified_count == limit as u64 && s.limit_exceeded_count == victim
+                    && s.head_seq == 2 && s.unknown_kind_count == if opaque { limit as u64 } else { 0 }),
+                    "valid tail opaque={opaque} limit={limit}: {result:?}"
+                ),
+                Damage::Content => assert!(
+                    matches!(&result, Err(LedgerError::IntegrityBroken { seq, reason })
+                    if *seq == victim && reason.as_str().contains("canonical_hash")),
+                    "content must fail Check 4 opaque={opaque} limit={limit}: {result:?}"
+                ),
+                Damage::Signature => assert!(
+                    matches!(&result, Err(LedgerError::InvalidSignature { .. })),
+                    "signature must fail Check 5 opaque={opaque} limit={limit}: {result:?}"
+                ),
+                Damage::Unsigned => assert!(
+                    matches!(&result, Err(LedgerError::UnsignedRecordAfterCutoff { seq, cutoff: 0 }) if *seq == victim),
+                    "unsigned must fail cutoff opaque={opaque} limit={limit}: {result:?}"
+                ),
+                Damage::MultiSig => assert!(
+                    matches!(&result, Err(LedgerError::MultiSigInvalid { .. })),
+                    "multisig must fail opaque={opaque} limit={limit}: {result:?}"
+                ),
+            }
+            LocalSigningKey::delete_from_keychain(&svc, chain_id).unwrap();
+        }
+
+        fn all_windows(damage: Damage) {
+            for opaque in [false, true] {
+                for limit in [1, 2] {
+                    check_window(opaque, limit, damage);
+                }
+            }
+        }
+
+        #[test]
+        fn valid_first_record_is_authenticated_and_counted_once() {
+            all_windows(Damage::None);
+        }
+        #[test]
+        fn first_record_content_tampering_is_rejected() {
+            all_windows(Damage::Content);
+        }
+        #[test]
+        fn first_record_signature_tampering_is_rejected() {
+            all_windows(Damage::Signature);
+        }
+        #[test]
+        fn first_record_unsigned_after_cutoff_is_rejected() {
+            all_windows(Damage::Unsigned);
+        }
+        #[test]
+        fn first_record_malformed_multisig_is_rejected() {
+            all_windows(Damage::MultiSig);
+        }
     }
 
     fn sandbox_config(pid_suffix: u32) -> VerifyConfig {
@@ -2912,10 +3360,14 @@ mod tests {
     ///   op-chain still verifies clean (independent fault domains).
     ///
     /// Test artifice: the EATP chain here reuses the op-chain's `chain_id` + key
-    /// seed so the existing `audit_init` bootstrap can stand up a verifiable
-    /// chain WITHOUT W2b's per-EATP-chain key custody. W2a's surface is the
-    /// verify-side subdir parameterization; the born-canonical genesis writer
-    /// that gives the EATP chain its OWN `chain_id` + seed is W2b.
+    /// seed via the plain `audit_init` bootstrap, rather than the real
+    /// per-EATP-chain key-custody path (`eatp_audit_init`, shipped separately
+    /// and exercised by its own tests in `csq/src/kailash_eatp_genesis.rs`).
+    /// This test's scope is narrower: it isolates the verify-side subdir
+    /// parameterization (does `ChainKind::Eatp` verify `eatp-runs/`
+    /// independently of `csq-runs/`?), so the simpler shared-key setup is
+    /// deliberately kept rather than exercising the full genesis path a
+    /// second time here.
     #[test]
     fn verify_chain_in_eatp_verifies_and_is_isolated_from_op() {
         let _env_guard = crate::platform::test_env::lock();
@@ -5502,27 +5954,176 @@ mod tests {
 
     use crate::audit::key_custody::write_roster_floor_to_keychain;
 
+    /// Exact `OsString` save/restore for the two audit env overrides the
+    /// roster-anchor fixtures below clear (an internal ticket).
+    ///
+    /// Clearing a variable is not preserving the caller's environment: the
+    /// prior four fixtures removed both names and never put them back, so a
+    /// sequentially-later test in the same process inherited the cleared
+    /// state. This guard captures `var_os` — which distinguishes "unset" from
+    /// "set to the empty string", as `var().ok()` does not — and restores the
+    /// exact prior value on `Drop`, i.e. on normal return AND on unwind.
+    ///
+    /// Construct it AFTER `platform::test_env::lock()`. Rust drops locals in
+    /// reverse declaration order, so the restore runs BEFORE the shared lock
+    /// is released and no other env-mutating test can observe the window
+    /// (`test-hermeticity.md` MUST 1).
+    struct RosterAnchorEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl RosterAnchorEnvRestore {
+        /// The overrides `verify_chain` reads transitively:
+        /// `multi_sig::edition::resolve_edition` reads `CSQ_AUDIT_EDITION`, and
+        /// enterprise registry loading can read `CSQ_AUDIT_ROSTER_ROOT_PUBKEY`
+        /// through `authority::roster`.
+        const NAMES: [&'static str; 2] = ["CSQ_AUDIT_EDITION", "CSQ_AUDIT_ROSTER_ROOT_PUBKEY"];
+
+        /// Captures the caller's exact values, then clears both so the fixture
+        /// runs against a pinned community baseline.
+        fn capture_and_clear() -> Self {
+            let saved = Self::NAMES
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            for name in Self::NAMES {
+                std::env::remove_var(name);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for RosterAnchorEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Deletes a roster-anchor fixture's keyring entry on drop — on unwind as
+    /// well as on the normal tail, which the prior best-effort tail calls did
+    /// not cover.
+    ///
+    /// This is PROCESS-MEMORY hygiene, not a host-keychain operation:
+    /// `key_custody::keyring_entry` installs the in-memory `ProcessOnly`
+    /// backend under `cfg(test)`/`test-utils` before `keyring::Entry::new`, so
+    /// every entry these fixtures create lives in a mutex-guarded map for the
+    /// test process's lifetime and never reaches the OS keychain.
+    struct RosterAnchorFixtureKey {
+        service: String,
+        chain_id: String,
+    }
+
+    impl Drop for RosterAnchorFixtureKey {
+        fn drop(&mut self) {
+            let _ = LocalSigningKey::delete_from_keychain(&self.service, &self.chain_id);
+        }
+    }
+
+    /// A keychain service name unique to one fixture RUN.
+    ///
+    /// The PID alone repeats across every test in a binary; the counter makes
+    /// a name unique even if a fixture is re-entered, so two fixtures can
+    /// never read each other's embedded cutoff.
+    fn unique_roster_fixture_service(label: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("csq-test-rfanchor-{label}-{}-{n}", std::process::id())
+    }
+
+    /// Initializes a private audit chain under `base` and returns its state,
+    /// FAILING LOUDLY if setup did not succeed.
+    ///
+    /// The prior fixtures wrote `let _ = audit_init(..)` and then defaulted a
+    /// failed `ChainState::load` to an empty id — so a chain that was never
+    /// established still satisfied the `Confirmed` default verdict. Asserting
+    /// both the init result and the chain identity is what makes the verdict
+    /// evidence about an INITIALIZED chain rather than about an absent one.
+    fn init_private_chain(
+        base: &std::path::Path,
+        svc: &str,
+    ) -> crate::audit::key_custody::ChainState {
+        use crate::audit::key_custody::ChainState;
+        crate::audit::key_custody::test_helpers::init_mock_keyring();
+        crate::audit::key_custody::audit_init(base, svc)
+            .expect("audit_init must succeed on a fresh private base");
+        let state = ChainState::load(base).expect("chain state must exist after audit_init");
+        assert!(
+            !state.chain_id.is_empty(),
+            "audit_init must establish a non-empty chain identity; got {state:?}"
+        );
+        state
+    }
+
+    /// Non-vacuity proof for [`RosterAnchorEnvRestore`] itself: it restores the
+    /// EXACT prior values, on UNWIND, and keeps "set to the empty string"
+    /// distinct from "unset".
+    ///
+    /// Without this, the guard's presence in the four fixtures above would be
+    /// an assertion rather than a demonstration — every one of them passes
+    /// identically whether or not the restore ever runs.
+    #[test]
+    fn roster_anchor_env_restore_returns_exact_prior_values_on_unwind() {
+        let _env_lock = crate::platform::test_env::lock();
+        // Protect the rest of the suite from THIS test's own mutations.
+        let _outer = RosterAnchorEnvRestore::capture_and_clear();
+
+        // A value, and an EMPTY value — `var().ok()` cannot tell the latter
+        // from "unset"; `var_os` can, which is why the guard uses it.
+        std::env::set_var("CSQ_AUDIT_EDITION", "enterprise");
+        std::env::set_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY", "");
+
+        let prior_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the expected panic quiet
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = RosterAnchorEnvRestore::capture_and_clear();
+            assert!(
+                std::env::var_os("CSQ_AUDIT_EDITION").is_none(),
+                "capture_and_clear must clear the variable inside the guarded scope"
+            );
+            panic!("simulated fixture failure");
+        });
+        std::panic::set_hook(prior_hook);
+        assert!(unwound.is_err(), "the guarded scope must have unwound");
+
+        assert_eq!(
+            std::env::var_os("CSQ_AUDIT_EDITION"),
+            Some(std::ffi::OsString::from("enterprise")),
+            "unwinding must restore the exact prior value"
+        );
+        assert_eq!(
+            std::env::var_os("CSQ_AUDIT_ROSTER_ROOT_PUBKEY"),
+            Some(std::ffi::OsString::new()),
+            "a variable set to the empty string must be restored as set-and-empty, not unset"
+        );
+    }
+
     /// When no roster is installed (chain.json has no `roster_version_floor`),
     /// `check_roster_floor_anchor` returns `Confirmed` (the safe default).
     /// `verify_chain` therefore surfaces `Confirmed` for fresh installs.
     #[test]
     fn roster_floor_anchor_confirmed_when_no_roster_installed() {
         // Hermeticity: verify_chain (below) transitively reads CSQ_AUDIT_EDITION;
-        // hold the shared env lock + pin a clean community baseline so this test
-        // cannot race a concurrent enterprise-edition test (testing.md Rule 6 /
-        // test-hermeticity.md MUST 1 — reader side).
-        let _env_guard = crate::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        // hold the shared env lock, then capture-and-clear so the caller's exact
+        // values are restored on unwind BEFORE the lock releases (an internal ticket).
+        let _env_lock = crate::platform::test_env::lock();
+        let _env_restore = RosterAnchorEnvRestore::capture_and_clear();
+
         // Arrange — init a chain without ever running `roster install`.
         let base = tempfile::TempDir::new().unwrap();
         let base = base.path();
-        let svc = format!("csq-test-rfanchor-none-{}", std::process::id());
-        let _ = crate::audit::key_custody::audit_init(base, &svc);
-        let chain_id = crate::audit::key_custody::ChainState::load(base)
-            .ok()
-            .map(|cs| cs.chain_id.clone())
-            .unwrap_or_default();
+        let svc = unique_roster_fixture_service("none");
+        let chain = init_private_chain(base, &svc);
+        let _fixture_key = RosterAnchorFixtureKey {
+            service: svc.clone(),
+            chain_id: chain.chain_id.clone(),
+        };
+        assert_eq!(
+            chain.roster_version_floor, None,
+            "fixture precondition: a fresh chain must carry no roster floor"
+        );
 
         // Act
         let cfg = VerifyConfig {
@@ -5537,33 +6138,34 @@ mod tests {
             RosterFloorAnchorStatus::Confirmed,
             "fresh install with no roster must yield Confirmed"
         );
-
-        if !chain_id.is_empty() {
-            let _ = LocalSigningKey::delete_from_keychain(&svc, &chain_id);
-        }
+        assert!(
+            !summary.roster_floor_present,
+            "no floor in either store must report roster_floor_present = false"
+        );
     }
 
     /// When a roster is installed and the keychain entry has the matching floor,
     /// `verify_chain` yields `Confirmed`.
     #[test]
     fn roster_floor_anchor_confirmed_when_keychain_matches_chain_json() {
-        use crate::audit::key_custody::{audit_init, ChainState};
         // Hermeticity: verify_chain (below) transitively reads CSQ_AUDIT_EDITION;
-        // hold the shared env lock + pin a clean community baseline (testing.md
-        // Rule 6 / test-hermeticity.md MUST 1 — reader side).
-        let _env_guard = crate::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        // hold the shared env lock, then capture-and-clear so the caller's exact
+        // values are restored on unwind BEFORE the lock releases (an internal ticket).
+        let _env_lock = crate::platform::test_env::lock();
+        let _env_restore = RosterAnchorEnvRestore::capture_and_clear();
 
         // Arrange — init chain, install a synthetic roster_version_floor into
         // chain.json, then write the matching floor into the keychain.
         let base = tempfile::TempDir::new().unwrap();
         let base = base.path();
-        let svc = format!("csq-test-rfanchor-match-{}", std::process::id());
-        let _ = audit_init(base, &svc);
+        let svc = unique_roster_fixture_service("match");
+        let mut chain = init_private_chain(base, &svc);
+        let _fixture_key = RosterAnchorFixtureKey {
+            service: svc.clone(),
+            chain_id: chain.chain_id.clone(),
+        };
 
-        // Load chain state and plant a roster_version_floor.
-        let mut chain = ChainState::load(base).expect("chain state must exist after audit_init");
+        // Plant a roster_version_floor on the initialized chain.
         chain.roster_version_floor = Some(3);
         chain.save(base).expect("chain.save must succeed");
 
@@ -5583,8 +6185,10 @@ mod tests {
             RosterFloorAnchorStatus::Confirmed,
             "matching chain.json and keychain floors must yield Confirmed"
         );
-
-        let _ = LocalSigningKey::delete_from_keychain(&svc, &chain.chain_id);
+        assert!(
+            summary.roster_floor_present,
+            "a floor in both stores must report roster_floor_present = true"
+        );
     }
 
     /// When a roster is installed but the keychain entry has no floor (e.g.
@@ -5592,22 +6196,23 @@ mod tests {
     /// detection layer is chain.json-only for that installation.
     #[test]
     fn roster_floor_anchor_unconfirmed_when_keychain_has_no_floor() {
-        use crate::audit::key_custody::{audit_init, ChainState};
         // Hermeticity: verify_chain (below) transitively reads CSQ_AUDIT_EDITION;
-        // hold the shared env lock + pin a clean community baseline (testing.md
-        // Rule 6 / test-hermeticity.md MUST 1 — reader side).
-        let _env_guard = crate::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        // hold the shared env lock, then capture-and-clear so the caller's exact
+        // values are restored on unwind BEFORE the lock releases (an internal ticket).
+        let _env_lock = crate::platform::test_env::lock();
+        let _env_restore = RosterAnchorEnvRestore::capture_and_clear();
 
         // Arrange — init chain, plant a floor in chain.json, but do NOT write
         // the floor into the keychain (simulating a pre-an internal ticket keychain entry).
         let base = tempfile::TempDir::new().unwrap();
         let base = base.path();
-        let svc = format!("csq-test-rfanchor-unconf-{}", std::process::id());
-        let _ = audit_init(base, &svc);
+        let svc = unique_roster_fixture_service("unconf");
+        let mut chain = init_private_chain(base, &svc);
+        let _fixture_key = RosterAnchorFixtureKey {
+            service: svc.clone(),
+            chain_id: chain.chain_id.clone(),
+        };
 
-        let mut chain = ChainState::load(base).expect("chain state must exist after audit_init");
         chain.roster_version_floor = Some(5);
         chain.save(base).expect("chain.save must succeed");
         // Note: no write_roster_floor_to_keychain call here.
@@ -5625,8 +6230,10 @@ mod tests {
             RosterFloorAnchorStatus::Unconfirmed,
             "pre-an internal ticket keychain entry (no floor field) must yield Unconfirmed"
         );
-
-        let _ = LocalSigningKey::delete_from_keychain(&svc, &chain.chain_id);
+        assert!(
+            summary.roster_floor_present,
+            "a floor in chain.json alone must still report roster_floor_present = true"
+        );
     }
 
     /// When the keychain-anchored floor DIFFERS from chain.json's floor, the
@@ -5634,21 +6241,22 @@ mod tests {
     /// This MUST NOT prevent `verify_chain` from returning `Ok` (non-fatal).
     #[test]
     fn roster_floor_anchor_mismatch_when_keychain_floor_differs() {
-        use crate::audit::key_custody::{audit_init, ChainState};
         // Hermeticity: verify_chain (below) transitively reads CSQ_AUDIT_EDITION;
-        // hold the shared env lock + pin a clean community baseline (testing.md
-        // Rule 6 / test-hermeticity.md MUST 1 — reader side).
-        let _env_guard = crate::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        // hold the shared env lock, then capture-and-clear so the caller's exact
+        // values are restored on unwind BEFORE the lock releases (an internal ticket).
+        let _env_lock = crate::platform::test_env::lock();
+        let _env_restore = RosterAnchorEnvRestore::capture_and_clear();
 
         // Arrange — chain.json floor = 10, keychain anchor floor = 5.
         let base = tempfile::TempDir::new().unwrap();
         let base = base.path();
-        let svc = format!("csq-test-rfanchor-mismatch-{}", std::process::id());
-        let _ = audit_init(base, &svc);
+        let svc = unique_roster_fixture_service("mismatch");
+        let mut chain = init_private_chain(base, &svc);
+        let _fixture_key = RosterAnchorFixtureKey {
+            service: svc.clone(),
+            chain_id: chain.chain_id.clone(),
+        };
 
-        let mut chain = ChainState::load(base).expect("chain state must exist after audit_init");
         chain.roster_version_floor = Some(10);
         chain.save(base).expect("chain.save must succeed");
 
@@ -5674,8 +6282,10 @@ mod tests {
             RosterFloorAnchorStatus::Mismatch,
             "differing chain.json (10) vs keychain (5) floors must yield Mismatch"
         );
-
-        let _ = LocalSigningKey::delete_from_keychain(&svc, &chain.chain_id);
+        assert!(
+            summary.roster_floor_present,
+            "differing floors are still floors: roster_floor_present must be true"
+        );
     }
 
     // === M3a Acceptance Criterion Tests ===

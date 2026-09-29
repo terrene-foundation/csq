@@ -30,6 +30,11 @@
 //! either the probe-bail fragment IS present (for bail cases) or IS ABSENT
 //! while a different downstream-error fragment IS present (for proceed cases).
 
+// PathBuf is only referenced (unqualified) inside the #[cfg(unix)]
+// write_stub/write_hang_stub helpers below -- gate the import to match,
+// or it is unused on non-unix targets (windows-gnu cross-clippy, #1 in
+// the same class as the manifest-relative fallback 6ce7bd56 fixed).
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Command;
 #[cfg(unix)]
@@ -43,18 +48,9 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Binary path ──────────────────────────────────────────────────────────────
 
-fn csq_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_csq") {
-        return PathBuf::from(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("csq")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::csq_bin;
 
 // ── Subprocess helper ────────────────────────────────────────────────────────
 
@@ -83,6 +79,9 @@ fn clean_cmd(path_override: Option<&str>) -> Command {
     // Sandbox HOME and CLAUDE_HOME — never re-inject the parent's live values.
     // Callers may still override CLAUDE_HOME per-test via `.env("CLAUDE_HOME", ...)`.
     cmd.env("HOME", sandbox_home());
+    // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
+    // test-utils-gated override is what actually sandboxes it there.
+    cmd.env("CSQ_HOME", sandbox_home());
     cmd.env("CLAUDE_HOME", sandbox_home());
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {

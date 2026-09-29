@@ -14,7 +14,7 @@ use csq_core::credentials::{self, file as cred_file};
 use csq_core::oauth::{exchange_code, LoginRequest, PASTE_CODE_REDIRECT_URI};
 use csq_core::providers;
 use csq_core::quota::state as quota_state;
-use csq_core::quota::QuotaFile;
+use csq_core::quota::{AccountQuota, QuotaFile};
 use csq_core::rotation::config as rotation_config;
 use csq_core::rotation::RotationConfig;
 use csq_core::sessions;
@@ -73,9 +73,21 @@ pub struct AccountView {
     /// Codex → codex, ThirdParty / Manual → claude-code).
     pub surface: String,
     pub has_credentials: bool,
-    pub five_hour_pct: f64,
+    /// The 5-hour usage percentage, or `None` when this slot's quota row
+    /// carries no 5-hour window at all (e.g. a weekly-only plan whose row
+    /// still matches `has_quota` because the 7-day window IS present —
+    /// C2, journal `operator-surfaces`: `has_quota` gates the ROW, not
+    /// either window individually, so a lossy `0.0` here was
+    /// indistinguishable from a real 0% reading on exactly that split
+    /// case). Sourced from [`csq_core::quota::AccountQuota::five_hour_pct_opt`]
+    /// — never the lossy `five_hour_pct()`. Renderers MUST show an absent
+    /// window distinctly from a measured zero.
+    pub five_hour_pct: Option<f64>,
     pub five_hour_resets_in: Option<i64>,
-    pub seven_day_pct: f64,
+    /// The 7-day usage percentage, or `None` when this slot's quota row
+    /// carries no 7-day window. See [`Self::five_hour_pct`] — same
+    /// caveat, same fix.
+    pub seven_day_pct: Option<f64>,
     pub seven_day_resets_in: Option<i64>,
     pub updated_at: f64,
     /// "healthy" | "expiring" | "expired" | "missing"
@@ -113,14 +125,20 @@ pub struct AccountView {
     /// tokens-and-cost-over-time ledger view; others keep the 5h/7d bars.
     pub quota_kind: String,
     /// True when `quota.json` holds a row for THIS slot whose `surface`
-    /// matches the slot's own dispatch shape (the same predicate that
-    /// gates `five_hour_pct`/`seven_day_pct` below). `false` means no
-    /// row has been polled yet — the percentage fields below are `0.0`
-    /// as a serialization default, NOT a measured "0% used". The
-    /// frontend MUST branch on this before reading the percentage
-    /// fields as real data (HIGH-1, an internal ticket redteam: a missing row
-    /// rendering as a bare 0% is indistinguishable from "quota
-    /// exhausted" or "genuinely unused").
+    /// matches the slot's own dispatch shape. `false` means no row has
+    /// been polled yet at all — the frontend renders a "Checking
+    /// usage…" pending state rather than reading the percentage fields
+    /// (HIGH-1, an internal ticket redteam: a missing row rendering as a bare 0%
+    /// is indistinguishable from "quota exhausted" or "genuinely
+    /// unused").
+    ///
+    /// This flag is ROW-level, not per-window: `true` only means SOME
+    /// window matched, not that BOTH did. A row can carry a 7-day window
+    /// with no 5-hour window (or vice versa) and still report
+    /// `has_quota=true`. `five_hour_pct`/`seven_day_pct` are `Option<f64>`
+    /// precisely so the frontend can render that split case honestly
+    /// instead of inheriting a fabricated `0.0` for the absent window
+    /// (C2, journal `operator-surfaces`).
     pub has_quota: bool,
 
     /// Formatted balance string for pay-per-token providers (e.g. DeepSeek).
@@ -665,14 +683,14 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 surface: a.surface.to_string(),
                 has_credentials: a.has_credentials,
                 has_quota: utilization_quota.is_some(),
-                five_hour_pct: utilization_quota.map(|q| q.five_hour_pct()).unwrap_or(0.0),
+                five_hour_pct: utilization_quota.and_then(|q| q.five_hour_pct_opt()),
                 five_hour_resets_in: utilization_quota.and_then(|q| {
                     q.five_hour.as_ref().map(|w| {
                         let now = now_ms / 1000;
                         w.resets_at as i64 - now as i64
                     })
                 }),
-                seven_day_pct: utilization_quota.map(|q| q.seven_day_pct()).unwrap_or(0.0),
+                seven_day_pct: utilization_quota.and_then(|q| q.seven_day_pct_opt()),
                 seven_day_resets_in: utilization_quota.and_then(|q| {
                     q.seven_day.as_ref().map(|w| {
                         let now = now_ms / 1000;
@@ -796,6 +814,26 @@ pub fn provider_cli_installed(binary: String) -> bool {
 /// INTENT+OUTCOME for the CC-state cleanup it performs — these are separate
 /// audit events covering separate destructive steps (vault vs credential files).
 /// Both are detectable by `scan_orphan_intents` on crash-between.
+///
+/// Logs an `emit_outcome` failure with a fixed-vocabulary `error_kind`
+/// (`zero-tolerance.md` Rule 3 — a `let _ =` on a meaningful error is a
+/// silent fallback). The account-lifecycle side effect this OUTCOME record
+/// describes has ALREADY completed by the time this fires — the OUTCOME is
+/// best-effort audit trail, never a gate on the operation — so a WARN is
+/// correct here, not a propagated error. `e.fixed_tag()` is itself a fixed
+/// vocabulary (`AuditV2Error::fixed_tag`), so this never echoes an upstream
+/// error body onto the log (`security.md` MUST-2).
+fn warn_outcome_emit_failed(account: u16, e: &csq_core::audit::persist::AuditV2Error) {
+    tracing::warn!(
+        error_kind = "audit_outcome_emit_failed",
+        op = "remove_account",
+        account,
+        audit_error_kind = e.fixed_tag(),
+        "remove_account: failed to emit AccountLogout OUTCOME record \
+         (op already completed; audit trail incomplete)"
+    );
+}
+
 #[tauri::command]
 pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSummary, String> {
     use csq_core::accounts::logout::{logout_account, LogoutError};
@@ -850,7 +888,7 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
             // and the intent was skipped (Ok(false)), emitting an outcome here would
             // produce an orphan outcome with no matching intent on the chain.
             if gemini_intent_emitted {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
@@ -859,7 +897,9 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                     OpOutcome::Failed {
                         reason: RedactedString::from_untrusted("vault unavailable"),
                     },
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             // R2-FIX-1: use error_kind_tag() — never embed {e} (SecretError::Io
             // Display contains host paths, leaking them into the Tauri IPC payload).
@@ -870,7 +910,7 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
         if let Err(e) = delete_api_key_from_vault(&base, account_num, vault.as_ref()) {
             // FIX-1 (R5): same gate — only emit if intent was committed.
             if gemini_intent_emitted {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
@@ -879,7 +919,9 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                     OpOutcome::Failed {
                         reason: RedactedString::from_untrusted("vault delete failed"),
                     },
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             // R2-FIX-1: same — use error_kind_tag(), not {e}.
             return Err(format!(
@@ -920,14 +962,16 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
             // if the slot was also a Gemini-only slot. For mixed slots
             // (Gemini + CC state), we just emit the Gemini vault OUTCOME here.
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
                     payload,
                     corr_id,
                     OpOutcome::Ok,
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             Ok(RemoveAccountSummary {
                 account: s.account.get(),
@@ -952,14 +996,16 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
             }
             // M13b FIX-6: emit OUTCOME for the Gemini-only cleanup path.
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
                     payload,
                     corr_id,
                     OpOutcome::Ok,
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             Ok(RemoveAccountSummary {
                 account,
@@ -978,7 +1024,7 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
         // R2-FIX-3: no {e} in the returned String — InUse carries no path.
         Err(LogoutError::InUse { account: a, pids }) => {
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
@@ -987,7 +1033,9 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                     OpOutcome::Failed {
                         reason: RedactedString::from_untrusted("logout aborted: account in use"),
                     },
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             Err(format!(
                 "ACCOUNT_IN_USE: account {} is bound to live process(es) {:?} \
@@ -1004,7 +1052,7 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
         // paths from LogoutError::Io::path.display() reach the Tauri payload.
         Err(LogoutError::Io { .. }) => {
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
@@ -1015,13 +1063,15 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                             "logout_account failed after vault delete",
                         ),
                     },
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             Err("REMOVE_FAILED: filesystem error during logout".into())
         }
         Err(LogoutError::Profiles(_)) => {
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
@@ -1032,7 +1082,9 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                             "logout_account failed after vault delete",
                         ),
                     },
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             Err("REMOVE_FAILED: profiles.json error during logout".into())
         }
@@ -1044,7 +1096,7 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
         // where it somehow still fires. Fixed-vocab tag only — no {e}.
         Err(LogoutError::VaultUnavailable { error_kind, .. }) => {
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
-                let _ = op_emit::emit_outcome(
+                if let Err(oe) = op_emit::emit_outcome(
                     &base,
                     &chain_id,
                     EventKind::AccountLogout,
@@ -1055,7 +1107,9 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
                             "logout_account failed after vault delete",
                         ),
                     },
-                );
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
             }
             Err(format!(
                 "REMOVE_FAILED: gemini vault unavailable ({error_kind})"
@@ -1219,7 +1273,7 @@ type UsagePairs = Vec<(AccountNum, csq_core::usage::ledger::UsageEvent)>;
 struct UsageCacheEntry {
     base_dir: String,
     computed_at: std::time::Instant,
-    pairs: std::sync::Arc<UsagePairs>,
+    pairs: Result<std::sync::Arc<UsagePairs>, String>,
 }
 
 // SINGLE-BASE ASSUMPTION: csq desktop runs with exactly one `~/.claude/accounts`
@@ -1250,20 +1304,24 @@ fn usage_cache() -> &'static std::sync::Mutex<Option<UsageCacheEntry>> {
 /// callback below is only a FALLBACK for sessions whose transcript had no
 /// model line (prior to an internal ticket this hardcoded model was applied to EVERY slot,
 /// costing a DeepSeek slot at Sonnet rates).
-fn aggregate_usage_pairs(base: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> UsagePairs {
+fn aggregate_usage_pairs(
+    base: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<UsagePairs, String> {
     // Resolve $HOME/.claude — `get_base_dir` resolves ~/.claude/accounts, so
-    // claude_home is its parent. Malformed base → empty (no panic).
-    let Some(claude_home) = base.parent().map(|p| p.to_path_buf()) else {
-        return Vec::new();
-    };
+    // claude_home is its parent. Malformed base is an explicit error.
+    let claude_home = base
+        .parent()
+        .ok_or_else(|| "INVALID_INPUT: usage base has no parent".to_string())?;
     // Model FALLBACK for the rare model-less transcript line: resolve the
     // slot's configured model (matching the daemon usage-ledger writer's
     // fallback) so the cold-start live-scan and the published ledger cost such
     // lines identically. (an internal ticket redteam R1 MEDIUM-2.)
-    csq_core::usage::aggregator::aggregate(&claude_home, base, now, |slot| {
+    csq_core::usage::aggregator::aggregate(claude_home, base, now, |slot| {
         csq_core::providers::settings::model_id_for_slot(base, slot.get())
             .unwrap_or_else(|| "claude-sonnet-5".to_string())
     })
+    .map_err(|error| format!("MODEL_MANIFEST: {error:#}"))
 }
 
 /// Filters the cached pairs to one slot and summarizes into the IPC view.
@@ -1304,23 +1362,46 @@ fn summary_to_view(summary: csq_core::usage::ledger::UsageSummary) -> UsageSumma
         today_cost_usd: summary.today_cost_usd,
         event_count: summary.event_count,
         unestimated_cost_count: summary.unestimated_cost_count,
+        // Straight-through, 1:1. No arithmetic happens here on purpose: the
+        // window totals are summed in the renderer from the four disjoint
+        // token dimensions, and the diagnostics below are carried across
+        // untouched rather than folded into any total (an internal ticket).
+        total_cache_creation_tokens: summary.total_cache_creation_tokens,
+        total_cache_read_tokens: summary.total_cache_read_tokens,
+        last_30d_cache_creation_tokens: summary.last_30d_cache_creation_tokens,
+        last_30d_cache_read_tokens: summary.last_30d_cache_read_tokens,
+        last_7d_cache_creation_tokens: summary.last_7d_cache_creation_tokens,
+        last_7d_cache_read_tokens: summary.last_7d_cache_read_tokens,
+        last_5d_cache_creation_tokens: summary.last_5d_cache_creation_tokens,
+        last_5d_cache_read_tokens: summary.last_5d_cache_read_tokens,
+        today_cache_creation_tokens: summary.today_cache_creation_tokens,
+        today_cache_read_tokens: summary.today_cache_read_tokens,
+        request_count: summary.request_count,
+        duplicate_snapshots_collapsed: summary.duplicate_snapshots_collapsed,
+        finalization_divergent_requests: summary.finalization_divergent_requests,
+        subagent_request_count: summary.subagent_request_count,
+        unidentified_request_count: summary.unidentified_request_count,
     }
 }
 
 /// Returns the cached all-slots pairs (cloning the `Arc`), kicking ONE guarded
 /// background refresh when the entry is stale/absent/for a different base. The
 /// caller gets an immediate answer; refreshed numbers appear on the next poll.
-fn cached_or_refresh_pairs(base_dir: &str) -> std::sync::Arc<UsagePairs> {
+fn cached_or_refresh_pairs(base_dir: &str) -> Result<std::sync::Arc<UsagePairs>, String> {
     use std::sync::atomic::Ordering;
 
     let (pairs, needs_refresh) = {
         let guard = usage_cache().lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
-            Some(c) if c.base_dir == base_dir && c.computed_at.elapsed() < USAGE_CACHE_TTL => {
+            Some(c)
+                if c.base_dir == base_dir
+                    && c.computed_at.elapsed() < USAGE_CACHE_TTL
+                    && c.pairs.is_ok() =>
+            {
                 (c.pairs.clone(), false)
             }
             Some(c) if c.base_dir == base_dir => (c.pairs.clone(), true), // stale → serve + refresh
-            _ => (std::sync::Arc::new(Vec::new()), true),                 // absent / different base
+            _ => (Ok(std::sync::Arc::new(Vec::new())), true),             // absent / different base
         }
     };
 
@@ -1351,7 +1432,7 @@ fn cached_or_refresh_pairs(base_dir: &str) -> std::sync::Arc<UsagePairs> {
                 *guard = Some(UsageCacheEntry {
                     base_dir: base_owned,
                     computed_at: std::time::Instant::now(),
-                    pairs: std::sync::Arc::new(fresh),
+                    pairs: fresh.map(std::sync::Arc::new),
                 });
                 // `_reset` drops here (or on unwind), releasing the flag.
             });
@@ -1409,7 +1490,11 @@ pub fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryV
     // first seconds after launch before the writer's first tick completes).
     // Serve the cached live-scan aggregate and kick a background refresh
     // (an internal ticket) — non-blocking, never runs the scan on this call.
-    let pairs = cached_or_refresh_pairs(&base_dir);
+    // Fail explicitly on a malformed present manifest, even when a previous
+    // cold-start cache exists. Never silently fall back to compiled prices.
+    csq_core::providers::model_manifest::ModelManifest::load(&base)
+        .map_err(|error| format!("MODEL_MANIFEST: {error:#}"))?;
+    let pairs = cached_or_refresh_pairs(&base_dir)?;
     Ok(summarize_slot(&pairs, account_num, now))
 }
 
@@ -1431,7 +1516,40 @@ pub struct UsageSummaryView {
     pub today_output_tokens: u64,
     pub today_cost_usd: f64,
     pub event_count: u64,
+    /// Requests whose model/timestamp had no verified rate. Per REQUEST since
+    /// an internal ticket, not per session — a session that used a priced model for most of
+    /// its calls now reports only the affected requests here.
     pub unestimated_cost_count: u64,
+
+    // ── an internal ticket: cache dimensions ──────────────────────────────────────────
+    // `input_tokens` EXCLUDES anything served from cache, and cache-write and
+    // cache-read are separate meters, so the four token dimensions of a window
+    // are disjoint and the renderer sums all four to get a cache-inclusive
+    // total with nothing counted twice. Shipping input+output alone understated
+    // real usage by close to two orders of magnitude on cache-heavy slots.
+    pub total_cache_creation_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub last_30d_cache_creation_tokens: u64,
+    pub last_30d_cache_read_tokens: u64,
+    pub last_7d_cache_creation_tokens: u64,
+    pub last_7d_cache_read_tokens: u64,
+    pub last_5d_cache_creation_tokens: u64,
+    pub last_5d_cache_read_tokens: u64,
+    pub today_cache_creation_tokens: u64,
+    pub today_cache_read_tokens: u64,
+
+    // ── an internal ticket: coverage diagnostics ──────────────────────────────────────
+    // These describe how the figures above were DERIVED — the estimate's
+    // boundary, which the card surfaces so a reader can judge it. None is a
+    // token or cost quantity and none may be folded into any total.
+    // `duplicate_snapshots_collapsed` counts streaming snapshots DISCARDED and
+    // routinely EXCEEDS `request_count` (a request carries several snapshots),
+    // so it is a count of what was removed, never a share of anything.
+    pub request_count: u64,
+    pub duplicate_snapshots_collapsed: u64,
+    pub finalization_divergent_requests: u64,
+    pub subagent_request_count: u64,
+    pub unidentified_request_count: u64,
 }
 
 /// Returns the current auto-rotation configuration.
@@ -1583,25 +1701,47 @@ pub struct SessionView {
     /// Account label for `account_id` at the moment of the query,
     /// or null if the account is unknown.
     pub account_label: Option<String>,
-    /// Current 5-hour quota percentage for the bound account.
+    /// Current 5-hour quota percentage for the bound account, or `None`
+    /// when this row carries no 5-hour window at all.
     ///
-    /// `0.0` when `has_quota` is false — a wire-format default, NOT a
-    /// measurement. Gate any rendering on `has_quota` first.
-    pub five_hour_pct: f64,
-    /// Current 7-day quota percentage for the bound account.
+    /// C6 (journal `operator-surfaces`, same class as C2's
+    /// `AccountView.five_hour_pct`): `has_quota` below is `shows_window()`
+    /// — true when EITHER window is present — so a row with a `seven_day`
+    /// window and no `five_hour` one still reports `has_quota=true`. This
+    /// field was previously sourced from the lossy `five_hour_pct()`
+    /// accessor (`unwrap_or(0.0)`), so that absent window and a genuine
+    /// 0% reading both serialized as `0.0` and rendered identically.
+    /// Sourced from [`csq_core::quota::AccountQuota::five_hour_pct_opt`] —
+    /// never the lossy `five_hour_pct()`. Renderers MUST show an absent
+    /// window distinctly from a measured zero.
+    pub five_hour_pct: Option<f64>,
+    /// Current 7-day quota percentage for the bound account, or `None`
+    /// when this row carries no 7-day window. See [`Self::five_hour_pct`]
+    /// — same caveat, same fix.
+    pub seven_day_pct: Option<f64>,
+    /// Whether this row carries a usage window AT ALL (either label).
     ///
-    /// Same caveat as [`Self::five_hour_pct`].
-    pub seven_day_pct: f64,
-    /// Whether the two percentages above are MEASUREMENTS.
+    /// `false` means the bound account has no quota row, or has one
+    /// carrying no usage window at all (a balance-metered slot such as
+    /// DeepSeek, or a weekly-only slot before its first poll) — `false`
+    /// gates the single "quota: n/a" badge in `SessionList.svelte`, since
+    /// (unlike `AccountList.svelte`) the session list has no separate
+    /// balance-widget rendering path to fall back to.
     ///
-    /// False when the bound account has no quota row, or has one carrying
-    /// no usage window at all (a balance-metered slot such as DeepSeek, or
-    /// a weekly-only slot before its first poll). Without this the badge
-    /// rendered `7d:0%` styled healthy for slots whose quota is simply not
-    /// observable — the same wire-format-default hazard `AccountView`
-    /// already carries `has_quota` to prevent. `SessionView` was missing
-    /// the companion field, so the session list could not tell the two
-    /// apart even though the account list could.
+    /// `true` does NOT mean BOTH windows are present — only that at
+    /// least one is (`AccountQuota::shows_window`'s OR, not AND). A row
+    /// can carry a `seven_day` window and no `five_hour` one and still
+    /// report `has_quota=true`; `five_hour_pct`/`seven_day_pct` being
+    /// `Option<f64>` is what lets the per-badge renderer distinguish that
+    /// case from a genuinely measured `0%` (C6, journal
+    /// `operator-surfaces`). Deliberately NOT changed to row-existence
+    /// (`AccountView.has_quota`'s stricter semantics) — the two fields
+    /// answer different questions for different UIs: `AccountView` also
+    /// gates a "Checking usage…" pending state that a balance-only row
+    /// must still reach, so it needs "did a row match" independent of
+    /// windows; `SessionView` has no such intermediate state, so
+    /// "does this row have anything to show" (`shows_window()`) is the
+    /// right predicate for its single fallback badge.
     pub has_quota: bool,
     /// Unix seconds since the process started, or null if the
     /// platform could not report it.
@@ -1739,6 +1879,22 @@ mod resolve_live_account_tests {
     }
 }
 
+/// Computes `SessionView`'s `(has_quota, five_hour_pct, seven_day_pct)`
+/// triple from a session's resolved quota row.
+///
+/// Pulled out of `list_sessions` (C6, journal `operator-surfaces`) as a
+/// pure function so the lossy-accessor fix — `has_quota` is `shows_window()`
+/// (true if EITHER window is present), while each percentage is sourced
+/// from the `_opt` accessor and stays `None` when ITS OWN window is absent
+/// — is unit-testable without depending on `csq_core::sessions::list()`'s
+/// live OS process enumeration, which has no fixture seam.
+fn session_quota_fields(row: Option<&AccountQuota>) -> (bool, Option<f64>, Option<f64>) {
+    let has_quota = row.map(|q| q.shows_window()).unwrap_or(false);
+    let five_hour_pct = row.and_then(|q| q.five_hour_pct_opt());
+    let seven_day_pct = row.and_then(|q| q.seven_day_pct_opt());
+    (has_quota, five_hour_pct, seven_day_pct)
+}
+
 /// Returns the list of live Claude Code sessions under the current
 /// user. Each entry is one terminal's `claude` process with the
 /// current account and 5-hour quota for its bound config dir.
@@ -1784,13 +1940,7 @@ pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
         // matter: a balance-metered slot has a row but no window, and its
         // percentages below are wire-format defaults rather than readings.
         let session_row = live_account.and_then(|id| quota.get(id));
-        let has_quota = session_row.map(|q| q.shows_window()).unwrap_or(false);
-        let five_hour_pct = session_row
-            .and_then(|q| q.five_hour_pct_opt())
-            .unwrap_or(0.0);
-        let seven_day_pct = session_row
-            .and_then(|q| q.seven_day_pct_opt())
-            .unwrap_or(0.0);
+        let (has_quota, five_hour_pct, seven_day_pct) = session_quota_fields(session_row);
 
         out.push(SessionView {
             pid: s.pid,
@@ -4023,7 +4173,7 @@ pub async fn complete_codex_login(
     let app_for_task = app.clone();
 
     // an internal journal entry finding 8: refuse concurrent invocations for any
-    // account. codex-cli writes to a single `CODEX_HOME/auth.json`
+    // account. codex-cli writes to a single `<CODEX_HOME>/auth.json`
     // and multiple spawns would race both the subprocess itself and
     // the post-login `save_canonical_for` + `remove_file` sequence.
     {
@@ -4826,8 +4976,8 @@ pub fn acknowledge_gemini_tos(base_dir: String) -> Result<(), String> {
 /// concretely.
 #[tauri::command]
 pub fn gemini_probe_tos_residue() -> Result<Option<String>, String> {
-    let home =
-        dirs::home_dir().ok_or_else(|| "could not resolve user home directory".to_string())?;
+    let home = csq_core::platform::home::home_dir()
+        .ok_or_else(|| "could not resolve user home directory".to_string())?;
     Ok(csq_core::providers::gemini::tos::probe_oauth_residue(&home)
         .map(|p| p.display().to_string()))
 }
@@ -6134,9 +6284,9 @@ mod tests {
             surface: "claude-code".into(),
             has_credentials: true,
             has_quota: false,
-            five_hour_pct: 0.0,
+            five_hour_pct: None,
             five_hour_resets_in: None,
-            seven_day_pct: 0.0,
+            seven_day_pct: None,
             seven_day_resets_in: None,
             updated_at: 0.0,
             token_status: "healthy".into(),
@@ -6231,9 +6381,9 @@ mod tests {
             surface: "claude-code".into(),
             has_credentials: true,
             has_quota: false,
-            five_hour_pct: 0.0,
+            five_hour_pct: None,
             five_hour_resets_in: None,
-            seven_day_pct: 0.0,
+            seven_day_pct: None,
             seven_day_resets_in: None,
             updated_at: 0.0,
             token_status: "healthy".into(),
@@ -6479,9 +6629,9 @@ mod tests {
             surface: "codex".into(),
             has_credentials: true,
             has_quota: true,
-            five_hour_pct: 10.0,
+            five_hour_pct: Some(10.0),
             five_hour_resets_in: Some(3600),
-            seven_day_pct: 5.0,
+            seven_day_pct: Some(5.0),
             seven_day_resets_in: Some(86_400),
             updated_at: 1_775_722_800.0,
             token_status: "healthy".into(),
@@ -6514,9 +6664,9 @@ mod tests {
             surface: "gemini".into(),
             has_credentials: true,
             has_quota: false,
-            five_hour_pct: 0.0,
+            five_hour_pct: None,
             five_hour_resets_in: None,
-            seven_day_pct: 0.0,
+            seven_day_pct: None,
             seven_day_resets_in: None,
             updated_at: 0.0,
             token_status: "healthy".into(),
@@ -6615,8 +6765,16 @@ mod tests {
             .expect("codex slot 7 visible");
         assert_eq!(v.surface, "codex");
         assert_eq!(v.source, "codex");
-        assert_eq!(v.five_hour_pct, 42.0, "codex 5h utilization must surface");
-        assert_eq!(v.seven_day_pct, 18.0, "codex 7d utilization must surface");
+        assert_eq!(
+            v.five_hour_pct,
+            Some(42.0),
+            "codex 5h utilization must surface"
+        );
+        assert_eq!(
+            v.seven_day_pct,
+            Some(18.0),
+            "codex 7d utilization must surface"
+        );
         assert!(v.five_hour_resets_in.is_some());
         assert!(v.seven_day_resets_in.is_some());
     }
@@ -6782,8 +6940,8 @@ mod tests {
             .expect("claude slot 4 visible");
         assert_eq!(v.surface, "claude-code");
         assert_eq!(v.source, "anthropic");
-        assert_eq!(v.five_hour_pct, 30.0);
-        assert_eq!(v.seven_day_pct, 60.0);
+        assert_eq!(v.five_hour_pct, Some(30.0));
+        assert_eq!(v.seven_day_pct, Some(60.0));
     }
 
     /// Decouple regression: the token badge "expiring" warning fires at
@@ -6864,11 +7022,11 @@ mod tests {
             .expect("codex slot 13 visible");
         assert_eq!(v.surface, "codex");
         assert_eq!(
-            v.five_hour_pct, 0.0,
+            v.five_hour_pct, None,
             "stale claude-code quota MUST NOT leak to a rebound codex slot"
         );
         assert_eq!(
-            v.seven_day_pct, 0.0,
+            v.seven_day_pct, None,
             "stale claude-code quota MUST NOT leak to a rebound codex slot"
         );
         assert!(v.five_hour_resets_in.is_none());
@@ -6921,8 +7079,8 @@ mod tests {
             v.has_quota,
             "kimi 3P slot with a matching quota row must report has_quota=true"
         );
-        assert_eq!(v.five_hour_pct, 34.0);
-        assert_eq!(v.seven_day_pct, 12.0);
+        assert_eq!(v.five_hour_pct, Some(34.0));
+        assert_eq!(v.seven_day_pct, Some(12.0));
     }
 
     /// Native Kimi CLI slot: quota row surface is "kimi-cli", account
@@ -6957,8 +7115,8 @@ mod tests {
             v.has_quota,
             "native kimi slot with a matching 'kimi-cli' row must report has_quota=true"
         );
-        assert_eq!(v.five_hour_pct, 55.0);
-        assert_eq!(v.seven_day_pct, 20.0);
+        assert_eq!(v.five_hour_pct, Some(55.0));
+        assert_eq!(v.seven_day_pct, Some(20.0));
     }
 
     /// Negative control: Grok has no dedicated poller and must keep the
@@ -7123,12 +7281,18 @@ mod tests {
              while a real usage window exists"
         );
         assert_eq!(
-            v.seven_day_pct, 7.0,
+            v.seven_day_pct,
+            Some(7.0),
             "the window the balance was hiding must reach the frontend"
         );
         assert_eq!(
-            v.five_hour_pct, 0.0,
-            "the absent 5h window must not be fabricated from the 7d value"
+            v.five_hour_pct, None,
+            "the absent 5h window must render as ABSENT, not a fabricated \
+             `Some(0.0)` — C2 (journal `operator-surfaces`): before this fix \
+             `AccountView` sourced this field from the lossy `five_hour_pct()` \
+             accessor, so an absent window and a genuine 0% reading were both \
+             `0.0` on the wire. `has_quota=true` here (asserted below) is a \
+             ROW-level flag — it does not mean this SPECIFIC window is present."
         );
         assert!(v.has_quota, "a slot with a real row reports has_quota=true");
     }
@@ -7185,8 +7349,8 @@ mod tests {
              window-carrying row loses balance_display on EVERY surface, not \
              just Grok"
         );
-        assert_eq!(v.five_hour_pct, 12.0, "the 5h window must survive");
-        assert_eq!(v.seven_day_pct, 55.0, "the 7d window must survive");
+        assert_eq!(v.five_hour_pct, Some(12.0), "the 5h window must survive");
+        assert_eq!(v.seven_day_pct, Some(55.0), "the 7d window must survive");
     }
 
     /// `has_quota` distinguishes "no row yet" from "measured 0%" — a
@@ -7210,7 +7374,114 @@ mod tests {
             !v.has_quota,
             "no quota row yet must report has_quota=false, not a bare 0.0"
         );
-        assert_eq!(v.five_hour_pct, 0.0);
+        assert_eq!(v.five_hour_pct, None);
+    }
+
+    // ── C6 (journal `operator-surfaces`) — session_quota_fields ─────────
+    //
+    // Same bug class as C2 (`AccountView.five_hour_pct`/`seven_day_pct`):
+    // `SessionView`'s row could match (`has_quota=true`, an OR of both
+    // windows) while carrying a window for only ONE of the two labels.
+    // Before this fix the percentages were sourced from the lossy
+    // `five_hour_pct()`/`seven_day_pct()` accessors (`unwrap_or(0.0)`), so
+    // the absent window and a real 0% reading both surfaced as `0.0`.
+
+    /// No row at all (fresh slot, not yet polled): `has_quota=false` and
+    /// both percentages are `None` — never a bare `Some(0.0)`.
+    #[test]
+    fn session_quota_fields_no_row_reports_has_quota_false() {
+        let (has_quota, five_hour_pct, seven_day_pct) = session_quota_fields(None);
+        assert!(!has_quota);
+        assert_eq!(five_hour_pct, None);
+        assert_eq!(seven_day_pct, None);
+    }
+
+    /// A row with a `seven_day` window and no `five_hour` one (a
+    /// weekly-only plan): `has_quota=true` (the OR), but `five_hour_pct`
+    /// MUST be `None`, not a fabricated `Some(0.0)`.
+    #[test]
+    fn session_quota_fields_seven_day_only_leaves_five_hour_none() {
+        use csq_core::quota::{AccountQuota, UsageWindow};
+        let row = AccountQuota {
+            seven_day: Some(UsageWindow {
+                used_percentage: 12.0,
+                resets_at: 1_700_000_000,
+            }),
+            ..AccountQuota::default()
+        };
+        let (has_quota, five_hour_pct, seven_day_pct) = session_quota_fields(Some(&row));
+        assert!(
+            has_quota,
+            "a row with only a 7-day window still has SOME window"
+        );
+        assert_eq!(
+            five_hour_pct, None,
+            "the absent 5h window must not be fabricated as Some(0.0)"
+        );
+        assert_eq!(seven_day_pct, Some(12.0));
+    }
+
+    /// A row with a `five_hour` window and no `seven_day` one:
+    /// symmetric to the above — `seven_day_pct` MUST be `None`.
+    #[test]
+    fn session_quota_fields_five_hour_only_leaves_seven_day_none() {
+        use csq_core::quota::{AccountQuota, UsageWindow};
+        let row = AccountQuota {
+            five_hour: Some(UsageWindow {
+                used_percentage: 34.0,
+                resets_at: 1_700_000_000,
+            }),
+            ..AccountQuota::default()
+        };
+        let (has_quota, five_hour_pct, seven_day_pct) = session_quota_fields(Some(&row));
+        assert!(has_quota);
+        assert_eq!(five_hour_pct, Some(34.0));
+        assert_eq!(
+            seven_day_pct, None,
+            "the absent 7d window must not be fabricated as Some(0.0)"
+        );
+    }
+
+    /// A row carrying no window at all (e.g. a balance-only row):
+    /// `has_quota=false`, matching the no-row case above — SessionList
+    /// has no separate balance-widget path, so this is the single
+    /// fallback "quota: n/a" state.
+    #[test]
+    fn session_quota_fields_balance_only_row_reports_has_quota_false() {
+        use csq_core::quota::{AccountQuota, BalanceInfo};
+        let row = AccountQuota {
+            balance: Some(BalanceInfo {
+                currency: "USD".into(),
+                remaining: 4.20,
+            }),
+            ..AccountQuota::default()
+        };
+        let (has_quota, five_hour_pct, seven_day_pct) = session_quota_fields(Some(&row));
+        assert!(!has_quota);
+        assert_eq!(five_hour_pct, None);
+        assert_eq!(seven_day_pct, None);
+    }
+
+    /// Both windows present: both percentages surface as their real
+    /// measurements — the ordinary, non-split case.
+    #[test]
+    fn session_quota_fields_both_windows_present_surface_both() {
+        use csq_core::quota::{AccountQuota, UsageWindow};
+        let row = AccountQuota {
+            five_hour: Some(UsageWindow {
+                used_percentage: 10.0,
+                resets_at: 1_700_000_000,
+            }),
+            seven_day: Some(UsageWindow {
+                used_percentage: 5.0,
+                resets_at: 1_700_000_000,
+            }),
+            ..AccountQuota::default()
+        };
+        let (has_quota, five_hour_pct, seven_day_pct) = session_quota_fields(Some(&row));
+        assert!(has_quota);
+        assert_eq!(five_hour_pct, Some(10.0));
+        assert_eq!(seven_day_pct, Some(5.0));
     }
 
     // ── PR-C9a an internal journal entry — set_codex_slot_model surface verification ─
@@ -9021,7 +9292,7 @@ mod tests {
         )
         .unwrap();
 
-        let pairs = aggregate_usage_pairs(&base, now);
+        let pairs = aggregate_usage_pairs(&base, now).unwrap();
 
         // Slot 4 sees the event with the real transcript model (deepseek).
         let s4 = summarize_slot(&pairs, AccountNum::try_from(4u16).unwrap(), now);
@@ -9032,6 +9303,78 @@ mod tests {
         // Slot 7 (no launch event) sees nothing.
         let s7 = summarize_slot(&pairs, AccountNum::try_from(7u16).unwrap(), now);
         assert_eq!(s7.event_count, 0);
+    }
+
+    #[test]
+    fn runtime_manifest_desktop_scan_reads_changed_prices_without_rebuild() {
+        let _env = csq_core::platform::test_env::lock();
+        let home = tempfile::TempDir::new().unwrap();
+        let claude_home = home.path().join(".claude");
+        let base = claude_home.join("accounts");
+        let projects = claude_home.join("projects/private-manifest");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let transcript = projects.join("private-fixture.jsonl");
+        std::fs::write(&transcript, serde_json::json!({
+            "type": "assistant", "cwd": "/private/manifest-fixture", "timestamp": "2026-09-14T11:30:00Z", "sessionId": "private-manifest-fixture",
+            "message": {"model": "deepseek-flash", "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}
+        }).to_string()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(now.into())
+            .unwrap();
+        csq_core::usage::launch_log::append(
+            &base,
+            &csq_core::usage::launch_log::LaunchEvent {
+                ts: "2026-09-14T11:00:00Z".into(),
+                event: "run".into(),
+                slot: 11,
+                pid: 1,
+                project_path: "/private/manifest-fixture".into(),
+            },
+        )
+        .unwrap();
+        let original_transcript = std::fs::read(&transcript).unwrap();
+        let account = AccountNum::try_from(11u16).unwrap();
+        for price in [1.0, 4.0] {
+            let mut manifest =
+                serde_json::to_value(csq_core::providers::model_manifest::ModelManifest::bundled())
+                    .unwrap();
+            manifest["rates"] = serde_json::json!([{
+                "match_kind": "exact", "patterns": ["deepseek-flash"], "strip_context_hint": false,
+                "epochs": [{"start_unix": null, "end_unix": null, "peak": null,
+                    "rate": {"input_per_1m_usd": price, "output_per_1m_usd": 0.0, "cache_read_per_1m_usd": null, "cache_write_per_1m_usd": null}}],
+                "evidence": "Private synthetic fixture, not vendor pricing"
+            }]);
+            std::fs::write(
+                base.join("model-rates.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let pairs = aggregate_usage_pairs(&base, now).unwrap();
+            let summary = summarize_slot(&pairs, account, now);
+            assert_eq!(summary.event_count, 1);
+            assert_eq!(summary.total_cost_usd, price);
+            assert_eq!(summary.unestimated_cost_count, 0);
+        }
+        assert_eq!(std::fs::read(transcript).unwrap(), original_transcript);
+    }
+
+    #[test]
+    fn runtime_manifest_desktop_cold_start_rejects_invalid_present_file() {
+        let _env = csq_core::platform::test_env::lock();
+        let home = tempfile::TempDir::new().unwrap();
+        let base = home.path().join(".claude/accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("model-rates.json"), "{").unwrap();
+        let error = get_account_usage(base.to_string_lossy().into_owned(), 11).unwrap_err();
+        assert!(error.starts_with("MODEL_MANIFEST:"), "{error}");
+        assert!(aggregate_usage_pairs(&base, chrono::Utc::now()).is_err());
     }
 
     /// The Tauri command is non-blocking: it returns a summary immediately
@@ -9080,6 +9423,14 @@ mod tests {
             cost_usd_estimate: Some(0.05),
             source: csq_core::usage::ledger::UsageSource::ProjectsJsonl,
             project_path: None,
+            // an internal ticket made one UsageEvent one normalized REQUEST and added four
+            // coverage diagnostics. All four are `#[serde(default)]`, so the
+            // on-disk ledger shape is unchanged — but a struct LITERAL must
+            // still name them. Mechanical fixture completion; no behaviour.
+            snapshots_collapsed: 0,
+            finalization_divergent: false,
+            from_subagent: false,
+            unidentified: false,
         };
         csq_core::usage::ledger::write_all(&base, slot, std::slice::from_ref(&ev)).unwrap();
 
@@ -9141,6 +9492,21 @@ mod tests {
             today_cost_usd: 0.0,
             event_count: 0,
             unestimated_cost_count: 0,
+            total_cache_creation_tokens: 0,
+            total_cache_read_tokens: 0,
+            last_30d_cache_creation_tokens: 0,
+            last_30d_cache_read_tokens: 0,
+            last_7d_cache_creation_tokens: 0,
+            last_7d_cache_read_tokens: 0,
+            last_5d_cache_creation_tokens: 0,
+            last_5d_cache_read_tokens: 0,
+            today_cache_creation_tokens: 0,
+            today_cache_read_tokens: 0,
+            request_count: 0,
+            duplicate_snapshots_collapsed: 0,
+            finalization_divergent_requests: 0,
+            subagent_request_count: 0,
+            unidentified_request_count: 0,
         };
         assert_ipc_keys_whitelisted(
             &v,
@@ -9162,6 +9528,26 @@ mod tests {
                 "today_cost_usd",
                 "event_count",
                 "unestimated_cost_count",
+                // an internal ticket. Each key below was reviewed against MUST Rule 3
+                // before being admitted: all fifteen are aggregate COUNTS —
+                // token totals and coverage tallies — carrying no credential,
+                // no path, no session or request id, and nothing that
+                // identifies a project. They are safe for the renderer.
+                "total_cache_creation_tokens",
+                "total_cache_read_tokens",
+                "last_30d_cache_creation_tokens",
+                "last_30d_cache_read_tokens",
+                "last_7d_cache_creation_tokens",
+                "last_7d_cache_read_tokens",
+                "last_5d_cache_creation_tokens",
+                "last_5d_cache_read_tokens",
+                "today_cache_creation_tokens",
+                "today_cache_read_tokens",
+                "request_count",
+                "duplicate_snapshots_collapsed",
+                "finalization_divergent_requests",
+                "subagent_request_count",
+                "unidentified_request_count",
             ],
         );
     }

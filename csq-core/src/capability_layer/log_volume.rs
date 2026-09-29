@@ -6,9 +6,9 @@
 //!
 //! This module is the stdlib-only primitive layer. The
 //! `tracing-subscriber::Layer` impl that consumes these primitives lives
-//! in `csq-cli/src/log_volume_layer.rs` so `csq-core` does not pull
+//! in `csq/src/cli/log_volume_layer.rs` so `csq-core` does not pull
 //! `tracing-subscriber` as a dependency (workspace `Cargo.toml` keeps
-//! that crate `csq-cli`-only).
+//! that crate on the `csq` side).
 //!
 //! # Why thread_local only
 //!

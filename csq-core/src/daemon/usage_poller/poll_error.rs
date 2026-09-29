@@ -214,12 +214,15 @@ mod tests {
     }
 
     /// Structural guard for the gap above: every `return Err(...)` that
-    /// `post_json_node`, `post_json_node_with_date`, and `get_bearer_node`
-    /// (all three Node-transport pre-flight guards, round-7 redteam A-M2 —
+    /// `post_json_node`, `post_json_node_with_date`, `get_bearer_node`,
+    /// and `get_bearer_node_with_retry_after`
+    /// (all four Node-transport pre-flight guards, round-7 redteam A-M2 —
     /// the ORIGINAL version of this test scanned only `get_bearer_node`,
-    /// silently excluding the other two because it anchored on
-    /// `get_bearer_node` and kept only the file TAIL, and the other two
-    /// functions are defined earlier in `http/mod.rs`) can emit BEFORE the
+    /// silently excluding the others because it anchored on
+    /// `get_bearer_node` and kept only the file TAIL, and the other
+    /// functions are defined earlier in `http/mod.rs`; `get_bearer_node_with_retry_after`
+    /// was added 2026-09-11 for retry-after support and listed here from
+    /// the start rather than repeating that omission) can emit BEFORE the
     /// request leaves the process is a pre-flight URL/credential
     /// rejection, and every one of them must be a shared `ERR_*` constant
     /// the classifier can compare against. An inline literal at a
@@ -260,6 +263,7 @@ mod tests {
             "post_json_node",
             "post_json_node_with_date",
             "get_bearer_node",
+            "get_bearer_node_with_retry_after",
         ] {
             assert_pre_flight_region_uses_shared_constants(src, fn_name);
         }

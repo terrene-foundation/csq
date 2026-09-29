@@ -152,14 +152,14 @@ impl std::error::Error for LogoutError {}
 ///     `.csq-account` symlink resolves to `account`. If any exist,
 ///     return `InUse` listing the PIDs.
 ///  3. Delete each surface-shaped canonical file (best-effort if
-///     absent) — see [`ALL_SURFACES`]. The pre-PR-fix code only
+///     absent) — see `ALL_SURFACES`. The pre-PR-fix code only
 ///     swept the ClaudeCode shape, so logging out a Codex or Gemini
 ///     slot left its credential file on disk and `discover_codex` /
 ///     `discover_gemini` continued to surface the slot to the
 ///     dashboard. Originating bug: this session, slot 12 (Codex)
 ///     surviving `csq logout 12`.
 ///  4. Delete the slot's native-CLI (Kimi/Grok) vendor home directory
-///     (best-effort if absent) — see [`remove_native_homes`]. The vendor's
+///     (best-effort if absent) — see `remove_native_homes`. The vendor's
 ///     real credentials live there, not in the marker swept in step 3.
 ///  5. Delete `config-N/` recursively (best-effort if absent).
 ///  6. Remove the `account` entry from `profiles.json` (if present).
@@ -249,7 +249,7 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
         let vault = match open_default_vault() {
             Ok(v) => v,
             Err(e) => {
-                let _ = emit_logout_outcome(
+                emit_logout_outcome(
                     base_dir,
                     &chain_id,
                     correlation_id,
@@ -267,7 +267,7 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
             }
         };
         if let Err(e) = delete_api_key_from_vault(base_dir, account, vault.as_ref()) {
-            let _ = emit_logout_outcome(
+            emit_logout_outcome(
                 base_dir,
                 &chain_id,
                 correlation_id,
@@ -321,7 +321,7 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 // Partial failure → emit OUTCOME:Failed best-effort, then return error.
-                let _ = emit_logout_outcome(
+                emit_logout_outcome(
                     base_dir,
                     &chain_id,
                     correlation_id,
@@ -350,7 +350,7 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            let _ = emit_logout_outcome(
+            emit_logout_outcome(
                 base_dir,
                 &chain_id,
                 correlation_id,
@@ -401,7 +401,7 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
     let profiles_lock = match ProfilesFileLock::acquire(base_dir) {
         Ok(l) => l,
         Err(e) => {
-            let _ = emit_logout_outcome(
+            emit_logout_outcome(
                 base_dir,
                 &chain_id,
                 correlation_id,
@@ -419,7 +419,7 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
         match remove_profiles_entry(&profiles_lock, base_dir, account) {
             Ok(r) => r,
             Err(e) => {
-                let _ = emit_logout_outcome(
+                emit_logout_outcome(
                     base_dir,
                     &chain_id,
                     correlation_id,
@@ -447,11 +447,22 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
     // yields `orphaned_uuid == None` → the dir is preserved for the sibling
     // slot. NotFound is treated as success (the GC pass may have raced).
     let identity_dir_removed = match orphaned_uuid {
-        Some(uuid) => match std::fs::remove_dir_all(identity_path(base_dir, uuid)) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(_) => false, // best-effort; the GC pass collects it next start
-        },
+        Some(uuid) => {
+            let removed = match std::fs::remove_dir_all(identity_path(base_dir, uuid)) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => false, // best-effort; the GC pass collects it next start
+            };
+            // `keychain-fix-r11.md` D-5: mark this uuid REMOVED regardless of
+            // whether the dir physically existed to delete — the intent
+            // ("this identity is logged out") is the same either way, and
+            // the tombstone is what stops a racing refresher/backsync/adopt
+            // write (`credentials::file::save_uuid_credentials`, which
+            // shares no lock with this call) from silently recreating it.
+            // A fresh login for this SAME uuid clears the marker.
+            crate::accounts::identity_store::mark_identity_removed(base_dir, uuid);
+            removed
+        }
         None => false,
     };
 
@@ -459,7 +470,7 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
 
     // M13b — emit OUTCOME:Ok with the resolved orphaned_uuid.
     let outcome_orphaned_uuid = orphaned_uuid.map(|u| u.to_string());
-    let _ = emit_logout_outcome(
+    emit_logout_outcome(
         base_dir,
         &chain_id,
         correlation_id,
@@ -527,21 +538,26 @@ fn remove_native_homes(base_dir: &Path, account: AccountNum) -> bool {
 /// on the committed audit chain.
 ///
 /// FIX-7: `io::Error` messages from `remove_file` / `remove_dir_all` can
-/// contain the full filesystem path. Replacing `$HOME` with `<home>` prevents
-/// the user's username from appearing in exported audit bundles.
+/// contain the full filesystem path.
+///
+/// S-LOW-A / C-B5 (round 8b): was an independent, byte-identical copy of
+/// the naive `raw.replace(&home, "<home>")` implementation — destructive
+/// when `HOME` is `/` (replaces every path separator in `raw`) and blind to
+/// an OS-canonicalized home path that differs from the literal `$HOME` env
+/// var. Delegates to `op_emit::redact_reason`, which fixes both, so this
+/// crate has exactly one home-directory-scrub implementation rather than
+/// two drifting independently.
 fn logout_redact_reason(raw: &str) -> RedactedString {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let scrubbed = if !home.is_empty() {
-        raw.replace(&home, "<home>")
-    } else {
-        raw.to_string()
-    };
-    RedactedString::from_untrusted(scrubbed)
+    crate::audit::op_emit::redact_reason(raw)
 }
 
-/// Emit an OUTCOME record for a logout operation. Best-effort — errors are
-/// silently discarded (the side effect has already run; the intent is either
-/// resolved or becomes a visible orphan for `csq doctor`).
+/// Emit an OUTCOME record for a logout operation. Best-effort — the side
+/// effect has already run by the time this is called (the intent is either
+/// resolved or becomes a visible orphan for `csq doctor`), so a write
+/// failure here does NOT propagate as an error to the caller. It IS logged:
+/// S-LOW-C (round 9), the same fixed-vocabulary `audit_outcome_emit_failed`
+/// WARN `move_slot::emit_failed` uses, so a failed OUTCOME write is
+/// observable rather than silently discarded.
 fn emit_logout_outcome(
     base_dir: &Path,
     chain_id: &str,
@@ -550,24 +566,36 @@ fn emit_logout_outcome(
     orphaned_uuid: Option<&str>,
     result: OpOutcome,
     intent_emitted: bool,
-) -> Result<(), crate::audit::persist::AuditV2Error> {
+) {
     // FIX-1: if the intent was skipped (chain broken), skip the outcome too —
     // there is no correlation_id on the chain to match against.
     if !intent_emitted {
-        return Ok(());
+        return;
     }
     let payload = EventPayload::AccountLogout(AccountLogoutPayload {
         slot: account,
         orphaned_uuid: orphaned_uuid.map(|s| s.to_owned()),
     });
-    op_emit::emit_outcome(
+    if let Err(e) = op_emit::emit_outcome(
         base_dir,
         chain_id,
         EventKind::AccountLogout,
         payload,
         correlation_id,
         result,
-    )
+    ) {
+        // S-LOW-C (round 9): best-effort audit trail — the logout already
+        // ran by this point, so a WARN is correct, not a propagated error.
+        // `e.fixed_tag()` is a fixed vocabulary (`security.md` MUST-2).
+        tracing::warn!(
+            error_kind = "audit_outcome_emit_failed",
+            op = "logout",
+            audit_error_kind = e.fixed_tag(),
+            "logout: failed to emit AccountLogout OUTCOME record (op already \
+             completed; audit trail incomplete — the INTENT is left as an \
+             orphan for scan_orphan_intents)"
+        );
+    }
 }
 
 /// Removes the `account` entry from `quota.json` so a recycled slot
@@ -830,10 +858,12 @@ fn bound_handle_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
 /// "never the sole copy." Refusing the entire logout on a keychain timeout
 /// is still the wrong trade (a locked/unreachable keychain is a common,
 /// transient, RECOVERABLE operator condition — headless / SSH / tmux
-/// session with no Aqua session, `security.md` §6 — and every EXISTING
-/// caller of `keychain::clear_handle_dir`, `csq swap` / `auto_rotate`, is
-/// already fire-and-forget for the same reason; refusing would trap an
-/// operator who most needs to remove a compromised or leaked slot). So
+/// session with no Aqua session, `security.md` §6 — refusing here would
+/// trap an operator who most needs to remove a compromised or leaked slot;
+/// unlike `csq swap` / `auto_rotate`'s v4 forced write — which correctly
+/// refuses the SWITCH on the same condition, per `force_sync_account_changed`
+/// — a logout has nothing left to protect by refusing: the file copies are
+/// deleted either way, a few statements later). So
 /// instead of accepting that residual as permanent, an unconfirmed clear is
 /// queued via [`crate::credentials::keychain::record_pending_clear`] and
 /// retried by the daemon's periodic sweep and `csq run`'s opportunistic
@@ -892,9 +922,18 @@ fn clear_bound_keychain_items(base_dir: &Path, account: AccountNum) -> bool {
             // for retry by the daemon's periodic sweep and by `csq run`'s
             // opportunistic sweep, rather than leaving it a silent, permanent
             // orphan the moment `config_dir` disappears below.
+            // `keychain-fix-r9.md` S-M-1/D-F2: `Logout` origin — the retry
+            // repeats the SAME unconditional delete-by-service-name this
+            // call just attempted (`clear_handle_dir_reporting`, above),
+            // never decide+adopt. No candidate email or account-attribute
+            // hint is needed for that disposition.
             crate::credentials::keychain::record_pending_clear(
                 base_dir,
                 &crate::credentials::keychain::service_name(&abs),
+                Some(account),
+                crate::credentials::keychain::PendingClearOrigin::Logout,
+                None,
+                None,
             );
         }
     }

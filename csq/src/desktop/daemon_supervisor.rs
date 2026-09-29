@@ -50,7 +50,8 @@ use tokio_util::sync::CancellationToken;
 // named pipe instead of a Unix socket.
 use csq_core::accounts::AccountInfo;
 use csq_core::daemon::{
-    server as daemon_server, HttpGetFn, HttpPostFn, HttpPostFnCodex, HttpPostProbeFn, TtlCache,
+    server as daemon_server, HttpGetFn, HttpGetWithRetryAfterFn, HttpPostFn, HttpPostFnCodex,
+    HttpPostProbeFn, TtlCache,
 };
 use csq_core::http;
 use csq_core::oauth::OAuthStateStore;
@@ -230,8 +231,34 @@ mod sigterm_bridge_tests {
     /// inside `signal()` itself, before any task runs) a scheduling
     /// point to complete before the raise — a scheduling nicety, not a
     /// correctness requirement, since the syscall itself is synchronous.
+    /// Item 4 (D-F3): this bridge registers via `tokio`'s
+    /// `signal-hook-registry`, while `cli_deps::auto_update`'s
+    /// `InterruptSignalGuard` and `codex_supervise::drive_child` both
+    /// install raw `libc::signal(SIGTERM, ..)` handlers — a mechanism that
+    /// silently OVERWRITES whatever `signal-hook-registry` installed for
+    /// the remainder of the process. All three touch the SAME process-wide
+    /// `SIGTERM` disposition, and this crate's default feature set
+    /// compiles `desktop` alongside `cli`/`enterprise` into one test
+    /// binary, so `cargo test`'s default parallel runner can genuinely
+    /// interleave this test with either of the other two. Held across the
+    /// awaits below deliberately: the race window this guards is exactly
+    /// "another test mutates SIGTERM disposition between this test's
+    /// install and its own raise+await", which spans both await points.
+    ///
+    /// `await_holding_lock`: this `std::sync::Mutex` guard IS intentionally
+    /// held across the awaits below — see the doc above for why the race
+    /// window it closes spans both of them. Nothing else in THIS test's
+    /// own async context contends for the SAME lock while it is held (the
+    /// two-worker-thread runtime is sized for the one other task this test
+    /// spawns, not for a second lock acquirer), so the usual deadlock risk
+    /// the lint warns about does not apply here; the risk this lock
+    /// defends against is cross-TEST signal-disposition interleaving, not
+    /// an in-test lock-ordering hazard.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unix_sigterm_bridge_cancels_the_token() {
+        let _signal_guard = csq_core::platform::test_env::signal_lock();
+
         let cancel = CancellationToken::new();
         install_unix_sigterm_bridge(cancel.clone());
         tokio::task::yield_now().await;
@@ -252,7 +279,7 @@ mod sigterm_bridge_tests {
 /// subsystems, await cancellation, drain cleanly.
 ///
 /// Mirrors the CLI `csq daemon start` startup sequence in
-/// `csq-cli/src/commands/daemon.rs` so the subsystem composition
+/// `csq/src/cli/commands/daemon.rs` so the subsystem composition
 /// stays in exactly one shape — refresher + usage poller +
 /// auto-rotate + server, all sharing a single shutdown token.
 ///
@@ -303,6 +330,13 @@ async fn run_daemon(
     let http_get: HttpGetFn = Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
         http::get_bearer_node(url, token, headers)
     });
+    // Anthropic-only sibling transport that additionally captures the
+    // `retry-after` response header (see
+    // `csq-core/src/daemon/usage_poller/mod.rs::HttpGetWithRetryAfterFn`).
+    let http_get_retry_after: HttpGetWithRetryAfterFn =
+        Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+            http::get_bearer_node_with_retry_after(url, token, headers)
+        });
     let http_post_probe: HttpPostProbeFn =
         Arc::new(|url: &str, headers: &[(String, String)], body: &str| {
             http::post_json_with_headers(url, headers, body)
@@ -316,17 +350,22 @@ async fn run_daemon(
     // path has the same audit health signal and sentinel as the CLI path.
     // Run synchronous verify_chain in a spawn_blocking call to keep the
     // async runtime free during disk I/O.
-    let audit_health: csq_core::audit::AuditHealth = {
-        // FIX-5b: clamp timeout floor to 1s (same as CLI daemon).
-        let timeout_secs: u64 = std::env::var("CSQ_AUDIT_VERIFY_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|v| v.max(1))
-            .unwrap_or(5);
+    let (audit_health, audit_records_unverified): (csq_core::audit::AuditHealth, u64) = {
         let record_limit: usize = std::env::var("CSQ_AUDIT_VERIFY_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
+        // FIX-5b: clamp timeout floor to 1s (same as CLI daemon). Absent an
+        // explicit override, the default scales with the CONFIGURED
+        // record_limit — see `derive_audit_verify_timeout_secs` (mirrored
+        // from the CLI daemon path per this block's own FIX-2 comment).
+        let timeout_secs: u64 = std::env::var("CSQ_AUDIT_VERIFY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or_else(|| {
+                crate::cli::commands::daemon::derive_audit_verify_timeout_secs(record_limit)
+            });
         let verify_cfg = csq_core::audit::VerifyConfig {
             record_limit,
             keychain_service: csq_core::audit::AUDIT_SIGNING_SERVICE_NAME.to_string(),
@@ -352,24 +391,59 @@ async fn run_daemon(
             );
             csq_core::audit::verify_chain(&base_for_verify, &verify_cfg, None)
         });
+        // Set by the two Ok(Ok(Ok(summary))) arms below — mirrors the CLI
+        // daemon path's `records_unverified` (FIX-2 parity).
+        let mut records_unverified: u64 = 0;
         let health = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             verify_future,
         )
         .await
         {
-            Ok(Ok(Ok(summary))) if summary.historical_key_gaps.is_empty() => {
-                log::info!("audit chain verified clean (desktop daemon startup)");
-                csq_core::audit::AuditHealth::Verified
-            }
+            // SINGLE PRODUCER — twin parity with the CLI daemon's
+            // `attempt_audit_verify`. `from_verify_result` owns the
+            // summary→verdict mapping; hand-constructing `Verified` here is
+            // what let this twin keep reporting a whole-chain verdict on a
+            // truncated scan (`guard-reader-writer-parity.md` MUST NOT #2 —
+            // an exhaustive match binds CONSUMERS, not PRODUCERS).
             Ok(Ok(Ok(summary))) => {
-                log::warn!(
-                    "audit chain DEGRADED ({} historical-key gap(s)) (desktop daemon startup)",
-                    summary.historical_key_gaps.len()
-                );
-                csq_core::audit::AuditHealth::Degraded {
-                    gaps: summary.historical_key_gaps,
+                records_unverified = summary.limit_exceeded_count;
+                let health = csq_core::audit::AuditHealth::from_verify_result(&Ok(summary));
+                match &health {
+                    csq_core::audit::AuditHealth::Verified => {
+                        log::info!(
+                            "audit chain verified clean (desktop daemon startup); \
+                             records_unverified={records_unverified}"
+                        );
+                    }
+                    csq_core::audit::AuditHealth::TailVerified { skipped } => {
+                        log::warn!(
+                            "audit chain TAIL-VERIFIED (desktop daemon startup) — the \
+                             {skipped} oldest record(s), INCLUDING the genesis, were NOT \
+                             scanned, so the surviving window's first record is anchored \
+                             to nothing. The audit subsystem stays operational; raise \
+                             CSQ_AUDIT_VERIFY_LIMIT above the chain length for \
+                             whole-chain coverage."
+                        );
+                    }
+                    csq_core::audit::AuditHealth::Degraded { gaps } => {
+                        log::warn!(
+                            "audit chain DEGRADED ({} historical-key gap(s)) (desktop daemon startup)",
+                            gaps.len()
+                        );
+                    }
+                    // Unreachable by construction — see the CLI twin's note.
+                    // Enumerated rather than wildcarded so a future variant
+                    // forces a decision here too.
+                    csq_core::audit::AuditHealth::Broken { .. }
+                    | csq_core::audit::AuditHealth::Unknown { .. } => {
+                        log::warn!(
+                            "audit verify mapped a clean summary to an error verdict \
+                             (desktop daemon startup)"
+                        );
+                    }
                 }
+                health
             }
             Ok(Ok(Err(ref e))) => {
                 let h = csq_core::audit::AuditHealth::from_ledger_error(e);
@@ -440,7 +514,10 @@ Run `csq audit verify --full` for diagnosis."
         // FIX-2: Unknown (timeout/panic) leaves sentinel UNCHANGED — a transient
         // condition must not produce a durable write-lockout that outlives it.
         match &health {
+            // TailVerified clears alongside Verified/Degraded — outgrowing the
+            // record limit is not brokenness. Coverage is reported separately.
             csq_core::audit::AuditHealth::Verified
+            | csq_core::audit::AuditHealth::TailVerified { .. }
             | csq_core::audit::AuditHealth::Degraded { .. } => {
                 csq_core::audit::clear_chain_broken(base_dir);
             }
@@ -453,7 +530,7 @@ Run `csq audit verify --full` for diagnosis."
             }
         }
 
-        health
+        (health, records_unverified)
     };
 
     // Clone before move into router_state so the anchor gate below can consult it.
@@ -472,7 +549,15 @@ Run `csq audit verify --full` for diagnosis."
         base_dir: Arc::new(base_dir.to_path_buf()),
         oauth_store: Some(Arc::clone(&oauth_store)),
         gemini_consumer: gemini_consumer.clone(),
-        audit_health,
+        // NOTE (scope): wrapped in the shared handle for type parity with the
+        // standalone daemon's `RouterState`, but the in-process desktop
+        // supervisor does NOT run the bounded verify-retry
+        // (`csq/src/cli/commands/daemon.rs::spawn_audit_verify_retry`) — an
+        // `Unknown` startup health here is never promoted without an app
+        // restart. Extending the retry to this path is unverified scope, not
+        // silently covered by this wrap.
+        audit_health: csq_core::audit::new_shared(audit_health),
+        audit_records_unverified,
         anchor_sink: anchor_sink_desktop.clone(),
         // an internal ticket — seed the interactive enforcement registry from the fail-closed
         // §10.5 activation gate (absent → empty/503).
@@ -489,7 +574,7 @@ Run `csq audit verify --full` for diagnosis."
                 Some(crate::kailash_governor::make_governor_factory()),
                 // T-M4.5 — inject the lifecycle-audit-sink factory (twin of the CLI
                 // daemon path) so every session records a signed audit trail.
-                Some(crate::kailash_audit_sink::make_audit_sink_factory()),
+                Some(crate::kailash_audit_sink::make_audit_sink_factory(base_dir)),
             );
             // M3 §10.5 W2b — inject the EATP born-canonical genesis guard (twin
             // of the CLI daemon path). Classifies the genesis record on every
@@ -578,6 +663,7 @@ Run `csq audit verify --full` for diagnosis."
     let usage_poller = daemon::spawn_usage_poller(
         base_dir.to_path_buf(),
         http_get,
+        http_get_retry_after,
         http_post_probe,
         gemini_consumer.clone(),
         shutdown.clone(),
@@ -776,10 +862,16 @@ fn resolve_anchor_sink_desktop(
             match csq_core::audit::impls::sinks::rekor::RekorSink::with_defaults() {
                 Ok(s) => {
                     // HONEST LABEL: M07 in-memory mock substrate — not a durable witness.
-                    // See the CLI resolver's comment for the full rationale.
+                    // See the CLI resolver's comment for the full rationale. The
+                    // `event=anchor_sink_mock_backend` token is included so the
+                    // same grep primitive that finds the CLI resolver's structured
+                    // `tracing::warn!` event also finds this `log::warn!` (the
+                    // `log` crate has no key=value fields, so the token is
+                    // embedded in the message text instead).
                     log::warn!(
-                        "rekor sink uses the in-memory M07 substrate (non-persistent); \
-                         real Sigstore Rekor HTTP client is a pending follow-up"
+                        "event=anchor_sink_mock_backend sink=rekor rekor sink uses the \
+                         in-memory M07 substrate (non-persistent); real Sigstore Rekor \
+                         HTTP client is a pending follow-up"
                     );
                     Some(std::sync::Arc::new(s))
                 }
@@ -797,6 +889,99 @@ fn resolve_anchor_sink_desktop(
                 Err(e) => {
                     log::warn!(
                         "csq-ledger sink initialisation failed — anchor task not started: {e}"
+                    );
+                    None
+                }
+            }
+        }
+
+        #[cfg(feature = "s3-sink")]
+        "s3" => match csq_core::audit::impls::sinks::s3::S3ObjectLockSink::with_defaults() {
+            Ok(s) => {
+                // HONEST LABEL (mirrors rekor's above): in-memory mock substrate,
+                // nothing leaves this process.
+                log::warn!(
+                    "event=anchor_sink_mock_backend sink=s3 s3 sink uses the in-memory \
+                     M07 substrate (non-persistent); real AWS S3 Object Lock client is \
+                     a pending follow-up"
+                );
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                log::warn!("s3 sink initialisation failed — anchor task not started: {e}");
+                None
+            }
+        },
+
+        #[cfg(feature = "azure-sink")]
+        "azure" => {
+            match csq_core::audit::impls::sinks::azure::AzureImmutableBlobSink::with_defaults() {
+                Ok(s) => {
+                    // HONEST LABEL (mirrors rekor's above): in-memory mock
+                    // substrate, nothing leaves this process.
+                    log::warn!(
+                        "event=anchor_sink_mock_backend sink=azure azure sink uses the \
+                         in-memory M07 substrate (non-persistent); real Azure Immutable \
+                         Blob Storage client is a pending follow-up"
+                    );
+                    Some(std::sync::Arc::new(s))
+                }
+                Err(e) => {
+                    log::warn!("azure sink initialisation failed — anchor task not started: {e}");
+                    None
+                }
+            }
+        }
+
+        #[cfg(feature = "gcp-sink")]
+        "gcp" => match csq_core::audit::impls::sinks::gcp::GcpBucketLockSink::with_defaults() {
+            Ok(s) => {
+                // HONEST LABEL (mirrors rekor's above): in-memory mock substrate,
+                // nothing leaves this process.
+                log::warn!(
+                    "event=anchor_sink_mock_backend sink=gcp gcp sink uses the in-memory \
+                     M07 substrate (non-persistent); real GCP Cloud Storage Bucket Lock \
+                     client is a pending follow-up"
+                );
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                log::warn!("gcp sink initialisation failed — anchor task not started: {e}");
+                None
+            }
+        },
+
+        #[cfg(feature = "azure-sql-sink")]
+        "azure-sql" => {
+            match csq_core::audit::impls::sinks::azure_sql::AzureSqlLedgerSink::with_defaults() {
+                Ok(s) => {
+                    // HONEST LABEL (mirrors rekor's above): in-memory mock
+                    // substrate, nothing leaves this process.
+                    log::warn!(
+                        "event=anchor_sink_mock_backend sink=azure-sql azure-sql sink uses \
+                         the in-memory M07 substrate (non-persistent); real Azure SQL \
+                         ledger-table client is a pending follow-up"
+                    );
+                    Some(std::sync::Arc::new(s))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "azure-sql sink initialisation failed — anchor task not started: {e}"
+                    );
+                    None
+                }
+            }
+        }
+
+        #[cfg(feature = "customer-body-store-sink")]
+        "customer-body-store" => {
+            match csq_core::audit::impls::sinks::customer_body_store::CustomerBodyStoreSink::new(
+                csq_core::audit::impls::sinks::customer_body_store::CustomerBodyStoreConfig::default(),
+            ) {
+                Ok(s) => Some(std::sync::Arc::new(s)),
+                Err(e) => {
+                    log::warn!(
+                        "customer-body-store sink initialisation failed — anchor task not started: {e}"
                     );
                     None
                 }

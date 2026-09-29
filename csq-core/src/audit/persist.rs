@@ -306,6 +306,16 @@ pub struct ChainGenesis {
     pub genesis_ts: String,
 }
 
+/// The in-lock authorization precheck's signature (S-LOW-B / C-N2, round
+/// 8b) — `(csq_runs_dir, chain_id) -> authorized`. A type alias rather than
+/// the raw `Option<&dyn Fn(&Path, &str) -> bool>` at each of its three
+/// call sites (`op_emit::emit_outcome_with_precheck`,
+/// `write_record_v2_maybe_signed_with_precheck`, `WriteV2Flags::precheck`)
+/// because clippy's `type_complexity` lint fires on the raw form; the
+/// alias is otherwise purely a naming convenience with no behavioural
+/// effect.
+pub(crate) type PrecheckFn<'a> = &'a dyn Fn(&Path, &str) -> bool;
+
 /// Errors returned by [`write_record_v2`].
 #[derive(Debug, thiserror::Error)]
 pub enum AuditV2Error {
@@ -358,6 +368,21 @@ pub enum AuditV2Error {
     /// `.chain-broken` sentinel.
     #[error("genesis already exists — chain is not empty, born-canonical genesis already written")]
     GenesisAlreadyExists,
+    /// A caller-supplied authorization precheck, evaluated INSIDE the
+    /// `.chain-lock` critical section immediately before the append,
+    /// returned `false`. No record was written.
+    ///
+    /// S-LOW-B / C-N2 (round 8b): used by the correlated `AccountSwap`
+    /// OUTCOME writer ([`crate::audit::op_emit::emit_outcome_with_precheck`])
+    /// so the "exactly one OUTCOME per (correlation_id, kind)" authorization
+    /// check is atomic with the append — a caller-side, out-of-lock read
+    /// (the prior [`crate::audit::intent_scan::verify_swap_correlation`]-only
+    /// design) cannot make two concurrent writers for the same
+    /// `correlation_id` mutually exclusive; this can, because only one
+    /// writer holds `.chain-lock` at a time and the second observes the
+    /// first's just-appended OUTCOME before deciding.
+    #[error("write refused by in-lock authorization precheck — no record written")]
+    PrecheckRefused,
 }
 
 impl AuditV2Error {
@@ -373,6 +398,7 @@ impl AuditV2Error {
             AuditV2Error::ChainBrokenRefuseAppend { .. } => "audit_chain_broken_refuse_append",
             AuditV2Error::Internal { .. } => "audit_internal_error",
             AuditV2Error::GenesisAlreadyExists => "audit_genesis_already_exists",
+            AuditV2Error::PrecheckRefused => "audit_precheck_refused",
         }
     }
 }
@@ -776,13 +802,31 @@ pub enum ChainKind {
     /// set/clear `eatp-runs/.chain-broken`. The prior W2-BLOCKER (a written EATP
     /// chain that nothing verifies) is therefore resolved.
     ///
-    /// **Remaining W2b work before the first production `ChainKind::Eatp` write:**
-    /// the EATP chain has its OWN `chain_id`, and `verify_chain_in` resolves the
-    /// verifying key by that `chain_id`, so W2b's born-canonical genesis writer
-    /// MUST establish the EATP chain's key custody (its own `chain.json` +
-    /// file-store seed under the EATP `chain_id`, mirroring `csq audit init`)
-    /// before emitting the `seq==0` signed genesis. There are no production
-    /// `ChainKind::Eatp` writers yet — W2b is the first.
+    /// **W2b (key custody) and W3 (attestation writer) have both shipped.** The
+    /// EATP chain establishes its OWN key custody — its own `chain.json` +
+    /// file-store seed under the EATP `chain_id`, mirroring `csq audit init`'s
+    /// op-chain init — via `eatp_audit_init` (`audit/key_custody/init.rs`),
+    /// serialized under the same `.chain-lock` sidecar the genesis write itself
+    /// uses so two concurrent `csq audit init` invocations cannot mint the key
+    /// twice. There are two production writers, both enterprise-only:
+    ///
+    /// - **Genesis** — `csq audit init` (`csq/src/cli/commands/audit.rs::
+    ///   emit_eatp_genesis`) calls [`write_genesis_v2_signed_in`] to emit the
+    ///   `seq==0` signed genesis, idempotently, after `eatp_audit_init`
+    ///   establishes the key.
+    /// - **Attestation append** — the W3 session-close attestor
+    ///   (`csq/src/kailash_eatp_attest.rs::run_eatp_session_close_attestor`,
+    ///   wired into the daemon's session registry via `with_eatp_attestor` in
+    ///   both `csq daemon start` and the desktop in-process supervisor) calls
+    ///   [`write_record_v2_signed_in`] on every session close to append a
+    ///   `seq >= 1` attestation, guarded by `make_eatp_genesis_guard` so it
+    ///   only appends onto a verified, born-canonical genesis.
+    ///
+    /// **Anchoring asymmetry (deliberate, not a gap):** unlike the op-chain,
+    /// the EATP chain is never anchored and never swept — `audit::anchor` and
+    /// `daemon::anchor_task` carry zero `ChainKind` references and read
+    /// `csq-runs/` exclusively. EATP records are verified in place
+    /// (`verify_chain_in`); they are not exported to an external anchor.
     Eatp,
 }
 
@@ -833,7 +877,15 @@ impl ChainKind {
 /// signature. For real-key records use [`write_record_v2_signed`], which
 /// signs AFTER seq assignment.
 pub fn write_record_v2(record: SignedRecord, base_dir: Option<&Path>) -> Result<(), AuditV2Error> {
-    write_record_v2_impl(record, base_dir, ChainKind::Op, None, None, false, false).map(|_| ())
+    write_record_v2_impl(
+        record,
+        base_dir,
+        ChainKind::Op,
+        None,
+        None,
+        WriteV2Flags::default(),
+    )
+    .map(|_| ())
 }
 
 /// Like [`write_record_v2`], but targets `chain`'s runs-directory. Used by the
@@ -844,7 +896,7 @@ pub fn write_record_v2_in(
     base_dir: Option<&Path>,
     chain: ChainKind,
 ) -> Result<(), AuditV2Error> {
-    write_record_v2_impl(record, base_dir, chain, None, None, false, false).map(|_| ())
+    write_record_v2_impl(record, base_dir, chain, None, None, WriteV2Flags::default()).map(|_| ())
 }
 
 /// TEST-ONLY: append an unsigned record while SKIPPING the M19b in-lock
@@ -859,7 +911,18 @@ pub fn write_record_v2_unchecked(
     record: SignedRecord,
     base_dir: Option<&Path>,
 ) -> Result<(), AuditV2Error> {
-    write_record_v2_impl(record, base_dir, ChainKind::Op, None, None, true, false).map(|_| ())
+    write_record_v2_impl(
+        record,
+        base_dir,
+        ChainKind::Op,
+        None,
+        None,
+        WriteV2Flags {
+            bypass_cutoff_guard: true,
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
 }
 
 /// Acquires the chain-wide `.chain-lock` sidecar with a bounded 5-second polled
@@ -963,8 +1026,7 @@ pub fn write_seam_record(
         ChainKind::Op,
         signing_key,
         Some(spec),
-        false,
-        false,
+        WriteV2Flags::default(),
     )? {
         WriteV2Outcome::Written(r) => Ok(SeamWriteOutcome::Written(r)),
         WriteV2Outcome::Duplicate => Ok(SeamWriteOutcome::Duplicate),
@@ -1015,13 +1077,51 @@ pub fn write_record_v2_signed_in(
         chain,
         Some(signing_key),
         None,
-        false,
-        false,
+        WriteV2Flags::default(),
     )? {
         WriteV2Outcome::Written(r) => Ok(*r),
         // Unreachable: dedup is only consulted when `seam` is Some. Surface as
         // a logic error (NOT ChainCorrupt — that would brick the chain via the
         // .chain-broken sentinel for what is a programmer error).
+        WriteV2Outcome::Duplicate => {
+            debug_assert!(false, "dedup outcome without seam spec");
+            Err(AuditV2Error::Internal {
+                reason: "dedup outcome without seam spec".to_string(),
+            })
+        }
+    }
+}
+
+/// Like [`write_record_v2_signed`], but evaluates `precheck` INSIDE the
+/// `.chain-lock` critical section, immediately before the append, and
+/// refuses the write with [`AuditV2Error::PrecheckRefused`] when it returns
+/// `false`. `precheck` receives `(csq_runs_dir, chain_id)` — the exact
+/// directory and active chain id this append targets — so it can re-read the
+/// SAME on-disk chain file the append is about to extend, observing any
+/// concurrent writer's just-appended record before deciding.
+///
+/// `pub(crate)`: the only production caller is
+/// [`crate::audit::op_emit::emit_outcome_with_precheck`] (same crate,
+/// different module). S-LOW-B / C-N2, round 8b — see
+/// [`AuditV2Error::PrecheckRefused`]'s doc for the race this closes.
+pub(crate) fn write_record_v2_maybe_signed_with_precheck(
+    record: SignedRecord,
+    base_dir: Option<&Path>,
+    signing_key: Option<&dyn crate::audit::traits::SigningKey>,
+    precheck: Option<PrecheckFn<'_>>,
+) -> Result<SignedRecord, AuditV2Error> {
+    match write_record_v2_impl(
+        record,
+        base_dir,
+        ChainKind::Op,
+        signing_key,
+        None,
+        WriteV2Flags {
+            precheck,
+            ..Default::default()
+        },
+    )? {
+        WriteV2Outcome::Written(r) => Ok(*r),
         WriteV2Outcome::Duplicate => {
             debug_assert!(false, "dedup outcome without seam spec");
             Err(AuditV2Error::Internal {
@@ -1052,8 +1152,10 @@ pub fn write_genesis_v2_signed_in(
         chain,
         Some(signing_key),
         None,
-        false,
-        true,
+        WriteV2Flags {
+            require_genesis_empty: true,
+            ..Default::default()
+        },
     )? {
         WriteV2Outcome::Written(r) => Ok(*r),
         WriteV2Outcome::Duplicate => {
@@ -1073,6 +1175,36 @@ enum WriteV2Outcome {
     Duplicate,
 }
 
+/// Bundles [`write_record_v2_impl`]'s behavioural flags — introduced
+/// (round 8b, alongside `precheck`) so the function's own argument count
+/// stays under clippy's `too_many_arguments` threshold. `Default` gives
+/// every existing caller (all of which pass `false, false, None`) a
+/// one-line `..Default::default()` for the flags it does not set.
+#[derive(Default)]
+struct WriteV2Flags<'a> {
+    /// M19b M3: when `true`, skip the in-lock unsigned-after-cutoff guard. ONLY
+    /// the test-only `write_record_v2_unchecked` passes `true` — it lets the
+    /// verify-detection tests construct the malformed (unsigned-after-cutoff)
+    /// chain state that the production writer now structurally refuses to create,
+    /// so they can assert `verify_chain` still CATCHES it (tamper/corruption path).
+    bypass_cutoff_guard: bool,
+    /// M1 (redteam R1): when `true`, this write MUST land at `seq == 0` (chain
+    /// genesis). Checked IN-LOCK after seq assignment — if the chain already has a
+    /// record, the write is refused with `GenesisAlreadyExists` rather than
+    /// appending a duplicate "genesis" at `seq >= 1`. Closes the TOCTOU where two
+    /// concurrent `csq audit init` both pass an out-of-lock emptiness check. Only
+    /// the EATP genesis wrapper passes `true`; every other caller passes `false`.
+    require_genesis_empty: bool,
+    /// S-LOW-B / C-N2 (round 8b): an optional authorization precheck,
+    /// evaluated INSIDE `.chain-lock` right after the genesis is resolved and
+    /// BEFORE the append — receives `(csq_runs_dir, chain_id)` so it can
+    /// re-read the exact chain file this write is about to extend. `false` →
+    /// refuse with `PrecheckRefused`, no write. `None` for every caller except
+    /// `write_record_v2_maybe_signed_with_precheck` (the correlated swap
+    /// outcome writer) — every existing writer's behaviour is unchanged.
+    precheck: Option<PrecheckFn<'a>>,
+}
+
 /// Shared implementation for [`write_record_v2`] (no signing),
 /// [`write_record_v2_signed`] (sign-after-assign), and
 /// `write_seam_record_signed` (sign + in-lock dedup). Returns the finalized
@@ -1084,20 +1216,13 @@ fn write_record_v2_impl(
     chain: ChainKind,
     signing_key: Option<&dyn crate::audit::traits::SigningKey>,
     seam: Option<&SeamWriteSpec<'_>>,
-    // M19b M3: when `true`, skip the in-lock unsigned-after-cutoff guard. ONLY
-    // the test-only `write_record_v2_unchecked` passes `true` — it lets the
-    // verify-detection tests construct the malformed (unsigned-after-cutoff)
-    // chain state that the production writer now structurally refuses to create,
-    // so they can assert `verify_chain` still CATCHES it (tamper/corruption path).
-    bypass_cutoff_guard: bool,
-    // M1 (redteam R1): when `true`, this write MUST land at `seq == 0` (chain
-    // genesis). Checked IN-LOCK after seq assignment — if the chain already has a
-    // record, the write is refused with `GenesisAlreadyExists` rather than
-    // appending a duplicate "genesis" at `seq >= 1`. Closes the TOCTOU where two
-    // concurrent `csq audit init` both pass an out-of-lock emptiness check. Only
-    // the EATP genesis wrapper passes `true`; every other caller passes `false`.
-    require_genesis_empty: bool,
+    flags: WriteV2Flags<'_>,
 ) -> Result<WriteV2Outcome, AuditV2Error> {
+    let WriteV2Flags {
+        bypass_cutoff_guard,
+        require_genesis_empty,
+        precheck,
+    } = flags;
     use crate::audit::types::{Ed25519Signature, RecordId, Sha256Hex};
 
     // Step 1 — ensure the chain's runs-dir (`csq-runs/` op-chain, `eatp-runs/`
@@ -1165,6 +1290,18 @@ fn write_record_v2_impl(
     // Step 2 — read or init chain genesis.
     let ts = current_iso8601_utc_persist();
     let genesis = read_or_init_chain_genesis(&csq_runs, &ts)?;
+
+    // Step 2.4 — S-LOW-B / C-N2 (round 8b): in-lock authorization precheck.
+    // Evaluated with the exact (csq_runs, chain_id) this append targets, so
+    // it observes the SAME on-disk chain state the append is about to
+    // extend — including any OUTCOME a concurrent writer appended for this
+    // correlation_id/kind in the interval between this writer's out-of-lock
+    // fast-fail check (if any) and this writer acquiring `.chain-lock`.
+    if let Some(check_fn) = precheck {
+        if !check_fn(&csq_runs, &genesis.chain_id) {
+            return Err(AuditV2Error::PrecheckRefused);
+        }
+    }
 
     // Step 2.5 — M20 in-lock idempotent dedup (inside `.chain-lock`, atomic
     // with the append below). When a seam dedup key is supplied, consult the
@@ -1239,7 +1376,7 @@ fn write_record_v2_impl(
     // Require BOTH so the guard's refusal set == verify's rejection set.
     //
     // W1: the cutoff guard is an OP-CHAIN concern. `ChainState::load(base)`
-    // resolves `base/csq-runs/chain.json` (the op-chain's key-custody state)
+    // resolves `<base>/csq-runs/chain.json` (the op-chain's key-custody state)
     // regardless of `chain`, so consulting it for an EATP write would compare
     // the EATP chain's `seq` against the OP-chain's cutoff — a cross-chain leak.
     // The EATP attestation chain is born-canonical and ALWAYS signed (W2/W3), so
@@ -1602,7 +1739,7 @@ fn write_sidecar_atomic(path: &Path, body: &[u8]) -> Result<(), AuditV2Error> {
 ///
 /// The `base_dir` parameter allows tests to supply a `TempDir`-backed path
 /// instead of the real `~/.claude/accounts`.  Production callers pass
-/// `None` (falls back to [`audit_dir()`]).
+/// `None` (falls back to `audit_dir()`).
 pub fn write_record(record: AuditRecord) -> Result<(), AuditError> {
     write_record_to(record, None)
 }

@@ -13,8 +13,8 @@ import { tick } from "svelte";
 
 const mockInvoke = vi.fn();
 let capturedProgressHandler:
-  | ((event: { payload: { stream: string; line: string } }) => void)
-  | null = null;
+  ((event: { payload: { stream: string; line: string } }) => void) | null =
+  null;
 const mockListen = vi.fn(
   (event: string, handler: (e: { payload: unknown }) => void) => {
     if (event === "ollama-pull-progress") {

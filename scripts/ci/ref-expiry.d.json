@@ -1,0 +1,78 @@
+{
+  "$comment": [
+    "Declaration for scripts/verify/ref-expiry.sh — edit THIS, never the script's",
+    "internals, so there is exactly one place a number lives.",
+    "",
+    "WHY THIS EXISTS. A full ref census on 2026-09-10 found 187 local branches and",
+    "106 remote branches in this clone. 184 of the local ones are STRICT ANCESTORS",
+    "of origin/dev — merged long ago, never deleted. They are not merely untidy:",
+    "they are camouflage. `git branch` becomes unreadable, and the one or two refs",
+    "that genuinely hold unlanded work are hidden inside 184 that do not.",
+    "",
+    "The same census found eight git stashes accumulated since April, invisible to",
+    "any branch-based audit; one held ~4900 insertions. Nothing in this repo had",
+    "ever MEASURED ref accumulation, so it grew unopposed for months.",
+    "",
+    "This gate is the meter. It is the age/expiry sibling of orphan-branch-drift.sh,",
+    "which asks a different question — 'does this content exist ONLY on this disk'.",
+    "A ref can be fully preserved on a remote (clean by that gate) and still be 200",
+    "days of dead weight (a finding here). Read the two together."
+  ],
+
+  "trunk": "dev",
+  "$why_trunk": [
+    "The 2026-09-10 dev-trunk directive made `dev` the integration trunk, so `dev`",
+    "— not `main` — is where lane work actually lands and therefore the ref against",
+    "which 'has this landed?' is the right question. Overridable with CSQ_TRUNK for",
+    "a clone on a different model. The gate resolves origin/<trunk> first and falls",
+    "back to the local refs/heads/<trunk>; if NEITHER resolves it returns",
+    "UNDETERMINED rather than guessing, because a wrong trunk silently reclassifies",
+    "every landed ref as unlanded and vice versa."
+  ],
+
+  "max_age_days": 30,
+  "$why_age": [
+    "The threshold is on AGE, not on count, and it is deliberately generous.",
+    "",
+    "A merged branch deleted the same week is normal hygiene and needs no gate. The",
+    "cost this number bounds is CAMOUFLAGE: how long a genuinely unlanded ref can",
+    "hide among landed ones before anyone would notice. 30 days is one calendar",
+    "month — long enough that no active branch is ever reported (the longest-lived",
+    "in-flight lane branch in this repo's history is well under a month), short",
+    "enough that the 184-branch backlog measured above could never have formed",
+    "silently: it would have fired in the first month and every month after.",
+    "",
+    "The same number governs BOTH reported classes on purpose. A landed ref over 30",
+    "days is drainable; an UNLANDED ref over 30 days is the dangerous case, because",
+    "at that age nobody remembers what it holds. Using one bound keeps the question",
+    "'is this ref older than a month' single-valued."
+  ],
+
+  "max_stash_age_days": 30,
+  "$why_stash": [
+    "Stashes get the same bound as branches because they are the same hazard with",
+    "worse visibility: `git branch`, `git log`, every PR view and every existing",
+    "audit in this repo is blind to refs/stash. The measured case is the argument —",
+    "eight stashes since April, one carrying ~4900 insertions, none surfaced by any",
+    "instrument. A stash is UNLANDED by construction (it was never committed), so",
+    "an old one is always the loud class, never the drainable one.",
+    "",
+    "Same number as max_age_days rather than a second tunable to argue about: the",
+    "question is identical ('older than a month'), and two numbers for one question",
+    "invites them to drift apart."
+  ],
+
+  "protected_patterns": ["main", "dev", "preserve/*", "salvage/*"],
+  "$why_protected": [
+    "NEVER reported and NEVER prunable, whatever their age or classification.",
+    "",
+    "main and dev are the trunks themselves. `preserve/*` and `salvage/*` are the",
+    "names this repo's recovery discipline uses for refs deliberately parked",
+    "long-term — a salvage branch is SUPPOSED to be old and unlanded, so reporting",
+    "it would train the operator to ignore exactly the class of finding this gate",
+    "exists to make loud (instrument-discipline.md MUST-1: an override habit forms",
+    "because a gate cannot discriminate, not because it is frequent).",
+    "",
+    "Matched as globs against the short ref name."
+  ]
+}

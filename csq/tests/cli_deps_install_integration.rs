@@ -25,7 +25,6 @@
 //! Per `rules/probe-driven-verification.md` MUST 1: assertions are structural
 //! (exit code + exact fragment checks), NOT prose-regex semantic checks.
 
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
@@ -37,35 +36,16 @@ use tempfile::TempDir;
 #[cfg(unix)]
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-// ── Binary helpers ─────────────────────────────────────────────────────────────
-
-fn csq_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_csq") {
-        return PathBuf::from(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("csq")
-}
-
+#[path = "common/mod.rs"]
+mod common;
+use common::csq_bin;
+// stub_cli_bin's every caller in this file is #[cfg(unix)] (they write
+// `#!/bin/sh` wrappers) -- gate the import to match, or it fails to
+// resolve on non-unix targets (windows-gnu cross-clippy): `stub_cli_bin`
+// is itself #[cfg(unix)] in common/mod.rs, since its own callers across
+// every adopter are unix-only.
 #[cfg(unix)]
-fn stub_cli_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_stub-cli") {
-        return PathBuf::from(p);
-    }
-    // Fallback: locate beside csq binary.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("stub-cli")
-}
+use common::stub_cli_bin;
 
 // ── Env-cleared command builder ────────────────────────────────────────────────
 
@@ -89,6 +69,9 @@ fn clean_cmd(path_override: Option<&str>) -> Command {
     // operator's real login keychain (rules/test-hermeticity.md).
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
     cmd.env("HOME", sandbox_home());
+    // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
+    // test-utils-gated override is what actually sandboxes it there.
+    cmd.env("CSQ_HOME", sandbox_home());
     for k in &["LANG", "LC_ALL", "TERM", "USER", "TMPDIR"] {
         if let Ok(v) = std::env::var(k) {
             cmd.env(k, v);

@@ -205,7 +205,10 @@ pub use persist::{
 };
 // v2 re-exports — parallel write path (M02, spec 12 §12.2).
 pub use anchor::scan_chain_for_anchor_outcome;
-pub use intent_scan::{scan_orphan_intents, OrphanIntent, OrphanScanError};
+pub use intent_scan::{
+    scan_orphan_intents, verify_swap_correlation, OrphanIntent, OrphanScanError,
+    SwapCorrelationCheck,
+};
 pub use persist::{
     current_iso8601_utc_persist, gen_chain_id, write_genesis_v2_signed_in, write_record_v2,
     write_record_v2_in, write_record_v2_signed, write_record_v2_signed_in, AuditV2Error,
@@ -245,21 +248,22 @@ pub use persist::{canonical_bytes_for_test, sha256_hex_test, AUDIT_SCHEMA_VERSIO
 
 // M07 public surface — sink config + doctor snapshot.
 pub use sink_config::{
-    validate_sink_compiled_in, AuditSinkConfig, SinkCadenceConfig, SinkConfigError,
-    SinkDoctorSnapshot,
+    is_mock_backed_sink, validate_sink_compiled_in, AuditSinkConfig, SinkCadenceConfig,
+    SinkConfigError, SinkDoctorSnapshot,
 };
 
 // M05 public surface — chain-integrity verifier.
 pub use verify::{
-    exit_code_for_error, to_json_output, verify_chain, verify_chain_in, KeyGap,
-    KeychainAnchorStatus, RosterFloorAnchorStatus, VerifyConfig, VerifyFailureDetail,
+    exit_code_for_error, to_json_output, verify_chain, verify_chain_in, verify_record_signature,
+    KeyGap, KeychainAnchorStatus, RosterFloorAnchorStatus, VerifyConfig, VerifyFailureDetail,
     VerifyJsonOutput, VerifySummary,
 };
 
 // AuditHealth — daemon-startup verify outcome.
 pub use health::{
-    clear_chain_broken, clear_chain_broken_in, is_chain_broken, is_chain_broken_in,
+    clear_chain_broken, clear_chain_broken_in, is_chain_broken, is_chain_broken_in, new_shared,
     reconcile_chain_sentinel, set_chain_broken, set_chain_broken_in, AuditHealth,
+    SharedAuditHealth,
 };
 
 // M09 public surface — verifiable audit-bundle export.

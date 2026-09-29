@@ -162,6 +162,97 @@ describe("SessionList", () => {
     expect(quotaBadges[3].classList.contains("quota-error")).toBe(true);
   });
 
+  // C6 (journal `operator-surfaces`, same class as AccountList's C2): a
+  // ROW can match (`has_quota=true`) while carrying a window for only
+  // ONE of the two labels — e.g. a weekly-only plan with a `seven_day`
+  // window and no `five_hour` one. Before this fix, `SessionView`'s
+  // `five_hour_pct`/`seven_day_pct` were plain `f64` sourced from the
+  // lossy accessors (`unwrap_or(0.0)`), so the absent window and a real
+  // 0% reading both serialized as `0` and rendered identically. This
+  // pins the fix: the absent window renders "idle"/"—" (the SAME
+  // vocabulary AccountList.svelte's `emptyLabel` uses), and the present
+  // window still renders its real percentage.
+  it("C6: a row with only a 7-day window renders the absent 5-hour window as idle, not 0%", async () => {
+    const weeklyOnlySession = {
+      ...SESSION_1,
+      pid: 9001,
+      account_id: 22,
+      account_label: "WeeklyOnly",
+      has_quota: true,
+      five_hour_pct: null,
+      seven_day_pct: 12.0,
+    };
+    setupMocks({ list_sessions: [weeklyOnlySession] });
+    const { container } = render(SessionList);
+    await settle();
+    // Not the whole-row "n/a" fallback — a row DID match.
+    expect(
+      container.querySelector('[data-testid="session-quota-na"]'),
+    ).toBeNull();
+    const emptyBadge = container.querySelector(
+      '[data-testid="session-quota-5h-na"]',
+    );
+    expect(emptyBadge).not.toBeNull();
+    expect(emptyBadge?.textContent).toContain("idle");
+    const presentBadge = container.querySelector(
+      '[data-testid="session-quota-7d-na"]',
+    );
+    expect(presentBadge).toBeNull();
+    const badges = container.querySelectorAll(".quota-badge");
+    expect(badges.length).toBe(2);
+    expect(container.textContent).toContain("12%");
+    // The absent 5h window must never be fabricated as a real "0%" reading.
+    expect(container.textContent).not.toContain("0%");
+  });
+
+  it("C6: a row with only a 5-hour window renders the absent 7-day window as —, not 0%", async () => {
+    const dailyOnlySession = {
+      ...SESSION_1,
+      pid: 9002,
+      account_id: 23,
+      account_label: "DailyOnly",
+      has_quota: true,
+      five_hour_pct: 34.0,
+      seven_day_pct: null,
+    };
+    setupMocks({ list_sessions: [dailyOnlySession] });
+    const { container } = render(SessionList);
+    await settle();
+    expect(
+      container.querySelector('[data-testid="session-quota-na"]'),
+    ).toBeNull();
+    const emptyBadge = container.querySelector(
+      '[data-testid="session-quota-7d-na"]',
+    );
+    expect(emptyBadge).not.toBeNull();
+    expect(emptyBadge?.textContent).toContain("—");
+    expect(container.textContent).toContain("34%");
+    expect(container.textContent).not.toContain("0%");
+  });
+
+  it("has_quota===false still renders the single n/a fallback badge, not per-window empties", async () => {
+    const unpolledSession = {
+      ...SESSION_1,
+      pid: 9003,
+      has_quota: false,
+      five_hour_pct: null,
+      seven_day_pct: null,
+    };
+    setupMocks({ list_sessions: [unpolledSession] });
+    const { container } = render(SessionList);
+    await settle();
+    expect(
+      container.querySelector('[data-testid="session-quota-na"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="session-quota-5h-na"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="session-quota-7d-na"]'),
+    ).toBeNull();
+    expect(container.querySelectorAll(".quota-badge").length).toBe(1);
+  });
+
   it("renders session age", async () => {
     const { container } = render(SessionList);
     await settle();

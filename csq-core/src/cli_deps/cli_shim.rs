@@ -149,12 +149,104 @@ pub fn resolve_shim_source(current_exe: &Path) -> PathBuf {
     current_exe.to_path_buf()
 }
 
-/// Resolve the CLI shim target: the existing on-PATH `csq` when it is a regular
-/// file OUTSIDE an app bundle / AppImage, else `~/.local/bin/csq` (the canonical
-/// `install.sh` location). Returns `None` only when no home directory resolves
-/// and no suitable on-PATH `csq` exists.
+/// Resolve the CLI shim target: `~/.local/bin/csq` (the canonical `install.sh`
+/// location) whenever anything already sits there, else the on-PATH `csq` when
+/// it is OUTSIDE an app bundle / AppImage, else `~/.local/bin/csq` as the
+/// create-path. Returns `None` only when no home directory resolves and no
+/// suitable on-PATH `csq` exists.
+///
+/// **The canonical location outranks the `$PATH` hit, and that ordering is
+/// load-bearing.** This function answers "which csq installation must this app
+/// keep in sync with the bundle" — NOT "which csq would a subprocess get". The
+/// desktop app resolves the second question through a `$PATH` it seeds itself
+/// in `augment_subprocess_path`, which prepends `/opt/homebrew/bin`,
+/// `/opt/homebrew/sbin` and `/usr/local/bin` AHEAD of `~/.local/bin`. That
+/// ordering is right for locating third-party CLIs (claude / codex / gemini)
+/// and wrong for choosing which csq to overwrite. Scope of the claim: the
+/// augmentation SKIPS any entry already on the inherited `PATH`, so on a host
+/// where both locations are already present in the operator's own order this is
+/// a no-op for them and `~/.local/bin` can win. Under the launch context that
+/// motivates the augmentation at all — Finder/Dock, i.e. the system-default
+/// `PATH`, which carries neither — the prepend applies in full and
+/// [`crate::cli_deps::install_path::find_in_path`] returns the homebrew copy,
+/// while the operator's own interactive shell runs the `~/.local/bin` one. The shim refresh then keeps a binary nobody runs current
+/// and lets the binary everybody runs drift — producing exactly the
+/// daemon-vs-CLI version skew the refresh exists to prevent (see this module's
+/// header). Measured on the maintainer host 2026-09-12: `.app` 2.18.0 and
+/// `/opt/homebrew/bin/csq` byte-identical at 2.18.0 (so the refresh was a
+/// silent `NoOp`) against `~/.local/bin/csq` 2.19.0, daemon spawning from the
+/// stale path.
+///
+/// Existence — not regular-file-ness — is the test, because a SYMLINK at the
+/// canonical path is precisely the `mode::detect` trap [`ensure_cli_shim`]
+/// exists to replace ([`ShimOutcome::ReplacedNonRegular`]). Skipping a symlink
+/// here would route the refresh to some other path and leave the trap in place.
 pub fn resolve_shim_target() -> Option<PathBuf> {
-    if let Some(p) = crate::cli_deps::install_path::find_in_path("csq") {
+    // `crate::platform::home::home_dir()`: exactly `dirs::home_dir()` in
+    // production (test-hermeticity.md Windows hole fix — see that module's
+    // doc comment). Previously this read `$HOME` directly, which returned
+    // `None` on native Windows outside Git Bash (no `HOME` set) even though
+    // every other call site in csq resolved the profile dir via `dirs`.
+    let canonical =
+        crate::platform::home::home_dir().map(|home| home.join(".local").join("bin").join("csq"));
+    let canonical_occupied = canonical.as_ref().is_some_and(|c| canonical_is_occupied(c));
+    resolve_shim_target_from(
+        canonical,
+        canonical_occupied,
+        crate::cli_deps::install_path::find_in_path("csq"),
+    )
+}
+
+/// Is a REPLACEABLE thing sitting at the canonical CLI path?
+///
+/// `symlink_metadata` and NOT `metadata`, and the difference is load-bearing
+/// for exactly one input: a DANGLING symlink. `metadata()` follows the link,
+/// fails to stat the missing referent, and reports the path as free — so the
+/// refresh would route to the `$PATH` hit and leave the dangling link in place.
+/// That link is the `mode::detect` canonicalize trap: a `csq` there resolves
+/// into the bundle and runs the terminal CLI in Desktop mode.
+/// [`ensure_cli_shim`] exists to replace it ([`ShimOutcome::ReplacedNonRegular`]),
+/// and can only do so if this predicate reports it occupied.
+///
+/// A DIRECTORY is excluded, and that exclusion is not cosmetic. This path does
+/// not only receive the shim copy — `resolve_managed_daemon_exe` falls through
+/// to [`resolve_shim_target`] whenever `current_exe()` is inside the bundle,
+/// which is every Finder launch, so it also becomes the launchd plist's
+/// `ProgramArguments[0]`. Claiming a directory here would make `ensure_cli_shim`
+/// fail with a non-fatal warn (recoverable) AND point the managed daemon's exec
+/// at a directory (not recoverable — the daemon can never start). Treating it as
+/// unoccupied instead falls through to the `$PATH` hit, which at worst refreshes
+/// a different real binary.
+///
+/// Extracted from [`resolve_shim_target`] so the predicate PRODUCTION uses is
+/// the one under test — a test that recomputes `symlink_metadata` itself proves
+/// a std-library fact and leaves this line unpinned.
+fn canonical_is_occupied(path: &Path) -> bool {
+    match path.symlink_metadata() {
+        Ok(meta) => !meta.is_dir(),
+        Err(_) => false,
+    }
+}
+
+/// [`resolve_shim_target`]'s decision, with its two environment reads
+/// (`$HOME`, `$PATH`) injected.
+///
+/// Split out so the PRECEDENCE is testable without mutating process-global
+/// environment — `test-hermeticity.md` forbids the `$HOME`/`$PATH` swap this
+/// would otherwise need, and an env-locked test would serialize against every
+/// other test in the crate. Same extraction the sibling
+/// `version_output_is_enterprise` took in the desktop crate.
+fn resolve_shim_target_from(
+    canonical: Option<PathBuf>,
+    canonical_occupied: bool,
+    path_hit: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if canonical_occupied {
+        if let Some(canonical) = canonical {
+            return Some(canonical);
+        }
+    }
+    if let Some(p) = path_hit {
         let s = p.to_string_lossy();
         // Skip a PATH hit inside the desktop bundle / AppImage — copying onto or
         // next to the bundle is wrong; fall through to ~/.local/bin.
@@ -164,8 +256,7 @@ pub fn resolve_shim_target() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let home = home_dir()?;
-    Some(home.join(".local").join("bin").join("csq"))
+    canonical
 }
 
 /// True iff both files exist with identical length AND identical bytes. Length
@@ -189,12 +280,6 @@ fn set_executable(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -335,6 +420,143 @@ mod tests {
         write_exe(&macos, b"main");
         std::fs::create_dir_all(dir.path().join("App.app/Contents/Helpers/csq-cli")).unwrap();
         assert_eq!(resolve_shim_source(&macos), macos);
+    }
+
+    // ── resolve_shim_target precedence ────────────────────────────────
+    //
+    // Each of these RUNS on every platform: the decision is exercised through
+    // `resolve_shim_target_from`, whose inputs are injected, so no case depends
+    // on the host actually carrying a `/opt/homebrew/bin/csq`.
+
+    /// The regression that motivated the change. A host with BOTH a homebrew
+    /// `csq` (which the desktop app's own `augment_subprocess_path` ranks first
+    /// on `$PATH`) and the canonical `~/.local/bin/csq` must refresh the
+    /// CANONICAL one — the binary the operator's shell actually runs.
+    ///
+    /// Falsifying result, named up front: before the fix this returned
+    /// `/opt/homebrew/bin/csq`, i.e. the `path_hit`.
+    #[test]
+    fn shim_target_prefers_canonical_over_path_hit() {
+        let canonical = PathBuf::from("/home/u/.local/bin/csq");
+        let got = resolve_shim_target_from(
+            Some(canonical.clone()),
+            true,
+            Some(PathBuf::from("/opt/homebrew/bin/csq")),
+        );
+        assert_eq!(got, Some(canonical));
+    }
+
+    /// The canonical path is only preferred when something is THERE. A host
+    /// that installed csq solely to `/usr/local/bin` keeps that target, so the
+    /// fix does not strand single-location installs.
+    #[test]
+    fn shim_target_falls_back_to_path_hit_when_canonical_absent() {
+        let hit = PathBuf::from("/usr/local/bin/csq");
+        let got = resolve_shim_target_from(
+            Some(PathBuf::from("/home/u/.local/bin/csq")),
+            false,
+            Some(hit.clone()),
+        );
+        assert_eq!(got, Some(hit));
+    }
+
+    /// A `$PATH` hit INSIDE the bundle is still skipped — copying onto or next
+    /// to the running `.app` is wrong — and the canonical create-path is used.
+    #[test]
+    fn shim_target_skips_in_bundle_path_hit() {
+        let canonical = PathBuf::from("/home/u/.local/bin/csq");
+        for hit in [
+            "/Applications/Code Squad Q.app/Contents/MacOS/csq",
+            "/opt/x/csq.AppImage",
+        ] {
+            let got =
+                resolve_shim_target_from(Some(canonical.clone()), false, Some(PathBuf::from(hit)));
+            assert_eq!(got, Some(canonical.clone()), "hit {hit}");
+        }
+    }
+
+    /// With no home AND only an in-bundle `$PATH` hit there is no legitimate
+    /// target — the caller must skip the refresh rather than guess.
+    #[test]
+    fn shim_target_is_none_without_home_or_usable_path_hit() {
+        let got = resolve_shim_target_from(
+            None,
+            false,
+            Some(PathBuf::from(
+                "/Applications/Code Squad Q.app/Contents/MacOS/csq",
+            )),
+        );
+        assert_eq!(got, None);
+    }
+
+    /// `canonical_is_occupied` over all four on-disk shapes, calling the
+    /// function PRODUCTION calls rather than recomputing the predicate here.
+    ///
+    /// The DANGLING-symlink row is the one that discriminates. Falsifying
+    /// result, named up front: swap `symlink_metadata` for `metadata` in
+    /// `canonical_is_occupied` and that row flips to `false` — the refresh
+    /// would then route to the `$PATH` hit and leave a `mode::detect` trap
+    /// symlink at the canonical path. The other three rows survive that
+    /// mutation, which is precisely why testing only them proves nothing.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_is_occupied_covers_every_on_disk_shape() {
+        let dir = TempDir::new().unwrap();
+
+        let regular = dir.path().join("regular");
+        write_exe(&regular, b"bin");
+        assert!(canonical_is_occupied(&regular), "regular file is occupied");
+
+        let referent = dir.path().join("referent");
+        write_exe(&referent, b"bin");
+        let live_link = dir.path().join("live-link");
+        std::os::unix::fs::symlink(&referent, &live_link).unwrap();
+        assert!(
+            canonical_is_occupied(&live_link),
+            "symlink to an existing file is occupied"
+        );
+
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+        assert!(
+            canonical_is_occupied(&dangling),
+            "a DANGLING symlink is still occupied — metadata() would say otherwise, \
+             and ensure_cli_shim must be routed here to replace the mode::detect trap"
+        );
+
+        let a_directory = dir.path().join("a-directory");
+        std::fs::create_dir_all(&a_directory).unwrap();
+        assert!(
+            !canonical_is_occupied(&a_directory),
+            "a DIRECTORY must NOT count as occupied — this path also becomes the \
+             launchd plist's ProgramArguments[0] via resolve_managed_daemon_exe, and a \
+             directory there is a daemon that can never exec"
+        );
+
+        assert!(
+            !canonical_is_occupied(&dir.path().join("absent")),
+            "nothing there is not occupied"
+        );
+    }
+
+    /// A symlink at the canonical path still wins the precedence decision, so
+    /// `ensure_cli_shim` is routed at it and can replace it.
+    #[cfg(unix)]
+    #[test]
+    fn shim_target_treats_canonical_symlink_as_occupied() {
+        let dir = TempDir::new().unwrap();
+        let canonical = dir.path().join(".local/bin/csq");
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        let bundle = dir.path().join("Bundle.app/Contents/MacOS/csq");
+        write_exe(&bundle, b"bundle");
+        std::os::unix::fs::symlink(&bundle, &canonical).unwrap();
+
+        let got = resolve_shim_target_from(
+            Some(canonical.clone()),
+            canonical_is_occupied(&canonical),
+            Some(PathBuf::from("/opt/homebrew/bin/csq")),
+        );
+        assert_eq!(got, Some(canonical));
     }
 
     #[cfg(unix)]

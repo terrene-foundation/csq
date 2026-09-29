@@ -1,12 +1,12 @@
 //! `csq.capabilities.v1` builder — the app-side op list, `EDITION`, feature flags,
 //! and provider union (an internal ticket).
 //!
-//! The payload SHAPE ([`CapabilitiesPayload`](super::CapabilitiesPayload)) lives in the
+//! The payload SHAPE ([`CapabilitiesPayload`]) lives in the
 //! public `csq-sdk` crate; this builder supplies the ops THIS build actually implements,
-//! the [`EDITION`](super::EDITION) discriminant, the feature flags this build honestly
+//! the [`EDITION`] discriminant, the feature flags this build honestly
 //! derives, and `providers[]` — mapped from `csq-core`'s canonical provider union
 //! ([`crate::providers::registry::all`]) onto the SDK's hand-authored
-//! [`ProviderSummary`](super::ProviderSummary) DTO (R1: never serialize the internal
+//! [`ProviderSummary`] DTO (R1: never serialize the internal
 //! `ProviderDescriptor` directly). A consumer calls `csq sdk capabilities --json` to
 //! learn which ops the binary implements and which providers it can route to BEFORE
 //! invoking either, instead of discovering an unsupported op/provider via a

@@ -892,11 +892,11 @@ pub fn show_status(base_dir: &Path, active: Option<AccountNum>) -> Vec<AccountSt
 /// none of which have a display-order concern, so widening its contract
 /// with a display-only sort would be a much wider blast radius than this
 /// display-order fix needs. The sort key is a 3-tuple: a genuinely
-/// balance-only account ([`AccountStatus::is_balance_only`] — a positive
+/// balance-only account (`AccountStatus::is_balance_only` — a positive
 /// assertion, NOT the absence of window data; see that method's doc
 /// comment for why the distinction is load-bearing) sorts after every
 /// other account, since billing mode is per-PLAN, not per-provider (PR
-/// an internal ticket); then by [`AccountStatus::provider_group_rank`] (mirrors the
+/// an internal ticket); then by `AccountStatus::provider_group_rank` (mirrors the
 /// desktop dashboard's `providerGroupRank`, an internal ticket); then by slot id
 /// ascending. The id tiebreak is explicit rather than relying on
 /// `discover_all`'s composition order being stable-sort-preserved: that

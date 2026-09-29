@@ -16,24 +16,14 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-fn csq_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_csq") {
-        return PathBuf::from(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("csq")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::csq_bin;
 
 /// Write an executable fake `claude` at `<dir>/claude` that hangs on any
 /// invocation — mimicking `claude auth login` stuck waiting for a browser
@@ -65,6 +55,9 @@ fn login_direct_times_out_on_hung_claude_auth_login() {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
     cmd.env("HOME", home.path());
+    // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
+    // test-utils-gated override is what actually sandboxes it there.
+    cmd.env("CSQ_HOME", home.path());
     cmd.env("CSQ_BASE_DIR", &base);
     // Never shell `security` against the operator's real login keychain.
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");

@@ -164,7 +164,7 @@ pub(crate) fn parse_term_session_id(raw: &str) -> (Option<u8>, Option<u8>, Optio
 }
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::list as list_impl;
 

@@ -83,7 +83,7 @@ const SHADOW_AUTH_VARS: &[&str] = &[
 ];
 
 /// Walks `cwd` and its ancestors up to `$HOME` (inclusive) looking
-/// for `.env` files declaring any of [`SHADOW_AUTH_VARS`]. Returns
+/// for `.env` files declaring any of `SHADOW_AUTH_VARS`. Returns
 /// the FIRST hit (CWD-first walk order matches gemini-cli's own
 /// resolution order per OPEN-G02 finding).
 ///

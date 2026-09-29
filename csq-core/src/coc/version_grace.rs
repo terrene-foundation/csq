@@ -33,7 +33,7 @@
 //!
 //! # Why this is in csq-core, not csq-cli
 //!
-//! Both the CLI (`csq run` ↔ `csq-cli/src/commands/run.rs`) and the
+//! Both the CLI (`csq run` ↔ `csq/src/cli/commands/run.rs`) and the
 //! desktop tray (future banner consumer) need this state. Putting
 //! the load/save in csq-core keeps both consumers on the same code
 //! path and the grace clock honest across surfaces.

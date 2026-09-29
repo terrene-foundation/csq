@@ -41,8 +41,8 @@ use crate::audit::key_custody::{
     try_load_signing_key, ChainState, KeyLoadOutcome, KeySlot, LocalSigningKey, SERVICE_NAME,
 };
 use crate::audit::persist::{
-    current_iso8601_utc_persist, gen_chain_id, write_record_v2, write_record_v2_signed,
-    write_seam_record, AuditV2Error, SeamWriteOutcome, SeamWriteSpec, AUDIT_SCHEMA_VERSION,
+    current_iso8601_utc_persist, gen_chain_id, write_seam_record, AuditV2Error, SeamWriteOutcome,
+    SeamWriteSpec, AUDIT_SCHEMA_VERSION,
 };
 use crate::audit::traits::SigningKey as _;
 use crate::audit::types::{
@@ -268,6 +268,12 @@ fn emit_record(
     base_dir: &Path,
     record: SignedRecord,
     phase: EmitPhase,
+    // S-LOW-B / C-N2 (round 8b): an optional authorization precheck run
+    // INSIDE `.chain-lock` immediately before the append (see
+    // `persist::AuditV2Error::PrecheckRefused`'s doc). `None` for every
+    // caller except `emit_outcome_with_precheck` — every existing
+    // `emit_intent` / `emit_outcome` call keeps its current behaviour.
+    precheck: Option<crate::audit::persist::PrecheckFn<'_>>,
 ) -> Result<bool, AuditV2Error> {
     // Pre-cutoff budget: 200 ms — short enough not to stall statusline renders,
     // long enough for a warm macOS keychain (typically < 10 ms).
@@ -356,6 +362,36 @@ fn emit_record(
                     Ok(false)
                 }
             },
+            // S-LOW-B / C-N2 (round 8b): the in-lock precheck (currently only
+            // ever supplied on the OUTCOME phase, via `emit_outcome_with_precheck`)
+            // refused the write — another writer's OUTCOME for this
+            // (correlation_id, kind) is already on-chain, or the correlation
+            // is otherwise unauthorized as observed AT LOCK TIME. Skip, do not
+            // fail closed: the side effect already committed for an OUTCOME
+            // write, so surfacing an orphan-detectable skip is correct; this
+            // arm is unreachable for the INTENT phase today (no caller passes
+            // a precheck there) but is handled symmetrically for safety.
+            Err(AuditV2Error::PrecheckRefused) => match phase {
+                EmitPhase::Intent => {
+                    tracing::warn!(
+                        error_kind = "audit_intent_skipped_precheck_refused",
+                        "M13b: audit INTENT write skipped — in-lock authorization \
+                         precheck refused the write"
+                    );
+                    Ok(false)
+                }
+                EmitPhase::Outcome => {
+                    tracing::warn!(
+                        error_kind = "audit_outcome_skipped_precheck_refused",
+                        "M13b: audit OUTCOME write skipped — in-lock authorization \
+                         precheck refused the write (another writer's OUTCOME for \
+                         this correlation_id/kind is already on-chain, or the \
+                         correlation is otherwise unauthorized as observed at \
+                         lock-acquisition time)"
+                    );
+                    Ok(false)
+                }
+            },
             Err(other) => Err(other),
         }
     }
@@ -372,13 +408,28 @@ fn emit_record(
             let mut record = record;
             record.key_id = ctx.key.key_id();
             write_and_map_broken(
-                write_record_v2_signed(record, Some(base_dir), &ctx.key).map(|_| ()),
+                crate::audit::persist::write_record_v2_maybe_signed_with_precheck(
+                    record,
+                    Some(base_dir),
+                    Some(&ctx.key as &dyn crate::audit::traits::SigningKey),
+                    precheck,
+                )
+                .map(|_| ()),
                 phase,
             )
         }
         Ok(None) => {
             // No key registered (pre-cutoff or pre-init). Unsigned is safe.
-            write_and_map_broken(write_record_v2(record, Some(base_dir)), phase)
+            write_and_map_broken(
+                crate::audit::persist::write_record_v2_maybe_signed_with_precheck(
+                    record,
+                    Some(base_dir),
+                    None,
+                    precheck,
+                )
+                .map(|_| ()),
+                phase,
+            )
         }
         Err(AuditV2Error::Signing { .. }) => {
             // Cutoff active; short budget exhausted. Try the extended budget.
@@ -387,7 +438,13 @@ fn emit_record(
                     let mut record = record;
                     record.key_id = ctx.key.key_id();
                     write_and_map_broken(
-                        write_record_v2_signed(record, Some(base_dir), &ctx.key).map(|_| ()),
+                        crate::audit::persist::write_record_v2_maybe_signed_with_precheck(
+                            record,
+                            Some(base_dir),
+                            Some(&ctx.key as &dyn crate::audit::traits::SigningKey),
+                            precheck,
+                        )
+                        .map(|_| ()),
                         phase,
                     )
                 }
@@ -396,7 +453,16 @@ fn emit_record(
                     // the key IS registered; None means it is not). If somehow
                     // reached after the extended budget, treat as pre-cutoff:
                     // write unsigned.
-                    write_and_map_broken(write_record_v2(record, Some(base_dir)), phase)
+                    write_and_map_broken(
+                        crate::audit::persist::write_record_v2_maybe_signed_with_precheck(
+                            record,
+                            Some(base_dir),
+                            None,
+                            precheck,
+                        )
+                        .map(|_| ()),
+                        phase,
+                    )
                 }
                 Err(signing_err) => {
                     // Extended budget also exhausted; cutoff active.
@@ -542,7 +608,7 @@ pub fn emit_intent(
         payload,
         OpPhase::Intent { correlation_id },
     )?;
-    emit_record(base_dir, record, EmitPhase::Intent)
+    emit_record(base_dir, record, EmitPhase::Intent, None)
 }
 
 /// Build and emit an OUTCOME record for a M13b lifecycle op.
@@ -575,7 +641,52 @@ pub fn emit_outcome(
         },
     )?;
     // Ok(false) = skipped (chain broken or keychain unavailable) — treat as Ok(()).
-    emit_record(base_dir, record, EmitPhase::Outcome).map(|_| ())
+    emit_record(base_dir, record, EmitPhase::Outcome, None).map(|_| ())
+}
+
+/// Build and emit an OUTCOME record for a M13b lifecycle op, with an
+/// additional AUTHORIZATION precheck evaluated INSIDE the `.chain-lock`
+/// critical section, immediately before the append — the correlated
+/// `AccountSwap` OUTCOME writer's counterpart to [`emit_outcome`].
+///
+/// S-LOW-B / C-N2 (round 8b): the codex supervisor's
+/// `SwapAuditCorrelation::write_outcome_once` is the sole caller. Its
+/// out-of-lock [`crate::audit::intent_scan::verify_swap_correlation`] check
+/// (still run first, unchanged, as a fast-fail) cannot make two concurrent
+/// writers for the same `correlation_id` mutually exclusive — both could
+/// observe "no OUTCOME yet" before either appends. `precheck` re-runs the
+/// SAME authorization scan (via
+/// `crate::audit::intent_scan::verify_swap_correlation_in_file`) against
+/// the exact `(csq_runs_dir, chain_id)` this append targets, evaluated while
+/// `.chain-lock` is held — so the second concurrent writer observes the
+/// first's just-appended OUTCOME and refuses.
+///
+/// Returns `Ok(true)` when the record was written, `Ok(false)` when the
+/// precheck refused it (or any of the same benign-skip conditions
+/// [`emit_outcome`] tolerates — chain-broken, keychain-unavailable), and
+/// `Err` on a hard I/O / chain-loader error. Unlike [`emit_outcome`], the
+/// caller MUST distinguish `Ok(true)`/`Ok(false)` (the codex supervisor's
+/// `written` double-write guard depends on it — a `Ok(false)` precheck
+/// refusal must NOT be treated as "written").
+pub fn emit_outcome_with_precheck(
+    base_dir: &Path,
+    chain_id_str: &str,
+    kind: EventKind,
+    payload: EventPayload,
+    correlation_id: RecordId,
+    result: OpOutcome,
+    precheck: &dyn Fn(&Path, &str) -> bool,
+) -> Result<bool, AuditV2Error> {
+    let record = build_lifecycle_record(
+        chain_id_str,
+        kind,
+        payload,
+        OpPhase::Outcome {
+            correlation_id,
+            result,
+        },
+    )?;
+    emit_record(base_dir, record, EmitPhase::Outcome, Some(precheck))
 }
 
 /// Derive the chain_id string for use in lifecycle records.
@@ -603,6 +714,92 @@ pub fn gen_correlation_id() -> Result<RecordId, AuditV2Error> {
     RecordId::try_new(gen_chain_id()).map_err(|e| AuditV2Error::ChainCorrupt {
         reason: format!("gen_chain_id produced invalid correlation_id: {e}"),
     })
+}
+
+/// D-F5/S-LOW-3 (round 7): path-safe, token-safe reason string for an
+/// [`crate::audit::types::OpOutcome::Failed`] on a lifecycle op's
+/// correlated OUTCOME record. Routes through
+/// [`crate::audit::types::RedactedString::from_untrusted`] (which itself
+/// runs `redact_tokens` — see that type's doc) AND strips any embedded
+/// `$HOME` prefix first, so neither secret-derivable bytes nor the
+/// operator's filesystem path land on the committed audit chain in
+/// exported bundles.
+///
+/// Moved here from `csq/src/cli/commands/swap.rs` (which had its own
+/// private copy) so every lifecycle-op outcome writer in BOTH crates —
+/// `csq swap`'s own `finish_swap_audit`/`abort_handoff` paths, AND the
+/// codex supervisor's `SwapAuditCorrelation`/`drive_child` outcome writes
+/// in `csq/src/cli/commands/codex_supervise.rs` (previously
+/// `RedactedString::from_untrusted(e.to_string())` with no `$HOME` scrub
+/// at all) — go through the SAME redaction, rather than three call sites
+/// each deciding independently whether to scrub the home directory.
+/// `csq-core/src/accounts/logout.rs::logout_redact_reason` now delegates
+/// here too (S-LOW-A / C-B5, round 8b) — see that function's doc.
+///
+/// S-LOW-A / C-B5 (round 8b): the `$HOME` pass alone misses an `io::Error`
+/// whose `Display` embeds the OS-CANONICALIZED home path rather than the
+/// literal env var (e.g. macOS's `/tmp` -> `/private/tmp`, or a symlinked
+/// home directory) — so this ALSO scrubs the canonicalized `$HOME` when it
+/// differs from the literal value. Both passes reuse
+/// `crate::cli_deps::sanitize::redact_needle_anywhere`'s boundary-safe
+/// matching (never a raw `.replace()`), whose empty-needle guard is what
+/// makes an unset or `HOME=/` home directory a no-op rather than a
+/// destructive replace-every-separator pass — a bare `raw.replace(&home,
+/// "<home>")` against `HOME=/` would corrupt every path in `raw`.
+pub fn redact_reason(raw: impl AsRef<str>) -> crate::audit::types::RedactedString {
+    let literal = crate::cli_deps::sanitize::resolved_home_string();
+    let canonical = crate::cli_deps::sanitize::canonical_home_string();
+    crate::audit::types::RedactedString::from_untrusted(redact_reason_with_needles(
+        raw.as_ref(),
+        literal,
+        canonical,
+    ))
+}
+
+/// The needle-ordering core of [`redact_reason`], split out so a test can
+/// supply synthetic `literal`/`canonical` values directly rather than
+/// reconstructing a real macOS symlink-resolution chain under a
+/// randomized tmpdir (whose own prefix would otherwise break the exact
+/// "canonical contains literal" substring relationship the real-world
+/// case relies on — `/Users/<name>` has no prefix of its own to collide
+/// with).
+///
+/// Item 7 (S-LOW-2): when the LONGER of the two needles contains the
+/// SHORTER as a substring — the standing case is macOS resolving
+/// `/Users/<name>` to `/System/Volumes/Data/Users/<name>`, so the literal
+/// `$HOME` value is a genuine, boundary-safe tail of the canonicalized
+/// one — the longer needle MUST run first. Redacting with the shorter
+/// needle first would match that tail on its own (right-boundary-
+/// confirmed, since it is followed by a real separator) and replace only
+/// it, leaving a mangled `/System/Volumes/Data~/file` instead of the
+/// clean `~/file` a whole-path match produces. Order is irrelevant when
+/// neither contains the other (the common case: no symlink, canonical ==
+/// literal) — this only reorders the specific case that matters.
+fn redact_reason_with_needles(
+    raw: &str,
+    literal: Option<String>,
+    canonical: Option<String>,
+) -> String {
+    let (first, second) = match (&literal, &canonical) {
+        (Some(a), Some(b)) if a.len() != b.len() => {
+            let (longer, shorter) = if a.len() > b.len() { (a, b) } else { (b, a) };
+            if longer.contains(shorter.as_str()) {
+                (Some(longer.clone()), Some(shorter.clone()))
+            } else {
+                (literal.clone(), canonical.clone())
+            }
+        }
+        _ => (literal.clone(), canonical.clone()),
+    };
+
+    let mut scrubbed = raw.to_string();
+    if let Some(needle) = &first {
+        scrubbed = crate::cli_deps::sanitize::redact_needle_anywhere(&scrubbed, needle);
+    }
+    if let Some(needle) = &second {
+        scrubbed = crate::cli_deps::sanitize::redact_needle_anywhere(&scrubbed, needle);
+    }
+    scrubbed
 }
 
 #[cfg(test)]
@@ -1211,5 +1408,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// S-LOW-A / C-B5 (round 8b): `redact_reason` must scrub a LITERAL
+    /// `$HOME` occurrence mid-sentence (an `io::Error`'s `Display` chain
+    /// commonly embeds one), same as `cli_deps::sanitize::redact_home_anywhere`.
+    #[test]
+    fn redact_reason_scrubs_a_literal_home_occurrence() {
+        let _env_guard = crate::platform::test_env::lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/Users/jack");
+        let redacted =
+            redact_reason("failed to write /Users/jack/.claude/accounts/rotation.json: EOF");
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(
+            redacted.as_str(),
+            "failed to write ~/.claude/accounts/rotation.json: EOF"
+        );
+    }
+
+    /// S-LOW-A / C-B5 (round 8b): `HOME=/` must NOT be destructive. The
+    /// pre-fix implementation did `raw.replace(&home, "<home>")`, and with
+    /// `home == "/"` that replaces EVERY path separator in `raw` — this
+    /// pins the fix (boundary-safe matching via
+    /// `redact_needle_anywhere`'s empty-trimmed-needle guard) rather than
+    /// the naive replace.
+    #[test]
+    fn redact_reason_does_nothing_destructive_when_home_is_root() {
+        let _env_guard = crate::platform::test_env::lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/");
+        let raw = "atomic replace at /var/tmp/a: rename /var/tmp/a.tmp -> /var/tmp/a failed";
+        let redacted = redact_reason(raw);
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(
+            redacted.as_str(),
+            raw,
+            "HOME=/ must not corrupt every path separator in the reason string"
+        );
+    }
+
+    /// S-LOW-A / C-B5 (round 8b): an unset `HOME` must also be a no-op
+    /// (never a panic, never a corrupted string) — mirrors
+    /// `redact_home_anywhere`'s unset-HOME contract.
+    #[test]
+    fn redact_reason_does_nothing_when_home_is_unset() {
+        let _env_guard = crate::platform::test_env::lock();
+        let prior = std::env::var_os("HOME");
+        std::env::remove_var("HOME");
+        let raw = "failed to write /some/path/rotation.json: EOF";
+        let redacted = redact_reason(raw);
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(redacted.as_str(), raw);
+    }
+
+    /// S-LOW-A / C-B5 (round 8b): the whole point of the fix — an
+    /// `io::Error`'s `Display` chain embeds the OS-CANONICALIZED home path
+    /// (e.g. macOS resolves a symlinked home directory), which does NOT
+    /// literally match `$HOME`. Non-vacuity: without the canonical-home
+    /// pass added to `redact_reason`, this reason string would pass
+    /// through with the fully-resolved real-home path intact — the
+    /// literal-`$HOME` pass alone cannot see it, since `$HOME` here is the
+    /// symlink, not the target.
+    #[cfg(unix)]
+    #[test]
+    fn redact_reason_scrubs_the_canonicalized_home_when_it_differs_from_the_literal() {
+        use std::os::unix::fs::symlink;
+
+        let _env_guard = crate::platform::test_env::lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real-home");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("home-link");
+        symlink(&real, &link).unwrap();
+        let canon = std::fs::canonicalize(&real).expect("real-home must canonicalize");
+
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", &link);
+        let raw = format!("failed to write {}/state.json: EOF", canon.display());
+        let redacted = redact_reason(&raw);
+        match prior {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(redacted.as_str(), "failed to write ~/state.json: EOF");
+    }
+
+    // ── item 7 (S-LOW-2): the LONGER needle (canonical, when it contains
+    //    the literal one) must run FIRST, or the shorter needle mangles a
+    //    genuine whole-path match into a half-redacted string ───────────
+    //
+    // RED — EXECUTED: with `redact_reason_with_needles`'s reordering
+    // `match` replaced by the pre-fix `(literal.clone(), canonical.clone())`
+    // unconditionally (literal always first), `cargo test -p csq-core --lib
+    // audit::op_emit::tests::redact_reason_runs_the_longer_containing_needle_first \
+    // -- --exact` failed:
+    // `left: "failed to write /System/Volumes/Data~/state.json: EOF"
+    //  right: "failed to write ~/state.json: EOF"` — the literal pass ran
+    // first, matched the tail `/Users/jack` inside the canonical path, and
+    // left the mangled prefix untouched. GREEN with the reordering
+    // restored.
+    #[test]
+    fn redact_reason_runs_the_longer_containing_needle_first() {
+        let literal = "/Users/jack".to_string();
+        let canonical = "/System/Volumes/Data/Users/jack".to_string();
+        assert!(
+            canonical.contains(&literal),
+            "test setup: canonical must genuinely contain literal as a substring"
+        );
+
+        let redacted = redact_reason_with_needles(
+            "failed to write /System/Volumes/Data/Users/jack/state.json: EOF",
+            Some(literal),
+            Some(canonical),
+        );
+        assert_eq!(redacted, "failed to write ~/state.json: EOF");
+    }
+
+    /// A raw string containing ONLY the literal (never the fuller
+    /// canonical path) must still redact via the literal needle — the
+    /// reordering above must not accidentally suppress the shorter
+    /// needle's own, independent occurrences.
+    #[test]
+    fn redact_reason_still_redacts_a_literal_only_occurrence_after_reordering() {
+        let literal = "/Users/jack".to_string();
+        let canonical = "/System/Volumes/Data/Users/jack".to_string();
+
+        let redacted = redact_reason_with_needles(
+            "failed to write /Users/jack/state.json: EOF",
+            Some(literal),
+            Some(canonical),
+        );
+        assert_eq!(redacted, "failed to write ~/state.json: EOF");
     }
 }

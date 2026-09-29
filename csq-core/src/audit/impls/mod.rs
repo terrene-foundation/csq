@@ -4,7 +4,7 @@
 //! csq-core hosts ONLY implementations whose dependency footprint is
 //! Apache 2.0 / Foundation-owned. The the enterprise edition-backed impls
 //! (proprietary) live in the sibling `the enterprise seam crate`
-//! crate, which is NOT a workspace member — maintainers build it
+//! crate, an enterprise workspace member — maintainers can also build it
 //! locally with `cargo check --manifest-path the enterprise seam crate/Cargo.toml`.
 //! See `internal-design-docs`
 //! §"Acceptance criteria" amendment for the rationale.

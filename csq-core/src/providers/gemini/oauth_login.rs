@@ -381,7 +381,7 @@ fn verify_oauth_creds(path: &Path, slot: AccountNum) -> Result<(), OauthLoginErr
 /// typed [`OauthLoginError`] (which names the remediation — `csq login
 /// {slot} --provider gemini`, csq's own OAuth flow) instead of a hang.
 ///
-/// Reuses [`verify_oauth_creds`] — the exact `exists + valid + fresh` check
+/// Reuses `verify_oauth_creds` — the exact `exists + valid + fresh` check
 /// gemini-cli's own auth will apply — so a green pre-flight means gemini-cli
 /// will find usable creds and run non-interactively. `home_dir` is injected
 /// for testability; production passes the process `HOME`. Read-only: no

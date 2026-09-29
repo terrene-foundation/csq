@@ -18,7 +18,7 @@
 //! # PRIMARY METHODOLOGICAL DIRECTIVE (M04, amended for file-based custody)
 //!
 //! **Primary custody is the 0o600 file store at `csq-runs/keys/`** (see
-//! [`file_store`]). The OS keychain is retained as a **migration source +
+//! `file_store`). The OS keychain is retained as a **migration source +
 //! read fallback + integrity anchor**, NOT the primary store — the daemon
 //! cannot read the keychain non-interactively (the brick root cause), so the
 //! file store is the daemon-readable channel.

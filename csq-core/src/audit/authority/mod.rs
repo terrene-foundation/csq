@@ -68,14 +68,21 @@
 //! 2. Monotonic `roster_version` in the signed roster.
 //! 3. `roster_version_floor` in `chain.json` (rejects below-floor rosters).
 //!
-//! **Trust boundary**: the floor is FS-anchored (`chain.json`), not
-//! keychain-anchored. Same-user-FS-write tamper of the floor sits outside the
-//! defended boundary because (a) the roster is org-root-signed, so an FS-write
-//! attacker cannot forge a valid replacement; (b) rollback additionally
-//! requires a compromised revoked member key; (c) the FS-based floor catches
-//! naive rollback. Keychain-anchoring the floor is tracked in an internal ticket
-//! (was an internal ticket, a 3-item hardening backlog closed with no successor for this
-//! item — re-pointed 2026-08-12; see `scripts/verify/todo-closed-issue.sh`).
+//! **Trust boundary**: enforcement reads the FILE floor in `chain.json`.
+//! The floor is also recorded best-effort in the active seed payload in BOTH
+//! the file key store and the keychain by `write_roster_floor_to_keychain`.
+//! `verify_chain` compares the keychain copy with `chain.json` and reports
+//! `RosterFloorAnchorStatus`: a non-fatal DETECTOR, not an enforcing anchor.
+//! Signed rosters below the file floor are still rejected; lowering that file
+//! floor alone is detected when the independent readable anchor disagrees.
+//! A missing floor on one side is unconfirmed, never proof of agreement.
+//!
+//! The anchor does not prevent a same-UID attacker from changing/deleting both
+//! copies. Enforcing `max(file, anchor)` is deliberately declined: a mutable
+//! anchor poisoned to `u64::MAX` would add a denial-of-service vector rather
+//! than a stronger trust root. See spec 12 §12.16 and the detector threat model
+//! in `crate::phase2b::bundle_floor` (enterprise). This is detection, not a
+//! claim of rejection after floor tampering or absence of tampering.
 //!
 //! # LDAP/AD source
 //!
@@ -100,6 +107,8 @@ pub mod registry;
 pub mod roster;
 pub mod sign;
 
+#[cfg(test)]
+mod roster_floor_tests;
 #[cfg(test)]
 mod tests_m12;
 

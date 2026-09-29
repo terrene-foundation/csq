@@ -57,7 +57,7 @@
 //! the WARN.  Spec 12 §12.4 documents the contract.
 
 use csq_core::audit::{AuditRecord, Decision, RedactedString, ResultState};
-use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 #[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -308,6 +308,32 @@ impl AuditEmitter {
             &self.pending_dir,
             &self.operation,
         )
+    }
+
+    /// Discards the held record WITHOUT writing it anywhere — no live-IPC
+    /// POST, no `.pending/` fallback write.
+    ///
+    /// `AuditEmitter` holds no OS resource beyond the record itself (a
+    /// `PathBuf` for the socket, a `PathBuf` for the pending dir, and a
+    /// `String` operation label — no file handle, no lock, no socket is
+    /// opened at construction), so taking the record is sufficient to
+    /// release everything the emitter owns. After this call, both `Drop`
+    /// and [`try_flush_now`](Self::try_flush_now) are no-ops (the same
+    /// take-then-noop invariant `try_flush_now` itself establishes on a
+    /// successful flush).
+    ///
+    /// Use this on a path that must not write an audit record at all —
+    /// e.g. a pre-spawn termination check where no session was ever
+    /// actually started and a record describing one would be misleading.
+    ///
+    /// Gated `#[cfg(unix)]`: its only caller today is
+    /// `codex_supervise::exit_cleanly_if_terminating_before_spawn` (also
+    /// `#[cfg(unix)]` — the SIGHUP/SIGTERM pre-spawn termination check is
+    /// unix-signal-only), so on a non-unix build this method is genuinely
+    /// unreachable rather than merely untested.
+    #[cfg(unix)]
+    pub fn discard(&mut self) {
+        self.record = None;
     }
 
     /// Emit the record immediately, best-effort (test-only).
@@ -623,18 +649,15 @@ fn write_pending(pending_dir: &Path, run_id: &str, bytes: &[u8]) -> Result<(), S
     let target = pending_dir.join(format!("{run_id}.jsonl"));
     let tmp = unique_tmp_path(&target);
 
-    // §5a cleanup on every failure branch.
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate write + secure_file pair would leave
+    // open. Treated as secret-bearing under ambiguity-resolves-closed —
+    // an audit record for a `csq run` invocation may embed sensitive
+    // command args or output.
+    if let Err(e) = write_new_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
             "write .pending/ tmp: {}",
-            csq_core::error::redact_tokens(&e.to_string())
-        ));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "secure .pending/ tmp: {}",
             csq_core::error::redact_tokens(&e.to_string())
         ));
     }
@@ -1051,6 +1074,59 @@ mod tests {
         let content2 = std::fs::read_to_string(&path2).unwrap();
         let parsed2: csq_core::audit::AuditRecord = serde_json::from_str(&content2).unwrap();
         assert_eq!(parsed2.run_id, run_id_2);
+    }
+
+    // ── discard(): writes no record, leaks no handle/lock ──────────────────
+
+    /// AC (governing task item 1): `discard()` writes NO record — neither a
+    /// live-IPC POST nor a `.pending/` fallback file — and leaves nothing
+    /// for `Drop` to do. This replaces the `std::mem::forget` workaround
+    /// C-R4-7's pre-spawn termination check previously used: the emitter's
+    /// only state is the `Option<AuditRecord>` plus two `PathBuf`s and a
+    /// `String` (no file handle, no lock, no socket opened at construction),
+    /// so proving `record` is `None` after `discard()` — and that `Drop`
+    /// afterward performs no filesystem write — is the whole proof that
+    /// nothing is leaked: there is no other resource the type holds.
+    #[cfg(unix)]
+    #[test]
+    fn discard_writes_no_record_and_drop_becomes_a_noop() {
+        let dir = TempDir::new().unwrap();
+        // A socket path that, if ever POSTed to, would prove discard() failed
+        // to short-circuit before the live-IPC attempt.
+        let socket_path = dir.path().join("csq.sock"); // absent
+        let pending_dir = dir.path().join("csq-runs").join(".pending");
+
+        let run_id = "00000000-0000-4000-a000-000000000030";
+        let mut emitter = AuditEmitter::new(
+            sample_record(run_id),
+            socket_path,
+            pending_dir.clone(),
+            "csq run account 30".to_string(),
+        );
+
+        emitter.discard();
+
+        // The held record is gone — the same invariant try_flush_now's
+        // take() establishes on a successful flush.
+        assert!(
+            emitter.record.is_none(),
+            "discard() must take the record, leaving None"
+        );
+
+        // try_flush_now() after discard() is the take()-already-ran no-op
+        // branch: Ok(()) with no write attempted.
+        assert!(
+            emitter.try_flush_now().is_ok(),
+            "try_flush_now after discard() must be a no-op Ok"
+        );
+
+        // Drop performs no filesystem write: .pending/ must never be created.
+        drop(emitter);
+        assert!(
+            !pending_dir.exists(),
+            "discard() must prevent Drop from writing to .pending/ — a record \
+             was written despite discard(), the workaround this test replaces"
+        );
     }
 
     // ── Timeout: simulate hung daemon (fast test via missing socket) ───────

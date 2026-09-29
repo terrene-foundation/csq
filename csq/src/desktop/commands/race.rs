@@ -1774,47 +1774,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn install_rejection_releases_loopback_port() {
-        // Sister test to install_rejection_does_not_orphan_task. The
-        // production code's `drop(prep)` releases the loopback
-        // listener after install rejects. We exercise the analogous
-        // shape here by binding a real listener, asserting the port
-        // is reachable, dropping the bind, and asserting the port is
-        // released.
-        //
-        // This is a property test for `LoopbackListener::drop` (which
-        // already has its own coverage in csq-core), wired into the
-        // race-rejection path here so a future refactor that forgets
-        // to drop `prep` on rejection has a regression check.
-        use csq_core::oauth::loopback::LoopbackListener;
-
-        let listener = LoopbackListener::bind("test-secret".into())
-            .await
-            .expect("bind a listener");
-        let port = listener.port;
-
-        // Confirm the port is reachable.
-        assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok(),
-            "port should be reachable while listener is bound"
-        );
-
-        // The production rejection path drops `prep` which owns
-        // the listener. Mirror that here.
-        drop(listener);
-        // Give the kernel a tick.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let attempt = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
-        assert!(
-            attempt.is_err(),
-            "port MUST be released after listener drops — install \
-             rejection path drops prep, which drops listener (REV-R2-01)"
-        );
-    }
+    // NOTE: `install_rejection_releases_loopback_port` was REMOVED here.
+    // It never exercised the rejection path it claimed to guard — it bound
+    // and dropped its OWN listener — so it duplicated
+    // `csq_core::oauth::loopback::tests::dropping_listener_releases_port`
+    // while adding a parallel-suite port-reuse flake: ~800 tests run
+    // concurrently, so another test can take that ephemeral port number
+    // between the drop and the check. The rejection path itself is covered
+    // by `install_rejection_does_not_orphan_task` above; the drop property
+    // is covered, collision-proof, in csq-core.
 
     fn debug_take(t: &PasteSenderTake) -> &'static str {
         match t {
@@ -2561,7 +2529,7 @@ mod tests {
     // breaks the lib-unittest binary loader with
     // `STATUS_ENTRYPOINT_NOT_FOUND` (0xc0000139) before any test runs.
     // The `tauri = { ..., "test" }` dev-dep is similarly Unix-gated in
-    // `csq-desktop/src-tauri/Cargo.toml`. The R3-L3 contract this test
+    // `csq/Cargo.toml`. The R3-L3 contract this test
     // pins (credential persistence is decoupled from emit delivery) is
     // platform-independent, so Linux + macOS coverage is sufficient
     // until upstream Tauri's mock_app supports Windows. Tracked as

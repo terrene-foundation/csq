@@ -76,6 +76,7 @@ target/
 # Frontend + Tauri CLI host build artifacts (csq crate)
 csq/node_modules/
 csq/ui/node_modules/
+node_modules/
 csq/ui/dist/
 
 # Local-only research and notes folders
@@ -182,3 +183,22 @@ THIRD-PARTY-LICENSES.md.*
 /helm-safety.yml
 
 
+
+# .env backups — same secrets as .env; an untracked one is a `git add -A` away
+# from being committed (near-miss 2026-08-31).
+.env.bak*
+.env.*.bak
+
+# Quarantined stale release artifacts. Kept on disk as a recovery fallback but
+# NEVER committed: >10 MB each, which `git.md` MUST NOT #4 blocks outright, and
+# git never forgets a large blob. Ignored rather than merely uncommitted so the
+# worktree-drift guard can reach CLEAN — a guard that reports a permanent,
+# deliberate exception on every run is one operators learn to skip
+# (durable-instruments.md MUST-1), and this trunk's whole point is that the
+# guards must be able to terminate.
+.stale-artifacts-*/
+
+# dev-preflight receipt — written at repo root (NOT the .git admin subtree,
+# which is a protected path here). Untracked by design: it is bound to one SHA
+# and is evidence for a single push, never repo content.
+.csq-dev-preflight.json

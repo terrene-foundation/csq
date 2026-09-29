@@ -1,7 +1,12 @@
 # Code Squad Q (csq)
 
-Run several Claude Code accounts on one machine, switch between them per terminal,
-and see how much quota each one has left.
+A governed execution layer for coding-agent CLIs. Run Claude Code, Codex, Gemini,
+Kimi and Grok under one command, apply the same governance standard to every run,
+and get a verifiable audit trail of what each one did.
+
+Running several accounts on one machine — switching per terminal, tracking quota,
+keeping tokens fresh — is the substrate underneath that, and it works on its own if
+that is all you need.
 
 Claude Code stores its credentials in a single config directory. If you have more
 than one account, using them at the same time means logging in and out — and every
@@ -10,6 +15,17 @@ home and each terminal its own view, so several sessions can run side by side
 against different accounts without disturbing one another.
 
 Apache-2.0 licensed, maintained by the Terrene Foundation.
+
+## Embedding csq
+
+csq is not only a CLI. Every `csq <op> --json` emits a versioned envelope
+(`csq.exec/verify/capabilities.v1`) whose shape is defined by the `csq-sdk`
+crate (Apache-2.0), so another program can drive csq and parse its output
+against a stable contract rather than scraping human-readable text.
+
+`csq-sdk` is deliberately thin: it depends only on serde and the redaction
+leaf, with no dependency on csq's core, its daemon, or anything that touches
+credentials. You can take the contract without taking the application.
 
 ## What it does
 

@@ -1,9 +1,9 @@
-//! Generates the `handle-dir/.gemini/settings.json` content that
+//! Generates the `<handle_dir>/.gemini/settings.json` content that
 //! pre-seeds `gemini-cli` to use API-key auth (not OAuth) before
 //! every spawn.
 //!
 //! Per OPEN-G01 (an internal journal entry RESOLVED) the handle-dir
-//! `GEMINI_CLI_HOME/.gemini/settings.json` fully isolates from the
+//! `<GEMINI_CLI_HOME>/.gemini/settings.json` fully isolates from the
 //! user-level `~/.gemini/settings.json` — no fallback observed when
 //! the handle-dir variant exists. Pre-seeding is therefore a cheap
 //! settings-drift reassertion (in [`super::probe`]) rather than active

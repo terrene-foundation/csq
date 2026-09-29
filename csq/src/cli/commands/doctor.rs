@@ -251,48 +251,71 @@ struct DoctorReport {
     ///
     /// Mirrors the `AuditHealth` enum the daemon computes at startup.
     ///
-    /// `verified`  — chain is intact and all reachable signatures verified.
-    /// `degraded`  — chain-linking verified; one or more historical signing keys
-    ///               absent from keychain (per-record sigs for those records skipped).
-    ///               Daemon is operational; see `audit_historical_key_gaps`.
-    /// `broken`    — `verify_chain` returned a fatal error (chain corruption,
-    ///               invalid signature, IO failure, etc.). Daemon audit subsystem
-    ///               is non-operational until repaired.
-    /// `unknown`   — transient: the signing key is present but the credential
-    ///               store could not be read this run (`KeychainUnavailable` —
-    ///               keychain locked / access-denied; reachable from doctor), OR
-    ///               (daemon-startup only) a verify timeout/panic. Audit subsystem
-    ///               fail-closed for the run; NOT a durable lockout (the
-    ///               `.chain-broken` sentinel is left unchanged). Run
-    ///               `csq audit migrate-keys`.
+    /// `verified`      — chain is intact and all reachable signatures
+    ///                   verified, scanned back to genesis.
+    /// `tail_verified` — the scan hit `record_limit` and only examined the
+    ///                   tail; the head verified clean, but genesis and the
+    ///                   anti-truncation checks were skipped over the
+    ///                   `skipped` oldest records. Daemon is operational
+    ///                   (see `AuditHealth::TailVerified`'s own doc for why);
+    ///                   the record-limit override is `CSQ_AUDIT_VERIFY_LIMIT`.
+    /// `degraded`      — chain-linking verified; one or more historical signing keys
+    ///                   absent from keychain (per-record sigs for those records skipped).
+    ///                   Daemon is operational; see `audit_historical_key_gaps`.
+    /// `broken`        — `verify_chain` returned a fatal error (chain corruption,
+    ///                   invalid signature, IO failure, etc.). Daemon audit subsystem
+    ///                   is non-operational until repaired.
+    /// `unknown`       — transient: the signing key is present but the credential
+    ///                   store could not be read this run (`KeychainUnavailable` —
+    ///                   keychain locked / access-denied; reachable from doctor), OR
+    ///                   (daemon-startup only) a verify timeout/panic. Audit subsystem
+    ///                   fail-closed for the run; NOT a durable lockout (the
+    ///                   `.chain-broken` sentinel is left unchanged). Run
+    ///                   `csq audit migrate-keys`.
     ///
-    /// JSON shape: `{ "status": "verified" | "degraded" | "broken" | "unknown",
-    ///               "error_kind": "...", "reason": "..." }` (broken/unknown only).
+    /// JSON shape: `{ "status": "verified" | "tail_verified" | "degraded" |
+    ///               "broken" | "unknown", "skipped": <u64>, "error_kind": "...",
+    ///               "reason": "..." }` — `skipped` present only for
+    ///               `tail_verified`; `error_kind` / `reason` only for
+    ///               `broken` / `unknown`. Same shape as the `GET
+    ///               /api/audit/health` body (spec 12 §12.13.5a).
     ///
     /// Note: no host paths included; `error_kind` is a fixed-vocabulary tag.
     audit_chain_state: csq_core::audit::AuditHealth,
     /// Records the verifier SKIPPED because the chain exceeded its
     /// `record_limit` (daemon default 10,000). `0` means whole-chain coverage.
     ///
-    /// This exists because `audit_chain_state` CANNOT express it.
-    /// `AuditHealth::Verified` is a unit variant, so a tail-only run and a
-    /// whole-chain run are indistinguishable through the enum — which is how
-    /// `csq doctor` came to print a bare `✓ verified` on a host where the
-    /// verifier had just logged `audit_verify_limit_exceeded … skipped=658`,
-    /// the skipped records INCLUDING the genesis. `compliance_report.rs` had
-    /// the honest rendering all along; the operator surface did not.
+    /// Before 2026-09-13 this existed because `audit_chain_state` could not
+    /// express truncation at all (`AuditHealth::Verified` was a unit variant
+    /// and a tail-only run was indistinguishable from a whole-chain one) —
+    /// `csq doctor` printed a bare `✓ verified` on a host where the verifier
+    /// had just logged `audit_verify_limit_exceeded … skipped=658`, the
+    /// skipped records INCLUDING the genesis (`compliance_report.rs` had the
+    /// honest rendering all along; the operator surface did not). Since then
+    /// `AuditHealth::TailVerified { skipped }` carries the count directly, so
+    /// `audit_chain_state` alone is sufficient — including on `--json`, which
+    /// now expresses partial coverage through that variant's `skipped` field.
     ///
-    /// A `✓` that reads the same whether or not the genesis was verified is an
-    /// instrument that cannot fail (`instrument-discipline.md` MUST-1).
-    ///
-    /// `#[serde(skip)]` deliberately: this plumbs the count to the TEXT
-    /// renderer only. The `--json` surface is versioned by
-    /// `DOCTOR_SCHEMA_VERSION` under spec 13 §9, so adding a wire field is a
-    /// schema bump and belongs in its own change rather than riding along with
-    /// a render fix. `--json` therefore still cannot express partial coverage —
-    /// stated here rather than left for the next reader to discover.
+    /// This field is kept for the TEXT renderer's version-skew compat arm
+    /// (`audit_chain_line`'s `AuditHealth::Verified if records_unverified > 0`
+    /// branch): a daemon running pre-2026-09-13 code can still report
+    /// `Verified` with a separately-carried unverified count, and the text
+    /// renderer needs a value to read in that case even though a current
+    /// daemon always folds the count into `TailVerified` itself. `#[serde(skip)]`
+    /// because the `--json` surface reads the count off `audit_chain_state`
+    /// directly and gains nothing from a duplicate wire field.
     #[serde(skip)]
     audit_records_unverified: u64,
+    /// Provenance of `audit_chain_state` / `audit_records_unverified`:
+    /// read from the RUNNING daemon's own `GET /api/audit/health`
+    /// (`AuditChainSource::Daemon`), or a LOCAL `verify_chain` fallback
+    /// (`AuditChainSource::LocalOnly`) when no daemon was reachable —
+    /// see `check_audit_chain` / `try_daemon_audit_health`.
+    ///
+    /// `#[serde(skip)]` for the same reason as `audit_records_unverified`
+    /// immediately above: TEXT-renderer only, not a `--json` schema field.
+    #[serde(skip)]
+    audit_chain_source: AuditChainSource,
     /// M2 T2.5 — trust-plane conformance grade for the audit chain
     /// (`"COMPATIBLE"` / `"CONFORMANT"` / `"COMPLETE"`). Added in **enterprise**
     /// schema v17.
@@ -331,12 +354,13 @@ struct DoctorReport {
     /// Keychain roster-version-floor anchor verdict (a DETECTOR — never bricks).
     /// Added in schema v16 (`an internal ticket` item 2).
     /// `confirmed` = chain.json floor matches keychain-anchored floor;
-    /// `unconfirmed` = no roster installed yet (chain.json has no floor), OR
-    ///   keychain entry absent / unreadable — detection is file-only for now;
+    /// `unconfirmed` = one floor missing, or keychain entry unreadable;
+    ///   no claim of agreement or complete rollback detection;
     /// `mismatch` = chain.json floor differs from keychain-anchored floor (possible
     ///   rollback tampering — investigate; run `csq audit verify`).
     ///
-    /// `None` on installations that have never run `csq audit roster install`.
+    /// `None` when no floor is observed in either source. An anchor-only floor
+    /// remains visible even when the chain.json field has been deleted.
     /// Always `None` for schema_version < 16 (backward compatibility).
     ///
     /// JSON shape: `{ "audit_roster_floor_anchor": "confirmed" }` (omitted when None).
@@ -467,7 +491,7 @@ struct DoctorReport {
     /// current, edition-specific-or-converged, values — a LATER cross-edition
     /// field can still carry both ceilings to the same number without changing
     /// which fields this community build emits).
-    /// JSON shape: `{ pending_count, oldest_age_secs, state, last_drain_age_secs, warn }`
+    /// JSON shape: `{ pending_count, oldest_age_secs, state, last_drain_age_secs, warn, admission_problem? }`
     /// (omitted when None).
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp_gate_outbox_backlog: Option<McpGateOutboxBacklog>,
@@ -482,6 +506,33 @@ struct DoctorReport {
     /// §9 contract change); the printed WARN is the operator-facing signal.
     #[serde(skip)]
     custodian_identity_canary: CustodianIdentityCanary,
+
+    /// Daemon refresh posture (leader / follower) plus, on a follower, the
+    /// slots whose token has already expired because no leader renewed it.
+    /// A follower is a deliberate operator choice for multi-host installs
+    /// where Anthropic's refresh-token rotation would otherwise make two
+    /// daemons invalidate each other; a follower going stale is the failure
+    /// mode that must not be silent. NOT serialized in `--json` (drives only
+    /// the printed lines, so it adds no `schema_version` bump / spec-13 §9
+    /// contract change) — mirrors `custodian_identity_canary` above.
+    #[serde(skip)]
+    daemon_posture: DaemonPostureReport,
+}
+
+/// `csq doctor`'s view of the daemon refresh posture. Built by
+/// [`check_daemon_posture`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DaemonPostureReport {
+    /// `"leader"` or `"follower"`.
+    role: String,
+    /// True when `daemon-posture.json` exists but could not be read/parsed, so
+    /// the daemon stood down to follower. Carries the reason.
+    unreadable_reason: Option<String>,
+    /// Slots with an already-expired token. Only populated on a follower —
+    /// on a leader the refresher owns that condition and its own cooldown /
+    /// `broker_failed` surfaces report it, so duplicating it here would give
+    /// the operator two places to look for one fact.
+    expired: Vec<(u16, &'static str, u64)>,
 }
 
 /// CU4 MCP partial-coverage advisory state for `csq doctor` (spec 10 §10.8.3).
@@ -504,16 +555,22 @@ struct McpPartialCoverage {
 /// guarantees no record is LOST; an internal ticket makes a stuck backlog VISIBLE).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct McpGateOutboxBacklog {
+    /// Fixed-vocabulary admission constraint/inspection error. Additive within
+    /// doctor v25 per doctor_schema_string's declared policy; omitted if healthy.
+    /// Capacity warns conservatively when a maximum-sized record cannot fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_problem: Option<&'static str>,
     /// `.pending-mcp-gate/*.json` files queued (enforced MCP-gate decisions not
     /// yet on the signed chain). Excludes `.tmp.` in-flight writes and subdirs,
-    /// mirroring the drain's own filter.
+    /// mirroring the drain's own filter. On inspection error this is only the
+    /// observed count, not an assertion that no other pending files exist.
     pending_count: u32,
     /// Age in seconds of the OLDEST queued file, taken as the max of each file's
     /// `now - mtime`. A file whose mtime is unreadable OR in the future
     /// (`duration_since` errs — clock skew) contributes NO age, so it does not
     /// raise this value; `None` means every counted file's age was unreadable
-    /// (never `Some(_)` with `pending_count == 0` — the whole struct is `None`
-    /// then). The count axis (`pending_count`) is computed BEFORE the mtime read,
+    /// (never `Some(_)` with `pending_count == 0`; admission trouble can still
+    /// produce a warning with no observed JSON records). The count axis (`pending_count`) is computed BEFORE the mtime read,
     /// so it always reflects every queued file even when ages are missing — a
     /// backlog can never be fully hidden from `warn` via mtime alone. A genuinely
     /// stuck backlog (daemon not restarting / chain not appendable) carries normal
@@ -531,7 +588,7 @@ struct McpGateOutboxBacklog {
     /// one merely PENDING behind a stopped daemon.
     last_drain_age_secs: Option<u64>,
     /// `true` iff `state == Stuck` — the single operator-actionable axis (chain not
-    /// appendable while the daemon drains, OR the count cap exceeded). Retained for
+    /// appendable while the daemon drains, OR admission is constrained/uninspectable). Retained for
     /// consumers of the pre-shard-D shape; `false` is a benign `draining` /
     /// `pending_daemon_down` transient.
     warn: bool,
@@ -553,12 +610,13 @@ const MCP_GATE_DRAIN_STAMP_FRESH_SECS: u64 = 15 * 60;
 /// daemon from a down one).
 const MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS: u64 = 15 * 60;
 
-/// an internal ticket: a queued-file count above this flips the doctor surface to WARN
+/// an internal ticket: a queued-file count at or above this flips doctor to WARN
 /// regardless of age OR daemon state — a large backlog is itself a signal, even
 /// behind a down daemon (so an unbounded pending queue is never silently tolerated;
 /// M6 an internal ticket shard D keeps this axis unconditional). Mirrors the seam custody soft
-/// cap ([`check_seam_pending_backlog`]'s 1 000-file threshold).
-const MCP_GATE_OUTBOX_STUCK_COUNT: u32 = 1_000;
+/// capacity now shares the writer's non-evicting hard admission bound.
+const MCP_GATE_OUTBOX_STUCK_COUNT: u32 =
+    csq_core::audit::outbox_paths::MCP_GATE_OUTBOX_MAX_PENDING as u32;
 
 /// M19 hook-conformance state for `csq doctor` (Finding D fix).
 ///
@@ -629,6 +687,15 @@ struct AuditSinkDoctorInfo {
     last_anchor_ts: Option<String>,
     /// Records queued in `.pending-<sink>/` awaiting daemon drain.
     pending_count: u64,
+    /// `true` when `active_sink`'s current implementation is an in-memory
+    /// mock substrate (`csq_core::audit::is_mock_backed_sink`) — nothing has
+    /// actually left the process, regardless of what `last_anchor_ts` or
+    /// `pending_count` suggest. A clean anchor timestamp with
+    /// `mock_backend: true` is NOT a durable compliance attestation; the
+    /// text renderer and `--json` both surface this alongside the sink
+    /// status so an operator reading `csq doctor` sees it, not only the
+    /// daemon log's `anchor_sink_mock_backend` WARN.
+    mock_backend: bool,
     /// Drift events detected since last reset.
     replication_drift_count: u64,
 }
@@ -673,7 +740,7 @@ struct CodexSharedShapeJson {
     hint: String,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 struct StaleQuotaSlotJson {
     /// Slot number.
     slot: u16,
@@ -707,6 +774,29 @@ struct StaleQuotaSlotJson {
     /// — only the native-CLI slot is.
     #[serde(default)]
     expected: bool,
+    /// The poller's own recorded outcome for its most recent attempt on
+    /// this slot (`csq_core::quota::PollOutcome`, serialized `snake_case`
+    /// — e.g. `"rate_limited"`), read from `quota.json`'s `poller_health`
+    /// map (added #6877eea0). `None` when no health record exists yet —
+    /// a pre-#6877eea0 `quota.json`, or a surface this poller never polls
+    /// (today: everything except Anthropic OAuth slots) — in which case
+    /// `remedy` falls back to the surface/method-derived generic text
+    /// rather than asserting a cause `csq` never actually observed
+    /// (`evidence-first-claims.md` MUST-4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_outcome: Option<csq_core::quota::PollOutcome>,
+    /// `PollerHealth::consecutive_failures` for this slot — how many
+    /// non-`Ok` outcomes in a row (see that field's own doc comment for
+    /// why `SkippedCooldown` re-observations do not inflate it). `None`
+    /// under the same conditions as `last_outcome`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    consecutive_failures: Option<u32>,
+    /// Epoch seconds at which the poller will next attempt this slot,
+    /// when it is currently backing off (`PollerHealth::next_retry_at`).
+    /// `None` when the slot is not in backoff, or when there is no
+    /// health record at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_retry_at: Option<f64>,
 }
 
 /// JSON representation of one unrecoverable rename label slot.
@@ -1059,7 +1149,7 @@ struct DaemonInfo {
     /// Populated when the daemon's reported version differs from the CLI's
     /// own `CARGO_PKG_VERSION`, signalling a stale-daemon-after-csq-upgrade
     /// drift. The daemon is alive and serving but its data may be stale; the
-    /// remediation is `csq daemon stop && csq daemon start`.
+    /// remediation verifies service/PATH executables before owner-specific recovery.
     #[serde(skip_serializing_if = "Option::is_none")]
     version_drift: Option<String>,
 }
@@ -1735,6 +1825,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         audit_verification_levels_populated,
         audit_level_summary_raw,
         audit_records_unverified,
+        audit_chain_source,
     ) = check_audit_chain(base_dir);
 
     // Enterprise gate-coverage (task #77): the trust-plane grade is enterprise-differentiated
@@ -1803,6 +1894,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         audit_verification_level_summary,
         audit_chain_state,
         audit_records_unverified,
+        audit_chain_source,
         audit_keychain_anchor,
         audit_roster_floor_anchor,
         audit_bundle_floor_anchor: doctor_bundle_floor_anchor(base_dir),
@@ -1818,6 +1910,39 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         mcp_partial_coverage: check_mcp_partial_coverage(base_dir),
         mcp_gate_outbox_backlog: check_mcp_gate_outbox_backlog(base_dir),
         custodian_identity_canary: check_custodian_identity_canary(base_dir),
+        daemon_posture: check_daemon_posture(base_dir),
+    }
+}
+
+/// Read the daemon refresh posture and, on a follower, the already-expired
+/// slots. Cheap: one small JSON read, plus (follower only) one credential read
+/// per discovered OAuth slot.
+fn check_daemon_posture(base_dir: &Path) -> DaemonPostureReport {
+    use csq_core::daemon::posture::{self, PostureSource};
+
+    let eff = posture::load(base_dir);
+    // Borrow rather than move: `eff` is read again below (`eff.is_follower()`,
+    // `eff.posture`), so destructuring `source` by value partially moves it.
+    let unreadable_reason = match &eff.source {
+        PostureSource::Unreadable(why) => Some(why.clone()),
+        _ => None,
+    };
+    let expired = if eff.is_follower() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        posture::expired_slots(base_dir, now_ms)
+            .into_iter()
+            .map(|e| (e.slot, e.surface, e.expired_for_secs))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    DaemonPostureReport {
+        role: eff.posture.as_str().to_string(),
+        unreadable_reason,
+        expired,
     }
 }
 
@@ -1896,6 +2021,23 @@ fn check_seam_registry_status(base_dir: &Path) -> String {
     }
 }
 
+/// True when `path` is NotFound because an EXISTING ancestor component is not
+/// a directory, rather than because the path is genuinely absent. Walks from
+/// `path`'s parent upward and classifies by the first ancestor that exists.
+///
+/// Needed because Windows' `ERROR_PATH_NOT_FOUND` (a non-directory component
+/// earlier in the path) maps to the same `std::io::ErrorKind::NotFound` as
+/// "no such entry" — see the call site in [`check_mcp_gate_outbox_backlog`].
+fn ancestor_is_not_a_directory(path: &Path) -> bool {
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) => return !meta.is_dir(),
+            Err(_) => continue,
+        }
+    }
+    false
+}
+
 /// M6 an internal ticket: inspect the MCP-gate attestation outbox for a stuck backlog.
 ///
 /// Reads `<base>/csq-runs/.pending-mcp-gate/*.json` directly (independent of the
@@ -1903,13 +2045,14 @@ fn check_seam_registry_status(base_dir: &Path) -> String {
 /// queued count + the OLDEST file's age + the daemon-aware `state` (M6 an internal ticket shard D,
 /// via [`classify_mcp_gate_backlog`]). WARNs (`state == Stuck`) when the daemon is
 /// draining yet the oldest file persists past
-/// [`MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS`], or the count exceeds the soft
+/// [`MCP_GATE_OUTBOX_STUCK_AGE_WHILE_DRAINING_SECS`], or the count reaches the hard
 /// cap ([`MCP_GATE_OUTBOX_STUCK_COUNT`]) — either signals an enforced-but-unrecorded
 /// compliance backlog the drain cannot land (chain not appendable).
 ///
-/// Returns `None` when the outbox directory is absent OR empty — the healthy
-/// steady state, and ALWAYS the case in the community edition (the proxy
-/// producer is enterprise-only). No host paths are surfaced (only count + age),
+/// Returns `None` when no queued JSON is observed AND admission is inspectable
+/// with capacity. An admission warning can have pending_count=0, including in
+/// community builds reading an enterprise-written outbox. No host paths are
+/// surfaced (only fixed-vocabulary reasons, count and age),
 /// so this is exempt from the operator-surface path-leak class. The directory is
 /// resolved by `csq_core::audit::outbox_paths::mcp_gate_outbox_dir` — the single
 /// shared full-path helper that both this (community) reader and the
@@ -1920,19 +2063,56 @@ fn check_seam_registry_status(base_dir: &Path) -> String {
 /// custody count.
 fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog> {
     let dir = csq_core::audit::outbox_paths::mcp_gate_outbox_dir(base_dir);
-    // Absent dir → None (never written in community; healthy when daemon is up).
-    let entries = std::fs::read_dir(&dir).ok()?;
+    use csq_core::audit::outbox_paths::{inspect_mcp_gate_admission, MCP_GATE_PENDING_MAX_BYTES};
+    let mut admission_problem = match inspect_mcp_gate_admission(base_dir) {
+        Ok(usage) => usage.admission_problem(MCP_GATE_PENDING_MAX_BYTES),
+        Err(problem) => Some(problem),
+    };
+    // Never follow a symlink directory even for the informational JSON count;
+    // a second-scan error must not erase the first inspector's evidence.
+    let entries = match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => match std::fs::read_dir(&dir) {
+            Ok(entries) => Some(entries),
+            Err(_) => {
+                admission_problem = Some("mcp_gate_pending_readdir");
+                None
+            }
+        },
+        Ok(_) => {
+            admission_problem = Some("mcp_gate_pending_unsafe_directory");
+            None
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Windows maps ERROR_PATH_NOT_FOUND (a path component exists but is
+            // not a directory) onto the same `ErrorKind::NotFound` as "genuinely
+            // absent". Unix instead returns ENOTDIR for that case, which lands
+            // directly in the `Err(_)` arm below without ever reaching here — so
+            // walking ancestors is required only to recover the distinction
+            // Windows' error-kind mapping collapses.
+            if ancestor_is_not_a_directory(&dir) {
+                admission_problem = Some("mcp_gate_pending_stat");
+            }
+            None
+        }
+        Err(_) => {
+            admission_problem = Some("mcp_gate_pending_stat");
+            None
+        }
+    };
     let now = std::time::SystemTime::now();
     let mut pending_count: u32 = 0;
     let mut oldest_age_secs: Option<u64> = None;
-    for entry in entries.flatten() {
+    for entry in entries.into_iter().flatten() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                admission_problem = Some("mcp_gate_pending_readdir");
+                continue;
+            }
+        };
         let path = entry.path();
-        // Same effective filter as the drain (regular `.json` file, no `.tmp.`
-        // in-flight). The drain excludes directories via `!path.is_dir()`; here we
-        // require a regular file via `entry.metadata().is_file()` below, which ALSO
-        // excludes a symlink — stricter, but the producer (`write_pending`) only
-        // ever emits regular files via atomic rename, so the two agree on every
-        // real outbox file.
+        // Keep the JSON-count contract. Admission separately counts all regular
+        // entries, including stale tmp files; symlink_metadata never follows links.
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
@@ -1943,9 +2123,16 @@ fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog
         if fname.contains(".tmp.") {
             continue;
         }
-        let meta = match entry.metadata() {
+        let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() => m,
-            _ => continue,
+            Ok(_) => {
+                admission_problem = Some("mcp_gate_pending_unsafe_entry");
+                continue;
+            }
+            Err(_) => {
+                admission_problem = Some("mcp_gate_pending_stat");
+                continue;
+            }
         };
         pending_count += 1;
         if let Ok(modified) = meta.modified() {
@@ -1956,8 +2143,8 @@ fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog
             }
         }
     }
-    if pending_count == 0 {
-        // Dir exists but empty (drained clean) → nothing to report.
+    if pending_count == 0 && admission_problem.is_none() {
+        // Truly empty/absent and inspectable, not an unknown count.
         return None;
     }
     // M6 an internal ticket shard D: read the last-drain stamp (shard B) as the daemon-liveness +
@@ -1969,9 +2156,13 @@ fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog
         .unwrap_or(0);
     let last_drain_secs = csq_core::audit::outbox_paths::read_outbox_drain_stamp(base_dir);
     let last_drain_age_secs = last_drain_secs.map(|s| now_secs.saturating_sub(s));
-    let state =
-        classify_mcp_gate_backlog(pending_count, oldest_age_secs, last_drain_secs, now_secs);
+    let state = if admission_problem.is_some() {
+        McpGateBacklogState::Stuck
+    } else {
+        classify_mcp_gate_backlog(pending_count, oldest_age_secs, last_drain_secs, now_secs)
+    };
     Some(McpGateOutboxBacklog {
+        admission_problem,
         pending_count,
         oldest_age_secs,
         state,
@@ -2007,7 +2198,7 @@ enum McpGateBacklogState {
 /// `mcp_gate_outbox_is_stuck`. The `last_drain_secs` stamp (shard B) is the
 /// daemon-liveness + drain-activity signal. Disposition:
 ///
-/// - count > cap → `Stuck` ALWAYS (a large backlog is a problem even behind a down
+/// - count >= cap → `Stuck` ALWAYS (a large backlog is a problem even behind a down
 ///   daemon — the one axis that ignores the stamp, so an unbounded pending queue is
 ///   never silently tolerated).
 /// - fresh stamp (daemon draining) + oldest file older than a few drain cycles →
@@ -2024,7 +2215,7 @@ fn classify_mcp_gate_backlog(
     last_drain_secs: Option<u64>,
     now_secs: u64,
 ) -> McpGateBacklogState {
-    if pending_count > MCP_GATE_OUTBOX_STUCK_COUNT {
+    if pending_count >= MCP_GATE_OUTBOX_STUCK_COUNT {
         return McpGateBacklogState::Stuck;
     }
     let draining = last_drain_secs
@@ -2303,9 +2494,20 @@ fn check_audit_orphan_intents_m13(base_dir: &Path) -> Vec<csq_core::audit::Orpha
 /// `records_unverified` is the count the verifier SKIPPED at its record limit.
 /// It is a separate parameter rather than part of `health` because
 /// `AuditHealth::Verified` is a unit variant and cannot carry it.
-fn audit_chain_line(health: &csq_core::audit::AuditHealth, records_unverified: u64) -> String {
+///
+/// `source` names where `health`/`records_unverified` came from
+/// (`AuditChainSource`). A `LocalOnly` fallback is appended as a visible
+/// caveat — never rendered identically to a `Daemon`-sourced line
+/// (`diagnostic-surface-parity.md` MUST NOT Rule 4;
+/// `durable-instruments.md` MUST-2: "could not confirm the daemon's own
+/// view" is a distinguishable third outcome, not a silent substitute).
+fn audit_chain_line(
+    health: &csq_core::audit::AuditHealth,
+    records_unverified: u64,
+    source: &AuditChainSource,
+) -> String {
     use csq_core::audit::AuditHealth;
-    match health {
+    let body = match health {
         // A bare `✓ verified` is truthful only for WHOLE-CHAIN coverage. When
         // the verifier hits its record limit it logs `audit_verify_limit_exceeded`
         // and skips the oldest records — the genesis among them — yet
@@ -2313,6 +2515,14 @@ fn audit_chain_line(health: &csq_core::audit::AuditHealth, records_unverified: u
         // or this line cannot fail (`instrument-discipline.md` MUST-1).
         AuditHealth::Verified if records_unverified > 0 => format!(
             "  Audit chain:   {} PARTIAL — tail verified; {records_unverified} older record(s), \
+             INCLUDING the genesis, were NOT verified (run `csq audit verify --full`)",
+            warn(),
+        ),
+        // Since 2026-09-13 the verdict itself carries the truncation, so this
+        // arm no longer depends on `records_unverified` arriving intact from a
+        // separate parameter — the count and the verdict cannot desync.
+        AuditHealth::TailVerified { skipped } => format!(
+            "  Audit chain:   {} PARTIAL — tail verified; {skipped} older record(s), \
              INCLUDING the genesis, were NOT verified (run `csq audit verify --full`)",
             warn(),
         ),
@@ -2329,6 +2539,12 @@ fn audit_chain_line(health: &csq_core::audit::AuditHealth, records_unverified: u
         AuditHealth::Unknown { reason } => {
             format!("  Audit chain:   {} UNVERIFIED ({reason})", warn())
         }
+    };
+    match source {
+        AuditChainSource::Daemon => body,
+        AuditChainSource::LocalOnly { reason } => {
+            format!("{body} [cannot reach the daemon ({reason}) — local verify only]")
+        }
     }
 }
 
@@ -2339,6 +2555,33 @@ fn audit_chain_line(health: &csq_core::audit::AuditHealth, records_unverified: u
 /// is omitted, surfaced beside `audit_trust_plane_grade` so a CONFORMANT grade
 /// is never shown bare — honest-host boundary, redteam R1 HIGH 2026-06-17).
 /// Factored into an alias to satisfy `clippy::type_complexity`.
+/// Where `audit_chain_state` / `audit_records_unverified` came from.
+///
+/// TEXT-RENDERER ONLY: like `audit_records_unverified` on `DoctorReport`
+/// (see that field's own doc for why), this does not ride onto the
+/// `--json` surface — that is a schema bump and belongs in its own change.
+///
+/// `Daemon` is the authoritative case (`diagnostic-surface-parity.md` MUST
+/// NOT Rule 4): the RUNNING daemon's own `GET /api/audit/health` answer,
+/// read verbatim — the same value the daemon itself gates anchoring/emit
+/// on. `LocalOnly` is every other case: no daemon, a stale/unhealthy
+/// daemon, or a reachable daemon whose `/api/audit/health` request itself
+/// failed. `LocalOnly` MUST be rendered distinguishably from `Daemon` — a
+/// silent identical-looking fallback is exactly the defect this rule
+/// exists to prevent (durable-instruments.md MUST-2: "could not confirm
+/// the daemon's own view" is a THIRD outcome, never folded into either
+/// pass or fail as if it were the same measurement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuditChainSource {
+    /// Read from the running daemon's `/api/audit/health`.
+    Daemon,
+    /// Fell back to a LOCAL `verify_chain` call under doctor's own
+    /// env-derived `record_limit`, which MAY disagree with whatever a
+    /// running daemon (if any) is actually gating on. `reason` names why
+    /// the daemon path was not used — never blank, always operator-facing.
+    LocalOnly { reason: String },
+}
+
 type AuditChainCheck = (
     Vec<AuditHistoricalKeyGap>,
     csq_core::audit::AuditHealth,
@@ -2354,6 +2597,9 @@ type AuditChainCheck = (
     // churning a trust-bearing enum across its twelve consumers — see the render
     // site for the residual that leaves.
     u64,
+    // Provenance of the two fields directly above: the running daemon's own
+    // answer, or a local fallback. See `AuditChainSource`.
+    AuditChainSource,
 );
 
 /// Runs a lightweight `verify_chain` scan (tail 1,000 records) and returns
@@ -2366,6 +2612,9 @@ type AuditChainCheck = (
 /// - `Verified` — chain-linking clean, all reachable sigs verified. Also
 ///   returned when no chain exists yet (`verify_chain` returns `Ok(default)`
 ///   for an absent `csq-runs/` directory).
+/// - `TailVerified` — the scan hit `record_limit` and only the tail was
+///   examined; operational, but distinct from `Verified` (see that variant's
+///   own doc for why the distinction is security-bearing).
 /// - `Degraded` — chain-linking verified; one or more historical keys absent.
 /// - `Broken`   — `verify_chain` returned a fatal `LedgerError`.
 /// - `Unknown`  — reachable here when `verify_chain` returns
@@ -2389,7 +2638,7 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
     // verify_chain returns Ok(default) for a genuinely-absent chain, so we
     // use the existence flag to suppress the floor-anchor field in doctor
     // output when no chain has ever been initialised (no roster possible).
-    let chain_json_exists = base_dir.join("csq-runs").join("chain.json").exists();
+    let chain_json_exists = chain_json_present(base_dir);
 
     let result = verify_chain(base_dir, &cfg, None);
 
@@ -2405,7 +2654,9 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
     // write-lockout). Do NOT collapse it to unreachable!().
     let health = AuditHealth::from_verify_result(&result);
     match &health {
-        AuditHealth::Verified | AuditHealth::Degraded { .. } => {
+        // TailVerified clears alongside Verified/Degraded — outgrowing the
+        // record limit is not brokenness. Coverage is reported separately.
+        AuditHealth::Verified | AuditHealth::TailVerified { .. } | AuditHealth::Degraded { .. } => {
             csq_core::audit::clear_chain_broken(base_dir);
         }
         AuditHealth::Broken { error_kind, .. } => {
@@ -2427,7 +2678,7 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
     }
 
     use csq_core::audit::{KeychainAnchorStatus, LedgerError};
-    match result {
+    let local = match result {
         Ok(summary) => {
             let gaps: Vec<AuditHistoricalKeyGap> = summary
                 .historical_key_gaps
@@ -2439,13 +2690,7 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
                     count: g.count,
                 })
                 .collect();
-            // Only emit the floor anchor when chain.json existed AND carries a
-            // roster_version_floor (i.e. a roster has actually been installed).
-            // An initialized-but-rosterless install (chain.json present, floor
-            // None) and a no-chain install both omit the field — a Confirmed
-            // default would be misleading (nothing to confirm against).
-            let floor_anchor = (chain_json_exists && summary.roster_floor_present)
-                .then_some(summary.roster_floor_anchor);
+            let floor_anchor = roster_floor_anchor_for_doctor(chain_json_exists, &summary);
             let vl_populated = summary.verification_levels_populated;
             // M3a: the per-level disclosure map. `verification_level_summary` is
             // an enterprise-only field on VerifySummary, so source it under cfg;
@@ -2491,6 +2736,103 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
             None,
             0,
         ),
+    };
+
+    let (
+        gaps,
+        local_health,
+        keychain_anchor,
+        floor_anchor,
+        vl_populated,
+        vl_summary,
+        local_records_unverified,
+    ) = local;
+
+    // diagnostic-surface-parity.md MUST NOT Rule 4: the RUNNING daemon's own
+    // answer wins over the LOCAL verify_chain run just performed above (the
+    // local run is still needed regardless — it drives the `.chain-broken`
+    // sentinel management above, a write-gating concern independent of what
+    // doctor DISPLAYS). `health` and `records_unverified` are the only two
+    // fields the daemon route carries; the rest (gaps, keychain/floor
+    // anchors, vl_summary) stay sourced from the local run — those are not
+    // part of the mismatch this fix closes, and the daemon does not expose
+    // them today.
+    let (health, records_unverified, source) = resolve_audit_chain_answer(
+        local_health,
+        local_records_unverified,
+        super::audit_health::try_daemon_audit_health(base_dir),
+    );
+
+    (
+        gaps,
+        health,
+        keychain_anchor,
+        floor_anchor,
+        vl_populated,
+        vl_summary,
+        records_unverified,
+        source,
+    )
+}
+
+/// Has an audit chain ever been initialised under `base_dir`?
+///
+/// Extracted from [`check_audit_chain`] (an internal ticket) so the two omission
+/// cases can assert the SAME existence probe production uses, without
+/// duplicating the path literal in a fixture — a duplicated literal would go
+/// on passing if production's path ever moved.
+///
+/// Read-only, and scoped entirely to the supplied base dir: no ambient
+/// `HOME`/`CLAUDE_HOME` read, no PATH lookup, no subprocess.
+fn chain_json_present(base_dir: &Path) -> bool {
+    base_dir.join("csq-runs").join("chain.json").exists()
+}
+
+/// Preserve anchor-only evidence; the producer tracks presence in either store.
+fn roster_floor_anchor_for_doctor(
+    chain_json_exists: bool,
+    summary: &csq_core::audit::VerifySummary,
+) -> Option<csq_core::audit::RosterFloorAnchorStatus> {
+    (chain_json_exists && summary.roster_floor_present).then_some(summary.roster_floor_anchor)
+}
+
+fn roster_floor_operator_line(status: csq_core::audit::RosterFloorAnchorStatus) -> String {
+    use csq_core::audit::RosterFloorAnchorStatus;
+    match status {
+        RosterFloorAnchorStatus::Confirmed => format!(
+            "  Roster floor:  {} confirmed (chain.json ↔ keychain agree)", ok()
+        ),
+        RosterFloorAnchorStatus::Unconfirmed => format!(
+            "  Roster floor:  {} UNCONFIRMED — a floor is missing from one store or the keychain anchor is unreadable; investigate, agreement is not established", warn()
+        ),
+        RosterFloorAnchorStatus::Mismatch => format!(
+            "  Roster floor:  {} MISMATCH — chain.json floor differs from keychain anchor; possible rollback tampering — inspect chain.json history; reinstalling the authentic roster re-anchors the floor", fail()
+        ),
+    }
+}
+
+/// The override decision at the heart of Defect 2: given what a LOCAL
+/// `verify_chain` run computed and what (if anything) the RUNNING daemon
+/// reported, decide which one `csq doctor` reports.
+///
+/// Factored out of [`check_audit_chain`] specifically so the critical case
+/// — a local run that would say PARTIAL winning against a daemon that
+/// already verified the WHOLE chain clean — is testable without
+/// constructing a real >10,000-record signed chain (`tooling-self-
+/// verification.md` Rule 2: exercise the actual decision, not a proxy for
+/// it). This is the ENTIRE fix; `check_audit_chain` is plumbing around it.
+fn resolve_audit_chain_answer(
+    local_health: csq_core::audit::AuditHealth,
+    local_records_unverified: u64,
+    daemon_result: Result<(csq_core::audit::AuditHealth, u64), String>,
+) -> (csq_core::audit::AuditHealth, u64, AuditChainSource) {
+    match daemon_result {
+        Ok((health, records_unverified)) => (health, records_unverified, AuditChainSource::Daemon),
+        Err(reason) => (
+            local_health,
+            local_records_unverified,
+            AuditChainSource::LocalOnly { reason },
+        ),
     }
 }
 
@@ -2499,7 +2841,17 @@ fn check_audit_chain(base_dir: &Path) -> AuditChainCheck {
 ///
 /// Returns `None` when the sink is `"none"` (local-only default) so the
 /// `audit_sink` field is absent from the JSON output when not relevant.
+///
+/// Populates `AuditSinkDoctorInfo::mock_backend` from
+/// [`csq_core::audit::sink_config::is_mock_backed_sink`] — the single
+/// source of truth also used by the daemon's resolve-time
+/// `anchor_sink_mock_backend` WARN. Five of the seven catalogued sinks
+/// (rekor/s3/azure/gcp/azure-sql) are in-memory mocks whose `append()`
+/// returns `Ok` unconditionally, so `csq doctor` MUST NOT let a clean
+/// `last_anchor_ts` read as a durable WORM attestation for those — an
+/// operator checking compliance posture reads this command, not daemon logs.
 fn check_audit_sink_m07(base_dir: &Path) -> Option<AuditSinkDoctorInfo> {
+    use csq_core::audit::sink_config::is_mock_backed_sink;
     use csq_core::audit::{AuditSinkConfig, SinkDoctorSnapshot};
     let cfg = AuditSinkConfig::load(base_dir).unwrap_or_default();
     if cfg.sink == "none" {
@@ -2509,10 +2861,15 @@ fn check_audit_sink_m07(base_dir: &Path) -> Option<AuditSinkDoctorInfo> {
         if let Some((prior_sink, prior_ts)) = prior {
             // Surface a synthetic "disabled" entry so the doctor text renderer
             // shows the warning row instead of silently omitting the field.
+            // mock_backend is sourced from the SAME predicate the live-sink
+            // branch below uses, keyed on the prior sink's own name — a
+            // disabled mock witness is exactly as non-durable in hindsight
+            // as it was while active.
             return Some(AuditSinkDoctorInfo {
                 active_sink: format!("none (was: {prior_sink} — witness disabled)"),
                 last_anchor_ts: Some(prior_ts),
                 pending_count: 0,
+                mock_backend: is_mock_backed_sink(&prior_sink),
                 replication_drift_count: 0,
             });
         }
@@ -2524,6 +2881,7 @@ fn check_audit_sink_m07(base_dir: &Path) -> Option<AuditSinkDoctorInfo> {
         active_sink: snap.active_sink,
         last_anchor_ts: snap.last_anchor_ts,
         pending_count: snap.pending_count,
+        mock_backend: snap.mock_backend,
         replication_drift_count: snap.replication_drift_count,
     })
 }
@@ -3446,8 +3804,13 @@ fn check_settings() -> SettingsInfo {
 }
 
 fn check_daemon(base_dir: &Path) -> DaemonInfo {
-    use csq_core::daemon::{detect_daemon, version_drift_reason, DetectResult};
-    match detect_daemon(base_dir) {
+    use csq_core::daemon::detect_daemon;
+    daemon_info_from_detection(detect_daemon(base_dir))
+}
+
+fn daemon_info_from_detection(result: csq_core::daemon::DetectResult) -> DaemonInfo {
+    use csq_core::daemon::{version_drift_reason, DetectResult};
+    match result {
         DetectResult::Healthy {
             pid,
             daemon_version,
@@ -3615,17 +3978,25 @@ fn check_codex_shared_shapes(base_dir: &Path) -> Vec<CodexSharedShapeJson> {
 /// `active` is `None` — staleness classification does not depend on which
 /// slot is the CLI's current binding.
 fn check_stale_quota_polls(base_dir: &Path) -> Vec<StaleQuotaSlotJson> {
+    // Loaded once, salvage-parsed the same way `csq status` reads it — a
+    // corrupt sibling row (accounts OR poller_health) must not blank this
+    // whole check. Read-only: never written back.
+    let quota_file = csq_core::quota::state::load_state_salvage(base_dir);
     csq_core::quota::status::show_status(base_dir, None)
         .into_iter()
         .filter_map(|a| {
             let age_secs = a.stale_secs?;
+            let health = quota_file.get_health(a.id);
             Some(StaleQuotaSlotJson {
                 slot: a.id,
                 label: sanitize_for_display(&a.label),
                 surface: a.surface.as_str().to_string(),
                 age_secs,
-                remedy: stale_quota_remedy(a.id, a.surface, &a.method, &a.source),
+                remedy: stale_quota_remedy(a.id, a.surface, &a.method, &a.source, health),
                 expected: is_expected_stale_surface(a.surface),
+                last_outcome: health.map(|h| h.last_outcome),
+                consecutive_failures: health.map(|h| h.consecutive_failures),
+                next_retry_at: health.and_then(|h| h.next_retry_at),
             })
         })
         .collect()
@@ -3682,8 +4053,72 @@ fn stale_quota_remedy(
     surface: csq_core::providers::catalog::Surface,
     method: &str,
     source: &csq_core::accounts::AccountSource,
+    health: Option<&csq_core::quota::PollerHealth>,
+) -> String {
+    // The 2026-09-12 slot-9 incident: this remedy used to guess a cause
+    // from `surface`/`method` alone. Slot 9 was 72 min stale with HEALTHY
+    // credentials (`csq probe 9` returned 6/6 OK, 499ms against the exact
+    // endpoint the poller uses) — the guessed remedy ("run `csq login 9`")
+    // would have burned a device-auth flow for nothing. When the poller has
+    // actually recorded WHY the last attempt didn't land (`poller_health`,
+    // #6877eea0), that recorded outcome is strictly better evidence than a
+    // surface-shaped guess and takes priority.
+    if let Some(h) = health {
+        return remedy_from_poll_outcome(slot, surface, method, source, h);
+    }
+    stale_quota_remedy_no_evidence(slot, surface, method, source)
+}
+
+/// Actionable, surface-specific remediation for a stale quota poll, used
+/// when `csq` has no recorded [`csq_core::quota::PollerHealth`] for this
+/// slot at all — a pre-#6877eea0 `quota.json`, or a surface the current
+/// poller set never writes health for (everything except Anthropic OAuth,
+/// as of #6877eea0). This is a GUESS from surface/method shape, not an
+/// observed cause, so the OAuth-refresh arms below say so explicitly
+/// (`evidence-first-claims.md` MUST-4 — inference is not stated as fact).
+///
+/// Native Kimi/Grok remedy verified against `csq/src/cli/commands/login.rs`
+/// `handle` (2026-08-04): `--provider kimi-cli` routes to `handle_native(...,
+/// Surface::Kimi, ...)`, `--provider grok` routes to `handle_native(...,
+/// Surface::Grok, ...)` — both re-bind the slot THROUGH csq. A bare vendor
+/// CLI login (`grok login` / `kimi-code login`) writes to the vendor's own
+/// home dir (`~/.grok`, `~/.kimi-code`) and never touches csq's binding
+/// marker or the slot's quota poll — the slot stays frozen even though the
+/// vendor CLI itself now has a fresh session (`account-terminal-separation.md`,
+/// user memory `discovery_native_slot_login_must_go_through_csq`).
+///
+/// `method` and `source` come straight from the `AccountStatus` row
+/// `check_stale_quota_polls` already reads (`AccountInfo.method` /
+/// `AccountInfo.source`, set once per slot at discovery time — never
+/// re-derived from a legacy marker, per `account-terminal-separation.md`
+/// MUST NOT Rule 4). They are the auth-MECHANISM axis (OAuth login vs a
+/// static key) and are orthogonal to `BillingMode` (the per-PLAN axis —
+/// MiniMax/Z.AI/DeepSeek ship both subscription and pay-per-token plans
+/// behind the SAME static-key binding, so `BillingMode` cannot tell
+/// "csq login will work here" from "it won't").
+///
+/// `ClaudeCode` and `Gemini` both multiplex an OAuth mode and one or more
+/// static-credential modes onto the same `Surface`, so — unlike Kimi/Grok/
+/// Codex, which have exactly one auth mechanism each — their remedy MUST
+/// branch on `method`. Sending `csq login` to a static-credential slot is
+/// the exact defect this function exists to avoid (SWEEP-2026-08-12): it
+/// cannot work (there is no OAuth session to refresh) and burns trust in
+/// every other remedy on this surface, same as the native treadmill above.
+fn stale_quota_remedy_no_evidence(
+    slot: u16,
+    surface: csq_core::providers::catalog::Surface,
+    method: &str,
+    source: &csq_core::accounts::AccountSource,
 ) -> String {
     use csq_core::providers::catalog::Surface;
+
+    // Prefixed onto the OAuth-refresh arms only: those are a GUESS at the
+    // cause (no recorded poll outcome exists to confirm it), unlike the
+    // native/setkey arms below, which describe the slot's BINDING shape —
+    // a fact, not a guessed cause — regardless of health.
+    const NO_EVIDENCE_HEDGE: &str =
+        "cause unconfirmed (csq has no recorded poll outcome for this slot) — ";
+
     match surface {
         // Native-CLI surfaces: staleness here is EXPECTED and needs no action.
         //
@@ -3720,8 +4155,8 @@ fn stale_quota_remedy(
              `grok` login, which writes to ~/.grok and never rebinds the slot)"
         ),
         Surface::Codex => format!(
-            "check `csq daemon status`; if healthy, run `csq login {slot} --provider codex` \
-             to re-authenticate"
+            "{NO_EVIDENCE_HEDGE}check `csq daemon status`; if healthy, {}",
+            reauth_action(slot, surface, method, source)
         ),
         // Gemini has three binding modes (spec 07 §7.3.4): Code Assist OAuth
         // (`csq login --provider gemini`), AI Studio API key, and Vertex SA —
@@ -3730,8 +4165,8 @@ fn stale_quota_remedy(
         // calls `handle_gemini_oauth`; there is no OAuth flow for the other
         // two modes to re-authenticate).
         Surface::Gemini if method == "code_assist_oauth" => format!(
-            "check `csq daemon status`; if healthy, run `csq login {slot} --provider gemini` \
-             to re-authenticate"
+            "{NO_EVIDENCE_HEDGE}check `csq daemon status`; if healthy, {}",
+            reauth_action(slot, surface, method, source)
         ),
         Surface::Gemini => format!(
             "check `csq daemon status`; this slot is bound via a static credential \
@@ -3751,7 +4186,8 @@ fn stale_quota_remedy(
         // a catalog display name, so it falls through to the generic hint
         // rather than guessing a command that might be wrong.
         Surface::ClaudeCode if method == "oauth" => format!(
-            "check `csq daemon status`; if healthy, run `csq login {slot}` to re-authenticate"
+            "{NO_EVIDENCE_HEDGE}check `csq daemon status`; if healthy, {}",
+            reauth_action(slot, surface, method, source)
         ),
         Surface::ClaudeCode => {
             let setkey_hint = match source {
@@ -3771,6 +4207,138 @@ fn stale_quota_remedy(
                  Anthropic OAuth slots and will not help here"
             )
         }
+    }
+}
+
+/// The "re-authenticate this slot" action phrase, by surface/method/source —
+/// factored out of [`stale_quota_remedy_no_evidence`] so the SAME
+/// login-vs-setkey knowledge backs both the no-evidence guess (prefixed with
+/// its hedge) and [`remedy_from_poll_outcome`]'s `Unauthorized` /
+/// `SkippedNoCredentials` arms, which know FOR A FACT that re-auth is the fix
+/// but still must not send `csq login` at a static-credential slot (the
+/// SWEEP-2026-08-12 defect this whole remedy exists to avoid).
+///
+/// Only the `ClaudeCode { method: "oauth" }` arm is reachable through a real
+/// [`csq_core::quota::PollerHealth`] today — the Anthropic usage poller
+/// (`daemon/usage_poller/anthropic.rs`) is the only writer of that state, and
+/// it polls exactly `AccountSource::Anthropic` slots (`info.source !=
+/// AccountSource::Anthropic` is skipped before any `PollOutcome` is
+/// recorded). The other arms exist so a future poller for those surfaces can
+/// start writing health without a doctor-side change.
+fn reauth_action(
+    slot: u16,
+    surface: csq_core::providers::catalog::Surface,
+    method: &str,
+    source: &csq_core::accounts::AccountSource,
+) -> String {
+    use csq_core::providers::catalog::Surface;
+    match surface {
+        Surface::Codex => format!("run `csq login {slot} --provider codex` to re-authenticate"),
+        Surface::Gemini if method == "code_assist_oauth" => {
+            format!("run `csq login {slot} --provider gemini` to re-authenticate")
+        }
+        Surface::Gemini => format!(
+            "re-run `csq setkey gemini --slot {slot}` with a fresh key (this slot is bound \
+             via a static credential, not OAuth — `csq login` will not help)"
+        ),
+        Surface::Kimi => format!("run `csq login {slot} --provider kimi-cli` to re-authenticate"),
+        Surface::Grok => format!("run `csq login {slot} --provider grok` to re-authenticate"),
+        Surface::ClaudeCode if method == "oauth" => {
+            format!("run `csq login {slot}` to re-authenticate")
+        }
+        Surface::ClaudeCode => {
+            let setkey_hint = match source {
+                csq_core::accounts::AccountSource::ThirdParty { provider } => {
+                    csq_core::providers::catalog::id_from_display_name(provider).map(|id| {
+                        format!("re-run `csq setkey {id} --slot {slot}` with a fresh key")
+                    })
+                }
+                _ => None,
+            }
+            .unwrap_or_else(|| {
+                "re-run the bind command you originally used for this slot".to_string()
+            });
+            format!(
+                "{setkey_hint} (this slot is bound via a static credential, not OAuth — \
+                 `csq login` will not help)"
+            )
+        }
+    }
+}
+
+/// Derives an operator remedy from the poller's OWN recorded outcome for
+/// this slot (`csq_core::quota::PollOutcome`), rather than guessing from
+/// surface/method shape. Every arm is true of its outcome and does not
+/// prescribe re-login unless the outcome is actually evidence of a
+/// credential problem — the fix for the 2026-09-12 slot-9 incident, where a
+/// fixed "run `csq login 9`" remedy fired on a slot whose credentials were
+/// fine (`csq probe 9` returned 6/6 OK, 499ms against the poller's own
+/// endpoint; the real cause was rate-limit backoff).
+fn remedy_from_poll_outcome(
+    slot: u16,
+    surface: csq_core::providers::catalog::Surface,
+    method: &str,
+    source: &csq_core::accounts::AccountSource,
+    health: &csq_core::quota::PollerHealth,
+) -> String {
+    use csq_core::quota::PollOutcome;
+
+    let retry_hint = match health.next_retry_at {
+        Some(t) if t > 0.0 => format!(" (next retry around {})", format_utc_date(t as u64)),
+        _ => String::new(),
+    };
+
+    match health.last_outcome {
+        PollOutcome::Unauthorized => format!(
+            "the last poll of slot {slot} was rejected with 401 Unauthorized — the stored \
+             token is invalid; {}",
+            reauth_action(slot, surface, method, source)
+        ),
+        PollOutcome::RateLimited => format!(
+            "csq is being rate-limited (429) polling slot {slot}; it is backing off and will \
+             retry automatically{retry_hint} — do NOT re-authenticate, the credential is not \
+             the problem"
+        ),
+        PollOutcome::SkippedCooldown => format!(
+            "slot {slot} is in a poller backoff window after {} consecutive non-Unauthorized \
+             failure(s); csq will retry automatically{retry_hint} — do NOT re-authenticate yet, \
+             the last confirmed cause was not a credential problem",
+            health.consecutive_failures
+        ),
+        PollOutcome::ServerError => format!(
+            "the last poll of slot {slot} reached the upstream server, which answered with an \
+             error status; this is an upstream problem, not the account — csq will retry \
+             automatically; re-authenticating will not help unless this persists for hours"
+        ),
+        PollOutcome::Transport => format!(
+            "the last poll of slot {slot} failed at the network layer (DNS/connect) before \
+             reaching the server; check network/proxy connectivity, not the account — csq will \
+             retry automatically"
+        ),
+        PollOutcome::Parse => format!(
+            "the last poll of slot {slot} returned a response csq could not parse — likely an \
+             upstream API shape change, which is a csq bug; please file an issue naming this \
+             outcome — re-authenticating will not help"
+        ),
+        PollOutcome::Timeout => format!(
+            "the last poll of slot {slot} did not finish inside its timeout budget, which is \
+             usually host load rather than the account; check `csq daemon status` and this \
+             host's load, not the credential"
+        ),
+        PollOutcome::Panic => format!(
+            "the poller task for slot {slot} crashed on its last attempt — this is a csq bug; \
+             check the daemon log and file an issue — re-authenticating will not help"
+        ),
+        PollOutcome::SkippedNoCredentials => format!(
+            "csq has no readable credential file for slot {slot}, so it is not being polled at \
+             all; {}",
+            reauth_action(slot, surface, method, source)
+        ),
+        PollOutcome::Ok => format!(
+            "the last poll of slot {slot} SUCCEEDED but this row is still stale — the poller \
+             itself is not running or not reaching this slot; check `csq daemon status` (this \
+             slot's credentials are not implicated)"
+        ),
     }
 }
 
@@ -4297,6 +4865,64 @@ fn render_cli_row(label: &str, surface_name: &str, info: &CliSurfaceInfo, auth_s
     }
 }
 
+/// Same formatter used by text output and private operator-output regressions.
+fn daemon_operator_detail(info: &DaemonInfo) -> (&'static str, String) {
+    match info.status.as_str() {
+        "healthy" => {
+            let pid_str = info.pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
+            (ok(), format!("running and healthy{pid_str}"))
+        }
+        "drifted" => {
+            // The generic third-party sanitizer caps at 200 characters. Apply
+            // it only to the version summary; otherwise it silently truncates
+            // the executable prerequisite and the recovery command. Regenerate
+            // the trusted, static guidance rather than trusting a report suffix.
+            let summary = info
+                .version_drift
+                .as_deref()
+                .unwrap_or("version drift detected")
+                .split_once("; ")
+                .map(|(summary, _)| summary)
+                .unwrap_or_else(|| {
+                    info.version_drift
+                        .as_deref()
+                        .unwrap_or("version drift detected")
+                });
+            (
+                warn(),
+                format!(
+                    "{}; {}",
+                    sanitize_for_display(summary),
+                    csq_core::daemon::recovery::recovery_guidance()
+                ),
+            )
+        }
+        "pid_alive_no_socket" => (
+            warn(),
+            "PID alive but socket unreachable — daemon may be starting up".into(),
+        ),
+        "stale" => (
+            fail(),
+            format!(
+                "stale PID/socket — {}",
+                csq_core::daemon::recovery::recovery_guidance()
+            ),
+        ),
+        "unhealthy" => (
+            warn(),
+            "daemon unhealthy — socket connect or health check failed".into(),
+        ),
+        "not running" => (
+            warn(),
+            format!(
+                "not running — {}",
+                csq_core::daemon::recovery::recovery_guidance()
+            ),
+        ),
+        _ => (warn(), info.status.clone()),
+    }
+}
+
 /// All user-supplied or third-party-supplied strings that flow into
 /// `println!` calls MUST pass through `sanitize_for_display` before
 /// being written to the terminal.  This defends against terminal
@@ -4371,40 +4997,7 @@ fn print_report(r: &DoctorReport) {
     println!("  Settings:    {settings_icon} {settings_detail}");
 
     // Daemon
-    let (daemon_icon, daemon_detail) = match r.daemon.status.as_str() {
-        "healthy" => {
-            let pid_str = r
-                .daemon
-                .pid
-                .map(|p| format!(" (PID {p})"))
-                .unwrap_or_default();
-            (ok(), format!("running and healthy{pid_str}"))
-        }
-        "drifted" => {
-            // The daemon answers /api/health but its CARGO_PKG_VERSION
-            // does not match this CLI's. Surface the reason verbatim
-            // — it already names both versions and the remediation.
-            // sanitize_for_display guards against terminal injection via
-            // a malicious daemon that returns ESC sequences in its version
-            // string (spec/13 §10, M-3).
-            let raw =
-                r.daemon.version_drift.as_deref().unwrap_or(
-                    "version drift detected — run `csq daemon stop && csq daemon start`",
-                );
-            (warn(), sanitize_for_display(raw))
-        }
-        "pid_alive_no_socket" => (
-            warn(),
-            "PID alive but socket unreachable — daemon may be starting up".into(),
-        ),
-        "stale" => (fail(), "stale PID/socket — run `csq daemon start`".into()),
-        "unhealthy" => (
-            warn(),
-            "daemon unhealthy — socket connect or health check failed".into(),
-        ),
-        "not running" => (warn(), "not running — run `csq daemon start`".into()),
-        _ => (warn(), r.daemon.status.clone()),
-    };
+    let (daemon_icon, daemon_detail) = daemon_operator_detail(&r.daemon);
     println!("  Daemon:      {daemon_icon} {daemon_detail}");
 
     // Accounts
@@ -4495,6 +5088,37 @@ fn print_report(r: &DoctorReport) {
                 reason,
                 entry.account,
             );
+        }
+    }
+
+    // Daemon refresh posture. Printed only when it is NOT the plain leader
+    // default: a single-host install should see nothing new, while a follower
+    // (or a host that stood down because its posture file is broken) must see
+    // that it is not refreshing before it wonders why its tokens died.
+    {
+        let p = &r.daemon_posture;
+        if let Some(why) = &p.unreadable_reason {
+            println!(
+                "  Posture:     {} daemon-posture.json is unreadable ({why}) — this host stood down to follower and will NOT refresh tokens",
+                warn()
+            );
+            println!("               → fix or delete the file, then `csq daemon posture leader` if this host should refresh.");
+        } else if p.role == "follower" {
+            println!("  Posture:     follower — this host never refreshes OAuth tokens (a leader host does)");
+        }
+        if !p.expired.is_empty() {
+            println!(
+                "  Posture:     {} {} slot(s) have an EXPIRED token and this host is a follower — no leader is covering them",
+                warn(),
+                p.expired.len()
+            );
+            for (slot, surface, secs) in &p.expired {
+                println!(
+                    "                 slot {slot} ({surface}) expired {}m ago",
+                    secs / 60
+                );
+            }
+            println!("               → start/repair the leader daemon, or run `csq daemon posture leader` on this host.");
         }
     }
 
@@ -4701,7 +5325,11 @@ fn print_report(r: &DoctorReport) {
     // FIX-4: audit chain state line (next to signing key).
     println!(
         "{}",
-        audit_chain_line(&r.audit_chain_state, r.audit_records_unverified)
+        audit_chain_line(
+            &r.audit_chain_state,
+            r.audit_records_unverified,
+            &r.audit_chain_source
+        )
     );
 
     // Keychain integrity-anchor verdict (DETECTOR — never bricks the chain).
@@ -4730,25 +5358,7 @@ fn print_report(r: &DoctorReport) {
 
     // Roster-version-floor keychain anchor verdict (DETECTOR — never bricks).
     if let Some(floor_anchor) = r.audit_roster_floor_anchor {
-        use csq_core::audit::RosterFloorAnchorStatus;
-        let floor_line = match floor_anchor {
-            RosterFloorAnchorStatus::Confirmed => format!(
-                "  Roster floor:  {} confirmed (chain.json ↔ keychain agree)",
-                ok()
-            ),
-            RosterFloorAnchorStatus::Unconfirmed => format!(
-                "  Roster floor:  {} UNCONFIRMED — keychain anchor absent or unreadable; \
-                 tamper-detection is chain.json-only for now",
-                warn()
-            ),
-            RosterFloorAnchorStatus::Mismatch => format!(
-                "  Roster floor:  {} MISMATCH — chain.json floor differs from keychain anchor; \
-                 possible rollback tampering — inspect chain.json history; reinstalling the \
-                 authentic roster re-anchors the floor",
-                fail()
-            ),
-        };
-        println!("{floor_line}");
+        println!("{}", roster_floor_operator_line(floor_anchor));
     }
 
     // an internal ticket b2b — policy-bundle version-floor keychain-anchor verdict (DETECTOR —
@@ -4785,20 +5395,36 @@ fn print_report(r: &DoctorReport) {
 
     // M07 audit sink status.
     if let Some(ref sink_info) = r.audit_sink {
-        let (sink_icon, pending_note) =
+        let (mut sink_icon, mut note) =
             if sink_info.pending_count == 0 && sink_info.replication_drift_count == 0 {
                 (ok(), String::new())
             } else {
-                let warn = warn();
                 let note = format!(
                     " (pending: {}, drift: {})",
                     sink_info.pending_count, sink_info.replication_drift_count
                 );
-                (warn, note)
+                (warn(), note)
             };
+        // A mock-backed sink is a WARN regardless of pending/drift reading
+        // clean — those being zero is precisely the misleading part:
+        // `append()` returns `Ok` unconditionally against an in-memory
+        // HashMap, so a mock sink always looks caught up. The record is NOT
+        // durably anchored; it dies with the daemon process. Not an ERROR —
+        // the operator opted into this substrate by building with the
+        // feature — but reporting a clean `ok()` here would be exactly the
+        // "reads the same whether the property holds or not" defect
+        // `AuditHealth::TailVerified` closed for truncation earlier today
+        // (`instrument-discipline.md` MUST-1); an operator's compliance
+        // posture check must not be able to read this as WORM storage.
+        if sink_info.mock_backend {
+            sink_icon = warn();
+            note.push_str(
+                " — MOCK-BACKED, NOT durably anchored (in-memory only; lost on daemon restart)",
+            );
+        }
         let last_anchor = sink_info.last_anchor_ts.as_deref().unwrap_or("never");
         println!(
-            "  Audit sink:    {sink_icon} {} — last anchor: {last_anchor}{pending_note}",
+            "  Audit sink:    {sink_icon} {} — last anchor: {last_anchor}{note}",
             sink_info.active_sink
         );
     }
@@ -4867,7 +5493,7 @@ fn print_report(r: &DoctorReport) {
     }
 
     // M6 an internal ticket — MCP-gate attestation outbox backlog. Printed only when the
-    // outbox is non-empty (None in the community edition — never written there).
+    // outbox has queued JSON or an admission problem (reader is edition-neutral).
     if let Some(ref backlog) = r.mcp_gate_outbox_backlog {
         let age_note = match backlog.oldest_age_secs {
             Some(secs) => format!(", oldest {}", fmt_age_secs(secs)),
@@ -4876,6 +5502,10 @@ fn print_report(r: &DoctorReport) {
         // M6 an internal ticket shard D: three daemon-aware dispositions replace the fixed-6h
         // warn/info split. Only `Stuck` is operator-actionable.
         match backlog.state {
+            McpGateBacklogState::Stuck if backlog.admission_problem.is_some() => {
+                println!("  MCP gate outbox: {} admission constrained/uninspectable ({}) — {} observed queued JSON decision(s){}; inspect capacity, permissions and unsafe entries; do not discard pending evidence",
+                    warn(), backlog.admission_problem.unwrap(), backlog.pending_count, age_note);
+            }
             McpGateBacklogState::Stuck => {
                 println!(
                     "  MCP gate outbox: {} {} decision(s) stuck{} — enforced MCP-gate \
@@ -5210,13 +5840,153 @@ mod tests {
     ///
     /// Non-vacuity: restore the old text ("run `csq login …`" as the leading
     /// instruction) and the first two assertions fail.
+    /// Builds a `PollerHealth` with the given outcome. `next_retry_at` is a
+    /// fixed far-future epoch rather than `now()+N` so the assertion cannot
+    /// rot into a time-bomb (`feedback_no_test_timebombs`).
+    fn health_with(outcome: csq_core::quota::PollOutcome) -> csq_core::quota::PollerHealth {
+        csq_core::quota::PollerHealth {
+            last_attempt_at: 1_700_000_000.0,
+            last_outcome: outcome,
+            consecutive_failures: 3,
+            cooldown_until: Some(4_102_444_800.0),
+            next_retry_at: Some(4_102_444_800.0),
+        }
+    }
+
+    /// THE ORIGINATING BUG (2026-09-12). Slot 9 was 72 min stale and doctor
+    /// told the operator to run `csq login 9`. `csq probe 9` returned
+    /// `RC=0, 6/6 OK, 499ms` against the very endpoint the poller uses — the
+    /// credential was fine, and re-authenticating would have burned a
+    /// device-auth flow on a healthy slot for nothing.
+    ///
+    /// REDs against the pre-fix code, which returned a FIXED string
+    /// containing "run `csq login N` to re-authenticate" for every stale
+    /// slot regardless of cause.
+    #[test]
+    fn backoff_outcomes_never_prescribe_re_authentication() {
+        use csq_core::accounts::AccountSource;
+        use csq_core::providers::catalog::Surface;
+        use csq_core::quota::PollOutcome;
+
+        for outcome in [PollOutcome::RateLimited, PollOutcome::SkippedCooldown] {
+            let h = health_with(outcome);
+            let r = remedy_from_poll_outcome(
+                9,
+                Surface::ClaudeCode,
+                "oauth",
+                &AccountSource::Anthropic,
+                &h,
+            );
+            assert!(
+                !r.contains("csq login"),
+                "{outcome:?} must NOT prescribe a login — the credential is not the \
+                 problem and a device-auth flow would be burned for nothing: {r}"
+            );
+            assert!(
+                r.contains("do NOT re-authenticate"),
+                "{outcome:?} must say so explicitly, not merely omit it: {r}"
+            );
+            assert!(
+                r.contains("retry automatically"),
+                "{outcome:?} must tell the operator csq recovers on its own: {r}"
+            );
+        }
+    }
+
+    /// The one outcome that legitimately points at a login still does.
+    /// Guards against over-correcting the bug above into never advising
+    /// re-auth at all.
+    #[test]
+    fn unauthorized_and_missing_credential_do_prescribe_re_authentication() {
+        use csq_core::accounts::AccountSource;
+        use csq_core::providers::catalog::Surface;
+        use csq_core::quota::PollOutcome;
+
+        for outcome in [PollOutcome::Unauthorized, PollOutcome::SkippedNoCredentials] {
+            let r = remedy_from_poll_outcome(
+                9,
+                Surface::ClaudeCode,
+                "oauth",
+                &AccountSource::Anthropic,
+                &health_with(outcome),
+            );
+            assert!(
+                r.contains("csq login"),
+                "{outcome:?} IS a credential problem and must name the re-auth action: {r}"
+            );
+        }
+    }
+
+    /// A successful last poll on a still-stale row means the POLLER is not
+    /// running — the operator must be sent to the daemon, never to the slot.
+    /// This is the shape that left a host with no refresher for 2h08m.
+    #[test]
+    fn ok_but_stale_points_at_the_poller_not_the_slot() {
+        use csq_core::accounts::AccountSource;
+        use csq_core::providers::catalog::Surface;
+        use csq_core::quota::PollOutcome;
+
+        let r = remedy_from_poll_outcome(
+            9,
+            Surface::ClaudeCode,
+            "oauth",
+            &AccountSource::Anthropic,
+            &health_with(PollOutcome::Ok),
+        );
+        assert!(
+            !r.contains("csq login"),
+            "a SUCCEEDING poll is not a credential problem: {r}"
+        );
+        assert!(
+            r.to_lowercase().contains("poller") || r.contains("daemon"),
+            "must direct the operator at the poller/daemon: {r}"
+        );
+    }
+
+    /// Every `PollOutcome` yields a non-empty, slot-naming remedy. Freezes the
+    /// mapping's totality: a new variant that falls through to an empty or
+    /// generic string would REGRESS to the fixed-guess behaviour this whole
+    /// change removes.
+    #[test]
+    fn every_poll_outcome_yields_a_specific_remedy() {
+        use csq_core::accounts::AccountSource;
+        use csq_core::providers::catalog::Surface;
+        use csq_core::quota::PollOutcome;
+
+        for outcome in [
+            PollOutcome::Ok,
+            PollOutcome::Unauthorized,
+            PollOutcome::RateLimited,
+            PollOutcome::ServerError,
+            PollOutcome::Transport,
+            PollOutcome::Parse,
+            PollOutcome::Timeout,
+            PollOutcome::Panic,
+            PollOutcome::SkippedCooldown,
+            PollOutcome::SkippedNoCredentials,
+        ] {
+            let r = remedy_from_poll_outcome(
+                9,
+                Surface::ClaudeCode,
+                "oauth",
+                &AccountSource::Anthropic,
+                &health_with(outcome),
+            );
+            assert!(!r.is_empty(), "{outcome:?} produced an empty remedy");
+            assert!(
+                r.contains('9'),
+                "{outcome:?} must name the slot it is about: {r}"
+            );
+        }
+    }
+
     #[test]
     fn native_stale_remedy_says_expected_not_go_re_login() {
         use csq_core::accounts::AccountSource;
         use csq_core::providers::catalog::Surface;
         for surface in [Surface::Kimi, Surface::Grok] {
             let source = AccountSource::Native { surface };
-            let r = stale_quota_remedy(14, surface, "native_cli", &source);
+            let r = stale_quota_remedy(14, surface, "native_cli", &source, None);
             assert!(
                 r.starts_with("expected"),
                 "native staleness must lead with 'expected', not an action: {r}"
@@ -5282,7 +6052,7 @@ mod tests {
             (Surface::Gemini, "code_assist_oauth", AccountSource::Gemini),
         ];
         for (surface, method, source) in cases {
-            let r = stale_quota_remedy(3, surface, method, &source);
+            let r = stale_quota_remedy(3, surface, method, &source, None);
             assert!(
                 !r.starts_with("expected"),
                 "a non-native stale poll is NOT expected — it must stay \
@@ -5318,7 +6088,7 @@ mod tests {
         let kimi_bearer = AccountSource::ThirdParty {
             provider: "Kimi".to_string(),
         };
-        let r = stale_quota_remedy(13, Surface::ClaudeCode, "api_key", &kimi_bearer);
+        let r = stale_quota_remedy(13, Surface::ClaudeCode, "api_key", &kimi_bearer, None);
         assert!(
             r.contains("csq setkey kimi --slot 13"),
             "must name the exact setkey command for a resolvable 3P provider: {r}"
@@ -5335,14 +6105,14 @@ mod tests {
         let cloud_vertex = AccountSource::ThirdParty {
             provider: "claude-vertex".to_string(),
         };
-        let r = stale_quota_remedy(9, Surface::ClaudeCode, "api_key", &cloud_vertex);
+        let r = stale_quota_remedy(9, Surface::ClaudeCode, "api_key", &cloud_vertex, None);
         assert!(
             r.contains("re-run the bind command you originally used"),
             "unresolvable provider id must fall back, not guess: {r}"
         );
 
         // Gemini AI Studio API key.
-        let r = stale_quota_remedy(5, Surface::Gemini, "api_key", &AccountSource::Gemini);
+        let r = stale_quota_remedy(5, Surface::Gemini, "api_key", &AccountSource::Gemini, None);
         assert!(
             r.contains("csq setkey gemini --slot 5"),
             "AI Studio slot must point at setkey, not OAuth login: {r}"
@@ -5353,7 +6123,13 @@ mod tests {
         );
 
         // Gemini Vertex SA.
-        let r = stale_quota_remedy(6, Surface::Gemini, "vertex_sa", &AccountSource::Gemini);
+        let r = stale_quota_remedy(
+            6,
+            Surface::Gemini,
+            "vertex_sa",
+            &AccountSource::Gemini,
+            None,
+        );
         assert!(
             r.contains("--vertex-sa-json"),
             "Vertex SA slot must mention the vertex-sa flag: {r}"
@@ -5362,7 +6138,7 @@ mod tests {
         // Every non-login-remedy string must still route through
         // `csq daemon status` first, matching every other remedy on this
         // surface (`non_native_stale_remedy_still_prescribes_an_action`).
-        let r = stale_quota_remedy(13, Surface::ClaudeCode, "api_key", &kimi_bearer);
+        let r = stale_quota_remedy(13, Surface::ClaudeCode, "api_key", &kimi_bearer, None);
         assert!(r.contains("csq daemon status"), "{r}");
     }
 
@@ -5396,6 +6172,87 @@ mod tests {
             count_authenticated_slots(base, SurfaceCli::Grok),
             1,
             "one Grok binding marker must count as one authenticated Grok slot"
+        );
+    }
+
+    /// THE EXPOSURE THIS CLOSES (2026-09-13, M07 hand-off from `fx-sinks`).
+    /// `SinkDoctorSnapshot::mock_backend` existed (`sink_config.rs`) but
+    /// `check_audit_sink_m07` never read it, so `csq doctor` rendered a
+    /// mock-backed sink (rekor/s3/azure/gcp/azure-sql — in-memory
+    /// `HashMap`s that die with the daemon) identically to a real one
+    /// (csq-ledger/customer-body-store). An operator checking compliance
+    /// posture via `csq doctor` — not daemon logs — saw a clean attestation
+    /// of WORM storage that does not exist.
+    ///
+    /// MUTATION DIRECTION 1: a mock-backed sink must be FLAGGED.
+    #[test]
+    fn audit_sink_m07_flags_mock_backed_sink() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        csq_core::audit::AuditSinkConfig {
+            sink: "rekor".to_string(),
+            ..Default::default()
+        }
+        .save(base)
+        .unwrap();
+
+        let info = check_audit_sink_m07(base).expect("rekor sink must produce a doctor entry");
+        assert!(
+            info.mock_backend,
+            "rekor is an in-memory mock sink; mock_backend must be true"
+        );
+    }
+
+    /// MUTATION DIRECTION 2: a REAL sink must NOT be mislabelled mock. A
+    /// flag only ever observed `true` cannot catch a future real sink being
+    /// misclassified — the exact non-discriminating shape removed elsewhere
+    /// today (`instrument-discipline.md` MUST-1) — so this asserts the
+    /// other branch explicitly.
+    #[test]
+    fn audit_sink_m07_does_not_flag_real_sink_as_mock() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        csq_core::audit::AuditSinkConfig {
+            sink: "csq-ledger".to_string(),
+            ..Default::default()
+        }
+        .save(base)
+        .unwrap();
+
+        let info = check_audit_sink_m07(base).expect("csq-ledger sink must produce a doctor entry");
+        assert!(
+            !info.mock_backend,
+            "csq-ledger is a real reqwest-backed sink; mock_backend must be false"
+        );
+    }
+
+    /// The "witness disabled" synthetic entry (sink reverted to `none` after
+    /// a prior mock-backed anchor) must ALSO disclose that the disabled
+    /// witness was never durable — sourced from the same predicate, keyed on
+    /// the prior sink's own name rather than defaulting to either value.
+    #[test]
+    fn audit_sink_m07_disabled_witness_reports_prior_mock_backend() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        // sink is "none" (default — no audit-sink.json written), but a prior
+        // anchor-state-<name>.json sidecar records a past mock-backed sink.
+        let sidecar = base.join("anchor-state-rekor.json");
+        std::fs::write(
+            &sidecar,
+            r#"{"last_anchor_ts":"2026-09-01T00:00:00Z","replication_drift_count":0}"#,
+        )
+        .unwrap();
+
+        let info = check_audit_sink_m07(base)
+            .expect("a prior anchor sidecar must produce a synthetic disabled entry");
+        assert!(
+            info.active_sink.contains("witness disabled"),
+            "expected the synthetic disabled-witness entry, got: {}",
+            info.active_sink
+        );
+        assert!(
+            info.mock_backend,
+            "the prior sink (rekor) was mock-backed; the disabled entry must say so too"
         );
     }
 
@@ -5834,7 +6691,11 @@ mod tests {
         // The originating defect: on a host where the verifier logged
         // `audit_verify_limit_exceeded … skipped=658`, `csq doctor` printed a
         // bare `✓ verified`. The genesis was among the 658.
-        let line = audit_chain_line(&csq_core::audit::AuditHealth::Verified, 658);
+        let line = audit_chain_line(
+            &csq_core::audit::AuditHealth::Verified,
+            658,
+            &AuditChainSource::Daemon,
+        );
         assert!(
             line.contains("PARTIAL"),
             "a tail-only run must not render as a clean verify: {line}"
@@ -5854,7 +6715,11 @@ mod tests {
         // The other direction. Without this the test above passes trivially
         // for an implementation that ALWAYS says PARTIAL, which would be a
         // different instrument that also cannot fail.
-        let line = audit_chain_line(&csq_core::audit::AuditHealth::Verified, 0);
+        let line = audit_chain_line(
+            &csq_core::audit::AuditHealth::Verified,
+            0,
+            &AuditChainSource::Daemon,
+        );
         assert!(line.contains("verified"), "{line}");
         assert!(
             !line.contains("PARTIAL"),
@@ -5872,9 +6737,92 @@ mod tests {
                 reason: "r".into(),
             },
             658,
+            &AuditChainSource::Daemon,
         );
         assert!(broken.contains("BROKEN"), "{broken}");
         assert!(!broken.contains("PARTIAL"), "{broken}");
+    }
+
+    // ── Defect 2: doctor reports the DAEMON's audit health, not its own ────
+    // (diagnostic-surface-parity.md MUST NOT Rule 4)
+
+    /// THE CRITICAL CASE (per the assignment): the daemon has ALREADY
+    /// verified the whole chain clean; a local re-verify under doctor's own
+    /// (smaller) `record_limit` would say PARTIAL. The daemon's answer MUST
+    /// win. A test suite without this case has not tested the fix — every
+    /// other case in this file would pass identically against the OLD,
+    /// buggy "always trust local" behavior.
+    #[test]
+    fn daemon_clean_overrides_local_partial_the_critical_case() {
+        let (health, records_unverified, source) = resolve_audit_chain_answer(
+            csq_core::audit::AuditHealth::Verified,
+            1449, // local: would render PARTIAL (matches the reported host)
+            Ok((csq_core::audit::AuditHealth::Verified, 0)), // daemon: whole chain clean
+        );
+        assert!(
+            matches!(health, csq_core::audit::AuditHealth::Verified),
+            "{health:?}"
+        );
+        assert_eq!(
+            records_unverified, 0,
+            "the daemon's clean answer must win over local's PARTIAL count"
+        );
+        assert_eq!(source, AuditChainSource::Daemon);
+
+        // And the RENDERED line must say "verified", never "PARTIAL" — the
+        // exact operator-visible defect this fix closes.
+        let line = audit_chain_line(&health, records_unverified, &source);
+        assert!(line.contains("verified"), "{line}");
+        assert!(!line.contains("PARTIAL"), "{line}");
+    }
+
+    /// The daemon is unreachable (not running / stale / request failed):
+    /// doctor MUST still report something useful (the local answer), and
+    /// MUST mark it as local-only rather than presenting it as if it were
+    /// the daemon's own view (durable-instruments.md MUST-2: a third,
+    /// distinguishable outcome — never silently folded into either the
+    /// daemon-sourced pass or fail).
+    #[test]
+    fn daemon_unreachable_falls_back_to_local_and_names_why() {
+        let (health, records_unverified, source) = resolve_audit_chain_answer(
+            csq_core::audit::AuditHealth::Verified,
+            1449,
+            Err("daemon not reachable (NotRunning)".to_string()),
+        );
+        assert!(
+            matches!(health, csq_core::audit::AuditHealth::Verified),
+            "{health:?}"
+        );
+        assert_eq!(
+            records_unverified, 1449,
+            "the local answer is still surfaced"
+        );
+        match &source {
+            AuditChainSource::LocalOnly { reason } => {
+                assert!(reason.contains("not reachable"), "{reason}");
+            }
+            other => panic!("expected LocalOnly, got {other:?}"),
+        }
+    }
+
+    /// A `LocalOnly` fallback MUST render visibly differently from a
+    /// `Daemon`-sourced line for the IDENTICAL health/count — otherwise the
+    /// fallback is a silent substitute wearing the daemon-sourced line's
+    /// grammar, which is the exact failure MUST-2 prohibits.
+    #[test]
+    fn local_only_source_renders_visibly_different_from_daemon_source() {
+        use csq_core::audit::AuditHealth;
+        let daemon_line = audit_chain_line(&AuditHealth::Verified, 0, &AuditChainSource::Daemon);
+        let local_line = audit_chain_line(
+            &AuditHealth::Verified,
+            0,
+            &AuditChainSource::LocalOnly {
+                reason: "daemon not running".into(),
+            },
+        );
+        assert_ne!(daemon_line, local_line);
+        assert!(local_line.contains("daemon not running"), "{local_line}");
+        assert!(!daemon_line.contains("daemon not running"), "{daemon_line}");
     }
 
     /// Helper: build a minimal DoctorReport with specific terminal info.
@@ -5883,6 +6831,9 @@ mod tests {
             schema_version: DOCTOR_SCHEMA_VERSION,
             schema: doctor_schema_string(),
             audit_records_unverified: 0,
+            audit_chain_source: AuditChainSource::LocalOnly {
+                reason: "test fixture".into(),
+            },
             unshared_handle_state: Vec::new(),
             codex_shared_shape_mismatches: Vec::new(),
             version: "0.0.0".into(),
@@ -5995,6 +6946,7 @@ mod tests {
             },
             mcp_gate_outbox_backlog: None,
             custodian_identity_canary: CustodianIdentityCanary::default(),
+            daemon_posture: DaemonPostureReport::default(),
         }
     }
 
@@ -6712,6 +7664,50 @@ mod tests {
             json.contains("\"check_available\":true"),
             "JSON must include check_available"
         );
+    }
+
+    #[test]
+    fn daemon_recovery_doctor_text_and_json_share_produced_drift_reason() {
+        for version in ["2.5.0", "", "bad\n/Users/private/token"] {
+            let info = daemon_info_from_detection(csq_core::daemon::DetectResult::Healthy {
+                pid: 123,
+                socket_path: std::path::PathBuf::from("/private/fixture.sock"),
+                daemon_version: version.into(),
+            });
+            assert_eq!(info.status, "drifted");
+            assert_eq!(info.socket_healthy, Some(true));
+            let (_, text) = daemon_operator_detail(&info);
+            let json = serde_json::to_string(&info).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed["version_drift"], text);
+            assert!(text
+                .contains("Service executable versus PATH-selected CLI executable is unverified"));
+            assert!(text.contains("restarting the same old binary does not fix"));
+            assert!(!text.contains("/Users/private"));
+            assert!(!json.contains("/private/fixture.sock"));
+            println!("Daemon: {text}\n{json}");
+        }
+        let info = daemon_info_from_detection(csq_core::daemon::DetectResult::Healthy {
+            pid: 123,
+            socket_path: std::path::PathBuf::from("/private/fixture.sock"),
+            daemon_version: csq_core::daemon::CLI_VERSION.into(),
+        });
+        assert_eq!(info.status, "healthy");
+        assert!(info.version_drift.is_none());
+    }
+
+    #[test]
+    fn daemon_recovery_doctor_fallback_and_absent_siblings_do_not_prescribe_foreground_repair() {
+        for status in ["drifted", "stale", "not running"] {
+            let (_, text) = daemon_operator_detail(&DaemonInfo {
+                status: status.into(),
+                pid: None,
+                socket_healthy: None,
+                version_drift: None,
+            });
+            assert!(text.contains("supervisor is unverified"));
+            assert!(!text.contains("daemon stop && csq daemon start"));
+        }
     }
 
     // ── Daemon version-drift JSON tests ───────────────────────────────────
@@ -8415,63 +9411,179 @@ mod tests {
         assert_eq!(report.schema_version, DOCTOR_SCHEMA_VERSION);
     }
 
+    #[test]
+    fn roster_disposition_doctor_retains_anchor_only_warning_in_text_and_json() {
+        use csq_core::audit::{RosterFloorAnchorStatus, VerifySummary};
+        let summary = VerifySummary {
+            roster_floor_present: true,
+            roster_floor_anchor: RosterFloorAnchorStatus::Unconfirmed,
+            ..Default::default()
+        };
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: true,
+        });
+        report.audit_roster_floor_anchor = roster_floor_anchor_for_doctor(true, &summary);
+        let status = report
+            .audit_roster_floor_anchor
+            .expect("anchor-only evidence must be visible");
+        let text = roster_floor_operator_line(status);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["audit_roster_floor_anchor"], "unconfirmed");
+        assert!(text.contains("a floor is missing from one store"));
+        assert!(!text.contains("chain.json-only"));
+        println!(
+            "{text}\n{}",
+            serde_json::to_string(&json["audit_roster_floor_anchor"]).unwrap()
+        );
+        assert!(roster_floor_anchor_for_doctor(true, &VerifySummary::default()).is_none());
+        assert!(roster_floor_anchor_for_doctor(false, &summary).is_none());
+    }
+
     // ── an internal ticket item 2: audit_roster_floor_anchor field ──────────────────────
 
-    /// When no roster is installed `audit_roster_floor_anchor` is omitted from
-    /// the JSON (None → skip_serializing_if). The assertion pins to the
-    /// build-active `DOCTOR_SCHEMA_VERSION` const (edition-specific), never a
-    /// literal — so it stays correct across schema bumps.
+    /// A floor-BEARING summary — the discriminator both omission cases below
+    /// need. Each asserts that its own gate turns this into `None`; without it
+    /// a `None` verdict would be indistinguishable from a producer that can
+    /// never return `Some`.
+    fn floor_bearing_summary() -> csq_core::audit::VerifySummary {
+        csq_core::audit::VerifySummary {
+            roster_floor_present: true,
+            roster_floor_anchor: csq_core::audit::RosterFloorAnchorStatus::Unconfirmed,
+            ..Default::default()
+        }
+    }
+
+    /// When no chain has ever been initialised the field is omitted, and the
+    /// JSON therefore carries no `audit_roster_floor_anchor` key.
+    ///
+    /// ISOLATION (an internal ticket): this case no longer calls `build_report`. That
+    /// collector reaches `check_settings` → `commands::claude_home` (ambient
+    /// `CLAUDE_HOME`, else the platform home) and `check_js_runtime` →
+    /// `resolve_js_runtime`, which searches PATH and known paths and then RUNS
+    /// each candidate with `--version` — real host subprocess capability that a
+    /// private base dir does not fence off. It also runs `verify_chain` under
+    /// the PRODUCTION keychain service name. The field's producer is
+    /// `roster_floor_anchor_for_doctor(chain_json_present(base), &summary)`,
+    /// and `build_report` stores that value verbatim, so composing the two
+    /// production functions here exercises the same decision with no ambient
+    /// read, no PATH lookup and no subprocess.
     #[test]
     fn doctor_audit_roster_floor_anchor_absent_when_no_roster() {
-        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
-        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
-        // so this test cannot race a concurrent enterprise-edition setter.
-        let _env_guard = csq_core::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
-        // Arrange
+        // READER-SIDE env guard, kept deliberately (test-hermeticity.md MUST 1).
+        //
+        // This case now MUTATES no environment variable — the two `remove_var`
+        // calls it used to make are the pollution an internal ticket removes, and with
+        // `build_report` gone there is nothing left to clear. The LOCK stays,
+        // because the lock protects a test from a CONCURRENT writer as well as
+        // from its own writes, and that half was not settled by execution.
+        //
+        // The transitive survey supports (but does not prove) that the surface
+        // is env-free: `chain_json_present` is a path join + `exists()`;
+        // `roster_floor_anchor_for_doctor` is a pure boolean; `make_report` is
+        // a struct literal whose only calls are `doctor_schema_string`
+        // (`format!` on a const) and `doctor_trust_plane_grade` →
+        // `csq_core::audit::trust_grade`, which contains no `env::`/`home_dir`
+        // anywhere in the file; `ChainState::save` writes under the supplied
+        // base and `chain_state.rs` contains no `env::`/`home_dir`/`keyring`.
+        // The one residual env read is `TempDir::new()` → `std::env::temp_dir()`
+        // → `TMPDIR`, which no test in this repo mutates. What was NOT done is
+        // the falsifying run — executing these alongside the env-mutating
+        // fixtures — because those neighbours are themselves unaudited (an internal ticket
+        // covers seven tests, not the module). Until that runs, holding the
+        // lock is the honest disposition: serialized-and-right beats
+        // fast-and-occasionally-wrong, which is the defect class this issue
+        // exists to remove.
+        let _env_lock = csq_core::platform::test_env::lock();
+
+        // Arrange — an empty install: no chain, therefore no roster possible.
         let dir = TempDir::new().unwrap();
-
-        // Act — build on an empty install (no chain, no roster).
-        let report = build_report(dir.path());
-
-        // Assert — field is None (omitted).
         assert!(
-            report.audit_roster_floor_anchor.is_none(),
-            "audit_roster_floor_anchor MUST be None when no roster is installed"
+            !chain_json_present(dir.path()),
+            "fixture precondition: the ABSENT-CHAIN case requires no csq-runs/chain.json"
         );
+
+        // Act — the production composition, on the absent-chain fixture.
+        let anchor = roster_floor_anchor_for_doctor(
+            chain_json_present(dir.path()),
+            &floor_bearing_summary(),
+        );
+
+        // Assert — the EXISTENCE gate is what omits the field here: even a
+        // summary that reports a floor must not surface one with no chain.
+        assert!(
+            anchor.is_none(),
+            "audit_roster_floor_anchor MUST be None when no chain is initialised, \
+             even for a floor-bearing summary; got {anchor:?}"
+        );
+
+        // …and the realistic empty-install summary agrees, and serialises away.
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.audit_roster_floor_anchor = roster_floor_anchor_for_doctor(
+            chain_json_present(dir.path()),
+            &csq_core::audit::VerifySummary::default(),
+        );
+        assert!(report.audit_roster_floor_anchor.is_none());
         let json = serde_json::to_string(&report).unwrap();
         assert!(
             !json.contains("audit_roster_floor_anchor"),
             "JSON MUST omit audit_roster_floor_anchor when None; got: {json}"
         );
-        assert_eq!(report.schema_version, DOCTOR_SCHEMA_VERSION);
     }
 
     /// an internal ticket review MED-2: an INITIALIZED install (chain.json present)
     /// that has never run `csq audit roster install` (floor None) must ALSO
     /// omit the field — `chain.json exists` alone is the wrong predicate.
+    ///
+    /// ISOLATION (an internal ticket): same seam as the absent-chain case above, and this
+    /// case's acceptance is deliberately the OTHER one — here the chain DOES
+    /// exist, so the omission has to come from the floorless summary. The
+    /// closing assertion proves that by flipping only the summary.
     #[test]
     fn doctor_floor_anchor_omitted_when_initialized_but_no_roster() {
-        // Hermeticity (test-hermeticity.md MUST 1b): build_report transitively reads
-        // CSQ_AUDIT_EDITION; pin a clean community baseline under the shared env lock
-        // so this test cannot race a concurrent enterprise-edition setter.
-        let _env_guard = csq_core::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        // Reader-side env guard, held for the same reason and with the same
+        // unresolved caveat recorded on
+        // `doctor_audit_roster_floor_anchor_absent_when_no_roster` above: this
+        // case mutates nothing, so it cannot pollute, but the "no concurrent
+        // writer matters" half is surveyed rather than executed.
+        let _env_lock = csq_core::platform::test_env::lock();
+
         let dir = TempDir::new().unwrap();
         // chain.json present, roster_version_floor None (audit init, no roster).
         csq_core::audit::ChainState::new("01ARZ3NDEKTSV4RRFFQ69G5D0C")
             .save(dir.path())
             .expect("save chain.json");
-
-        let report = build_report(dir.path());
-
         assert!(
-            report.audit_roster_floor_anchor.is_none(),
+            chain_json_present(dir.path()),
+            "fixture precondition: the INITIALIZED case requires csq-runs/chain.json — \
+             without it this would silently re-test the absent-chain case"
+        );
+
+        let anchor = roster_floor_anchor_for_doctor(
+            chain_json_present(dir.path()),
+            &csq_core::audit::VerifySummary::default(),
+        );
+        assert!(
+            anchor.is_none(),
             "audit_roster_floor_anchor MUST be omitted on an initialized-but-rosterless \
-             install; got {:?}",
-            report.audit_roster_floor_anchor
+             install; got {anchor:?}"
+        );
+
+        // Non-vacuity: on the SAME initialized fixture a floor-bearing summary
+        // DOES surface the field, so the `None` above is the floorless gate
+        // firing — not the existence gate, and not a producer stuck at None.
+        assert_eq!(
+            roster_floor_anchor_for_doctor(
+                chain_json_present(dir.path()),
+                &floor_bearing_summary()
+            ),
+            Some(csq_core::audit::RosterFloorAnchorStatus::Unconfirmed),
+            "an initialized chain with a floor-bearing summary MUST surface the anchor"
         );
     }
 
@@ -8572,7 +9684,6 @@ mod tests {
         // An in-flight tmp write and a non-json file must NOT be counted.
         std::fs::write(outbox.join("sess-a.2.tmp.1234.json"), b"{}").unwrap();
         std::fs::write(outbox.join("README"), b"x").unwrap();
-        std::fs::create_dir_all(outbox.join("subdir.json")).unwrap();
 
         let backlog =
             check_mcp_gate_outbox_backlog(dir.path()).expect("non-empty outbox must yield Some");
@@ -8623,6 +9734,126 @@ mod tests {
 
     /// M6 an internal ticket shard D: the daemon-aware classifier across the count-cap,
     /// drain-freshness, and age axes — Stuck / Draining / PendingDaemonDown.
+
+    #[test]
+    fn mcp_gate_admission_diagnostics_count_stale_tmp_and_legacy_bytes() {
+        use csq_core::audit::outbox_paths::{
+            MCP_GATE_OUTBOX_MAX_BYTES, MCP_GATE_OUTBOX_MAX_PENDING,
+        };
+        for bytes in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let outbox = csq_core::audit::outbox_paths::mcp_gate_outbox_dir(dir.path());
+            std::fs::create_dir_all(&outbox).unwrap();
+            if bytes {
+                std::fs::File::create(outbox.join("legacy"))
+                    .unwrap()
+                    .set_len(MCP_GATE_OUTBOX_MAX_BYTES)
+                    .unwrap();
+            } else {
+                for i in 0..MCP_GATE_OUTBOX_MAX_PENDING {
+                    std::fs::write(outbox.join(format!("stale.tmp.{i}")), b"retain").unwrap();
+                }
+            }
+            let report = check_mcp_gate_outbox_backlog(dir.path()).unwrap();
+            assert_eq!(
+                report.pending_count, 0,
+                "JSON count must not be relabeled as all entries"
+            );
+            assert_eq!(report.state, McpGateBacklogState::Stuck);
+            assert!(report.warn);
+            assert_eq!(
+                serde_json::to_value(report).unwrap()["admission_problem"],
+                "mcp_gate_pending_capacity"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_gate_admission_diagnostics_stat_error_is_not_healthy_zero() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("csq-runs"), b"not a directory").unwrap();
+        let report = check_mcp_gate_outbox_backlog(dir.path()).unwrap();
+        assert_eq!(report.admission_problem, Some("mcp_gate_pending_stat"));
+        assert!(report.warn);
+    }
+
+    /// Windows maps ERROR_PATH_NOT_FOUND (a path component exists but is not a
+    /// directory) onto the same `ErrorKind::NotFound` used for a genuinely
+    /// absent path. This is the platform-neutral regression test for the
+    /// Windows-only symptom: `ancestor_is_not_a_directory` must distinguish the
+    /// two NotFound-shaped situations directly, without depending on which
+    /// `io::ErrorKind` this host's `stat` actually returns.
+    #[test]
+    fn ancestor_is_not_a_directory_distinguishes_notfound_shapes() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file"), b"not a directory").unwrap();
+        // `<tmp>/file/child`: an existing ancestor ("file") is not a directory.
+        assert!(ancestor_is_not_a_directory(
+            &dir.path().join("file").join("child")
+        ));
+        // `<tmp>/missing/child`: no ancestor below `dir` exists at all.
+        assert!(!ancestor_is_not_a_directory(
+            &dir.path().join("missing").join("child")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_gate_admission_diagnostics_symlink_is_not_followed() {
+        let dir = TempDir::new().unwrap();
+        let outbox = csq_core::audit::outbox_paths::mcp_gate_outbox_dir(dir.path());
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("absent-target"), outbox.join("fake.json"))
+            .unwrap();
+        let report = check_mcp_gate_outbox_backlog(dir.path()).unwrap();
+        assert_eq!(
+            report.admission_problem,
+            Some("mcp_gate_pending_unsafe_entry")
+        );
+        assert_eq!(report.pending_count, 0);
+        assert!(report.warn);
+    }
+
+    #[test]
+    fn mcp_gate_admission_diagnostics_empty_and_healthy_omit_problem() {
+        let dir = TempDir::new().unwrap();
+        let outbox = csq_core::audit::outbox_paths::mcp_gate_outbox_dir(dir.path());
+        assert!(check_mcp_gate_outbox_backlog(dir.path()).is_none());
+        std::fs::create_dir_all(&outbox).unwrap();
+        assert!(check_mcp_gate_outbox_backlog(dir.path()).is_none());
+        std::fs::write(outbox.join("one.json"), b"{}").unwrap();
+        let report = check_mcp_gate_outbox_backlog(dir.path()).unwrap();
+        assert!(!report.warn);
+        assert!(serde_json::to_value(report)
+            .unwrap()
+            .get("admission_problem")
+            .is_none());
+    }
+
+    #[test]
+    fn classify_mcp_gate_backlog_warns_at_hard_admission_capacity() {
+        use McpGateBacklogState::{Draining, PendingDaemonDown, Stuck};
+        for stamp in [None, Some(1_000_000)] {
+            assert_eq!(
+                classify_mcp_gate_backlog(MCP_GATE_OUTBOX_STUCK_COUNT, Some(0), stamp, 1_000_000),
+                Stuck
+            );
+            assert_eq!(
+                classify_mcp_gate_backlog(
+                    MCP_GATE_OUTBOX_STUCK_COUNT - 1,
+                    Some(0),
+                    stamp,
+                    1_000_000
+                ),
+                if stamp.is_some() {
+                    Draining
+                } else {
+                    PendingDaemonDown
+                }
+            );
+        }
+    }
+
     #[test]
     fn classify_mcp_gate_backlog_daemon_aware() {
         use McpGateBacklogState::{Draining, PendingDaemonDown, Stuck};

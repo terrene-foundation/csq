@@ -43,18 +43,9 @@ use tempfile::TempDir;
 
 // ── Binary paths ──────────────────────────────────────────────────────────────
 
-fn csq_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_csq") {
-        return PathBuf::from(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("csq")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::csq_bin;
 
 // ── Clean command builder ────────────────────────────────────────────────────
 
@@ -91,6 +82,9 @@ fn clean_cmd(home: &std::path::Path, path_override: &str) -> Command {
         cmd.env("CSQ_SECRET_PASSPHRASE", "hermetic-test-vault");
     }
     cmd.env("HOME", home);
+    // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
+    // test-utils-gated override is what actually sandboxes it there.
+    cmd.env("CSQ_HOME", home);
     cmd.env("CLAUDE_HOME", home);
     // an internal ticket: launch_gemini now pre-checks `~/.gemini/oauth_creds.json` before a
     // headless CodeAssistOAuth spawn (to avoid gemini-cli's interactive

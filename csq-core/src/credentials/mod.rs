@@ -12,6 +12,7 @@ pub mod keychain;
 pub mod mutex;
 pub mod post_login;
 pub mod refresh;
+pub mod token_history;
 
 pub use file::{load, save, save_canonical_for, save_uuid_settings, write_uuid_settings};
 pub use keychain::service_name;

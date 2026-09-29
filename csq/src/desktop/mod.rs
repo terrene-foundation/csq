@@ -226,7 +226,7 @@ fn base_dir() -> Option<PathBuf> {
         }
         return Some(path);
     }
-    let home = dirs::home_dir()?;
+    let home = csq_core::platform::home::home_dir()?;
     Some(home.join(".claude").join("accounts"))
 }
 
@@ -823,6 +823,23 @@ fn installed_cli_is_enterprise_within(
     cli_path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> bool {
+    probe_cli_version_output_within(cli_path, timeout)
+        .is_some_and(|stdout| version_output_is_enterprise(&stdout))
+}
+
+/// Run `<cli_path> --version` under `timeout` and return its stdout, or `None`
+/// on ANY ambiguity — missing binary, symlink, spawn error, timeout, or
+/// non-zero exit.
+///
+/// Extracted from [`installed_cli_is_enterprise_within`] so the EDITION guard
+/// and the VERSION-downgrade guard ([`installed_cli_is_newer_within`]) share a
+/// single spawn shape rather than each growing their own copy — the two guards
+/// read the same one line of output for different properties. Each caller
+/// decides for itself what `None` means; this function takes no position.
+fn probe_cli_version_output_within(
+    cli_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<String> {
     use std::process::{Command, Stdio};
     // Reject a SYMLINK target without spawning: `mode::detect` canonicalizes
     // `current_exe()`, so a symlink at the CLI path pointing into
@@ -836,7 +853,7 @@ fn installed_cli_is_enterprise_within(
         .map(|m| m.file_type().is_file())
         .unwrap_or(false);
     if !is_regular_file {
-        return false;
+        return None;
     }
     let cli = cli_path.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -851,9 +868,9 @@ fn installed_cli_is_enterprise_within(
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(output)) if output.status.success() => {
-            version_output_is_enterprise(&String::from_utf8_lossy(&output.stdout))
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -868,6 +885,97 @@ fn installed_cli_is_enterprise_within(
 /// the one genuinely-good thing to keep and port here).
 fn version_output_is_enterprise(stdout: &str) -> bool {
     stdout.contains("(enterprise)")
+}
+
+/// Parse `MAJOR.MINOR.PATCH` out of a `csq --version` stdout line.
+///
+/// Accepts the shipped shape `csq 2.19.0 (enterprise)` (built as
+/// `VERSION_LINE` in `csq/src/main.rs`) and a bare `2.19.0`.
+///
+/// A pre-release / build suffix is truncated at the first `-` or `+`, so
+/// `2.19.0-rc1` compares EQUAL to `2.19.0`. That is a deliberate deviation from
+/// semver, where `2.19.0-rc1 < 2.19.0`: it means an rc-installed host facing a
+/// same-version final bundle is refreshed rather than refused. That is the safe
+/// direction here — the caller is a downgrade guard, and refusing would strand
+/// the host on a pre-release.
+///
+/// Returns `None` for anything it cannot read as three integers — the caller
+/// decides what ambiguity means.
+fn parse_version_triple(stdout: &str) -> Option<(u64, u64, u64)> {
+    for token in stdout.split_whitespace() {
+        let core = token
+            .split(['-', '+'])
+            .next()
+            .unwrap_or(token)
+            .trim_start_matches(['v', 'V']);
+        let mut parts = core.split('.');
+        let (Some(a), Some(b), Some(c), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if let (Ok(a), Ok(b), Ok(c)) = (a.parse::<u64>(), b.parse::<u64>(), c.parse::<u64>()) {
+            return Some((a, b, c));
+        }
+    }
+    None
+}
+
+/// Decides whether an installed CLI's `--version` stdout names a STRICTLY
+/// NEWER version than this bundle.
+///
+/// Split out of [`installed_cli_is_newer_within`] for the same reason
+/// [`version_output_is_enterprise`] was: the DECISION is then testable without
+/// spawning a subprocess or racing a wall-clock budget.
+///
+/// Returns `false` on ambiguity (either side unparseable). That direction is
+/// deliberate and is NOT a fail-open on the destructive branch: this predicate
+/// is only ever consulted for a target that already exists, and a target whose
+/// `--version` cannot be parsed is not a working csq — there is no version to
+/// downgrade FROM, and the refresh is the thing that repairs it. The branch
+/// where a real downgrade is possible (both sides parse, installed is newer)
+/// fails closed, per `guard-reader-writer-parity.md` MUST-2.
+fn version_output_is_newer_than(stdout: &str, bundle_version: &str) -> bool {
+    match (
+        parse_version_triple(stdout),
+        parse_version_triple(bundle_version),
+    ) {
+        (Some(installed), Some(bundle)) => installed > bundle,
+        _ => false,
+    }
+}
+
+/// Best-effort: does the CLI already installed at `cli_path` report a STRICTLY
+/// NEWER version than this bundle? When it does, the shim refresh MUST be
+/// skipped — copying the bundle over it is a silent DOWNGRADE of the binary the
+/// operator actually runs.
+///
+/// The sibling [`installed_cli_is_enterprise`] guards the EDITION axis of the
+/// same copy. Neither implies the other: a stale ENTERPRISE `.app` downgrading
+/// a newer ENTERPRISE CLI passes the edition guard cleanly. Measured on the
+/// maintainer host 2026-09-12 — `.app` 2.18.0, `~/.local/bin/csq` 2.19.0, both
+/// enterprise.
+fn installed_cli_is_newer(cli_path: &std::path::Path) -> bool {
+    installed_cli_is_newer_within(
+        cli_path,
+        std::time::Duration::from_secs(CLI_ENTERPRISE_PROBE_TIMEOUT_SECS),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// [`installed_cli_is_newer`], parameterized on the probe budget and the
+/// bundle version so tests need neither a wall-clock assertion nor a rebuild at
+/// a synthetic version. The production entry point always passes
+/// [`CLI_ENTERPRISE_PROBE_TIMEOUT_SECS`] and `CARGO_PKG_VERSION`.
+fn installed_cli_is_newer_within(
+    cli_path: &std::path::Path,
+    timeout: std::time::Duration,
+    bundle_version: &str,
+) -> bool {
+    match probe_cli_version_output_within(cli_path, timeout) {
+        Some(stdout) => version_output_is_newer_than(&stdout, bundle_version),
+        None => false,
+    }
 }
 
 /// Interval between background update checks (30 minutes).
@@ -1612,6 +1720,33 @@ pub fn run() {
                          enterprise CLI, to keep editions consistent."
                     );
                 }
+                // Version-downgrade guard: a STALE `.app` must never copy an
+                // OLDER binary over a NEWER installed CLI. The edition guard
+                // above does not cover this — an enterprise 2.18.0 bundle
+                // downgrading an enterprise 2.19.0 CLI passes it cleanly. Doing
+                // so silently reverts the binary the operator runs in the
+                // terminal, and (because the managed-daemon plist below points
+                // at this same target) the launchd daemon with it — resurfacing
+                // the very version-skew warning this whole block exists to
+                // prevent. Observed on the maintainer host 2026-09-12.
+                //
+                // COVERAGE NOTE: the two predicates below are unit-tested, but
+                // this `match` — the decision that consults them, and the arm
+                // ORDER that makes the edition guard short-circuit the version
+                // probe — is NOT. `run()` is a Tauri setup closure and is not
+                // unit-testable, so deleting either guard arm leaves every test
+                // green. Reviewed and accepted 2026-09-12 rather than extracting
+                // the decision; if a third guard is ever added here, extract
+                // them into one testable predicate instead of growing this match.
+                (Ok(_), Some(target)) if installed_cli_is_newer(&target) => {
+                    tracing::warn!(
+                        target = %target.display(),
+                        bundle_version = %env!("CARGO_PKG_VERSION"),
+                        "cli shim refresh SKIPPED: the installed CLI is NEWER than this \
+                         bundle; refusing to downgrade it. Update the desktop app (or \
+                         reinstall the CLI from this bundle) to bring the two back in step."
+                    );
+                }
                 (Ok(src), Some(target)) => {
                     match csq_core::cli_deps::cli_shim::ensure_cli_shim(&src, &target) {
                         Ok(outcome) => tracing::info!(
@@ -2163,6 +2298,161 @@ mod tests {
     // every core). Neither layer alone is sufficient.
     #[cfg(unix)]
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ── version-downgrade guard ───────────────────────────────────────
+    #[test]
+    fn parse_version_triple_reads_the_shipped_shapes() {
+        assert_eq!(
+            parse_version_triple("csq 2.19.0 (enterprise)"),
+            Some((2, 19, 0))
+        );
+        assert_eq!(
+            parse_version_triple("csq 2.19.0 (community)\n"),
+            Some((2, 19, 0))
+        );
+        assert_eq!(parse_version_triple("2.19.0"), Some((2, 19, 0)));
+        assert_eq!(
+            parse_version_triple("csq 2.19.0-rc1 (enterprise)"),
+            Some((2, 19, 0))
+        );
+        assert_eq!(parse_version_triple("csq 2.19.0+abc123"), Some((2, 19, 0)));
+        assert_eq!(parse_version_triple("csq 10.2.30"), Some((10, 2, 30)));
+        // Unreadable → None, so the caller can decide what ambiguity means.
+        assert_eq!(parse_version_triple(""), None);
+        assert_eq!(parse_version_triple("csq unknown"), None);
+        assert_eq!(parse_version_triple("csq 2.19"), None);
+        assert_eq!(parse_version_triple("csq 2.19.0.1"), None);
+        assert_eq!(parse_version_triple("csq a.b.c"), None);
+    }
+
+    /// The guard fires ONLY when the installed CLI is strictly newer.
+    ///
+    /// Falsifying result, named up front: if the comparison were absent (or
+    /// inverted) the `2.19.0`-installed-vs-`2.18.0`-bundle row would return
+    /// `false` and the downgrade would proceed. That row is the maintainer-host
+    /// regression of 2026-09-12 verbatim.
+    #[test]
+    fn version_output_is_newer_than_fires_only_on_a_real_downgrade() {
+        // installed NEWER than bundle → guard fires
+        assert!(version_output_is_newer_than(
+            "csq 2.19.0 (enterprise)",
+            "2.18.0"
+        ));
+        assert!(version_output_is_newer_than(
+            "csq 3.0.0 (enterprise)",
+            "2.19.0"
+        ));
+        assert!(version_output_is_newer_than(
+            "csq 2.19.1 (enterprise)",
+            "2.19.0"
+        ));
+
+        // equal or older → no downgrade, refresh proceeds
+        assert!(!version_output_is_newer_than(
+            "csq 2.19.0 (enterprise)",
+            "2.19.0"
+        ));
+        assert!(!version_output_is_newer_than(
+            "csq 2.18.0 (enterprise)",
+            "2.19.0"
+        ));
+        assert!(!version_output_is_newer_than(
+            "csq 2.9.0 (enterprise)",
+            "2.19.0"
+        ));
+
+        // Ambiguity on EITHER side → false. Deliberate: this predicate is only
+        // consulted for an existing target, and a target that cannot print a
+        // parseable version is not a working csq — there is nothing to
+        // downgrade FROM and the refresh is what repairs it.
+        assert!(!version_output_is_newer_than("", "2.18.0"));
+        assert!(!version_output_is_newer_than("csq unknown", "2.18.0"));
+        assert!(!version_output_is_newer_than("csq 2.19.0", "not-a-version"));
+    }
+
+    /// The edition guard and the version guard are INDEPENDENT axes: an
+    /// enterprise-over-enterprise downgrade passes the edition check cleanly
+    /// and must still be caught. This is why the second guard exists at all.
+    #[test]
+    fn edition_guard_does_not_catch_a_same_edition_downgrade() {
+        let stale_bundle_sees = "csq 2.19.0 (enterprise)";
+        assert!(
+            version_output_is_enterprise(stale_bundle_sees),
+            "precondition: the installed CLI is enterprise, so the edition guard is satisfied"
+        );
+        assert!(
+            version_output_is_newer_than(stale_bundle_sees, "2.18.0"),
+            "the version guard MUST catch what the edition guard cannot"
+        );
+    }
+
+    /// End-to-end through the real subprocess probe: a fake `csq` that prints a
+    /// newer version is refused. Exercises `probe_cli_version_output_within`
+    /// (spawn + parse), not just the pure decision. Uses the same
+    /// `SERIAL` + `TEST_PROBE_TIMEOUT` discipline as the sibling edition-probe
+    /// tests — see `TEST_PROBE_TIMEOUT`'s doc comment for why the production
+    /// budget is not safe to assert against on the self-hosted runner.
+    #[cfg(unix)]
+    #[test]
+    fn installed_cli_is_newer_within_refuses_a_newer_fake_cli() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+            SERIAL.clear_poison();
+            p.into_inner()
+        });
+        let dir = TempDir::new().unwrap();
+        let cli = write_fake_cli(dir.path(), "csq-new", "csq 2.19.0 (enterprise)");
+
+        assert!(
+            installed_cli_is_newer_within(&cli, TEST_PROBE_TIMEOUT, "2.18.0"),
+            "a 2.19.0 CLI against a 2.18.0 bundle is a downgrade and must be refused"
+        );
+        assert!(
+            !installed_cli_is_newer_within(&cli, TEST_PROBE_TIMEOUT, "2.19.0"),
+            "same version is not a downgrade"
+        );
+        assert!(
+            !installed_cli_is_newer_within(&cli, TEST_PROBE_TIMEOUT, "2.20.0"),
+            "a newer bundle is an UPGRADE and must proceed"
+        );
+    }
+
+    /// A missing target is not a downgrade — otherwise the guard would break
+    /// FIRST INSTALL, where nothing sits at the target at all.
+    #[cfg(unix)]
+    #[test]
+    fn installed_cli_is_newer_within_is_false_for_a_missing_target() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+            SERIAL.clear_poison();
+            p.into_inner()
+        });
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nope/csq");
+        assert!(!installed_cli_is_newer_within(
+            &missing,
+            TEST_PROBE_TIMEOUT,
+            "2.18.0"
+        ));
+    }
+
+    /// A target that exists but cannot print a parseable version is NOT treated
+    /// as a downgrade: it is not a working csq, so there is nothing to protect
+    /// and the refresh is what repairs it. This is the one ambiguity branch
+    /// that deliberately proceeds — see `version_output_is_newer_than`.
+    #[cfg(unix)]
+    #[test]
+    fn installed_cli_is_newer_within_is_false_for_an_unparseable_version() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+            SERIAL.clear_poison();
+            p.into_inner()
+        });
+        let dir = TempDir::new().unwrap();
+        let cli = write_fake_cli(dir.path(), "csq-broken", "not a version at all");
+        assert!(!installed_cli_is_newer_within(
+            &cli,
+            TEST_PROBE_TIMEOUT,
+            "2.18.0"
+        ));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -100,6 +100,7 @@ pub fn load_state_salvage(base_dir: &Path) -> QuotaFile {
     let mut quota_file = QuotaFile {
         schema_version,
         accounts: std::collections::HashMap::new(),
+        poller_health: std::collections::HashMap::new(),
     };
 
     if let Some(accounts_obj) = raw.get("accounts").and_then(|v| v.as_object()) {
@@ -131,6 +132,46 @@ pub fn load_state_salvage(base_dir: &Path) -> QuotaFile {
                         error_kind = "quota_row_corrupt",
                         error = %e,
                         "quota.json account row failed to parse; dropping this row, \
+                         sibling rows preserved"
+                    );
+                }
+            }
+        }
+    }
+
+    // Same per-row salvage discipline as `accounts` above: a single
+    // corrupt health row must not blank every sibling slot's health, and
+    // a health row must never poison the accounts parse above it (the two
+    // maps are walked independently).
+    if let Some(health_obj) = raw.get("poller_health").and_then(|v| v.as_object()) {
+        for (key, row_value) in health_obj.iter() {
+            let valid_key = key
+                .parse::<u16>()
+                .ok()
+                .and_then(|n| crate::types::AccountNum::try_from(n).ok())
+                .is_some();
+            if !valid_key {
+                tracing::warn!(
+                    path = %path.display(),
+                    slot = %key,
+                    error_kind = "poller_health_row_invalid_key",
+                    "quota.json poller_health key is not a valid AccountNum (1..=999); \
+                     dropping this row, sibling rows preserved"
+                );
+                continue;
+            }
+
+            match serde_json::from_value::<super::PollerHealth>(row_value.clone()) {
+                Ok(h) => {
+                    quota_file.poller_health.insert(key.clone(), h);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        slot = %key,
+                        error_kind = "poller_health_row_corrupt",
+                        error = %e,
+                        "quota.json poller_health row failed to parse; dropping this row, \
                          sibling rows preserved"
                     );
                 }

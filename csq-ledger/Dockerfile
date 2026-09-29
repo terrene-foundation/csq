@@ -8,8 +8,8 @@
 #   docker build -f csq-ledger/Dockerfile -t ghcr.io/terrene-foundation/csq-ledger:latest .
 #
 # Run:
-#   docker run -v /var/lib/csq-ledger:/data -p 8080:8080 \
-#     ghcr.io/terrene-foundation/csq-ledger:latest
+#   docker run -v /var/lib/csq-ledger:/data -p 127.0.0.1:8080:8080 \
+#     ghcr.io/terrene-foundation/csq-ledger:latest --bind 0.0.0.0 --allow-public-bind
 
 # ── Stage 1: builder ─────────────────────────────────────────────────────────
 FROM rust:1.90-bookworm AS builder
@@ -46,7 +46,8 @@ COPY --from=builder --chown=65532:65532 /data /data
 VOLUME /data
 ENV CSQ_LEDGER_DATA_DIR=/data
 ENV CSQ_LEDGER_PORT=8080
-ENV CSQ_LEDGER_BIND=0.0.0.0
+# Keep the binary's loopback default. Container-network access requires the
+# operator to pass BOTH --bind 0.0.0.0 and --allow-public-bind at runtime.
 
 EXPOSE 8080
 

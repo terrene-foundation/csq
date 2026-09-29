@@ -42,7 +42,7 @@ pub fn handle(base_dir: &Path, slot: Option<u16>, json: bool) -> Result<()> {
     // channel the daemon's production paths use
     // (`account-terminal-separation.md` MUST Rule 4 diagnostic-daemon
     // parity). The probe never reads `~/.codex/auth.json`.
-    let home = dirs::home_dir().ok_or_else(|| {
+    let home = csq_core::platform::home::home_dir().ok_or_else(|| {
         anyhow!(
             "HOME not set; csq probe needs the home directory to find \
              ~/.gemini/oauth_creds.json (Gemini Code Assist OAuth)"

@@ -282,13 +282,22 @@ pub struct StatuslineContext {
     pub is_csq_terminal: bool,
 }
 
-/// Git state at the moment the statusline rendered. `dirty` means
-/// `git diff --quiet` OR `git diff --cached --quiet` returned
-/// non-zero (worktree or index has uncommitted changes).
+/// Git state at the moment the statusline rendered.
+///
+/// `dirty` is THREE-STATE, not boolean: `Some(true)` — worktree or
+/// index has uncommitted changes; `Some(false)` — both `git diff
+/// --quiet` and `git diff --cached --quiet` confirmed clean;
+/// `None` — git could not be measured (spawn failure, or an exit
+/// status that is neither 0 nor 1, which on Unix also covers a
+/// signal-killed git process). `None` is NOT the same claim as
+/// `Some(false)`: the producer in `csq::cli::commands::statusline::git_status`
+/// never asserts "clean" when it does not know that (an internal ticket —
+/// a killed-under-load git process used to collapse into a
+/// confident `dirty: false`, identical to a genuinely clean repo).
 #[derive(Debug, Clone)]
 pub struct GitStatus {
     pub branch: String,
-    pub dirty: bool,
+    pub dirty: Option<bool>,
 }
 
 /// Composes the full statusline — account/quota + model + project +
@@ -359,7 +368,16 @@ pub fn rich_statusline(
     }
 
     if let Some(g) = &ctx.git {
-        let dirty_glyph = if g.dirty { "●" } else { "" };
+        // `None` (git could not be measured) renders identically to
+        // `Some(false)` (confirmed clean) — deliberately. A statusline
+        // that invented a dirty marker for an unmeasured repo would be
+        // worse than one that shows nothing; the glyph is a claim about
+        // KNOWN dirtiness, not "definitely clean". Only `Some(true)`
+        // earns the dot. This is a DISPLAY choice layered on top of the
+        // producer's honest three-state `Option<bool>` — the producer
+        // no longer asserts a fact it doesn't have, even though the
+        // rendered pixels for "clean" and "unknown" are unchanged.
+        let dirty_glyph = if g.dirty == Some(true) { "●" } else { "" };
         parts.push(format!("git:{}{}", g.branch, dirty_glyph));
     }
 
@@ -477,7 +495,7 @@ pub fn parse_workspace_dir(raw: &str) -> Option<String> {
 }
 
 // M3-7 fix-wave R1 M2-DA: `is_swap_stuck` is retired. Pre-M3-7 it compared
-// `config_dir/.credentials.json` (live mirror, then a credential reader) to
+// `<config_dir>/.credentials.json` (live mirror, then a credential reader) to
 // `credentials/N.json` (canonical) and rendered a `!` glyph in the statusline
 // when they diverged. Post-M3-7 the live mirror is no longer a credential
 // reader — handle dirs symlink `.credentials.json` to
@@ -621,7 +639,7 @@ mod tests {
             session_cost_usd: Some(0.1234),
             git: Some(GitStatus {
                 branch: "main".into(),
-                dirty: true,
+                dirty: Some(true),
             }),
             is_csq_terminal: true,
         };
@@ -878,7 +896,7 @@ mod tests {
         let ctx = StatuslineContext {
             git: Some(GitStatus {
                 branch: "main".into(),
-                dirty: false,
+                dirty: Some(false),
             }),
             ..Default::default()
         };

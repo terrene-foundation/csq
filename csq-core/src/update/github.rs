@@ -12,7 +12,7 @@
 //! unauthenticated — shared across every csq instance behind one egress IP and
 //! trivially exhausted at scale. Release-asset downloads (`releases/download/`)
 //! are CDN-served and not subject to that limit, so the whole flow scales to
-//! unlimited users. See [`GITHUB_LATEST_JSON`].
+//! unlimited users. See `GITHUB_LATEST_JSON`.
 //!
 //! ### Security
 //!
@@ -27,8 +27,15 @@
 //! - `os`   = `macos` | `linux` | `windows`
 //! - `arch` = `aarch64` | `x86_64`
 //!
-//! The `.sig` file for each binary is `csq-{os}-{arch}.sig` (no `.exe`
-//! suffix for either, even on Windows).
+//! The `.sig` file for each binary is `<binary-asset-name>.sig` — i.e. it is
+//! the FULL binary filename (including the `.exe` suffix on Windows) with
+//! `.sig` appended, never the bare platform stem. The release pipeline's
+//! `sign-release` binary (`csq-core/src/bin/sign-release.rs`) signs whatever
+//! file it is handed and writes `<input>.sig` verbatim; `release.yml` hands
+//! it the exact staged artifact name (`csq-windows-x86_64.exe` on Windows),
+//! so the published signature asset is `csq-windows-x86_64.exe.sig`, NOT
+//! `csq-windows-x86_64.sig`. macOS/Linux binaries carry no extension, so for
+//! those two platforms the two forms happen to coincide.
 
 use crate::http::FullResponse;
 use anyhow::{Context, Result};
@@ -98,7 +105,7 @@ struct LatestManifest {
 /// transport/parse failure or a non-2xx manifest fetch.
 ///
 /// **No GitHub REST API is used** — the manifest and the constructed asset
-/// URLs are all CDN-served release assets (see [`GITHUB_LATEST_JSON`]),
+/// URLs are all CDN-served release assets (see `GITHUB_LATEST_JSON`),
 /// immune to the 60/hour unauthenticated API rate limit. The download URLs
 /// are constructed from the manifest `version` + the deterministic release-
 /// asset naming, so no asset enumeration is needed; the actual download +
@@ -139,15 +146,32 @@ where
     // `v{version}` tag; `apply.rs` verifies + fails closed if any 404s.
     let platform_stem = current_platform_stem();
     let binary_name = binary_asset_name(&platform_stem);
-    let tag_base = format!("{RELEASE_DOWNLOAD_BASE}/v{latest_version}");
 
-    Ok(Some(UpdateInfo {
+    Ok(Some(build_update_info(latest_version, &binary_name)))
+}
+
+/// Builds the `UpdateInfo` asset URLs for a resolved version + binary asset
+/// name. Pulled out of `check_latest_version` as a pure function, parameterized
+/// by `binary_name` alone (never re-deriving a bare platform stem internally),
+/// so the platform-specific naming bug this guards against — the `.sig`
+/// asset name silently dropping Windows' `.exe` suffix — is testable with an
+/// explicit `binary_name` on ANY host, not only a genuine Windows CI runner.
+///
+/// The `.sig` name MUST be `<binary_name>.sig`: the release pipeline's
+/// `sign-release` (`csq-core/src/bin/sign-release.rs`) signs the EXACT
+/// staged artifact and writes `<input>.sig` verbatim, and `release.yml`
+/// stages the Windows CLI binary as `csq-windows-x86_64.exe` — so the
+/// published signature is `csq-windows-x86_64.exe.sig`, never the bare-stem
+/// `csq-windows-x86_64.sig`.
+fn build_update_info(latest_version: String, binary_name: &str) -> UpdateInfo {
+    let tag_base = format!("{RELEASE_DOWNLOAD_BASE}/v{latest_version}");
+    UpdateInfo {
         download_url: format!("{tag_base}/{binary_name}"),
-        signature_url: format!("{tag_base}/{platform_stem}.sig"),
+        signature_url: format!("{tag_base}/{binary_name}.sig"),
         checksum_url: format!("{tag_base}/SHA256SUMS"),
         html_url: format!("{RELEASE_TAG_BASE}/v{latest_version}"),
         version: latest_version,
-    }))
+    }
 }
 
 /// Returns the platform stem used in release asset names.
@@ -317,14 +341,42 @@ mod tests {
                 "https://github.com/terrene-foundation/csq/releases/download/v999.0.0/{binary}"
             )
         );
+        // The `.sig` name MUST track the full binary asset name (including
+        // `.exe` on Windows), never the bare platform stem — the release
+        // pipeline signs the exact staged artifact
+        // (`csq-core/src/bin/sign-release.rs` writes `<input>.sig`
+        // verbatim), and on Windows the staged artifact carries `.exe`.
         assert_eq!(
             info.signature_url,
             format!(
-                "https://github.com/terrene-foundation/csq/releases/download/v999.0.0/{stem}.sig"
+                "https://github.com/terrene-foundation/csq/releases/download/v999.0.0/{binary}.sig"
             )
         );
         assert!(info.checksum_url.ends_with("/v999.0.0/SHA256SUMS"));
         assert!(info.html_url.ends_with("/releases/tag/v999.0.0"));
+    }
+
+    /// Regression (Windows signature-URL mismatch): `build_update_info` is
+    /// exercised DIRECTLY with an explicit Windows-shaped `binary_name`, so
+    /// this reds on ANY host if the `.sig` formula regresses to a bare
+    /// platform stem — unlike the test above, which cannot distinguish the
+    /// two formulas on macOS/Linux because `binary_name == platform_stem`
+    /// there (no extension). Ground truth: `release.yml` stages the Windows
+    /// CLI binary as `csq-windows-x86_64.exe`, and `sign-release`
+    /// (`csq-core/src/bin/sign-release.rs`) writes `<input>.sig` over
+    /// whatever file it is handed — so the published signature asset is
+    /// `csq-windows-x86_64.exe.sig`.
+    #[test]
+    fn signature_url_keeps_the_exe_suffix_on_windows() {
+        let info = build_update_info("999.0.0".to_string(), "csq-windows-x86_64.exe");
+        assert_eq!(
+            info.signature_url,
+            "https://github.com/terrene-foundation/csq/releases/download/v999.0.0/csq-windows-x86_64.exe.sig"
+        );
+        assert_eq!(
+            info.download_url,
+            "https://github.com/terrene-foundation/csq/releases/download/v999.0.0/csq-windows-x86_64.exe"
+        );
     }
 
     /// The scaling guarantee (regression): every URL the checker emits is a

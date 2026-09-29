@@ -308,4 +308,283 @@ mod tests {
         assert!(debug.starts_with("ApiKey("));
         assert!(!debug.contains("abcdefghijklmnopqrstuv"));
     }
+
+    // ── Serializable token-holder surface (durable-instruments.md MUST-1/2) ──
+    //
+    // `AccessToken` and `RefreshToken`'s `Serialize` impls (above) deliberately
+    // emit the RAW secret — `Display`/`Debug` mask, `Serialize` does not, because
+    // the credential MUST round-trip byte-for-byte to
+    // `identities/<UUID>/credentials.json`. That asymmetry is intentional and is
+    // NOT what this test guards. What it guards: nothing at the type level stops
+    // a FUTURE struct that embeds one of these tokens and derives `Serialize`
+    // from emitting the raw secret into a log line, a telemetry payload, an
+    // error body, or an audit record — `redact_tokens` (security.md MUST-8)
+    // never sees it, because it never becomes a `String` the redactor can scan
+    // until the moment it has already left the process as JSON. `ApiKey` has no
+    // `Serialize` impl at all (verified: `grep -rn "for ApiKey" csq-core/src
+    // csq/src` finds only Clone/Debug/Display) and is correctly out of scope —
+    // its on-disk persistence goes through a separate plain-`String` field that
+    // `ApiKey` only wraps as a VIEW at the point of access (`providers/settings.rs`).
+
+    /// The known-legitimate credential-persistence chain: every type that (a)
+    /// derives `Serialize` and (b) holds an `AccessToken`/`RefreshToken` field
+    /// directly or transitively, established by manual audit
+    /// (`daemon-auth-resilience` zeroize-guard follow-up) and re-verified by
+    /// [`serializable_token_holder_surface_matches_known_legitimate_set`] on
+    /// every test run: `OAuthPayload` (the direct holder) -> wrapped by
+    /// `AnthropicCredentialFile` (`claude_ai_oauth: OAuthPayload`) -> wrapped by
+    /// the `CredentialFile` enum (`Anthropic(AnthropicCredentialFile)`). All
+    /// three MUST serialize the raw secret — this is the on-disk credential
+    /// file shape csq reads and writes at `identities/<UUID>/credentials.json`.
+    const KNOWN_LEGITIMATE_TOKEN_HOLDERS: &[&str] =
+        &["OAuthPayload", "AnthropicCredentialFile", "CredentialFile"];
+
+    /// Sanity floor for the "could not measure" outcome
+    /// (`durable-instruments.md` MUST-2's third outcome): a full scan of
+    /// `csq-core/src`'s PRODUCTION code (test modules stripped) declares several
+    /// hundred struct/enum types. A parser regression that stops matching
+    /// declarations would report a near-zero count instead of a real "no new
+    /// holders" result — this floor turns that silent failure into a loud one.
+    /// Measured at introduction: ~500-600 production declarations; 300 leaves
+    /// ample margin against normal codebase growth/shrinkage while still being
+    /// far above what a broken parser would find.
+    const MIN_EXPECTED_TYPE_COUNT: usize = 300;
+
+    /// Removes every `#[cfg(test)] mod ... { ... }` block from `content`
+    /// (brace-depth-tracked, so it survives nesting) — test fixtures MUST NOT
+    /// count as a production risk. Generalizes the single-suffix-module
+    /// `\nmod tests {` boundary this file's sibling `keychain.rs` uses in its
+    /// own self-scan tripwire (`no_bare_unbounded_output_call_in_this_file`) to
+    /// the general case needed here: many files, `#[cfg(test)]` anywhere.
+    fn strip_cfg_test_modules(content: &str) -> String {
+        let mut out = String::with_capacity(content.len());
+        let mut skipping = false;
+        let mut skip_depth: i32 = 0;
+        let mut saw_cfg_test = false;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if skipping {
+                skip_depth += line.matches('{').count() as i32;
+                skip_depth -= line.matches('}').count() as i32;
+                if skip_depth <= 0 {
+                    skipping = false;
+                }
+                continue;
+            }
+            if trimmed == "#[cfg(test)]" {
+                saw_cfg_test = true;
+                continue;
+            }
+            if saw_cfg_test {
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue; // allow stray attributes between #[cfg(test)] and `mod`
+                }
+                if trimmed.starts_with("mod ") {
+                    let opens = line.matches('{').count() as i32;
+                    let closes = line.matches('}').count() as i32;
+                    skip_depth = opens - closes;
+                    saw_cfg_test = false;
+                    if skip_depth > 0 {
+                        skipping = true;
+                    }
+                    continue;
+                }
+                saw_cfg_test = false; // not followed by `mod` — nothing to skip
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Scans every `.rs` file under `csq-core/src` (production code only —
+    /// [`strip_cfg_test_modules`] removes test modules first) and returns
+    /// `(holders, total_type_count)`: `holders` is every type name that (a) is
+    /// reachable, via zero or more "struct/variant embeds type" hops, from
+    /// `{AccessToken, RefreshToken}`, AND (b) derives or manually implements
+    /// `Serialize`. `total_type_count` is every struct/enum declaration found
+    /// (the [`MIN_EXPECTED_TYPE_COUNT`] sanity signal).
+    ///
+    /// Deliberately line-based, not a real Rust parser — matches this
+    /// codebase's existing self-scan-tripwire style (see
+    /// `keychain.rs::no_bare_unbounded_output_call_in_this_file`), which is
+    /// sufficient because rustfmt (CI-enforced) guarantees the brace-placement
+    /// conventions this scan relies on.
+    fn scan_serializable_token_holders() -> (std::collections::BTreeSet<String>, usize) {
+        use std::collections::{HashMap, HashSet};
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let src_root = std::path::PathBuf::from(manifest_dir).join("src");
+
+        let field_re = regex::Regex::new(
+            r"^(?:pub(?:\([^)]*\))?\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*(?:Option<|Vec<|Box<)*([A-Za-z_][A-Za-z0-9_]*)",
+        )
+        .expect("valid field regex");
+        let variant_re =
+            regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*(?:Box<)?([A-Za-z_][A-Za-z0-9_]*)")
+                .expect("valid variant regex");
+        let type_decl_re = regex::Regex::new(
+            r"^(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        )
+        .expect("valid type-decl regex");
+        let manual_impl_re =
+            regex::Regex::new(r"^impl(?:<[^>]*>)?\s+Serialize\s+for\s+([A-Za-z_][A-Za-z0-9_]*)")
+                .expect("valid manual-impl regex");
+
+        let mut holds: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut serialize_types: HashSet<String> = HashSet::new();
+        let mut total_types: usize = 0;
+
+        let mut stack: Vec<std::path::PathBuf> = vec![src_root];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(
+            files.len() > 20,
+            "could not measure — found only {} .rs files under csq-core/src \
+             (directory walk likely broken)",
+            files.len()
+        );
+
+        for path in files {
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let production = strip_cfg_test_modules(&content);
+
+            let mut pending_derive_serialize = false;
+            let mut current: Option<String> = None;
+            let mut current_start_depth: i32 = 0;
+            let mut depth: i32 = 0;
+
+            for line in production.lines() {
+                let trimmed = line.trim();
+
+                if let Some(caps) = manual_impl_re.captures(trimmed) {
+                    serialize_types.insert(caps[1].to_string());
+                }
+
+                if trimmed.starts_with("#[derive(") {
+                    if trimmed.contains("Serialize") {
+                        pending_derive_serialize = true;
+                    }
+                } else if current.is_none()
+                    && !trimmed.is_empty()
+                    && !trimmed.starts_with("//")
+                    && !trimmed.starts_with('#')
+                {
+                    if let Some(caps) = type_decl_re.captures(trimmed) {
+                        let name = caps[2].to_string();
+                        total_types += 1;
+                        if pending_derive_serialize {
+                            serialize_types.insert(name.clone());
+                        }
+                        current = Some(name);
+                        current_start_depth = depth;
+                    }
+                    pending_derive_serialize = false;
+                }
+
+                if let Some(name) = &current {
+                    if depth > current_start_depth {
+                        if let Some(caps) = field_re.captures(trimmed) {
+                            holds
+                                .entry(name.clone())
+                                .or_default()
+                                .insert(caps[1].to_string());
+                        } else if let Some(caps) = variant_re.captures(trimmed) {
+                            holds
+                                .entry(name.clone())
+                                .or_default()
+                                .insert(caps[1].to_string());
+                        }
+                    }
+                }
+
+                depth += trimmed.matches('{').count() as i32;
+                depth -= trimmed.matches('}').count() as i32;
+                if current.is_some() && depth <= current_start_depth {
+                    current = None;
+                }
+            }
+        }
+
+        let seed: HashSet<String> = ["AccessToken", "RefreshToken"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut reachable = seed.clone();
+        loop {
+            let mut added = false;
+            for (holder, held) in &holds {
+                if !reachable.contains(holder) && held.iter().any(|h| reachable.contains(h)) {
+                    reachable.insert(holder.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        let result: std::collections::BTreeSet<String> = reachable
+            .into_iter()
+            .filter(|t| serialize_types.contains(t) && t != "AccessToken" && t != "RefreshToken")
+            .collect();
+
+        (result, total_types)
+    }
+
+    /// The discriminating check (durable-instruments.md MUST-2 — three
+    /// outcomes, never a pass/fail binary): **holds** (the discovered
+    /// Serialize-deriving token-holder set is exactly
+    /// [`KNOWN_LEGITIMATE_TOKEN_HOLDERS`]) / **a new unaudited holder
+    /// appeared, or a known one vanished** (named in the panic message,
+    /// forcing a conscious decision) / **could not measure** (the scan found
+    /// suspiciously few types — [`MIN_EXPECTED_TYPE_COUNT`] — a parser
+    /// break, never silently read as "nothing found").
+    #[test]
+    fn serializable_token_holder_surface_matches_known_legitimate_set() {
+        let (found, total_types) = scan_serializable_token_holders();
+
+        assert!(
+            total_types >= MIN_EXPECTED_TYPE_COUNT,
+            "could not measure — the scan found only {total_types} struct/enum \
+             declarations in csq-core/src production code (expected >= \
+             {MIN_EXPECTED_TYPE_COUNT}); the parser likely broke — this is NOT \
+             evidence the token-holder set is empty"
+        );
+
+        let expected: std::collections::BTreeSet<String> = KNOWN_LEGITIMATE_TOKEN_HOLDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        if found != expected {
+            let extra: Vec<&String> = found.difference(&expected).collect();
+            let missing: Vec<&String> = expected.difference(&found).collect();
+            panic!(
+                "serializable token-holder surface drifted from the known-legitimate \
+                 set.\nNew unaudited Serialize-deriving type(s) holding \
+                 AccessToken/RefreshToken: {extra:?}\nKnown-legitimate type(s) no \
+                 longer found (renamed/removed?): {missing:?}\nIf a new type \
+                 genuinely needs to round-trip credentials to disk, add it to \
+                 KNOWN_LEGITIMATE_TOKEN_HOLDERS with a comment stating why. \
+                 Otherwise its Serialize derive/impl is the bug — see \
+                 credential-type-hygiene.md and security.md MUST-2."
+            );
+        }
+    }
 }

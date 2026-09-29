@@ -273,11 +273,17 @@ pub fn detect_stale_marker_binding(base_dir: &Path, slot: AccountNum) -> Option<
 /// for, so the sweep never runs. This mirrors the ordering
 /// `csq::desktop::commands::remove_account` already uses for the identical
 /// reason (`delete_api_key_from_vault` before `gemini_unbind`): vault
-/// delete precedes marker removal, and the marker is left in place on ANY
-/// vault-step failure (`guard-reader-writer-parity.md` MUST-2 — a
-/// destructive path proceeds only once "cannot complete" has been ruled
-/// out; here that means the vault entry stays findable for the next login
-/// attempt or an explicit `csq logout`, rather than being stranded).
+/// delete precedes marker removal, and for the modes that HAVE vault
+/// material (`ApiKey`) the marker is left in place on any vault-step
+/// failure (`guard-reader-writer-parity.md` MUST-2 — a destructive path
+/// proceeds only once "cannot complete" has been ruled out; here that
+/// means the vault entry stays findable for the next login attempt or an
+/// explicit `csq logout`, rather than being stranded). See
+/// `clear_stale_gemini_marker` (private to this module — not an intra-doc
+/// link: rustdoc warns "public documentation links to private item" when a
+/// PUBLIC item's doc links a private one, since the target has no page in
+/// generated public API docs) for why the vault is opened LAZILY, and for
+/// the disposition on a host where it cannot open at all (an internal ticket).
 ///
 /// Best-effort by design: a stale-marker cleanup failure MUST NOT block a
 /// successful OAuth login — the fresh credential is already written and
@@ -291,16 +297,7 @@ pub fn clear_detected_marker_binding(base_dir: &Path, slot: AccountNum, surface:
     // a caller passing an un-captured value — a no-op, not a panic, so a
     // programming error here can never turn into a login-time crash.
     match surface {
-        BoundSurface::Gemini => match crate::platform::secret::open_default_vault() {
-            Ok(vault) => clear_gemini_marker_with_vault(base_dir, slot, vault.as_ref()),
-            Err(e) => tracing::warn!(
-                account = slot.get(),
-                error_kind = "stale_gemini_vault_unavailable",
-                vault_error_kind = e.error_kind_tag(),
-                "oauth login: vault unavailable — stale Gemini marker left in place \
-                 so it stays findable (non-fatal)"
-            ),
-        },
+        BoundSurface::Gemini => clear_stale_gemini_marker(base_dir, slot),
         BoundSurface::Native(native_surface) => {
             match crate::providers::native::unbind(base_dir, slot, native_surface) {
                 Ok(()) => tracing::info!(
@@ -321,6 +318,94 @@ pub fn clear_detected_marker_binding(base_dir: &Path, slot: AccountNum, surface:
     }
 }
 
+/// Gemini arm of [`clear_detected_marker_binding`].
+///
+/// # The vault is opened LAZILY — only when a vault entry can exist (an internal ticket)
+///
+/// Of the three [`crate::providers::gemini::provisioning::AuthMode`]s only
+/// `ApiKey` stores material in our vault: `VertexSa`'s credential is the SA
+/// JSON file its marker points at, and `CodeAssistOAuth`'s tokens belong to
+/// gemini-cli at `~/.gemini/oauth_creds.json`. The auth MODE, meanwhile, is
+/// carried by the MARKER FILE — `read_binding` parses it with no vault
+/// involved, which is exactly how `delete_api_key_from_vault` classifies a
+/// slot before deciding whether to touch a vault at all.
+///
+/// So the vault is not a precondition for this clear. Opening it
+/// UNCONDITIONALLY made the whole arm unreachable wherever
+/// `open_default_vault()` fails — a bus-less Linux host with no D-Bus Secret
+/// Service (`platform/secret/linux.rs`) — INCLUDING for the `VertexSa` /
+/// `CodeAssistOAuth` slots that have no vault material to begin with. The
+/// login had already succeeded, the stale marker survived, and the slot
+/// stayed dual-bound: precisely the state an internal ticket exists to prevent. Reading
+/// the auth mode through the vault instead of through the marker that
+/// carries it is `guard-reader-writer-parity.md` MUST-1's narrow-accessor
+/// defect, and a guard that permits what it exists to prevent is inert.
+///
+/// # Disposition when the vault IS needed and IS unavailable (an internal ticket)
+///
+/// For `ApiKey` — and for a marker that will not parse, where vault material
+/// cannot be ruled out — an unopenable vault means the vault entry cannot be
+/// deleted. The marker is then LEFT IN PLACE and the slot stays dual-bound.
+/// This is the EXPLICIT accepted disposition, not an implicit default:
+/// `csq logout` gates its own vault sweep on `is_gemini_bound_slot`, so
+/// clearing the marker here would make that entry PERMANENTLY unfindable,
+/// and a stranded secret is irreversible where a dual-bind is recoverable
+/// (restore the backend, then re-login or `csq logout`). Per
+/// `guard-reader-writer-parity.md` MUST-2, a destructive path that cannot
+/// classify refuses rather than destroys.
+fn clear_stale_gemini_marker(base_dir: &Path, slot: AccountNum) {
+    let needs_vault = match crate::providers::gemini::provisioning::read_binding(base_dir, slot) {
+        Ok(binding) => matches!(
+            binding.auth,
+            crate::providers::gemini::provisioning::AuthMode::ApiKey
+        ),
+        // Unreadable or malformed marker: the auth mode is UNKNOWN, so vault
+        // material cannot be ruled out. Take the vault path — which attempts
+        // the best-effort delete `delete_api_key_from_vault` already performs
+        // for this case — and fail closed if the vault will not open.
+        Err(_) => true,
+    };
+
+    if !needs_vault {
+        // No vault entry can exist for this auth mode. Unbind directly, so a
+        // host whose vault cannot open still clears the stale marker and the
+        // dual-bind is prevented.
+        unbind_gemini_marker(base_dir, slot);
+        return;
+    }
+
+    match crate::platform::secret::open_default_vault() {
+        Ok(vault) => clear_gemini_marker_with_vault(base_dir, slot, vault.as_ref()),
+        Err(e) => tracing::warn!(
+            account = slot.get(),
+            error_kind = "stale_gemini_vault_unavailable",
+            vault_error_kind = e.error_kind_tag(),
+            "oauth login: vault unavailable — stale ApiKey-mode Gemini marker left \
+             in place so its vault entry stays findable; slot REMAINS DUAL-BOUND \
+             (non-fatal)"
+        ),
+    }
+}
+
+/// Removes the Gemini binding marker and logs the outcome. Shared by the
+/// vault-free path above (`VertexSa` / `CodeAssistOAuth`, where no vault step
+/// applies at all) and [`clear_gemini_marker_with_vault`]'s post-delete step,
+/// so both report through one fixed-vocabulary log shape.
+fn unbind_gemini_marker(base_dir: &Path, slot: AccountNum) {
+    match crate::providers::gemini::provisioning::unbind(base_dir, slot) {
+        Ok(()) => tracing::info!(
+            account = slot.get(),
+            "oauth login: removed stale Gemini binding marker"
+        ),
+        Err(e) => tracing::warn!(
+            account = slot.get(),
+            error_kind = "stale_gemini_marker_cleanup_failed",
+            provision_error_kind = e.error_kind_tag(),
+            "oauth login: could not remove stale Gemini binding marker (non-fatal)"
+        ),
+    }
+}
+
 /// Gemini marker-clear core: the vault entry is deleted BEFORE the marker,
 /// and the marker is left in place (fail-closed) on any vault-step failure
 /// — see [`clear_detected_marker_binding`]'s doc for why. Split out of
@@ -336,18 +421,7 @@ fn clear_gemini_marker_with_vault(
     vault: &dyn crate::platform::secret::Vault,
 ) {
     match crate::providers::gemini::provisioning::delete_api_key_from_vault(base_dir, slot, vault) {
-        Ok(()) => match crate::providers::gemini::provisioning::unbind(base_dir, slot) {
-            Ok(()) => tracing::info!(
-                account = slot.get(),
-                "oauth login: removed stale Gemini binding marker"
-            ),
-            Err(e) => tracing::warn!(
-                account = slot.get(),
-                error_kind = "stale_gemini_marker_cleanup_failed",
-                provision_error_kind = e.error_kind_tag(),
-                "oauth login: could not remove stale Gemini binding marker (non-fatal)"
-            ),
-        },
+        Ok(()) => unbind_gemini_marker(base_dir, slot),
         Err(e) => tracing::warn!(
             account = slot.get(),
             error_kind = "stale_gemini_vault_cleanup_failed",
@@ -650,6 +724,104 @@ mod tests {
             detect_bound_surface(dir.path(), slot(1)),
             None,
             "the Gemini marker must be gone after clear_detected_marker_binding"
+        );
+    }
+
+    // ── an internal ticket: the vault must be opened LAZILY, and only for ApiKey ────────
+    //
+    // `open_default_vault()` fails on a bus-less Linux host (no D-Bus Secret
+    // Service). Before the fix the Gemini arm opened it BEFORE reading the
+    // marker, so the clear was unreachable there for EVERY auth mode — and
+    // `VertexSa` / `CodeAssistOAuth` slots have no vault material at all, so
+    // the vault was never needed for them. The stale marker survived a
+    // successful login and the slot stayed dual-bound (an internal ticket's exact defect).
+
+    /// A `CSQ_SECRET_BACKEND` value `open_default_vault` REJECTS
+    /// (`is_known_override`). This is the one pin that reproduces the
+    /// vault-cannot-open branch on macOS and Windows too — their native
+    /// vaults always open, so `in-memory` (which the neighbouring tests pin)
+    /// cannot reproduce it anywhere off Linux. A `file` pin does not work
+    /// either: it is Linux-only and errors on macOS, while SUCCEEDING on the
+    /// very Linux hosts the arm is about.
+    const UNOPENABLE_BACKEND: &str = "csq-test-unopenable-backend";
+
+    #[test]
+    fn clear_removes_vault_free_gemini_marker_when_vault_cannot_open() {
+        use crate::platform::test_env::with_secret_backend;
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        // Both vault-free modes, planted through the REAL writer so the
+        // fixture is the shape production writes (`guard-reader-writer-parity.md`
+        // MUST-4).
+        gemini_write(
+            dir.path(),
+            slot(1),
+            &GeminiBinding::new(
+                AuthMode::VertexSa {
+                    path: PathBuf::from("/tmp/vertex-sa.json"),
+                },
+                "auto",
+            ),
+        )
+        .unwrap();
+        gemini_write(
+            dir.path(),
+            slot(2),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "auto"),
+        )
+        .unwrap();
+
+        for n in [1u16, 2] {
+            let detected = detect_stale_marker_binding(dir.path(), slot(n));
+            assert_eq!(detected, Some(BoundSurface::Gemini));
+            with_secret_backend(UNOPENABLE_BACKEND, || {
+                clear_detected_marker_binding(dir.path(), slot(n), detected.unwrap());
+            });
+        }
+
+        assert_eq!(
+            detect_bound_surface(dir.path(), slot(1)),
+            None,
+            "a VertexSa marker must be cleared even when the vault cannot open (an internal ticket) \
+             — its credential is the SA JSON, so the vault is not a precondition"
+        );
+        assert_eq!(
+            detect_bound_surface(dir.path(), slot(2)),
+            None,
+            "a CodeAssistOAuth marker must be cleared even when the vault cannot open (an internal ticket)"
+        );
+    }
+
+    #[test]
+    fn clear_leaves_api_key_marker_when_vault_cannot_open() {
+        // The EXPLICIT disposition for an internal ticket: an ApiKey slot's secret lives in
+        // the vault and is findable ONLY through the marker (`csq logout` gates
+        // its sweep on `is_gemini_bound_slot`), so on a host where the vault
+        // will not open the marker MUST survive. The slot stays dual-bound —
+        // recoverable by restoring the backend and re-logging-in or running
+        // `csq logout` — rather than stranding the secret, which is not
+        // (`guard-reader-writer-parity.md` MUST-2).
+        //
+        // NOTE: this is a CHARACTERIZATION pin, not the non-vacuity test —
+        // this behaviour is what the pre-fix code did too. The RED-before /
+        // GREEN-after evidence lives in the vault-free test above.
+        use crate::platform::test_env::with_secret_backend;
+
+        let dir = TempDir::new().unwrap();
+        plant_gemini(dir.path(), 1); // ApiKey-mode marker
+
+        let detected = detect_stale_marker_binding(dir.path(), slot(1));
+        assert_eq!(detected, Some(BoundSurface::Gemini));
+        with_secret_backend(UNOPENABLE_BACKEND, || {
+            clear_detected_marker_binding(dir.path(), slot(1), detected.unwrap());
+        });
+
+        assert_eq!(
+            detect_bound_surface(dir.path(), slot(1)),
+            Some(BoundSurface::Gemini),
+            "an ApiKey marker must SURVIVE when the vault cannot open — clearing it \
+             would strand the vault entry permanently (an internal ticket accepted disposition)"
         );
     }
 

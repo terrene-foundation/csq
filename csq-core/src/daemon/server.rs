@@ -140,13 +140,34 @@ pub struct RouterState {
     /// invariant). Cloned cheaply (every field is an `Arc`).
     pub gemini_consumer: GeminiConsumerState,
     /// Audit-chain health as determined at daemon startup by
-    /// `verify_chain`. Gates the audit subsystem:
-    /// - Anchor task skips anchoring when `!is_operational()`.
+    /// `verify_chain` — and possibly PROMOTED afterward by a bounded
+    /// background retry when startup produced `Unknown` (see
+    /// `crate::audit::health`'s module doc and
+    /// `csq/src/cli/commands/daemon.rs::spawn_audit_verify_retry`). Every
+    /// handler reads this through the shared lock, so a post-startup
+    /// promotion is visible on the very next request. Gates the audit
+    /// subsystem:
+    /// - Anchor task skips anchoring when `!is_operational()` (re-armed on
+    ///   promotion — see `spawn_audit_verify_retry`).
     /// - `POST /api/audit/record` rejects emits when `!is_operational()`.
     ///
     /// Other subsystems (token-refresh, usage-poller, IPC server itself)
     /// are NEVER gated on this — see spec 12 §12.13.5.
-    pub audit_health: crate::audit::AuditHealth,
+    pub audit_health: crate::audit::SharedAuditHealth,
+    /// Records the daemon's startup `verify_chain` call SKIPPED because
+    /// the chain exceeded the run's configured `record_limit` (the oldest
+    /// records, including possibly the genesis — `verify.rs`'s
+    /// tail-window behaviour). `0` means the daemon's own startup verify
+    /// covered the whole chain.
+    ///
+    /// Exposed via `GET /api/audit/health` alongside `audit_health` so
+    /// `csq doctor` can report the DAEMON's actual coverage instead of
+    /// recomputing a possibly-different answer with its own env-derived
+    /// `record_limit` (`diagnostic-surface-parity.md` MUST NOT Rule 4) —
+    /// `AuditHealth::Verified` is a unit variant and cannot carry this by
+    /// itself, the same reason `csq doctor`'s own local check carries it
+    /// as a sibling field rather than folding it into the enum.
+    pub audit_records_unverified: u64,
     /// an internal ticket — the interactive per-turn enforcement session registry
     /// (enterprise-only). Seeded at daemon startup by
     /// `crate::daemon::interactive_live::seed_registry`: a LIVE registry when the
@@ -223,6 +244,15 @@ pub struct HealthResponse {
 /// - `GET /api/login/:id` — initiate a paste-code OAuth flow
 /// - `POST /api/oauth/exchange` — submit the paste-code and exchange it
 /// - `POST /api/invalidate-cache` — clear all caches (M8-10c)
+/// - `GET /api/audit/health` — the daemon's own startup `AuditHealth` +
+///   `audit_records_unverified`, so `csq doctor` can read the same answer
+///   the daemon gates anchoring/emit on instead of recomputing locally
+///   (`diagnostic-surface-parity.md` MUST NOT Rule 4)
+///
+/// (This list predates several routes — `/api/slot-swap`,
+/// `/api/gemini/event`, `/api/audit/{record,anchor}`,
+/// `/api/provenance/anchor` — not re-enumerated here; see the `router`
+/// body below for the authoritative route table.)
 ///
 /// `#[cfg(feature = "enterprise")]` also mounts (spec 21 §21.7, an internal ticket/an internal ticket):
 /// - `POST /api/interactive/open` — open a new governed session → `OpenSessionResponse`
@@ -247,9 +277,11 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/oauth/exchange", post(oauth_exchange_handler))
         .route("/api/invalidate-cache", post(invalidate_cache_handler))
         .route("/api/slot-swap", post(slot_swap_handler))
+        .route("/api/harvest-account", post(harvest_account_handler))
         .route("/api/gemini/event", post(gemini_event_handler))
         .route("/api/audit/record", post(audit_record_handler))
         .route("/api/audit/anchor", post(audit_anchor_handler))
+        .route("/api/audit/health", get(audit_health_handler))
         .route("/api/provenance/anchor", post(provenance_anchor_handler));
 
     // an internal ticket/an internal ticket — interactive per-turn enforcement routes (enterprise-only,
@@ -305,6 +337,37 @@ async fn health_handler() -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
+    })
+}
+
+/// Body of `GET /api/audit/health` — the daemon's OWN startup audit-verify
+/// result, read directly from [`RouterState`] (no re-verification, no
+/// re-derivation). This is the wire type `diagnostic-surface-parity.md`
+/// MUST NOT Rule 4 exists to make possible: a diagnostic surface
+/// (`csq doctor`) that reads the SAME channel the daemon gates
+/// anchoring/emit on, rather than recomputing a possibly-different answer
+/// with its own `record_limit` config.
+///
+/// Also `Deserialize` (see [`crate::audit::AuditHealth`]'s own doc for why)
+/// so the CLIENT side (`csq doctor`) can parse the daemon's response body
+/// back into this same type via `daemon::http_get_unix`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditHealthResponse {
+    /// Mirrors [`RouterState::audit_health`] verbatim.
+    #[serde(flatten)]
+    pub health: crate::audit::AuditHealth,
+    /// Mirrors [`RouterState::audit_records_unverified`] verbatim.
+    pub records_unverified: u64,
+}
+
+async fn audit_health_handler(State(state): State<RouterState>) -> Json<AuditHealthResponse> {
+    Json(AuditHealthResponse {
+        health: state
+            .audit_health
+            .read()
+            .expect("audit health lock poisoned")
+            .clone(),
+        records_unverified: state.audit_records_unverified,
     })
 }
 
@@ -1079,6 +1142,1075 @@ async fn slot_swap_handler(
     Json(SlotSwapResponse { invalidated: true })
 }
 
+/// Request body for `POST /api/harvest-account`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HarvestAccountRequest {
+    pub account: u16,
+}
+
+/// Response body for `POST /api/harvest-account` — `outcome` is one of
+/// `"adopted"`, `"nothing_to_harvest"`, `"ownership_unknown"`, `"busy"`
+/// (fixed vocabulary; carries no token material).
+#[derive(Debug, Clone, Serialize)]
+pub struct HarvestAccountResponse {
+    pub outcome: &'static str,
+}
+
+/// POST /api/harvest-account — round 7c D3: run the custodian's existing
+/// harvest→validate→adopt path (`custodian::reconcile_account`) for `account`
+/// SYNCHRONOUSLY, on request, rather than waiting for the next refresh tick.
+///
+/// This scans EVERY live handle dir bound to `account` — including the
+/// caller's own — which is simpler than a per-dir harvest route and correct:
+/// `csq swap`/`auto_rotate`'s D4/D5 callers ask this BEFORE taking their
+/// per-dir swap lock, so there is no harvest-vs-lock ordering hazard here
+/// (the lock only needs to exclude a CONCURRENT daemon custodian tick, which
+/// `reconcile_account`'s own per-account write path already serializes
+/// against via the store lock it takes internally).
+///
+/// Blocking (subprocess `security` reads + a synchronous validation HTTP
+/// call) — dispatched via `spawn_blocking` so it does not tie up the async
+/// runtime's worker threads, mirroring every other daemon route that does
+/// real I/O.
+async fn harvest_account_handler(
+    State(state): State<RouterState>,
+    Json(req): Json<HarvestAccountRequest>,
+) -> Result<Json<HarvestAccountResponse>, (StatusCode, String)> {
+    let account = AccountNum::try_from(req.account)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+    let Some(uuid) =
+        crate::accounts::profiles::resolve_slot_to_uuid(&state.base_dir, account.get())
+    else {
+        // No identity-store UUID mapping — a pure-legacy slot has no
+        // harvest binding key at all (`reconcile_account`'s doc: "the
+        // harvest binding key"), so there is nothing this route can do.
+        return Ok(Json(HarvestAccountResponse {
+            outcome: "nothing_to_harvest",
+        }));
+    };
+    let base_dir = state.base_dir.as_ref().clone();
+    let uuid_s = uuid.to_string();
+    let http_get: crate::daemon::usage_poller::HttpGetFn =
+        std::sync::Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+            crate::http::get_bearer_node(url, token, headers)
+        });
+    harvest_account_reconcile_and_respond(
+        base_dir,
+        account,
+        uuid_s,
+        http_get,
+        harvest_gate::real_reconcile(),
+        &harvest_gate::ip_rate_limit_gate(),
+    )
+    .await
+}
+
+/// The part of [`harvest_account_handler`] downstream of account/UUID
+/// resolution, with the [`harvest_gate::ReconcileFn`] and
+/// [`harvest_gate::IpRateLimitGate`] taken as parameters rather than hardcoded
+/// — the test seam for the `Err(e)` (`JoinError`/panic) arm below, which no
+/// test previously exercised. Production always calls this with
+/// [`harvest_gate::real_reconcile`] and the process-wide
+/// [`harvest_gate::ip_rate_limit_gate`] (exactly as the inlined call used to);
+/// tests pass a reconcile closure that panics and a fresh
+/// [`harvest_gate::new_ip_rate_limit_gate`] so the panic path is reachable
+/// without a real keychain or network call.
+async fn harvest_account_reconcile_and_respond(
+    base_dir: PathBuf,
+    account: AccountNum,
+    uuid_s: String,
+    http_get: crate::daemon::usage_poller::HttpGetFn,
+    reconcile: harvest_gate::ReconcileFn,
+    gate: &harvest_gate::IpRateLimitGate,
+) -> Result<Json<HarvestAccountResponse>, (StatusCode, String)> {
+    // C-F5 (`keychain-fix-r8.md`): coordinated through `harvest_gate` —
+    // concurrent callers for the SAME account join the in-flight call
+    // rather than each starting their own; the gate is also where the
+    // refresher shares its own RateLimited observations, so an on-demand
+    // harvest during the refresher's cooldown returns `busy` with no HTTP.
+    let result = harvest_gate::run_with(base_dir, account, uuid_s, http_get, reconcile, gate).await;
+    match result {
+        Ok(harvest_gate::GatedResult::Ran(outcome)) => Ok(Json(HarvestAccountResponse {
+            outcome: map_reconcile_outcome(outcome),
+        })),
+        Ok(harvest_gate::GatedResult::Busy) => {
+            // NIT (`keychain-fix-r8.md`): the handler previously logged
+            // `error_kind` ONLY on the JoinError arm below — the busy/
+            // rate-limited path is a normal, expected outcome (not a
+            // panic), but it is still useful telemetry, so it gets its own
+            // fixed tag at DEBUG rather than staying silent.
+            tracing::debug!(
+                account = account.get(),
+                error_kind = "harvest_account_busy",
+                "harvest-account: rate-limited or too-soon; returning busy with no HTTP call"
+            );
+            Ok(Json(HarvestAccountResponse { outcome: "busy" }))
+        }
+        Err(e) => {
+            // `keychain-fix-r10.md` S-L-2: a JoinError's Display can carry
+            // the panic's own message (tokio includes it when the payload
+            // downcasts to `String`/`&str`) — not opaque; redact before
+            // logging, same as the refresher's own JoinError sites.
+            tracing::warn!(
+                error = %crate::error::redact_tokens(&e.to_string()),
+                error_kind = "harvest_account_task_panicked",
+                panicked = e.is_panic(),
+                "harvest-account task panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "harvest failed".to_string(),
+            ))
+        }
+    }
+}
+
+/// Crate-visible entrypoint into [`harvest_gate`]'s shared, IP-wide
+/// rate-limit gate (D-F6, `keychain-fix-r9.md`) — a thin convenience wrapper
+/// around the process-wide singleton for callers that always want THAT gate,
+/// never an injected one. `refresher.rs` calls this to FEED an observed 429
+/// into the shared gate, and calls [`harvest_gate_is_rate_limited`] to
+/// HONOUR a 429 observed elsewhere before making its own call.
+///
+/// `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: `harvest_gate`
+/// itself is now `pub(crate)` (no longer private to this module), so
+/// `auto_rotate.rs`'s `tick_with_deps` and `daemon::custodian`'s
+/// `adopt_single_candidate_before_delete_with_gate` call
+/// [`harvest_gate::gate_mark_rate_limited`]/[`harvest_gate::gate_is_rate_limited`]
+/// DIRECTLY against an explicit, injectable `IpRateLimitGate` parameter
+/// (production passes [`harvest_gate::ip_rate_limit_gate`], the SAME
+/// singleton this wrapper reaches — tests pass a fresh one) — mirroring
+/// [`run_with`]'s own split, rather than going through this wrapper. Sync —
+/// see [`harvest_gate::mark_rate_limited_from_refresher`]'s doc for why no
+/// `.await` (and no `blocking_lock`) is needed here.
+pub(crate) fn harvest_gate_mark_rate_limited(account: AccountNum) {
+    harvest_gate::mark_rate_limited_from_refresher(account);
+}
+
+/// Crate-visible entrypoint into [`harvest_gate`]'s shared, IP-wide
+/// rate-limit gate (D-F6) — the read half of
+/// [`harvest_gate_mark_rate_limited`]. `true` iff a 429 observed on ANY
+/// account, by ANY of the FOUR production surfaces that share this gate —
+/// this on-demand harvest route (`run_with`), the refresher's own custodian
+/// call, auto-rotate's opportunistic harvest, or the dead-handle-dir
+/// reaper / pending-clear retry queue's single-candidate adopt
+/// (`daemon::custodian::adopt_single_candidate_before_delete`) — is still
+/// within its cooldown window.
+pub(crate) fn harvest_gate_is_rate_limited() -> bool {
+    harvest_gate::is_rate_limited()
+}
+
+/// C-F5 (`keychain-fix-r8.md`): per-account coordination for
+/// `harvest_account_handler` — single-flight (a concurrent request joins
+/// the in-flight call rather than launching a second one), a rate-limited
+/// gate shared with the refresher (`refresher.rs`'s own custodian call), and
+/// a small minimum interval between two on-demand harvests for the same
+/// account.
+///
+/// Module-static rather than a [`RouterState`] field: `RouterState` is
+/// constructed by EXHAUSTIVE struct literals in four call sites outside this
+/// module (`daemon/detect.rs`, `daemon/server_windows.rs`,
+/// `csq/src/cli/commands/daemon.rs`, `csq/src/desktop/daemon_supervisor.rs`)
+/// — every one would need a new field threaded through for a
+/// `RouterState`-resident version of this state, and there is exactly ONE
+/// daemon process per machine, so a process-wide static carries the same
+/// semantics with none of that coordination cost.
+///
+/// `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: `pub(crate)`
+/// (rather than private) so `daemon::auto_rotate`'s `tick_with_deps` and
+/// `daemon::custodian`'s `adopt_single_candidate_before_delete` can take
+/// [`harvest_gate::IpRateLimitGate`] as an explicit, injectable parameter —
+/// mirroring [`run_with`]'s own production-singleton-vs-fresh-gate split —
+/// rather than being hardwired to the crate-visible
+/// [`harvest_gate_is_rate_limited`]/[`harvest_gate_mark_rate_limited`]
+/// wrappers, which read/write the process-wide singleton unconditionally
+/// and are UNSAFE to call from a test (see [`ip_rate_limit_gate`]'s own doc:
+/// shared with every other test in this binary for the gate's 600s
+/// cooldown).
+pub(crate) mod harvest_gate {
+    use crate::daemon::custodian::ReconcileOutcome;
+    use crate::daemon::usage_poller::HttpGetFn;
+    use crate::types::AccountNum;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// Minimum spacing between two on-demand harvests for the SAME
+    /// account. `reconcile_account` does a keychain `security` subprocess
+    /// read plus (when a candidate exists) a live validation HTTPS call —
+    /// hammering it faster than this does not surface a fresher token (the
+    /// refresher itself only reconciles every 5 minutes) and only spends
+    /// more of the same per-IP Cloudflare budget the refresher's own
+    /// backoff exists to protect. Typical case: an account with no pending
+    /// harvest and no recent call pays only the reconcile's own cost
+    /// (usually a fraction of a second — see `client::HARVEST_TIMEOUT`'s
+    /// doc for the WORST case, which this constant is not sized against).
+    const MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// How long a `RateLimited` observation — from THIS route or from the
+    /// refresher's own custodian call — gates further on-demand harvests
+    /// for the account. Mirrors the refresher's base `FAILURE_COOLDOWN`
+    /// (`refresher.rs`) so the two surfaces agree on how long a 429 against
+    /// this account's validation endpoint should be respected.
+    const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
+
+    #[derive(Default)]
+    struct AccountState {
+        last_completed_at: Option<Instant>,
+        last_outcome: Option<ReconcileOutcome>,
+        /// `keychain-fix-r9.md` S-L-1: `Some(started_at)` while a reconcile
+        /// is running for this account — set BEFORE `spawn_blocking`, and
+        /// cleared INSIDE that spawned task (never by the awaiting caller's
+        /// own continuation). See [`AccountGate`]'s doc for why.
+        in_flight_since: Option<Instant>,
+    }
+
+    /// S-L-1: the per-account single-flight mutex PLUS the notification
+    /// primitive that lets a concurrent caller JOIN an in-flight reconcile
+    /// without busy-polling. Bundled together (rather than a second
+    /// process-wide map keyed by account) so `state_for` hands out one
+    /// `Arc` per account covering both.
+    ///
+    /// **Why the prior design lost single-flight state on a client
+    /// disconnect.** The PRIOR `run_with` held the per-account
+    /// `tokio::sync::Mutex` guard across the ENTIRE `spawn_blocking(...)
+    /// .await?` — that was how a second concurrent caller "joined": it
+    /// blocked trying to acquire the SAME guard. But an axum handler future
+    /// is dropped the instant its client disconnects, and dropping the
+    /// future drops every local it owns, INCLUDING that guard — releasing
+    /// the per-account lock immediately, well before the underlying
+    /// `spawn_blocking` task (which keeps running independently; dropping a
+    /// `JoinHandle` does not cancel it) actually finishes. The final state
+    /// write (`guard.last_completed_at = ...`) lived in the CALLER's own
+    /// continuation after that `.await?` — code that, for a dropped future,
+    /// never runs. A second request arriving in that window found the lock
+    /// free and `last_completed_at`/`last_outcome` untouched from this
+    /// attempt, and launched an entirely redundant SECOND reconcile — the
+    /// exact duplicate-live-network-call single-flight exists to prevent.
+    ///
+    /// **The fix.** The per-account lock is now held only for the quick,
+    /// synchronous state CHECK/MARK before spawning (see `run_with`) — never
+    /// across the blocking reconcile itself — so dropping the caller's
+    /// future cannot strand it. `in_flight_since` is set before spawning and
+    /// is the signal a concurrent caller joins on; the SPAWNED TASK (which
+    /// is not tied to the caller future's lifetime) does the final state
+    /// write and calls [`tokio::sync::Notify::notify_waiters`] on `notify`,
+    /// guaranteed to run to completion even if every caller who ever awaited
+    /// it has since disconnected.
+    struct AccountGate {
+        state: AsyncMutex<AccountState>,
+        notify: tokio::sync::Notify,
+    }
+
+    static PER_ACCOUNT: OnceLock<StdMutex<HashMap<u16, Arc<AccountGate>>>> = OnceLock::new();
+
+    fn state_for(account: u16) -> Arc<AccountGate> {
+        let map = PER_ACCOUNT.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(guard.entry(account).or_insert_with(|| {
+            Arc::new(AccountGate {
+                state: AsyncMutex::new(AccountState::default()),
+                notify: tokio::sync::Notify::new(),
+            })
+        }))
+    }
+
+    /// `keychain-fix-r9.md` D-F6: Anthropic's `/api/oauth/profile` 429 is
+    /// IP-wide (Cloudflare's per-IP throttle), never per-account — a 429
+    /// validating account 3's token means account 7's validate call would
+    /// 429 too. `AccountState`'s PRIOR per-account `rate_limited_until`
+    /// field (removed above) modeled a per-account limit that does not
+    /// exist, which let every OTHER account's on-demand harvest keep
+    /// hammering an endpoint already known to be throttling this daemon's
+    /// IP. This shared (never per-account) cooldown is fed by every surface
+    /// that can observe a 429 here — this route's own call
+    /// ([`run_with`]), the refresher's own custodian call
+    /// (`refresher.rs`'s `tick`, via [`super::harvest_gate_mark_rate_limited`]),
+    /// and auto-rotate's opportunistic harvest (`auto_rotate.rs`'s `tick`,
+    /// via the same wrapper) — and honoured by all three before making a
+    /// validate call.
+    ///
+    /// A plain `std::sync::Mutex`, not the per-account map's
+    /// `tokio::sync::Mutex`: the critical section is a single
+    /// `Option<Instant>` read/write, cheap enough to lock synchronously
+    /// from EITHER an async context (the route, the refresher) or a
+    /// genuinely synchronous one (`auto_rotate::tick`, which runs on a
+    /// blocking OS thread and cannot `.await` at all) without ever needing
+    /// `blocking_lock` — sidestepping the whole bug class that `blocking_lock`
+    /// on a `tokio::sync::Mutex` from a runtime worker created (round 9,
+    /// S-C-1 / D-F1).
+    pub(crate) type IpRateLimitGate = Arc<StdMutex<Option<Instant>>>;
+
+    pub(crate) fn new_ip_rate_limit_gate() -> IpRateLimitGate {
+        Arc::new(StdMutex::new(None))
+    }
+
+    static IP_RATE_LIMIT_GATE: OnceLock<IpRateLimitGate> = OnceLock::new();
+
+    /// The ONE process-wide gate every PRODUCTION surface shares — the same
+    /// "exactly one daemon process per machine" reasoning the module doc
+    /// above already gives for [`PER_ACCOUNT`]. Tests MUST NOT call this: it
+    /// is shared with every OTHER test in this binary, and a truly global
+    /// (not per-account-keyed) scalar has no per-test key to avoid
+    /// collisions with — construct a fresh [`new_ip_rate_limit_gate`]
+    /// instead, exactly as [`run_with`]'s own tests do.
+    pub(crate) fn ip_rate_limit_gate() -> IpRateLimitGate {
+        Arc::clone(IP_RATE_LIMIT_GATE.get_or_init(new_ip_rate_limit_gate))
+    }
+
+    /// True iff a 429 observed on ANY account, from ANY of the three
+    /// surfaces above, is still within its cooldown window. Pure over the
+    /// injected gate: unit-testable with a fresh gate and zero risk of
+    /// cross-test races.
+    pub(crate) fn gate_is_rate_limited(gate: &IpRateLimitGate) -> bool {
+        let guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(*guard, Some(until) if Instant::now() < until)
+    }
+
+    /// Records a 429 observed anywhere against the shared cooldown.
+    pub(crate) fn gate_mark_rate_limited(gate: &IpRateLimitGate) {
+        let mut guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Instant::now() + RATE_LIMIT_COOLDOWN);
+    }
+
+    /// The two shapes a gated call can return: it actually ran the
+    /// custodian (`Ran`), or it was suppressed entirely — rate-limited or
+    /// too soon after the last call (`Busy`, mapped to the wire outcome
+    /// `"busy"`, same vocabulary [`super::map_reconcile_outcome`] already
+    /// uses for `SkippedUnknown`/`RateLimited`/`NotAdopted`).
+    pub(super) enum GatedResult {
+        Ran(ReconcileOutcome),
+        Busy,
+    }
+
+    /// Injectable seam for the actual reconcile call (Transport Injection
+    /// Pattern — see the daemon-architecture skill's table, and
+    /// `daemon::auto_rotate`'s `ReconcileAccountFn`, the same pattern
+    /// applied to the SAME underlying call). Production passes
+    /// [`real_reconcile`]; tests pass a call-counting closure so the
+    /// single-flight/min-interval/rate-limit coordination is directly
+    /// testable without a live keychain or network call.
+    pub(super) type ReconcileFn = std::sync::Arc<
+        dyn Fn(&std::path::Path, AccountNum, &str, &HttpGetFn) -> ReconcileOutcome + Send + Sync,
+    >;
+
+    /// `pub(super)`, not private: [`super::harvest_account_reconcile_and_respond`]
+    /// (the parent module's test seam for the panic/`JoinError` arm) needs to
+    /// pass this SAME production reconcile fn when a test wants everything
+    /// EXCEPT the reconcile call itself to be real — no test in this crate
+    /// currently does that, but the visibility is the minimal seam
+    /// (`user-path-verification.md`-style: least surface, not "make it all
+    /// public").
+    pub(super) fn real_reconcile() -> ReconcileFn {
+        std::sync::Arc::new(crate::daemon::custodian::reconcile_account)
+    }
+
+    /// Runs `custodian::reconcile_account` for `account`, coordinated
+    /// through the per-account gate. See the module doc for what each
+    /// coordination axis buys.
+    pub(super) async fn run_with(
+        base_dir: PathBuf,
+        account: AccountNum,
+        uuid: String,
+        http_get: HttpGetFn,
+        reconcile: ReconcileFn,
+        gate: &IpRateLimitGate,
+    ) -> Result<GatedResult, tokio::task::JoinError> {
+        let request_start = Instant::now();
+
+        // D-F6: the shared IP-wide gate is checked FIRST, before ever taking
+        // the per-account lock below — a 429 observed against ANY account
+        // (by this route, the refresher, or auto-rotate) means this account's
+        // call would 429 too, so there is nothing account-specific left to
+        // decide.
+        if gate_is_rate_limited(gate) {
+            return Ok(GatedResult::Busy);
+        }
+
+        let acc_gate = state_for(account.get());
+
+        // S-L-1: join loop. The per-account lock is held ONLY for this
+        // quick synchronous check-and-mark — never across the blocking
+        // reconcile below (see `AccountGate`'s doc for why that matters).
+        // `notified()` is created BEFORE re-locking on each iteration
+        // (tokio's documented race-free pattern: a notification fired
+        // between our check and the `.await` below is still caught, because
+        // the `Notified` future already registered interest at creation).
+        loop {
+            // `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: re-check
+            // the shared gate on EVERY iteration, not just before the loop.
+            // A caller that joined the `notified.await` wait below can sleep
+            // through a 429 observed by a DIFFERENT account's `run_with` (or
+            // by the refresher/auto-rotate) while it waits — the pre-loop
+            // check above only catches a 429 that landed before this call
+            // started. Without this re-check, a request that starts clean,
+            // waits out an in-flight reconcile, and wakes up AFTER the gate
+            // was marked mid-wait would still proceed to spawn a fresh
+            // reconcile against an endpoint already known to be throttling
+            // this daemon's IP.
+            if gate_is_rate_limited(gate) {
+                return Ok(GatedResult::Busy);
+            }
+
+            let notified = acc_gate.notify.notified();
+            let mut guard = acc_gate.state.lock().await;
+
+            if let Some(completed_at) = guard.last_completed_at {
+                // A call that COMPLETED after this request started waiting
+                // is the in-flight call this request joined — reuse its
+                // outcome rather than reconciling again.
+                if completed_at >= request_start {
+                    let outcome = guard
+                        .last_outcome
+                        .expect("last_completed_at implies last_outcome is set");
+                    return Ok(GatedResult::Ran(outcome));
+                }
+                // Minimum interval: a call that completed BEFORE this
+                // request started, but too recently, is throttled rather
+                // than re-run.
+                if completed_at.elapsed() < MIN_INTERVAL {
+                    return Ok(GatedResult::Busy);
+                }
+            }
+
+            if guard.in_flight_since.is_some() {
+                // Someone else's reconcile is running RIGHT NOW (possibly
+                // one whose ORIGINAL caller has since disconnected — S-L-1:
+                // that caller's future being dropped does not affect this
+                // one). Wait for it to finish and loop to re-check, rather
+                // than busy-polling.
+                drop(guard);
+                notified.await;
+                continue;
+            }
+
+            // No one in flight, nothing recent enough to reuse — this
+            // caller starts the reconcile. Mark in-flight BEFORE spawning,
+            // then release the lock: it must NOT be held across the
+            // blocking call below.
+            guard.in_flight_since = Some(Instant::now());
+            break;
+        }
+
+        let acc_gate_for_task = Arc::clone(&acc_gate);
+        let gate_for_task = Arc::clone(gate);
+        let outcome = tokio::task::spawn_blocking(move || {
+            // S-L-1: `catch_unwind` so the in-flight marker and the notify
+            // are ALWAYS cleared/fired — success or panic — never left
+            // clearing to a caller continuation that a disconnect can
+            // prevent from ever running. A stuck `in_flight_since` would
+            // wedge every future caller for this account permanently (the
+            // join loop above would `notified().await` forever, since
+            // nothing would ever call `notify_waiters` again).
+            let reconcile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reconcile(&base_dir, account, &uuid, &http_get)
+            }));
+            {
+                // Genuine OS thread (spawn_blocking), never a tokio runtime
+                // worker — `blocking_lock` is the correct, safe primitive
+                // here (contrast the ASYNC-context misuse this same round
+                // fixed in `mark_rate_limited_from_refresher`, D-F1).
+                let mut guard = acc_gate_for_task.state.blocking_lock();
+                guard.in_flight_since = None;
+                if let Ok(outcome) = &reconcile_result {
+                    guard.last_completed_at = Some(Instant::now());
+                    guard.last_outcome = Some(*outcome);
+                    if matches!(outcome, ReconcileOutcome::RateLimited) {
+                        gate_mark_rate_limited(&gate_for_task);
+                    }
+                }
+            }
+            acc_gate_for_task.notify.notify_waiters();
+            match reconcile_result {
+                Ok(outcome) => outcome,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        })
+        .await?;
+
+        Ok(GatedResult::Ran(outcome))
+    }
+
+    /// Called by the refresher (`refresher.rs`) whenever ITS OWN custodian
+    /// call for `account` comes back `RateLimited` — marks the SAME shared,
+    /// IP-wide gate [`run_with`] reads (D-F6), so an on-demand harvest, a
+    /// later refresher tick, a later auto-rotate tick, or the reaper/retry
+    /// queue's single-candidate adopt during this cooldown window all
+    /// return `busy`/skip with no further HTTP call against an endpoint
+    /// already known to be throttling this daemon's IP.
+    ///
+    /// `keychain-fix-r10.md` item 2: auto-rotate and the reaper/retry queue
+    /// no longer route through this function — they call
+    /// [`gate_mark_rate_limited`] directly against an injected
+    /// [`IpRateLimitGate`] (production: [`ip_rate_limit_gate`], the SAME
+    /// singleton this function marks), so their own tests can inject a
+    /// fresh gate instead of mutating process-wide state shared with every
+    /// other test in this binary.
+    ///
+    /// Sync, not async: this is a plain `std::sync::Mutex` critical section
+    /// (see [`IpRateLimitGate`]'s doc), so it needs no `.await` and is safe
+    /// to call from EITHER an async context (the refresher, after it has
+    /// already `.await`-ed the custodian's own `spawn_blocking` JoinHandle)
+    /// or a genuinely synchronous one (`auto_rotate::tick`, which cannot
+    /// `.await` at all). The PRIOR implementation locked a per-account
+    /// `tokio::sync::Mutex` with `blocking_lock`, which panics with "Cannot
+    /// block the current thread from within a runtime" when called from a
+    /// tokio worker thread — exactly the refresher's own call shape,
+    /// silently killing the refresher's `run_loop` task and stopping ALL
+    /// token refresh with no further trace (round 9, S-C-1 / D-F1). Moving
+    /// this state onto a `std::sync::Mutex` instead removes the whole
+    /// blocking-lock-on-a-worker footgun class rather than merely working
+    /// around the one call site that hit it. See `run_tick_supervised` in
+    /// `refresher.rs` for the independent backstop that now also survives a
+    /// panic anywhere on the tick call graph.
+    ///
+    /// `account` is accepted (rather than a bare `()`) purely for the
+    /// caller-identifying log line below — the effect itself is IP-wide, not
+    /// account-scoped.
+    pub(crate) fn mark_rate_limited_from_refresher(account: AccountNum) {
+        gate_mark_rate_limited(&ip_rate_limit_gate());
+        tracing::debug!(
+            account = account.get(),
+            "shared IP-wide rate-limit gate marked (D-F6)"
+        );
+    }
+
+    /// True iff the shared IP-wide gate (D-F6) is currently within its
+    /// cooldown window, from ANY observation on ANY account. Consulted by
+    /// the refresher (`refresher.rs`, via [`harvest_gate_is_rate_limited`])
+    /// before making its own opportunistic custodian call. `keychain-fix-r10.md`
+    /// item 2: auto-rotate (`auto_rotate.rs`) and the reaper/retry queue's
+    /// single-candidate adopt (`daemon::custodian`) consult the SAME
+    /// singleton too, but via an injected [`IpRateLimitGate`] parameter
+    /// (production: [`ip_rate_limit_gate`]) and [`gate_is_rate_limited`]
+    /// directly, not this function — so a 429 observed on any of the four
+    /// surfaces stops the others from immediately re-hitting the same
+    /// throttled endpoint.
+    pub(crate) fn is_rate_limited() -> bool {
+        gate_is_rate_limited(&ip_rate_limit_gate())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Every test picks a UNIQUE account number — `PER_ACCOUNT` is a
+        /// process-wide static, so two tests sharing an account number
+        /// would observe each other's gate state under `cargo test`'s
+        /// default parallel test execution. The D-F6 IP-wide rate-limit
+        /// gate has no per-account key at all, so every test below
+        /// constructs its OWN [`new_ip_rate_limit_gate`] via
+        /// [`fresh_gate`] rather than touching [`ip_rate_limit_gate`]'s
+        /// process-wide singleton — that singleton is reserved for
+        /// production wiring ONLY (see its own doc, and the note at the
+        /// bottom of this module explaining why NO test here touches it:
+        /// `refresher.rs`'s `tick` reads the same singleton on every
+        /// invocation, including every refresher test in this process).
+        fn fresh_gate() -> IpRateLimitGate {
+            new_ip_rate_limit_gate()
+        }
+
+        fn noop_http_get() -> HttpGetFn {
+            Arc::new(|_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+                Err("unused: the injected reconcile never calls it".to_string())
+            })
+        }
+
+        fn counting_reconcile(
+            counter: Arc<AtomicUsize>,
+            outcome: ReconcileOutcome,
+            delay: Duration,
+        ) -> ReconcileFn {
+            Arc::new(move |_base, _account, _uuid, _http_get| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Forces the two concurrent callers below to overlap: the
+                // SECOND call's `request_start` must be captured (and it
+                // must reach the point of trying to acquire the gate's
+                // lock) WHILE the first call's reconcile is still running,
+                // or the "joined an in-flight call" branch is never
+                // exercised — the two calls would simply run sequentially,
+                // each doing its own reconcile, and the test would pass for
+                // the wrong reason (`instrument-discipline.md` MUST-2).
+                std::thread::sleep(delay);
+                outcome
+            })
+        }
+
+        /// C-F5 (`keychain-fix-r8.md`): two concurrent `run_with` calls for
+        /// the SAME account must result in exactly ONE reconcile call — the
+        /// second joins the in-flight call rather than launching its own.
+        ///
+        /// RED: reverting to "call reconcile unconditionally, never check
+        /// `last_completed_at`" makes `calls.load(..)` come back `2`
+        /// instead of the required `1`.
+        #[tokio::test]
+        async fn concurrent_calls_for_same_account_join_into_one_reconcile() {
+            let account = AccountNum::try_from(981u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reconcile = counting_reconcile(
+                Arc::clone(&calls),
+                ReconcileOutcome::NoCandidates,
+                Duration::from_millis(80),
+            );
+
+            let base = PathBuf::from("/nonexistent/fixture-base");
+            let gate = fresh_gate();
+            let (r1, r2) = tokio::join!(
+                run_with(
+                    base.clone(),
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    Arc::clone(&reconcile),
+                    &gate,
+                ),
+                async {
+                    // Give the first call time to acquire the gate lock
+                    // and enter its (slow, 80ms) reconcile before this one
+                    // starts trying to acquire it too.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    run_with(
+                        base.clone(),
+                        account,
+                        "uuid-fixture".to_string(),
+                        noop_http_get(),
+                        reconcile,
+                        &gate,
+                    )
+                    .await
+                }
+            );
+            assert!(matches!(
+                r1,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert!(matches!(
+                r2,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "exactly one reconcile call should have run for the two concurrent callers"
+            );
+        }
+
+        /// S-L-1: a dropped CALLER future (the axum-handler analogue of a
+        /// client disconnecting mid-request) must NOT lose the in-flight
+        /// marker or prevent the underlying reconcile from finishing and
+        /// recording its outcome. Proven end-to-end: abort the first
+        /// caller's task while its reconcile is provably still running
+        /// (blocked on a channel this test controls, not a sleep — an
+        /// ordering proof, not a timing guess), unblock it, then show a
+        /// SECOND caller for the same account joins the abandoned call's
+        /// result via the notify path rather than launching a duplicate
+        /// reconcile.
+        ///
+        /// RED: reverting `run_with` to hold the per-account guard across
+        /// the `spawn_blocking(...).await?` (the pre-S-L-1 shape) makes the
+        /// second caller below launch its OWN reconcile —
+        /// `calls.load(..)` comes back `2`, not `1` — because dropping the
+        /// first caller's task releases that guard immediately, well before
+        /// the still-running blocking task ever writes `last_completed_at`.
+        #[tokio::test]
+        async fn dropped_caller_future_does_not_lose_the_in_flight_marker() {
+            let account = AccountNum::try_from(996u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+            let unblock_rx = Arc::new(std::sync::Mutex::new(Some(unblock_rx)));
+            // Signals "the reconcile closure has actually started (and is
+            // now blocked on `unblock_rx`)" — awaited below so the abort is
+            // an ORDERING PROOF, not a timing guess
+            // (`instrument-discipline.md` MUST-2): a sleep-based or
+            // yield-count-based version would pass identically whether or
+            // not the closure had genuinely started before the abort.
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+            let reconcile: ReconcileFn = {
+                let calls = Arc::clone(&calls);
+                let unblock_rx = Arc::clone(&unblock_rx);
+                let started_tx = Arc::clone(&started_tx);
+                Arc::new(
+                    move |_base: &std::path::Path,
+                          _account: AccountNum,
+                          _uuid: &str,
+                          _http_get: &HttpGetFn| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if let Some(tx) = started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        // Block until the test explicitly releases us.
+                        if let Some(rx) = unblock_rx.lock().unwrap().take() {
+                            let _ = rx.recv();
+                        }
+                        ReconcileOutcome::NoCandidates
+                    },
+                )
+            };
+            let gate = fresh_gate();
+            let base = PathBuf::from("/nonexistent/fixture-base");
+
+            // Drive the first caller on its OWN task, then abort that task —
+            // simulating the axum handler future being dropped mid-request.
+            let gate_for_first = Arc::clone(&gate);
+            let base_for_first = base.clone();
+            let reconcile_for_first = Arc::clone(&reconcile);
+            let first_task = tokio::spawn(async move {
+                run_with(
+                    base_for_first,
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    reconcile_for_first,
+                    &gate_for_first,
+                )
+                .await
+            });
+            // Deterministically wait for proof the closure is running (and
+            // therefore blocked in it, not merely "probably" so) before
+            // aborting — `abort()` only takes effect at the task's next
+            // await point, which by now is provably the `spawn_blocking`
+            // JoinHandle `.await`, not an earlier one.
+            started_rx.await.unwrap();
+            first_task.abort();
+            let first_result = first_task.await;
+            assert!(
+                matches!(&first_result, Err(e) if e.is_cancelled()),
+                "the first caller's task must actually have been cancelled \
+                 (dropped mid-flight), or this test proves nothing"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the reconcile closure must have started (and be blocked in \
+                 it) before the abort — otherwise nothing was in flight to lose"
+            );
+
+            // Ordering proof, not a timing guess: poll the second caller
+            // ONCE while the abandoned reconcile is still provably blocked.
+            // That single poll stamps its `request_start`, finds
+            // `in_flight_since` set, registers its `Notified` and parks —
+            // so it has joined the in-flight call BEFORE that call can
+            // complete. Only then is the reconcile released. Previously the
+            // release came first, and the reconcile could finish before the
+            // second caller started; it then saw "completed just before I
+            // arrived" and returned `Busy` under MIN_INTERVAL (measured: 2
+            // of 300 runs on the host).
+            let mut second_fut = Box::pin(run_with(
+                base,
+                account,
+                "uuid-fixture".to_string(),
+                noop_http_get(),
+                reconcile,
+                &gate,
+            ));
+            let first_poll_ready = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(
+                    std::future::Future::poll(second_fut.as_mut(), cx).is_ready(),
+                )
+            })
+            .await;
+            assert!(
+                !first_poll_ready,
+                "the second caller must park on the in-flight call, not \
+                 finish (or start its own reconcile) on its first poll"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "joining the in-flight call must not have started a second reconcile"
+            );
+
+            // Release the blocked reconcile — it keeps running on its OWN
+            // spawn_blocking thread, independent of the aborted task above,
+            // records its outcome and wakes the parked second caller.
+            unblock_tx.send(()).unwrap();
+            let second = second_fut.await;
+            assert!(matches!(
+                second,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the second caller must NOT have triggered its own reconcile \
+                 call — it joins the first (abandoned-by-its-caller, but \
+                 still-running-to-completion) call's result"
+            );
+        }
+
+        /// `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: the gate is
+        /// re-checked on EVERY loop iteration, not just once before the loop
+        /// — a caller that JOINS an in-flight call (via `notified.await`)
+        /// must not proceed to reuse that call's outcome (or launch its own)
+        /// if the gate was marked WHILE it was waiting. Two calls for the
+        /// SAME account: the first (A) is spawned on its own task and blocks
+        /// mid-reconcile on a channel this test controls (an ordering proof,
+        /// per `instrument-discipline.md` MUST-2 — never a timing guess);
+        /// once A's reconcile is provably running (and therefore
+        /// `in_flight_since` is provably set), the second call (B) is
+        /// spawned and cooperatively yielded to until it has provably
+        /// entered the join wait (`notified.await`) — B's OWN reconcile
+        /// closure must NEVER run, so its only observable progress is via
+        /// the loop's pre-lock gate check, proven below by mutation. THEN,
+        /// and only then, the gate is marked and A is released.
+        ///
+        /// RED: reverting the loop-top `if gate_is_rate_limited(gate) {
+        /// return Ok(GatedResult::Busy) }` re-check (this round's fix) makes
+        /// B fall through to `last_completed_at >= request_start` once A
+        /// completes, returning `Ran(NoCandidates)` instead of the required
+        /// `Busy` — proceeding to reuse an outcome produced entirely AFTER
+        /// this daemon's IP was already known to be throttled.
+        #[tokio::test]
+        async fn run_with_re_checks_gate_after_joining_an_in_flight_call() {
+            let account = AccountNum::try_from(998u16).unwrap();
+            let base = PathBuf::from("/nonexistent/fixture-base");
+            let gate = fresh_gate();
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+            let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+            let unblock_rx = Arc::new(std::sync::Mutex::new(Some(unblock_rx)));
+            let reconcile_a: ReconcileFn = {
+                let started_tx = Arc::clone(&started_tx);
+                let unblock_rx = Arc::clone(&unblock_rx);
+                Arc::new(
+                    move |_base: &std::path::Path, _account, _uuid: &str, _http_get: &HttpGetFn| {
+                        if let Some(tx) = started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = unblock_rx.lock().unwrap().take() {
+                            let _ = rx.recv();
+                        }
+                        ReconcileOutcome::NoCandidates
+                    },
+                )
+            };
+
+            let gate_for_a = Arc::clone(&gate);
+            let base_for_a = base.clone();
+            let task_a = tokio::spawn(async move {
+                run_with(
+                    base_for_a,
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    reconcile_a,
+                    &gate_for_a,
+                )
+                .await
+            });
+
+            // A is provably running (and therefore in_flight_since is
+            // provably set) before B is even spawned.
+            started_rx.await.unwrap();
+
+            let gate_for_b = Arc::clone(&gate);
+            let base_for_b = base.clone();
+            let reconcile_b: ReconcileFn = Arc::new(
+                |_base: &std::path::Path, _account, _uuid: &str, _http_get: &HttpGetFn| {
+                    panic!(
+                        "B's own reconcile must never run — it must either join A's \
+                         result or (with the gate marked mid-wait) return Busy"
+                    );
+                },
+            );
+            let task_b = tokio::spawn(async move {
+                run_with(
+                    base_for_b,
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    reconcile_b,
+                    &gate_for_b,
+                )
+                .await
+            });
+
+            // Cooperatively yield so B's task actually runs up to its
+            // genuine pending await point (`notified.await` — A still holds
+            // `in_flight_since`, so B cannot take any other branch). This is
+            // a scheduler-fairness yield, not a wall-clock timing guess: B
+            // has nothing else to wait on except A's completion, which we
+            // have not yet permitted.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+
+            // Mark the gate WHILE B is still waiting, THEN release A.
+            gate_mark_rate_limited(&gate);
+            unblock_tx.send(()).unwrap();
+
+            let result_a = task_a.await.unwrap();
+            let result_b = task_b.await.unwrap();
+
+            assert!(matches!(
+                result_a,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert!(
+                matches!(result_b, Ok(GatedResult::Busy)),
+                "B must re-check the gate on waking from the join wait and \
+                 return Busy, not reuse A's outcome or launch its own reconcile"
+            );
+        }
+
+        /// C-F5/S-MEDIUM-2, D-F6: once a call comes back `RateLimited`, a
+        /// LATER call — for the SAME account, or ANY OTHER account, since
+        /// the gate is IP-wide (D-F6) — within the cooldown window must
+        /// return `Busy` WITHOUT invoking reconcile again: no further HTTP
+        /// validation call against an endpoint already known to be
+        /// throttling this daemon's IP.
+        #[tokio::test]
+        async fn rate_limited_outcome_gates_the_next_call_with_no_further_reconcile() {
+            let account = AccountNum::try_from(982u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reconcile = counting_reconcile(
+                Arc::clone(&calls),
+                ReconcileOutcome::RateLimited,
+                Duration::ZERO,
+            );
+            let base = PathBuf::from("/nonexistent/fixture-base");
+            let gate = fresh_gate();
+
+            let first = run_with(
+                base.clone(),
+                account,
+                "uuid-fixture".to_string(),
+                noop_http_get(),
+                Arc::clone(&reconcile),
+                &gate,
+            )
+            .await;
+            assert!(matches!(
+                first,
+                Ok(GatedResult::Ran(ReconcileOutcome::RateLimited))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // D-F6: a DIFFERENT account, same shared gate — must also see
+            // Busy, proving the cooldown is IP-wide and not keyed by
+            // account 982 specifically. 995, not 983 — 983 is used by
+            // `refresher_rate_limit_observation_gates_a_later_on_demand_call`
+            // below, and reusing it would let the two tests' PER_ACCOUNT
+            // single-flight/min-interval state collide under parallel
+            // execution.
+            let other_account = AccountNum::try_from(995u16).unwrap();
+            let second = run_with(
+                base,
+                other_account,
+                "uuid-fixture-2".to_string(),
+                noop_http_get(),
+                reconcile,
+                &gate,
+            )
+            .await;
+            assert!(
+                matches!(second, Ok(GatedResult::Busy)),
+                "a call within the RateLimited cooldown must return Busy"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the gated call must not have invoked reconcile a second time"
+            );
+        }
+
+        /// The refresher's OWN observation feeds the SAME shared, IP-wide
+        /// gate (D-F6) `run_with` reads — an on-demand harvest arriving
+        /// after the refresher's own custodian call was rate-limited must
+        /// also see `Busy`, with no reconcile call at all, for ANY account
+        /// (not just the one the refresher happened to observe the 429 on).
+        ///
+        /// Exercises [`gate_mark_rate_limited`] directly against a FRESH
+        /// injected gate rather than [`mark_rate_limited_from_refresher`]
+        /// (which always writes the process-wide [`ip_rate_limit_gate`]
+        /// singleton) — see [`fresh_gate`]'s doc for why: a truly global,
+        /// non-per-account-keyed scalar has no per-test isolation key, so
+        /// every test in this module other than the ONE dedicated
+        /// singleton-wiring test below stays off the real singleton
+        /// entirely. `gate_mark_rate_limited` IS
+        /// `mark_rate_limited_from_refresher`'s real body (the singleton
+        /// pass-through is a one-line, untested-by-design wrapper), so this
+        /// exercises the identical logic the production call path runs.
+        #[tokio::test]
+        async fn refresher_rate_limit_observation_gates_a_later_on_demand_call() {
+            let gate = fresh_gate();
+            // Mirrors the real caller: `refresher.rs`'s `tick` invokes
+            // `mark_rate_limited_from_refresher` directly from its own async
+            // body, AFTER it has already `.await`-ed the custodian's
+            // `spawn_blocking` JoinHandle — a tokio runtime worker, not a
+            // blocking OS thread. `auto_rotate.rs`'s `tick` invokes the SAME
+            // wrapper from a genuinely synchronous body (round 9, S-C-1 /
+            // D-F1 for the async-context bug this fixes; D-F6 for the
+            // IP-wide sharing this test exercises).
+            gate_mark_rate_limited(&gate);
+
+            let account = AccountNum::try_from(984u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reconcile = counting_reconcile(
+                Arc::clone(&calls),
+                ReconcileOutcome::NoCandidates,
+                Duration::ZERO,
+            );
+            let result = run_with(
+                PathBuf::from("/nonexistent/fixture-base"),
+                account,
+                "uuid-fixture".to_string(),
+                noop_http_get(),
+                reconcile,
+                &gate,
+            )
+            .await;
+            assert!(matches!(result, Ok(GatedResult::Busy)));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "no reconcile call may occur once the shared gate observation is set"
+            );
+        }
+
+        // No test in this file calls `mark_rate_limited_from_refresher` or
+        // `is_rate_limited` (the crate-visible pair that always writes/reads
+        // the process-wide `ip_rate_limit_gate()` singleton) — deliberately.
+        // `refresher.rs`'s `tick` reads that SAME singleton via
+        // `harvest_gate_is_rate_limited()` on every invocation, including
+        // every refresher test in this binary, and the mark's cooldown is
+        // 600s: a test that legitimately marked the real singleton would
+        // silently flip `rate_limited_this_tick` to `true` for every OTHER
+        // refresher test in this process for the next 10 minutes,
+        // reclassifying their expected `"refreshed"` outcomes as
+        // `"rate_limited"`. Both wrappers are one-line pass-throughs to
+        // `gate_mark_rate_limited`/`gate_is_rate_limited` via
+        // `ip_rate_limit_gate()` — already exercised, injected, above — so
+        // the wiring is visible by inspection and does not need a test that
+        // would introduce exactly the hazard this file's own design (fresh
+        // gate per test) exists to avoid.
+    }
+}
+
+/// Pure mapping from the custodian's internal [`ReconcileOutcome`] to the
+/// wire-level outcome string — factored out of [`harvest_account_handler`]
+/// so every variant is directly unit-testable without driving the full
+/// HTTP/custodian machinery (which needs live keychain harvesting).
+fn map_reconcile_outcome(outcome: crate::daemon::custodian::ReconcileOutcome) -> &'static str {
+    use crate::daemon::custodian::ReconcileOutcome;
+    match outcome {
+        ReconcileOutcome::Adopted => "adopted",
+        ReconcileOutcome::StoreFreshest
+        | ReconcileOutcome::NoCandidates
+        | ReconcileOutcome::NoEligibleCandidate
+        | ReconcileOutcome::AllDead => "nothing_to_harvest",
+        ReconcileOutcome::IdentityUnconfirmed => "ownership_unknown",
+        ReconcileOutcome::SkippedUnknown
+        | ReconcileOutcome::RateLimited
+        | ReconcileOutcome::NotAdopted => "busy",
+    }
+}
+
 /// POST /api/gemini/event — accepts a single [`EventEnvelope`] from
 /// csq-cli and applies it to `quota.json`.
 ///
@@ -1293,11 +2425,19 @@ async fn audit_record_handler(
     // Audit-subsystem fail-closed: reject new appends when the chain is broken.
     // Health check MUST run before body deserialization so Broken/Unknown health
     // returns 503 even when the request body would be malformed (422).
-    if !state.audit_health.is_operational() {
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
         tracing::warn!(
             error_kind = "audit_chain_broken",
             "audit emit rejected — chain is not operational (audit_health={:?})",
-            state.audit_health
+            state
+                .audit_health
+                .read()
+                .expect("audit health lock poisoned")
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1429,16 +2569,28 @@ async fn mcp_gate_handler(
 ) -> Result<StatusCode, (StatusCode, Json<McpGateError>)> {
     // Fail-closed: reject new appends when the chain is not operational. Runs
     // before deserialization so a broken chain returns 503 even for a bad body.
-    if !state.audit_health.is_operational() {
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
         // Proxy queues on this 503 too — mark the outbox maybe-dirty so that once
-        // the chain is repaired + the daemon restarts (which re-evaluates
-        // audit_health), the first confirmed-on-chain emit drains it event-driven
-        // (shard B). The periodic backstop is the belt-and-braces backstop.
+        // `audit_health` is re-armed operational — via a daemon restart OR an
+        // in-process bounded-retry promotion (`crate::audit::health`'s module
+        // doc; `spawn_audit_verify_retry`) — the first confirmed-on-chain emit
+        // drains it event-driven (shard B). The periodic backstop is the
+        // belt-and-braces backstop. No extra wiring is needed here: this gate
+        // re-reads the shared `audit_health` cell on every request, so
+        // promotion alone is sufficient to re-arm this path.
         crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
         tracing::warn!(
             error_kind = "audit_chain_broken",
             "mcp-gate emit rejected — chain is not operational (audit_health={:?})",
-            state.audit_health
+            state
+                .audit_health
+                .read()
+                .expect("audit health lock poisoned")
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1676,7 +2828,12 @@ async fn provenance_anchor_handler(
 
     // Audit-subsystem fail-closed: reject appends when chain is broken.
     // Health gate MUST run before body processing.
-    if !state.audit_health.is_operational() {
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
         tracing::warn!(
             error_kind = "seam_chain_broken",
             "provenance/anchor rejected — audit chain not operational"
@@ -1913,11 +3070,19 @@ async fn audit_anchor_handler(
     // Fail-closed: reject when the chain is not operational. Health check
     // runs BEFORE body deserialization so a broken chain returns 503 even
     // for a malformed body (mirrors audit_record_handler).
-    if !state.audit_health.is_operational() {
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
         tracing::warn!(
             error_kind = "audit_chain_broken",
             "audit anchor rejected — chain is not operational (audit_health={:?})",
-            state.audit_health
+            state
+                .audit_health
+                .read()
+                .expect("audit health lock poisoned")
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2455,7 +3620,7 @@ fn verify_peer_uid(_stream: &tokio::net::UnixStream) -> std::io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::daemon::test_socket_fixture::UnixSocketFixture;
 
     /// Builds a minimal RouterState for tests. Both caches start
     /// empty; base_dir points at the provided temp directory. The
@@ -2475,7 +3640,8 @@ mod tests {
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: GeminiConsumerState::default(),
-            audit_health: crate::audit::AuditHealth::Verified,
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
             anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
@@ -2491,7 +3657,8 @@ mod tests {
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: None,
             gemini_consumer: GeminiConsumerState::default(),
-            audit_health: crate::audit::AuditHealth::Verified,
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
             anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
@@ -2511,7 +3678,8 @@ mod tests {
             base_dir: Arc::new(base.to_path_buf()),
             oauth_store: Some(Arc::new(OAuthStateStore::new())),
             gemini_consumer: GeminiConsumerState::default(),
-            audit_health: crate::audit::AuditHealth::Verified,
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
             anchor_sink: None,
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
@@ -2520,8 +3688,8 @@ mod tests {
 
     #[tokio::test]
     async fn serve_binds_and_sets_permissions() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
 
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
         assert!(sock.exists(), "socket file should be created");
@@ -2543,8 +3711,8 @@ mod tests {
 
     #[tokio::test]
     async fn serve_cleans_stale_socket_file() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
 
         // Pretend a stale socket file exists (regular file, not a real socket).
         std::fs::write(&sock, "stale").unwrap();
@@ -2565,8 +3733,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
 
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
 
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
@@ -2614,8 +3782,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
 
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
 
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
@@ -2838,8 +4006,8 @@ mod tests {
             })
         };
 
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-it.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (state, key) = seeded_interactive_state(dir.path(), factory);
         let (handle, join) = serve(&sock, state).await.unwrap();
         let key_str = key.as_str().to_owned();
@@ -2887,8 +4055,8 @@ mod tests {
         // Probe via `POST /api/interactive/open` (no key required) — the route
         // returns 503 `interactive_unavailable` — NOT 404 (route is present) and
         // NOT a panic.
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-it-fc.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         let (status, body) = http_post_json(&sock, "/api/interactive/open", "{}").await;
@@ -2910,8 +4078,8 @@ mod tests {
     async fn interactive_route_options_fail_closed_503_on_empty_registry() {
         // Default `test_state` seeds an EMPTY registry (gate closed). The options
         // pre-open query is fail-closed identically to the keyed routes (an internal ticket).
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-it-opt-fc.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
@@ -2937,7 +4105,7 @@ mod tests {
         use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         // Gate: provider=claude with a minimal valid schema.
         let gate = serde_json::json!({
             "provider": "claude",
@@ -2975,7 +4143,7 @@ mod tests {
             interactive: Arc::new(reg),
             ..test_state(dir.path())
         };
-        let sock = dir.path().join("csq-it-opt.sock");
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, state).await.unwrap();
 
         let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
@@ -3008,8 +4176,8 @@ mod tests {
                 serde_json::json!("not an object"),
             )) as Box<dyn ProviderClient>]
         });
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-it-ab.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (state, key) = seeded_interactive_state(dir.path(), factory);
         let (handle, join) = serve(&sock, state).await.unwrap();
         let key_str = key.as_str().to_owned();
@@ -3049,8 +4217,8 @@ mod tests {
                 serde_json::json!({ "answer": "ok" }),
             )) as Box<dyn ProviderClient>]
         });
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-it-422.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (state, key) = seeded_interactive_state(dir.path(), factory);
         let (handle, join) = serve(&sock, state).await.unwrap();
         let key_str = key.as_str().to_owned();
@@ -3084,8 +4252,8 @@ mod tests {
                 serde_json::json!({ "answer": "ok" }),
             )) as Box<dyn ProviderClient>]
         });
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-it-missing-key.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (state, _key) = seeded_interactive_state(dir.path(), factory);
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3107,8 +4275,8 @@ mod tests {
 
     #[tokio::test]
     async fn accounts_route_returns_empty_list_on_empty_base() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/accounts").await;
@@ -3127,7 +4295,7 @@ mod tests {
         use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
 
         // Install a valid credentials/1.json so discover_anthropic picks it up.
         let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
@@ -3149,7 +4317,7 @@ mod tests {
         )
         .unwrap();
 
-        let sock = dir.path().join("csq-test.sock");
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/accounts").await;
@@ -3163,8 +4331,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_status_one_returns_404_when_absent() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
@@ -3177,8 +4345,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_status_one_rejects_out_of_range_id() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         // 0 is out of the 1..=999 range so AccountNum::try_from rejects it.
@@ -3194,7 +4362,7 @@ mod tests {
     async fn refresh_status_one_returns_cached_entry() {
         use crate::daemon::refresher::RefreshStatus;
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         let state = test_state(dir.path());
 
         // Pre-populate the cache with a known status.
@@ -3208,7 +4376,7 @@ mod tests {
             },
         );
 
-        let sock = dir.path().join("csq-test.sock");
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, state).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
@@ -3229,7 +4397,7 @@ mod tests {
         use crate::daemon::refresher::RefreshStatus;
         use crate::types::{AccessToken, RefreshToken};
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
 
         // Install account 1 and account 2, but only populate the
         // cache for account 1.
@@ -3265,7 +4433,7 @@ mod tests {
             },
         );
 
-        let sock = dir.path().join("csq-test.sock");
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, state).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/refresh-status").await;
@@ -3280,8 +4448,8 @@ mod tests {
 
     #[tokio::test]
     async fn login_route_returns_authorize_url() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         // Remember the store so we can verify the pending entry.
         let store = Arc::clone(state.oauth_store.as_ref().unwrap());
@@ -3310,8 +4478,8 @@ mod tests {
 
     #[tokio::test]
     async fn login_route_returns_503_when_oauth_unavailable() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state_no_oauth(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3325,8 +4493,8 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_exchange_rejects_empty_code() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         let req_body = r#"{"state":"anything","code":"   "}"#;
@@ -3340,8 +4508,8 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_exchange_rejects_unknown_state() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
 
         // Send a state token that was never issued — the consume
@@ -3357,8 +4525,8 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_exchange_returns_503_when_oauth_unavailable() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state_no_oauth(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3378,8 +4546,8 @@ mod tests {
         // verifies that the state_mismatch branch drops the entry
         // so a subsequent retry with the same token fails the
         // same way — i.e. state is single-use even on failure.
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let store = Arc::clone(state.oauth_store.as_ref().unwrap());
         let (handle, join) = serve(&sock, state).await.unwrap();
@@ -3461,7 +4629,7 @@ mod tests {
         use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         let num = AccountNum::try_from(1u16).unwrap();
         let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
@@ -3478,7 +4646,7 @@ mod tests {
         let cred_path = credentials::file::canonical_path(dir.path(), num);
         credentials::save(&cred_path, &creds).unwrap();
 
-        let sock = dir.path().join("csq-test.sock");
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3509,7 +4677,7 @@ mod tests {
         use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use crate::types::{AccessToken, RefreshToken};
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         let num = AccountNum::try_from(1u16).unwrap();
         let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
@@ -3527,7 +4695,7 @@ mod tests {
         credentials::save(&cred_path, &creds).unwrap();
 
         // Very short TTL so the test doesn't wait 5 seconds.
-        let sock = dir.path().join("csq-test.sock");
+        let sock = dir.socket_path();
         let state = test_state_with_discovery_ttl(dir.path(), std::time::Duration::from_millis(50));
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3563,7 +4731,7 @@ mod tests {
         use crate::daemon::refresher::RefreshStatus;
         use crate::types::{AccessToken, RefreshToken};
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         let num = AccountNum::try_from(1u16).unwrap();
         let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
@@ -3580,7 +4748,7 @@ mod tests {
         let cred_path = credentials::file::canonical_path(dir.path(), num);
         credentials::save(&cred_path, &creds).unwrap();
 
-        let sock = dir.path().join("csq-test.sock");
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         // Pre-populate the refresh-status cache so the aggregated
         // response has something to return.
@@ -3617,8 +4785,8 @@ mod tests {
 
     #[tokio::test]
     async fn login_route_rejects_out_of_range_id() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3637,8 +4805,8 @@ mod tests {
     #[tokio::test]
     async fn slot_swap_handler_rejects_from_equals_to() {
         // Arrange: start a live server.
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-test.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3656,13 +4824,263 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 
+    // ── round 7c D3 — POST /api/harvest-account ───────────────────────────
+
+    /// Every `ReconcileOutcome` variant maps to exactly one of the four wire
+    /// outcomes, and none maps outside that set.
+    #[test]
+    fn map_reconcile_outcome_covers_every_variant() {
+        use crate::daemon::custodian::ReconcileOutcome::*;
+        let cases = [
+            (Adopted, "adopted"),
+            (StoreFreshest, "nothing_to_harvest"),
+            (NoCandidates, "nothing_to_harvest"),
+            (NoEligibleCandidate, "nothing_to_harvest"),
+            (AllDead, "nothing_to_harvest"),
+            (IdentityUnconfirmed, "ownership_unknown"),
+            (SkippedUnknown, "busy"),
+            (RateLimited, "busy"),
+            (NotAdopted, "busy"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(
+                map_reconcile_outcome(variant),
+                expected,
+                "{variant:?} must map to {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn harvest_account_handler_rejects_invalid_account() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        // account 0 is out of AccountNum's 1..=999 range.
+        let (status, body) =
+            http_post_json(&sock, "/api/harvest-account", r#"{"account":0}"#).await;
+        assert!(status.contains("400"), "expected 400, got: {status}");
+        assert!(
+            body.contains("invalid account id"),
+            "expected the invalid-account message, got: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn harvest_account_handler_no_uuid_mapping_is_nothing_to_harvest() {
+        // A fresh base with no `profiles.json`/`by_slot` mapping at all —
+        // `resolve_slot_to_uuid` returns `None`, so there is no harvest
+        // binding key and the route must not attempt one.
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = serve(&sock, state).await.unwrap();
+
+        let (status, body) =
+            http_post_json(&sock, "/api/harvest-account", r#"{"account":5}"#).await;
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            body.contains("\"outcome\":\"nothing_to_harvest\""),
+            "expected nothing_to_harvest, got: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // Test-only structured capture for the harvest-account panic-arm test
+    // below. Mirrors `refresh::check`'s `BrokerCapture` (private to that
+    // module, so not reusable here) — never installs a global subscriber,
+    // reads RUST_LOG, emits the expected event itself, or captures
+    // credential payloads.
+    #[derive(Clone, Debug, Default)]
+    struct HarvestEvent {
+        level: Option<tracing::Level>,
+        error: Option<String>,
+        error_kind: Option<String>,
+        panicked: Option<bool>,
+    }
+
+    impl tracing::field::Visit for HarvestEvent {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "error_kind" {
+                self.error_kind = Some(value.to_owned());
+            }
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            if field.name() == "panicked" {
+                self.panicked = Some(value);
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            // `error = %redact_tokens(..)` dispatches through `record_debug`:
+            // `tracing::field::display()`'s `Value` impl calls
+            // `visitor.record_debug(key, self)` against a wrapper whose OWN
+            // `Debug` impl delegates to the inner value's `Display` — so
+            // `{value:?}` here reproduces the exact Display string, same as
+            // the crate's other capture (`BrokerEvent::record_debug` on
+            // `account`).
+            if field.name() == "error" {
+                self.error = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    struct HarvestCapture {
+        events: Arc<std::sync::Mutex<Vec<HarvestEvent>>>,
+        next_span: std::sync::atomic::AtomicU64,
+    }
+
+    impl tracing::Subscriber for HarvestCapture {
+        // Capture all levels: a WARN->DEBUG mutation on the panic arm must
+        // fail the level assertion, not be silently hidden by a filter.
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(
+                self.next_span
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut captured = HarvestEvent {
+                level: Some(*event.metadata().level()),
+                ..Default::default()
+            };
+            event.record(&mut captured);
+            self.events.lock().unwrap().push(captured);
+        }
+    }
+
+    /// Serialises this capture against every OTHER scoped-dispatcher capture
+    /// in the binary — see `refresh::check`'s `BROKER_CAPTURE_LOCK` doc for
+    /// why a dedicated lock is required: `with_default` also mutates
+    /// tracing's PROCESS-GLOBAL max-level filter, so two captures racing
+    /// across threads can transiently filter each other's events out.
+    static HARVEST_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_harvest_events<T>(run: impl FnOnce() -> T) -> (T, Vec<HarvestEvent>) {
+        let _capture_guard = HARVEST_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = HarvestCapture {
+            events: Arc::clone(&events),
+            next_span: std::sync::atomic::AtomicU64::new(1),
+        };
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    /// The `JoinError` arm of [`harvest_account_reconcile_and_respond`] (fed
+    /// by a panicking reconcile) had NO test before this one. Drives it
+    /// through the same seam [`harvest_gate::run_with`]'s own tests use — an
+    /// injected [`harvest_gate::ReconcileFn`] and a fresh
+    /// [`harvest_gate::new_ip_rate_limit_gate`] — and asserts both halves of
+    /// `keychain-fix-r10.md` S-L-2: the route answers 500 `"harvest failed"`,
+    /// and the WARN it logs carries `panicked: true` with the panic message
+    /// run through [`crate::error::redact_tokens`] — no token bytes reach
+    /// the log even though the panic payload contains one.
+    ///
+    /// RED (mutation 1 — status): change the `Err(e)` arm to
+    /// `Ok(Json(HarvestAccountResponse { outcome: "busy" }))` (return 200
+    /// instead of the 500) — `result.expect_err(..)` panics because the
+    /// call now returns `Ok`.
+    /// RED (mutation 2 — redaction): change `%crate::error::redact_tokens(&e.to_string())`
+    /// back to `%e` — the token-bytes assertion below fails because the
+    /// full panic message (with the token) reaches the captured `error`
+    /// field.
+    #[test]
+    fn harvest_account_handler_panic_arm_returns_500_and_redacts_panic_message() {
+        let account = AccountNum::try_from(842u16).unwrap();
+        let gate = harvest_gate::new_ip_rate_limit_gate();
+        let leaked_token = "sk-ant-oat01-PANICLEAKTESTTOKEN0123456789";
+        let panic_message = format!("upstream response echoed the token: {leaked_token}");
+        let panicking_reconcile: harvest_gate::ReconcileFn = {
+            let panic_message = panic_message.clone();
+            Arc::new(
+                move |_base: &Path,
+                      _account: AccountNum,
+                      _uuid: &str,
+                      _http_get: &crate::daemon::usage_poller::HttpGetFn| {
+                    panic!("{panic_message}");
+                },
+            )
+        };
+        let http_get: crate::daemon::usage_poller::HttpGetFn =
+            Arc::new(|_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+                Err("unused: the injected reconcile never calls it".to_string())
+            });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (result, events) = capture_harvest_events(|| {
+            rt.block_on(harvest_account_reconcile_and_respond(
+                PathBuf::from("/nonexistent/fixture-base"),
+                account,
+                "uuid-fixture".to_string(),
+                http_get,
+                panicking_reconcile,
+                &gate,
+            ))
+        });
+
+        let (status, body) = result.expect_err("a panicked reconcile must surface as an Err");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the JoinError arm must answer 500, got {status:?}"
+        );
+        assert_eq!(
+            body, "harvest failed",
+            "the JoinError arm's body is a fixed, token-free string"
+        );
+
+        let warn = events
+            .iter()
+            .find(|e| e.error_kind.as_deref() == Some("harvest_account_task_panicked"))
+            .expect("the panic arm must log error_kind=harvest_account_task_panicked");
+        assert_eq!(
+            warn.level,
+            Some(tracing::Level::WARN),
+            "the panic-arm log must be a WARN"
+        );
+        assert_eq!(
+            warn.panicked,
+            Some(true),
+            "JoinError::is_panic() must be true for a genuine panic"
+        );
+        let logged_error = warn.error.as_deref().unwrap_or("");
+        assert!(
+            !logged_error.is_empty(),
+            "the panic arm must log a non-empty `error` field"
+        );
+        assert!(
+            !logged_error.contains(leaked_token),
+            "token bytes leaked into the logged error field: {logged_error}"
+        );
+    }
+
     // ── Audit-health gate tests ──────────────────────────────────────────────
 
     /// `POST /api/audit/record` is accepted when `audit_health` is Verified.
     #[tokio::test]
     async fn audit_record_accepted_when_health_verified() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-audit-ok.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified by default
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3683,10 +5101,13 @@ mod tests {
     /// `POST /api/audit/record` is rejected (503) when `audit_health` is Broken.
     #[tokio::test]
     async fn audit_record_rejected_when_health_broken() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-audit-broken.sock");
-        let mut state = test_state(dir.path());
-        state.audit_health = crate::audit::AuditHealth::Broken {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Broken {
             error_kind: "audit_chain_broken_at_seq_0".to_string(),
             reason: "test broken chain".to_string(),
         };
@@ -3710,10 +5131,13 @@ mod tests {
     /// `POST /api/audit/record` is rejected (503) when `audit_health` is Unknown.
     #[tokio::test]
     async fn audit_record_rejected_when_health_unknown() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-audit-unknown.sock");
-        let mut state = test_state(dir.path());
-        state.audit_health = crate::audit::AuditHealth::Unknown {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Unknown {
             reason: "audit_verify_timeout".to_string(),
         };
         let (handle, join) = serve(&sock, state).await.unwrap();
@@ -3736,10 +5160,13 @@ mod tests {
     /// `POST /api/audit/record` is accepted when `audit_health` is Degraded.
     #[tokio::test]
     async fn audit_record_accepted_when_health_degraded() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-audit-degraded.sock");
-        let mut state = test_state(dir.path());
-        state.audit_health = crate::audit::AuditHealth::Degraded {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Degraded {
             gaps: vec![crate::audit::KeyGap {
                 key_id: format!("ed25519:{}", "a".repeat(64)),
                 first_seq: 0,
@@ -3769,8 +5196,8 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[tokio::test]
     async fn mcp_gate_accepted_when_health_verified() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-mcp-ok.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified by default
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3794,10 +5221,10 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[tokio::test]
     async fn mcp_gate_uninit_with_intent_returns_503_intent_queued() {
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         // Declare attestation intent BEFORE any decision (pre-init window).
         crate::audit::outbox_paths::set_attestation_intent(dir.path()).unwrap();
-        let sock = dir.path().join("csq-mcp-intent.sock");
+        let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified health, chain uninitialised.
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3823,12 +5250,12 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[tokio::test]
     async fn mcp_gate_uninit_without_intent_returns_204_drop() {
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         assert!(
             !crate::audit::outbox_paths::attestation_intent_is_set(dir.path()),
             "precondition: no intent marker"
         );
-        let sock = dir.path().join("csq-mcp-noint.sock");
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3860,7 +5287,7 @@ mod tests {
             Sha256Hex, SignedRecord,
         };
 
-        let dir = TempDir::new().unwrap();
+        let dir = UnixSocketFixture::new().unwrap();
         // Bootstrap a chain genesis so the decision has a real chain to land on.
         let boot = SignedRecord {
             schema_version: crate::audit::persist::AUDIT_SCHEMA_VERSION_TEST.to_string(),
@@ -3892,7 +5319,7 @@ mod tests {
         };
         write_record_v2(boot, Some(dir.path())).unwrap();
 
-        let sock = dir.path().join("csq-mcp-onchain.sock");
+        let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3922,10 +5349,13 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[tokio::test]
     async fn mcp_gate_rejected_when_health_broken() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-mcp-broken.sock");
-        let mut state = test_state(dir.path());
-        state.audit_health = crate::audit::AuditHealth::Broken {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Broken {
             error_kind: "audit_chain_broken_at_seq_0".to_string(),
             reason: "test broken chain".to_string(),
         };
@@ -3951,8 +5381,8 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[tokio::test]
     async fn mcp_gate_rejects_invalid_verdict() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-mcp-badverdict.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -3977,8 +5407,8 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[tokio::test]
     async fn mcp_gate_rejects_unknown_cli() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-mcp-badcli.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -4010,8 +5440,8 @@ mod tests {
     /// NOT return 503 or 500.
     #[tokio::test]
     async fn provenance_anchor_wellformed_unknown_version_parked_202() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-prov-anchor-parked.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -4049,8 +5479,8 @@ mod tests {
     /// so it succeeds without a signing key.
     #[tokio::test]
     async fn provenance_anchor_accepts_malformed_with_202() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-prov-anchor-malformed.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -4096,8 +5526,8 @@ mod tests {
     // initialised chain and active signing key.
     #[tokio::test]
     async fn audit_anchor_returns_200_and_anchor_payload_on_signed_chain() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-200.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         init_signed_chain(dir.path());
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();
@@ -4178,8 +5608,8 @@ mod tests {
     // read back from the sink receipt (NOT null, NOT client-computed).
     #[tokio::test]
     async fn anchor_proof_present_with_sink() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-proof.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         init_signed_chain(dir.path());
         let mut state = test_state(dir.path());
         state.anchor_sink = Some(std::sync::Arc::new(StructuredProofSink));
@@ -4254,8 +5684,8 @@ mod tests {
             }
         }
 
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-failopen.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         init_signed_chain(dir.path());
         let mut state = test_state(dir.path());
         state.anchor_sink = Some(std::sync::Arc::new(FailingSink));
@@ -4315,8 +5745,8 @@ mod tests {
             }
         }
 
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-unsound.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         init_signed_chain(dir.path());
         let mut state = test_state(dir.path());
         state.anchor_sink = Some(std::sync::Arc::new(UnsoundProofSink));
@@ -4418,8 +5848,8 @@ mod tests {
     // T2: 422 on malformed body — body is not a valid AuditRecord JSON.
     #[tokio::test]
     async fn audit_anchor_returns_422_on_malformed_body() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-422.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified by default
         let (handle, join) = serve(&sock, state).await.unwrap();
 
@@ -4441,10 +5871,13 @@ mod tests {
     // T3: 503 when audit_health is Broken — fail-closed gate fires before signing.
     #[tokio::test]
     async fn audit_anchor_returns_503_when_chain_health_broken() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-503-broken.sock");
-        let mut state = test_state(dir.path());
-        state.audit_health = crate::audit::AuditHealth::Broken {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Broken {
             error_kind: "anchor_chain_broken_test".to_string(),
             reason: "injected broken health for T3".to_string(),
         };
@@ -4469,8 +5902,8 @@ mod tests {
     // not set (pre-`csq audit init` state).
     #[tokio::test]
     async fn audit_anchor_returns_503_when_no_signing_key() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-503-nokey.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         // Seed a chain WITHOUT calling audit_init — no signing cutoff set.
         {
             use crate::audit::anchor::test_helpers::sample_signed_record;
@@ -4501,8 +5934,8 @@ mod tests {
     // non-empty hex string assigned by the daemon, not the CLI.
     #[tokio::test]
     async fn audit_anchor_canonical_hash_is_nonempty_hex_from_daemon() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("csq-anchor-hash.sock");
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
         init_signed_chain(dir.path());
         let state = test_state(dir.path());
         let (handle, join) = serve(&sock, state).await.unwrap();

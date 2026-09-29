@@ -64,6 +64,14 @@ tower.workspace = true
 # of the crypto stay portable, but `open_default_vault` refuses to route
 # there from non-Linux even when the env override is set.
 aes-gcm.workspace = true
+# `aes` is a TRANSITIVE dependency of `aes-gcm` (0.10.3 -> aes 0.8.4) that no
+# csq-core module imports by name — pinned here solely to activate its
+# `zeroize` feature (round-key-schedule scrub-on-drop for `Aes256`/`Aes128`;
+# see the workspace Cargo.toml's aes-gcm comment for the full rationale and
+# `audit::key_hierarchy::keys`'s compile-time assertion for the enforcement).
+# `aes-gcm` does not forward a "zeroize" feature to its own `aes` dependency,
+# so a direct pin is the only way to turn this on.
+aes.workspace = true
 argon2.workspace = true
 zeroize.workspace = true
 subtle.workspace = true
@@ -79,6 +87,12 @@ regex.workspace = true
 # readers continue using slot-keyed paths until Phase 2. See workspace
 # todo `M1-phase1-identity-coexistence.md` for the migration trajectory.
 uuid.workspace = true
+# `dirs`: the canonical cross-platform home-directory resolver, used by
+# `platform::home::home_dir()` so the shared resolver's production fallback
+# is byte-identical to what every csq call site already computed before the
+# consolidation (`rules/test-hermeticity.md` Windows hole fix). Non-optional:
+# production binaries need the fallback branch unconditionally.
+dirs.workspace = true
 # tempfile: used ONLY by `testing::identity_fixtures` (M1-7, test-utils feature).
 # Promoted from dev-dependency so external test consumers that enable
 # `csq-core/test-utils` can access the fixture surface. Optional — compiled

@@ -68,7 +68,7 @@
 //! key is wiped on `Drop` via `zeroize`.
 
 use super::{SecretError, SlotKey, Vault};
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 use crate::types::AccountNum;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -539,19 +539,15 @@ fn write_file(path: &Path, file: &VaultFile) -> Result<(), SecretError> {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
     })?;
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate `std::fs::write` + `secure_file` pair
+    // would leave open for this encrypted-vault-bearing tmp file.
     let tmp = unique_tmp_path(path);
-    if let Err(e) = std::fs::write(&tmp, &json) {
+    if let Err(e) = write_new_private(&tmp, &json) {
         let _ = std::fs::remove_file(&tmp);
         return Err(SecretError::Io {
             path: tmp,
-            source: e,
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(SecretError::Io {
-            path: tmp,
-            source: std::io::Error::other(format!("secure_file: {e}")),
+            source: std::io::Error::other(format!("write: {e}")),
         });
     }
     if let Err(e) = atomic_replace(&tmp, path) {

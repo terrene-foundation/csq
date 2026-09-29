@@ -1,0 +1,42 @@
+{
+  "edition": "enterprise",
+  "features": {
+    "exec": {
+      "providers_routable": ["claude", "gemini", "codex"]
+    }
+  },
+  "id": "corr-id-2",
+  "ok": true,
+  "ops": ["exec.v1", "capabilities.v1", "verify.v1"],
+  "providers": [
+    {
+      "binary": "claude-cli",
+      "default_model": "opus",
+      "id": "claude",
+      "kind": "wrapped",
+      "login": {
+        "flow": "browser_subprocess",
+        "headless_drivable": false,
+        "instructions": "run `csq login <slot>` from a machine with a reachable local browser"
+      },
+      "name": "Claude",
+      "surface": "claude-code"
+    }
+  ],
+  "schema": "csq.capabilities.v1",
+  "sdk": {
+    "capabilities": [
+      {
+        "id": "authoring_session.v1",
+        "schema": "csq.authoring_session.v1"
+      }
+    ],
+    "crate": "csq-sdk",
+    "version": "2.19.0"
+  },
+  "tool": {
+    "edition": "enterprise",
+    "name": "csq",
+    "version": "2.19.0"
+  }
+}

@@ -222,7 +222,7 @@ where
 /// 5. Re-reads canonical inside the lock to absorb a refresh another
 ///    process may have just landed (mirrors `broker_check`'s
 ///    re-read-inside-lock guard against ping-pong).
-/// 6. Calls [`http_codex::refresh_with_http_meta`] with the injected
+/// 6. Calls `http_codex::refresh_with_http_meta` with the injected
 ///    transport. The transport returns body + Date header so we can
 ///    emit `clock_skew_detected` per INV-P01.
 /// 7. On `code: "token_expired"` / `"refresh_token_reused"` →
@@ -252,7 +252,7 @@ pub fn broker_codex_check<F>(
     http_post: F,
 ) -> Result<BrokerResult, CsqError>
 where
-    F: FnOnce(&str, &str) -> Result<(Vec<u8>, Option<String>), String>,
+    F: FnOnce(&str, &str) -> Result<crate::http::NodeHttpResponse, String>,
 {
     use crate::providers::catalog::Surface;
 
@@ -972,10 +972,15 @@ mod tests {
 
         let calls = Arc::new(AtomicU32::new(0));
         let calls_c = Arc::clone(&calls);
-        let mock = move |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            calls_c.fetch_add(1, Ordering::SeqCst);
-            Ok((b"{}".to_vec(), None))
-        };
+        let mock =
+            move |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::http::NodeHttpResponse {
+                    status: 200,
+                    body: b"{}".to_vec(),
+                    date: None,
+                })
+            };
 
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
         assert!(matches!(result, BrokerResult::Valid));
@@ -1004,8 +1009,12 @@ mod tests {
         sentinel::set_broker_failed(dir.path(), acc, "codex_token_invalidated").unwrap();
         assert!(sentinel::is_broker_failed(dir.path(), acc));
 
-        let mock = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((b"{}".to_vec(), None))
+        let mock = |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+            Ok(crate::http::NodeHttpResponse {
+                status: 200,
+                body: b"{}".to_vec(),
+                date: None,
+            })
         };
 
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
@@ -1032,12 +1041,28 @@ mod tests {
         let body = format!(
             r#"{{"access_token":"{new_at}","refresh_token":"rt_new","id_token":"{new_at}","expires_in":3600}}"#
         );
-        let mock = move |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((
-                body.clone().into_bytes(),
-                Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
-            ))
-        };
+        // NO `Date` header, deliberately. This test is about the tokens the
+        // refresh WRITES, and it asserts nothing about the server clock — but it
+        // used to send `Mon, 01 Jan 2024 00:00:00 GMT`, which was roughly "now"
+        // when it was written and has since decayed into ~1.7 YEARS of drift.
+        // That silently turned a normal-refresh fixture into one that fires the
+        // clock-skew `warn!` on every run, with no subscriber installed to see
+        // it — a wall-clock time-bomb of exactly the shape `testing.md` MUST
+        // Rule 1 forbids, and one that gets worse every year it is left alone.
+        //
+        // `None` states the intent directly: no server date, so no skew check.
+        // The Date-bearing paths are covered where they belong — a skewed date
+        // in `broker_codex_check_clock_skew_emits_warn_but_succeeds` and a
+        // missing/invalid one in
+        // `broker_codex_check_missing_or_invalid_date_emits_no_clock_skew_warn`.
+        let mock =
+            move |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                Ok(crate::http::NodeHttpResponse {
+                    status: 200,
+                    body: body.clone().into_bytes(),
+                    date: None,
+                })
+            };
 
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
         assert!(matches!(result, BrokerResult::Refreshed));
@@ -1070,8 +1095,12 @@ mod tests {
         let exp = now_secs_test().saturating_sub(60); // already expired
         let acc = install_codex_account(dir.path(), 13, exp, Some("rt_dead"));
 
-        let mock = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((br#"{"error":{"code":"token_expired"}}"#.to_vec(), None))
+        let mock = |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+            Ok(crate::http::NodeHttpResponse {
+                status: 401,
+                body: br#"{"error":{"code":"token_expired"}}"#.to_vec(),
+                date: None,
+            })
         };
 
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
@@ -1102,11 +1131,12 @@ mod tests {
         let exp = now_secs_test().saturating_sub(60);
         let acc = install_codex_account(dir.path(), 12, exp, Some("rt_invalidated"));
 
-        let mock = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((
-                br#"{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated","param":null},"status":401}"#.to_vec(),
-                None,
-            ))
+        let mock = |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+            Ok(crate::http::NodeHttpResponse {
+                status: 401,
+                body: br#"{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated","param":null},"status":401}"#.to_vec(),
+                date: None,
+            })
         };
 
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
@@ -1127,11 +1157,12 @@ mod tests {
         let exp = now_secs_test().saturating_sub(60);
         let acc = install_codex_account(dir.path(), 14, exp, Some("rt_reused"));
 
-        let mock = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((
-                br#"{"error":{"code":"refresh_token_reused"}}"#.to_vec(),
-                None,
-            ))
+        let mock = |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+            Ok(crate::http::NodeHttpResponse {
+                status: 401,
+                body: br#"{"error":{"code":"refresh_token_reused"}}"#.to_vec(),
+                date: None,
+            })
         };
 
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
@@ -1155,10 +1186,15 @@ mod tests {
 
         let calls = Arc::new(AtomicU32::new(0));
         let calls_c = Arc::clone(&calls);
-        let mock = move |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            calls_c.fetch_add(1, Ordering::SeqCst);
-            Ok((b"{}".to_vec(), None))
-        };
+        let mock =
+            move |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::http::NodeHttpResponse {
+                    status: 200,
+                    body: b"{}".to_vec(),
+                    date: None,
+                })
+            };
 
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
         assert!(matches!(
@@ -1205,7 +1241,11 @@ mod tests {
                     broker_codex_check(&base, acc, move |_u, _b| {
                         count.fetch_add(1, Ordering::SeqCst);
                         thread::sleep(std::time::Duration::from_millis(10));
-                        Ok((body_local.into_bytes(), None))
+                        Ok(crate::http::NodeHttpResponse {
+                            status: 200,
+                            body: body_local.into_bytes(),
+                            date: None,
+                        })
                     })
                 })
             })
@@ -1225,6 +1265,116 @@ mod tests {
         );
     }
 
+    // Test-only structured capture. Never installs a global subscriber, reads
+    // RUST_LOG, emits the expected event itself, or captures credential payloads.
+    #[derive(Clone, Debug)]
+    struct BrokerEvent {
+        level: tracing::Level,
+        error_kind: Option<String>,
+        surface: Option<String>,
+        account: Option<String>,
+        drift_secs: Option<u64>,
+    }
+
+    impl tracing::field::Visit for BrokerEvent {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "error_kind" => self.error_kind = Some(value.to_owned()),
+                "surface" => self.surface = Some(value.to_owned()),
+                "account" => self.account = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "drift_secs" {
+                self.drift_secs = Some(value);
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "account" {
+                self.account = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    struct BrokerCapture {
+        events: Arc<std::sync::Mutex<Vec<BrokerEvent>>>,
+        next_span: std::sync::atomic::AtomicU64,
+    }
+
+    impl tracing::Subscriber for BrokerCapture {
+        // Capture all levels: a WARN->INFO mutation must fail the level assertion,
+        // not be accidentally hidden by an environment-controlled log filter.
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed))
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut captured = BrokerEvent {
+                level: *event.metadata().level(),
+                error_kind: None,
+                surface: None,
+                account: None,
+                drift_secs: None,
+            };
+            event.record(&mut captured);
+            self.events.lock().unwrap().push(captured);
+        }
+    }
+
+    /// Serialises every scoped-dispatcher capture in this binary.
+    ///
+    /// `tracing::subscriber::with_default` installs a THREAD-LOCAL subscriber,
+    /// which by itself is race-free — but it also updates tracing's PROCESS-GLOBAL
+    /// runtime max-level filter, and the `warn!` macro consults that filter before
+    /// it dispatches anything. Two tests entering and leaving `with_default`
+    /// concurrently can therefore transiently lower the global max while the other
+    /// thread's `warn!` is being evaluated: the event is filtered out before it ever
+    /// reaches the subscriber, and the capture legitimately sees zero events.
+    ///
+    /// That is the shape of the failure observed on CI's macos leg at 08e26839 —
+    /// `Refreshed must still emit the clock-skew event: left: 0, right: 1` — with
+    /// `BrokerResult::Refreshed` and `calls == 1` both asserted green immediately
+    /// above it, so the refresh unambiguously ran and only the CAPTURE came back
+    /// empty.
+    ///
+    /// The second caller is the reason this is not merely a flake to wait out:
+    /// `broker_codex_check_missing_or_invalid_date_emits_no_clock_skew_warn`
+    /// asserts the ABSENCE of the event, so under the same race it passes for the
+    /// wrong reason and reports on nothing (`instrument-discipline.md` MUST-1).
+    /// Serialising fixes a false RED and a false GREEN with one lock.
+    ///
+    /// A dedicated mutex rather than `platform::test_env::lock()`: the subject is
+    /// the tracing dispatcher, not the process environment, and borrowing the env
+    /// lock would couple these tests to every env-mutating test in the workspace
+    /// for no isolation benefit.
+    static BROKER_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_broker_events<T>(run: impl FnOnce() -> T) -> (T, Vec<BrokerEvent>) {
+        // Held for the whole scope, INCLUDING the drop of the dispatcher guard
+        // inside `with_default` — releasing early would leave exactly the window
+        // this lock exists to close.
+        let _capture_guard = BROKER_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = BrokerCapture {
+            events: Arc::clone(&events),
+            next_span: std::sync::atomic::AtomicU64::new(1),
+        };
+        // broker_codex_check and its injected transport execute synchronously on
+        // this thread; the scoped default is removed before assertions run.
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
+    }
+
     /// Successful refresh with a server `Date` header far from local time
     /// — the broker must succeed (clock-skew is a warn, not a failure)
     /// AND emit the `clock_skew_detected` log tag at WARN.
@@ -1240,18 +1390,71 @@ mod tests {
         let new_at = make_codex_jwt(new_exp);
         let body =
             format!(r#"{{"access_token":"{new_at}","refresh_token":"rt_new","expires_in":3600}}"#);
-        let mock = move |_u: &str, _b: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((
-                body.clone().into_bytes(),
-                Some("Thu, 01 Jan 1970 00:00:00 GMT".to_string()),
-            ))
+        let calls = Arc::new(AtomicU32::new(0));
+        let mock_calls = Arc::clone(&calls);
+        let mock = move |_u: &str, _b: &str| -> Result<crate::http::NodeHttpResponse, String> {
+            mock_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::http::NodeHttpResponse {
+                status: 200,
+                body: body.into_bytes(),
+                date: Some("Thu, 01 Jan 1970 00:00:00 GMT".to_string()),
+            })
         };
 
-        let result = broker_codex_check(dir.path(), acc, mock).unwrap();
+        let (result, events) = capture_broker_events(|| broker_codex_check(dir.path(), acc, mock));
+        let result = result.unwrap();
         assert!(
             matches!(result, BrokerResult::Refreshed),
             "clock skew is a warning, not a failure: got {result:?}"
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|event| event.error_kind.as_deref() == Some("clock_skew_detected"))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "Refreshed must still emit the clock-skew event"
+        );
+        let warning = warnings[0];
+        assert_eq!(warning.level, tracing::Level::WARN);
+        assert_eq!(warning.surface.as_deref(), Some("codex"));
+        assert_eq!(warning.account.as_deref(), Some(acc.to_string().as_str()));
+        assert!(warning.drift_secs.unwrap() > http_codex::CLOCK_SKEW_WARN_SECS);
+    }
+
+    #[test]
+    fn broker_codex_check_missing_or_invalid_date_emits_no_clock_skew_warn() {
+        for date in [None, Some("not-an-http-date")] {
+            let dir = TempDir::new().unwrap();
+            let acc = install_codex_account(
+                dir.path(),
+                17,
+                now_secs_test() + 3600,
+                Some("synthetic-test-rt"),
+            );
+            let new_at = make_codex_jwt(now_secs_test() + 6 * 3600);
+            let body = format!(
+                r#"{{"access_token":"{new_at}","refresh_token":"synthetic-new-rt","expires_in":3600}}"#
+            );
+            let calls = AtomicU32::new(0);
+            let (result, events) = capture_broker_events(|| {
+                broker_codex_check(dir.path(), acc, |_url, _body| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(crate::http::NodeHttpResponse {
+                        status: 200,
+                        body: body.into_bytes(),
+                        date: date.map(str::to_owned),
+                    })
+                })
+            });
+            assert!(matches!(result.unwrap(), BrokerResult::Refreshed));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(!events
+                .iter()
+                .any(|event| { event.error_kind.as_deref() == Some("clock_skew_detected") }));
+        }
     }
 
     // ── R2-MED-1: codex_is_expired_within boundary conditions ────────────────

@@ -50,7 +50,7 @@
 //! (`~/.claude/settings.json`, etc.) are NOT touched. Those are the
 //! user's own CC config and csq must not edit them.
 
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -186,17 +186,14 @@ fn migrate_one(path: &Path) -> Result<bool> {
     let json = serde_json::to_string_pretty(&value)
         .with_context(|| format!("serialize after strip {}", path.display()))?;
 
+    // Per `rules/security.md` §5a: `write_new_private` creates the tmp
+    // file at 0o600 at creation, closing the window a separate
+    // `std::fs::write` + `secure_file` pair would leave open for this
+    // ANTHROPIC_AUTH_TOKEN-bearing settings file.
     let tmp = unique_tmp_path(path);
-    // Per `rules/security.md` §5a: clean up the umask-default tmp file
-    // on every failure branch so we never leave a token-bearing file
-    // at world-readable perms on disk.
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow!(e).context(format!("write tmp {}", tmp.display())));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!("secure_file {}: {e}", tmp.display()));
     }
     if let Err(e) = atomic_replace(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);

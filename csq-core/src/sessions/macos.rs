@@ -142,7 +142,7 @@ fn parse_ps_line(line: &str) -> Option<SessionInfo> {
     // cwd via `lsof -a -p <pid> -d cwd -Fn`.
     let cwd = read_cwd_via_lsof(pid).unwrap_or_else(|| PathBuf::from(""));
 
-    // Start time via `ps -o etimes=` for the same PID.
+    // Start time via `ps -o lstart=`/`etime=` for the same PID.
     let started_at = read_start_time(pid);
 
     // Controlling TTY via `ps -o tty=`. Normalized to the basename
@@ -416,7 +416,15 @@ fn read_cwd_via_lsof(pid: u32) -> Option<PathBuf> {
 
 /// Reads the Unix-seconds start time of a process via `ps -o
 /// lstart=`. Returns `None` on any failure.
-fn read_start_time(pid: u32) -> Option<u64> {
+///
+/// `pub(crate)` (`keychain-fix-r11.md` S-LOW-1/D-4b): also the
+/// identity-aware liveness confirmation
+/// `credentials::keychain::live_handle_dir_maps_to_service` uses — a PID
+/// can pass bare `kill(pid, 0)` yet belong to a process this call cannot
+/// otherwise positively confirm; requiring `ps` to independently resolve a
+/// start time is a second, differently-sourced signal before treating a PID
+/// as a genuine live collision.
+pub(crate) fn read_start_time(pid: u32) -> Option<u64> {
     // `ps -o lstart=` returns a local-time string like
     // `Fri Apr 11 21:30:45 2026`. Parse via a minimal format walk;
     // avoid pulling in `chrono` just for this. Fall back to None.
@@ -432,30 +440,86 @@ fn read_start_time(pid: u32) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    // Heuristic: walk the current epoch back by the process's
-    // reported "elapsed" seconds via `ps -o etimes=`, which is way
-    // easier to parse than `lstart`.
-    let etimes_out = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "etimes="])
+    // Heuristic: walk the current epoch back by the process's reported
+    // elapsed time. `keychain-fix-r11.md` S-LOW-1/D-4b: this was previously
+    // `ps -o etimes=` — `etimes` (elapsed SECONDS, a single integer) is a
+    // Linux/procps extension; BSD `ps` (macOS, hence this module's own
+    // filename) has no such keyword and exits non-zero with "etimes:
+    // keyword not found", so on every real macOS host this call ALWAYS
+    // failed and `read_start_time` ALWAYS returned `None` — undetected
+    // because nothing previously depended on it returning `Some`.
+    // `etime` (no trailing `s`) IS a portable BSD keyword, formatted
+    // `[[dd-]hh:]mm:ss`, hence the parse below rather than a bare integer.
+    let etime_out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "etime="])
         .output()
         .ok()?;
-    if !etimes_out.status.success() {
+    if !etime_out.status.success() {
         return None;
     }
-    let etimes: u64 = String::from_utf8_lossy(&etimes_out.stdout)
-        .trim()
-        .parse()
-        .ok()?;
+    let etime_secs = parse_etime_to_secs(String::from_utf8_lossy(&etime_out.stdout).trim())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    Some(now.saturating_sub(etimes))
+    Some(now.saturating_sub(etime_secs))
+}
+
+/// Parses BSD `ps -o etime=` output (`[[dd-]hh:]mm:ss`) into total elapsed
+/// seconds. `None` on any shape this format does not produce.
+fn parse_etime_to_secs(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, mins, secs) = match parts.as_slice() {
+        [m, s] => (0u64, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        [h, m, s] => (
+            h.parse::<u64>().ok()?,
+            m.parse::<u64>().ok()?,
+            s.parse::<u64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parse_etime_to_secs (keychain-fix-r11.md S-LOW-1/D-4b) ──
+
+    /// RED under a mutation reverting to `ps -o etimes=`/a bare-integer
+    /// parse: BSD `ps` has no `etimes` keyword, so the shell-out itself
+    /// would fail and `read_start_time` would return `None` for every real,
+    /// live PID — exactly the bug this fix corrects.
+    #[test]
+    fn parse_etime_to_secs_mm_ss() {
+        assert_eq!(parse_etime_to_secs("05:30"), Some(5 * 60 + 30));
+        assert_eq!(parse_etime_to_secs("00:00"), Some(0));
+    }
+
+    #[test]
+    fn parse_etime_to_secs_hh_mm_ss() {
+        assert_eq!(parse_etime_to_secs("01:02:03"), Some(3_600 + 2 * 60 + 3));
+    }
+
+    #[test]
+    fn parse_etime_to_secs_dd_hh_mm_ss() {
+        assert_eq!(
+            parse_etime_to_secs("2-03:04:05"),
+            Some(2 * 86_400 + 3 * 3_600 + 4 * 60 + 5)
+        );
+    }
+
+    #[test]
+    fn parse_etime_to_secs_malformed_is_none() {
+        assert_eq!(parse_etime_to_secs(""), None);
+        assert_eq!(parse_etime_to_secs("garbage"), None);
+        assert_eq!(parse_etime_to_secs("1:2:3:4"), None);
+    }
 
     #[test]
     fn split_command_and_env_handles_no_env() {

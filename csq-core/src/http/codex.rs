@@ -30,7 +30,7 @@
 //!
 //! The public entry points ([`refresh_access_token`],
 //! [`fetch_wham_usage`]) delegate to transport-injected helpers
-//! ([`refresh_with_http`], [`fetch_wham_with_http`]) so tests can feed
+//! (`refresh_with_http`, `fetch_wham_with_http`) so tests can feed
 //! pre-canned response bodies without spawning Node subprocesses.
 //! Matches the `testing.md` Rule 5 contract — the mock closure signature
 //! is byte-for-byte identical to the production transport.
@@ -318,9 +318,12 @@ where
 
     let bytes = http_post(OAUTH_TOKEN_URL, &body).map_err(|_| CodexHttpError::Transport)?;
 
-    // Success/error discrimination by shape, not status (post_json_node
-    // doesn't surface status). Try success first; fall back to error.
-    parse_refresh_response(200, &bytes)
+    // `post_json_node` (this function's transport) has no status-reporting
+    // path at all, so there is no status to pass here — `None` means
+    // exactly that, not "assume 200". Success/error discrimination for
+    // this legacy path is by BODY SHAPE only: try the success shape first,
+    // fall back to the error envelope.
+    parse_refresh_response(None, &bytes)
 }
 
 /// Like [`refresh_with_http`] but the injected transport also returns
@@ -332,7 +335,7 @@ pub(crate) fn refresh_with_http_meta<F>(
     http_post: F,
 ) -> Result<(CodexTokens, Option<String>), CodexHttpError>
 where
-    F: FnOnce(&str, &str) -> Result<(Vec<u8>, Option<String>), String>,
+    F: FnOnce(&str, &str) -> Result<crate::http::NodeHttpResponse, String>,
 {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
@@ -341,9 +344,9 @@ where
     })
     .to_string();
 
-    let (bytes, date) = http_post(OAUTH_TOKEN_URL, &body).map_err(|_| CodexHttpError::Transport)?;
+    let resp = http_post(OAUTH_TOKEN_URL, &body).map_err(|_| CodexHttpError::Transport)?;
 
-    parse_refresh_response(200, &bytes).map(|tokens| (tokens, date))
+    parse_refresh_response(Some(resp.status), &resp.body).map(|tokens| (tokens, resp.date))
 }
 
 /// Threshold beyond which the daemon emits a `clock_skew_detected`
@@ -507,20 +510,73 @@ where
 
 // ─── Pure parsers (no I/O, fully test-exercisable) ─────────────────
 
-fn parse_refresh_response(_status: u16, bytes: &[u8]) -> Result<CodexTokens, CodexHttpError> {
-    // Prefer the success shape — it has an `access_token` field that
-    // error envelopes never contain.
-    if let Ok(tokens) = serde_json::from_slice::<CodexTokens>(bytes) {
-        // Sanity: success body must include a non-empty access_token.
-        if !tokens.access_token.is_empty() {
-            return Ok(tokens);
+/// Parses a `/oauth/token` refresh response.
+///
+/// `status` is `Some(s)` for every transport that actually surfaces an
+/// HTTP status ([`refresh_with_http_meta`], via
+/// [`crate::http::post_json_node_with_date`]) and `None` only for the
+/// legacy [`refresh_with_http`] path (via [`crate::http::post_json_node`],
+/// which has no status-reporting path at all).
+///
+/// With `Some(s)`:
+/// - `200..300` — success shape only; a body that doesn't parse as
+///   [`CodexTokens`] with a non-empty `access_token` is
+///   `MalformedResponse { status: s }` (an error envelope on a 2xx would
+///   be a schema violation upstream should not commit, so it is not
+///   given a second chance at the envelope shape here).
+/// - `429` — always [`CodexHttpError::Upstream { status: 429, .. }`],
+///   regardless of body shape, with `tag` set from the envelope `code`
+///   when the body happens to parse as one. This is the fix for the
+///   Codex rate-limit gate: `refresh/check.rs::broker_codex_check`
+///   matches on this exact variant/status to distinguish "rate limited"
+///   from every other failure, and a non-JSON 429 body must still be
+///   classified as rate-limited rather than falling through to
+///   `MalformedResponse`.
+/// - any other non-2xx — the envelope `code` classifies via
+///   [`classify_error`] when present; otherwise `MalformedResponse { status: s }`.
+///
+/// With `None` (status unknown): shape-based discrimination only — try
+/// the success shape first, fall back to the error envelope, reporting
+/// `status: 0` on either malformed-response outcome (there is no real
+/// status to report).
+fn parse_refresh_response(
+    status: Option<u16>,
+    bytes: &[u8],
+) -> Result<CodexTokens, CodexHttpError> {
+    match status {
+        Some(429) => {
+            let tag = serde_json::from_slice::<ErrorEnvelope>(bytes)
+                .ok()
+                .and_then(|e| e.error.code);
+            Err(CodexHttpError::Upstream { status: 429, tag })
+        }
+        Some(s) if (200..300).contains(&s) => {
+            if let Ok(tokens) = serde_json::from_slice::<CodexTokens>(bytes) {
+                if !tokens.access_token.is_empty() {
+                    return Ok(tokens);
+                }
+            }
+            Err(CodexHttpError::MalformedResponse { status: s })
+        }
+        Some(s) => {
+            if let Ok(err) = serde_json::from_slice::<ErrorEnvelope>(bytes) {
+                return Err(classify_error(s, err.error.code));
+            }
+            Err(CodexHttpError::MalformedResponse { status: s })
+        }
+        None => {
+            // Shape-based discrimination — no real status to key off.
+            if let Ok(tokens) = serde_json::from_slice::<CodexTokens>(bytes) {
+                if !tokens.access_token.is_empty() {
+                    return Ok(tokens);
+                }
+            }
+            if let Ok(err) = serde_json::from_slice::<ErrorEnvelope>(bytes) {
+                return Err(classify_error(0, err.error.code));
+            }
+            Err(CodexHttpError::MalformedResponse { status: 0 })
         }
     }
-    // Error envelope.
-    if let Ok(err) = serde_json::from_slice::<ErrorEnvelope>(bytes) {
-        return Err(classify_error(0, err.error.code));
-    }
-    Err(CodexHttpError::MalformedResponse { status: 0 })
 }
 
 pub(crate) fn parse_wham_response(
@@ -562,7 +618,7 @@ mod tests {
     #[test]
     fn codex_tokens_debug_redacts_every_token_field() {
         let body = br#"{"access_token":"sk-at-SECRET-ACCESS","refresh_token":"sk-rt-SECRET-REFRESH","id_token":"eyJ-SECRET-ID","account_id":"acct-SECRET-ID-VALUE","token_type":"bearer","expires_in":3600}"#;
-        let t = parse_refresh_response(200, body).expect("should parse");
+        let t = parse_refresh_response(Some(200), body).expect("should parse");
 
         // Guard the guard: if the fixture ever stopped carrying the
         // secrets, the absence assertions below would pass vacuously.
@@ -598,7 +654,7 @@ mod tests {
         // A missing refresh token is a real diagnostic signal; blanket
         // `<redacted>` on a None would erase it.
         let body = br#"{"access_token":"sk-at-only","token_type":"bearer"}"#;
-        let t = parse_refresh_response(200, body).expect("should parse");
+        let t = parse_refresh_response(Some(200), body).expect("should parse");
         let rendered = format!("{t:?}");
         assert!(
             rendered.contains("refresh_token: None"),
@@ -612,7 +668,7 @@ mod tests {
     #[test]
     fn parse_refresh_success_returns_tokens() {
         let body = br#"{"access_token":"new_at","refresh_token":"rt_new","id_token":"new_id","token_type":"bearer","expires_in":3600}"#;
-        let r = parse_refresh_response(200, body).expect("should parse");
+        let r = parse_refresh_response(Some(200), body).expect("should parse");
         assert_eq!(r.access_token, "new_at");
         assert_eq!(r.refresh_token.as_deref(), Some("rt_new"));
         assert_eq!(r.id_token.as_deref(), Some("new_id"));
@@ -622,21 +678,21 @@ mod tests {
     #[test]
     fn parse_refresh_token_expired_is_typed() {
         let body = br#"{"error":{"message":"...","type":"invalid_request_error","param":null,"code":"token_expired"}}"#;
-        let e = parse_refresh_response(401, body).unwrap_err();
+        let e = parse_refresh_response(Some(401), body).unwrap_err();
         assert_eq!(e, CodexHttpError::TokenExpired);
     }
 
     #[test]
     fn parse_refresh_refresh_reused_is_typed() {
         let body = br#"{"error":{"message":"Your refresh token has already been used to generate a new access token. Please try signing in again.","type":"invalid_request_error","param":null,"code":"refresh_token_reused"}}"#;
-        let e = parse_refresh_response(401, body).unwrap_err();
+        let e = parse_refresh_response(Some(401), body).unwrap_err();
         assert_eq!(e, CodexHttpError::RefreshReused);
     }
 
     #[test]
     fn parse_refresh_token_invalidated_is_typed() {
         let body = br#"{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","param":null,"code":"token_invalidated"}}"#;
-        let e = parse_refresh_response(401, body).unwrap_err();
+        let e = parse_refresh_response(Some(401), body).unwrap_err();
         assert_eq!(e, CodexHttpError::TokenInvalidated);
     }
 
@@ -663,7 +719,7 @@ mod tests {
     #[test]
     fn parse_refresh_unknown_code_is_upstream() {
         let body = br#"{"error":{"message":"x","type":"y","code":"some_new_code"}}"#;
-        let e = parse_refresh_response(401, body).unwrap_err();
+        let e = parse_refresh_response(Some(401), body).unwrap_err();
         assert!(matches!(
             e,
             CodexHttpError::Upstream { tag: Some(ref t), .. } if t == "some_new_code"
@@ -673,7 +729,7 @@ mod tests {
     #[test]
     fn parse_refresh_malformed_body() {
         let body = b"<html>gateway timeout</html>";
-        let e = parse_refresh_response(502, body).unwrap_err();
+        let e = parse_refresh_response(Some(502), body).unwrap_err();
         assert!(matches!(e, CodexHttpError::MalformedResponse { .. }));
     }
 
@@ -682,8 +738,59 @@ mod tests {
         // An error envelope that happens to have an `access_token` field
         // set to empty string must NOT be misclassified as success.
         let body = br#"{"access_token":"","error":{"code":"token_expired"}}"#;
-        let e = parse_refresh_response(401, body).unwrap_err();
+        let e = parse_refresh_response(Some(401), body).unwrap_err();
         assert_eq!(e, CodexHttpError::TokenExpired);
+    }
+
+    // ── parse_refresh_response: status-driven 429 classification ────
+    //
+    // The defect these four tests pin: `parse_refresh_response` MUST use
+    // the REAL status when one is available, not a literal passed by the
+    // caller. Mutation guard: reverting `Some(429) => ...` back to
+    // "shape-based, status ignored" makes `parse_refresh_429_non_json_body`
+    // fail — a non-JSON 429 body has no `access_token` and no `error`
+    // envelope, so shape-based parsing falls through to
+    // `MalformedResponse { status: 0 }` instead of `Upstream { status: 429 }`.
+
+    #[test]
+    fn parse_refresh_429_non_json_body() {
+        let body = b"upstream is down";
+        let e = parse_refresh_response(Some(429), body).unwrap_err();
+        assert_eq!(
+            e,
+            CodexHttpError::Upstream {
+                status: 429,
+                tag: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_refresh_429_with_envelope_carries_tag() {
+        let body = br#"{"error":{"code":"rate_limit_exceeded"}}"#;
+        let e = parse_refresh_response(Some(429), body).unwrap_err();
+        assert_eq!(
+            e,
+            CodexHttpError::Upstream {
+                status: 429,
+                tag: Some("rate_limit_exceeded".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parse_refresh_500_non_json_body_is_malformed_with_real_status() {
+        let body = b"internal server error, not json";
+        let e = parse_refresh_response(Some(500), body).unwrap_err();
+        assert_eq!(e, CodexHttpError::MalformedResponse { status: 500 });
+    }
+
+    #[test]
+    fn parse_refresh_200_success_unchanged() {
+        let body = br#"{"access_token":"at","refresh_token":"rt","expires_in":3600}"#;
+        let t = parse_refresh_response(Some(200), body).expect("should parse");
+        assert_eq!(t.access_token, "at");
+        assert_eq!(t.refresh_token.as_deref(), Some("rt"));
     }
 
     // ── parse_wham_response ──────────────────────────────────────
@@ -948,12 +1055,14 @@ mod tests {
 
     #[test]
     fn refresh_with_http_meta_returns_date_alongside_tokens() {
-        let mock_post = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((
-                br#"{"access_token":"fresh"}"#.to_vec(),
-                Some("Tue, 22 Apr 2026 14:32:01 GMT".to_string()),
-            ))
-        };
+        let mock_post =
+            |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                Ok(crate::http::NodeHttpResponse {
+                    status: 200,
+                    body: br#"{"access_token":"fresh"}"#.to_vec(),
+                    date: Some("Tue, 22 Apr 2026 14:32:01 GMT".to_string()),
+                })
+            };
         let (tokens, date) = refresh_with_http_meta("rt_x", mock_post).expect("ok");
         assert_eq!(tokens.access_token, "fresh");
         assert_eq!(date.as_deref(), Some("Tue, 22 Apr 2026 14:32:01 GMT"));
@@ -961,23 +1070,52 @@ mod tests {
 
     #[test]
     fn refresh_with_http_meta_propagates_transport_error() {
-        let mock_post = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Err("connect refused".into())
-        };
+        let mock_post =
+            |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                Err("connect refused".into())
+            };
         let e = refresh_with_http_meta("rt_x", mock_post).unwrap_err();
         assert_eq!(e, CodexHttpError::Transport);
     }
 
     #[test]
     fn refresh_with_http_meta_returns_typed_token_expired_with_date() {
-        let mock_post = |_url: &str, _body: &str| -> Result<(Vec<u8>, Option<String>), String> {
-            Ok((
-                br#"{"error":{"code":"token_expired"}}"#.to_vec(),
-                Some("Tue, 22 Apr 2026 14:32:01 GMT".to_string()),
-            ))
-        };
+        let mock_post =
+            |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                Ok(crate::http::NodeHttpResponse {
+                    status: 401,
+                    body: br#"{"error":{"code":"token_expired"}}"#.to_vec(),
+                    date: Some("Tue, 22 Apr 2026 14:32:01 GMT".to_string()),
+                })
+            };
         let e = refresh_with_http_meta("rt_x", mock_post).unwrap_err();
         assert_eq!(e, CodexHttpError::TokenExpired);
+    }
+
+    /// The defect this fix closes: `refresh_with_http_meta` (the production
+    /// broker path via `broker_codex_check`) MUST surface a real 429 as
+    /// `Upstream { status: 429, .. }` — the exact variant/status
+    /// `refresh/check.rs::broker_codex_check` matches to return
+    /// `BrokerResult::RateLimited`. Before this fix, every call site passed
+    /// a literal status (`200`), so this could never happen in production.
+    #[test]
+    fn refresh_with_http_meta_429_is_upstream_rate_limited() {
+        let mock_post =
+            |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                Ok(crate::http::NodeHttpResponse {
+                    status: 429,
+                    body: br#"{"error":{"code":"rate_limit_exceeded"}}"#.to_vec(),
+                    date: None,
+                })
+            };
+        let e = refresh_with_http_meta("rt_x", mock_post).unwrap_err();
+        assert_eq!(
+            e,
+            CodexHttpError::Upstream {
+                status: 429,
+                tag: Some("rate_limit_exceeded".to_string()),
+            }
+        );
     }
 
     // ── parse_http_date_secs ─────────────────────────────────────

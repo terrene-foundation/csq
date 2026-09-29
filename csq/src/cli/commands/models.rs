@@ -5,51 +5,79 @@
 //! `registry::known_ids()` reports is listable, not just the subset that happens
 //! to carry curated [`ModelCatalog`] rows. Dispatch keys off
 //! [`ProviderDescriptor::kind`] (`Wrapped` vs `Native`), never a per-id `if
-//! provider_id == "grok"` chain: a native descriptor has no catalog entries by
-//! construction, so it always reports its `default_model`; a wrapped descriptor
-//! (Codex today) with zero catalog rows falls back to the same synthesized-default
-//! row rather than an empty array. Ollama's live-pulled-model enumeration is the
+//! provider_id == "grok"` chain. Both kinds honor runtime manifest rows; a
+//! descriptor with zero catalog rows falls back to its synthesized default
+//! rather than an empty array. Ollama's live-pulled-model enumeration is the
 //! one kept id-check — it is a genuine runtime-vs-static distinction, not a
 //! provider-identity branch (`agents.md` "PRIMARY METHODOLOGICAL DIRECTIVE").
 
 use anyhow::{anyhow, Result};
 use csq_core::providers::catalog::ModelConfigTarget;
+use csq_core::providers::model_manifest::{self, ModelManifest};
 use csq_core::providers::registry::{self, ProviderDescriptor};
 use csq_core::providers::{self, ModelCatalog, ProviderKind};
-use csq_core::sdk::{self, Envelope, SdkError, SdkErrorCode, SCHEMA_MODELS_V1};
-use serde::Serialize;
+use csq_core::sdk::{
+    self, Envelope, ModelEntry, ModelsPayload, SdkError, SdkErrorCode, SCHEMA_MODELS_V1,
+};
 use std::path::Path;
 
-/// One model row. Mirrors [`csq_core::providers::ModelInfo`]'s full shape
-/// (`context_window` / `output_limit` / `aliases`, previously dropped by the
-/// old id/name-only `ModelEntry`) plus the provider identity and
-/// [`Self::is_default`].
-#[derive(Debug, Serialize)]
-struct ModelEntry {
-    provider_id: String,
-    provider_name: String,
-    model_id: String,
-    model_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context_window: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_limit: Option<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    aliases: Vec<String>,
-    /// `true` iff this row is NOT a curated [`ModelCatalog`] entry — it is the
-    /// provider's [`ProviderDescriptor::default_model`], synthesized because no
-    /// catalog rows exist for this provider (every native vendor CLI; a wrapped
-    /// provider like Codex whose model space csq does not curate). A host
-    /// building a model picker uses this to distinguish "csq vouches for this
-    /// row's specs" from "this is just the provider's current default, no
-    /// context/output data available."
-    is_default: bool,
+/// Local manifest maintenance. No HTTP fetching or session/configuration migration.
+pub enum ManifestAction {
+    Show,
+    Validate(std::path::PathBuf),
+    Install(std::path::PathBuf),
+    Reset,
 }
 
-/// The `csq.models.v1` success payload.
-#[derive(Serialize)]
-struct ModelsPayload {
-    models: Vec<ModelEntry>,
+pub fn handle_manifest(base_dir: &Path, action: ManifestAction, json: bool) -> Result<()> {
+    match action {
+        ManifestAction::Show => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ModelManifest::load(base_dir)?)?
+            );
+        }
+        ManifestAction::Validate(file) => {
+            let manifest = model_manifest::validate_file(&file)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"valid": true, "revision": manifest.revision})
+                );
+            } else {
+                println!("Valid model manifest: {}", manifest.revision);
+            }
+        }
+        ManifestAction::Install(file) => {
+            let manifest = ModelManifest::install(base_dir, &file)?;
+            let path = model_manifest::manifest_path(base_dir);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"installed": true, "revision": manifest.revision, "path": path})
+                );
+            } else {
+                println!(
+                    "Installed model manifest {} at {}",
+                    manifest.revision,
+                    path.display()
+                );
+                println!("New model commands read it immediately; usage prices refresh on the daemon's next ledger cycle (up to 10 minutes). No restart required.");
+            }
+        }
+        ManifestAction::Reset => {
+            let removed = model_manifest::reset(base_dir)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"removed": removed, "source": "bundled"})
+                );
+            } else {
+                println!("Using bundled model manifest (local snapshot removed: {removed}).");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A row synthesized from `d.default_model` — never a bare-empty substitute.
@@ -67,16 +95,7 @@ fn default_entry(d: &ProviderDescriptor) -> ModelEntry {
     } else {
         (d.default_model.to_string(), d.default_model.to_string())
     };
-    ModelEntry {
-        provider_id: d.id.to_string(),
-        provider_name: d.name.to_string(),
-        model_id,
-        model_name,
-        context_window: None,
-        output_limit: None,
-        aliases: Vec::new(),
-        is_default: true,
-    }
+    ModelEntry::new(d.id, d.name, model_id, model_name, true)
 }
 
 /// This provider's curated [`ModelCatalog`] rows, mapped to [`ModelEntry`].
@@ -84,15 +103,11 @@ fn catalog_entries(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelE
     catalog
         .by_provider(d.id)
         .into_iter()
-        .map(|m| ModelEntry {
-            provider_id: d.id.to_string(),
-            provider_name: d.name.to_string(),
-            model_id: m.id.clone(),
-            model_name: m.name.clone(),
-            context_window: m.context_window,
-            output_limit: m.output_limit,
-            aliases: m.aliases.clone(),
-            is_default: false,
+        .map(|m| {
+            ModelEntry::new(d.id, d.name, m.id.clone(), m.name.clone(), false)
+                .with_context_window(m.context_window)
+                .with_output_limit(m.output_limit)
+                .with_aliases(m.aliases.clone())
         })
         .collect()
 }
@@ -100,36 +115,38 @@ fn catalog_entries(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelE
 /// Ollama's model space is whatever the user has pulled locally — queried live,
 /// never curated. Kept as an explicit id check (not a `kind` branch): this is a
 /// runtime-vs-static distinction orthogonal to wrapped/native classification.
-fn ollama_live_entries(d: &ProviderDescriptor) -> Vec<ModelEntry> {
-    providers::ollama::get_ollama_models()
+fn ollama_entries(d: &ProviderDescriptor, names: Vec<String>) -> Vec<ModelEntry> {
+    names
         .into_iter()
-        .map(|name| ModelEntry {
-            provider_id: d.id.to_string(),
-            provider_name: d.name.to_string(),
-            model_id: name.clone(),
-            model_name: name,
-            context_window: None,
-            output_limit: None,
-            aliases: Vec::new(),
-            is_default: false,
-        })
+        .map(|name| ModelEntry::new(d.id, d.name, name.clone(), name, false))
         .collect()
 }
 
-/// Every listable row for one provider. Dispatch is on [`ProviderDescriptor::kind`]:
-/// a [`ProviderKind::Native`] descriptor has no [`ModelCatalog`] rows by
-/// construction (the catalog only covers `catalog::PROVIDERS` ids), so it always
-/// reports [`default_entry`]. A [`ProviderKind::Wrapped`] descriptor reports its
-/// catalog rows (plus Ollama's live rows); if that combined set is empty — Codex
-/// today, whose model space csq does not curate — it falls back to
-/// [`default_entry`] rather than an empty array.
+/// Both provider kinds honor runtime catalog rows. Wrapped Ollama also lists
+/// locally pulled models; a provider with no resulting entries uses its registry
+/// default, preserving native vendor-selected behavior when no manifest rows exist.
 fn entries_for(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelEntry> {
+    entries_for_with_ollama(d, catalog, &mut providers::ollama::get_ollama_models)
+}
+
+fn entries_for_with_ollama(
+    d: &ProviderDescriptor,
+    catalog: &ModelCatalog,
+    ollama_models: &mut impl FnMut() -> Vec<String>,
+) -> Vec<ModelEntry> {
     match d.kind {
-        ProviderKind::Native => vec![default_entry(d)],
+        ProviderKind::Native => {
+            let entries = catalog_entries(d, catalog);
+            if entries.is_empty() {
+                vec![default_entry(d)]
+            } else {
+                entries
+            }
+        }
         ProviderKind::Wrapped => {
             let mut entries = catalog_entries(d, catalog);
             if d.id == "ollama" {
-                entries.extend(ollama_live_entries(d));
+                entries.extend(ollama_entries(d, ollama_models()));
             }
             if entries.is_empty() {
                 entries.push(default_entry(d));
@@ -147,6 +164,18 @@ fn entries_for(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelEntry
 fn list_models_json(
     provider_filter: &str,
     catalog: &ModelCatalog,
+) -> Result<Vec<ModelEntry>, SdkError> {
+    list_models_json_with_ollama(
+        provider_filter,
+        catalog,
+        providers::ollama::get_ollama_models,
+    )
+}
+
+fn list_models_json_with_ollama(
+    provider_filter: &str,
+    catalog: &ModelCatalog,
+    mut ollama_models: impl FnMut() -> Vec<String>,
 ) -> Result<Vec<ModelEntry>, SdkError> {
     let descriptors: Vec<ProviderDescriptor> = if provider_filter == "all" {
         registry::all()
@@ -169,19 +198,30 @@ fn list_models_json(
 
     Ok(descriptors
         .iter()
-        .flat_map(|d| entries_for(d, catalog))
+        .flat_map(|d| entries_for_with_ollama(d, catalog, &mut ollama_models))
         .collect())
 }
 
-pub fn handle_list(_base_dir: &Path, provider_filter: &str, json: bool) -> Result<()> {
-    let catalog = ModelCatalog::default_catalog();
+fn runtime_models_json(
+    base_dir: &Path,
+    provider_filter: &str,
+) -> Result<Vec<ModelEntry>, SdkError> {
+    let manifest = ModelManifest::load(base_dir).map_err(|error| {
+        SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            format!("model manifest unavailable: {error}"),
+        )
+    })?;
+    list_models_json(provider_filter, &manifest.catalog())
+}
 
+pub fn handle_list(base_dir: &Path, provider_filter: &str, json: bool) -> Result<()> {
     if json {
-        let code = match list_models_json(provider_filter, &catalog) {
+        let code = match runtime_models_json(base_dir, provider_filter) {
             Ok(models) => sdk::emit(&Envelope::success(
                 SCHEMA_MODELS_V1,
                 None,
-                ModelsPayload { models },
+                ModelsPayload::new(models),
             ))?,
             Err(err) => sdk::emit(&Envelope::<ModelsPayload>::failure(
                 SCHEMA_MODELS_V1,
@@ -192,6 +232,7 @@ pub fn handle_list(_base_dir: &Path, provider_filter: &str, json: bool) -> Resul
         std::process::exit(code);
     }
 
+    let catalog = ModelManifest::load(base_dir)?.catalog();
     println!();
 
     let descriptors: Vec<ProviderDescriptor> = if provider_filter == "all" {
@@ -231,6 +272,8 @@ pub fn handle_switch(
     let provider = providers::get_provider(provider_id)
         .ok_or_else(|| anyhow!("unknown provider: {provider_id}"))?;
 
+    let catalog = ModelManifest::load(base_dir)?.catalog();
+
     // Resolve the target model id. Three strategies by provider:
     //
     // - **Ollama** — the "catalog" is whatever the user has pulled
@@ -254,7 +297,7 @@ pub fn handle_switch(
         }
         trimmed.to_string()
     } else if provider_id == "codex" {
-        resolve_codex_model(model_query, force)?
+        resolve_codex_model(model_query, force, &catalog)?
     } else if provider_id == "gemini" && model_query.trim().eq_ignore_ascii_case("auto") {
         // FR-G-CLI-04 special: `auto` is intentionally NOT in the
         // catalog (it instructs gemini-cli to pick rather than
@@ -263,7 +306,6 @@ pub fn handle_switch(
         // not surface a misleading rejection.
         "auto".to_string()
     } else {
-        let catalog = ModelCatalog::default_catalog();
         let m = catalog.find(model_query).ok_or_else(|| {
             let suggestion = catalog
                 .suggest(model_query)
@@ -279,7 +321,7 @@ pub fn handle_switch(
                 provider_id
             ));
         }
-        m.id.clone()
+        with_context_annotation(provider_id, model_query, &m.id, m.context_window)
     };
 
     // INV-P06 write-path dispatch by `ModelConfigTarget`.
@@ -302,7 +344,7 @@ pub fn handle_switch(
                 let mut settings = providers::settings::load_settings(base_dir, provider_id)?;
                 settings.set_model(&model_id);
                 providers::settings::save_settings(base_dir, &settings)?;
-                let display_name = ModelCatalog::default_catalog()
+                let display_name = catalog
                     .find(&model_id)
                     .map(|m| format!(" ({})", m.name))
                     .unwrap_or_default();
@@ -429,14 +471,13 @@ fn write_gemini_model_to_binding(
 /// arbitrary OpenAI model id. Empty input is always rejected. This
 /// mirrors the Ollama "user space" model for catalog-less providers
 /// while keeping the default path (catalog hit) typo-resistant.
-fn resolve_codex_model(query: &str, force: bool) -> Result<String> {
+fn resolve_codex_model(query: &str, force: bool, catalog: &ModelCatalog) -> Result<String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("model id must not be empty"));
     }
 
     // Catalog hit is the happy path for csq-curated models.
-    let catalog = ModelCatalog::default_catalog();
     if let Some(m) = catalog.find(trimmed) {
         if m.provider == "codex" {
             return Ok(m.id.clone());
@@ -460,6 +501,32 @@ fn resolve_codex_model(query: &str, force: bool) -> Result<String> {
          arbitrary OpenAI model id (csq does not validate it against your \
          ChatGPT subscription entitlements)"
     ))
+}
+
+/// The id to write for a catalog hit, keeping the query's `[1m]` annotation.
+///
+/// Claude only. `ModelCatalog::find` strips `[1m]` to match, so writing the
+/// bare `m.id` silently turned `claude-opus-5-5[1m]` into `claude-opus-5-5` —
+/// and Claude Code sizes the window from that suffix: measured on a Vertex
+/// slot, the bare id ran with a 200000-token window and the annotated one with
+/// 1000000. The suffix is Claude Code's annotation, not part of any vendor's
+/// model id, so no other provider gets it (gemini-cli would send
+/// `gemini-2.5-pro[1m]` to Google verbatim). It is kept only when the catalog
+/// row has a 1M window, so it never promises context the model lacks.
+fn with_context_annotation(
+    provider_id: &str,
+    query: &str,
+    id: &str,
+    context_window: Option<u64>,
+) -> String {
+    const ONE_M: &str = "[1m]";
+    let asked = query.trim().to_ascii_lowercase().ends_with(ONE_M);
+    let has = id.to_ascii_lowercase().ends_with(ONE_M);
+    if provider_id == "claude" && asked && !has && context_window.is_some_and(|w| w >= 1_000_000) {
+        format!("{id}{ONE_M}")
+    } else {
+        id.to_string()
+    }
 }
 
 /// Rewrites every `ANTHROPIC_*_MODEL` key in the slot's settings.json to
@@ -570,7 +637,239 @@ mod tests {
     use serde_json::Value;
     use tempfile::TempDir;
 
+    #[test]
+    fn model_manifest_cli_install_lists_and_switches_new_model_without_rebuild() {
+        let _guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("reviewed.json");
+        let mut manifest = ModelManifest::bundled();
+        manifest.revision = "private-new-model".into();
+        let mut model = manifest.catalog().find("deepseek-flash").unwrap().clone();
+        model.id = "deepseek-private-next[1m]".into();
+        model.name = "Private next model".into();
+        model.aliases = vec!["private-next".into()];
+        manifest.models.push(model);
+        std::fs::write(&source, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        handle_manifest(dir.path(), ManifestAction::Validate(source.clone()), true).unwrap();
+        assert!(!model_manifest::manifest_path(dir.path()).exists());
+        handle_manifest(dir.path(), ManifestAction::Install(source), true).unwrap();
+        let entries = runtime_models_json(dir.path(), "deepseek").unwrap();
+        assert!(entries
+            .iter()
+            .any(|row| row.model_id == "deepseek-private-next[1m]"));
+        let config = dir.path().join("config-15");
+        std::fs::create_dir(&config).unwrap();
+        let settings = config.join("settings.json");
+        std::fs::write(&settings, r#"{"effortLevel":"max","env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","CLAUDE_CODE_SUBAGENT_MODEL_FORCE":"deepseek-flash[1m]"}}"#).unwrap();
+        handle_switch(
+            dir.path(),
+            "deepseek",
+            "private-next",
+            Some(AccountNum::try_from(15u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(saved["env"]["ANTHROPIC_MODEL"], "deepseek-private-next[1m]");
+        assert_eq!(saved["effortLevel"], "max");
+        assert_eq!(
+            saved["env"]["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"],
+            "deepseek-flash[1m]"
+        );
+        handle_manifest(dir.path(), ManifestAction::Reset, true).unwrap();
+        assert!(!model_manifest::manifest_path(dir.path()).exists());
+        assert!(!runtime_models_json(dir.path(), "deepseek")
+            .unwrap()
+            .iter()
+            .any(|row| row.model_id == "deepseek-private-next[1m]"));
+    }
+
+    #[test]
+    fn model_manifest_invalid_configuration_fails_list_and_preserves_slot() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(model_manifest::manifest_path(dir.path()), b"{broken").unwrap();
+        let config = dir.path().join("config-15");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("settings.json");
+        let original = br#"{"env":{"ANTHROPIC_MODEL":"do-not-change"}}"#;
+        std::fs::write(&path, original).unwrap();
+        let error = runtime_models_json(dir.path(), "deepseek").unwrap_err();
+        let envelope = Envelope::<ModelsPayload>::failure(SCHEMA_MODELS_V1, None, error);
+        let value: Value = serde_json::from_str(&envelope.to_line().unwrap()).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "invalid_input");
+        assert!(handle_switch(
+            dir.path(),
+            "deepseek",
+            "4.1",
+            Some(AccountNum::try_from(15u16).unwrap()),
+            false,
+            false
+        )
+        .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn model_manifest_native_catalogue_rows_are_not_hidden_by_static_default() {
+        let dir = TempDir::new().unwrap();
+        let mut manifest = ModelManifest::bundled();
+        manifest
+            .models
+            .push(csq_core::providers::models::ModelInfo {
+                id: "grok-private-next".into(),
+                name: "Private Grok".into(),
+                provider: "grok".into(),
+                context_window: Some(900_000),
+                output_limit: Some(100_000),
+                aliases: vec![],
+            });
+        std::fs::write(
+            model_manifest::manifest_path(dir.path()),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let rows = runtime_models_json(dir.path(), "grok").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model_id, "grok-private-next");
+        assert_eq!(rows[0].context_window, Some(900_000));
+    }
+
+    #[test]
+    fn json_list_sdk_payload_preserves_default_row_wire_shape() {
+        let models = list_models_json("codex", &ModelCatalog::default_catalog()).unwrap();
+        let env = Envelope::success(SCHEMA_MODELS_V1, None, ModelsPayload::new(models));
+        let value: Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(value["schema"], "csq.models.v1");
+        assert_eq!(value["ok"], true);
+        assert!(value.get("payload").is_none());
+        let row = value["models"][0].as_object().unwrap();
+        let keys: std::collections::BTreeSet<_> = row.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "provider_id",
+                "provider_name",
+                "model_id",
+                "model_name",
+                "is_default",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(row["provider_id"], "codex");
+        assert_eq!(row["is_default"], true);
+    }
+
     // ── JSON registry-union coverage (GH an internal ticket, closes an internal ticket) ──────────
+
+    #[test]
+    fn deepseek_v41_json_list_exposes_canonical_flash_and_preserves_pro() {
+        let entries = list_models_json("deepseek", &ModelCatalog::default_catalog()).unwrap();
+        let envelope = Envelope::success(SCHEMA_MODELS_V1, None, ModelsPayload::new(entries));
+        let value: Value = serde_json::from_str(&envelope.to_line().unwrap()).unwrap();
+        assert_eq!(value["schema"], "csq.models.v1");
+        assert_eq!(value["ok"], true);
+        let rows = value["models"].as_array().unwrap();
+        let flash = rows
+            .iter()
+            .find(|row| row["model_id"] == "deepseek-flash")
+            .unwrap();
+        assert_eq!(flash["model_name"], "DeepSeek V4.1 Flash");
+        assert_eq!(flash["context_window"], 1_000_000);
+        assert_eq!(flash["output_limit"], 384_000);
+        assert!(flash["aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alias| alias == "deepseek-v4-flash"));
+        assert!(rows.iter().any(|row| row["model_id"] == "deepseek-v4-pro"));
+        assert!(!rows
+            .iter()
+            .any(|row| row["model_id"] == "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn deepseek_v41_switch_aliases_write_only_selected_private_slot() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(15u16).unwrap();
+        let config = dir.path().join("config-15");
+        std::fs::create_dir_all(&config).unwrap();
+        // This path exercises the settings writer, not discovery/login. No key
+        // or host account is needed, and no live provider command is spawned.
+        let original = serde_json::json!({
+            "effortLevel": "max",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_MODEL": "deepseek-v4-flash",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "explicit-user-choice",
+                "KEEP_FIXTURE_SETTING": "preserved"
+            }
+        });
+        let path = config.join("settings.json");
+        let other = dir.path().join("settings-deepseek.json");
+        std::fs::write(&other, b"private-global-sentinel").unwrap();
+        for subagent in [
+            "explicit-user-choice",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        ] {
+            let mut original = original.clone();
+            original["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = Value::String(subagent.to_string());
+            for query in [
+                "deepseek-flash",
+                "deepseek-flash[1m]",
+                "4.1",
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp",
+            ] {
+                std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+                handle_switch(dir.path(), "deepseek", query, Some(slot), false, false).unwrap();
+                let actual: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let mut expected = original.clone();
+                for key in csq_core::session::merge::MODEL_KEYS {
+                    expected["env"][*key] = Value::String("deepseek-flash[1m]".to_string());
+                }
+                if subagent == "deepseek-v4-flash" {
+                    expected["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] =
+                        Value::String("deepseek-flash[1m]".to_string());
+                }
+                assert_eq!(
+                    actual, expected,
+                    "query {query} must change only model-selector keys"
+                );
+                assert_eq!(std::fs::read(&other).unwrap(), b"private-global-sentinel");
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_global_switch_preserves_context_annotation_and_effort() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings-deepseek.json");
+        let original = serde_json::json!({
+            "effortLevel": "max",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_MODEL": "deepseek-v4-flash",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
+                "CLAUDE_CODE_EFFORT_LEVEL": "max"
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        handle_switch(dir.path(), "deepseek", "4.1", None, false, false).unwrap();
+        let actual: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut expected = original;
+        for key in csq_core::session::merge::MODEL_KEYS {
+            expected["env"][*key] = Value::String("deepseek-flash[1m]".to_string());
+        }
+        expected["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] =
+            Value::String("deepseek-flash[1m]".to_string());
+        assert_eq!(actual, expected);
+    }
 
     /// The regression this module was built to fix: `csq models list --json
     /// grok` used to fail `Error: unknown provider: grok` (rc=1) — `grok` is
@@ -635,7 +934,20 @@ mod tests {
     #[test]
     fn json_list_all_covers_every_known_id() {
         let catalog = ModelCatalog::default_catalog();
-        let entries = list_models_json("all", &catalog).expect("`all` never fails");
+        // Production still performs live Ollama discovery. This registry
+        // coverage test injects the producer instead of consulting OLLAMA_HOST
+        // or a maintainer's local/remote server.
+        let mut calls = 0;
+        let entries = list_models_json_with_ollama("all", &catalog, || {
+            calls += 1;
+            vec!["synthetic-private-model:latest".to_string()]
+        })
+        .expect("`all` never fails");
+        assert_eq!(calls, 1);
+        assert!(entries
+            .iter()
+            .any(|row| row.provider_id == "ollama"
+                && row.model_id == "synthetic-private-model:latest"));
         let covered: std::collections::HashSet<&str> =
             entries.iter().map(|e| e.provider_id.as_str()).collect();
         for id in registry::known_ids() {
@@ -663,8 +975,8 @@ mod tests {
 
     /// Dispatch is keyed off `ProviderDescriptor::kind`, not a per-id string
     /// chain: EVERY native descriptor (not just grok) reports a
-    /// default-marked row with no catalog lookup, driven purely by `kind ==
-    /// ProviderKind::Native`.
+    /// default-marked row when the bundled catalog has no native entries,
+    /// driven by `kind == ProviderKind::Native`. Runtime rows are tested above.
     #[test]
     fn entries_for_dispatches_every_native_descriptor_by_kind_not_id() {
         let catalog = ModelCatalog::default_catalog();
@@ -778,6 +1090,60 @@ mod tests {
             .and_then(|x| x.as_str())
             .unwrap();
         assert!(model.starts_with("claude-opus-4-"), "got: {model}");
+    }
+
+    /// Asking for the `[1m]` form must write the `[1m]` form: Claude Code
+    /// sizes the window from the suffix (200000 without it, 1000000 with it).
+    /// Falsifying result: `claude-opus-5-5`, which is what the catalog-id
+    /// write produced before `with_context_annotation`.
+    #[test]
+    fn switch_claude_keeps_the_1m_annotation() {
+        let dir = TempDir::new().unwrap();
+        handle_switch(
+            dir.path(),
+            "claude",
+            "claude-opus-5-5[1m]",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.pointer("/env/ANTHROPIC_MODEL").and_then(|x| x.as_str()),
+            Some("claude-opus-5-5[1m]")
+        );
+    }
+
+    #[test]
+    fn context_annotation_is_kept_only_where_the_window_exists() {
+        let one_m = Some(1_000_000);
+        assert_eq!(
+            with_context_annotation("claude", "claude-opus-5-5", "claude-opus-5-5", one_m),
+            "claude-opus-5-5"
+        );
+        // A 200K model never gets a 1M promise, whatever was asked.
+        assert_eq!(
+            with_context_annotation(
+                "claude",
+                "haiku[1m]",
+                "claude-haiku-4-5-20251001",
+                Some(200_000)
+            ),
+            "claude-haiku-4-5-20251001"
+        );
+        // An id carrying the annotation natively is not doubled.
+        assert_eq!(
+            with_context_annotation("zai", "glm-5.3[1m]", "glm-5.3[1m]", one_m),
+            "glm-5.3[1m]"
+        );
+        assert_eq!(
+            with_context_annotation("claude", "opus[1M]", "claude-opus-4-8", one_m),
+            "claude-opus-4-8[1m]"
+        );
     }
 
     #[test]
@@ -1015,6 +1381,25 @@ mod tests {
             dir.path(),
             "gemini",
             "pro",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 4), "gemini-2.5-pro");
+    }
+
+    /// `[1m]` is Claude Code's annotation. A Gemini slot asked for
+    /// `gemini-2.5-pro[1m]` must still write the vendor id, or gemini-cli
+    /// sends the suffixed id to Google. Falsifying result: `gemini-2.5-pro[1m]`.
+    #[test]
+    fn switch_gemini_never_writes_the_1m_annotation() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "gemini-2.5-pro[1m]",
             Some(AccountNum::try_from(4u16).unwrap()),
             false,
             false,

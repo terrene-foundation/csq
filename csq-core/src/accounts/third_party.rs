@@ -20,7 +20,7 @@ use crate::accounts::profiles;
 use crate::accounts::profiles::AccountProfile;
 use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::error::ConfigError;
-use crate::platform::fs::{atomic_replace, secure_file};
+use crate::platform::fs::atomic_replace;
 use crate::providers;
 use crate::providers::catalog::Surface;
 use crate::session::merge::MODEL_KEYS;
@@ -441,7 +441,7 @@ pub fn bind_provider_to_slot(
     // from one provider to another leaves the prior provider's
     // extra_env keys orphaned in the env block — e.g. binding slot 6
     // to DeepSeek then to MiniMax would leave
-    // CLAUDE_CODE_SUBAGENT_MODEL=deepseek-v4-flash visible to every
+    // CLAUDE_CODE_SUBAGENT_MODEL=deepseek-flash[1m] visible to every
     // MiniMax invocation. Mirrors the same purge in
     // unbind_provider_from_slot. Code review HIGH-1.
     purge_previous_provider_extras(env);
@@ -487,6 +487,8 @@ pub fn bind_provider_to_slot(
     );
     env.insert(key_env_var.to_string(), Value::String(token));
     let model_to_write = model.unwrap_or(provider.default_model);
+    let model_to_write =
+        providers::models::claude_code_model_selector(model_to_write, provider.default_base_url);
     for model_key in MODEL_KEYS {
         env.insert(
             (*model_key).to_string(),
@@ -518,25 +520,15 @@ pub fn bind_provider_to_slot(
             reason: "settings serialize failed".into(),
         })?;
 
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate `std::fs::write` + `secure_file` pair
+    // would leave open for this API-key-bearing settings file (red-team B2).
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ConfigError::InvalidJson {
             path: tmp.clone(),
             reason: format!("write: {e}"),
-        });
-    }
-    // SECURITY: propagate (not `.ok()`) — a silent permission failure would
-    // publish the credential file at the umask default, potentially
-    // world-readable. Fail closed. Red-team B2: `std::fs::write` above
-    // created `tmp` at umask-default permissions with the token in
-    // plaintext; on any failure path below we MUST `remove_file`
-    // before propagating so the token isn't left readable on disk.
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("secure_file: {e}"),
         });
     }
     if let Err(e) = atomic_replace(&tmp, &settings_path) {
@@ -835,19 +827,15 @@ pub fn bind_cloud_claude_backend_to_slot(
             path: settings_path.clone(),
             reason: "settings serialize failed".into(),
         })?;
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate `std::fs::write` + `secure_file` pair
+    // would leave open for this Bedrock-bearer-token-bearing settings file.
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ConfigError::InvalidJson {
             path: tmp.clone(),
             reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("secure_file: {e}"),
         });
     }
     if let Err(e) = atomic_replace(&tmp, &settings_path) {
@@ -1010,20 +998,15 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
     // holds the 3P token (we just removed the env block), the
     // unrelated settings fields that DO remain (permissions,
     // plugins, user env vars) may still be sensitive, and the
-    // umask-default artifact would be surprising.
+    // umask-default artifact would be surprising. `write_new_private`
+    // creates the tmp file at 0o600 at creation (§5a), closing the
+    // window a separate `std::fs::write` + `secure_file` pair left open.
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ConfigError::InvalidJson {
             path: tmp.clone(),
             reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("secure_file: {e}"),
         });
     }
     if let Err(e) = atomic_replace(&tmp, &settings_path) {
@@ -1760,7 +1743,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let real = write_fake_sa(dir.path());
         let link = dir.path().join("sa-link.json");
+        // This fixture requires a real symlink: never degrade to a hard link,
+        // copy, or a skipped assertion when Windows symlink creation is denied.
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&real, &link)
+            .expect("symlink fixture requires Windows Developer Mode or symlink privilege");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let slot = AccountNum::try_from(5u16).unwrap();
         let err = bind_cloud_claude_backend_to_slot(
             dir.path(),
@@ -2011,6 +2004,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deepseek_v41_bind_override_uses_one_million_selectors_for_all_flash_tiers() {
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(15u16).unwrap();
+        for model in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "deepseek-flash[1m]",
+        ] {
+            bind_provider_to_slot(
+                dir.path(),
+                "deepseek",
+                slot,
+                Some("sk-private-fixture"),
+                Some(model),
+            )
+            .unwrap();
+            let content = std::fs::read(dir.path().join("config-15/settings.json")).unwrap();
+            let settings: Value = serde_json::from_slice(&content).unwrap();
+            for key in MODEL_KEYS
+                .iter()
+                .copied()
+                .chain(["CLAUDE_CODE_SUBAGENT_MODEL"])
+            {
+                assert_eq!(settings["env"][key], "deepseek-flash[1m]", "{model}: {key}");
+            }
+            assert_eq!(settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "max");
+            assert_eq!(
+                settings["env"]["ANTHROPIC_BASE_URL"],
+                "https://api.deepseek.com/anthropic"
+            );
+        }
+    }
+
     /// Rebinding with a new key must overwrite the old AUTH_TOKEN
     /// but still preserve unrelated fields.
     /// Regression: per-slot bind MUST apply `provider.extra_env` after
@@ -2032,32 +2061,87 @@ mod tests {
         let env = json.get("env").unwrap();
 
         // MODEL_KEYS fan-out: opus + sonnet + ANTHROPIC_MODEL +
-        // ANTHROPIC_SMALL_FAST_MODEL stay at pro (the default_model).
+        // ANTHROPIC_SMALL_FAST_MODEL all carry the default_model, now
+        // `deepseek-flash[1m]`.
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").unwrap(),
-            "deepseek-v4-pro"
+            "deepseek-flash[1m]"
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").unwrap(),
-            "deepseek-v4-pro"
+            "deepseek-flash[1m]"
         );
-        // extra_env override: haiku is flash, NOT pro.
+        // The haiku override now yields the SAME value as the fan-out, so it no
+        // longer discriminates on its own. The regression check keeps its teeth
+        // on the assertions BELOW: `CLAUDE_CODE_SUBAGENT_MODEL` and
+        // `CLAUDE_CODE_EFFORT_LEVEL` sit outside MODEL_KEYS, so only a slot path
+        // that properly applies `extra_env` after the fan-out can emit them.
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").unwrap(),
-            "deepseek-v4-flash"
+            "deepseek-flash[1m]"
         );
         // Non-MODEL_KEYS extras are present.
         assert_eq!(
             env.get("CLAUDE_CODE_SUBAGENT_MODEL").unwrap(),
-            "deepseek-v4-flash"
+            "deepseek-flash[1m]"
         );
         assert_eq!(env.get("CLAUDE_CODE_EFFORT_LEVEL").unwrap(), "max");
+    }
+
+    /// an internal ticket: the per-slot bind path is what `csq setkey` drives, so the
+    /// auto-compact window has to land HERE too — the global
+    /// `providers::settings::default_settings` path alone would leave every
+    /// CLI-bound 3P slot with auto-compact still dead.
+    ///
+    /// All four 3P providers now carry the SAME uniform 1_048_576, so this
+    /// test no longer distinguishes "zai's own value" from "kimi's value
+    /// leaked" by the number alone -- that discrimination is GONE and is
+    /// replaced by asserting the companion pair and the purge-on-rebind. The
+    /// leak this guards is now caught by the ollama rebind below, which must
+    /// leave the key absent.
+    #[test]
+    fn bind_writes_auto_compact_window_and_purges_it_on_rebind_to_ollama() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(6u16).unwrap();
+
+        bind_provider_to_slot(dir.path(), "zai", slot, Some("sk-test-zai"), None).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("config-6/settings.json")).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            json["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1048576",
+            "zai bind must carry its own 1M window"
+        );
+        assert_eq!(
+            json["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1048576",
+            "and pair it with the companion at the SAME value"
+        );
+
+        let slot2 = AccountNum::try_from(7u16).unwrap();
+        bind_provider_to_slot(dir.path(), "kimi", slot2, Some("sk-test-kimi"), None).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("config-7/settings.json")).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            json["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1048576",
+            "kimi keeps its docs-mandated full window"
+        );
+
+        // Rebind slot 6 zai -> ollama. `gemma4` has no window, so the key must
+        // be GONE rather than left at zai's 1048576: a stale window would tell
+        // CC gemma4 has room it does not have, and compaction would fire late.
+        bind_provider_to_slot(dir.path(), "ollama", slot, None, None).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("config-6/settings.json")).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            json["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none(),
+            "rebinding to a window-less model must purge the stale window, got {:?}",
+            json["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+        );
     }
 
     /// Regression: rebinding a slot from one provider to another MUST
     /// purge the previous provider's `extra_env` keys. Code review
     /// HIGH-1: without this, binding slot 6 to DeepSeek then to
-    /// MiniMax leaves CLAUDE_CODE_SUBAGENT_MODEL=deepseek-v4-flash
+    /// MiniMax leaves CLAUDE_CODE_SUBAGENT_MODEL=deepseek-flash[1m]
     /// visible to every MiniMax invocation on that slot.
     #[test]
     fn rebind_from_deepseek_to_mm_purges_deepseek_extras() {
@@ -2076,7 +2160,7 @@ mod tests {
                 .unwrap()
                 .get("CLAUDE_CODE_SUBAGENT_MODEL")
                 .unwrap(),
-            "deepseek-v4-flash"
+            "deepseek-flash[1m]"
         );
 
         // Step 2: rebind to MiniMax (whose extra_env is empty). The
@@ -2135,16 +2219,22 @@ mod tests {
             "false"
         );
 
-        // Step 2: rebind to MiniMax (empty extra_env). Kimi's four extras must
-        // NOT survive into the MiniMax-bound slot's env block.
+        // Step 2: rebind to MiniMax. Kimi's extras must NOT survive into the
+        // MiniMax-bound slot's env block.
         bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-mm-12345678"), None).unwrap();
         let after_mm: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let env = after_mm.get("env").unwrap();
 
+        // Three of Kimi's four extras are Kimi-specific and must vanish.
+        //
+        // `CLAUDE_CODE_AUTO_COMPACT_WINDOW` left this list in an internal ticket. MiniMax
+        // now declares the same 1_048_576 window, so after the rebind the key is
+        // legitimately present — but at MiniMax's value, not Kimi's. The leak
+        // this test guards is still guarded, and more strictly: "absent" never
+        // distinguished "purged" from "replaced by the correct value".
         for leaked in [
             "ENABLE_TOOL_SEARCH",
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
             "CLAUDE_CODE_EFFORT_LEVEL",
             "CLAUDE_CODE_SUBAGENT_MODEL",
         ] {
@@ -2153,6 +2243,11 @@ mod tests {
                 "Kimi's {leaked} must be purged on rebind to MiniMax"
             );
         }
+        assert_eq!(
+            env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").unwrap(),
+            "1048576",
+            "must be MiniMax's OWN window, not Kimi's 1048576"
+        );
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL").unwrap(),
             "https://api.minimax.io/anthropic"
@@ -2181,11 +2276,11 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").unwrap(),
-            "deepseek-v4-flash"
+            "deepseek-flash[1m]"
         );
         assert_eq!(
             env.get("CLAUDE_CODE_SUBAGENT_MODEL").unwrap(),
-            "deepseek-v4-flash"
+            "deepseek-flash[1m]"
         );
         assert_eq!(env.get("CLAUDE_CODE_EFFORT_LEVEL").unwrap(), "max");
     }

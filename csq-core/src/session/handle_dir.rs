@@ -475,7 +475,7 @@ pub fn find_unregistered_ephemeral_looking_dirs(base_dir: &Path) -> Vec<String> 
 /// - Symlinks to `~/.claude/<item>` for each shared item
 /// - A `.live-pid` file with the csq CLI PID
 ///
-/// All account-bound symlinks are created via [`create_symlink`] (platform-aware:
+/// All account-bound symlinks are created via `create_symlink` (platform-aware:
 /// Unix `std::os::unix::fs::symlink`; Windows dispatches dir-junction-vs-hardlink
 /// based on target type). M1-3's [`crate::platform::fs::symlink_exclusive`] is a
 /// directory-junction-only primitive and does NOT handle the file-target case on
@@ -577,6 +577,33 @@ pub fn create_handle_dir_named(
             dir_name,
             recorded = ?recorded_pid,
             "handle dir already exists with dead or missing PID — removing orphan"
+        );
+        // `keychain-fix-r11.md` S-MEDIUM-1 / D-4: this custom-named
+        // namespace (`create_handle_dir_named` serves non-`term-*` callers
+        // like the phase2b interactive-capture dirs) has NO daemon reaper of
+        // its own — `sweep_dead_handles` only walks `term-*` names. This
+        // orphan-removal path is the ONLY chance this dir's keychain item
+        // (if any) will ever be cleared — once `remove_dir_all` below runs,
+        // the canonicalized path that produces its keychain service name is
+        // gone forever. Run the SAME dead-handle clear the term-* reaper
+        // uses (`clear_dead_handle_keychain_item` -> decide+adopt, queuing a
+        // pending-clear retry on an unconfirmed result), BEFORE the
+        // directory disappears.
+        let http_get: crate::daemon::usage_poller::HttpGetFn =
+            std::sync::Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+                crate::http::get_bearer_node(url, token, headers)
+            });
+        clear_dead_handle_keychain_item(
+            &handle_dir,
+            recorded_pid.unwrap_or(0),
+            base_dir,
+            &mut |abs| {
+                keychain::decide_and_clear_dead_handle(base_dir, abs, &|account, candidate| {
+                    crate::daemon::custodian::adopt_single_candidate_before_delete(
+                        base_dir, account, candidate, &http_get,
+                    )
+                })
+            },
         );
         std::fs::remove_dir_all(&handle_dir).map_err(|e| CredentialError::Io {
             path: handle_dir.clone(),
@@ -694,6 +721,48 @@ pub fn create_handle_dir_named(
 
     // Write .live-pid with the csq CLI PID
     markers::write_live_pid(&handle_dir, pid)?;
+
+    // `keychain-fix-r11.md` S-MEDIUM-1 / D-4: PID reuse makes THIS fresh
+    // dir's canonicalized path — and therefore its keychain `service_name` —
+    // identical to whatever PRIOR session last occupied the same PID. Any
+    // pending-clear queue entry recorded against that same service is
+    // resolved — its OWN disposition run against the real keychain item —
+    // now, under this dir's own per-dir swap lock and before this session's
+    // own keychain write (`force_sync_for_launch`) ever lands, so a
+    // surviving `Logout`-origin entry actually clears the stale item rather
+    // than merely being dropped (the retired `drop_pending_clear_for_service`
+    // silently left the item behind — S-MEDIUM-1). `canonicalize_for_
+    // keychain_sync`/`resolve_pending_clear_at_creation` are both
+    // cross-platform (the latter a no-op off macOS) — no `#[cfg]` needed at
+    // this call site. `TimedOut`/`Failed` skip the resolve for this cycle
+    // (fixed-tag warn) rather than proceeding unlocked — the entry, if any,
+    // stays queued for the daemon's own `sweep_pending_clears` to retry.
+    let (handle_dir_abs, keychain_write_allowed) =
+        keychain::canonicalize_for_keychain_sync(&handle_dir);
+    if keychain_write_allowed {
+        match keychain::lock_handle_dir_for_swap_bounded(&handle_dir_abs) {
+            keychain::BoundedLockOutcome::Acquired(_guard) => {
+                keychain::resolve_pending_clear_at_creation(
+                    base_dir,
+                    &keychain::service_name(&handle_dir_abs),
+                );
+            }
+            keychain::BoundedLockOutcome::NotNeeded => {
+                keychain::resolve_pending_clear_at_creation(
+                    base_dir,
+                    &keychain::service_name(&handle_dir_abs),
+                );
+            }
+            keychain::BoundedLockOutcome::TimedOut | keychain::BoundedLockOutcome::Failed => {
+                warn!(
+                    error_kind = "keychain_pending_clear_resolve_lock_unavailable",
+                    "could not acquire the per-dir swap lock to resolve a stale \
+                     pending-clear entry at handle-dir creation; entry, if any, \
+                     stays queued for the daemon's own retry"
+                );
+            }
+        }
+    }
 
     info!(pid, account = %account, path = %handle_dir.display(), "handle dir created");
     Ok(handle_dir)
@@ -944,15 +1013,15 @@ pub fn create_handle_dir_codex_named(
     Ok(handle_dir)
 }
 
-/// Writes `handle_dir/settings.json` as a real file by deep-merging
-/// `claude_home/settings.json` (base) with the slot-keyed overlay.
+/// Writes `<handle_dir>/settings.json` as a real file by deep-merging
+/// `<claude_home>/settings.json` (base) with the slot-keyed overlay.
 ///
 /// ## M2-3 / M4-2 overlay resolution (spec 02 §2.3.3)
 ///
 /// The overlay source is chosen by the following priority:
 /// 1. `uuid_settings_path` — when `Some(path)` AND the file exists at `path`,
 ///    use it as the overlay (UUID-keyed canonical, Phase 2 active path).
-/// 2. `config_dir/settings.json` — fallback for legacy-only layouts where
+/// 2. `<config_dir>/settings.json` — fallback for legacy-only layouts where
 ///    `identities/<UUID>/settings.json` has not been materialized yet (Phase 1
 ///    remaining slots, fresh-install, or daemon Pass 0 not yet run).
 ///
@@ -969,16 +1038,16 @@ pub fn create_handle_dir_codex_named(
 /// plugins, env experiments). The overlay carries slot-specific env for
 /// 3P bindings (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
 /// `ANTHROPIC_MODEL`). Precedence is slot overlay > user-global > csq
-/// defaults ([`default_settings`]): overlay keys win on merge, and a csq
+/// defaults (`default_settings`): overlay keys win on merge, and a csq
 /// default fills in only when neither the user-global nor the overlay
 /// sets the key. For OAuth slots where neither overlay source is present,
 /// the materialized file equals the user's global settings plus any csq
 /// default the user has not explicitly set (currently `effortLevel:
-/// "high"` — an explicit `effortLevel` in the global, e.g. `"xhigh"`,
+/// "medium"` — an explicit `effortLevel` in the global, e.g. `"xhigh"`,
 /// always wins).
 ///
 /// Failures at each step:
-/// - Missing `claude_home/settings.json` → base is `{}`
+/// - Missing `<claude_home>/settings.json` → base is `{}`
 /// - Invalid JSON in either source → logged at WARN, treated as `{}`
 /// - Write / secure_file / rename → propagated as [`CredentialError`]
 ///
@@ -1007,13 +1076,14 @@ pub fn materialize_handle_settings(
 /// `~/.claude/settings.json` or in a slot overlay always wins; the
 /// default fills in only when neither sets it.
 ///
-/// `effortLevel: "high"` — the default effort for Claude Code CLI
-/// sessions on Anthropic OAuth slots (csq 1–10). Without this layer the
-/// handle inherits whatever CC's built-in default is (currently
-/// `xhigh`); users who explicitly set `effortLevel` in their global keep
-/// their choice untouched.
+/// `effortLevel: "medium"` — the default effort for Claude Code CLI
+/// sessions on Anthropic OAuth slots (csq 1–10), set by the maintainer
+/// 2026-09-25 (previously `"high"`). Without this layer the handle inherits
+/// whatever CC's built-in default is (currently `xhigh`); users who
+/// explicitly set `effortLevel` in their global, or a slot overlay that
+/// sets it (3P bindings pin their own), keep their choice untouched.
 fn default_settings() -> Value {
-    serde_json::json!({ "effortLevel": "high" })
+    serde_json::json!({ "effortLevel": "medium" })
 }
 
 /// Internal implementation for [`materialize_handle_settings`] with optional
@@ -1021,13 +1091,79 @@ fn default_settings() -> Value {
 ///
 /// Called by:
 /// - `materialize_handle_settings` (passes `None` for `uuid_settings_path`)
-/// - `create_handle_dir` and `repoint_handle_dir` (pass the resolved UUID path)
+/// - `create_handle_dir` (pass the resolved UUID path)
+///
+/// S-H1/D-F1 fix: `repoint_handle_dir` no longer calls this directly. It
+/// calls [`prepare_handle_settings_tmp`] BEFORE its symlink rename loop
+/// touches anything, then [`commit_prepared_handle_settings`] as the final
+/// step of that same loop's commit — folding the settings write into the
+/// existing rollback story instead of leaving it as an unrollback-able `?`
+/// after every `ACCOUNT_BOUND_ITEMS` symlink has already moved. This
+/// wrapper still performs both halves back-to-back for `create_handle_dir`
+/// and the public no-UUID entry point, where there is no rename loop to
+/// fold into and a failure here has nothing else to roll back.
 fn materialize_handle_settings_inner(
     handle_dir: &Path,
     claude_home: &Path,
     config_dir: &Path,
     uuid_settings_path: Option<&Path>,
 ) -> Result<(), CredentialError> {
+    let tmp = prepare_handle_settings_tmp(handle_dir, claude_home, config_dir, uuid_settings_path)?;
+    let settings_path = handle_dir.join("settings.json");
+    commit_prepared_handle_settings(&tmp, &settings_path).map_err(|e| CredentialError::Corrupt {
+        path: settings_path,
+        reason: format!("atomic replace: {e}"),
+    })
+}
+
+/// L2 (`security.md` §5a): creates `tmp` EXCLUSIVELY (`O_EXCL` via
+/// `create_new(true)`) at `mode(0o600)` on unix, then writes `content` to
+/// it. `std::fs::write` — used here until this fix — opens with `O_CREAT`
+/// but NOT `O_EXCL`, at umask-default permissions (typically 0o644): if an
+/// attacker (or a stale leftover from a crashed prior run) has already
+/// planted a symlink OR a regular file at `tmp`'s predicted path (`PID +
+/// process-local counter` — `crate::platform::fs::unique_tmp_path`, not a
+/// secret), `write` follows it and overwrites/exposes THAT target rather
+/// than refusing, and there is a window between the write landing and a
+/// separate `secure_file` call in which the content sits world-readable.
+/// `create_new` fails the open with `AlreadyExists` against ANY
+/// pre-existing directory entry there — including a dangling symlink whose
+/// target does not even exist — instead of following it; `mode(0o600)`
+/// removes the world-readable window entirely rather than relying on a
+/// later `secure_file` call to close it after the fact. On a write failure
+/// (not an open failure) the created tmp file is removed — an open
+/// failure never created anything to clean up.
+/// Thin `std::io::Result` wrapper around
+/// [`write_new_private`](crate::platform::fs::write_new_private) — this
+/// function used to duplicate that helper's `create_new` + `mode(0o600)`
+/// body directly; kept as a named wrapper (rather than inlining the call
+/// at the one production callsite) so this module's own dedicated tests
+/// below stay unchanged, and because callers here propagate a bare
+/// `std::io::Error` (`CredentialError::Io { source: e }`) rather than
+/// `PlatformError`.
+fn create_tmp_exclusive(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
+    crate::platform::fs::write_new_private(tmp, content)
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// S-H1/D-F1: merges the settings JSON for `config_dir`/`uuid_settings_path`
+/// and writes the result to a freshly-allocated temp path next to
+/// `<handle_dir>/settings.json`, securing it — but does NOT touch
+/// `<handle_dir>/settings.json` itself. Every failure branch here fires
+/// BEFORE any mutation of `handle_dir`, so a caller that has not yet
+/// mutated anything else can propagate the error as-is: there is nothing
+/// to roll back (consistent with every other pre-mutation refusal in this
+/// module — `CredentialError::repoint_rolled_back()` reporting `None` for
+/// these variants is correct here specifically because nothing moved).
+///
+/// Returns the prepared temp path on success; the caller commits it via
+/// [`commit_prepared_handle_settings`].
+fn prepare_handle_settings_tmp(
+    handle_dir: &Path,
+    claude_home: &Path,
+    config_dir: &Path,
+    uuid_settings_path: Option<&Path>,
+) -> Result<PathBuf, CredentialError> {
     let base = read_json_object_or_empty(&claude_home.join("settings.json"));
 
     // M2-3: prefer the UUID-keyed settings.json when present (Phase 2 active
@@ -1057,12 +1193,17 @@ fn materialize_handle_settings_inner(
     })?;
 
     let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    // §5a cleanup: handle dir settings.json is the MERGED view of
+    // §5a cleanup (L2): handle dir settings.json is the MERGED view of
     // claude_home + slot's config-<N>/settings.json — and the slot's
-    // settings.json carries ANTHROPIC_AUTH_TOKEN per the bind/unbind
-    // path. Partial-failure leaves a token-bearing tmp at umask 0o644.
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
+    // settings.json carries ANTHROPIC_AUTH_TOKEN per the bind/unbind path.
+    // `create_tmp_exclusive` (below) opens with `O_EXCL` + `mode(0o600)`
+    // rather than `std::fs::write`'s `O_CREAT`-without-`O_EXCL` at
+    // umask-default permissions — see that fn's doc for why.
+    if let Err(e) = create_tmp_exclusive(&tmp, json.as_bytes()) {
+        // create_tmp_exclusive already cleaned up its own tmp on a
+        // WRITE failure; an `open` refusal (planted symlink/file, or a
+        // genuine PID+counter collision) never created anything to clean
+        // up in the first place.
         return Err(CredentialError::Io {
             path: tmp,
             source: e,
@@ -1075,11 +1216,37 @@ fn materialize_handle_settings_inner(
             reason: format!("secure_file: {e}"),
         });
     }
-    if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &settings_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CredentialError::Corrupt {
-            path: settings_path,
-            reason: format!("atomic replace: {e}"),
+    Ok(tmp)
+}
+
+/// S-H1/D-F1: commits a temp file prepared by [`prepare_handle_settings_tmp`]
+/// into `settings_path` via a single rename (`atomic_replace`). This is the
+/// ONLY fallible operation `repoint_handle_dir` performs after its symlink
+/// rename loop has started mutating disk — folding it into the loop's own
+/// rollback path (rather than leaving it as a trailing `?` with no
+/// rollback) is the whole point of the prepare/commit split.
+///
+/// Returns the raw I/O error (rather than a `CredentialError`) so
+/// `repoint_handle_dir` can carry it directly in
+/// `CredentialError::RepointFailed { source: io::Error, .. }` alongside a
+/// truthful `rolled_back`, exactly like a failed symlink rename. On
+/// failure the temp file is removed here (`atomic_replace`'s underlying
+/// `rename(2)` leaves the source in place on error) — the caller never
+/// needs to clean it up itself.
+fn commit_prepared_handle_settings(tmp: &Path, settings_path: &Path) -> std::io::Result<()> {
+    // S-H1/D-F1 test-only fault seam — see the `thread_local!` block above
+    // `repoint_lock_path` for the full contract.
+    if repoint_fail_settings_commit_for_test() {
+        let _ = std::fs::remove_file(tmp);
+        return Err(std::io::Error::other(
+            "injected test failure (repoint_fail_settings_commit_for_test)",
+        ));
+    }
+    if let Err(e) = crate::platform::fs::atomic_replace(tmp, settings_path) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(match e {
+            crate::error::PlatformError::Io(io_err) => io_err,
+            other => std::io::Error::other(other.to_string()),
         });
     }
     Ok(())
@@ -1105,6 +1272,329 @@ fn read_json_object_or_empty(path: &Path) -> Value {
             Value::Object(serde_json::Map::new())
         }
     }
+}
+
+/// F2(a): what one `ACCOUNT_BOUND_ITEMS` link held immediately before
+/// [`repoint_handle_dir`]'s rename loop touched it — either it did not
+/// exist, or it resolved to a specific target. Snapshotting every item
+/// BEFORE the loop starts (rather than only the ones it successfully
+/// moves) is what lets a failure partway through restore each
+/// already-moved item to exactly what it held, rather than merely
+/// reporting which items moved and leaving the rest to the caller.
+enum PreRepointLinkState {
+    Absent,
+    Target(PathBuf),
+}
+
+/// S7: `symlink_metadata` (never `read_link` alone) is the ONLY primitive
+/// that can tell "genuinely absent" apart from "exists, but is a real file
+/// or directory, not a symlink" — `read_link`'s `Err` collapses both into
+/// the same outcome, which is what let [`PreRepointLinkState::Absent`]
+/// silently stand in for a REAL file. A caller about to rename a symlink
+/// OVER that path (see the pre-flight guard in [`repoint_handle_dir`],
+/// which runs before this function's result is ever used to mutate
+/// anything) must see the distinction, not lose it here.
+fn snapshot_link_state(handle_dir: &Path, item: &str) -> PreRepointLinkState {
+    let path = handle_dir.join(item);
+    let is_symlink = path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    if !is_symlink {
+        return PreRepointLinkState::Absent;
+    }
+    match std::fs::read_link(&path) {
+        Ok(target) => PreRepointLinkState::Target(target),
+        // A symlink `symlink_metadata` just confirmed, but `read_link` can no
+        // longer read — a race with a concurrent unlink. Genuinely absent now.
+        Err(_) => PreRepointLinkState::Absent,
+    }
+}
+
+/// F2: best-effort restore of one `item`'s link at `handle_dir` back to
+/// `state`. Also removes any leftover `{item}.swap-tmp` — a rename that
+/// failed partway can leave the temp symlink behind, and the caller's
+/// message (F2(d)) is only accurate if that temp file is gone. Returns
+/// `false` on any failure so the caller can tell "nothing changed" from
+/// "may be partially switched" — never panics, and never leaves the
+/// process in a worse state than it found it.
+fn restore_link_state(handle_dir: &Path, item: &str, state: &PreRepointLinkState) -> bool {
+    // S2 test-only fault seam: simulate THIS item's own restore failing
+    // (e.g. the item's `create_symlink` call failing) so a caller-facing
+    // test can prove a rollback that ITSELF fails is correctly reported as
+    // `rolled_back: false`, distinct from a rollback that never ran.
+    if repoint_fail_restore_for_item_for_test() == Some(item) {
+        return false;
+    }
+    let link_path = handle_dir.join(item);
+    let tmp_path = handle_dir.join(format!("{item}.swap-tmp"));
+    let _ = std::fs::remove_file(&tmp_path);
+    match state {
+        PreRepointLinkState::Absent => {
+            if link_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&link_path).is_ok()
+            } else {
+                true
+            }
+        }
+        PreRepointLinkState::Target(previous_target) => {
+            if link_path.symlink_metadata().is_ok() && std::fs::remove_file(&link_path).is_err() {
+                return false;
+            }
+            create_symlink(previous_target, &link_path).is_ok()
+        }
+    }
+}
+
+/// F2: restore every item named in `moved` to its snapshotted pre-repoint
+/// state. `moved` names both items that were actually renamed into place
+/// AND items whose old link was deleted because the new config lacked a
+/// matching target (F2(c): that branch is a mutation too, not a no-op).
+/// Returns `true` only if EVERY named item was fully restored — the
+/// caller's F2(d) operator message is chosen from this, not from whether
+/// the repoint itself failed.
+fn rollback_repoint(
+    handle_dir: &Path,
+    snapshots: &[(&'static str, PreRepointLinkState)],
+    moved: &[&'static str],
+) -> bool {
+    let mut fully_restored = true;
+    for item in moved {
+        if let Some((_, state)) = snapshots.iter().find(|(name, _)| name == item) {
+            if !restore_link_state(handle_dir, item, state) {
+                fully_restored = false;
+            }
+        }
+    }
+    fully_restored
+}
+
+/// F2(d)/S1/S2: are `handle_dir`'s `ACCOUNT_BOUND_ITEMS` symlinks mutually
+/// consistent with the account its own `.csq-account` marker names, and no
+/// `*.swap-tmp` leftover remains?
+///
+/// Used by a repoint failure's caller (`csq swap`, `auto_rotate`) to pick
+/// between "the switch did not complete; nothing was changed" and "your
+/// terminal may be partially switched — run `csq swap N` again": re-reads
+/// the actual on-disk state rather than trusting an in-memory flag from
+/// the failed call, so it reports correctly even across a process
+/// boundary or if the failed call's own rollback attempt silently missed
+/// a case.
+///
+/// S1 fix: the prior implementation compared every item's link PARENT
+/// against a single common value, which is a legacy-only invariant — an
+/// identity-keyed slot's `.credentials.json` resolves under
+/// `identities/<UUID>/` while its OTHER three items resolve under
+/// `config-<N>/`, so that comparison was `false` for every identity-keyed
+/// dir regardless of whether anything had actually gone wrong. This
+/// version instead resolves the account the dir's OWN marker names
+/// (`markers::resolve_marker_to_slot`, numeric-or-UUID) and compares each
+/// item's actual link target against the EXPECTED target for THAT
+/// account, via the same [`account_to_identity_paths`] chokepoint
+/// [`create_handle_dir`] and [`repoint_handle_dir`] both build their
+/// targets from — so the comparison is correct for both layouts.
+///
+/// S2 fix: a link that is MISSING now counts as inconsistent whenever its
+/// expected target exists on disk — the prior version silently skipped a
+/// `read_link` error (`let Ok(target) = ... else { continue }`), which
+/// could not distinguish "this item is legitimately absent" (e.g. no
+/// `.credentials.json` for a 3P API-key slot) from "this item's symlink
+/// was deleted mid-repoint and never restored".
+///
+/// K1 fix: S2's "missing + expected exists ⇒ inconsistent" rule is only
+/// correct for `.credentials.json` and `.csq-account` — `create_handle_dir`
+/// links these two whenever the CONFIG dir already carries them, and a
+/// slot's config dir always has both by the time it is usable. But
+/// `.current-account` and `.quota-cursor` are NOT guaranteed to exist yet
+/// at handle-dir creation time (they are written later, by the first
+/// quota poll or by a swap from a DIFFERENT terminal) — so a healthy dir
+/// created before either existed legitimately lacks the link, and a later
+/// write from elsewhere then makes `expected.exists()` true. Under the old
+/// rule that flipped this healthy dir to "inconsistent" and every
+/// subsequent failed-repoint report on it read "may be partially switched"
+/// even after a clean rollback. A missing link for these two items is
+/// therefore never itself a sign of inconsistency; a mismatched
+/// (present-but-wrong-target) link for them still is.
+///
+/// K2/D-Lead: `expected` for `.credentials.json` is resolved through
+/// [`account_to_identity_paths`], which prefers the identity-keyed path
+/// once `profiles.json` maps this slot to a UUID. A handle dir created
+/// while the slot was still legacy-keyed has `.credentials.json` pointed
+/// at `config-<N>/.credentials.json`; if the slot migrates to a UUID
+/// afterward, nothing repoints that dir's existing link. **This is NOT
+/// "correctly keeping working" (the prior wording here, retracted
+/// D-Lead)**: M3-7 retired csq's own writers to the legacy path for any
+/// UUID-keyed slot (spec 02 INV-05 — the legacy mirror is no longer
+/// written), so `config-<N>/.credentials.json` is FROZEN at whatever it
+/// held at migration time. A dir still linked to it silently reads a
+/// stale, never-refreshing credential snapshot while CC's keychain-first
+/// read may still show the account as "working" right up until that
+/// frozen token expires. This function therefore accepts ONLY the
+/// identity-keyed target for `.credentials.json` once the slot has
+/// migrated — for a still-legacy (unmigrated) slot,
+/// [`account_to_identity_paths`] already resolves `credentials_path` to
+/// `config-<N>/.credentials.json`, so the single accepted target still
+/// covers that case without a separate legacy fallback.
+///
+/// The marker itself being unresolvable (no `by_slot` entry, corrupt
+/// `profiles.json`, or the `.csq-account` link itself missing) is
+/// reported as inconsistent: with no account to check targets against,
+/// "consistent" cannot be established.
+///
+/// I2 (B3, 2026-09-26 owner directive): this function's DIRECT caller is
+/// `credentials::keychain::repoint_left_mixed_links` (`base_dir`/
+/// `handle_dir` are threaded straight through, unmodified) — NOT `csq
+/// swap`/`auto_rotate` directly, which is what an earlier revision of this
+/// doc claimed. That claim was doubly stale: at the time it was written,
+/// this function had been revived as production logic only in its OWN
+/// unit tests — `csq swap` and `auto_rotate` did not consult it at the
+/// point a repoint failed at all (the gap B3 fixes). Post-B3,
+/// `repoint_left_mixed_links` IS wired into both callers' error paths
+/// (`csq swap`'s same-surface ClaudeCode route, `daemon::auto_rotate::tick`),
+/// each combining this function's `false` result with
+/// `CredentialError::repoint_rolled_back() == Some(false)` (the OTHER
+/// half of `repoint_left_mixed_links`'s `||`) before choosing the mixed-
+/// links operator line over the plain reconcile-outcome line.
+pub fn handle_dir_symlinks_are_consistent(base_dir: &Path, handle_dir: &Path) -> bool {
+    for item in ACCOUNT_BOUND_ITEMS {
+        if handle_dir
+            .join(format!("{item}.swap-tmp"))
+            .symlink_metadata()
+            .is_ok()
+        {
+            return false;
+        }
+    }
+
+    let Some(account) = markers::resolve_marker_to_slot(base_dir, handle_dir) else {
+        return false;
+    };
+    let identity_paths = account_to_identity_paths(base_dir, account);
+    let config_dir = base_dir.join(format!("config-{}", account.get()));
+
+    for item in ACCOUNT_BOUND_ITEMS {
+        // K1: only `.credentials.json` and `.csq-account` are always
+        // created for a usable slot; a missing link for the other two is
+        // not itself inconsistent.
+        let always_created = *item == ".credentials.json" || *item == ".csq-account";
+
+        // D-Lead: `.credentials.json` accepts ONLY the identity-keyed
+        // target — see this function's doc comment above for why the
+        // prior "either the identity path or this slot's own legacy path"
+        // acceptance was unsound (the legacy path is frozen, not merely a
+        // second valid location).
+        let expected_targets: Vec<PathBuf> = if *item == ".credentials.json" {
+            vec![identity_paths.credentials_path.clone()]
+        } else {
+            vec![config_dir.join(item)]
+        };
+
+        match std::fs::read_link(handle_dir.join(item)) {
+            Ok(actual) if expected_targets.contains(&actual) => {}
+            Ok(_) => return false,
+            Err(_) => {
+                if always_created {
+                    return false;
+                }
+                // else: legitimately absent for this item — not inconsistent.
+            }
+        }
+    }
+    true
+}
+
+// F2 test-only fault seam: when set, the `k`-th item processed by
+// `repoint_handle_dir`'s rename loop (0-indexed, in the loop's own
+// processing order) fails as if `std::fs::rename` returned an error —
+// without touching the filesystem beyond what a real failed rename
+// would leave (the temp symlink still present). Thread-local so
+// concurrent tests never interfere; a `Drop` guard in the test resets it
+// even on panic (the default test harness reuses OS threads across
+// tests, so an unguarded set would leak into an unrelated test).
+// `cfg(all(test, unix))`, not just `cfg(test)`: the only consumer is a
+// `#[cfg(unix)]` test (`repoint_handle_dir` symlinks are POSIX-only), so a
+// bare `cfg(test)` leaves the setter genuinely unused on a Windows test
+// build — `dead_code` under `-D warnings`.
+#[cfg(all(test, unix))]
+thread_local! {
+    static REPOINT_FAIL_AT_RENAME_INDEX: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// F2 test-only fault seam setter — see the `thread_local!` block above
+/// this function for the full contract (what it simulates, why
+/// thread-local, and the `Drop`-guard requirement on callers).
+#[cfg(all(test, unix))]
+pub(crate) fn set_repoint_fail_at_rename_index_for_test(index: Option<usize>) {
+    REPOINT_FAIL_AT_RENAME_INDEX.with(|c| c.set(index));
+}
+
+#[cfg(all(test, unix))]
+fn repoint_fail_at_rename_index_for_test() -> Option<usize> {
+    REPOINT_FAIL_AT_RENAME_INDEX.with(|c| c.get())
+}
+
+#[cfg(not(all(test, unix)))]
+fn repoint_fail_at_rename_index_for_test() -> Option<usize> {
+    None
+}
+
+// S2 test-only fault seam: when set, `restore_link_state` reports failure
+// for the NAMED item regardless of what its own restore logic would have
+// done — lets a test prove a rollback that ITSELF fails (as opposed to one
+// that never runs) is reported as `rolled_back: false`. Thread-local for
+// the same reason as `REPOINT_FAIL_AT_RENAME_INDEX`; reset by the same
+// `RepointFaultGuard` RAII pattern in tests.
+#[cfg(all(test, unix))]
+thread_local! {
+    static REPOINT_FAIL_RESTORE_FOR_ITEM: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn set_repoint_fail_restore_for_item_for_test(item: Option<&'static str>) {
+    REPOINT_FAIL_RESTORE_FOR_ITEM.with(|c| c.set(item));
+}
+
+#[cfg(all(test, unix))]
+fn repoint_fail_restore_for_item_for_test() -> Option<&'static str> {
+    REPOINT_FAIL_RESTORE_FOR_ITEM.with(|c| c.get())
+}
+
+#[cfg(not(all(test, unix)))]
+fn repoint_fail_restore_for_item_for_test() -> Option<&'static str> {
+    None
+}
+
+// S-H1/D-F1 test-only fault seam: when set, `commit_prepared_handle_settings`
+// fails as if the final `atomic_replace` of the prepared settings.json temp
+// file returned an error — without touching the filesystem beyond what a
+// real failed commit would leave (the temp file removed, `settings_path`
+// untouched). Lets a test prove that a failure at THIS specific point —
+// after every `ACCOUNT_BOUND_ITEMS` symlink (including `.csq-account`) has
+// already been renamed — is folded into the same `rollback_repoint` +
+// `RepointFailed` reporting as a mid-loop rename failure, rather than
+// propagating as a bare `Corrupt`/`Io` with no rollback (S-H1/D-F1).
+// Thread-local + `Drop`-guard-reset for the same reason as the two seams
+// above.
+#[cfg(all(test, unix))]
+thread_local! {
+    static REPOINT_FAIL_SETTINGS_COMMIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn set_repoint_fail_settings_commit_for_test(fail: bool) {
+    REPOINT_FAIL_SETTINGS_COMMIT.with(|c| c.set(fail));
+}
+
+#[cfg(all(test, unix))]
+fn repoint_fail_settings_commit_for_test() -> bool {
+    REPOINT_FAIL_SETTINGS_COMMIT.with(|c| c.get())
+}
+
+#[cfg(not(all(test, unix)))]
+fn repoint_fail_settings_commit_for_test() -> bool {
+    false
 }
 
 /// Resolve the per-handle-dir rename-serialization lock path (`.swap.lock`,
@@ -1366,7 +1856,7 @@ pub fn repoint_handle_dir(
         Err(e) => {
             warn!(
                 error = ?e,
-                path = %new_creds_symlink_target.display(),
+                path = %crate::cli_deps::sanitize::redact_path(&new_creds_symlink_target),
                 "pre-swap mtime bump failed; CC may skip credential reload (an internal ticket)"
             );
         }
@@ -1377,7 +1867,89 @@ pub fn repoint_handle_dir(
     //   `.credentials.json` → identity-keyed when UUID present (via
     //   `new_creds_symlink_target` resolved above).
     //   All other items stay at `config-N/<item>` through Phase 4.
-    for item in ACCOUNT_BOUND_ITEMS {
+    //
+    // F2: `ACCOUNT_BOUND_ITEMS` is still repointed ONE RENAME AT A TIME —
+    // this loop is NOT atomic across the whole set — but a failure
+    // partway is no longer left as a mixed handle dir. Every item's
+    // pre-repoint link state is snapshotted BEFORE the loop starts
+    // (`snapshots`), so a failure on any item triggers a best-effort
+    // restore of every item already moved back to that snapshot
+    // (`rollback_repoint`). `.csq-account` is processed LAST WITHIN THIS
+    // LOOP so that a failure among the symlinks (before settings.json is
+    // ever touched) leaves the marker naming the account every other link
+    // was ALSO on immediately before this call.
+    //
+    // S-H1/D-F1: `.csq-account` is NOT the true commit point for the call
+    // as a whole — the settings.json commit below (see
+    // `commit_prepared_handle_settings`) runs after this loop, and its
+    // failure is folded into the SAME `rollback_repoint` machinery, undoing
+    // `.csq-account` along with every other item. The true commit point is
+    // that settings.json rename: only once it succeeds has this call
+    // actually switched the account.
+    let processing_order: Vec<&'static str> = ACCOUNT_BOUND_ITEMS
+        .iter()
+        .copied()
+        .filter(|item| *item != ".csq-account")
+        .chain(std::iter::once(".csq-account"))
+        .collect();
+
+    // S-H1/D-F1: prepare the new slot's settings.json content to a temp
+    // file NOW, before any symlink is touched — this is a pure read+merge
+    // of `claude_home`'s + the target slot's settings, so preparing it
+    // early changes nothing about its content, only WHEN the (fallible)
+    // write happens. A failure here fires before any mutation, so it
+    // propagates as-is (nothing to roll back — see
+    // `prepare_handle_settings_tmp`'s doc comment). The temp file is
+    // committed into place as the LAST step of this call, after the
+    // symlink rename loop below, folding that final rename into the same
+    // rollback path as every other item instead of leaving it as an
+    // unrollback-able `?` (the S-H1/D-F1 bug: a settings-materialization
+    // failure AFTER every `ACCOUNT_BOUND_ITEMS` symlink — including
+    // `.csq-account` — had already moved was reported with
+    // `repoint_rolled_back() == None`, which callers combine via
+    // `.unwrap_or(true)` and read as "fully rolled back", even though the
+    // account had in fact fully switched).
+    let uuid_settings_swap =
+        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get())
+            .map(|uuid| settings_path_for(base_dir, uuid));
+    let settings_tmp = prepare_handle_settings_tmp(
+        handle_dir,
+        claude_home,
+        &new_config,
+        uuid_settings_swap.as_deref(),
+    )?;
+
+    // S7: refuse up front, before ANY mutation, if any `ACCOUNT_BOUND_ITEMS`
+    // slot is occupied by a REAL file or directory rather than a symlink.
+    // The rename loop below renames a freshly-created symlink OVER
+    // `link_path` unconditionally (`std::fs::rename(&tmp_path, &link_path)`)
+    // — POSIX rename silently replaces whatever is at the destination, so
+    // without this guard a real file would be clobbered with no warning.
+    //
+    // K3: this fires BEFORE any mutation, so it uses the dedicated
+    // `RepointRefusedRealFile` variant rather than `Corrupt` — a generic
+    // `Corrupt` reads to the caller identically to every other refusal,
+    // and the caller's operator line loops "run `csq swap N` again" forever
+    // on this one (retrying does not remove the blocking file). On this
+    // path `settings_tmp` was prepared but never committed — remove it so
+    // no stray temp file survives a refusal.
+    for item in &processing_order {
+        let link_path = handle_dir.join(item);
+        if let Ok(meta) = link_path.symlink_metadata() {
+            if !meta.file_type().is_symlink() {
+                let _ = std::fs::remove_file(&settings_tmp);
+                return Err(CredentialError::RepointRefusedRealFile { item });
+            }
+        }
+    }
+
+    let snapshots: Vec<(&'static str, PreRepointLinkState)> = processing_order
+        .iter()
+        .map(|item| (*item, snapshot_link_state(handle_dir, item)))
+        .collect();
+
+    let mut repointed: Vec<&'static str> = Vec::with_capacity(processing_order.len());
+    for (idx, item) in processing_order.iter().enumerate() {
         let new_target = if *item == ".credentials.json" {
             // Identity-keyed (or fallback) path computed above.
             new_creds_symlink_target.clone()
@@ -1389,10 +1961,15 @@ pub fn repoint_handle_dir(
 
         // Only repoint if the target exists in the new config dir
         if !new_target.exists() && new_target.symlink_metadata().is_err() {
-            // Remove the old symlink if the new config doesn't have this item
+            // F2(c): the new config lacks this item, so the old link is
+            // DELETED rather than repointed — that is a mutation this
+            // call made, not a no-op, so it MUST be recorded in
+            // `repointed` or a later failure's rollback would silently
+            // skip restoring it.
             if link_path.symlink_metadata().is_ok() {
                 let _ = std::fs::remove_file(&link_path);
             }
+            repointed.push(item);
             continue;
         }
 
@@ -1400,36 +1977,112 @@ pub fn repoint_handle_dir(
         if tmp_path.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&tmp_path);
         }
-        create_symlink(&new_target, &tmp_path).map_err(|e| CredentialError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
+        if let Err(e) = create_symlink(&new_target, &tmp_path) {
+            // The current item's own tmp file is not in `repointed` (it
+            // never successfully moved), so `rollback_repoint` will not
+            // clean it up — remove it here so no `*.swap-tmp` survives.
+            let _ = std::fs::remove_file(&tmp_path);
+            // `settings_tmp` was prepared but never committed at this
+            // point (the commit happens after this whole loop) — it is
+            // not one of `snapshots`/`repointed`, so `rollback_repoint`
+            // does not and should not touch it; clean it up directly.
+            let _ = std::fs::remove_file(&settings_tmp);
+            let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
+            warn!(
+                item,
+                repointed = ?repointed,
+                account = %target,
+                rolled_back,
+                "repoint_handle_dir: failed creating the temp symlink — attempted a best-effort restore of every already-moved item to its pre-repoint state"
+            );
+            // S2: carry the rollback's own outcome so a caller can combine
+            // it with its own disk-state check rather than trust the disk
+            // check alone.
+            return Err(CredentialError::RepointFailed {
+                path: tmp_path.clone(),
+                source: e,
+                rolled_back,
+            });
+        }
 
-        // Atomic rename over existing symlink
-        std::fs::rename(&tmp_path, &link_path).map_err(|e| CredentialError::Io {
-            path: link_path.clone(),
-            source: e,
-        })?;
+        // Atomic rename over existing symlink — or the test-only fault
+        // seam simulating exactly this failure on the `k`-th item.
+        let rename_result = if repoint_fail_at_rename_index_for_test() == Some(idx) {
+            Err(std::io::Error::other(
+                "injected test failure (repoint_fail_at_rename_index_for_test)",
+            ))
+        } else {
+            std::fs::rename(&tmp_path, &link_path)
+        };
+        if let Err(e) = rename_result {
+            // The current item's tmp symlink is left behind by a failed
+            // rename (real or injected); `rollback_repoint` only cleans
+            // up items already recorded in `repointed`, which this one
+            // is not.
+            let _ = std::fs::remove_file(&tmp_path);
+            // See the temp-symlink-create failure arm above: `settings_tmp`
+            // is not tracked by `snapshots`/`repointed` and must be cleaned
+            // up directly.
+            let _ = std::fs::remove_file(&settings_tmp);
+            let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
+            warn!(
+                item,
+                repointed = ?repointed,
+                account = %target,
+                rolled_back,
+                "repoint_handle_dir: failed renaming the temp symlink into place — attempted a best-effort restore of every already-moved item to its pre-repoint state"
+            );
+            // S2: see the temp-symlink-create failure arm above.
+            return Err(CredentialError::RepointFailed {
+                path: link_path.clone(),
+                source: e,
+                rolled_back,
+            });
+        }
 
+        repointed.push(item);
         debug!(item, account = %target, "repointed symlink");
     }
 
-    // Re-materialize settings.json for the new slot so the user's global
+    // Commit settings.json for the new slot so the user's global
     // customization is preserved and any 3P env block from the new
-    // config-<target>/settings.json overlays correctly. atomic_replace
+    // config-<target>/settings.json overlays correctly. `settings_tmp` was
+    // PREPARED before the rename loop above (see the S-H1/D-F1 comment at
+    // its call site); this is the single rename that commits it into
+    // place, and it is the LAST fallible step of this call. atomic_replace
     // keeps the swap semantics of INV-04: CC sees either the pre-swap or
     // post-swap file, never a half-written one.
-    // M2-3: resolve UUID for the swap target so UUID-keyed settings.json
-    // is preferred when present; falls back to config-<target>/settings.json.
-    let uuid_settings_swap =
-        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get())
-            .map(|uuid| settings_path_for(base_dir, uuid));
-    materialize_handle_settings_inner(
-        handle_dir,
-        claude_home,
-        &new_config,
-        uuid_settings_swap.as_deref(),
-    )?;
+    //
+    // S-H1/D-F1: because every `ACCOUNT_BOUND_ITEMS` symlink — including
+    // `.csq-account` — has already been renamed by the loop above, a
+    // failure HERE is exactly as consequential as a failure inside that
+    // loop: the account has already switched. This is why the failure
+    // path below folds into the SAME `rollback_repoint` + `RepointFailed`
+    // shape as every rename-loop failure, rather than propagating a bare
+    // `CredentialError::Corrupt`/`Io` (whose `repoint_rolled_back()` is
+    // `None` — S-LOW-4: this comment used to claim `daemon::auto_rotate`
+    // combines that via `.unwrap_or(true)`; that call site was deleted in
+    // the v5 rewrite (`error.rs::repoint_rolled_back`'s own doc comment
+    // records it), so the CURRENT hazard is only that a HYPOTHETICAL
+    // caller combining `None` via `.unwrap_or(true)` would read "fully
+    // rolled back" while the account had in fact fully switched — the
+    // shape this fold prevents from ever being constructible).
+    let settings_path = handle_dir.join("settings.json");
+    if let Err(e) = commit_prepared_handle_settings(&settings_tmp, &settings_path) {
+        let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
+        warn!(
+            item = "settings.json",
+            repointed = ?repointed,
+            account = %target,
+            rolled_back,
+            "repoint_handle_dir: failed committing the prepared settings.json — attempted a best-effort restore of every already-moved item to its pre-repoint state"
+        );
+        return Err(CredentialError::RepointFailed {
+            path: settings_path,
+            source: e,
+            rolled_back,
+        });
+    }
 
     // Re-materialize .claude.json for the new slot. This is the bug fix
     // for alpha.10: `csq swap` used to repoint credential symlinks but
@@ -1560,27 +2213,38 @@ fn mtime_collision(pre: &Option<CredsTargetStat>, post: &Option<CredsTargetStat>
     }
 }
 
-/// Atomically repoints the Codex symlinks in a Codex handle dir to
-/// point at a new `config-<target>` directory.
+/// Atomically repoints the Codex ACCOUNT-IDENTITY symlinks in a Codex
+/// handle dir to point at a new `config-<target>` directory.
 ///
-/// Counterpart to [`repoint_handle_dir`] for the Codex surface. The
-/// Codex symlink set per spec 07 §7.2.2 is:
+/// Counterpart to [`repoint_handle_dir`] for the Codex surface. This
+/// function repoints only the identity-bound triple:
 /// - `.csq-account` → `config-<N>/.csq-account`
 /// - `auth.json` → `credentials/codex-<N>.json` (canonical-direct)
 /// - `config.toml` → `config-<N>/config.toml`
-/// - `sessions` → `config-<N>/codex-sessions`
-/// - `history.jsonl` → `config-<N>/codex-history.jsonl`
 ///
-/// In-flight semantics are identical to the ClaudeCode path: codex-cli
-/// re-stats `auth.json` before every API call, so the next request
-/// after `csq swap` resolves through the new symlink. UNIX
-/// open-after-rename semantics keep any open fds into the old
-/// `codex-sessions/` valid until the holding process closes them — a
-/// session in flight continues writing to its existing session file via
-/// the old fd, while any new open (`codex resume`, a new session) hits
-/// the new slot. This matches the ClaudeCode model and replaces the
-/// prior `exec`-replace path that silently dropped the user's
-/// conversation (M10, an internal journal entry).
+/// It deliberately does NOT repoint the persistent conversation-state
+/// symlinks (`sessions` → `config-<N>/codex-sessions`, `history.jsonl` →
+/// `config-<N>/codex-history.jsonl`, `session_index.jsonl`, and the
+/// schema-versioned sqlite state) — see the comment at the call site
+/// where `codex_shared_pairs` used to be repointed here for the C1
+/// rationale (a live process's path-based reopen of one of those items
+/// would otherwise silently continue an in-progress conversation into
+/// the TARGET slot's directory, splitting one thread's on-disk record
+/// across two accounts). Only `same_surface_codex` calls this function,
+/// and only when the source and target slots' `tokens.account_id`
+/// already MATCH, so leaving the persistent store bound to the source
+/// slot for the remaining life of the running process carries no
+/// cross-identity risk.
+///
+/// This function's caller, `same_surface_codex`, is reached only in the
+/// `WhenSameAccountId` in-flight-adoption cell (spec 02 §2.3.3): codex-cli's
+/// own auth-reload guard silently ignores an `auth.json` change whose
+/// `tokens.account_id` differs from the running session's — verified live
+/// (spec 02 §2.3.3, corrected 2026-09-13) — so this repoint changes which
+/// slot the handle dir's IDENTITY items point at without any guarantee the
+/// running process notices before its next restart. It replaces the prior
+/// `exec`-replace path that silently dropped the user's conversation (M10,
+/// an internal journal entry).
 ///
 /// # Errors
 ///
@@ -1661,20 +2325,46 @@ pub fn repoint_handle_dir_codex(
         });
     }
 
-    // The legacy canonical Codex credential file is required as the fallback
-    // path AND as a precondition guard (Codex slot must have completed login).
-    // Per spec 07 §7.2.2: `auth.json` symlinks canonical-direct in the legacy
-    // layout; in Phase 3 we may retarget to identity-keyed path when available.
+    // The Codex credential may live at EITHER the identity-keyed path
+    // (`identities/<UUID>/credentials-codex.json`, post-M4-12) or the legacy
+    // numeric mirror (`credentials/codex-<N>.json`, pre-M4-12). Both are valid;
+    // at least one must exist. This mirrors the already-swept guard in
+    // `create_handle_dir_codex_named` ("Task 5") — this repoint guard was left
+    // behind by that migration and hard-required the legacy mirror, so a slot
+    // provisioned on a current build (identity.json provider=codex +
+    // credentials-codex.json, no legacy mirror) was refused with "has not
+    // completed login" while the daemon polled it successfully.
+    // `guard-reader-writer-parity.md` MUST-1/MUST-5: a guard MUST recognise
+    // every representation its writers produce, and a content migration MUST
+    // sweep every reader.
+    //
+    // The consumer below (`auth_symlink_target`) already resolves both forms;
+    // only this precondition was narrow. `identity_codex_path` is hoisted here
+    // so the guard and the symlink target are computed from ONE value and
+    // cannot disagree (an internal journal entry WBS line 124 keeps them unsplit).
     let canonical_cred = base_dir
         .join("credentials")
         .join(format!("codex-{target}.json"));
-    if !canonical_cred.exists() {
+    let identity_codex_path =
+        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get()).map(|uuid| {
+            crate::accounts::identity_store::credentials_codex_path_for(base_dir, uuid)
+        });
+    let identity_cred_exists = identity_codex_path
+        .as_ref()
+        .map(|p| p.exists() || p.symlink_metadata().is_ok())
+        .unwrap_or(false);
+    if !identity_cred_exists && !canonical_cred.exists() {
+        // Name the UUID-keyed path when a mapping exists, so the operator sees
+        // the authoritative post-M4-12 location rather than the retired mirror.
+        let error_path = identity_codex_path
+            .clone()
+            .unwrap_or_else(|| canonical_cred.clone());
         return Err(CredentialError::Corrupt {
-            path: canonical_cred,
+            path: error_path,
             reason: format!(
-                "credentials/codex-{target}.json does not exist — \
-                 Codex slot {target} has not completed login. Run \
-                 `csq login {target} --provider codex` first."
+                "neither the identity-keyed nor the legacy Codex credential exists \
+                 for slot {target} — Codex slot {target} has not completed login. \
+                 Run `csq login {target} --provider codex` first."
             ),
         });
     }
@@ -1700,20 +2390,27 @@ pub fn repoint_handle_dir_codex(
     // M3-4: Resolve the identity-keyed auth path for the Codex surface.
     //
     // `credentials_codex_path_for` returns `identities/<UUID>/credentials-codex.json`.
-    // Per HIGH-2 from the M3-3 fix-wave: this file is NEVER written by any current
-    // code path (Codex identity-path seeding lands in M3-7), so we expect
-    // `exists()` to return false in production until then.  The fallback to
-    // `credentials/codex-<N>.json` is therefore the PRODUCTION PATH for Phase 3.
-    // The identity path is tested via fixture injection (SEC-3-H3 test) to prove
-    // the primitive works once the file does exist.
+    //
+    // CORRECTED (the M3-3-era text here said this file "is NEVER written by any
+    // current code path", that `exists()` was expected to be false in production,
+    // and that the `credentials/codex-<N>.json` fallback was "the PRODUCTION PATH
+    // for Phase 3" — all three are false against the current tree). The UUID file
+    // IS written: `credentials::file::save_canonical_for`'s `Surface::Codex` arm
+    // calls `save_codex_canonical_for_uuid`, reached from the Codex login paths
+    // (`providers::codex::login`, `providers::codex::desktop_login`) and the
+    // refresh paths (`refresh::check`, `refresh::sync`).
+    //
+    // So the branch order below is now: identity-keyed path FIRST as the normal
+    // case; the legacy numeric mirror is the FALLBACK for a pre-mapping (legacy)
+    // layout or a partially-seeded identity, not the expected path. A slot
+    // provisioned on a current build has the UUID file and NO legacy mirror —
+    // see the sibling guard comment above, which `guard-reader-writer-parity.md`
+    // MUST-5 already swept for exactly this reason.
     //
     // PRIMARY METHODOLOGICAL DIRECTIVE 1 applies here too (an internal journal entry WBS line 124):
     // the bump target MUST match `auth_symlink_target` — both are computed from the
     // same `identity_codex_path` variable in this commit, never split.
-    let identity_codex_path =
-        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get()).map(|uuid| {
-            crate::accounts::identity_store::credentials_codex_path_for(base_dir, uuid)
-        });
+    // (`identity_codex_path` is computed once, above the precondition guard.)
 
     let auth_symlink_target = match identity_codex_path.as_ref() {
         Some(p) if p.exists() || p.symlink_metadata().is_ok() => {
@@ -1818,55 +2515,29 @@ pub fn repoint_handle_dir_codex(
         debug!(item = name, account = %target, "repointed codex symlink");
     }
 
-    // SHARED state follows the account-bound links, and MUST be repointed too: a
-    // swap that moved `auth.json` to slot N+1 while `sessions/` still resolved to
-    // slot N would show one account's conversations under another's credentials.
+    // SHARED persistent conversation state (sessions/, history.jsonl,
+    // session_index.jsonl, schema-versioned sqlite) is DELIBERATELY LEFT
+    // pointed at the SOURCE slot here — this function repoints a LIVE handle
+    // dir (`same_surface_codex`'s in-flight adopt; no exec, no tombstone,
+    // `.live-pid` unchanged), and unlike ClaudeCode's `.claude.json` (a REAL
+    // file explicitly re-merged at swap time via `build_scoped_claude_json`'s
+    // `preserve_handle` parameter), these Codex items are raw symlinks with NO
+    // reconciliation step. A still-running process that reopens one of these
+    // paths (rather than holding an fd that predates the repoint — true for a
+    // small JSONL log updated open/append/close per turn) would otherwise
+    // silently continue an in-progress conversation into the TARGET slot's
+    // directory, splitting one thread's on-disk record across two accounts
+    // (C1: "an account-A codex thread's history promotes into account-B's
+    // config-<N>" — reproduced in
+    // `repoint_handle_dir_codex_in_flight_does_not_split_live_conversation_across_accounts`).
     //
-    // Same atomic stage-then-rename as above, with one difference: an absent target
-    // is CREATED rather than skipped. Skipping is what let a listed item become
-    // per-terminal state in the first place, and at swap time it additionally
-    // strands the item on the OLD slot until codex-cli happens to recreate it.
-    for (name, new_target, kind) in codex_shared_pairs(&new_config) {
-        let link_path = handle_dir.join(&name);
-        let tmp_path = handle_dir.join(format!("{name}.swap-tmp"));
-
-        if !new_target.exists() && new_target.symlink_metadata().is_err() {
-            // DECLARED kind, same as the provisioning path. This site carried a
-            // SECOND copy of the suffix heuristic, so the file-vs-dir bug existed
-            // here too — a swap onto a slot whose target was absent created the
-            // same wrong-shaped entry.
-            let created = match kind {
-                SharedKind::File => std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&new_target)
-                    .map(|_| ()),
-                SharedKind::Dir => std::fs::create_dir_all(&new_target),
-            };
-            if let Err(e) = created {
-                // Non-fatal, but remove any link still pointing at the OLD slot
-                // rather than leaving cross-account state reachable.
-                debug!(item = %name, error = %e, "could not pre-create shared codex target");
-                if link_path.symlink_metadata().is_ok() {
-                    let _ = std::fs::remove_file(&link_path);
-                }
-                continue;
-            }
-        }
-
-        if tmp_path.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(&tmp_path);
-        }
-        create_symlink(&new_target, &tmp_path).map_err(|e| CredentialError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        std::fs::rename(&tmp_path, &link_path).map_err(|e| CredentialError::Io {
-            path: link_path.clone(),
-            source: e,
-        })?;
-        debug!(item = %name, account = %target, "repointed shared codex state");
-    }
+    // This is safe to leave behind: `same_surface_codex` is reached only when
+    // the source and target slots' `tokens.account_id` MATCH (the real
+    // upstream account is identical), so there is no cross-identity leak in
+    // leaving the persistent store bound to whichever slot the process
+    // started on — a future FRESH handle dir (a new `csq run` / exec-replace
+    // swap) binds sessions/history/etc. to its own target slot from scratch
+    // via `create_handle_dir_codex`, which is unaffected by this function.
 
     // an internal ticket observability (Codex parallel): post-swap mtime check mirrors
     // the ClaudeCode regression detector in `repoint_handle_dir`. If the
@@ -1902,7 +2573,7 @@ pub fn repoint_handle_dir_codex(
     Ok(())
 }
 
-/// Builds a `.claude.json` for `handle_dir` from `config_dir/.claude.json`
+/// Builds a `.claude.json` for `handle_dir` from `<config_dir>/.claude.json`
 /// with the `projects` map scoped to the current working directory.
 ///
 /// CC uses `projects` in `.claude.json` to track per-project settings AND
@@ -1996,7 +2667,7 @@ fn materialize_handle_claude_json(config_dir: &Path, handle_dir: &Path) {
 /// session.
 ///
 /// On the rare event of a missing or unparseable source
-/// (`config_dir/.claude.json`) we leave the handle dir's file alone.
+/// (`<config_dir>/.claude.json`) we leave the handle dir's file alone.
 /// Wiping it would strand CC with zero state, which is strictly worse
 /// than keeping the stale copy.
 /// an internal ticket: reconcile the handle dir's `.claude.json` `oauthAccount.emailAddress` to the
@@ -2126,16 +2797,12 @@ fn reconcile_handle_dir_oauth_email(
     };
     let path = handle_dir.join(".claude.json");
     let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation —
+    // the file carries the account email = PII. Closes the window a
+    // separate std::fs::write + secure_file pair left open.
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, out.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         warn!(path = %tmp.display(), error = %e, "swap: an internal ticket reconcile temp write failed");
-        return;
-    }
-    // 0600 the tmp before the rename (security.md §5a canonical pipeline): the file
-    // carries the account email = PII. secure_file is a no-op on Windows.
-    if let Err(e) = crate::platform::fs::secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        warn!(path = %tmp.display(), error = %e, "swap: an internal ticket reconcile secure_file failed");
         return;
     }
     if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &path) {
@@ -2173,14 +2840,9 @@ fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
     // (PII) — partial failure must remove the tmp so it doesn't linger at umask
     // 0o644, and the tmp is 0600'd before the rename (redteam R2 rust-specialist).
     let tmp = crate::platform::fs::unique_tmp_path(&handle_claude_json);
-    if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, out.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         warn!(path = %tmp.display(), error = %e, "swap: temp .claude.json write failed");
-        return;
-    }
-    if let Err(e) = crate::platform::fs::secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        warn!(path = %tmp.display(), error = %e, "swap: secure_file of .claude.json failed");
         return;
     }
     if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &handle_claude_json) {
@@ -2251,7 +2913,9 @@ fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
 /// doc comment for why the predicate is sound, not merely convenient.
 ///
 /// `clear_fn` is a test seam: production always passes
-/// [`keychain::clear_handle_dir_reporting`]; tests inject a counting spy so
+/// `keychain::decide_and_clear_dead_handle` (bound to `base_dir` and the
+/// real single-candidate custodian adopt — see [`sweep_dead_handles`]'s own
+/// doc); tests inject a counting spy so
 /// the gating behavior (called vs. not-called) is provable without shelling
 /// `security` — `keychain_mirror_disabled()` makes the real function return
 /// `Ok(false)` unconditionally under `cfg!(test)`, which is indistinguishable
@@ -2283,7 +2947,7 @@ fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
 /// only — never an absolute path (`security.md` MUST-2).
 ///
 /// `base_dir` is the accounts dir (`record_pending_clear`'s queue lives at
-/// `base_dir/keychain-pending-clears.json` — pure file I/O against a path
+/// `<base_dir>/keychain-pending-clears.json` — pure file I/O against a path
 /// the caller already owns, no dependency on `path`/`abs` continuing to
 /// exist afterward: `sweep_pending_clears` retries by SERVICE NAME string
 /// alone, never by re-deriving a directory path — see its doc comment).
@@ -2293,9 +2957,23 @@ fn clear_dead_handle_keychain_item(
     base_dir: &Path,
     clear_fn: &mut impl FnMut(&Path) -> Result<bool, keychain::KeychainClearUnconfirmed>,
 ) {
-    clear_dead_handle_keychain_item_inner(path, owner_pid, base_dir, clear_fn, &mut |b, s| {
-        keychain::record_pending_clear(b, s)
-    });
+    clear_dead_handle_keychain_item_inner(
+        path,
+        owner_pid,
+        base_dir,
+        clear_fn,
+        &mut |b, s, acct, email, account_hint, queued_identity| {
+            keychain::record_pending_clear_with_identity(
+                b,
+                s,
+                acct,
+                keychain::PendingClearOrigin::DeadHandle,
+                email,
+                account_hint,
+                queued_identity,
+            )
+        },
+    );
 }
 
 /// Test seam for [`clear_dead_handle_keychain_item`]: `record_fn` is the
@@ -2317,7 +2995,14 @@ fn clear_dead_handle_keychain_item_inner(
     owner_pid: u32,
     base_dir: &Path,
     clear_fn: &mut impl FnMut(&Path) -> Result<bool, keychain::KeychainClearUnconfirmed>,
-    record_fn: &mut impl FnMut(&Path, &str),
+    record_fn: &mut impl FnMut(
+        &Path,
+        &str,
+        Option<AccountNum>,
+        Option<String>,
+        Option<String>,
+        Option<(u64, i64)>,
+    ),
 ) {
     if !keychain::handle_dir_might_have_anthropic_keychain_item(path) {
         return;
@@ -2346,13 +3031,76 @@ fn clear_dead_handle_keychain_item_inner(
              handle dir (non-fatal — keychain may be locked or unavailable; queued for \
              automatic retry; sweep continues)"
         );
-        record_fn(base_dir, &keychain::service_name(&abs));
+        // `keychain-fix-r8d.md` item 1: resolve the dead dir's marker
+        // account NOW, while `abs` still exists, and record it alongside
+        // the service name — by retry time (`sweep_pending_clears`) this
+        // dir is gone and there is nothing left to re-resolve it from.
+        //
+        // `keychain-fix-r9.md` S-M-2/D-F5: the OAuth email and the keychain
+        // account-attribute hint are captured the SAME way, for the SAME
+        // reason — `decide_and_clear_dead_handle`'s own first attempt (which
+        // just returned this `Err`) already resolved and used both; the
+        // retry should target the identical candidate and account
+        // attribute, not `None`/a live re-derivation.
+        let marker_account = crate::accounts::markers::resolve_marker_to_slot(base_dir, &abs);
+        let candidate_email = crate::credentials::claude_json::read_oauth_email(&abs);
+        let account_hint = keychain::keychain_account_for(&abs);
+        // `keychain-fix-r11.md` S-LOW-1/D-4b: capture THIS dir's own
+        // identity now, while `abs` still exists — by retry time there is
+        // nothing left to re-derive it from, and this is what lets a later
+        // live-collision check tell "the SAME dir this entry was queued
+        // against" apart from "a DIFFERENT, NEWER dir that has since taken
+        // over the reused PID".
+        #[cfg(unix)]
+        let queued_identity = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&abs)
+                .ok()
+                .map(|meta| (meta.ino(), meta.ctime()))
+        };
+        #[cfg(not(unix))]
+        let queued_identity = None;
+        record_fn(
+            base_dir,
+            &keychain::service_name(&abs),
+            marker_account,
+            candidate_email,
+            Some(account_hint),
+            queued_identity,
+        );
     }
 }
 
 /// Returns the number of directories removed.
+///
+/// `keychain-fix-r8.md` C-F3: the per-dir keychain clear routes through
+/// `keychain::decide_and_clear_dead_handle` — DISTINCT from `csq logout`'s
+/// [`keychain::clear_handle_dir_reporting`], which deletes CC's item
+/// unconditionally (intentional: logout means "this account's credentials
+/// are gone everywhere"). A dead handle dir is an abandoned SESSION, not an
+/// intentional account removal, so it must not destroy the only live copy
+/// of a login nobody else recorded — see that function's own doc for the
+/// known-token / adopt-then-delete / keep-and-re-queue disposition.
+///
+/// `try_adopt` is wired to `crate::daemon::custodian::adopt_single_candidate_before_delete`
+/// with the same Node-transport `HttpGetFn` `daemon::server`/`daemon::refresher`
+/// construct for their own `reconcile_account` calls
+/// (`crate::http::get_bearer_node` — reachable crate-wide; no dependency on
+/// `daemon::server`/`daemon::refresher` themselves, so this stays inside
+/// `keychain-fix-r8c.md` SHARD KA's file scope: `handle_dir.rs`,
+/// `keychain.rs`, `custodian.rs`).
 pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize {
-    sweep_dead_handles_inner(base_dir, claude_home, keychain::clear_handle_dir_reporting)
+    let http_get: crate::daemon::usage_poller::HttpGetFn =
+        std::sync::Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+            crate::http::get_bearer_node(url, token, headers)
+        });
+    sweep_dead_handles_inner(base_dir, claude_home, |config_dir| {
+        keychain::decide_and_clear_dead_handle(base_dir, config_dir, &|account, candidate| {
+            crate::daemon::custodian::adopt_single_candidate_before_delete(
+                base_dir, account, candidate, &http_get,
+            )
+        })
+    })
 }
 
 /// Test seam for [`sweep_dead_handles`]: `clear_keychain_item` is the
@@ -2361,7 +3109,7 @@ pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize 
 /// Anthropic-bound dead dir, skipped for one that never held an item)
 /// without shelling `security` — production's only caller
 /// ([`sweep_dead_handles`] above) always passes
-/// [`keychain::clear_handle_dir_reporting`].
+/// `keychain::decide_and_clear_dead_handle`.
 fn sweep_dead_handles_inner(
     base_dir: &Path,
     claude_home: Option<&Path>,
@@ -2403,6 +3151,22 @@ fn sweep_dead_handles_inner(
         };
 
         let path = entry.path();
+
+        // R1/KC4-9: v4 ("switch now or say so") removed the
+        // account-change-pending marker and every mechanism that existed
+        // only to serve it. Nothing in this codebase writes
+        // `.keychain-account-change-pending` any more, but a dev host that
+        // ran a pre-v4 build may still have one on disk — best-effort
+        // cleanup here is cheap insurance, not a load-bearing step.
+        let stale_marker = path.join(".keychain-account-change-pending");
+        if let Err(e) = std::fs::remove_file(&stale_marker) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    error_kind = "keychain_stale_account_change_marker_cleanup_failed",
+                    "sweep: could not remove a leftover pre-v4 account-change-pending marker (non-fatal — retried on the next sweep)"
+                );
+            }
+        }
 
         // Read the authoritative PID from `.live-pid`. Fall back to
         // the dir-name PID if the marker is missing or corrupt — a
@@ -2502,11 +3266,10 @@ fn sweep_dead_handles_inner(
         // occupant that is about to replace it.
         //
         // It is NOT primarily a defense against `term-<pid>` PID recycling.
-        // an internal ticket also made `csq run`'s own keychain sync unconditionally pass
-        // `account_changed=true` (`sync_cc_keychain` ->
-        // `sync_handle_dir_account_changed`), which bypasses the
-        // newer-than-keychain guard and always overwrites-or-clears — so a
-        // NEW dir created at a recycled path self-heals on its own next
+        // an internal ticket also made `csq run`'s own keychain sync unconditionally force
+        // (v4 `force_sync_for_launch` -> `force_sync_account_changed`), which
+        // bypasses the newer-than-keychain guard and always overwrites-or-clears
+        // — so a NEW dir created at a recycled path self-heals on its own next
         // launch whether or not this reaper ever ran. Reaping here still
         // matters for the narrower window it closes: a path that is never
         // reused would otherwise leave its item stranded forever, and a
@@ -2514,6 +3277,25 @@ fn sweep_dead_handles_inner(
         // for however long the dir sits dead-but-unreaped before the next
         // `csq run` lands on it.
         clear_dead_handle_keychain_item(&path, owner_pid, base_dir, &mut clear_keychain_item);
+
+        // PROMOTE codex's sqlite state to `config-N` before the dir dies.
+        //
+        // `codex_shared_pairs` already symlinks any `*.sqlite` it FINDS in
+        // `config-N` — but nothing ever put one there, because codex creates
+        // them inside the ephemeral handle dir and this reaper deletes them.
+        // The share was a chicken-and-egg: discovery-only, with no seeder. So
+        // every launch rebuilt the whole index from scratch, which was cheap
+        // at a few hundred rollouts and is hours once `csq sessions share`
+        // pools thousands (measured 2026-09-12: 7,291 rollouts / 16.2 GB,
+        // ~10 KB/s of index growth, four terminals each building their own
+        // private copy and discarding it).
+        //
+        // Promotion is the seeder. It runs before the rename, so the FIRST
+        // session pays the build and every later one links the result. A
+        // PARTIAL index promotes too, and that is deliberate — codex's
+        // projection is cursor-based, so an interrupted build resumes instead
+        // of restarting.
+        promote_codex_sqlite_state(&path);
 
         // Atomic rename-to-tombstone frees the term-<pid> path in
         // one syscall. Any concurrent `create_handle_dir` calls
@@ -2578,6 +3360,83 @@ const CAPTURE_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(1
 /// new capture dir) AND from [`sweep_dead_handles`] (the 60s watcher) so a leak
 /// is reaped even if no further subscription capture ever runs. The
 /// `interactive-capture-*` namespace holds only credential SYMLINKS (never
+/// Move a dying codex handle dir's real `*.sqlite` state into its `config-N`,
+/// so the next session LINKS it instead of rebuilding it.
+///
+/// Best-effort and non-fatal throughout: this runs inside the reaper, whose job
+/// is to free the path. A promotion that fails must never stop the sweep — the
+/// worst case is the status quo ante (a rebuild next launch), never a stuck dir.
+///
+/// Only a REAL FILE is promoted. An entry that is already a symlink is one
+/// `codex_shared_pairs` linked at creation, so its database already lives in
+/// `config-N`; renaming that would replace the shared database with its own
+/// link. Only a `config-N` slot that is still EMPTY is filled, so a live shared
+/// database is never clobbered by a straggler handle dir reaped later.
+///
+/// The `-wal`/`-shm` sidecars move WITH the base database when present. A WAL
+/// can hold committed-but-uncheckpointed transactions after a SIGKILL, so
+/// promoting the base alone would silently drop them; moving the set keeps the
+/// database consistent.
+fn promote_codex_sqlite_state(handle_dir: &Path) {
+    let Some(config_dir) = codex_config_dir_of_handle(handle_dir) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(handle_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(CODEX_SHARED_SQLITE_SUFFIX) {
+            continue;
+        }
+        let src = handle_dir.join(name);
+        // symlink_metadata, not metadata: a linked database resolves to a real
+        // file in config-N and would otherwise read as promotable.
+        match src.symlink_metadata() {
+            Ok(m) if m.file_type().is_file() => {}
+            _ => continue,
+        }
+        let dst = config_dir.join(name);
+        if dst.exists() {
+            continue;
+        }
+        if std::fs::rename(&src, &dst).is_err() {
+            continue;
+        }
+        for sidecar in ["-wal", "-shm"] {
+            let s = handle_dir.join(format!("{name}{sidecar}"));
+            if s.is_file() {
+                let _ = std::fs::rename(&s, config_dir.join(format!("{name}{sidecar}")));
+            }
+        }
+        info!(
+            db = %name,
+            config_dir = %config_dir.display(),
+            "promoted codex sqlite state to config dir — next session links it"
+        );
+    }
+}
+
+/// The `config-N` a codex handle dir belongs to, resolved through the
+/// `config.toml` symlink csq itself created.
+///
+/// Read from the LINK rather than from `.csq-account`: the marker's content is
+/// an identity UUID on a post-M4-7 slot and a decimal on a legacy one
+/// (`guard-reader-writer-parity.md` MUST-5), so parsing it here would need the
+/// wide reader and would fail open on the form it did not recognise. The
+/// `config.toml` link is unambiguous — csq wrote it, and it points at exactly
+/// one `config-N`.
+fn codex_config_dir_of_handle(handle_dir: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(handle_dir.join("config.toml")).ok()?;
+    let parent = target.parent()?;
+    let base = parent.file_name()?.to_str()?;
+    if !base.starts_with("config-") || !parent.is_dir() {
+        return None;
+    }
+    Some(parent.to_path_buf())
+}
+
 /// copies), so `remove_dir_all` deletes links, not the real credentials.
 pub(crate) fn sweep_stale_capture_dirs(base_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(base_dir) else {
@@ -3790,6 +4649,73 @@ mod tests {
         assert_eq!(markers::read_live_pid(&handle), Some(99999));
     }
 
+    /// `keychain-fix-r11.md` S-MEDIUM-1 / D-4 — INVERTED from the retired
+    /// `keychain-fix-r10.md` S-M-2 test (`create_handle_dir_drops_stale_
+    /// pending_clear_for_reused_pid_service`, which asserted the entry was
+    /// DROPPED). The regression that fix introduced: dropping the entry
+    /// stopped a later retry from misfiring, but also threw away the ONLY
+    /// remaining chance to actually clear whatever the entry was queued to
+    /// clear. Creation now RESOLVES the entry instead (its own disposition,
+    /// run against the real keychain item) and removes it only on a
+    /// CONFIRMED clear (`Ok(true)`) — under test, `clear_service_reporting`
+    /// short-circuits to `Ok(false)` (`keychain_mirror_disabled()`), a
+    /// structural no-op that clears nothing, so the entry now correctly
+    /// SURVIVES creation rather than evaporating. Real file I/O throughout
+    /// (`record_pending_clear` is not gated by `keychain_mirror_disabled()`),
+    /// macOS-only for the same reason every other pending-clear-queue test
+    /// in this module is: off macOS `record_pending_clear`/
+    /// `resolve_pending_clear_at_creation` are both
+    /// `#[cfg(not(target_os = "macos"))] {}` no-ops, so the file would be
+    /// absent whichever way this ran and no result would falsify the claim
+    /// (`instrument-discipline.md` MUST-1).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn create_handle_dir_resolves_stale_pending_clear_for_reused_pid_service() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        let account = AccountNum::try_from(1u16).unwrap();
+        let pid = 88_813u32;
+
+        // Simulate a PRIOR session at this exact pid: create the dir once
+        // to learn its canonicalized service name, then remove it (as
+        // logout or the dead-handle reaper would), leaving a stale queue
+        // entry behind — exactly what a Logout-origin retry would act on.
+        let first = create_handle_dir(base, &claude_home, account, pid).unwrap();
+        let abs = std::fs::canonicalize(&first).unwrap();
+        let stale_service = crate::credentials::keychain::service_name(&abs);
+        std::fs::remove_dir_all(&first).unwrap();
+        crate::credentials::keychain::record_pending_clear(
+            base,
+            &stale_service,
+            Some(account),
+            crate::credentials::keychain::PendingClearOrigin::Logout,
+            None,
+            None,
+        );
+        let queue_path = base.join("keychain-pending-clears.json");
+        assert!(
+            std::fs::read_to_string(&queue_path)
+                .unwrap()
+                .contains(&stale_service),
+            "sanity: the stale entry must actually be queued before the fresh create"
+        );
+
+        // Fresh session reuses the SAME pid — same `term-<pid>` path, same
+        // canonicalized service name as the prior (now-gone) session.
+        let _second = create_handle_dir(base, &claude_home, account, pid).unwrap();
+
+        let queue_raw = std::fs::read_to_string(&queue_path).unwrap_or_default();
+        assert!(
+            queue_raw.contains(&stale_service),
+            "under test the keychain mirror is disabled, so resolving the entry \
+             is a structural no-op (Ok(false)) that clears nothing — the entry \
+             must SURVIVE creation, not be dropped unconfirmed: {queue_raw}"
+        );
+    }
+
     #[test]
     fn repoint_handle_dir_changes_targets() {
         let dir = TempDir::new().unwrap();
@@ -3854,6 +4780,776 @@ mod tests {
              same inode means CC's stat will see identical metadata and skip \
              reload (spec 01 §1.4 invariant)"
         );
+    }
+
+    /// F2: a rename failure on the `k`-th item MUST leave every already-
+    /// repointed item restored to its pre-repoint target — not merely
+    /// "logged as partially repointed" (the pre-F2 behaviour). Exercises
+    /// EVERY item position (k = 0..3) via the `repoint_fail_at_rename_index`
+    /// test-only fault seam.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_rolls_back_every_item_on_rename_failure_at_each_index() {
+        for k in 0..4usize {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path();
+            let claude_home = dir.path().join(".claude");
+            std::fs::create_dir_all(&claude_home).unwrap();
+            let config_1 = setup_config_dir(base, 1);
+            let config_2 = setup_config_dir(base, 2);
+            // All FOUR ACCOUNT_BOUND_ITEMS must be present in both configs so
+            // every item actually attempts a rename (none take the "absent in
+            // target" skip branch) — `setup_config_dir` only writes
+            // `.credentials.json` and `.csq-account`.
+            for extra in [".current-account", ".quota-cursor"] {
+                std::fs::write(config_1.join(extra), "1").unwrap();
+                std::fs::write(config_2.join(extra), "2").unwrap();
+            }
+
+            let account1 = AccountNum::try_from(1u16).unwrap();
+            let account2 = AccountNum::try_from(2u16).unwrap();
+            let handle = create_handle_dir(base, &claude_home, account1, 60000 + k as u32).unwrap();
+
+            // Snapshot the pre-repoint targets of every item.
+            let pre_targets: Vec<(&str, PathBuf)> = ACCOUNT_BOUND_ITEMS
+                .iter()
+                .map(|item| (*item, std::fs::read_link(handle.join(item)).unwrap()))
+                .collect();
+
+            let _guard = RepointFaultGuard;
+            set_repoint_fail_at_rename_index_for_test(Some(k));
+
+            let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+            assert!(
+                result.is_err(),
+                "k={k}: repoint must fail when the fault seam fires"
+            );
+
+            // Every item's link must be restored to EXACTLY its pre-repoint
+            // target — not merely "some items moved, logged for the caller".
+            for (item, pre_target) in &pre_targets {
+                let post_target = std::fs::read_link(handle.join(item)).unwrap_or_else(|e| {
+                    panic!("k={k}: item {item} must still resolve after rollback: {e}")
+                });
+                assert_eq!(
+                    &post_target, pre_target,
+                    "k={k}: item {item} must be restored to its pre-repoint target"
+                );
+            }
+
+            // No leftover `*.swap-tmp` may survive a rolled-back repoint.
+            for item in ACCOUNT_BOUND_ITEMS {
+                let tmp = handle.join(format!("{item}.swap-tmp"));
+                assert!(
+                    tmp.symlink_metadata().is_err(),
+                    "k={k}: leftover {item}.swap-tmp must be removed after rollback"
+                );
+            }
+        }
+    }
+
+    /// Test gap: the rollback coverage above never exercises F2(c) — an
+    /// item DELETED (not renamed) because the new config lacks a matching
+    /// target. `config-2` here omits `.current-account`/`.quota-cursor`,
+    /// so repointing to it deletes those two links before the fault seam
+    /// fires on the LAST item (`.csq-account`). Rollback must RECREATE
+    /// both deleted links pointing back at `config-1` — not merely
+    /// restore the items that were renamed.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_rollback_restores_f2c_deleted_items() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let config_1 = setup_config_dir(base, 1);
+        let _config_2 = setup_config_dir(base, 2);
+        for extra in [".current-account", ".quota-cursor"] {
+            std::fs::write(config_1.join(extra), "1").unwrap();
+        }
+
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60300).unwrap();
+
+        let pre_targets: Vec<(&str, PathBuf)> = ACCOUNT_BOUND_ITEMS
+            .iter()
+            .map(|item| (*item, std::fs::read_link(handle.join(item)).unwrap()))
+            .collect();
+
+        let _guard = RepointFaultGuard;
+        // processing_order = [.credentials.json, .current-account,
+        // .quota-cursor, .csq-account] — index 3 is the LAST item
+        // (.csq-account), processed after both F2(c) deletions above.
+        set_repoint_fail_at_rename_index_for_test(Some(3));
+
+        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        match result {
+            Err(CredentialError::RepointFailed { rolled_back, .. }) => {
+                assert!(rolled_back, "rollback must fully succeed here");
+            }
+            other => panic!("expected Err(RepointFailed), got {other:?}"),
+        }
+
+        for (item, pre_target) in &pre_targets {
+            let post_target = std::fs::read_link(handle.join(item))
+                .unwrap_or_else(|e| panic!("item {item} must be restored after rollback: {e}"));
+            assert_eq!(
+                &post_target, pre_target,
+                "item {item} (including F2(c)-deleted ones) must be restored to its pre-repoint target"
+            );
+        }
+    }
+
+    /// Test gap: the rollback coverage above only uses a legacy-only
+    /// fixture. An identity-keyed slot's `.credentials.json` link target
+    /// (`identities/<UUID>/credentials.json`) is a DIFFERENT shape from
+    /// its other three items' targets (`config-N/<item>`) — prove the
+    /// snapshot/restore machinery restores that heterogeneous shape
+    /// correctly too, not just the legacy uniform-parent shape.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_rollback_restores_identity_keyed_credentials_target() {
+        use crate::testing::identity_fixtures::{
+            coexisting_fixture, fixture_uuid_for_slot, write_uuid_account_marker,
+        };
+
+        let dir = coexisting_fixture(2);
+        let base = dir.path();
+        let claude_home = TempDir::new().unwrap();
+
+        for slot in [1u16, 2u16] {
+            let uuid = fixture_uuid_for_slot(slot);
+            let creds = base
+                .join("identities")
+                .join(uuid.to_canonical_string())
+                .join("credentials.json");
+            std::fs::write(&creds, b"{}").unwrap();
+            let cfg = base.join(format!("config-{slot}"));
+            write_uuid_account_marker(base, &cfg, slot);
+            std::fs::write(cfg.join("settings.json"), b"{}").unwrap();
+            std::fs::write(cfg.join(".claude.json"), b"{}").unwrap();
+            std::fs::write(cfg.join(".current-account"), slot.to_string()).unwrap();
+            std::fs::write(cfg.join(".quota-cursor"), "0").unwrap();
+        }
+
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, claude_home.path(), account1, 60301).unwrap();
+
+        let pre_creds_target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
+        assert!(
+            pre_creds_target.to_string_lossy().contains("identities"),
+            "fixture precondition: expected an identity-keyed pre-repoint target, got {pre_creds_target:?}"
+        );
+
+        let _guard = RepointFaultGuard;
+        // Fail on the LAST item (.csq-account) so every OTHER item,
+        // including the identity-keyed `.credentials.json`, has already
+        // been renamed and must be rolled back.
+        set_repoint_fail_at_rename_index_for_test(Some(3));
+
+        let result = repoint_handle_dir(base, claude_home.path(), &handle, account2);
+        assert!(
+            result.is_err(),
+            "repoint must fail when the fault seam fires"
+        );
+
+        let post_creds_target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
+        assert_eq!(
+            post_creds_target, pre_creds_target,
+            "identity-keyed .credentials.json must be restored to its exact pre-repoint target"
+        );
+        assert!(
+            handle_dir_symlinks_are_consistent(base, &handle),
+            "a fully-restored identity-keyed dir must read back as consistent"
+        );
+    }
+
+    /// Test gap: every rollback test so far assumes the rollback itself
+    /// SUCCEEDS. S2's `CredentialError::RepointFailed::rolled_back` exists
+    /// specifically to report the OTHER case — inject a restore failure on
+    /// one already-repointed item via the fault seam, and confirm
+    /// `rolled_back` reports `false`, AND that the disk-level consistency
+    /// check independently agrees the dir is left mixed (the two signals
+    /// this finding requires a caller to combine, both correctly firing).
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_reports_rolled_back_false_when_restore_itself_fails() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        setup_config_dir(base, 2);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60302).unwrap();
+
+        let _guard = RepointFaultGuard;
+        // Fail the RENAME on the last item (.csq-account, idx 3), so
+        // `.credentials.json` (idx 0) has already been successfully
+        // repointed to config-2 by the time rollback runs — then make
+        // THAT item's own restore fail.
+        set_repoint_fail_at_rename_index_for_test(Some(3));
+        set_repoint_fail_restore_for_item_for_test(Some(".credentials.json"));
+
+        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        match result {
+            Err(CredentialError::RepointFailed { rolled_back, .. }) => {
+                assert!(
+                    !rolled_back,
+                    "the injected restore failure must be reported as rolled_back: false"
+                );
+            }
+            other => panic!("expected Err(RepointFailed), got {other:?}"),
+        }
+
+        // The disk-level check independently agrees: `.credentials.json`
+        // is left pointing at config-2 while the other items were rolled
+        // back to config-1 -- a genuinely mixed, "partially switched" dir.
+        assert!(
+            !handle_dir_symlinks_are_consistent(base, &handle),
+            "a dir left mixed by a failed rollback must read back as inconsistent"
+        );
+    }
+
+    /// S-H1/D-F1: a settings.json-commit failure AFTER every
+    /// `ACCOUNT_BOUND_ITEMS` symlink (including `.csq-account`) has already
+    /// been renamed must be treated exactly like a mid-loop rename failure —
+    /// every already-repointed item rolled back to its pre-repoint target,
+    /// and the error reports `rolled_back: true` (via
+    /// `CredentialError::repoint_rolled_back()`), never `None`. Before the
+    /// fix this failure propagated a bare `Corrupt`/`Io` with no rollback at
+    /// all: the symlinks stayed on the NEW account while
+    /// `repoint_rolled_back()` returned `None`, which
+    /// `daemon::auto_rotate`'s `.unwrap_or(true)` combinator reads as "fully
+    /// rolled back" — reporting "nothing was changed" while the account had
+    /// in fact fully switched.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_rolls_back_symlinks_when_settings_commit_fails() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let config_1 = setup_config_dir(base, 1);
+        let config_2 = setup_config_dir(base, 2);
+        // Every ACCOUNT_BOUND_ITEMS symlink is only created when its source
+        // target exists (`create_handle_dir`'s `target.exists() || ...`
+        // guard) — `setup_config_dir` writes only `.csq-account` and
+        // `.credentials.json`, so `.current-account`/`.quota-cursor` need
+        // to be seeded on BOTH config dirs for every item's pre/post target
+        // to actually resolve via `read_link` below.
+        for cfg in [&config_1, &config_2] {
+            for extra in [".current-account", ".quota-cursor"] {
+                std::fs::write(cfg.join(extra), "1").unwrap();
+            }
+        }
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60310).unwrap();
+
+        let pre_targets: Vec<(&str, PathBuf)> = ACCOUNT_BOUND_ITEMS
+            .iter()
+            .map(|item| (*item, std::fs::read_link(handle.join(item)).unwrap()))
+            .collect();
+
+        let _guard = RepointFaultGuard;
+        // No rename-index fault: every ACCOUNT_BOUND_ITEMS symlink (incl.
+        // `.csq-account`) renames successfully. Only the settings.json
+        // commit — the true final step per S-H1/D-F1 — fails.
+        set_repoint_fail_settings_commit_for_test(true);
+
+        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        match result {
+            Err(ref e @ CredentialError::RepointFailed { rolled_back, .. }) => {
+                assert!(
+                    rolled_back,
+                    "a settings-commit failure with a clean restore must report rolled_back: true"
+                );
+                assert_eq!(
+                    e.repoint_rolled_back(),
+                    Some(true),
+                    "repoint_rolled_back() must be Some(true), never None, once every symlink \
+                     (including .csq-account) has already been renamed"
+                );
+            }
+            other => panic!("expected Err(RepointFailed), got {other:?}"),
+        }
+
+        // The bug this test pins: without the fix, every symlink stayed on
+        // account 2 here. With the fix, every item is restored to its
+        // EXACT pre-repoint (account 1) target.
+        for (item, pre_target) in &pre_targets {
+            let post_target = std::fs::read_link(handle.join(item))
+                .unwrap_or_else(|e| panic!("item {item} must still resolve after rollback: {e}"));
+            assert_eq!(
+                &post_target, pre_target,
+                "item {item} must be restored to its pre-repoint (account 1) target, \
+                 not left on account 2"
+            );
+        }
+        assert!(
+            handle_dir_symlinks_are_consistent(base, &handle),
+            "a fully-restored dir must read back as consistent with its (unchanged) account 1 marker"
+        );
+
+        // §5a: the prepared settings.json temp file must not linger.
+        let leaked: Vec<_> = std::fs::read_dir(&handle)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("settings.json"))
+                    .unwrap_or(false)
+                    && e.file_name() != std::ffi::OsStr::new("settings.json")
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "§5a leaked settings.json temp files: {leaked:?}"
+        );
+    }
+
+    /// S-H1/D-F1 companion: when a settings-commit failure's OWN rollback
+    /// ALSO fails to restore one item, the error must report `rolled_back:
+    /// false` (never silently drop to `None`), and the disk-level
+    /// consistency check must independently agree the dir is left mixed —
+    /// the same two-signal contract `repoint_handle_dir_reports_rolled_back_false_when_restore_itself_fails`
+    /// pins for a mid-loop rename failure, now proven for the settings-commit
+    /// failure path too.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_reports_rolled_back_false_when_settings_commit_and_restore_both_fail() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        setup_config_dir(base, 2);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60311).unwrap();
+
+        let _guard = RepointFaultGuard;
+        set_repoint_fail_settings_commit_for_test(true);
+        set_repoint_fail_restore_for_item_for_test(Some(".credentials.json"));
+
+        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        match result {
+            Err(CredentialError::RepointFailed { rolled_back, .. }) => {
+                assert!(
+                    !rolled_back,
+                    "the injected restore failure must be reported as rolled_back: false, \
+                     never collapsed to None"
+                );
+            }
+            other => panic!("expected Err(RepointFailed), got {other:?}"),
+        }
+
+        assert!(
+            !handle_dir_symlinks_are_consistent(base, &handle),
+            "a dir left mixed by a failed rollback (following a settings-commit failure) \
+             must read back as inconsistent"
+        );
+    }
+
+    /// S-H1/D-F1: a failure BEFORE any mutation must report
+    /// `repoint_rolled_back() == None` — "nothing to roll back" is the
+    /// correct answer only when nothing was ever mutated, which this test
+    /// independently confirms by asserting every symlink is untouched
+    /// (still on account 1). Distinguishes this pre-mutation case from the
+    /// post-rename-loop settings-commit failure above, which MUST NOT
+    /// report `None`.
+    ///
+    /// Making the handle dir read-only (0o500) fires the FIRST fallible
+    /// step that follows it — verified by RED-proof debug print to be
+    /// `lock_repoint_path`'s own `.swap.lock` file creation inside the
+    /// handle dir (`repoint lock acquisition failed: ... Permission
+    /// denied`), not `prepare_handle_settings_tmp`'s later
+    /// `std::fs::write` as an earlier draft of this comment claimed
+    /// (`doc-property-claims.md`: name the mechanism actually exercised).
+    /// Both are pre-mutation refusals reported through the SAME
+    /// `CredentialError::Corrupt`/`Io` path this test pins, so the
+    /// invariant under test — "nothing mutated ⇒ `None`" — holds either
+    /// way; only the specific fallible call this 0o500 fixture happens to
+    /// trip changes.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_reports_none_when_failure_is_before_any_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let config_1 = setup_config_dir(base, 1);
+        let config_2 = setup_config_dir(base, 2);
+        // See the sibling settings-commit-failure test above: every
+        // ACCOUNT_BOUND_ITEMS symlink is only created when its source
+        // target exists, so `.current-account`/`.quota-cursor` need to be
+        // seeded for `read_link` below to resolve on every item.
+        for cfg in [&config_1, &config_2] {
+            for extra in [".current-account", ".quota-cursor"] {
+                std::fs::write(cfg.join(extra), "1").unwrap();
+            }
+        }
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60312).unwrap();
+
+        let pre_targets: Vec<(&str, PathBuf)> = ACCOUNT_BOUND_ITEMS
+            .iter()
+            .map(|item| (*item, std::fs::read_link(handle.join(item)).unwrap()))
+            .collect();
+
+        // Read-only handle dir: the FIRST fallible step that follows —
+        // `lock_repoint_path`'s own `.swap.lock` creation inside the
+        // handle dir — fails with permission denied before the S7
+        // pre-flight guard, `prepare_handle_settings_tmp`, or the rename
+        // loop ever run; nothing has been mutated yet (RED-proof verified;
+        // see the doc comment above this test).
+        std::fs::set_permissions(&handle, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        std::fs::set_permissions(&handle, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        match result {
+            Err(ref e @ (CredentialError::Io { .. } | CredentialError::Corrupt { .. })) => {
+                assert_eq!(
+                    e.repoint_rolled_back(),
+                    None,
+                    "a failure before any mutation must report None, not Some(_)"
+                );
+            }
+            other => panic!("expected Err(Io) or Err(Corrupt), got {other:?}"),
+        }
+
+        // Independently confirm nothing was mutated: every symlink still
+        // resolves to its original (account 1) target.
+        for (item, pre_target) in &pre_targets {
+            let post_target = std::fs::read_link(handle.join(item)).unwrap();
+            assert_eq!(
+                &post_target, pre_target,
+                "item {item} must be completely untouched by a pre-mutation failure"
+            );
+        }
+    }
+
+    /// RAII guard resetting the F2 test-only rename-failure fault seam even
+    /// if the test body panics mid-assertion — the default test harness
+    /// reuses OS threads across tests, so an unguarded `set_...(Some(k))`
+    /// could otherwise leak into an unrelated later test on the same thread.
+    #[cfg(unix)]
+    struct RepointFaultGuard;
+    #[cfg(unix)]
+    impl Drop for RepointFaultGuard {
+        fn drop(&mut self) {
+            set_repoint_fail_at_rename_index_for_test(None);
+            set_repoint_fail_restore_for_item_for_test(None);
+            set_repoint_fail_settings_commit_for_test(false);
+        }
+    }
+
+    /// S7: `repoint_handle_dir` must refuse — before touching anything —
+    /// when an `ACCOUNT_BOUND_ITEMS` slot is occupied by a REAL file
+    /// rather than a symlink. Before the fix, `snapshot_link_state` used
+    /// `read_link` alone, which cannot tell a real file from a genuinely
+    /// absent item; the rename loop then renames a symlink OVER
+    /// `link_path` unconditionally, which would have silently clobbered
+    /// the real file with no warning.
+    #[test]
+    #[cfg(unix)]
+    fn repoint_handle_dir_refuses_when_item_is_a_real_file_not_symlink() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        setup_config_dir(base, 2);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60200).unwrap();
+
+        // Replace `.current-account` with a REAL file (not a symlink) —
+        // the exact shape a caller must never rename over.
+        std::fs::write(handle.join(".current-account"), "not a symlink").unwrap();
+
+        let pre_creds_target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
+
+        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let err = result.expect_err("must refuse rather than rename over a real file");
+
+        // K3: this fires before any mutation — `repoint_rolled_back()` must
+        // report `Some(true)` (nothing to roll back) and
+        // `repoint_refused_item()` must name the blocked item, so a caller
+        // can print "nothing was changed" plus the specific offending item
+        // instead of the generic loop-inducing "may be partially switched".
+        assert_eq!(err.repoint_rolled_back(), Some(true));
+        assert_eq!(err.repoint_refused_item(), Some(".current-account"));
+
+        // Nothing else was mutated: `.credentials.json` still resolves
+        // exactly where it did before the refused call.
+        let post_creds_target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
+        assert_eq!(pre_creds_target, post_creds_target);
+        // The real file itself must survive untouched.
+        assert_eq!(
+            std::fs::read_to_string(handle.join(".current-account")).unwrap(),
+            "not a symlink"
+        );
+    }
+
+    /// F2(d): a freshly-created (never repointed) handle dir is
+    /// consistent — every item resolves under the SAME `config-1`.
+    #[test]
+    #[cfg(unix)]
+    fn handle_dir_symlinks_are_consistent_true_for_fresh_dir() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60100).unwrap();
+        assert!(handle_dir_symlinks_are_consistent(base, &handle));
+    }
+
+    /// F2(d): a handle dir whose items resolve under TWO different
+    /// config-<N> dirs (the exact shape a non-rolled-back partial repoint
+    /// leaves) is reported inconsistent.
+    #[test]
+    #[cfg(unix)]
+    fn handle_dir_symlinks_are_consistent_false_for_mixed_targets() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        setup_config_dir(base, 2);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60101).unwrap();
+
+        // Manually repoint ONE item to config-2, simulating a partial
+        // repoint that was never rolled back.
+        let link = handle.join(".credentials.json");
+        std::fs::remove_file(&link).unwrap();
+        create_symlink(&base.join("config-2").join(".credentials.json"), &link).unwrap();
+
+        assert!(!handle_dir_symlinks_are_consistent(base, &handle));
+    }
+
+    /// F2(d): a leftover `*.swap-tmp` — an aborted rename that was never
+    /// cleaned up — is reported inconsistent even when every real symlink
+    /// still agrees.
+    #[test]
+    #[cfg(unix)]
+    fn handle_dir_symlinks_are_consistent_false_with_leftover_swap_tmp() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60102).unwrap();
+
+        std::fs::write(handle.join(".credentials.json.swap-tmp"), "leftover").unwrap();
+
+        assert!(!handle_dir_symlinks_are_consistent(base, &handle));
+    }
+
+    /// S1: a fresh identity-keyed handle dir — `.credentials.json` resolves
+    /// under `identities/<UUID>/`, the other three items under `config-N/`
+    /// — must be reported CONSISTENT. The prior "single common parent"
+    /// implementation returned `false` here unconditionally, because it
+    /// compared `.credentials.json`'s parent against the other items'
+    /// parent and the two are never equal for an identity-keyed slot.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(unix)]
+    #[test]
+    fn handle_dir_symlinks_are_consistent_true_for_identity_keyed_fresh_dir() {
+        use crate::testing::identity_fixtures::{
+            coexisting_fixture, fixture_uuid_for_slot, write_uuid_account_marker,
+        };
+
+        let dir = coexisting_fixture(2);
+        let base = dir.path();
+        let claude_home = TempDir::new().unwrap();
+
+        for slot in [1u16, 2u16] {
+            let uuid = fixture_uuid_for_slot(slot);
+            let creds = base
+                .join("identities")
+                .join(uuid.to_canonical_string())
+                .join("credentials.json");
+            std::fs::write(&creds, b"{}").unwrap();
+            let cfg = base.join(format!("config-{slot}"));
+            write_uuid_account_marker(base, &cfg, slot);
+            std::fs::write(cfg.join("settings.json"), b"{}").unwrap();
+            std::fs::write(cfg.join(".claude.json"), b"{}").unwrap();
+        }
+
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, claude_home.path(), account1, 61001).unwrap();
+
+        assert!(handle_dir_symlinks_are_consistent(base, &handle));
+    }
+
+    /// S1: an identity-keyed handle dir whose `.credentials.json` was
+    /// manually repointed to a DIFFERENT slot's identity credentials
+    /// (the exact shape a non-rolled-back partial repoint leaves) while
+    /// its marker still names the original slot — must be reported
+    /// INCONSISTENT.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(unix)]
+    #[test]
+    fn handle_dir_symlinks_are_consistent_false_for_identity_keyed_mixed_account() {
+        use crate::testing::identity_fixtures::{
+            coexisting_fixture, fixture_uuid_for_slot, write_uuid_account_marker,
+        };
+
+        let dir = coexisting_fixture(2);
+        let base = dir.path();
+        let claude_home = TempDir::new().unwrap();
+
+        for slot in [1u16, 2u16] {
+            let uuid = fixture_uuid_for_slot(slot);
+            let creds = base
+                .join("identities")
+                .join(uuid.to_canonical_string())
+                .join("credentials.json");
+            std::fs::write(&creds, b"{}").unwrap();
+            let cfg = base.join(format!("config-{slot}"));
+            write_uuid_account_marker(base, &cfg, slot);
+            std::fs::write(cfg.join("settings.json"), b"{}").unwrap();
+            std::fs::write(cfg.join(".claude.json"), b"{}").unwrap();
+        }
+
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, claude_home.path(), account1, 61002).unwrap();
+
+        // Manually repoint `.credentials.json` to slot 2's identity path,
+        // while the `.csq-account` marker still names slot 1.
+        let link = handle.join(".credentials.json");
+        std::fs::remove_file(&link).unwrap();
+        let uuid2 = fixture_uuid_for_slot(2);
+        create_symlink(
+            &base
+                .join("identities")
+                .join(uuid2.to_canonical_string())
+                .join("credentials.json"),
+            &link,
+        )
+        .unwrap();
+
+        assert!(!handle_dir_symlinks_are_consistent(base, &handle));
+    }
+
+    /// K1: a healthy handle dir created before `.current-account` existed
+    /// in its config dir legitimately lacks that link. A later write to
+    /// `config-N/.current-account` (e.g. a swap FROM a different terminal
+    /// bound to the same slot) makes the expected target exist on disk
+    /// without ever repointing this dir's link — that MUST still read
+    /// consistent, not "may be partially switched".
+    #[test]
+    #[cfg(unix)]
+    fn handle_dir_symlinks_are_consistent_true_when_current_account_missing_but_target_exists() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1); // no `.current-account` / `.quota-cursor` yet
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60103).unwrap();
+
+        // The handle dir has no `.current-account` link — setup_config_dir
+        // never wrote one, so create_handle_dir's target-exists guard (line
+        // ~629) skipped it. Now something else (a poller, a sibling
+        // terminal's swap) populates the config dir's copy.
+        assert!(handle.join(".current-account").symlink_metadata().is_err());
+        std::fs::write(base.join("config-1").join(".current-account"), "1").unwrap();
+
+        assert!(handle_dir_symlinks_are_consistent(base, &handle));
+    }
+
+    /// D-Lead (retracts the prior K2 "must still read consistent" claim
+    /// for this exact scenario): a handle dir created while its slot was
+    /// still legacy-keyed has `.credentials.json` -> `config-N/.credentials.json`.
+    /// If the slot later migrates to a UUID (`profiles.json::by_slot` gains
+    /// an entry), this dir's link is never repointed — and unlike the
+    /// retracted claim, that is NOT harmless: M3-7 retired csq's writers to
+    /// the legacy path for a migrated slot (spec 02 INV-05), so the linked
+    /// file is frozen and never refreshed again. This MUST read
+    /// inconsistent, so a failed repoint on this dir is reported as
+    /// "partially switched — run `csq swap` again" rather than "nothing
+    /// changed".
+    #[test]
+    #[cfg(unix)]
+    fn handle_dir_symlinks_are_consistent_false_for_legacy_credentials_after_slot_migrates_to_uuid()
+    {
+        use crate::testing::identity_fixtures::write_uuid_account_marker;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let cfg = setup_config_dir(base, 1);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        // Dir created while slot 1 was legacy: link targets config-1/.credentials.json.
+        let handle = create_handle_dir(base, &claude_home, account1, 60104).unwrap();
+
+        // Slot 1 migrates to a UUID after the fact; the handle dir's
+        // existing links are left untouched by the migration itself.
+        write_uuid_account_marker(base, &cfg, 1);
+        let uuid1 = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+        std::fs::create_dir_all(base.join("identities").join(uuid1.to_canonical_string())).unwrap();
+        std::fs::write(
+            base.join("identities")
+                .join(uuid1.to_canonical_string())
+                .join("credentials.json"),
+            "{}",
+        )
+        .unwrap();
+
+        assert!(!handle_dir_symlinks_are_consistent(base, &handle));
+    }
+
+    /// K2 (negative control, unaffected by the D-Lead fix above): after the
+    /// same migration, a REAL partial repoint — `.credentials.json`
+    /// pointed at a DIFFERENT slot's identity path — must still be
+    /// reported inconsistent.
+    #[test]
+    #[cfg(unix)]
+    fn handle_dir_symlinks_are_consistent_false_for_real_partial_after_slot_migrates_to_uuid() {
+        use crate::testing::identity_fixtures::write_uuid_account_marker;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let cfg = setup_config_dir(base, 1);
+        setup_config_dir(base, 2);
+        let account1 = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account1, 60105).unwrap();
+
+        write_uuid_account_marker(base, &cfg, 1);
+        let uuid1 = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+        std::fs::create_dir_all(base.join("identities").join(uuid1.to_canonical_string())).unwrap();
+        std::fs::write(
+            base.join("identities")
+                .join(uuid1.to_canonical_string())
+                .join("credentials.json"),
+            "{}",
+        )
+        .unwrap();
+
+        // Simulate a non-rolled-back partial repoint toward slot 2's legacy path.
+        let link = handle.join(".credentials.json");
+        std::fs::remove_file(&link).unwrap();
+        create_symlink(&base.join("config-2").join(".credentials.json"), &link).unwrap();
+
+        assert!(!handle_dir_symlinks_are_consistent(base, &handle));
     }
 
     /// an internal ticket fix regression test: when the two config dirs have
@@ -4585,6 +6281,37 @@ mod tests {
         assert!(removed >= 1);
     }
 
+    // R1/KC4-9: a leftover pre-v4 `.keychain-account-change-pending` marker
+    // in a LIVE (not dead) handle dir MUST be removed best-effort by the
+    // sweep, even though the dir itself survives.
+    //
+    // RED against the pre-R1 sweep (no cleanup step) would print:
+    // assertion failed: !stale_marker.exists() — the file survives the sweep.
+    #[test]
+    fn sweep_removes_leftover_pre_v4_account_change_pending_marker() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let alive = base.join("term-1");
+        std::fs::create_dir_all(&alive).unwrap();
+        std::fs::write(alive.join(".live-pid"), "1").unwrap();
+        let stale_marker = alive.join(".keychain-account-change-pending");
+        std::fs::write(&stale_marker, b"").unwrap();
+
+        sweep_dead_handles(base, Some(&claude_home));
+
+        #[cfg(unix)]
+        {
+            assert!(alive.exists(), "the live handle dir itself must survive");
+            assert!(
+                !stale_marker.exists(),
+                "a leftover pre-v4 account-change-pending marker must be removed"
+            );
+        }
+    }
+
     // ── dead-handle reaper clears the keychain OAuth item (fix/sweep-dead-
     // handles-clears-keychain) ──────────────────────────────────────────
     //
@@ -4852,7 +6579,14 @@ mod tests {
             let mut recorded: Vec<(std::path::PathBuf, String)> = Vec::new();
             let mut clear_spy = |_p: &Path| verdict;
             let mut record_spy =
-                |b: &Path, s: &str| recorded.push((b.to_path_buf(), s.to_string()));
+                |b: &Path,
+                 s: &str,
+                 _acct: Option<AccountNum>,
+                 _email: Option<String>,
+                 _hint: Option<String>,
+                 _queued_identity: Option<(u64, i64)>| {
+                    recorded.push((b.to_path_buf(), s.to_string()))
+                };
             clear_dead_handle_keychain_item_inner(
                 dir.path(),
                 999_999_991,
@@ -4883,6 +6617,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `keychain-fix-r10.md` T-f: the retry-queue recorder must actually
+    /// receive the resolved candidate email and keychain-account hint at
+    /// queue time (not `None`/`None`) — by retry time (`sweep_pending_clears`)
+    /// this dir is gone and there is nothing left to re-resolve either from
+    /// (`clear_dead_handle_keychain_item_inner`'s own doc). The sibling wiring
+    /// test above discards both fields (`_email`, `_hint`) entirely, so it
+    /// could not have caught either one silently regressing to `None`.
+    ///
+    /// `.csq-keychain-account` is [`crate::credentials::keychain::RECORDED_ACCOUNT_FILE`]
+    /// (private to that module) — a valid recorded hint here makes
+    /// `keychain_account_for` return it directly with NO live keychain call
+    /// (hermetic, per COMMON.md's hard limits).
+    ///
+    /// RED: reverting either `email` or `Some(account_hint)` in the
+    /// production `record_fn(...)` call to `None` makes this test's
+    /// corresponding assertion fail.
+    #[test]
+    fn clear_dead_handle_keychain_item_records_email_and_hint_at_queue_time() {
+        let base = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"x","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"dead-dir@test.invalid"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".csq-keychain-account"), "recorded-hint").unwrap();
+
+        let mut recorded_email: Option<Option<String>> = None;
+        let mut recorded_hint: Option<Option<String>> = None;
+        let mut clear_spy = |_p: &Path| Err(crate::credentials::keychain::KeychainClearUnconfirmed);
+        let mut record_spy = |_b: &Path,
+                              _s: &str,
+                              _acct: Option<AccountNum>,
+                              email: Option<String>,
+                              hint: Option<String>,
+                              _queued_identity: Option<(u64, i64)>| {
+            recorded_email = Some(email);
+            recorded_hint = Some(hint);
+        };
+        clear_dead_handle_keychain_item_inner(
+            dir.path(),
+            999_999_990,
+            base.path(),
+            &mut clear_spy,
+            &mut record_spy,
+        );
+
+        assert_eq!(
+            recorded_email,
+            Some(Some("dead-dir@test.invalid".to_string())),
+            "the resolved candidate email must be recorded at queue time, not None"
+        );
+        // The hint is resolved by `keychain_account_for`, which reads the
+        // recorded file ONLY on macOS; off macOS it is a documented
+        // structural no-op returning "" (no keychain account exists there).
+        // Either way the resolved value must reach `record_fn` — never None.
+        #[cfg(target_os = "macos")]
+        let expected_hint = "recorded-hint";
+        #[cfg(not(target_os = "macos"))]
+        let expected_hint = "";
+        assert_eq!(
+            recorded_hint,
+            Some(Some(expected_hint.to_string())),
+            "the resolved keychain-account hint must be recorded at queue time, not None"
+        );
     }
 
     /// Security review 1386 F1 + N1, closed on the shared `drain_service_inner`
@@ -5006,8 +6812,10 @@ mod tests {
     /// dead, Anthropic-bound `term-<pid>` handle dir is reaped through the
     /// REAL production path (`sweep_dead_handles`, not the `_inner` test
     /// seam) without panicking, and is actually removed. Under `cfg!(test)`
-    /// the real `keychain::clear_handle_dir_reporting` short-circuits to
-    /// `Ok(false)` (host safety — never shells `security` from a unit
+    /// the real `keychain::decide_and_clear_dead_handle` short-circuits to
+    /// `Ok(false)` (the SAME `keychain_mirror_disabled()` guard
+    /// `clear_handle_dir_reporting` shares — host safety, never shells
+    /// `security` from a unit
     /// test), so this proves reachability + no regression on the delete
     /// path, not the real macOS clear (that is
     /// `clear_dead_handle_keychain_item_calls_clear_fn_for_anthropic_bound_dir`
@@ -5724,6 +7532,136 @@ mod tests {
         );
     }
 
+    // ── codex sqlite promotion on reap ────────────────────────────────
+    //
+    // The share was discovery-only: `codex_shared_pairs` links any `*.sqlite`
+    // it finds in `config-N`, but codex creates them in the ephemeral handle
+    // dir and the reaper deleted them, so `config-N` was never seeded and every
+    // launch rebuilt the index. These pin the seeder.
+
+    /// Builds a dead codex handle dir wired the way `create_handle_dir_codex`
+    /// wires a live one: a `config.toml` SYMLINK into `config-N`, which is what
+    /// `codex_config_dir_of_handle` resolves the owning slot through.
+    #[cfg(unix)]
+    fn dead_codex_handle(base: &Path, pid: &str, slot: u16) -> (PathBuf, PathBuf) {
+        let config_dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), b"# slot config").unwrap(); // CI-ALLOW-fs-write-config-toml
+        let handle = base.join(format!("term-{pid}"));
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".live-pid"), pid).unwrap();
+        std::os::unix::fs::symlink(config_dir.join("config.toml"), handle.join("config.toml"))
+            .unwrap();
+        (handle, config_dir)
+    }
+
+    /// Falsifying result, named up front: without the promotion call the reaper
+    /// deletes the dir and `config-12/state_5.sqlite` never appears — which is
+    /// the shipped behaviour this fixes.
+    #[cfg(unix)]
+    #[test]
+    fn reap_promotes_codex_sqlite_into_config_dir() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let (handle, config_dir) = dead_codex_handle(base, "999999971", 12);
+
+        std::fs::write(handle.join("state_5.sqlite"), b"INDEX").unwrap();
+        std::fs::write(handle.join("state_5.sqlite-wal"), b"WAL").unwrap();
+        std::fs::write(handle.join("state_5.sqlite-shm"), b"SHM").unwrap();
+
+        assert_eq!(sweep_dead_handles(base, Some(&claude_home)), 1);
+
+        assert_eq!(
+            std::fs::read(config_dir.join("state_5.sqlite")).unwrap(),
+            b"INDEX",
+            "the database must survive the reap in config-N"
+        );
+        // The WAL can hold committed-but-uncheckpointed transactions after a
+        // SIGKILL; promoting the base alone would silently drop them.
+        assert_eq!(
+            std::fs::read(config_dir.join("state_5.sqlite-wal")).unwrap(),
+            b"WAL"
+        );
+        assert_eq!(
+            std::fs::read(config_dir.join("state_5.sqlite-shm")).unwrap(),
+            b"SHM"
+        );
+        assert!(!handle.exists(), "the handle dir is still reaped");
+    }
+
+    /// A LIVE shared database must never be clobbered by a straggler handle dir
+    /// reaped later — that would swap a full index for a stale one.
+    #[cfg(unix)]
+    #[test]
+    fn reap_does_not_overwrite_an_existing_config_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let (handle, config_dir) = dead_codex_handle(base, "999999972", 12);
+
+        std::fs::write(config_dir.join("state_5.sqlite"), b"ESTABLISHED").unwrap();
+        std::fs::write(handle.join("state_5.sqlite"), b"STRAGGLER").unwrap();
+
+        assert_eq!(sweep_dead_handles(base, Some(&claude_home)), 1);
+        assert_eq!(
+            std::fs::read(config_dir.join("state_5.sqlite")).unwrap(),
+            b"ESTABLISHED",
+            "an occupied config-N slot must not be overwritten"
+        );
+    }
+
+    /// An entry that is ALREADY a symlink was linked at creation, so its
+    /// database already lives in config-N. Renaming it would replace the shared
+    /// database with its own link — the file must be left alone.
+    #[cfg(unix)]
+    #[test]
+    fn reap_skips_a_symlinked_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let (handle, config_dir) = dead_codex_handle(base, "999999973", 12);
+
+        let shared = config_dir.join("logs_2.sqlite");
+        std::fs::write(&shared, b"SHARED").unwrap();
+        std::os::unix::fs::symlink(&shared, handle.join("logs_2.sqlite")).unwrap();
+
+        assert_eq!(sweep_dead_handles(base, Some(&claude_home)), 1);
+        assert_eq!(
+            std::fs::read(&shared).unwrap(),
+            b"SHARED",
+            "the shared database must still be a real file with its content"
+        );
+        assert!(shared.symlink_metadata().unwrap().file_type().is_file());
+    }
+
+    /// A NON-codex handle dir has no `config.toml` symlink, so there is no slot
+    /// to promote into and the reaper must behave exactly as before.
+    #[cfg(unix)]
+    #[test]
+    fn reap_of_a_non_codex_handle_promotes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let handle = base.join("term-999999974");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".live-pid"), "999999974").unwrap();
+        std::fs::write(handle.join("state_5.sqlite"), b"ORPHAN").unwrap();
+
+        assert_eq!(sweep_dead_handles(base, Some(&claude_home)), 1);
+        assert!(!handle.exists());
+        let strays: Vec<_> = std::fs::read_dir(base)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".sqlite"))
+            .collect();
+        assert!(strays.is_empty(), "nothing promoted to base: {strays:?}");
+    }
+
     #[test]
     fn sweep_cleans_up_stale_tombstones_from_previous_crash() {
         // Simulate a previous sweep that crashed mid-delete, leaving
@@ -5973,12 +7911,12 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn materialized_settings_default_effort_high_when_no_layer_sets_it() {
+    fn materialized_settings_default_effort_medium_when_no_layer_sets_it() {
         // Neither the user-global nor the slot overlay sets
-        // `effortLevel` → the csq default layer supplies "high".
+        // `effortLevel` → the csq default layer supplies "medium".
         // Non-vacuity: this assertion fails if the default resolves to
-        // anything other than "high" (e.g. "xhigh" or "max"), and fails
-        // if the key is absent.
+        // anything other than "medium" (e.g. the former "high", or CC's
+        // own "xhigh"), and fails if the key is absent.
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = base.join(".claude");
@@ -5998,7 +7936,7 @@ mod tests {
             materialized
                 .pointer("/effortLevel")
                 .and_then(|v| v.as_str()),
-            Some("high"),
+            Some("medium"),
         );
         // The default must not shadow other user-global keys.
         assert_eq!(
@@ -6947,9 +8885,12 @@ mod tests {
     // ── repoint_handle_dir_codex (M10 / an internal journal entry) ──────────────────
 
     /// Happy path: repointing a Codex handle dir from slot A → slot B
-    /// rewrites every Codex symlink to the new slot atomically. Mirrors
-    /// the spec 07 §7.2.2 symlink set: `.csq-account`, `auth.json`,
-    /// `config.toml`, `sessions`, `history.jsonl`.
+    /// rewrites the ACCOUNT-IDENTITY Codex symlinks (`.csq-account`,
+    /// `auth.json`, `config.toml`) to the new slot atomically. The
+    /// persistent conversation-state symlinks (`sessions`,
+    /// `history.jsonl`) are DELIBERATELY LEFT pointed at the source slot
+    /// — see the C1 fix rationale on `repoint_handle_dir_codex` and
+    /// `repoint_handle_dir_codex_in_flight_does_not_split_live_conversation_across_accounts`.
     #[cfg(unix)]
     #[test]
     fn repoint_handle_dir_codex_repoints_codex_symlinks() {
@@ -6976,7 +8917,7 @@ mod tests {
         // Act: repoint to slot 9.
         repoint_handle_dir_codex(base, &handle, to).expect("repoint must succeed");
 
-        // Assert: every Codex symlink now points at slot 9.
+        // Assert: the account-identity symlinks now point at slot 9.
         assert!(std::fs::read_link(handle.join(".csq-account"))
             .unwrap()
             .ends_with("config-9/.csq-account"));
@@ -6986,12 +8927,22 @@ mod tests {
         assert!(std::fs::read_link(handle.join("config.toml"))
             .unwrap()
             .ends_with("config-9/config.toml"));
-        assert!(std::fs::read_link(handle.join("sessions"))
-            .unwrap()
-            .ends_with("config-9/codex-sessions"));
-        assert!(std::fs::read_link(handle.join("history.jsonl"))
-            .unwrap()
-            .ends_with("config-9/codex-history.jsonl"));
+
+        // Assert: the persistent conversation-state symlinks (C1) are NOT
+        // repointed — they stay bound to the SOURCE slot for the remaining
+        // life of the process that already has them open.
+        assert!(
+            std::fs::read_link(handle.join("sessions"))
+                .unwrap()
+                .ends_with("config-4/codex-sessions"),
+            "C1: sessions/ must stay on the source slot across an in-flight repoint"
+        );
+        assert!(
+            std::fs::read_link(handle.join("history.jsonl"))
+                .unwrap()
+                .ends_with("config-4/codex-history.jsonl"),
+            "C1: history.jsonl must stay on the source slot across an in-flight repoint"
+        );
 
         // No exec-replace happened: the handle dir survives in-place.
         assert!(
@@ -7011,6 +8962,105 @@ mod tests {
         assert_eq!(
             tombstone_count, 0,
             "same-surface Codex repoint MUST NOT create a sweep tombstone (M10)"
+        );
+    }
+
+    /// C1 regression (cross-account codex session bleed — never diagnosed until
+    /// this test). `repoint_handle_dir_codex` is invoked ONLY by the same-surface
+    /// in-flight adopt path (`same_surface_codex`, reached when both slots'
+    /// Codex `tokens.account_id` MATCH) — the handle dir's owning PID is left
+    /// untouched; no process is exec-replaced, no tombstone is created. Unlike
+    /// ClaudeCode's `.claude.json` (a REAL file explicitly re-merged at swap
+    /// time via `build_scoped_claude_json`'s `preserve_handle` parameter),
+    /// Codex's persistent conversation state (`sessions`, `history.jsonl`,
+    /// `session_index.jsonl`, schema-versioned sqlite state) are raw symlinks
+    /// into `config-<N>` with NO reconciliation step. Repointing them mid-flight
+    /// lets a SINGLE in-progress conversation split across TWO `config-<N>`
+    /// directories: any write the still-running process makes by re-opening a
+    /// path (rather than through an fd that predates the repoint) lands under
+    /// the NEW slot, silently carrying that thread's continuation into a
+    /// directory the swap target never asked to inherit mid-conversation state
+    /// from — "an account-A codex thread's history promotes into account-B's
+    /// config-<N>".
+    ///
+    /// This test simulates the still-running process by writing to
+    /// `history.jsonl` THROUGH THE HANDLE DIR both before and after the
+    /// repoint — the shape a live process's path-based reopen takes (`open`,
+    /// `append`, `close`, as opposed to holding one fd for its entire life).
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_in_flight_does_not_split_live_conversation_across_accounts() {
+        use std::io::Write;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        setup_codex_slot(base, 4);
+        setup_codex_slot(base, 9);
+
+        let from = AccountNum::try_from(4u16).unwrap();
+        let to = AccountNum::try_from(9u16).unwrap();
+        let handle = create_handle_dir_codex(base, from, 70050).unwrap();
+
+        // Turn 1 of an in-progress conversation, written THROUGH the handle dir
+        // BEFORE the swap — resolves via the pre-swap symlink to
+        // config-4/codex-history.jsonl.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(handle.join("history.jsonl"))
+                .unwrap();
+            writeln!(
+                f,
+                r#"{{"session_id":"thread-1","ts":1,"text":"turn 1 (account 4)"}}"#
+            )
+            .unwrap();
+        }
+
+        // Act: in-flight repoint to slot 9 — same_surface_codex's operation.
+        repoint_handle_dir_codex(base, &handle, to).expect("repoint must succeed");
+        assert_eq!(
+            std::fs::read_to_string(handle.join(".live-pid"))
+                .unwrap()
+                .trim(),
+            "70050",
+            "precondition: this is an IN-FLIGHT repoint — the owning process \
+             never restarted"
+        );
+
+        // Turn 2 of the SAME conversation: the still-running process appends
+        // the next turn by re-opening history.jsonl BY PATH through the handle
+        // dir, exactly as a small JSONL log is commonly updated.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(handle.join("history.jsonl"))
+                .unwrap();
+            writeln!(
+                f,
+                r#"{{"session_id":"thread-1","ts":2,"text":"turn 2 (still account 4's thread)"}}"#
+            )
+            .unwrap();
+        }
+
+        // Assert: BOTH turns of thread-1 stay under the SOURCE slot (4) — an
+        // in-flight repoint must not let one conversation's continuation land
+        // in the TARGET slot's (9) persistent store.
+        let slot4_history =
+            std::fs::read_to_string(base.join("config-4").join("codex-history.jsonl")).unwrap();
+        assert!(
+            slot4_history.contains("turn 1") && slot4_history.contains("turn 2"),
+            "both turns of the in-flight conversation must stay on the source \
+             slot (config-4); got:\n{slot4_history}"
+        );
+
+        let slot9_history =
+            std::fs::read_to_string(base.join("config-9").join("codex-history.jsonl")).unwrap();
+        assert!(
+            !slot9_history.contains("turn 1") && !slot9_history.contains("turn 2"),
+            "the target slot (config-9) must NOT receive any part of a \
+             conversation that was already in progress when the in-flight swap \
+             happened; got:\n{slot9_history}"
         );
     }
 
@@ -7078,6 +9128,64 @@ mod tests {
         }
     }
 
+    /// Regression (2026-09-12): a Codex slot provisioned on a CURRENT build has
+    /// `identities/<UUID>/credentials-codex.json` and NO legacy
+    /// `credentials/codex-<N>.json`. The repoint precondition used to hard-require
+    /// the legacy mirror, so `csq swap <N>` refused such a slot with "has not
+    /// completed login" while the daemon polled it successfully — the reader was
+    /// narrower than its writers (`guard-reader-writer-parity.md` MUST-1/MUST-5).
+    /// REDs if that guard is narrowed back to `canonical_cred.exists()`.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_handle_dir_codex_accepts_identity_keyed_credential_without_legacy_mirror() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        setup_codex_slot(base, 6);
+        setup_codex_slot(base, 7);
+
+        // Make slot 7 look like a post-M4-12 slot: identity-keyed credential
+        // present, legacy mirror gone.
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(7);
+        let profiles_path = crate::accounts::profiles::profiles_path(base);
+        let mut profiles = if profiles_path.exists() {
+            crate::accounts::profiles::load(&profiles_path)
+                .unwrap_or_else(|_| crate::accounts::profiles::ProfilesFile::empty())
+        } else {
+            crate::accounts::profiles::ProfilesFile::empty()
+        };
+        profiles.by_slot.insert("7".to_string(), uuid);
+        crate::accounts::profiles::save(&profiles_path, &profiles).unwrap();
+
+        let id_cred = crate::accounts::identity_store::credentials_codex_path_for(base, uuid);
+        std::fs::create_dir_all(id_cred.parent().unwrap()).unwrap();
+        std::fs::write(
+            &id_cred,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"at","refresh_token":"rt","id_token":"it","account_id":"uuid"}}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(base.join("credentials").join("codex-7.json")).unwrap();
+
+        let from = AccountNum::try_from(6u16).unwrap();
+        let to = AccountNum::try_from(7u16).unwrap();
+        let handle = create_handle_dir_codex(base, from, 70013).unwrap();
+
+        repoint_handle_dir_codex(base, &handle, to).expect(
+            "a slot with an identity-keyed codex credential and no legacy mirror \
+                     MUST be swappable — this is the shape every current login produces",
+        );
+
+        // auth.json must resolve to the identity-keyed credential, not a dangling
+        // legacy path.
+        let auth = handle.join("auth.json");
+        let resolved = std::fs::read_link(&auth).unwrap_or_else(|_| auth.clone());
+        assert!(
+            resolved.ends_with("credentials-codex.json"),
+            "auth.json must point at the identity-keyed credential, got: {}",
+            resolved.display()
+        );
+    }
+
     /// Refuses repointing when the canonical credential file for the
     /// target slot is missing (login has not completed). Without the
     /// canonical file, `auth.json` would symlink to a dangling path
@@ -7101,10 +9209,17 @@ mod tests {
 
         let result = repoint_handle_dir_codex(base, &handle, to);
         match result {
-            Err(CredentialError::Corrupt { reason, .. }) => {
+            Err(CredentialError::Corrupt { reason, path }) => {
+                // No by_slot mapping in this fixture, so the error names the
+                // legacy path. Assert on the STRUCTURED field, not prose.
                 assert!(
-                    reason.contains("codex-7.json"),
-                    "error must name the missing canonical credential file: {reason}"
+                    path.ends_with("codex-7.json"),
+                    "error must name the credential path it checked: {}",
+                    path.display()
+                );
+                assert!(
+                    reason.contains("has not completed login"),
+                    "reason must tell the operator what to do: {reason}"
                 );
             }
             other => panic!("expected Corrupt for missing canonical, got: {other:?}"),
@@ -8682,6 +10797,69 @@ mod tests {
         assert!(
             marker_str.contains(&format!("config-{winner_slot}")),
             "AC9: .csq-account must target config-{winner_slot}/, got: {marker_str}"
+        );
+    }
+
+    /// L2 (`security.md` §5a): `create_tmp_exclusive` MUST refuse to write
+    /// through a symlink an attacker (or a crashed prior run) has already
+    /// planted at the exact tmp path — and the symlink's real target must
+    /// be left completely untouched, never overwritten and never exposed
+    /// via a follow-through open. Deterministic (no dependency on
+    /// `unique_tmp_path`'s process-global counter): this test picks its own
+    /// tmp path and plants the symlink there itself.
+    #[test]
+    #[cfg(unix)]
+    fn create_tmp_exclusive_refuses_a_planted_symlink_target_untouched() {
+        use super::create_tmp_exclusive;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_secret = dir.path().join("unrelated-real-file.json");
+        std::fs::write(&real_secret, b"PRE-EXISTING CONTENT, MUST NEVER CHANGE").unwrap();
+
+        let tmp = dir.path().join("settings.json.tmp.planted");
+        std::os::unix::fs::symlink(&real_secret, &tmp).unwrap();
+
+        let result = create_tmp_exclusive(&tmp, b"{\"attacker\":\"payload\"}");
+
+        assert!(
+            result.is_err(),
+            "create_new(true) must refuse to write through a planted \
+             symlink, got: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_secret).unwrap(),
+            "PRE-EXISTING CONTENT, MUST NEVER CHANGE",
+            "the symlink's real target must be untouched by the refused write"
+        );
+        // The symlink itself is also untouched (not replaced, not deleted).
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted symlink entry itself must be left exactly as it was"
+        );
+    }
+
+    /// The happy path, same fn: no pre-existing entry at `tmp` — the file
+    /// is created at 0o600 (never world-readable, even momentarily) and
+    /// holds exactly the written content.
+    #[test]
+    #[cfg(unix)]
+    fn create_tmp_exclusive_creates_fresh_file_at_0600() {
+        use super::create_tmp_exclusive;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("settings.json.tmp.fresh");
+
+        create_tmp_exclusive(&tmp, b"{\"real\":\"content\"}").expect("fresh create must succeed");
+
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"{\"real\":\"content\"}");
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "must be owner-only from creation, got {mode:o}"
         );
     }
 }

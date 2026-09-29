@@ -147,7 +147,14 @@ pub(crate) fn breaker_record_success(map: &BreakerMap, account: u16) {
 pub(crate) async fn tick(base_dir: &Path, http_get_codex: &HttpGetFn, breakers: &BreakerMap) {
     debug!("codex usage poller tick starting");
 
-    let mut accounts = discovery::discover_codex(base_dir);
+    // Quota rows are keyed by slot, not surface. Use the same winning
+    // account source as the UI: residual Codex credentials must not let
+    // this later tick overwrite a restored Claude slot's quota. Filter
+    // BEFORE the per-surface cap so Claude slots cannot starve Codex ones.
+    let mut accounts: Vec<_> = discovery::discover_all(base_dir)
+        .into_iter()
+        .filter(|info| info.source == AccountSource::Codex)
+        .collect();
     if accounts.len() > MAX_ACCOUNTS_PER_TICK {
         accounts.truncate(MAX_ACCOUNTS_PER_TICK);
     }
@@ -991,6 +998,137 @@ mod tests {
         });
         let path = cred_file::canonical_path_for(base, num, Surface::Codex);
         credentials::save(&path, &creds).unwrap();
+    }
+
+    // TEST INPUT only: UUID-routed private fixtures mirror the dual-store
+    // shape without reading any host credentials or invoking a real transport.
+    fn install_ownership_slot(base: &Path, slot: u16, anthropic: bool, codex: bool) {
+        use crate::accounts::{identity_store, profiles};
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(slot);
+        let path = profiles::profiles_path(base);
+        let mut pf = profiles::load(&path).unwrap_or_else(|_| profiles::ProfilesFile::empty());
+        pf.by_slot.insert(slot.to_string(), uuid);
+        // No by_slot_identity label: credential presence alone previously
+        // enrolled a restored Claude slot in the independent Codex poller.
+        profiles::save(&path, &pf).unwrap();
+        if anthropic {
+            let creds: CredentialFile = serde_json::from_value(serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "TEST INPUT synthetic Claude access",
+                    "refreshToken": "TEST INPUT synthetic Claude refresh",
+                    // Year 2100: no wall-clock expiry time bomb.
+                    "expiresAt": 4102444800000u64,
+                    "scopes": []
+                }
+            }))
+            .unwrap();
+            credentials::save(&identity_store::credentials_path_for(base, uuid), &creds).unwrap();
+        }
+        if codex {
+            install_codex_account(base, slot, "TEST INPUT synthetic Codex access");
+            let legacy = cred_file::canonical_path_for(
+                base,
+                AccountNum::try_from(slot).unwrap(),
+                Surface::Codex,
+            );
+            let target = identity_store::credentials_codex_path_for(base, uuid);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::rename(legacy, target).unwrap();
+        }
+    }
+
+    fn seed_claude_quota(base: &Path, slot: u16) {
+        let mut quota = crate::quota::QuotaFile::empty();
+        quota.set(
+            slot,
+            AccountQuota {
+                surface: "claude-code".into(),
+                five_hour: Some(UsageWindow {
+                    used_percentage: 37.0,
+                    resets_at: 4102444800, // Year 2100: stable synthetic window.
+                }),
+                updated_at: 1234.0,
+                ..Default::default()
+            },
+        );
+        quota_state::save_state(base, &quota).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_tick_skips_dual_bound_slot_without_transport_or_quota_write() {
+        let dir = TempDir::new().unwrap();
+        install_ownership_slot(dir.path(), 21, true, true);
+        seed_claude_quota(dir.path(), 21);
+        assert!(discovery::discover_codex(dir.path())
+            .iter()
+            .any(|a| a.id == 21 && a.has_credentials));
+        assert!(discovery::discover_all(dir.path())
+            .iter()
+            .any(|a| a.id == 21 && a.source == AccountSource::Anthropic));
+        let before = std::fs::read(quota_state::quota_path(dir.path())).unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_wham_success(Arc::clone(&counter));
+        let breakers: BreakerMap = Arc::new(Mutex::new(HashMap::new()));
+        tick(dir.path(), &http, &breakers).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "Claude winner must never invoke Codex transport"
+        );
+        assert_eq!(
+            std::fs::read(quota_state::quota_path(dir.path())).unwrap(),
+            before
+        );
+        assert!(breakers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_tick_polls_codex_only_sibling_preserving_claude_row() {
+        let dir = TempDir::new().unwrap();
+        install_ownership_slot(dir.path(), 21, true, true);
+        install_ownership_slot(dir.path(), 22, false, true);
+        seed_claude_quota(dir.path(), 21);
+        let before = quota_state::load_state(dir.path()).unwrap();
+        let before_row = serde_json::to_value(before.get(21).unwrap()).unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_wham_success(Arc::clone(&counter));
+        let breakers: BreakerMap = Arc::new(Mutex::new(HashMap::new()));
+        tick(dir.path(), &http, &breakers).await;
+        let after = quota_state::load_state(dir.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(after.get(21).unwrap()).unwrap(),
+            before_row,
+            "Codex tick must preserve the complete Claude quota row"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(after.get(22).unwrap().surface, "codex");
+        assert!(after.get(22).unwrap().shows_window());
+    }
+
+    #[tokio::test]
+    async fn codex_tick_filters_before_cap() {
+        let dir = TempDir::new().unwrap();
+        for slot in 1..=MAX_ACCOUNTS_PER_TICK as u16 {
+            install_ownership_slot(dir.path(), slot, true, false);
+        }
+        let codex_slot = MAX_ACCOUNTS_PER_TICK as u16 + 1;
+        install_ownership_slot(dir.path(), codex_slot, false, true);
+        assert_eq!(
+            discovery::discover_all(dir.path()).len(),
+            MAX_ACCOUNTS_PER_TICK + 1
+        );
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = mock_wham_success(Arc::clone(&counter));
+        let breakers: BreakerMap = Arc::new(Mutex::new(HashMap::new()));
+        tick(dir.path(), &http, &breakers).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "other surfaces must not consume the Codex cap"
+        );
+        let quota = quota_state::load_state(dir.path()).unwrap();
+        assert_eq!(quota.accounts.len(), 1);
+        assert_eq!(quota.get(codex_slot).unwrap().surface, "codex");
     }
 
     fn mock_wham_success(counter: Arc<AtomicU32>) -> HttpGetFn {

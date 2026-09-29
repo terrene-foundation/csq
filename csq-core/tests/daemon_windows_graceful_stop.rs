@@ -95,7 +95,8 @@ fn test_state(base: &std::path::Path) -> server::RouterState {
         base_dir: Arc::new(base.to_path_buf()),
         oauth_store: None,
         gemini_consumer: csq_core::daemon::usage_poller::gemini::GeminiConsumerState::default(),
-        audit_health: csq_core::audit::AuditHealth::Verified,
+        audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
+        audit_records_unverified: 0,
         anchor_sink: None,
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),

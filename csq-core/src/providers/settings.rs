@@ -2,7 +2,7 @@
 
 use super::catalog::{get_provider, Provider};
 use crate::error::ConfigError;
-use crate::platform::fs::{atomic_replace, secure_file};
+use crate::platform::fs::atomic_replace;
 use crate::session::merge::{repair_truncated_json, set_model};
 use crate::types::ApiKey;
 use serde::{Deserialize, Serialize};
@@ -454,34 +454,19 @@ pub fn save_settings(base_dir: &Path, settings: &ProviderSettings) -> Result<(),
         std::fs::create_dir_all(parent).ok();
     }
 
+    // SECURITY: this file holds 3P API tokens (ANTHROPIC_AUTH_TOKEN for
+    // MiniMax / Z.AI) under the env block. `write_new_private` creates the
+    // tmp file at 0o600 AT CREATION (`create_new` + `mode(0o600)`), closing
+    // the window `std::fs::write` (umask-default, typically 0o644) plus a
+    // separate `secure_file` chmod used to leave open — an internal journal entry P1-4,
+    // red-team B2. On any write failure the tmp file this call created is
+    // removed before propagating, same fail-closed intent as before.
     let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-        // `std::fs::write` may partially write before returning Err,
-        // leaving a tmp file containing the token at umask-default
-        // permissions. Clean up before propagating.
+    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ConfigError::InvalidJson {
             path: tmp.clone(),
             reason: format!("write: {e}"),
-        });
-    }
-
-    // SECURITY: propagate (not `.ok()`). This file holds 3P API
-    // tokens (ANTHROPIC_AUTH_TOKEN for MiniMax / Z.AI) under the
-    // env block — a silent chmod failure on an exotic filesystem
-    // (network mount, restrictive-ACL tmpfs) would publish the
-    // credential file at the umask default. Fail closed. Journal
-    // 0063 P1-4, red-team B2. On failure the tmp file must be
-    // removed — `std::fs::write` above created it at umask-default
-    // permissions, so leaving it behind would defeat the fail-
-    // closed intent. Uses a fixed reason string so a future
-    // secure_file implementation that included the path or file
-    // contents in its error message could not echo the key.
-    if secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: "secure_file: chmod failed".into(),
         });
     }
     if let Err(e) = atomic_replace(&tmp, &path) {
@@ -850,36 +835,42 @@ mod tests {
         assert_eq!(empty.key_fingerprint(), "(none)");
     }
 
-    /// DeepSeek's published tier asymmetry: opus/sonnet → pro, haiku
-    /// → flash, subagent → flash, effort → max. The MODEL_KEYS uniform
-    /// fan-out writes pro to all four; `extra_env` overrides haiku to
-    /// flash and adds the two CC-native keys outside MODEL_KEYS.
+    /// DeepSeek is now UNIFORM across tiers: every MODEL_KEYS tier fans out
+    /// to `deepseek-flash[1m]`, the 1M variant, and `extra_env` adds the two
+    /// CC-native keys outside MODEL_KEYS plus effort.
+    ///
+    /// This replaced an earlier ASYMMETRY (opus/sonnet → `deepseek-v4-pro`,
+    /// haiku → flash). The pro id carries no `[1m]` suffix, and `[1m]` is a
+    /// lever Claude Code reads — its own notice says "append [1m] to the model
+    /// name for 1M" — so the default handed CC a model it would size from its
+    /// own assumed window. Uniform `[1m]` also matches kimi (`kimi-k3[1m]`) and
+    /// zai (`glm-5.3[1m]`). Maintainer-directed.
     #[test]
-    fn default_settings_deepseek_applies_asymmetric_tier_defaults() {
+    fn default_settings_deepseek_applies_uniform_1m_tier_defaults() {
         let p = get_provider("deepseek").unwrap();
         let s = default_settings(p);
         let env = s.get("env").unwrap();
 
-        // Opus + Sonnet stay at pro (uniform fan-out, no override).
+        // Every tier fans out to the same 1M variant — no asymmetry.
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").unwrap().as_str(),
-            Some("deepseek-v4-pro")
+            Some("deepseek-flash[1m]")
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").unwrap().as_str(),
-            Some("deepseek-v4-pro")
+            Some("deepseek-flash[1m]")
         );
 
         // Haiku is overridden to flash.
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").unwrap().as_str(),
-            Some("deepseek-v4-flash")
+            Some("deepseek-flash[1m]")
         );
 
         // CC-native subagent + effort keys present.
         assert_eq!(
             env.get("CLAUDE_CODE_SUBAGENT_MODEL").unwrap().as_str(),
-            Some("deepseek-v4-flash")
+            Some("deepseek-flash[1m]")
         );
         assert_eq!(
             env.get("CLAUDE_CODE_EFFORT_LEVEL").unwrap().as_str(),
@@ -888,8 +879,8 @@ mod tests {
     }
 
     /// Kimi's official Claude Code docs require a fixed env set: all model
-    /// tiers → `kimi-k3[1m]` (uniform fan-out onto the 1M-context variant; no
-    /// tier asymmetry like DeepSeek), plus `ENABLE_TOOL_SEARCH=false` (the
+    /// tiers → `kimi-k3[1m]` (uniform fan-out onto the 1M-context variant, the same
+    /// shape DeepSeek now uses), plus `ENABLE_TOOL_SEARCH=false` (the
     /// Moonshot endpoint doesn't support tool-search yet), a 1M
     /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, and
     /// `CLAUDE_CODE_SUBAGENT_MODEL=kimi-k3[1m]`. Effort is a csq-chosen
@@ -929,6 +920,84 @@ mod tests {
         );
     }
 
+    /// an internal ticket: CC infers a context window only for models it recognises, so on a
+    /// 3P slot it has no window to compare against and its auto-compact trigger
+    /// never fires. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` supplies the number.
+    ///
+    /// It is pinned as a PAIR with `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. CC is
+    /// reported to cap unrecognised non-Claude model ids at a 200_000 window and
+    /// resolve the effective window as `min(model_window, value)`, which would
+    /// clamp a window-only setting straight back to 200_000 and make the var a
+    /// no-op — exactly the reported symptom. The companion is the documented
+    /// remediation. NOTE: that clamping is REPORTED, not verified here (see the
+    /// FIX-1577 deliverable §5); it is why the pair is written defensively.
+    ///
+    /// 1_048_576 is a UNIFORM value across all four 3P providers, chosen
+    /// deliberately over each model's own `context_window`: zai/deepseek/mm
+    /// are recorded at 1_000_000 and kimi at 1_048_576 in
+    /// `model-rates.builtin.json`, so 1_048_576 slightly EXCEEDS three of
+    /// them. That is the accepted trade.
+    ///
+    /// Claude Code applies its own threshold as a fraction of the declared
+    /// window (docs: ~967K of 1M for native-1M models, ~96.7%), so a declared
+    /// window higher than the model's real limit lets a session grow past it
+    /// before compacting. For kimi/zai/deepseek the id carries `[1m]`, so CC
+    /// assumes a 1M window and `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is INERT --
+    /// the overshoot cannot bite. For **mm** (a bare `MiniMax-M3`) the
+    /// companion is live, so mm is the one provider where this matters.
+    #[test]
+    fn default_settings_3p_providers_pin_the_window_and_its_companion() {
+        for id in ["zai", "deepseek", "mm"] {
+            let p = get_provider(id).unwrap();
+            let s = default_settings(p);
+            let env = s.get("env").unwrap();
+            assert_eq!(
+                env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                    .and_then(|v| v.as_str()),
+                Some("1048576"),
+                "{id} window"
+            );
+            assert_eq!(
+                env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                    .and_then(|v| v.as_str()),
+                Some("1048576"),
+                "{id} must pair the window with its companion at the SAME value \u{2014} \
+                 the pair is what makes the window take effect"
+            );
+        }
+
+        // Kimi is docs-mandated at its full 1_048_576 and is deliberately NOT
+        // changed by this fix. OPEN FINDING (deliverable §5): kimi sets the
+        // window but no companion, so by the same clamping mechanism it may also
+        // be inert. Deliberately NOT asserted either way here -- pinning its
+        // current state would enshrine a possible bug, and adding the companion
+        // would exceed this change's brief. For the maintainer to rule on.
+        let p = get_provider("kimi").unwrap();
+        let s = default_settings(p);
+        assert_eq!(
+            s.get("env")
+                .unwrap()
+                .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .and_then(|v| v.as_str()),
+            Some("1048576"),
+            "kimi stays at its docs-mandated full window"
+        );
+
+        // Models with no measured window get NOTHING -- neither var. A guessed
+        // window is worse than none: compaction would fire late or never.
+        for id in ["ollama", "claude"] {
+            let p = get_provider(id).unwrap();
+            let s = default_settings(p);
+            let env = s.get("env").unwrap();
+            for key in [
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+            ] {
+                assert!(env.get(key).is_none(), "{id} must not be given {key}");
+            }
+        }
+    }
+
     /// `set_model` must NOT clobber keys outside `MODEL_KEYS`. After
     /// switching DeepSeek to flash uniformly, the CC-native subagent +
     /// effort keys persist (they belong to the user's per-provider
@@ -941,14 +1010,14 @@ mod tests {
         let switched = crate::session::merge::set_model(&initial, "deepseek-v4-flash");
         let env = switched.get("env").unwrap();
 
-        // MODEL_KEYS now uniformly flash.
+        // Explicit legacy selection is canonicalized to the CC 1M selector.
         for key in crate::session::merge::MODEL_KEYS {
-            assert_eq!(env.get(*key).unwrap().as_str(), Some("deepseek-v4-flash"));
+            assert_eq!(env.get(*key).unwrap().as_str(), Some("deepseek-flash[1m]"));
         }
         // Extras outside MODEL_KEYS still there.
         assert_eq!(
             env.get("CLAUDE_CODE_SUBAGENT_MODEL").unwrap().as_str(),
-            Some("deepseek-v4-flash")
+            Some("deepseek-flash[1m]")
         );
         assert_eq!(
             env.get("CLAUDE_CODE_EFFORT_LEVEL").unwrap().as_str(),

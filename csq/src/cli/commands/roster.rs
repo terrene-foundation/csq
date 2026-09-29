@@ -27,7 +27,7 @@ use csq_core::audit::verify::{verify_chain, VerifyConfig};
 use csq_core::audit::ChainState;
 use csq_core::daemon::detect::{detect_daemon, DetectResult};
 use csq_core::error::redact_tokens;
-use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -43,10 +43,11 @@ use std::path::{Path, PathBuf};
 /// gets membership-enforced, but was signed by the operator key (NOT in the new
 /// roster) → `MultiSigInvalid` → daemon refuses to start permanently.
 ///
-/// Fix: refuse install while the daemon's PID is alive. With the daemon stopped,
-/// no concurrent guarded write can land, and `activation_seq = head_seq + 1`
-/// is race-free. `daemon_alive` is closure-injectable so tests can exercise both
-/// paths without a real daemon process.
+/// Refuse install while the daemon is detected alive. Planned maintenance must
+/// quiesce its actual owner and prevent automatic relaunch; a one-time liveness
+/// check alone does not establish universal race freedom. The chain-lock below
+/// also serializes the install's read-modify-write. `daemon_alive` is injectable
+/// so tests can exercise refusal without a real daemon process.
 ///
 /// # Ordering (CRIT-2 fix)
 ///
@@ -101,8 +102,8 @@ fn handle_roster_install_inner(
     // next verify_chain call, and permanently brick the daemon (permanent
     // MultiSigInvalid on every startup).
     //
-    // With the daemon stopped, the chain is single-writer (only this process),
-    // and activation_seq = head_seq + 1 is race-free.
+    // Quiesce through the actual owner, not a universal stop/manual-start recipe.
+    // The later chain lock remains necessary; liveness is only one observation.
     if daemon_alive() {
         // Best-effort: extract the PID for the operator message. The closure
         // already confirmed the daemon is alive (Healthy or Unhealthy); a
@@ -114,12 +115,10 @@ fn handle_roster_install_inner(
         } else {
             String::new()
         };
+        let guidance = csq_core::daemon::recovery::maintenance_guidance();
         bail!(
-            "the csq daemon is running{pid_hint} — stop it with \
-`csq daemon stop` before installing a roster, then `csq daemon start` afterward. \
-Installing a roster while the daemon may append records can permanently brick \
-the audit chain (a record written under the old trust model would fail the new \
-membership check)."
+            "the csq daemon is running{pid_hint} — roster installation refused while \
+a writer may append audit records. A record written under the old trust model may fail the new membership check. {guidance}"
         );
     }
     // Step 2: Read the roster JSON file as raw bytes (needed for detached-sig verification).
@@ -535,24 +534,21 @@ fn default_audit_dir(base_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| base_dir.join("audit"))
 }
 
-/// Write `bytes` to `path` via the §5a write path (unique tmp → write →
-/// secure_file(0o600) → atomic_replace) with cleanup-on-every-failure.
+/// Write `bytes` to `path` via the §5a write path (unique tmp →
+/// write_new_private(0o600 at creation) → atomic_replace) with
+/// cleanup-on-every-failure.
 ///
 /// Used for BOTH the secret and the public key: `resolve_root_pubkey` requires
 /// `roster-root.pub` to be 0o600-or-stricter on Unix, so the public file gets
 /// the same treatment as the secret.
 fn write_secure_bytes(path: &Path, bytes: &[u8], what: &'static str) -> Result<()> {
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate write + secure_file pair would leave
+    // open — this path carries the root signing PRIVATE key on one call.
     let tmp = unique_tmp_path(path);
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    if let Err(e) = write_new_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         bail!("failed to write {what}: {}", redact_tokens(&e.to_string()));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        bail!(
-            "failed to secure {what} permissions: {}",
-            redact_tokens(&e.to_string())
-        );
     }
     if let Err(e) = atomic_replace(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
@@ -1782,8 +1778,6 @@ mod tests {
     #[test]
     fn roster_install_refuses_when_daemon_alive() {
         let _g = csq_core::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         let dir = tmp();
         let base = dir.path();
@@ -1795,16 +1789,12 @@ mod tests {
         let roster_file = dir.path().join("test-roster.json");
         std::fs::write(&roster_file, serde_json::to_string_pretty(&signed).unwrap()).unwrap();
 
-        setup_env_root_pk(root_pk);
-
         // Confirm no roster or chain.json exists before the attempt.
         let roster_path = csq_core::audit::authority::roster_path(base);
         assert!(!roster_path.exists(), "pre: roster must not exist");
 
         // Inject daemon_alive=true — daemon is running.
         let result = handle_roster_install_inner(base, &roster_file, None, || true);
-
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         // Must fail with an operator-actionable message.
         assert!(
@@ -1813,13 +1803,15 @@ mod tests {
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("daemon stop"),
-            "error must mention `csq daemon stop`: {err_msg}"
+            err_msg.contains("Planned maintenance, not routine restart"),
+            "{err_msg}"
         );
         assert!(
-            err_msg.contains("daemon start"),
-            "error must mention `csq daemon start`: {err_msg}"
+            err_msg.contains("Daemon ownership is unverified"),
+            "{err_msg}"
         );
+        assert!(!err_msg.contains("`csq daemon stop`"), "{err_msg}");
+        assert!(!err_msg.contains("`csq daemon start`"), "{err_msg}");
 
         // On-disk roster MUST be unchanged (no partial write).
         assert!(
@@ -2265,5 +2257,393 @@ mod tests {
             reg.err()
         );
         assert_eq!(reg.unwrap().roster().roster_version, 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged durability contract (spec 12 §12.16.18)
+    //
+    // These three tests pin the STAGE BOUNDARIES of `roster-install` rather
+    // than a universal "Err ⇒ on-disk state unchanged" claim, which is false
+    // for the stages after verification. Each asserts the durable POST-STATE
+    // for its stage — `is_err()` alone cannot distinguish a partial write from
+    // a clean abort, and that distinction is the whole contract.
+    // -----------------------------------------------------------------------
+
+    /// Stage D/E (verification) — the CRIT-2 ordering guarantee, asserted on
+    /// BYTES, plus the two artifacts that stage C makes durable ahead of it.
+    ///
+    /// Falsifying result, named before the run: if `save_roster` ran before
+    /// `verify_signed_roster` (the pre-CRIT-2 order), the roster file would
+    /// read the bad v2 roster instead of the v1 sentinel bytes. If the chain
+    /// lock were acquired only after verification, `.chain-lock` would not
+    /// exist here — and the retired universal wording would have been correct.
+    #[test]
+    fn roster_install_verify_failure_keeps_roster_bytes_and_leaves_chain_lock() {
+        let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
+        let dir = tmp();
+        let base = dir.path();
+
+        // Pre-state: a valid v1 roster is live, and chain.json carries a
+        // distinctive chain_id so "unchanged" is checkable on bytes.
+        let (root_sk, root_pk) = gen_keypair();
+        save_roster(base, &minimal_signed_roster(&root_sk, root_pk, 1)).expect("save v1");
+        ChainState::new("sentinel-chain-verify-stage")
+            .save(base)
+            .expect("save chain");
+        setup_env_root_pk(root_pk);
+
+        let roster_on_disk = csq_core::audit::authority::roster_path(base);
+        let chain_json = base.join("csq-runs").join("chain.json");
+        let roster_before = std::fs::read(&roster_on_disk).expect("read v1 roster");
+        let chain_before = std::fs::read(&chain_json).expect("read chain.json");
+
+        // A v2 roster signed by the WRONG key: newer version, invalid signature.
+        let (bad_sk, _) = gen_keypair();
+        let bad = sign_roster_for_test(
+            &bad_sk,
+            &Roster {
+                format_version: 1,
+                roster_version: 2,
+                generated_at: "2026-06-02T00:00:00+00:00".to_string(),
+                entries: BTreeMap::new(),
+            },
+            root_pk,
+        );
+        let src = base.join("bad-v2.json");
+        std::fs::write(&src, serde_json::to_string_pretty(&bad).unwrap()).unwrap();
+
+        let err = handle_roster_install_inner(base, &src, None, || false)
+            .expect_err("bad-signature roster must not install");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        assert!(
+            err.to_string().contains("roster verification failed"),
+            "must fail AT the verification stage, not a later one: {err}"
+        );
+
+        // The guarantee that IS real: nothing the verification stage rejects
+        // reaches the live roster path or chain.json.
+        assert_eq!(
+            std::fs::read(&roster_on_disk).unwrap(),
+            roster_before,
+            "live roster must be byte-identical after a rejected install"
+        );
+        assert_eq!(
+            std::fs::read(&chain_json).unwrap(),
+            chain_before,
+            "chain.json must be byte-identical after a rejected install"
+        );
+
+        // The part the retired universal wording got wrong: the chain lock is
+        // acquired BEFORE verification, so its sidecar outlives the refusal.
+        //
+        // Unix: `try_lock_file`/`lock_file` open the sidecar via
+        // `OpenOptions::create(true)` (platform/lock.rs) before ever
+        // attempting `flock(2)`, so the sidecar's mere EXISTENCE is direct
+        // proof `acquire_chain_lock` ran — the same file-creation side
+        // effect `lock.rs::lock_creates_file_if_missing` documents as
+        // Unix-only ("On Windows, the 'lock' is a named kernel mutex — no
+        // file is created by the locking primitive itself").
+        //
+        // Windows: the chain lock is `CreateMutexW` / `WaitForSingleObject`
+        // (platform/lock.rs `imp` module under `#[cfg(windows)]`) — no
+        // filesystem sidecar is ever created by the locking primitive on
+        // ANY code path, so asserting the sidecar's existence would be
+        // vacuous there: it fails identically whether the lock was
+        // acquired before verification, after verification, or never at
+        // all. Assert the Windows-native contract instead: the guard
+        // `acquire_chain_lock` returned was dropped when the install
+        // returned `Err` (releasing the named mutex), so the SAME mutex is
+        // re-acquirable.
+        //
+        // The re-acquire runs on ANOTHER THREAD, and that is load-bearing:
+        // a Windows mutex is RECURSIVE for its owning thread, so a same-thread
+        // `WaitForSingleObject` succeeds even while a leaked guard still holds
+        // it — that version of this check could not fail. From a different
+        // thread a leaked hold makes `try_lock_file` return `Ok(None)`
+        // (`WAIT_TIMEOUT`), so this assertion discriminates.
+        #[cfg(unix)]
+        assert!(
+            base.join("csq-runs").join(".chain-lock").exists(),
+            "the chain-lock sidecar is created before verification and is durable"
+        );
+        #[cfg(windows)]
+        {
+            let lock_path = base.join("csq-runs").join(".chain-lock");
+            let reacquired = std::thread::spawn(move || {
+                csq_core::platform::lock::try_lock_file(&lock_path)
+                    .expect(
+                        "try_lock_file must not error re-acquiring the chain lock \
+                         after the rejected install",
+                    )
+                    .is_some()
+            })
+            .join()
+            .expect("re-acquire thread panicked");
+            assert!(
+                reacquired,
+                "the chain lock (a named mutex on Windows, not a filesystem \
+                 sidecar) must be cleanly released after the rejected \
+                 install — a leaked guard would make this re-acquisition \
+                 attempt time out instead"
+            );
+        }
+    }
+
+    /// Stage G (chain.json save) — the promise is FALSE here: the roster is
+    /// already published when `chain.save` fails, so the install returns `Err`
+    /// having changed on-disk state.
+    ///
+    /// Fault injection is filesystem-only: `csq-runs/` is made unwritable, so
+    /// `ChainState::save_in`'s tmp write fails with `EACCES` while `audit/`
+    /// (where the roster lands) stays writable. `.chain-lock` is pre-created
+    /// with the production primitive so lock acquisition needs no directory
+    /// write of its own.
+    ///
+    /// Falsifying result, named before the run: if the roster write were
+    /// staged behind the chain.json write, or rolled back on its failure, the
+    /// live roster would still read v1.
+    #[cfg(unix)]
+    #[test]
+    fn roster_install_chain_json_write_failure_leaves_new_roster_published() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
+        let dir = tmp();
+        let base = dir.path();
+
+        let (root_sk, root_pk) = gen_keypair();
+        save_roster(base, &minimal_signed_roster(&root_sk, root_pk, 1)).expect("save v1");
+        let mut chain = ChainState::new("sentinel-chain-save-stage");
+        chain.roster_version_floor = Some(1);
+        chain.save(base).expect("save chain");
+        setup_env_root_pk(root_pk);
+
+        let csq_runs = base.join("csq-runs");
+        // Pre-create the lock sidecar with the same primitive production uses,
+        // so acquisition does not itself need to create a directory entry.
+        drop(csq_core::platform::lock::lock_file(&csq_runs.join(".chain-lock")).expect("pre-lock"));
+
+        let chain_json = csq_runs.join("chain.json");
+        let chain_before = std::fs::read(&chain_json).expect("read chain.json");
+
+        std::fs::set_permissions(&csq_runs, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Probe the injected fault directly rather than inferring it from uid:
+        // root (DAC_OVERRIDE) and mode-ignoring filesystems both defeat 0o500,
+        // and a test that cannot inject its fault must SKIP, not pass.
+        let probe = csq_runs.join(".write-probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&csq_runs, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+            eprintln!(
+                "SKIP: roster_install_chain_json_write_failure_leaves_new_roster_published \
+                 — 0o500 did not deny writes (root, or a mode-ignoring filesystem)"
+            );
+            return;
+        }
+
+        let v2 = minimal_signed_roster(&root_sk, root_pk, 2);
+        let src = base.join("good-v2.json");
+        std::fs::write(&src, serde_json::to_string_pretty(&v2).unwrap()).unwrap();
+
+        let err = handle_roster_install_inner(base, &src, None, || false)
+            .expect_err("unwritable csq-runs/ must fail the chain.json save");
+
+        // Restore before any assertion can unwind past the cleanup.
+        std::fs::set_permissions(&csq_runs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
+        assert!(
+            err.to_string().contains("failed to save chain.json"),
+            "must fail AT the chain.json stage, not an earlier one: {err}"
+        );
+
+        // The retired promise said this would still read v1. It reads v2.
+        // Parsed straight off disk — the bytes that landed, not a re-verified view.
+        let live: SignedRoster = serde_json::from_slice(
+            &std::fs::read(csq_core::audit::authority::roster_path(base))
+                .expect("live roster must still be readable"),
+        )
+        .expect("live roster must still parse");
+        assert_eq!(
+            live.roster.roster_version, 2,
+            "the roster is published before chain.json is saved, so a chain.json \
+             failure returns Err with the NEW roster already live"
+        );
+        assert_eq!(
+            std::fs::read(&chain_json).unwrap(),
+            chain_before,
+            "chain.json itself is unchanged — the two are split, not rolled back"
+        );
+    }
+
+    /// Stage F (roster publish) — not all-or-nothing in the detached form: the
+    /// sidecar and the roster file are two separate `atomic_replace` calls, so
+    /// a failure on the second leaves the FIRST durable.
+    ///
+    /// Fault injection is filesystem-only: a directory at the live roster path
+    /// makes `rename(2)` fail with something other than `EXDEV`, which
+    /// `atomic_replace_unix` propagates rather than falling back on.
+    ///
+    /// Falsifying result, named before the run: if the pair were published
+    /// atomically, the sidecar would still hold the sentinel bytes.
+    #[cfg(unix)]
+    #[test]
+    fn roster_install_detached_roster_write_failure_leaves_new_sidecar_published() {
+        let _g = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
+        let dir = tmp();
+        let base = dir.path();
+        let (root_sk, root_pk) = gen_keypair();
+        setup_env_root_pk(root_pk);
+
+        // Pre-state: a sentinel sidecar, and a DIRECTORY where the roster file
+        // belongs so its rename fails while the sidecar's succeeds.
+        let sig_p = csq_core::audit::authority::roster_sig_path(base);
+        let roster_p = csq_core::audit::authority::roster_path(base);
+        std::fs::create_dir_all(roster_p.parent().unwrap()).unwrap();
+        let sentinel_sig = "00".repeat(64);
+        std::fs::write(&sig_p, &sentinel_sig).unwrap();
+        std::fs::create_dir_all(&roster_p).unwrap();
+
+        // A well-formed detached pair: signature over the EXACT source bytes.
+        let unsigned = UnsignedRosterFile {
+            roster: Roster {
+                format_version: 1,
+                roster_version: 1,
+                generated_at: "2026-06-02T00:00:00+00:00".to_string(),
+                entries: BTreeMap::new(),
+            },
+            roster_pubkey: root_pk,
+        };
+        let src = base.join("detached.json");
+        let src_bytes = serde_json::to_string_pretty(&unsigned).unwrap();
+        std::fs::write(&src, &src_bytes).unwrap();
+        let new_sig_hex = {
+            use ed25519_dalek::Signer;
+            hex::encode(root_sk.sign(src_bytes.as_bytes()).to_bytes())
+        };
+        std::fs::write(base.join("detached.json.sig"), &new_sig_hex).unwrap();
+
+        let err = handle_roster_install_inner(base, &src, None, || false)
+            .expect_err("a directory at the roster path must fail the publish");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+
+        assert!(
+            err.to_string().contains("failed to save detached roster"),
+            "must fail AT the roster-publish stage: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sig_p).unwrap(),
+            new_sig_hex,
+            "the sidecar is published before the roster file, so it survives the \
+             roster write's failure — the publish stage is not atomic across the pair"
+        );
+        assert_ne!(
+            std::fs::read_to_string(&sig_p).unwrap(),
+            sentinel_sig,
+            "sentinel must have been overwritten (guards against a vacuous pass)"
+        );
+        assert!(
+            roster_p.is_dir(),
+            "the roster file itself never landed — only the sidecar moved"
+        );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_refusal {
+    use super::*;
+
+    /// Restores a process-global var on drop, so an assertion failure below
+    /// cannot leak the override into a sibling test. Local to this module by
+    /// the same convention `swap.rs`'s test module uses for its own guard.
+    struct RuntimeDirGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl RuntimeDirGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+    impl Drop for RuntimeDirGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn live_writer_refusal_uses_planned_maintenance_without_writes() {
+        let _env = csq_core::platform::test_env::lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        // `pid_file_path` does NOT resolve under `base` on every platform: on
+        // Linux it returns `$XDG_RUNTIME_DIR/csq-daemon.pid` and on Windows
+        // `%LOCALAPPDATA%\csq\csq-daemon.pid`, ignoring `base` entirely
+        // (`csq-core/src/daemon/paths.rs::pid_file_path`). So the assertion
+        // below was reading a SHARED HOST path, and on any machine that
+        // actually runs csq — which is every self-hosted Linux runner — that
+        // file exists and the test fails for a reason unrelated to the
+        // refusal it exists to pin. Pinning both vars into the tempdir makes
+        // "no PID file exists" a claim about THIS private base on every
+        // platform (`test-isolation.md` Rule 4). Safe to mutate: the shared
+        // `test_env::lock()` above is held for the whole test body.
+        let _xdg = RuntimeDirGuard::set("XDG_RUNTIME_DIR", base);
+        let _lad = RuntimeDirGuard::set("LOCALAPPDATA", base);
+        let source = base.join("private-missing-input.json");
+        // No PID file exists: the injected callback alone selects refusal, and
+        // the informational second detect stays inside this private base.
+        assert!(!csq_core::daemon::pid_file_path(base).exists());
+        let sentinel = base.join("existing-private-evidence");
+        let before = b"must remain byte-identical";
+        std::fs::write(&sentinel, before).unwrap();
+        let error = handle_roster_install_inner(base, &source, None, || true)
+            .expect_err("live writer must refuse before input parsing");
+        let text = error.to_string();
+        assert!(text.contains("daemon is running"), "{text}");
+        assert!(
+            text.contains("Planned maintenance, not routine restart"),
+            "{text}"
+        );
+        assert!(text.contains("Daemon ownership is unverified"), "{text}");
+        assert!(
+            text.contains("Verify that the daemon writer is absent"),
+            "{text}"
+        );
+        assert!(!text.contains("`csq daemon stop`"), "{text}");
+        assert!(!text.contains("`csq daemon start`"), "{text}");
+        assert!(
+            !text.contains(base.to_str().unwrap()),
+            "private base must not leak"
+        );
+        assert!(
+            !text.contains("private-missing-input"),
+            "input path must not leak"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), before);
+        let entries: Vec<_> = std::fs::read_dir(base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            [std::ffi::OsString::from("existing-private-evidence")],
+            "refusal must not create chain, roster, bundle, floor or lock state"
+        );
     }
 }

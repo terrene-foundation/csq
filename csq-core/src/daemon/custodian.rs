@@ -87,6 +87,21 @@ use tracing::{info, warn};
 /// anything past this is rejected without parsing.
 const MAX_RAW_CANDIDATE_BYTES: usize = 64 * 1024;
 
+/// `keychain-fix-r9.md` D-F7: the worst case `client::HARVEST_TIMEOUT`'s doc
+/// derives its budget from — "up to 2 of those candidates going on to a live
+/// validation call" — was a DOCUMENTED ASSUMPTION, not something the loop in
+/// [`reconcile_candidates_inner`] actually enforced: nothing stopped it from
+/// sending every remaining candidate to `verify_token_owner` (a live
+/// `/api/oauth/profile` call) if enough of them passed gate 1 and parsed.
+/// This constant is what makes that assumption TRUE rather than merely
+/// stated (`rules/doc-property-claims.md` MUST-1: name the mechanism). Once
+/// reached without an Adopted/Mismatch verdict, the reconcile stops and
+/// returns [`ReconcileOutcome::SkippedUnknown`] — the same "cannot confirm
+/// this tick, retry next tick" semantics already used for a transport
+/// failure — rather than continuing to spend the shared, IP-wide rate-limit
+/// budget (D-F6) validating ever-older candidates.
+pub(crate) const MAX_VALIDATIONS_PER_RECONCILE: usize = 2;
+
 /// Server verdict on whether a candidate token BELONGS to the bound account.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum OwnerVerdict {
@@ -185,7 +200,7 @@ pub enum SlotOwnership {
 /// that [`check_slot_store_token_ownership`] reads and that
 /// `csq repair --heal-contaminated` clears. UUID-keyed
 /// (`identities/<UUID>/credentials.json`) when `by_slot` is populated, legacy
-/// numeric (`credentials/N.json`) otherwise — mirroring [`reconcile_account`]'s
+/// numeric (`credentials/N.json`) otherwise — mirroring `reconcile_account`'s
 /// store-path resolution.
 ///
 /// Exposed so the detector and the heal act on the SAME path (one keep-set across
@@ -202,7 +217,7 @@ pub fn slot_store_credential_path(base_dir: &Path, slot: AccountNum) -> PathBuf 
 /// account bound to that slot (its `identity.json` anchor email).
 ///
 /// This is the diagnostic counterpart to the custodian's ingest gate
-/// ([`verify_token_owner`]): the gate PREVENTS new cross-slot contamination
+/// (`verify_token_owner`): the gate PREVENTS new cross-slot contamination
 /// (an internal ticket), but a store already scrambled before that fix landed does not
 /// self-heal — the store token keeps a `future`-enough expiry that the refresher
 /// never replaces it, yet it polls a foreign account's quota. `csq doctor` had no
@@ -212,7 +227,7 @@ pub fn slot_store_credential_path(base_dir: &Path, slot: AccountNum) -> PathBuf 
 /// **Read-only.** Performs at most one `GET /api/oauth/profile` with the store
 /// token and mutates nothing. `http_get` is injected so the detector is
 /// unit-testable without the network. Resolves the store path + anchor exactly
-/// as the custodian's [`reconcile_account`] does (UUID-keyed, legacy fallback).
+/// as the custodian's `reconcile_account` does (UUID-keyed, legacy fallback).
 ///
 /// NEVER logs the token or the returned email.
 pub fn check_slot_store_token_ownership(
@@ -290,28 +305,40 @@ pub(crate) fn candidate_account_matches(
 /// The `candidate_email == None` case is split into `candidate_email_drift` (a
 /// PRESENT `.claude.json` the wrong-account gate can't read an email from — the
 /// an internal ticket format drift) vs `candidate_email_absent` (absent/empty file — benign
-/// not-yet-populated), via [`crate::credentials::claude_json::classify_oauth_account`],
-/// so the daemon log carries the same drift-vs-fresh signal as the `csq doctor`
-/// custodian canary (redteam R1 F6 — cross-surface parity). Telemetry only: the
-/// adopt decision stays fail-closed on `candidate_email == None` regardless of this
-/// tag. `source_tag` is the `term-<pid>` handle-dir basename, so
-/// `base_dir.join(source_tag)` is the handle dir the candidate came from.
+/// not-yet-populated OR no handle dir survives to classify at all), via
+/// [`crate::credentials::claude_json::classify_oauth_account`], so the daemon
+/// log carries the same drift-vs-fresh signal as the `csq doctor` custodian
+/// canary (redteam R1 F6 — cross-surface parity). Telemetry only: the adopt
+/// decision stays fail-closed on `candidate_email == None` regardless of this
+/// tag.
+///
+/// `handle_dir_tag` is [`crate::credentials::keychain::HarvestCandidate::handle_dir_tag`]
+/// — `Some(basename)` ONLY when the candidate's `term-<pid>` handle dir still
+/// exists to be classified (the harvest sweep and the dead-handle reaper);
+/// `None` for the pending-clear retry path, whose candidate carries a keychain
+/// SERVICE name in `source_tag`, not a handle-dir basename (`keychain-fix-
+/// r9.md` S-L-3). Classification is skipped entirely on `None` — no path is
+/// ever built from a service name — and the honest, structurally-forced
+/// answer for "no dir to inspect" is `candidate_email_absent`.
 fn identity_unconfirmed_reason(
     base_dir: &Path,
-    source_tag: &str,
+    handle_dir_tag: Option<&str>,
     anchor_email: Option<&str>,
     candidate_email: Option<&str>,
 ) -> &'static str {
     use crate::credentials::claude_json::{classify_oauth_account, OauthAccountState};
     match (anchor_email, candidate_email) {
         (None, _) => "anchor_email_absent",
-        (_, None) => {
-            let handle_dir = base_dir.join(source_tag);
-            match classify_oauth_account(&handle_dir) {
-                OauthAccountState::FieldMissing => "candidate_email_drift",
-                _ => "candidate_email_absent",
+        (_, None) => match handle_dir_tag {
+            Some(tag) => {
+                let handle_dir = base_dir.join(tag);
+                match classify_oauth_account(&handle_dir) {
+                    OauthAccountState::FieldMissing => "candidate_email_drift",
+                    _ => "candidate_email_absent",
+                }
             }
-        }
+            None => "candidate_email_absent",
+        },
         _ => "email_mismatch",
     }
 }
@@ -422,6 +449,51 @@ pub(crate) fn reconcile_candidates(
     store_expiry: Option<u64>,
     http_get: &HttpGetFn,
 ) -> ReconcileOutcome {
+    reconcile_candidates_inner(
+        base_dir,
+        account,
+        anchor_email,
+        candidates,
+        store_expiry,
+        http_get,
+        /* require_email_prefilter_on_absent_candidate_email = */ true,
+    )
+}
+
+/// `keychain-fix-r9.md` D-F3: `require_email_prefilter_on_absent_candidate_email`
+/// gates ONLY the "candidate has no captured `.claude.json` self-report"
+/// branch of gate 1 ([`candidate_account_matches`]) — when `false` AND
+/// `cand.candidate_email` is `None`, gate 1 is skipped entirely for that
+/// candidate and it proceeds straight to gate 2 ([`verify_token_owner`], the
+/// AUTHORITATIVE server-side owner check), instead of being rejected outright.
+/// A PRESENT-but-mismatched `candidate_email` is still rejected by gate 1
+/// regardless of this flag — this only relaxes the "we could not capture a
+/// self-report at all" case, never the "we captured one and it disagrees"
+/// case.
+///
+/// [`adopt_single_candidate_before_delete`] passes `false`: its callers (the
+/// dead-handle-dir reaper and the pending-clear retry queue) hold exactly ONE
+/// candidate — the keychain item about to be deleted — which by construction
+/// is THIS account's own stranded item, not a harvest sweep across many live
+/// sessions' dirs where an absent self-report is a genuinely ambiguous
+/// signal. Refusing to adopt purely because no `.claude.json` self-report
+/// survived the handle dir's teardown would defeat the retry/reaper path on
+/// exactly the entries it exists to rescue, when the authoritative
+/// server-side owner check (gate 2) is available and sufficient on its own.
+///
+/// [`reconcile_account`]'s harvest-across-many-live-sessions path (via
+/// [`reconcile_candidates`], above) passes `true` unchanged: there, an absent
+/// self-report is one of several candidates and staying fail-closed on it is
+/// the correct posture.
+fn reconcile_candidates_inner(
+    base_dir: &Path,
+    account: AccountNum,
+    anchor_email: Option<&str>,
+    candidates: &[credentials::keychain::HarvestCandidate],
+    store_expiry: Option<u64>,
+    http_get: &HttpGetFn,
+    require_email_prefilter_on_absent_candidate_email: bool,
+) -> ReconcileOutcome {
     // Set only when a candidate actually REACHED validation and came back Dead —
     // distinguishes "all chains revoked" (AllDead) from "candidates all rejected
     // pre-validation" (NoEligibleCandidate). A candidate dropped for oversize / parse
@@ -430,6 +502,10 @@ pub(crate) fn reconcile_candidates(
     // Set when a candidate beat the store but failed the wrong-account guard
     // (identity absent/mismatched) — surfaces the fail-closed wrong-account outcome.
     let mut identity_unconfirmed = false;
+    // D-F7: counts only candidates that actually REACH `verify_token_owner`
+    // (a live network call) — oversize/gate-1/parse-failed skips above never
+    // increment this, matching `MAX_VALIDATIONS_PER_RECONCILE`'s doc.
+    let mut validations_performed = 0usize;
     for cand in candidates {
         // security H2: reject an oversized payload without parsing.
         if cand.raw_json.len() > MAX_RAW_CANDIDATE_BYTES {
@@ -458,14 +534,22 @@ pub(crate) fn reconcile_candidates(
         // bound dir whose `.claude.json` is absent / not-yet-CC-populated also fails
         // closed (refused this tick; self-heals once CC writes oauthAccount).
         let candidate_email = cand.candidate_email.as_deref();
-        if !candidate_account_matches(anchor_email, candidate_email) {
+        // D-F3: a single-candidate caller that opted out of the prefilter for the
+        // absent-self-report case (see `reconcile_candidates_inner`'s doc) skips
+        // straight past gate 1 here — but ONLY when `candidate_email` is `None`; a
+        // PRESENT-and-mismatched self-report is never bypassed.
+        let skip_gate1_for_absent_self_report =
+            !require_email_prefilter_on_absent_candidate_email && candidate_email.is_none();
+        if !skip_gate1_for_absent_self_report
+            && !candidate_account_matches(anchor_email, candidate_email)
+        {
             // Distinct reason tags so an operator can tell a benign not-yet-populated
             // dir (candidate_email_absent) or a missing anchor (anchor_email_absent —
             // mint crash window) from a real wrong-account rejection (email_mismatch)
             // — redteam R1 LOW.
             let reason = identity_unconfirmed_reason(
                 base_dir,
-                &cand.source_tag,
+                cand.handle_dir_tag.as_deref(),
                 anchor_email,
                 candidate_email,
             );
@@ -495,6 +579,22 @@ pub(crate) fn reconcile_candidates(
             None => continue, // not an Anthropic credential — skip
         };
         let token = anth.claude_ai_oauth.access_token.expose_secret();
+
+        // D-F7: enforce the validation budget BEFORE spending it — a
+        // candidate that reaches this point is about to cost one live
+        // network call.
+        if validations_performed >= MAX_VALIDATIONS_PER_RECONCILE {
+            warn!(
+                account = account.get(),
+                error_kind = "custodian_validation_budget_exhausted",
+                cap = MAX_VALIDATIONS_PER_RECONCILE,
+                "custodian: validation cap reached this reconcile; deferring \
+                 remaining candidates to the next tick rather than spending \
+                 more of the shared rate-limit budget"
+            );
+            return ReconcileOutcome::SkippedUnknown;
+        }
+        validations_performed += 1;
 
         // A0 gate: only a token that is server-confirmed-live AND server-confirmed
         // to BELONG to this account may be adopted. `/api/oauth/profile` proves
@@ -598,6 +698,98 @@ fn adopt_candidate(
         sentinel::clear_broker_failed(base_dir, account);
     }
     Ok(wrote)
+}
+
+/// `keychain-fix-r8.md` C-F3 — single-candidate adopt for the dead-handle-dir
+/// reaper and the pending-clear retry queue
+/// (`credentials::keychain::decide_and_clear_dead_handle`'s `try_adopt`
+/// parameter). Those callers are not harvesting across every live handle dir
+/// for an account like [`reconcile_account`] does — they hold exactly ONE
+/// candidate (the keychain item about to be deleted), so there is nothing to
+/// compare it against for "freshest across many": `store_expiry` is passed
+/// as `None`, which skips [`reconcile_candidates_inner`]'s freshest-cutoff
+/// early return.
+///
+/// The SAME authoritative `verify_token_owner` liveness+ownership check
+/// (gate 2) always runs. Gate 1 (the local `.claude.json` self-report
+/// pre-filter, [`candidate_account_matches`]) is DIFFERENT here from
+/// [`reconcile_account`]'s harvest-across-many path (`keychain-fix-r9.md`
+/// D-F3): this function passes `require_email_prefilter_on_absent_candidate_email
+/// = false`, so when `candidate.candidate_email` is `None` gate 1 is skipped
+/// for this candidate and gate 2 alone decides. A PRESENT-but-mismatched
+/// self-report is still rejected by gate 1 regardless. This caller holds
+/// exactly one already-known candidate — the keychain item about to be
+/// deleted — so an absent self-report here is not the same ambiguity as an
+/// absent self-report in a multi-candidate harvest sweep, and refusing to
+/// adopt on that absence alone would defeat the reaper/retry path on exactly
+/// the entries it exists to rescue.
+///
+/// Returns `true` ONLY on [`ReconcileOutcome::Adopted`] — every other
+/// outcome (identity unconfirmed, dead, rate-limited, transport-unknown, or
+/// the store already fresher) means "do not delete this item"; the caller
+/// maps that to its own keep-and-re-queue disposition.
+///
+/// `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: honours the SAME
+/// shared, IP-wide validation gate `refresher.rs`'s custodian call and
+/// `auto_rotate.rs`'s opportunistic harvest already do (D-F6) — a 429
+/// observed anywhere means this call's own live validation HTTP request
+/// would 429 too, so it returns `false` (keep, re-queue) WITHOUT making
+/// that request at all. And on a fresh `RateLimited` observed by THIS call,
+/// it marks the same shared gate so the next caller on any of the three
+/// surfaces short-circuits too, rather than each rediscovering the 429
+/// independently.
+pub(crate) fn adopt_single_candidate_before_delete(
+    base_dir: &Path,
+    account: AccountNum,
+    candidate: &crate::credentials::keychain::HarvestCandidate,
+    http_get: &HttpGetFn,
+) -> bool {
+    adopt_single_candidate_before_delete_with_gate(
+        base_dir,
+        account,
+        candidate,
+        http_get,
+        &crate::daemon::server::harvest_gate::ip_rate_limit_gate(),
+    )
+}
+
+/// [`adopt_single_candidate_before_delete`]'s real body, with the shared
+/// gate made an explicit, injectable parameter (`keychain-fix-r10.md`
+/// S-M-1/C-B2 item 2, C-B1/S-L-5) — mirroring `daemon::server::run_with`'s
+/// own production-singleton-vs-fresh-gate split. A test passes a fresh
+/// [`crate::daemon::server::harvest_gate::new_ip_rate_limit_gate`] so it can
+/// assert this call marked (or honoured) the gate without touching the
+/// process-wide singleton every OTHER test in this binary also reads
+/// (`ip_rate_limit_gate`'s own doc: 600s cooldown, shared across the whole
+/// test binary).
+pub(crate) fn adopt_single_candidate_before_delete_with_gate(
+    base_dir: &Path,
+    account: AccountNum,
+    candidate: &crate::credentials::keychain::HarvestCandidate,
+    http_get: &HttpGetFn,
+    gate: &crate::daemon::server::harvest_gate::IpRateLimitGate,
+) -> bool {
+    if crate::daemon::server::harvest_gate::gate_is_rate_limited(gate) {
+        return false;
+    }
+    let anchor_email = profiles::resolve_slot_to_uuid(base_dir, account.get())
+        .and_then(|uuid| identity_store::read_identity_email(base_dir, uuid));
+    let outcome = reconcile_candidates_inner(
+        base_dir,
+        account,
+        anchor_email.as_deref(),
+        std::slice::from_ref(candidate),
+        None,
+        http_get,
+        // D-F3: an absent `candidate_email` on this single, already-known
+        // candidate must not fail-closed before ever asking the server —
+        // `verify_token_owner` (gate 2) is the authoritative check here.
+        false,
+    );
+    if matches!(outcome, ReconcileOutcome::RateLimited) {
+        crate::daemon::server::harvest_gate::gate_mark_rate_limited(gate);
+    }
+    matches!(outcome, ReconcileOutcome::Adopted)
 }
 
 #[cfg(test)]
@@ -969,6 +1161,7 @@ mod tests {
             expiry_ms,
             source_tag: "term-1".to_string(),
             candidate_email: email.map(str::to_owned),
+            handle_dir_tag: Some("term-1".to_string()),
         }
     }
 
@@ -1043,6 +1236,59 @@ mod tests {
             &dead,
         );
         assert_eq!(out, ReconcileOutcome::AllDead);
+    }
+
+    /// Counts calls, always returning 401 (Dead) — used by the D-F7 cap test
+    /// below to prove the loop stops calling `verify_token_owner` at the cap
+    /// rather than continuing through every remaining candidate.
+    fn counting_dead(counter: Arc<std::sync::atomic::AtomicUsize>) -> HttpGetFn {
+        Arc::new(move |_url: &str, _tok: &str, _hdrs: &[(&str, &str)]| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((401u16, b"{}".to_vec()))
+        })
+    }
+
+    #[test]
+    fn reconcile_candidates_stops_after_the_validation_cap_is_reached() {
+        // D-F7: 3 candidates, all passing gate 1 and parsing cleanly — without
+        // the cap every one of them would reach `verify_token_owner` (a live
+        // network call). With `MAX_VALIDATIONS_PER_RECONCILE` (2) enforced,
+        // only the two freshest do; the 3rd is deferred via `SkippedUnknown`
+        // rather than spending a 3rd call against the shared, IP-wide
+        // rate-limit budget (D-F6).
+        //
+        // RED: deleting the `if validations_performed >= ... { return ... }`
+        // check makes `calls.load(..)` come back `3`, not `2`, and the
+        // outcome `AllDead` (all three actually validated), not
+        // `SkippedUnknown`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cands = vec![
+            mk_candidate(Some("bound@example.com"), 4_102_444_800_000),
+            mk_candidate(Some("bound@example.com"), 4_102_444_700_000),
+            mk_candidate(Some("bound@example.com"), 4_102_444_600_000),
+        ];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let out = reconcile_candidates(
+            dir.path(),
+            acct,
+            Some("bound@example.com"),
+            &cands,
+            None,
+            &counting_dead(Arc::clone(&calls)),
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_VALIDATIONS_PER_RECONCILE,
+            "exactly the capped number of live validation calls must run, \
+             never all 3 candidates"
+        );
+        assert_eq!(
+            out,
+            ReconcileOutcome::SkippedUnknown,
+            "hitting the cap without an Adopted/Mismatch verdict defers the \
+             remaining candidates to the next tick"
+        );
     }
 
     #[test]
@@ -1140,7 +1386,7 @@ mod tests {
     fn reason_anchor_absent() {
         let dir = tempfile::TempDir::new().unwrap();
         assert_eq!(
-            identity_unconfirmed_reason(dir.path(), "term-1", None, Some("c@x.com")),
+            identity_unconfirmed_reason(dir.path(), Some("term-1"), None, Some("c@x.com")),
             "anchor_email_absent"
         );
     }
@@ -1149,7 +1395,12 @@ mod tests {
     fn reason_email_mismatch() {
         let dir = tempfile::TempDir::new().unwrap();
         assert_eq!(
-            identity_unconfirmed_reason(dir.path(), "term-1", Some("a@x.com"), Some("b@x.com")),
+            identity_unconfirmed_reason(
+                dir.path(),
+                Some("term-1"),
+                Some("a@x.com"),
+                Some("b@x.com")
+            ),
             "email_mismatch"
         );
     }
@@ -1159,7 +1410,7 @@ mod tests {
         // No term-1 dir → classify_oauth_account → NotYetPopulated → absent (fresh).
         let dir = tempfile::TempDir::new().unwrap();
         assert_eq!(
-            identity_unconfirmed_reason(dir.path(), "term-1", Some("a@x.com"), None),
+            identity_unconfirmed_reason(dir.path(), Some("term-1"), Some("a@x.com"), None),
             "candidate_email_absent"
         );
     }
@@ -1177,8 +1428,238 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            identity_unconfirmed_reason(dir.path(), "term-1", Some("a@x.com"), None),
+            identity_unconfirmed_reason(dir.path(), Some("term-1"), Some("a@x.com"), None),
             "candidate_email_drift"
+        );
+    }
+
+    /// `keychain-fix-r9.md` S-L-3: the pending-clear RETRY path's
+    /// `HarvestCandidate.source_tag` is a keychain SERVICE name, not a
+    /// handle-dir basename — `handle_dir_tag: None` for that path. A
+    /// directory that happens to share the service's name under `base_dir`
+    /// (a coincidence, not a real handle dir for this candidate) MUST NOT be
+    /// consulted: no path may ever be built from a service name, and the
+    /// logged reason must stay the truthful "no dir to inspect"
+    /// (`candidate_email_absent`), never the misleading `candidate_email_drift`
+    /// a stray directory of that name would otherwise produce.
+    #[test]
+    fn reason_none_handle_dir_tag_never_builds_a_path_from_service_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A directory that happens to share the retry queue's service-name
+        // string, populated so that IF it were consulted it would report
+        // "candidate_email_drift" — proving the None branch never joins it.
+        let coincidental = dir.path().join("csq-account-7");
+        std::fs::create_dir_all(&coincidental).unwrap();
+        std::fs::write(
+            coincidental.join(".claude.json"),
+            r#"{"numStartups":3,"userID":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            identity_unconfirmed_reason(dir.path(), None, Some("a@x.com"), None),
+            "candidate_email_absent"
+        );
+    }
+
+    // ── adopt_single_candidate_before_delete (keychain-fix-r8.md C-F3) ────────
+
+    /// Materialize a slot -> uuid mapping with an `identity.json` anchor —
+    /// the minimum `adopt_single_candidate_before_delete` needs to resolve
+    /// `anchor_email`. Deliberately does NOT write a store `credentials.json`
+    /// (unlike `setup_slot_store`): this function passes `store_expiry: None`
+    /// unconditionally, so it never reads one.
+    fn setup_slot_anchor(
+        base: &Path,
+        slot: u16,
+        uuid: identity_store::IdentityId,
+        anchor_email: &str,
+    ) {
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), uuid);
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+        let identity_dir = identity_store::credentials_path_for(base, uuid)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(
+            identity_dir.join("identity.json"),
+            format!(
+                r#"{{"email":{},"provider":"anthropic","created_at":"t","key_id":null}}"#,
+                serde_json::to_string(anchor_email).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn adopt_single_candidate_true_when_owner_confirmed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = identity_store::IdentityId::new_v4();
+        setup_slot_anchor(dir.path(), 2, uuid, "jack@researchroom.sg");
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(Some("jack@researchroom.sg"), 4_102_444_800_000);
+        let g = http_status(200, profile_body("jack@researchroom.sg"));
+        assert!(adopt_single_candidate_before_delete(
+            dir.path(),
+            acct,
+            &cand,
+            &g
+        ));
+    }
+
+    #[test]
+    fn adopt_single_candidate_false_when_owner_mismatch() {
+        // Gate 1 passes (self-report matches anchor) but gate 2's server
+        // check reveals the token actually belongs to a different account —
+        // must never adopt.
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = identity_store::IdentityId::new_v4();
+        setup_slot_anchor(dir.path(), 2, uuid, "jack@researchroom.sg");
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(Some("jack@researchroom.sg"), 4_102_444_800_000);
+        let g = http_status(200, profile_body("jack@integrum.global"));
+        assert!(!adopt_single_candidate_before_delete(
+            dir.path(),
+            acct,
+            &cand,
+            &g
+        ));
+    }
+
+    #[test]
+    fn adopt_single_candidate_false_when_dead() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = identity_store::IdentityId::new_v4();
+        setup_slot_anchor(dir.path(), 2, uuid, "jack@researchroom.sg");
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(Some("jack@researchroom.sg"), 4_102_444_800_000);
+        let g = http_status(401, b"{}".to_vec());
+        assert!(!adopt_single_candidate_before_delete(
+            dir.path(),
+            acct,
+            &cand,
+            &g
+        ));
+    }
+
+    #[test]
+    fn adopt_single_candidate_true_when_owner_confirmed_and_no_self_report() {
+        // D-F3: no `.claude.json` self-report at all (candidate_email: None) —
+        // gate 1 must be skipped for this single-candidate caller, and the
+        // authoritative server-side owner check (gate 2) alone decides.
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = identity_store::IdentityId::new_v4();
+        setup_slot_anchor(dir.path(), 2, uuid, "jack@researchroom.sg");
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(None, 4_102_444_800_000);
+        let g = http_status(200, profile_body("jack@researchroom.sg"));
+        assert!(adopt_single_candidate_before_delete(
+            dir.path(),
+            acct,
+            &cand,
+            &g
+        ));
+    }
+
+    #[test]
+    fn adopt_single_candidate_false_when_owner_mismatch_and_no_self_report() {
+        // D-F3: no self-report AND the server-side check says the token
+        // belongs to a different account — must never adopt.
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = identity_store::IdentityId::new_v4();
+        setup_slot_anchor(dir.path(), 2, uuid, "jack@researchroom.sg");
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(None, 4_102_444_800_000);
+        let g = http_status(200, profile_body("jack@integrum.global"));
+        assert!(!adopt_single_candidate_before_delete(
+            dir.path(),
+            acct,
+            &cand,
+            &g
+        ));
+    }
+
+    #[test]
+    fn adopt_single_candidate_false_when_no_anchor() {
+        // No profiles/identity.json at all -> anchor_email resolves to None
+        // -> the wrong-account guard refuses before ever calling http_get.
+        let dir = tempfile::TempDir::new().unwrap();
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(Some("jack@researchroom.sg"), 4_102_444_800_000);
+        assert!(!adopt_single_candidate_before_delete(
+            dir.path(),
+            acct,
+            &cand,
+            &never_called()
+        ));
+    }
+
+    // ── `keychain-fix-r10.md` item 2, C-B1/S-L-5: shared gate wiring ──────
+
+    /// CONSUMER half: a gate already marked BEFORE this call must return
+    /// `false` (keep, re-queue) WITHOUT ever calling `http_get` — mirrors
+    /// `auto_rotate.rs`'s own pre-marked-gate suppression test. Uses a
+    /// FRESH gate (never `ip_rate_limit_gate()`'s process-wide singleton,
+    /// which every other test in this binary also reads/writes — see that
+    /// function's own doc).
+    ///
+    /// RED: dropping the `if gate_is_rate_limited(gate) { return false }`
+    /// early-return makes this call fall through to `reconcile_candidates_inner`,
+    /// which calls the `never_called()` closure and panics — proving the
+    /// gate check is load-bearing, not merely decorative.
+    #[test]
+    fn adopt_single_candidate_pre_marked_gate_returns_false_without_http_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = identity_store::IdentityId::new_v4();
+        setup_slot_anchor(dir.path(), 2, uuid, "jack@researchroom.sg");
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(Some("jack@researchroom.sg"), 4_102_444_800_000);
+
+        let gate = crate::daemon::server::harvest_gate::new_ip_rate_limit_gate();
+        crate::daemon::server::harvest_gate::gate_mark_rate_limited(&gate);
+
+        assert!(!adopt_single_candidate_before_delete_with_gate(
+            dir.path(),
+            acct,
+            &cand,
+            &never_called(),
+            &gate,
+        ));
+    }
+
+    /// PRODUCER half: a fresh `RateLimited` observed by THIS call marks the
+    /// shared gate, so a later caller on any of the three surfaces
+    /// (refresher, auto-rotate, this reaper/retry path) short-circuits too.
+    ///
+    /// RED: dropping the `gate_mark_rate_limited(gate)` call after a
+    /// `RateLimited` outcome makes this assertion fail — the gate would
+    /// stay unmarked despite the 429 this call itself just observed.
+    #[test]
+    fn adopt_single_candidate_rate_limited_marks_the_shared_gate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = identity_store::IdentityId::new_v4();
+        setup_slot_anchor(dir.path(), 2, uuid, "jack@researchroom.sg");
+        let acct = AccountNum::try_from(2u16).unwrap();
+        let cand = mk_candidate(Some("jack@researchroom.sg"), 4_102_444_800_000);
+        let g = http_status(429, b"".to_vec());
+
+        let gate = crate::daemon::server::harvest_gate::new_ip_rate_limit_gate();
+        assert!(!crate::daemon::server::harvest_gate::gate_is_rate_limited(
+            &gate
+        ));
+
+        assert!(!adopt_single_candidate_before_delete_with_gate(
+            dir.path(),
+            acct,
+            &cand,
+            &g,
+            &gate,
+        ));
+
+        assert!(
+            crate::daemon::server::harvest_gate::gate_is_rate_limited(&gate),
+            "a RateLimited outcome observed by this call must mark the shared gate"
         );
     }
 }

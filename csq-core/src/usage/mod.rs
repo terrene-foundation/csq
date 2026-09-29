@@ -19,6 +19,10 @@
 //!   table covering Anthropic, OpenAI, Gemini, DeepSeek, MiniMax, Z.AI.
 //! - [`ledger`] — NDJSON read/write for the per-account ledger; aggregation
 //!   over rolling time windows (Total / 30d / 7d / 5d / Today).
+//! - [`request`] — request identity and snapshot finalization (an internal ticket).
+//!   CC appends a usage SNAPSHOT per streaming update, so one API call lands as
+//!   several usage-bearing records; this module collapses them to one billable
+//!   request and counts the residual where its rule is not exact.
 //! - [`account_id`] — `resolve_account_id` chokepoint: returns the account's
 //!   permanent UUID when `by_slot` maps the slot (A++ / an internal ticket), else the
 //!   slot number as a string (legacy fallback).
@@ -38,3 +42,4 @@ pub mod aggregator;
 pub mod cost_rates;
 pub mod launch_log;
 pub mod ledger;
+pub mod request;

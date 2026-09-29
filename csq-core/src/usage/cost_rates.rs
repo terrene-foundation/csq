@@ -1,24 +1,16 @@
-//! Static per-model cost rate table per an internal journal entry D3.
+//! Cost arithmetic and pure bundled-rate compatibility lookup.
 //!
-//! Rates from public pricing pages as of 2026-05-06. Updated when providers
-//! announce changes — this is the SOLE source of truth for cost estimation in
-//! Phase B' v1. Per D3, v1 uses the slot's CURRENT configured model for every
-//! turn (approximation); v2 (per-turn jsonl scan) will pick up actual model
-//! per turn.
+//! Model metadata and all rate data now live in the versioned JSON model
+//! manifest. Runtime aggregation loads a complete snapshot from its explicit
+//! base directory; no build or daemon restart is needed for subsequent data
+//! updates. This module retains the public `CostRate` arithmetic contract.
 //!
-//! Rates are USD per 1M tokens. `Unknown` is used when no rate exists for a
-//! model name — caller renders cost as `n/a` rather than guessing.
-//!
-//! **Rates can vary with WHEN the usage happened** (an internal ticket). Most
-//! providers price time-invariantly and live in `MODEL_RATES` as a flat
-//! [`CostRate`]. DeepSeek does not: from 2026-08-16T16:00:00Z it bills a peak
-//! rate during two daily UTC windows and half that off-peak. Those rows live in
-//! `TIME_VARYING_RATES` and are resolved against the SESSION'S OWN timestamp,
-//! never wall-clock now — so a July session prices at July's rate and an
-//! 02:00-UTC session on 2026-08-20 prices at peak, both at the same time. That
-//! is why the lookup entry point is [`rate_for_model_at`] and takes an instant.
+//! Estimates use the transcript-selected model (configured fallback if absent)
+//! and SESSION START, not billing-exact per-turn attribution. Session boundary
+//! approximations and nullable cache prices are unchanged. Unknown models or
+//! missing time for dated pricing stay `None`, rather than invented rates.
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Utc};
 
 /// Cost rate for one model. `input`/`output` fields are USD per 1,000,000
 /// tokens. The two cache fields hold that row's own prompt-cache PRICES, in the
@@ -39,7 +31,7 @@ use chrono::{DateTime, Timelike, Utc};
 /// constant enough: DeepSeek v4-pro's own cache ratio is 1/120 before its
 /// 2026-08-16 cutover and 1/30 after. The price therefore has to be per-ROW
 /// data, which is what this struct now carries — and because a row is already
-/// selected per time tier by [`TieredRate::at`], peak/off-peak cache pricing
+/// selected per time tier by the manifest, peak/off-peak cache pricing
 /// follows with no change to that type.
 ///
 /// Cache-eligibility remains keyed on the matched rate ROW (not a separate
@@ -175,285 +167,26 @@ pub const CACHE_WRITE_INPUT_MULTIPLIER: f64 = 1.25;
 /// See [`CACHE_WRITE_INPUT_MULTIPLIER`]. Cache-read (hit) multiplier.
 pub const CACHE_READ_INPUT_MULTIPLIER: f64 = 0.10;
 
-/// A rate that changes at a known instant, after which it alternates between a
-/// peak and an off-peak price on a daily UTC schedule (an internal ticket).
-///
-/// Only rows in [`TIME_VARYING_RATES`] carry this; every time-invariant
-/// provider stays a plain [`CostRate`] in [`MODEL_RATES`]. The schedule is
-/// per-row data (cutover instant + peak windows), not a global, so a second
-/// provider adopting a different schedule needs no change here.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct TieredRate {
-    /// The rate in force at instants strictly BEFORE `tiered_start_unix`.
-    /// Historical sessions price here forever.
-    before: CostRate,
-    /// UNIX seconds at which the peak/off-peak schedule takes effect. Compared
-    /// against the SESSION's timestamp, never wall-clock now.
-    tiered_start_unix: i64,
-    /// Peak windows as HALF-OPEN `[start_hour, end_hour)` in UTC.
-    peak_windows_utc: &'static [(u32, u32)],
-    /// Rate outside every peak window, at or after `tiered_start_unix`.
-    off_peak: CostRate,
-    /// Rate inside a peak window, at or after `tiered_start_unix`.
-    peak: CostRate,
-}
-
-impl TieredRate {
-    /// The rate in force at `when`.
-    fn at(&self, when: DateTime<Utc>) -> CostRate {
-        if when.timestamp() < self.tiered_start_unix {
-            return self.before;
-        }
-        let hour = when.hour();
-        let is_peak = self
-            .peak_windows_utc
-            .iter()
-            .any(|(start, end)| hour >= *start && hour < *end);
-        if is_peak {
-            self.peak
-        } else {
-            self.off_peak
-        }
-    }
-}
-
-/// The instant DeepSeek's peak/off-peak pricing takes effect:
-/// **2026-08-16T16:00:00Z**, in UNIX seconds.
-///
-/// Hand-derived, and therefore checked against the RFC3339 literal by
-/// `deepseek_cutover_constant_is_2026_08_16_1600z` — a constant nobody can
-/// eyeball is a constant nobody can trust (`tooling-self-verification.md`
-/// Rule 3). The two outcomes it separates: a session one second earlier bills
-/// the flat pre-cutover rate; a session at the instant itself bills the tiered
-/// rate for whichever window it falls in.
+/// Historical DeepSeek daily pricing cutover, 2026-08-16T16:00:00Z.
+/// Kept for API compatibility and independently pinned by named tests; runtime
+/// prices and schedules are data in the selected model manifest.
 pub const DEEPSEEK_TIERED_PRICING_START_UNIX: i64 = 1_786_896_000;
 
-/// DeepSeek peak hours, HALF-OPEN `[start, end)` in UTC: 01:00–04:00 and
-/// 06:00–10:00, i.e. UTC hours 1,2,3 and 6,7,8,9 (7 peak hours/day).
-///
-/// **Boundary reading — half-open, documented deliberately.** 04:00:00.000Z is
-/// OFF-PEAK, not peak; likewise 10:00:00.000Z, and 01:00:00.000Z IS peak. Two
-/// reasons: (a) half-open is the only reading under which the peak and off-peak
-/// sets partition the day — a closed-closed reading makes 04:00:00 belong to
-/// both, and resolving that overlap in favour of peak silently prices a
-/// boundary instant at 2× for no stated reason; (b) it makes the predicate
-/// exact at whole-hour granularity (`hour()` alone decides), so no sub-second
-/// rounding can move a session across a tier. If DeepSeek publishes an
-/// inclusive-end reading, only this table changes.
-const DEEPSEEK_PEAK_WINDOWS_UTC: &[(u32, u32)] = &[(1, 4), (6, 10)];
+/// DeepSeek V4.1 Flash cutover, 2026-09-10T04:00:00Z.
+pub const DEEPSEEK_V41_PRICING_START_UNIX: i64 = 1_789_012_800;
 
-/// Looks up the cost rate for a model name as it stood at instant `at`.
-/// Returns `None` if the name is unrecognized — caller renders `n/a` rather
-/// than guessing a rate.
-///
-/// Matching is case-insensitive substring on the model family. The static
-/// tables cover the canonical model families; if a provider ships a new
-/// minor (e.g. `deepseek-chat-2`), this returns `None` until the table is
-/// updated. That's the explicit fail-loud signal.
-///
-/// **`at` is the instant the USAGE happened** — a session's own start
-/// timestamp — never wall-clock now. Passing now would re-price every
-/// historical ledger entry at today's rate.
-///
-/// **`at == None` (no timestamp, or one that would not parse):** a
-/// time-invariant row still resolves — its price does not depend on when. A
-/// `TIME_VARYING_RATES` row returns `None` (rendered `n/a`), because picking
-/// either tier would be a guess. Peak and off-peak differ by exactly 2× on
-/// input and output; across ALL priced fields the widest gap between any two
-/// tiers of one model is **~12.1×** — v4-pro's cache-hit price, 0.003625
-/// pre-cutover against 0.044 at peak. (This figure read ~4.5× until an internal ticket,
-/// when it was the output spread 0.87 → 3.96 = 4.55×; adding cache-hit prices
-/// to the same rows made the old number an understatement, so it was
-/// re-derived rather than carried — `doc-property-claims.md`.) Guessing
-/// silently is exactly what this module's fail-loud contract forbids.
+/// Pure bundled-price lookup retained for library compatibility. Runtime usage
+/// aggregation loads one `ModelManifest` snapshot from its explicit base dir
+/// instead. Unknown names or missing timestamps for dated rates return `None`.
 pub fn rate_for_model_at(model: &str, at: Option<DateTime<Utc>>) -> Option<CostRate> {
-    let lc = model.to_lowercase();
-    for (pat, tiered) in TIME_VARYING_RATES {
-        if lc.contains(pat) {
-            // No instant ⇒ no tier ⇒ `n/a`. See the doc above.
-            return at.map(|when| tiered.at(when));
-        }
-    }
-    for (pat, rate) in MODEL_RATES {
-        if lc.contains(pat) {
-            return Some(*rate);
-        }
-    }
-    None
+    crate::providers::model_manifest::ModelManifest::bundled().rate_for_model_at(model, at)
 }
 
-/// Static rate table. Patterns match against the model name lowercase
-/// (substring contains). Order matters — most specific first.
-///
-/// **Rates as of 2026-05-06.** When a provider announces a price change
-/// or a new model lands, update this table and bump `RATES_AS_OF`.
-const MODEL_RATES: &[(&str, CostRate)] = &[
-    // ── Anthropic Claude (pay-per-token API) ───────────────────────────
-    // Subscription users see no cost; this fires for direct-API-key slots.
-    ("claude-opus-4-8", CostRate::with_cache(15.00, 75.00)),
-    ("claude-opus-4-7", CostRate::with_cache(15.00, 75.00)),
-    ("claude-opus-4-6", CostRate::with_cache(15.00, 75.00)),
-    ("claude-opus", CostRate::with_cache(15.00, 75.00)),
-    ("claude-sonnet-5", CostRate::with_cache(3.00, 15.00)),
-    ("claude-sonnet-4-7", CostRate::with_cache(3.00, 15.00)),
-    ("claude-sonnet-4-6", CostRate::with_cache(3.00, 15.00)),
-    ("claude-sonnet", CostRate::with_cache(3.00, 15.00)),
-    ("claude-haiku-4-5", CostRate::with_cache(1.00, 5.00)),
-    ("claude-haiku", CostRate::with_cache(1.00, 5.00)),
-    // ── OpenAI / Codex (pay-per-token API) ─────────────────────────────
-    ("gpt-5-codex", CostRate::new(1.25, 10.00)),
-    ("gpt-5", CostRate::new(1.25, 10.00)),
-    // ── Google Gemini AI Studio ────────────────────────────────────────
-    ("gemini-2.5-pro", CostRate::new(1.25, 5.00)),
-    ("gemini-2.5-flash", CostRate::new(0.075, 0.30)),
-    ("gemini-2.0-flash", CostRate::new(0.075, 0.30)),
-    ("gemini-1.5-pro", CostRate::new(1.25, 5.00)),
-    // ── DeepSeek — RETIRED aliases only ────────────────────────────────
-    // The live V4 rows are TIME-VARYING and live in `TIME_VARYING_RATES`.
-    //
-    // `deepseek-chat` / `deepseek-reasoner` were RETIRED on 2026-07-24 and are
-    // RETAINED here DELIBERATELY: ledger entries and transcripts from before
-    // that date still name them, and those sessions must keep pricing at the
-    // rate that was actually charged (V4 Flash's pre-cutover flat rate). They
-    // stay FLAT rather than tiered because a retired model cannot accrue usage
-    // after 2026-08-16 — every session bearing these names predates the
-    // peak/off-peak cutover by construction, so there is no tier to select.
-    // (The earlier comment here said "both deprecating 2026-07-24" — written in
-    // anticipation and never revisited once the date passed.)
-    //
-    // `deepseek-coder` was REMOVED: it is not part of the V4 lineup and has no
-    // verifiable current rate, so it correctly renders `n/a` rather than a
-    // guessed price (the fail-loud contract in this module's header).
-    ("deepseek-reasoner", CostRate::new(0.14, 0.28)),
-    ("deepseek-chat", CostRate::new(0.14, 0.28)),
-    // ── Kimi (Anthropic-API-compatible, api.kimi.com/coding subscription) ─────
-    // Rate is the cache-MISS input price + output price. Kimi publishes no
-    // verified cache-hit price, so this row carries no cache prices (both
-    // `None`) and its cache tokens bill at $0 — same as MiniMax.
-    //
-    // Two DIFFERENT reasons a row can be unpriced, and they are not
-    // interchangeable: Kimi and MiniMax publish NO cache price (nothing to
-    // wire); Z.AI publishes one (~1/5.4 of input — see the [`CostRate`] doc)
-    // that simply is not wired yet. DeepSeek was in Z.AI's position until
-    // an internal ticket wired it. Whichever the reason, the row must NOT be given a price
-    // derived from Anthropic's multipliers.
-    ("kimi-k3", CostRate::new(3.0, 15.0)),
-    // ── MiniMax ───────────────────────────────────────────────────────
-    ("m2.7-coder", CostRate::new(0.30, 1.20)),
-    ("minimax", CostRate::new(0.30, 1.20)),
-    // ── Z.AI ──────────────────────────────────────────────────────────
-    // Verified against https://docs.z.ai/guides/overview/pricing 2026-08-14.
-    // The prior rows (both $0.20/$0.80) under-reported live spend: GLM 5.2
-    // is actually $1.40/$4.40 — a 7x/5.5x under-report — and GLM 4.6 is
-    // $0.60/$2.20 — 3x/2.75x.
-    //
-    // GLM 5.3 (csq's shipping default since 2026-08-15, `providers::catalog`
-    // default_model `glm-5.3[1m]`) has NO separately published price — Z.AI
-    // has not listed a 5.3 pricing row as of 2026-08-15. This row is 5.2's
-    // published rate CARRIED FORWARD, not an independently verified 5.3
-    // figure: probed live against `api.z.ai/api/anthropic/v1/messages`,
-    // Z.AI's endpoint ALIASES a `glm-5.2` model request to `glm-5.3`
-    // server-side (response echoes `"model":"glm-5.3"`), so 5.2's published
-    // $1.40/$4.40 is already the rate 5.3 traffic bills at upstream — this
-    // row makes csq's own attribution match that reality rather than
-    // inventing a new number. Re-price when Z.AI publishes a distinct 5.3
-    // rate (`doc-property-claims.md` — a measured/carried-forward value is
-    // not a verified one, and this comment says so plainly).
-    //
-    // Ordering: `glm-5.3` and `glm-5.2` MUST both precede the bare `glm`
-    // catch-all: `rate_for_model_at` matches by lowercase SUBSTRING-CONTAINS
-    // (see its doc above), so either row placed after the catch-all would
-    // never be reached — `"glm-5.3[1m]".to_lowercase().contains("glm")` and
-    // `"glm-5.2[1m]".to_lowercase().contains("glm")` are both true, so
-    // ordering here is load-bearing, not cosmetic. `glm-5.3` precedes
-    // `glm-5.2` for readability (newest first); the two patterns do not
-    // overlap as substrings of each other, so their relative order does not
-    // itself affect correctness.
-    ("glm-5.3", CostRate::new(1.40, 4.40)),
-    ("glm-5.2", CostRate::new(1.40, 4.40)),
-    ("glm-4.6", CostRate::new(0.60, 2.20)),
-    ("glm", CostRate::new(0.60, 2.20)),
-];
-
-/// Rows whose price depends on WHEN the usage happened. Consulted BEFORE
-/// [`MODEL_RATES`] by [`rate_for_model_at`], so a pattern here wins over any
-/// overlapping flat pattern. Patterns match the same way (lowercase substring,
-/// most specific first).
-///
-/// **DeepSeek V4 (Anthropic-API-compatible, `api.deepseek.com/anthropic`).**
-/// The V4 lineup (released 2026-04-24) is what csq's catalog configures 3P
-/// DeepSeek slots with (`providers::catalog` default_model `deepseek-v4-pro`,
-/// haiku/subagent `deepseek-v4-flash`). Rates below are the cache-MISS input
-/// price + output price, USD per 1M tokens, verified against
-/// <https://api-docs.deepseek.com/quick_start/pricing> on 2026-08-14:
-///
-/// | model    | period          | input  | output |
-/// |----------|-----------------|--------|--------|
-/// | v4-pro   | before cutover  | 0.435  | 0.87   |
-/// | v4-pro   | off-peak        | 0.66   | 1.98   |
-/// | v4-pro   | peak            | 1.32   | 3.96   |
-/// | v4-flash | before cutover  | 0.14   | 0.28   |
-/// | v4-flash | off-peak        | 0.22   | 0.66   |
-/// | v4-flash | peak            | 0.44   | 1.32   |
-///
-/// The pre-cutover figures are the former 75%-off promo that became the
-/// permanent official price on 2026-05-31.
-///
-/// **Cache-HIT prices (an internal ticket).** DeepSeek publishes these outright, so each row
-/// carries its own rather than deriving one from a multiplier, and each tier
-/// gets the price that applies IN that tier:
-///
-/// | model    | period          | cache-hit | ratio to input |
-/// |----------|-----------------|-----------|----------------|
-/// | v4-pro   | before cutover  | 0.003625  | 1/120          |
-/// | v4-pro   | off-peak        | 0.022     | 1/30           |
-/// | v4-pro   | peak            | 0.044     | 1/30           |
-/// | v4-flash | before cutover  | 0.0028    | 1/50           |
-/// | v4-flash | off-peak        | 0.007     | 1/31.4         |
-/// | v4-flash | peak            | 0.014     | 1/31.4         |
-///
-/// Four distinct ratios within ONE vendor across time is why the cache price is
-/// row data and not a per-provider constant — see the [`CostRate`] doc.
-///
-/// **Cache-WRITE is deliberately `None` on every row below.** DeepSeek publishes
-/// no cache-write price. Anthropic charges a 1.25× write surcharge, and it is
-/// tempting to read DeepSeek's "cache miss = base input price" as implying no
-/// surcharge (i.e. write = input) — but that is an INFERENCE from the shape of
-/// the pricing page, not a figure DeepSeek states, and a wrong guess here
-/// OVER-bills the user. `None` bills cache-write at $0: the same under-report
-/// csq has always had on that dimension, strictly no worse than today, and it
-/// invents nothing. If DeepSeek publishes a write price, only these rows change.
-const TIME_VARYING_RATES: &[(&str, TieredRate)] = &[
-    (
-        "deepseek-v4-pro",
-        TieredRate {
-            before: CostRate::with_cache_read_only(0.435, 0.87, 0.003625),
-            tiered_start_unix: DEEPSEEK_TIERED_PRICING_START_UNIX,
-            peak_windows_utc: DEEPSEEK_PEAK_WINDOWS_UTC,
-            off_peak: CostRate::with_cache_read_only(0.66, 1.98, 0.022),
-            peak: CostRate::with_cache_read_only(1.32, 3.96, 0.044),
-        },
-    ),
-    (
-        "deepseek-v4-flash",
-        TieredRate {
-            before: CostRate::with_cache_read_only(0.14, 0.28, 0.0028),
-            tiered_start_unix: DEEPSEEK_TIERED_PRICING_START_UNIX,
-            peak_windows_utc: DEEPSEEK_PEAK_WINDOWS_UTC,
-            off_peak: CostRate::with_cache_read_only(0.22, 0.66, 0.007),
-            peak: CostRate::with_cache_read_only(0.44, 1.32, 0.014),
-        },
-    ),
-];
-
-/// Date the rates were last verified against public pricing. Update when the
-/// tables change. 2026-08-14: the Z.AI GLM 5.2/4.6 under-report correction and
-/// the DeepSeek V4 rows (peak/off-peak schedule, an internal ticket); the other
-/// providers' rows carry forward from the 2026-05-06 verification. 2026-08-15:
-/// added the `glm-5.3` row (csq's new shipping default) — see the `glm-5.3`
-/// row's own comment above for why it CARRIES FORWARD 5.2's published price
-/// rather than an independently verified 5.3 figure.
-pub const RATES_AS_OF: &str = "2026-08-15";
+/// Last bundled verification checkpoint, not the revision of a local manifest.
+/// The Claude rows were re-verified 2026-09-29 and V4.1 Flash 2026-09-14; other
+/// rows retain their older evidence boundaries, recorded per rule in
+/// `model-rates.builtin.json`.
+pub const RATES_AS_OF: &str = "2026-09-29";
 
 #[cfg(test)]
 mod tests {
@@ -520,6 +253,142 @@ mod tests {
         assert!(rate_for_model_at("deepseek-coder", t).is_none());
     }
 
+    // Fixed historical instants are intentional: these tests compare vendor
+    // pricing epochs, never an expiry against wall-clock now.
+    #[test]
+    fn deepseek_v41_cutover_is_vendor_2026_09_10_0400z() {
+        assert_eq!(
+            DEEPSEEK_V41_PRICING_START_UNIX,
+            at("2026-09-10T04:00:00Z").unwrap().timestamp()
+        );
+    }
+
+    #[test]
+    fn deepseek_v41_flash_canonical_and_legacy_aliases_use_new_prices() {
+        for model in [
+            "deepseek-flash",
+            "DeepSeek-Flash[1m]",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash[1m]",
+            "deepseek-v4-flash-vision-exp",
+        ] {
+            for ts in ["2026-09-10T04:00:00Z", "2026-09-14T12:00:00Z"] {
+                assert_eq!(
+                    rate_for_model_at(model, at(ts)),
+                    Some(CostRate::with_cache_read_only(0.15, 0.60, 0.003)),
+                    "{model} @ {ts}: canonical and retired Flash IDs use V4.1"
+                );
+            }
+            assert_eq!(
+                rate_for_model_at(model, at("2026-09-14T02:00:00Z")),
+                Some(CostRate::with_cache_read_only(0.30, 1.20, 0.006)),
+                "{model}: weekday peak includes its own cache-hit price"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_flash_cutover_preserves_historical_legacy_prices() {
+        for model in ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"] {
+            assert_eq!(
+                rate_for_model_at(model, at("2026-09-10T03:59:59Z")),
+                Some(CostRate::with_cache_read_only(0.44, 1.32, 0.014)),
+                "{model}: last old-rate second must not be repriced"
+            );
+            assert_eq!(
+                rate_for_model_at(model, at("2026-09-05T02:00:00Z")),
+                Some(CostRate::with_cache_read_only(0.44, 1.32, 0.014)),
+                "{model}: old DAILY schedule must not become weekday-only"
+            );
+        }
+        assert_eq!(
+            rate_for_model_at("deepseek-v4-flash", at("2026-07-04T02:00:00Z")),
+            Some(CostRate::with_cache_read_only(0.14, 0.28, 0.0028))
+        );
+    }
+
+    #[test]
+    fn deepseek_v41_flash_weekends_are_off_peak_for_every_utc_hour() {
+        for day in ["2026-09-12", "2026-09-13"] {
+            for hour in 0..24 {
+                let ts = format!("{day}T{hour:02}:30:00Z");
+                assert_eq!(
+                    rate_for_model_at("deepseek-flash", at(&ts)),
+                    Some(CostRate::with_cache_read_only(0.15, 0.60, 0.003)),
+                    "{ts}: Saturday and Sunday have no peak hours"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_flash_weekday_peak_windows_are_half_open() {
+        for (clock, peak) in [
+            ("00:59:59", false),
+            ("01:00:00", true),
+            ("03:59:59", true),
+            ("04:00:00", false),
+            ("05:59:59", false),
+            ("06:00:00", true),
+            ("09:59:59", true),
+            ("10:00:00", false),
+        ] {
+            let expected = if peak {
+                CostRate::with_cache_read_only(0.30, 1.20, 0.006)
+            } else {
+                CostRate::with_cache_read_only(0.15, 0.60, 0.003)
+            };
+            for day in [
+                "2026-09-14",
+                "2026-09-15",
+                "2026-09-16",
+                "2026-09-17",
+                "2026-09-18",
+            ] {
+                let ts = format!("{day}T{clock}Z");
+                assert_eq!(
+                    rate_for_model_at("deepseek-flash", at(&ts)),
+                    Some(expected),
+                    "{ts}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_unknown_time_or_model_does_not_guess() {
+        assert!(rate_for_model_at("deepseek-flash", at("2026-09-10T03:59:59Z")).is_none());
+        for model in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ] {
+            assert!(rate_for_model_at(model, None).is_none(), "{model}");
+        }
+        for model in [
+            "deepseek-flash-2",
+            "deepseek-v4-flash-unknown",
+            "deepseek-v4.1-flash",
+            "deepseek-pro",
+        ] {
+            assert!(
+                rate_for_model_at(model, at("2026-09-14T02:00:00Z")).is_none(),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_does_not_apply_cancelled_pro_retirement() {
+        for ts in ["2026-09-14T03:59:59Z", "2026-09-14T06:00:00Z"] {
+            assert_eq!(
+                rate_for_model_at("deepseek-v4-pro", at(ts)),
+                Some(CostRate::with_cache_read_only(1.32, 3.96, 0.044)),
+                "{ts}: current vendor docs retain Pro and its prices"
+            );
+        }
+    }
+
     // ── an internal ticket: DeepSeek peak / off-peak, selected by SESSION time ──────
 
     #[test]
@@ -569,7 +438,6 @@ mod tests {
             "2026-08-17T03:59:59Z", // last instant of the first window
             "2026-08-20T06:00:00Z",
             "2026-08-20T09:59:59Z",
-            "2027-01-01T02:00:00Z", // still peak years later
         ] {
             assert_eq!(
                 rate_for_model_at("deepseek-v4-pro", at(ts)).unwrap(),
@@ -690,13 +558,13 @@ mod tests {
     /// (`kimi-for-coding` / `grok-4.5`, `providers::native::KIMI` /
     /// `GROK::default_model`) are vendor SUBSCRIPTION products — Kimi
     /// Coding Subscription, Grok's own plan — not pay-per-token APIs. This
-    /// table intentionally carries NO rate row for either name. Suppression
+    /// bundled manifest intentionally carries NO rate row for either name. Suppression
     /// of per-token cost happens at the `BillingMode::Subscription`
     /// classification (`accounts::discovery::discover_native`), never by
     /// adding a rate here. This test locks that "miss is intentional, not a
     /// gap" invariant against an accidental future addition to
-    /// `MODEL_RATES` under a false "fix the n/a" framing — the 3P Bearer
-    /// `kimi-k3` row above is a DIFFERENT (pay-per-token) product and is
+    /// the bundled manifest under a false "fix the n/a" framing — the 3P Bearer
+    /// `kimi-k3` row is a DIFFERENT (pay-per-token) product and is
     /// unaffected.
     #[test]
     fn rate_for_model_native_kimi_grok_intentionally_unrated() {
@@ -759,11 +627,47 @@ mod tests {
         assert!((cost - 18.0).abs() < 0.001, "expected ~$18.0, got ${cost}");
     }
 
+    /// Opus 5.5 must own its row. The `claude-opus` catch-all ($15/$75, Opus
+    /// 4 / 4.1) matches the id by substring, so without a dedicated earlier
+    /// rule Opus 5.5 was billed 3.75x its published price. Falsifying result:
+    /// 15.0 / 75.0, which is what this returned before the row existed.
+    #[test]
+    fn opus_5_5_and_4_8_bill_at_published_prices() {
+        let r = rate_for_model_at("claude-opus-5-5[1m]", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 0) - 4.0).abs() < 1e-9);
+        assert!((r.estimate_usd(0, 1_000_000) - 20.0).abs() < 1e-9);
+        // Cache hits on Opus 5.5 are 0.05x base input, not 0.1x.
+        let read_only = r.estimate_usd_with_cache(0, 0, 0, 1_000_000);
+        assert!((read_only - 0.2).abs() < 1e-9, "cache read: {read_only}");
+        let r = rate_for_model_at("claude-opus-4-8", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 1_000_000) - 30.0).abs() < 1e-9);
+        // Opus 5 and 4.5 are $5/$25 too, and must not fall to the catch-all;
+        // `claude-opus-5` is a substring of `claude-opus-5-5`, so order matters.
+        for id in ["claude-opus-5", "claude-opus-4-5-20251101"] {
+            let r = rate_for_model_at(id, any_instant()).unwrap();
+            assert!(
+                (r.estimate_usd(1_000_000, 1_000_000) - 30.0).abs() < 1e-9,
+                "{id}"
+            );
+        }
+        let r = rate_for_model_at("claude-opus-5-5", any_instant()).unwrap();
+        assert!(
+            (r.estimate_usd(1_000_000, 0) - 4.0).abs() < 1e-9,
+            "5.5 kept its own row"
+        );
+        // The catch-all still prices Opus 4.1 at its own published $15/$75.
+        let r = rate_for_model_at("claude-opus-4-1-20250805", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 1_000_000) - 90.0).abs() < 1e-9);
+        let r = rate_for_model_at("claude-sonnet-5", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 1_000_000) - 12.0).abs() < 1e-9);
+    }
+
     #[test]
     fn rates_table_is_non_empty() {
         // Smoke — guards against accidental wholesale deletion.
-        assert!(MODEL_RATES.len() >= 10);
-        assert!(!TIME_VARYING_RATES.is_empty());
+        let manifest = crate::providers::model_manifest::ModelManifest::bundled();
+        assert!(manifest.rates.len() >= 10);
+        assert!(manifest.rates.iter().any(|rule| rule.epochs.len() > 1));
     }
 
     #[test]
@@ -855,7 +759,7 @@ mod tests {
                 "{model} at {ts}: cache-read price must follow the tier"
             );
             // Cache-WRITE is unpublished for DeepSeek and must stay unpriced —
-            // guessing it would OVER-bill. See `TIME_VARYING_RATES`.
+            // guessing it would OVER-bill. See the bundled manifest epochs.
             assert_eq!(
                 r.cache_write_per_1m_usd, None,
                 "{model} at {ts}: cache-write must stay unpriced"
@@ -905,17 +809,16 @@ mod tests {
 
     /// Regression for the 2026-08-14 Z.AI under-report correction (vendor
     /// pricing: https://docs.z.ai/guides/overview/pricing). Pins each GLM id
-    /// THROUGH `rate_for_model_at` — not by reading `MODEL_RATES` directly —
+    /// THROUGH `rate_for_model_at` — not by reading manifest fields directly —
     /// so this test is what actually catches the substring-precedence bug
-    /// `rate_for_model_at`'s doc warns about: `glm-5.2` must be listed before
+    /// preserved from the former static table: `glm-5.2` must be listed before
     /// the bare `glm` catch-all, or `"glm-5.2[1m]".contains("glm")` would
     /// match the catch-all first and silently return the wrong rate. The
     /// catch-all is deliberately set to the SAME value as `glm-4.6` (not
     /// `glm-5.2`), so an ordering regression that lets `glm-5.2[1m]` fall
     /// through to the catch-all is distinguishable from the correct answer.
-    /// GLM is a time-INVARIANT row (in `MODEL_RATES`, not
-    /// `TIME_VARYING_RATES`), so `any_instant()` is correct and the choice
-    /// of instant is not itself under test here.
+    /// GLM has one unbounded flat manifest epoch, so `any_instant()` is
+    /// correct and the choice of instant is not itself under test here.
     #[test]
     fn rate_for_model_glm_pins_vendor_rates_in_precedence_order() {
         let t = any_instant();
@@ -950,14 +853,14 @@ mod tests {
     /// request to `glm-5.3` server-side — probed live 2026-08-15). Pins the
     /// carried-forward rate THROUGH `rate_for_model_at`, mirroring
     /// `rate_for_model_glm_pins_vendor_rates_in_precedence_order` above:
-    /// `glm-5.3` must precede the bare `glm` catch-all in `MODEL_RATES`, or
+    /// `glm-5.3` must precede the bare `glm` catch-all in manifest rules, or
     /// `"glm-5.3[1m]".to_lowercase().contains("glm")` would match the
     /// catch-all first and silently return $0.60/$2.20 instead of the
     /// carried-forward $1.40/$4.40.
     ///
-    /// Non-vacuity for this row was proven by hand, not left to inspection
-    /// (`instrument-discipline.md` MUST-2). Two mutations were applied to
-    /// `MODEL_RATES` and this test run against each before the table was
+    /// Historical non-vacuity receipt, before manifest extraction:
+    /// (`instrument-discipline.md` MUST-2). Two mutations were applied to the
+    /// former `MODEL_RATES` and this test run against each before that table was
     /// restored to its shipped state:
     /// (1) delete the `glm-5.3` row entirely — `glm-5.3[1m]` then falls
     /// through to the bare `glm` catch-all (there is no `glm-5` pattern to

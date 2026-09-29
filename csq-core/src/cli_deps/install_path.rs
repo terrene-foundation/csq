@@ -44,6 +44,18 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
             if dir.as_os_str().len() > MAX_PATH_ENTRY_BYTES {
                 continue;
             }
+            // Skip empty and relative entries (S-F10). An empty PATH entry
+            // means "current working directory" per POSIX PATH semantics,
+            // and a relative entry resolves against whatever directory csq
+            // happens to be invoked from — both let a same-named file
+            // wherever csq runs from shadow the real binary. The result of
+            // this walk feeds directly into `Command::new(..).spawn()` on
+            // the auto-update path (`run_auto_update`), so a resolved
+            // relative/cwd-shadowed path is a code-execution hazard, not
+            // just a wrong-binary one.
+            if !is_safe_path_entry(&dir) {
+                continue;
+            }
 
             let candidate = dir.join(name);
             if is_executable(&candidate) {
@@ -79,6 +91,18 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Returns `true` when `dir` is safe to walk as a PATH entry: non-empty AND
+/// absolute (S-F10).
+///
+/// An empty entry (POSIX PATH grammar: two consecutive separators, or a
+/// leading/trailing separator) means "current working directory", and a
+/// relative entry resolves against whatever directory the process happens
+/// to be running from. Both let an attacker- or accident-placed file in the
+/// caller's cwd (e.g. `./codex`) be resolved as if it were the real binary.
+fn is_safe_path_entry(dir: &Path) -> bool {
+    !dir.as_os_str().is_empty() && dir.is_absolute()
 }
 
 /// Fixed per-user install directories for self-managed CLIs, checked after
@@ -149,6 +173,8 @@ pub fn resolve_canonical(name: &str) -> Option<PathBuf> {
 /// | `/lib/node_modules/`                      | `NpmGlobal`              |
 /// | `/.npm-global/lib/`                       | `NpmGlobal`              |
 /// | `/Cellar/gemini-cli/`                     | `BrewFormula`            |
+/// | `/.kimi-code/`, `/.grok/`                 | `SelfManaged`            |
+/// | `/.codex/packages/standalone/`            | `SelfManaged`            |
 /// | (anything else)                           | `Unknown`                |
 pub fn classify_install_manager(canonical_path: &Path) -> InstallManager {
     let s = canonical_path.to_string_lossy();
@@ -169,10 +195,18 @@ pub fn classify_install_manager(canonical_path: &Path) -> InstallManager {
     if s.contains("/Cellar/gemini-cli/") {
         return InstallManager::BrewFormula;
     }
-    // Self-managed vendor install dirs (Kimi/Grok update via own subcommand).
-    // Grok's `bin/grok` is a symlink into `~/.grok/downloads/`, so match the
-    // `/.grok/` ancestor rather than the `bin/` leaf; likewise `/.kimi-code/`.
-    if s.contains("/.kimi-code/") || s.contains("/.grok/") {
+    // Self-managed vendor install dirs (Kimi/Grok/Codex update via own
+    // subcommand). Grok's `bin/grok` is a symlink into `~/.grok/downloads/`,
+    // so match the `/.grok/` ancestor rather than the `bin/` leaf; likewise
+    // `/.kimi-code/`. OpenAI's standalone codex installer places releases
+    // under `~/.codex/packages/standalone/releases/<ver>-<target>/`, with
+    // `~/.codex/packages/standalone/current/bin/codex` symlinked to the
+    // current release; canonicalization resolves either form to a path
+    // under `/.codex/packages/standalone/`.
+    if s.contains("/.kimi-code/")
+        || s.contains("/.grok/")
+        || s.contains("/.codex/packages/standalone/")
+    {
         return InstallManager::SelfManaged;
     }
 
@@ -248,6 +282,19 @@ mod tests {
         // grok's bin/grok symlinks into ~/.grok/downloads/; canonicalize lands
         // there, so we match the `/.grok/` ancestor, not the `bin/` leaf.
         let p = PathBuf::from("/Users/u/.grok/downloads/grok-macos-aarch64");
+        assert_eq!(classify_install_manager(&p), InstallManager::SelfManaged);
+    }
+
+    #[test]
+    fn classify_self_managed_codex_standalone_installer() {
+        // OpenAI's standalone installer places releases under
+        // ~/.codex/packages/standalone/releases/<ver>-<target>/, with
+        // ~/.codex/packages/standalone/current/bin/codex symlinked to it.
+        // Canonicalization resolves either form to a path under
+        // /.codex/packages/standalone/.
+        let p = PathBuf::from(
+            "/Users/u/.codex/packages/standalone/releases/0.154.0-aarch64-apple-darwin/codex-aarch64-apple-darwin",
+        );
         assert_eq!(classify_install_manager(&p), InstallManager::SelfManaged);
     }
 
@@ -373,6 +420,64 @@ mod tests {
 
         assert!(result.is_some(), "should find the binary");
         assert_eq!(result.unwrap(), bin);
+    }
+
+    // ── S-F10: empty / relative PATH entries ──────────────────────────
+
+    #[test]
+    fn is_safe_path_entry_rejects_empty_and_relative() {
+        assert!(!is_safe_path_entry(Path::new("")));
+        assert!(!is_safe_path_entry(Path::new(".")));
+        assert!(!is_safe_path_entry(Path::new("./bin")));
+        assert!(!is_safe_path_entry(Path::new("relative/dir")));
+        // `/usr/local/bin` is not absolute on Windows (no drive/prefix), so
+        // use a directory that is absolute on every platform.
+        assert!(is_safe_path_entry(&std::env::temp_dir()));
+    }
+
+    /// An empty PATH entry (POSIX: "current working directory") must never
+    /// resolve against the real process cwd — the hazard the fix in
+    /// `find_in_path` closes. Places a same-named executable directly in the
+    /// test process's own cwd (exactly what an empty entry would walk to)
+    /// and confirms `find_in_path` does NOT find it when PATH consists of a
+    /// single empty entry.
+    #[test]
+    fn find_in_path_skips_empty_path_entry_resolving_against_cwd() {
+        use std::fs;
+
+        let _env_guard = crate::platform::test_env::lock();
+
+        let marker_name = format!("csq-empty-path-entry-marker-{}", std::process::id());
+        let cwd = std::env::current_dir().expect("current_dir must be readable");
+        let marker_path = cwd.join(&marker_name);
+        fs::write(&marker_path, b"#!/bin/sh\necho unexpected\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        // A single empty PATH entry — no other directory to fall back to.
+        // SAFETY: `_env_guard` above serializes against concurrent env
+        // mutations across the workspace.
+        unsafe { std::env::set_var("PATH", "") };
+
+        let result = find_in_path(&marker_name);
+
+        unsafe {
+            match old_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _ = fs::remove_file(&marker_path);
+
+        assert!(
+            result.is_none(),
+            "an empty PATH entry must not resolve against the current \
+             working directory; got {result:?}"
+        );
     }
 
     #[test]

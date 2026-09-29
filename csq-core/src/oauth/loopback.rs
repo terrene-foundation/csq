@@ -901,18 +901,60 @@ mod tests {
     async fn dropping_listener_releases_port() {
         // Prove cancellation safety: dropping the future closes the
         // socket. Used by the race orchestrator on the loser path.
-        let listener = LoopbackListener::bind(TEST_PATH_SECRET.into())
-            .await
-            .unwrap();
-        let port = listener.port;
-        // Start the accept loop, immediately abort it.
-        let server = tokio::spawn(listener.accept_one());
-        server.abort();
-        // Wait for the abort to actually drop the future.
-        let _ = server.await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let second = TcpStream::connect(("127.0.0.1", port)).await;
-        assert!(second.is_err(), "port must be released after future drop");
+        //
+        // THE FLAKE THIS SHAPE AVOIDS IS PORT REUSE, NOT TIMING. The earlier
+        // form slept 50ms and asserted `connect()` fails. Two independent ways
+        // that is wrong, both reported against real runs:
+        //
+        //   * `connect` is the wrong question. Bindability is the property;
+        //     connect additionally succeeds against ANYONE's socket on that
+        //     port, and a listener that is never accept()ed has a finite
+        //     backlog, so repeated connects eventually fail while the port is
+        //     still bound.
+        //   * ~800 tests run in parallel here, so between our drop and our
+        //     check another test can legitimately take that ephemeral port
+        //     number. No amount of retrying the ASSERTION fixes that.
+        //
+        // So: retry the whole SCENARIO on a fresh port, and use bind — which
+        // both answers the right question and TAKES the port, leaving no gap
+        // between the check and the verdict. A genuine leak fails every
+        // attempt; a stolen port costs one retry.
+        const ATTEMPTS: usize = 5;
+        const PER_ATTEMPT: Duration = Duration::from_secs(2);
+
+        for attempt in 1..=ATTEMPTS {
+            let listener = LoopbackListener::bind(TEST_PATH_SECRET.into())
+                .await
+                .unwrap();
+            let port = listener.port;
+            // Start the accept loop, immediately abort it.
+            let server = tokio::spawn(listener.accept_one());
+            server.abort();
+            // Wait for the abort to actually drop the future.
+            let _ = server.await;
+
+            let deadline = std::time::Instant::now() + PER_ATTEMPT;
+            let mut bound_back = false;
+            while std::time::Instant::now() < deadline {
+                if tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
+                    bound_back = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if bound_back {
+                return; // property holds
+            }
+            assert!(
+                attempt < ATTEMPTS,
+                "port {port} never became bindable after the accept future was \
+                 dropped, across {ATTEMPTS} attempts on fresh ports — \
+                 cancellation must close the socket"
+            );
+        }
     }
 
     #[tokio::test]

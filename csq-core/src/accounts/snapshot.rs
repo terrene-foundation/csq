@@ -38,7 +38,7 @@ fn resolve_authority(config_dir: &Path, base_dir: &Path) -> Option<AccountNum> {
 ///
 /// **Authority-first** (workspace `an internal workspace`): the slot
 /// is ALWAYS resolved from `.csq-account` (the SOLE authority per
-/// `account-terminal-separation.md` MUST NOT Rule 3) via [`resolve_authority`]
+/// `account-terminal-separation.md` MUST NOT Rule 3) via `resolve_authority`
 /// — numeric markers resolve directly, UUID markers reverse-resolve through
 /// `by_slot`. `.current-account` is demoted to a perf cache that is
 /// **self-healed** whenever it disagrees with the authority, so a stale

@@ -31,17 +31,17 @@
 //!
 //! # Atomicity
 //!
-//! The marker is written via `unique_tmp_path → secure_file →
-//! atomic_replace` — same pipeline as every other credential write
-//! per `rules/security.md` §4 + §5a. Partial failures clean up the
-//! tmp file before propagating the error so the umask-default tmp
-//! does not linger on disk (PR-G3 redteam B2 pattern).
+//! The marker is written via `unique_tmp_path → write_new_private
+//! (0o600 at creation) → atomic_replace` — same pipeline as every other
+//! credential write per `rules/security.md` §4 + §5a. Partial failures
+//! clean up the tmp file before propagating the error so the tmp never
+//! exists at umask-default mode (PR-G3 redteam B2 pattern).
 //!
 //! [`csq run`]: https://github.com/terrene-foundation/csq/blob/main/csq-cli/src/commands/run.rs
 
 use crate::credentials::file::canonical_path_for;
 use crate::error::PlatformError;
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 use crate::platform::secret::{SecretError, SlotKey, Vault};
 use crate::providers::catalog::Surface;
 use crate::providers::gemini::SURFACE_GEMINI;
@@ -344,7 +344,7 @@ pub fn gemini_mode_class(auth: &AuthMode) -> &'static str {
 /// `gemini-<N>/<mode-class>` (e.g. `gemini-13/apikey`).
 ///
 /// This is the SINGLE producer consumed by BOTH the synchronous
-/// provision write ([`write_gemini_identity`]) AND the daemon backfill
+/// provision write (`write_gemini_identity`) AND the daemon backfill
 /// pass, so the two paths emit byte-identical literals (FM-3a). It fills
 /// the reserved `<id>` position of spec 02 §INV-07's `gemini-<N>/<id>`
 /// convention with the only marker-derivable `<id>`-shaped fact csq owns
@@ -578,19 +578,19 @@ pub fn write_binding(
             reason: format!("serialize: {e}"),
         })?;
 
+    // §5a: treated as secret-bearing under ambiguity-resolves-closed.
+    // `AuthMode::ApiKey`'s own doc says the marker "carries no key
+    // material", but `AuthMode::VertexSa` carries an absolute path to a
+    // service-account JSON credential file — a disclosure of where the
+    // credential lives, even though not the credential bytes themselves.
+    // `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate write + secure_file pair left open.
     let tmp = unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ProvisionError::Io {
             path: tmp,
-            source: e,
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ProvisionError::AtomicReplace {
-            path: path.clone(),
-            reason: format!("secure_file: {e}"),
+            source: std::io::Error::other(e.to_string()),
         });
     }
     if let Err(e) = atomic_replace(&tmp, &path) {

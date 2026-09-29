@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.19.0"
+version = "2.20.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/terrene-foundation/csq"
@@ -27,13 +27,13 @@ repository = "https://github.com/terrene-foundation/csq"
 # NOT these dep literals (nor the enterprise SDK crate's `=X.Y.Z` pin), so the
 # `version_pins_match_workspace` test in the enterprise SDK crate fails closed on drift
 # until W5 automates the bump — do NOT trust the /release flow to keep these in sync.
-csq-redact = { path = "csq-redact", version = "2.19.0" }
+csq-redact = { path = "csq-redact", version = "2.20.0" }
 # csq-sdk — public (Apache-2.0) SDK wire contract (W2): envelope/error/adapter +
 # payload DTOs. csq-core depends on it and re-exports it (crate::sdk::*); the
 # builders (EDITION + audit->DTO mapping) live app-side in csq-core. `version`
 # alongside `path` for the same publishability reason as csq-redact above; the same
 # `version_pins_match_workspace` guard covers this literal.
-csq-sdk = { path = "csq-sdk", version = "2.19.0" }
+csq-sdk = { path = "csq-sdk", version = "2.20.0" }
 # csq-merkle — an internal ticket RFC 6962 Merkle verifier leaf crate (publish=false). Both
 # csq-ledger AND csq-core depend on it; no `version` alongside `path` is needed
 # because it is not published and no publishable (OPEN) crate depends on it — it
@@ -119,9 +119,35 @@ security-framework = "3"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 # Gemini PR-G2a — encryption-at-rest primitives for the platform::secret
 # fallback path (Linux without Secret Service / explicit opt-in). RustCrypto
-# audited pure Rust; no FFI. argon2 is OWASP 2023 KDF; aes-gcm is the AEAD.
-# zeroize wipes secret material before drop.
-aes-gcm = "0.10"
+# audited pure Rust; no FFI.
+#
+# `zeroize wipes secret material before drop` was WRITTEN here before it was
+# TRUE (doc-property-claims.md — a claim asserted, not verified): by default
+# neither `aes-gcm` nor its `aes` dependency enables their own optional
+# `zeroize` features (verified via `cargo tree -e features -i aes-gcm` / `-i
+# aes` — neither appeared in the resolved feature set for this workspace
+# before this line was added), so `AesGcm`'s ephemeral GHASH subkey
+# (`ghash_key.zeroize()`, aes-gcm's `src/lib.rs`) and `aes::Aes256`'s
+# round-key schedule (`impl ZeroizeOnDrop for Aes256`, aes's
+# `src/autodetect.rs` / `armv8.rs` — gated identically to
+# `ed25519-dalek`'s `SigningKey` below) were BOTH silently unwiped in every
+# csq build to date. `features = ["zeroize"]` below closes the `aes-gcm`
+# half explicitly (its own scrub, not forwarded to its `aes` dependency);
+# the direct `aes` line further down closes the round-key half — `aes` is
+# not otherwise imported by name anywhere in csq, it exists solely to pin
+# that transitive feature (`durable-instruments.md` MUST-1: the property
+# rests on a dependency feature and had no instrument that would notice
+# its absence — see `audit::key_hierarchy::keys`'s compile-time assertions
+# for both types).
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# Pinned SOLELY to enable its `zeroize` feature for the `Aes256`/`Aes128`
+# round-key-schedule scrub-on-drop (see the aes-gcm comment above) — `aes-gcm`
+# depends on this transitively and does not forward the feature itself, so a
+# direct pin is the only way to turn it on. Version MUST track whatever
+# `aes-gcm` 0.10's Cargo.lock resolves (currently 0.8.x) or this becomes a
+# SEPARATE crate instance in the graph and the feature no longer unifies with
+# aes-gcm's copy — verify with `cargo tree -i aes` after any aes-gcm bump.
+aes = { version = "0.8", features = ["zeroize"] }
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 # `subtle` provides constant-time equality (`ConstantTimeEq`) for
@@ -131,7 +157,19 @@ zeroize = { version = "1", features = ["derive"] }
 # public API surface. Kept at workspace level so both `csq-core` (state
 # store + race) and `csq` (race state-token compare in the desktop
 # surface) share the same version.
-subtle = { version = "2", default-features = false }
+#
+# `core_hint_black_box`: without it, `Choice`'s optimization barrier (the
+# thing standing between "constant-time compare" and "the compiler proved
+# it can skip work and turned it back into an early-exit branch") is a
+# hand-rolled `core::ptr::read_volatile` shim the crate's own source calls
+# "best-effort... a continually moving target" — written for pre-stabilization
+# Rust. This feature switches to the stdlib's own `core::hint::black_box`
+# (stable since 1.66; this workspace's toolchain is 1.94), which is the
+# barrier the crate's authors actually intend for stable Rust today. Zero
+# downside found: the feature adds no dependency, needs no `std`/`alloc`, and
+# was simply never opted into when `default-features = false` (above) turned
+# off subtle's OWN unrelated defaults (`std`, `i128`) at the same time.
+subtle = { version = "2", default-features = false, features = ["core_hint_black_box"] }
 # Gemini PR-G2a.2 — Linux Secret Service / kwallet via D-Bus. The crate's
 # `rt-tokio-crypto-rust` feature picks tokio for the async runtime and
 # RustCrypto for session-key crypto so we keep the no-OpenSSL-FFI posture.

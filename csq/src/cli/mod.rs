@@ -74,7 +74,12 @@ impl LayerIntent {
     }
 }
 
-/// csq — Claude Code multi-account rotation and session management
+/// csq — governed execution layer for coding-agent CLIs
+///
+/// Runs Claude Code, Codex, Gemini, Kimi and Grok under one command, applies a
+/// shared governance standard to each run, and records what happened in a
+/// verifiable audit chain. Account slots, quota and per-terminal isolation are
+/// the substrate that makes multi-CLI execution work — not the product.
 #[derive(Parser, Debug)]
 #[command(name = "csq", version = crate::VERSION_LINE, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -172,18 +177,34 @@ enum Command {
         /// to revert to the old bail-and-tell behaviour.
         #[arg(long = "no-auto-update-cli")]
         no_auto_update_cli: bool,
-        /// Keep this slot's managed CLI at the ABSOLUTE latest release
-        /// within its supported major, rather than only guarding the
-        /// minimum-version floor. When set, csq attempts an upgrade
-        /// (`npm install -g <package>`, range-pinned so never a cross-major
-        /// bump) even when the binary already passes the floor — throttled
-        /// to at most once per CLI per day so it does not slow every launch.
-        /// The once-a-day check may add a brief pause before the CLI starts
-        /// (and up to ~2 min if the npm registry is unreachable); it never
-        /// blocks the launch — a failed check proceeds with the installed
-        /// binary. Suppressed by `--no-auto-update-cli`. Also enabled by
-        /// `CSQ_TRACK_LATEST=1`. Default: OFF (the floor guard is the safe
-        /// default).
+        /// Keep this slot's managed CLI at the ABSOLUTE latest release,
+        /// rather than only guarding the minimum-version floor — csq
+        /// attempts an upgrade (`npm install -g <package>` or the CLI's own
+        /// `update`/`upgrade` subcommand) even when the binary already
+        /// passes the floor, throttled to at most once per CLI per day so
+        /// it does not slow every launch. For `npm install`-managed CLIs the
+        /// argv is range-pinned, so the upgrade stays within the supported
+        /// major; the standalone updaters (`codex update` / `kimi upgrade` /
+        /// `grok update`) are NOT range-pinned and may cross a major version
+        /// — csq prints a one-line WARN naming the old and new versions when
+        /// that happens, and proceeds either way. The once-a-day check may
+        /// add a brief pause before the CLI starts (and up to ~2 min if the
+        /// registry is unreachable); it usually does not block the launch —
+        /// a failed check proceeds with the installed binary — EXCEPT when
+        /// the upgrade times out mid-install: csq cannot tell whether the
+        /// binary is still being swapped, so it bails rather than launch
+        /// against it (re-run once the upgrade settles). Also skipped
+        /// (silently) when stdin is not a TTY or a CI-sentinel env var is
+        /// set (`CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`,
+        /// `JENKINS_URL`) — an unattended background upgrade is never
+        /// started from a non-interactive/CI context.
+        ///
+        /// **Default: ON** (csq keeps every managed CLI current the same way
+        /// Claude Code updates itself). This flag and `CSQ_TRACK_LATEST=1`
+        /// are now harmless explicit opt-ins. Opt out with
+        /// `CSQ_NO_TRACK_LATEST=1`, or suppress every auto-update
+        /// (including this one) with `--no-auto-update-cli` /
+        /// `CSQ_NO_AUTO_UPDATE_CLI=1`.
         #[arg(long = "track-latest")]
         track_latest: bool,
         /// Skip writing the audit record for THIS invocation only (M06).
@@ -389,12 +410,23 @@ enum Command {
         /// the old bail-and-tell behaviour.
         #[arg(long = "no-auto-update-cli")]
         no_auto_update_cli: bool,
-        /// Keep the managed CLI at the ABSOLUTE latest release within its
-        /// supported major during the login pre-flight, rather than only
-        /// guarding the minimum-version floor. Range-pinned (never a
-        /// cross-major bump); throttled to once per CLI per day; never blocks
-        /// the login. Suppressed by `--no-auto-update-cli`. Also enabled by
-        /// `CSQ_TRACK_LATEST=1`. Default: OFF.
+        /// Keep the managed CLI at the ABSOLUTE latest release during the
+        /// login pre-flight, rather than only guarding the minimum-version
+        /// floor. `npm install`-managed CLIs stay range-pinned (never a
+        /// cross-major bump); the standalone updaters (`codex update` /
+        /// `kimi upgrade` / `grok update`) are NOT range-pinned and may
+        /// cross a major version, WARNing when it happens. Throttled to
+        /// once per CLI per day. Usually does not block the login — EXCEPT
+        /// when the upgrade times out mid-install, in which case csq bails
+        /// rather than log in against a binary that may still be being
+        /// swapped. Also skipped (silently) outside an interactive TTY or
+        /// when a CI-sentinel env var is set (`CI`, `GITHUB_ACTIONS`,
+        /// `GITLAB_CI`, `BUILDKITE`, `JENKINS_URL`).
+        ///
+        /// **Default: ON.** This flag and `CSQ_TRACK_LATEST=1` are now
+        /// harmless explicit opt-ins. Opt out with `CSQ_NO_TRACK_LATEST=1`,
+        /// or suppress every auto-update with `--no-auto-update-cli` /
+        /// `CSQ_NO_AUTO_UPDATE_CLI=1`.
         #[arg(long = "track-latest")]
         track_latest: bool,
         /// Emit the an internal ticket fail-fast pre-flight refusal as a `csq.login.v1`
@@ -557,6 +589,13 @@ enum Command {
         /// Network + opt-in: off by default so the offline passes stay fast.
         #[arg(long)]
         heal_contaminated: bool,
+    },
+
+    /// Cross-slot session sharing — conversation history + `resume` lists
+    /// that survive `csq swap`.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
     },
 
     /// Generate shell completions for bash, zsh, fish, or powershell
@@ -753,6 +792,36 @@ enum CliCommand {
         /// CLI name to upgrade. Allowed: claude, codex, gemini, kimi, grok.
         #[arg(value_parser = ["claude", "codex", "gemini", "kimi", "grok"])]
         name: String,
+    },
+}
+
+/// Subcommands for `csq sessions` — cross-slot session sharing
+/// (`csq-core::session::shared_state`).
+#[derive(Subcommand, Debug)]
+enum SessionsCommand {
+    /// Migrate a surface's conversation history (rollout transcripts, the
+    /// `resume` index) out of each slot's isolated vendor home into a
+    /// single store shared across every slot bound to that surface, so
+    /// `csq swap` no longer strands conversation history behind the slot
+    /// you happened to be on when it was recorded. Merges, never
+    /// clobbers; safe to run repeatedly.
+    Share {
+        /// Only migrate this surface. Default: codex, kimi, and grok.
+        /// REQUIRED when `--force` is passed.
+        #[arg(long, value_parser = ["codex", "kimi", "grok"])]
+        surface: Option<String>,
+        /// Preview only: print exactly what WOULD move, per slot, with
+        /// counts. Changes nothing on disk. Never gated by the live-writer
+        /// guard — safe to run while a vendor session is active.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the live-writer guard for a REAL (non `--dry-run`) run.
+        /// Prints exactly which pid(s) it is overriding before proceeding.
+        /// Requires `--surface` to be named explicitly. Not recommended
+        /// while the named surface has an active session — it can lose or
+        /// corrupt an in-flight rollout file.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1449,6 +1518,20 @@ enum DaemonCmd {
     Install,
     /// Uninstall the platform service installed by `csq daemon install`
     Uninstall,
+    /// Show or set this host's refresh posture (leader / follower).
+    ///
+    /// A FOLLOWER polls usage, serves IPC, sweeps handle dirs and syncs
+    /// keychains exactly as normal, but never refreshes an OAuth token.
+    /// Set it on every host but one when two or more machines share the same
+    /// accounts: Anthropic rotates the refresh token on each refresh, so two
+    /// refreshing daemons invalidate each other's stored token.
+    ///
+    /// With no argument, prints the current posture.
+    Posture {
+        /// `leader` (refreshes tokens — the default) or `follower` (never does).
+        #[arg(value_name = "ROLE")]
+        role: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1607,6 +1690,11 @@ enum SetkeyCmd {
 
 #[derive(Subcommand, Debug)]
 enum ModelsCmd {
+    /// Inspect, validate or replace model metadata and historical prices without rebuilding
+    Manifest {
+        #[command(subcommand)]
+        action: ModelManifestCmd,
+    },
     /// List all models, or filter by provider
     List {
         /// Provider ID or "all"
@@ -1640,6 +1728,18 @@ enum ModelsCmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelManifestCmd {
+    /// Print the effective JSON manifest (redirect to a file to edit it)
+    Show,
+    /// Validate a complete JSON snapshot without installing it
+    Validate { file: std::path::PathBuf },
+    /// Validate and atomically install a local JSON snapshot
+    Install { file: std::path::PathBuf },
+    /// Remove the local snapshot and return to bundled defaults
+    Reset,
 }
 
 /// Enforce the enterprise license gate before an enterprise-only op (W4, journal
@@ -2138,6 +2238,16 @@ pub fn run() -> Result<()> {
                 provider: "all".to_string(),
             });
             match action {
+                ModelsCmd::Manifest { action } => {
+                    use commands::models::ManifestAction;
+                    let action = match action {
+                        ModelManifestCmd::Show => ManifestAction::Show,
+                        ModelManifestCmd::Validate { file } => ManifestAction::Validate(file),
+                        ModelManifestCmd::Install { file } => ManifestAction::Install(file),
+                        ModelManifestCmd::Reset => ManifestAction::Reset,
+                    };
+                    commands::models::handle_manifest(&base_dir, action, json)
+                }
                 ModelsCmd::List { provider } => {
                     commands::models::handle_list(&base_dir, &provider, json)
                 }
@@ -2208,6 +2318,9 @@ pub fn run() -> Result<()> {
             DaemonCmd::Status => commands::daemon::handle_status(&base_dir),
             DaemonCmd::Install => commands::daemon::handle_install(&base_dir),
             DaemonCmd::Uninstall => commands::daemon::handle_uninstall(&base_dir),
+            DaemonCmd::Posture { role } => {
+                commands::daemon::handle_posture(&base_dir, role.as_deref())
+            }
         },
         Command::Update { action } => match action {
             UpdateCmd::Check => commands::update::check(),
@@ -2224,6 +2337,13 @@ pub fn run() -> Result<()> {
         Command::Cli { command } => match command {
             CliCommand::Install { name } => commands::cli::handle_install(&name),
             CliCommand::Upgrade { name } => commands::cli::handle_upgrade(&name),
+        },
+        Command::Sessions { command } => match command {
+            SessionsCommand::Share {
+                surface,
+                dry_run,
+                force,
+            } => commands::sessions::handle_share(&base_dir, surface.as_deref(), dry_run, force),
         },
         Command::Classify {
             prompt,
@@ -2498,6 +2618,37 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_manifest_subcommands_parse_without_session_dispatch() {
+        use clap::Parser;
+        for args in [
+            vec!["csq", "models", "manifest", "show"],
+            vec![
+                "csq",
+                "models",
+                "manifest",
+                "validate",
+                "/private/reviewed.json",
+            ],
+            vec![
+                "csq",
+                "models",
+                "manifest",
+                "install",
+                "/private/reviewed.json",
+            ],
+            vec!["csq", "models", "manifest", "reset"],
+        ] {
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(super::Command::Models {
+                    action: Some(super::ModelsCmd::Manifest { .. })
+                })
+            ));
+        }
+    }
+
     use super::{ceiling_mode_for, Cli, Command, InspectCmd, LayerIntent};
     use clap::Parser;
     use csq_core::capability_layer::log_volume::CeilingMode;

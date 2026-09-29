@@ -1,4 +1,5 @@
-//! Model catalog — embedded list of models across providers.
+//! Owned model catalogue types, lookup, and bounded Claude selector policy.
+//! Bundled defaults and runtime metadata snapshots come from `model_manifest`.
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,7 @@ pub struct ModelCatalog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
@@ -18,194 +20,49 @@ pub struct ModelInfo {
     pub aliases: Vec<String>,
 }
 
+/// Maps a DeepSeek Flash API model to its Claude Code context selector.
+///
+/// The API catalogue keeps the bare ID, but explicit Claude Code settings
+/// selections require `[1m]` to retain the full context window. Only the known
+/// DeepSeek Anthropic endpoint is eligible: a same-named Ollama/proxy model is
+/// not evidence that this provider-specific annotation applies. Unknown model
+/// names, custom selectors and unrelated providers are preserved byte-for-byte.
+/// This is a write-time conversion, not a migration of existing settings.
+pub fn claude_code_model_selector<'a>(model_id: &'a str, base_url: Option<&str>) -> &'a str {
+    let Some(endpoint) = base_url.and_then(|value| url::Url::parse(value).ok()) else {
+        return model_id;
+    };
+    if endpoint.scheme() != "https"
+        || endpoint.host_str() != Some("api.deepseek.com")
+        || endpoint.port_or_known_default() != Some(443)
+        || endpoint.path().trim_end_matches('/') != "/anthropic"
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return model_id;
+    }
+    let bare = model_id.strip_suffix("[1m]").unwrap_or(model_id);
+    if [
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+    ]
+    .iter()
+    .any(|known| bare.eq_ignore_ascii_case(known))
+    {
+        "deepseek-flash[1m]"
+    } else {
+        model_id
+    }
+}
+
 impl ModelCatalog {
-    /// Returns the embedded default catalog.
+    /// Returns model metadata from the validated bundled manifest.
+    /// Runtime callers should load `ModelManifest` with their explicit base dir.
     pub fn default_catalog() -> Self {
-        Self {
-            models: vec![
-                // Claude
-                ModelInfo {
-                    id: "claude-opus-4-8".into(),
-                    name: "Claude Opus 4.8".into(),
-                    provider: "claude".into(),
-                    // 1M, not the 200_000 this carried since v2.0. That literal
-                    // was correct when it was written and then rode forward
-                    // untouched across 4.6 -> 4.7 -> 4.8: every version bump
-                    // renamed `id`/`name`/`aliases` only (4a3b8e0b), and every
-                    // later commit that DID touch a context_window was for a
-                    // different provider (Sonnet 5, Kimi, DeepSeek, Gemini).
-                    // Nothing failed, because — unlike deepseek-v4-pro and
-                    // kimi-k3 — no test pinned a Claude window. See
-                    // `claude_opus_4_8_context_window_is_1m` below, which is the
-                    // part that stops this rotting again.
-                    context_window: Some(1_000_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["opus".into(), "opus-4-8".into(), "opus-4-7".into()],
-                },
-                ModelInfo {
-                    id: "claude-sonnet-5".into(),
-                    name: "Claude Sonnet 5".into(),
-                    provider: "claude".into(),
-                    context_window: Some(200_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["sonnet".into(), "sonnet-5".into()],
-                },
-                ModelInfo {
-                    id: "claude-sonnet-4-6".into(),
-                    name: "Claude Sonnet 4.6".into(),
-                    provider: "claude".into(),
-                    context_window: Some(200_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["sonnet-4-6".into()],
-                },
-                ModelInfo {
-                    id: "claude-haiku-4-5-20251001".into(),
-                    name: "Claude Haiku 4.5".into(),
-                    provider: "claude".into(),
-                    context_window: Some(200_000),
-                    output_limit: Some(4_096),
-                    aliases: vec!["haiku".into(), "haiku-4-5".into()],
-                },
-                // MiniMax
-                ModelInfo {
-                    id: "MiniMax-M3".into(),
-                    name: "MiniMax M3".into(),
-                    provider: "mm".into(),
-                    context_window: Some(1_000_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["m3".into(), "minimax-m3".into(), "mm-m3".into()],
-                },
-                // Z.AI — `glm-5.3[1m]` is the 1M-context variant (Z.AI docs:
-                // append the `[1m]` suffix to enable the 1,000,000-token window).
-                // Bracket-free aliases (`glm`, `glm-5.3`) let `csq models switch`
-                // resolve it without shell-quoting the `[1m]` glob. `glm-5.2` is
-                // kept as an alias (not dropped): Z.AI's `/v1/messages` endpoint
-                // aliases `glm-5.2` requests to `glm-5.3` server-side (verified
-                // live 2026-08-15 — response echoes `"model":"glm-5.3"` for a
-                // `glm-5.2` request), and existing slot `settings-zai.json` files
-                // already pin the bracketed `glm-5.2[1m]` id and are not rewritten
-                // by this change (`account-terminal-separation.md` — no migration
-                // sweep of already-materialized slot files).
-                ModelInfo {
-                    id: "glm-5.3[1m]".into(),
-                    name: "GLM 5.3 (1M context)".into(),
-                    provider: "zai".into(),
-                    context_window: Some(1_000_000),
-                    output_limit: Some(8_192),
-                    aliases: vec![
-                        "glm".into(),
-                        "glm-5.3".into(),
-                        "glm-5".into(),
-                        "glm-5.2".into(),
-                    ],
-                },
-                // Gemini — static list per FR-G-UI-02 / ADR-G08.
-                // `auto` is handled as a literal in the
-                // `models switch gemini` branch, NOT as a catalog
-                // entry — it instructs gemini-cli to pick rather
-                // than pinning a specific id.
-                ModelInfo {
-                    id: "gemini-2.5-pro".into(),
-                    name: "Gemini 2.5 Pro".into(),
-                    provider: "gemini".into(),
-                    context_window: Some(2_000_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["pro".into(), "2.5-pro".into()],
-                },
-                ModelInfo {
-                    id: "gemini-2.5-flash".into(),
-                    name: "Gemini 2.5 Flash".into(),
-                    provider: "gemini".into(),
-                    context_window: Some(1_000_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["flash".into(), "2.5-flash".into()],
-                },
-                ModelInfo {
-                    id: "gemini-2.5-flash-lite".into(),
-                    name: "Gemini 2.5 Flash Lite".into(),
-                    provider: "gemini".into(),
-                    context_window: Some(1_000_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["flash-lite".into(), "2.5-flash-lite".into()],
-                },
-                ModelInfo {
-                    id: "gemini-3-pro-preview".into(),
-                    name: "Gemini 3 Pro (preview)".into(),
-                    provider: "gemini".into(),
-                    context_window: Some(2_000_000),
-                    output_limit: Some(8_192),
-                    aliases: vec!["3-pro-preview".into(), "3-pro".into()],
-                },
-                // DeepSeek — Anthropic-API-compatible models exposed via
-                // https://api.deepseek.com/anthropic. Tier mapping per
-                // DeepSeek docs: pro for opus/sonnet workloads, flash
-                // for haiku/subagent/cheap-fast workloads.
-                ModelInfo {
-                    id: "deepseek-v4-pro".into(),
-                    name: "DeepSeek V4 Pro".into(),
-                    provider: "deepseek".into(),
-                    // DeepSeek V4 Pro ships a 1M-token context window (maintainer-confirmed
-                    // 2026-07-05). CONSUMED by the statusline context-% recompute: the CLI
-                    // (`statusline.rs`) resolves this window from the slot's settings.json
-                    // model id (`providers::settings::model_id_for_slot`) and sets
-                    // `StatuslineContext::ctx_window_true`, so `format.rs` recomputes the %
-                    // against 1M instead of trusting CC's ~200k assumption for the
-                    // Anthropic-compatible endpoint (which rendered 177k → 89% instead of ~18%).
-                    context_window: Some(1_000_000),
-                    // 384K, not 8_192. Verified 2026-08-01 against DeepSeek's
-                    // published Models & Pricing table, `MAX OUTPUT` row:
-                    // "MAXIMUM: 384K" for BOTH v4-pro and v4-flash. The old
-                    // 8_192 predates V4 and was never revised.
-                    output_limit: Some(384_000),
-                    aliases: vec!["ds-pro".into(), "deepseek-pro".into(), "v4-pro".into()],
-                },
-                ModelInfo {
-                    id: "deepseek-v4-flash".into(),
-                    name: "DeepSeek V4 Flash".into(),
-                    provider: "deepseek".into(),
-                    // DeepSeek publishes `MODEL VERSION: DeepSeek-V4-Flash-0731`
-                    // for this id — the dated snapshot is the VERSION, not a
-                    // separate API model, so `deepseek-v4-flash` is the id to
-                    // call for it. (Maintainer asked for "0731" specifically;
-                    // this is that model.)
-                    //
-                    // 1M context, NOT 128k. Verified 2026-08-01 against the
-                    // published Models & Pricing table: `CONTEXT LENGTH` is
-                    // "1M" for both v4-flash and v4-pro.
-                    //
-                    // This one is BEHAVIOURAL, not just record-keeping.
-                    // `context_window` is consumed by the statusline's
-                    // context-% recompute (`statusline.rs:146` ->
-                    // `StatuslineContext::ctx_window_true`). At 128k a flash
-                    // slot over-reported usage ~8x — the identical bug the
-                    // v4-pro entry above documents having fixed ("rendered
-                    // 177k -> 89% instead of ~18%"). Pro got the correction;
-                    // flash was left behind.
-                    context_window: Some(1_000_000),
-                    output_limit: Some(384_000),
-                    aliases: vec![
-                        "ds-flash".into(),
-                        "deepseek-flash".into(),
-                        "v4-flash".into(),
-                    ],
-                },
-                // Kimi (Moonshot AI) — Anthropic-API-compatible model exposed via
-                // https://api.kimi.com/coding (subscription). 1M-token context window
-                // (maintainer-confirmed), matching the catalog default_model. The
-                // canonical id is `kimi-k3[1m]` (the 1M-context variant); the bare
-                // `kimi-k3` form is kept as an alias so older references still
-                // resolve to the same 1M entry — Kimi's coding endpoint exposes
-                // the 1M variant as the only K3 SKU.
-                ModelInfo {
-                    id: "kimi-k3[1m]".into(),
-                    name: "Kimi K3".into(),
-                    provider: "kimi".into(),
-                    context_window: Some(1_048_576),
-                    output_limit: Some(8_192),
-                    aliases: vec!["k3".into(), "kimi-k3".into()],
-                },
-            ],
-        }
+        super::model_manifest::ModelManifest::bundled().catalog()
     }
 
     /// Strips deployment-specific suffixes a model id can carry, for LOOKUP
@@ -290,6 +147,13 @@ mod tests {
         let cat = ModelCatalog::default_catalog();
         assert!(!cat.models.is_empty());
         assert!(cat.find("claude-opus-4-8").is_some());
+        // Vertex slot 19's pin: the [1m] annotation must still resolve to the
+        // 1M window, or the statusline over-reports context use 5x.
+        let opus55 = cat
+            .find("claude-opus-5-5[1m]")
+            .expect("opus 5.5 in catalog");
+        assert_eq!(opus55.id, "claude-opus-5-5");
+        assert_eq!(opus55.context_window, Some(1_000_000));
 
         // Vertex pins a version suffix in the slot's ANTHROPIC_MODEL. Before
         // normalisation this returned None, so `ctx_window_true` was None for
@@ -365,6 +229,159 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v41_claude_selector_annotates_only_known_flash_ids() {
+        for endpoint in [
+            "https://api.deepseek.com/anthropic",
+            "https://api.deepseek.com/anthropic/",
+            "https://API.DEEPSEEK.COM:443/anthropic",
+        ] {
+            for model in [
+                "deepseek-flash",
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp",
+                "DEEPSEEK-FLASH",
+                "deepseek-flash[1m]",
+                "deepseek-v4-flash[1m]",
+                "deepseek-v4-flash-vision-exp[1m]",
+            ] {
+                let selector = claude_code_model_selector(model, Some(endpoint));
+                assert_eq!(selector, "deepseek-flash[1m]", "{model} at {endpoint}");
+                assert_eq!(
+                    claude_code_model_selector(selector, Some(endpoint)),
+                    selector
+                );
+                assert_eq!(
+                    ModelCatalog::default_catalog().find(selector).unwrap().id,
+                    "deepseek-flash"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_claude_selector_preserves_other_endpoints_and_custom_models() {
+        for endpoint in [
+            None,
+            Some("not a URL"),
+            Some("http://localhost:11434"),
+            Some("http://127.0.0.1:11434/anthropic"),
+            Some("https://api.deepseek.com.evil.example/anthropic"),
+            Some("https://proxy.example/deepseek/anthropic"),
+            Some("http://api.deepseek.com/anthropic"),
+            Some("https://api.deepseek.com:8443/anthropic"),
+            Some("https://api.deepseek.com/v1"),
+            Some("https://user@api.deepseek.com/anthropic"),
+            Some("https://api.deepseek.com/anthropic?provider=other"),
+            Some("https://api.deepseek.com/anthropic#other"),
+        ] {
+            assert_eq!(
+                claude_code_model_selector("deepseek-flash", endpoint),
+                "deepseek-flash",
+                "endpoint {endpoint:?}"
+            );
+        }
+        for model in [
+            "deepseek-v4-pro",
+            "deepseek-v4-pro[1m]",
+            "custom-model",
+            "deepseek-flash[200k]",
+            "deepseek-v4.1-flash",
+            " deepseek-flash ",
+            "",
+        ] {
+            assert_eq!(
+                claude_code_model_selector(model, Some("https://api.deepseek.com/anthropic")),
+                model
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_flash_is_the_single_canonical_flash_entry() {
+        let cat = ModelCatalog::default_catalog();
+        let models = cat.by_provider("deepseek");
+        assert_eq!(
+            models.len(),
+            2,
+            "Pro remains distinct; aliases are not models"
+        );
+        let flash = models.iter().find(|m| m.id == "deepseek-flash").unwrap();
+        assert_eq!(flash.name, "DeepSeek V4.1 Flash");
+        assert_eq!(flash.context_window, Some(1_000_000));
+        assert_eq!(flash.output_limit, Some(384_000));
+        assert_eq!(cat.find("ds-pro").unwrap().id, "deepseek-v4-pro");
+        assert_eq!(cat.find("ds-pro").unwrap().name, "DeepSeek V4 Pro");
+        assert!(
+            cat.find("deepseek-v4.1-flash").is_none(),
+            "not a published API id"
+        );
+    }
+
+    #[test]
+    fn deepseek_v41_flash_legacy_and_version_aliases_resolve_canonically() {
+        let cat = ModelCatalog::default_catalog();
+        for query in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "ds-flash",
+            "v4-flash",
+            "4.1",
+            "v4.1",
+            "v4.1-flash",
+            "DEEPSEEK-FLASH",
+            "deepseek-v4-flash[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-flash@default",
+        ] {
+            let model = cat.find(query).unwrap_or_else(|| panic!("missing {query}"));
+            assert_eq!(model.id, "deepseek-flash", "lookup {query}");
+            assert_eq!(model.provider, "deepseek", "lookup {query}");
+            assert_eq!(model.context_window, Some(1_000_000), "lookup {query}");
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_switch_alias_is_unambiguous_across_providers() {
+        let cat = ModelCatalog::default_catalog();
+        for query in ["4.1", "v4.1", "v4.1-flash"] {
+            let matches: Vec<_> = cat
+                .models
+                .iter()
+                .filter(|model| {
+                    model.id.eq_ignore_ascii_case(query)
+                        || model
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(query))
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "ambiguous switch alias {query}");
+            assert_eq!(matches[0].id, "deepseek-flash");
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_catalog_serialization_exposes_canonical_identity_and_legacy_aliases() {
+        let cat = ModelCatalog::default_catalog();
+        let json = serde_json::to_value(cat.by_provider("deepseek")).unwrap();
+        let flash = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == "deepseek-flash")
+            .unwrap();
+        assert_eq!(flash["name"], "DeepSeek V4.1 Flash");
+        assert_eq!(flash["context_window"], 1_000_000);
+        assert_eq!(flash["output_limit"], 384_000);
+        let aliases = flash["aliases"].as_array().unwrap();
+        assert!(aliases.iter().any(|alias| alias == "deepseek-v4-flash"));
+        assert!(aliases
+            .iter()
+            .any(|alias| alias == "deepseek-v4-flash-vision-exp"));
+    }
+
+    #[test]
     fn deepseek_v4_pro_context_window_is_1m() {
         // DeepSeek V4 Pro is a 1M-token context model (maintainer-confirmed 2026-07-05);
         // a stale 128k value under-states the true window (and would drive a wrong
@@ -398,6 +415,57 @@ mod tests {
             Some(1_000_000),
             "the statusline resolves the Vertex-pinned id; it must see the true window"
         );
+        // The CC `[1m]` window annotation is what slot 19's settings.json holds
+        // TODAY (`claude-opus-4-8[1m]`); `@default` above is the older Vertex
+        // pin. Both must resolve, or the statusline silently falls back to CC's
+        // ~200k assumption and over-reports context use by 5x on a 1M model.
+        assert_eq!(
+            cat.find("claude-opus-4-8[1m]").unwrap().context_window,
+            Some(1_000_000),
+            "the [1m] annotation a Vertex slot actually carries must resolve too"
+        );
+    }
+
+    /// Every Claude entry's window AND output limit, pinned against the live
+    /// Models API.
+    ///
+    /// `claude_opus_4_8_context_window_is_1m` fixed ONE literal and said so:
+    /// "STILL STALE, deliberately not guessed: claude-sonnet-5,
+    /// claude-sonnet-4-6 and claude-haiku-4-5-20251001 remain at 200_000."
+    /// They are no longer guesses. Measured 2026-09-09 via
+    /// `GET https://api.anthropic.com/v1/models/{id}`:
+    ///
+    ///   claude-opus-4-8            max_input_tokens=1000000  max_tokens=128000
+    ///   claude-sonnet-5            max_input_tokens=1000000  max_tokens=128000
+    ///   claude-sonnet-4-6          max_input_tokens=1000000  max_tokens=128000
+    ///   claude-haiku-4-5-20251001  max_input_tokens= 200000  max_tokens= 64000
+    ///
+    /// Haiku's 200_000 was already RIGHT — and had no test. That is precisely
+    /// the state Opus 4.8 was in before it rotted through three version bumps,
+    /// so it is pinned here for the same reason, not because it changed.
+    ///
+    /// `context_window` is the operator-visible one: statusline.rs resolves it
+    /// into `ctx_window_true`, and a 5x-low figure over-reports context use
+    /// (the an internal ticket shape). `output_limit` is surfaced by `csq models --json`
+    /// only — wrong rather than dangerous, but wrong by 15x on Sonnet.
+    #[test]
+    fn claude_windows_and_output_limits_match_the_models_api() {
+        let cat = ModelCatalog::default_catalog();
+        for (id, ctx, out) in [
+            ("claude-opus-4-8", 1_000_000u64, 128_000u64),
+            ("claude-sonnet-5", 1_000_000, 128_000),
+            ("claude-sonnet-4-6", 1_000_000, 128_000),
+            ("claude-haiku-4-5-20251001", 200_000, 64_000),
+        ] {
+            let m = cat
+                .find(id)
+                .unwrap_or_else(|| panic!("{id} missing from catalog"));
+            assert_eq!(m.context_window, Some(ctx), "{id} context_window");
+            assert_eq!(m.output_limit, Some(out), "{id} output_limit");
+        }
+        // The aliases the statusline and `csq models` actually reach these by.
+        assert_eq!(cat.find("sonnet").unwrap().context_window, Some(1_000_000));
+        assert_eq!(cat.find("haiku").unwrap().context_window, Some(200_000));
     }
 
     #[test]

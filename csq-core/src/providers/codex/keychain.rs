@@ -98,6 +98,13 @@ pub(crate) enum SecurityExit {
     NotFound,
     /// `security` spawn failed or exited with an unexpected status.
     Error,
+    /// Keychain access is disabled on THIS (already-built) binary via the
+    /// production env var `CSQ_DISABLE_KEYCHAIN_MIRROR` — `security` was
+    /// never invoked at all. Distinct from `NotFound` (M-R3-1): a real
+    /// `com.openai.codex` item may still exist and was simply never checked,
+    /// so reporting `NotFound`/`Ok(false)` here would tell the user "no
+    /// residue" when the honest answer is "we didn't look".
+    Disabled,
 }
 
 /// Shape guard applied to every service name before it reaches
@@ -142,6 +149,9 @@ pub(crate) fn probe_residue_with(
         SecurityExit::Found => ProbeResult::Present,
         SecurityExit::NotFound => ProbeResult::Absent,
         SecurityExit::Error => ProbeResult::ProbeFailed,
+        // M-R3-1: never silently report "absent" for a residue check that
+        // never actually ran.
+        SecurityExit::Disabled => ProbeResult::ProbeFailed,
     }
 }
 
@@ -161,15 +171,29 @@ pub(crate) fn purge_residue_with(
         SecurityExit::Found => Ok(true),
         SecurityExit::NotFound => Ok(false),
         SecurityExit::Error => Err("security delete-generic-password failed unexpectedly".into()),
+        // M-R3-1: `Ok(false)` here would tell the user "nothing existed to
+        // purge" when the honest state is "we never checked" — a real item
+        // may remain.
+        SecurityExit::Disabled => Err("keychain access disabled; residue not checked".into()),
     }
 }
 
 #[cfg(target_os = "macos")]
 fn run_security_find(service: &str) -> SecurityExit {
-    // Test/hermetic guard — never shell `security` against the operator's real
-    // login keychain from a test. NotFound = "no residue" (probe → Absent), the
-    // safe no-op. Shares the CC-mirror guard so the two `security` surfaces can't
-    // drift (partial coverage was the gate-leak this closes).
+    // M-R3-1: distinguish the PRODUCTION env-var kill-switch
+    // (`CSQ_DISABLE_KEYCHAIN_MIRROR` on an already-built binary — a real
+    // `com.openai.codex` item may still exist and was never checked, so the
+    // caller must NOT read this as "confirmed absent") from our OWN
+    // unit-test guard (`cfg!(test)`/`cfg!(feature = "test-utils")` — harmless,
+    // silent `NotFound`). No macOS test in this module calls this fn (or the
+    // production `probe_residue()`/`purge_residue()` wiring that reaches it):
+    // every macOS test drives `probe_residue_with`/`purge_residue_with` via an
+    // injected closure instead, so this ordering changes no test's observed
+    // behaviour — the `cfg!(test)` silent branch is kept as a structural
+    // safeguard in case a future test reaches this fn directly.
+    if crate::credentials::keychain::keychain_mirror_disabled_by_env() {
+        return SecurityExit::Disabled;
+    }
     if crate::credentials::keychain::keychain_mirror_disabled() {
         return SecurityExit::NotFound;
     }
@@ -178,32 +202,55 @@ fn run_security_find(service: &str) -> SecurityExit {
     // absent. We match on both the exit code AND a substring so that
     // an unusual locale setting on the user's machine doesn't cause
     // us to mis-classify "not found" as a probe failure.
-    let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", service])
-        .output();
+    //
+    // Routed through the SHARED bounded runner (security.md §6 / same-class
+    // sibling of BUG-A/BUG-3): a bare `.output()` here has no timeout path at
+    // all, so a locked/hung keychain would block a Codex login forever. Both
+    // csq keychain surfaces now share the one runner rather than each
+    // carrying its own copy of the timeout/pid-safety logic.
+    // `.map(|bo| bo.output)`: this module only inspects the exit status /
+    // stderr substring, never parses `stdout` as content, so
+    // `BoundedOutput`'s completeness flags (BUG-R3-1) are irrelevant here —
+    // unlike `credentials::keychain`'s stdout-parsing callers.
+    let out = crate::credentials::keychain::run_security_bounded(
+        &["find-generic-password", "-s", service],
+        None,
+    )
+    .map(|bo| bo.output);
     classify_security_output(out, "could not be found")
 }
 
 #[cfg(target_os = "macos")]
 fn run_security_delete(service: &str) -> SecurityExit {
+    // M-R3-1: same distinction as `run_security_find` above — see its
+    // comment for the reasoning and the no-macOS-test-depends-on-it note.
+    if crate::credentials::keychain::keychain_mirror_disabled_by_env() {
+        return SecurityExit::Disabled;
+    }
     // Test/hermetic guard — NotFound = "nothing to delete" (delete → Ok(false)).
     if crate::credentials::keychain::keychain_mirror_disabled() {
         return SecurityExit::NotFound;
     }
-    let out = std::process::Command::new("security")
-        .args(["delete-generic-password", "-s", service])
-        .output();
+    let out = crate::credentials::keychain::run_security_bounded(
+        &["delete-generic-password", "-s", service],
+        None,
+    )
+    .map(|bo| bo.output);
     classify_security_output(out, "could not be found")
 }
 
 #[cfg(target_os = "macos")]
 fn classify_security_output(
-    result: std::io::Result<std::process::Output>,
+    result: Option<std::process::Output>,
     not_found_needle: &str,
 ) -> SecurityExit {
     let out = match result {
-        Ok(o) => o,
-        Err(_) => return SecurityExit::Error,
+        Some(o) => o,
+        // Spawn failure or timeout (the shared runner's own hermetic guard
+        // also returns `None` in test mode, but `run_security_find`/
+        // `run_security_delete` already short-circuit before reaching here
+        // in that mode — this arm is the REAL spawn-failure/timeout case).
+        None => return SecurityExit::Error,
     };
     if out.status.success() {
         return SecurityExit::Found;
@@ -245,6 +292,15 @@ mod tests {
     }
 
     #[test]
+    fn probe_maps_disabled_to_probe_failed() {
+        // M-R3-1: a probe that never actually ran (keychain access disabled
+        // via the production env kill-switch) must NEVER read as "absent" —
+        // it maps to ProbeFailed, same as a genuine spawn error.
+        let r = probe_residue_with("com.test.fixture", |_| SecurityExit::Disabled);
+        assert_eq!(r, ProbeResult::ProbeFailed);
+    }
+
+    #[test]
     fn purge_reports_true_on_found() {
         let deleted = purge_residue_with("com.test.fixture", |_| SecurityExit::Found).unwrap();
         assert!(deleted, "Found exit means an entry was deleted");
@@ -260,6 +316,15 @@ mod tests {
     fn purge_propagates_error_variant() {
         let e = purge_residue_with("com.test.fixture", |_| SecurityExit::Error).unwrap_err();
         assert!(e.contains("failed"), "error should name the failure: {e}");
+    }
+
+    #[test]
+    fn purge_maps_disabled_to_err() {
+        // M-R3-1: a purge that never actually ran must NEVER report
+        // `Ok(false)` ("nothing existed to purge") — a real item may
+        // remain, simply unchecked.
+        let e = purge_residue_with("com.test.fixture", |_| SecurityExit::Disabled).unwrap_err();
+        assert!(e.contains("disabled"), "error should name the reason: {e}");
     }
 
     #[test]

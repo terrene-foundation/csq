@@ -45,7 +45,7 @@
 //! - Token exchange goes over TLS to `oauth2.googleapis.com`.
 //! - `oauth_creds.json` is written via `atomic_replace` + chmod 0600.
 
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -714,19 +714,15 @@ fn write_oauth_creds(creds: &OauthCreds) -> Result<(), OauthFlowError> {
         path: path.clone(),
         reason: format!("serialize: {e}"),
     })?;
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate `std::fs::write` + `secure_file` pair
+    // would leave open for this OAuth-credential-bearing tmp file.
     let tmp = unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+    if let Err(e) = write_new_private(&tmp, json.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(OauthFlowError::WriteFailed {
             path: tmp,
             reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(OauthFlowError::WriteFailed {
-            path: tmp,
-            reason: format!("secure_file: {e}"),
         });
     }
     if let Err(e) = atomic_replace(&tmp, &path) {

@@ -73,9 +73,9 @@ pub enum LinuxFlavor {
 ///
 /// Scanned settings.json locations:
 ///
-/// 1. `claude_home/settings.json` — the global CC settings csq
+/// 1. `<claude_home>/settings.json` — the global CC settings csq
 ///    already patches (statusLine).
-/// 2. `cwd/.claude/settings.json` — the project-local settings that
+/// 2. `<cwd>/.claude/settings.json` — the project-local settings that
 ///    Claude Code picks up when invoked from inside a repo.
 ///
 /// `cwd` can be the current process cwd; callers in install/run pass
@@ -340,11 +340,87 @@ fn find_broken_relative_requires(script_path: &Path) -> Vec<EnvIssue> {
     issues
 }
 
+/// Strips `//` line comments and `/* … */` block comments, leaving string
+/// literals intact.
+///
+/// WHY THIS EXISTS. The scan below was a raw substring search, so a
+/// `require("./…")` written inside a COMMENT was treated as a real require.
+/// That is not a rare shape — it is how a hook documents a re-derivation
+/// command to its operator. Measured 2026-09-20: a COC hook whose ONLY
+/// `require("./…")` in a comment was a JSDoc example had csq print
+/// "hook require fails … sibling modules missing" on every launch, while the
+/// hook loaded cleanly (`node --check` rc=0) and all three of its actual
+/// requires resolved on disk. A detector that cries wolf on correct code is
+/// one operators learn to ignore — `tooling-self-verification.md` Rule 5.
+///
+/// Strings are deliberately NOT stripped: the path under test lives inside
+/// one. Comments only. Regex literals are not modelled — a `/*` inside a
+/// regex would still mislead — but that shape does not occur here and
+/// guessing at it would cost more than it buys.
+fn strip_js_comments(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            // Line comment: drop to end of line, keep the newline so tokens
+            // either side cannot be glued together.
+            '/' if next == Some('/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // Block comment: drop through the closing `*/`. A replacement
+            // space keeps separation and makes the removal visible in a diff.
+            '/' if next == Some('*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(chars.len());
+                out.push(' ');
+            }
+            // A string literal is copied verbatim, escapes included, so a
+            // `//` or `/*` inside a path cannot be mistaken for a comment.
+            '"' | '\'' | '`' => {
+                let quote = c;
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    let d = chars[i];
+                    out.push(d);
+                    if d == '\\' {
+                        if let Some(&escaped) = chars.get(i + 1) {
+                            out.push(escaped);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    if d == quote {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Returns every `./relative` string appearing inside a `require(...)`
-/// call. Uses a plain substring scan — scope is intentionally narrow
-/// so a single `require("./lib/x")` is picked up whether quoted with
-/// single or double quotes.
+/// call **in executable position**. Uses a plain substring scan over a
+/// comment-stripped copy — scope is intentionally narrow so a single
+/// `require("./lib/x")` is picked up whether quoted with single or double
+/// quotes, while a require written in prose stays out of it.
 fn extract_relative_requires(source: &str) -> Vec<String> {
+    let stripped = strip_js_comments(source);
+    let source: &str = &stripped;
     let mut out = Vec::new();
     for quote in ['"', '\''] {
         let pat_a = format!("require({quote}./");
@@ -538,6 +614,83 @@ mod tests {
                 if missing_sibling.ends_with("lib/learning-utils")
             )),
             "expected HookRelativeRequireMissing, got: {issues:?}"
+        );
+    }
+
+    /// A `require("./…")` written in a COMMENT is documentation, not a
+    /// module load. The scanner used to flag it, so a hook that documents a
+    /// re-derivation command to its operator — the shape `instrument-discipline.md`
+    /// MUST-6 actively asks for — reported "hook require fails" on every launch
+    /// while loading cleanly. Measured 2026-09-20 against a real COC hook.
+    ///
+    /// The second half is the control: the SAME string in executable position
+    /// must still be reported, or this test would go green on a scanner that
+    /// simply stopped looking.
+    #[test]
+    fn comment_only_require_is_not_a_broken_sibling() {
+        let claude_home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+
+        let hook = proj.path().join("scripts/hooks/documented.js");
+        write(
+            &hook,
+            r#"
+            /**
+             * Re-derive by running:
+             *   node -e 'const m=require("./.claude/test-harness/eval-manifest.json")'
+             *   // and a line-comment form: require("./lib/also-not-real")
+             */
+            const real = require("./lib/real.js");
+            module.exports = real;
+            "#,
+        );
+        write(&proj.path().join("scripts/hooks/lib/real.js"), "");
+
+        let settings = proj.path().join(".claude/settings.json");
+        write(
+            &settings,
+            r#"{
+                "hooks": {
+                    "SessionStart": [
+                        { "hooks": [
+                            {"type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/documented.js\""}
+                        ] }
+                    ]
+                }
+            }"#,
+        );
+
+        let issues = run_preflight(claude_home.path(), proj.path());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| matches!(i, EnvIssue::HookRelativeRequireMissing { .. })),
+            "a require inside a comment must NOT be reported, got: {issues:?}"
+        );
+
+        // CONTROL — same string, executable position. Must still fire.
+        let live = proj.path().join("scripts/hooks/live.js");
+        write(&live, "const x = require(\"./lib/absent-sibling.js\");\n");
+        write(
+            &settings,
+            r#"{
+                "hooks": {
+                    "SessionStart": [
+                        { "hooks": [
+                            {"type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/live.js\""}
+                        ] }
+                    ]
+                }
+            }"#,
+        );
+        let issues = run_preflight(claude_home.path(), proj.path());
+        assert!(
+            issues.iter().any(|i| matches!(
+                i,
+                EnvIssue::HookRelativeRequireMissing { missing_sibling, .. }
+                if missing_sibling.ends_with("lib/absent-sibling.js")
+            )),
+            "a require in CODE must still be reported, got: {issues:?}"
         );
     }
 

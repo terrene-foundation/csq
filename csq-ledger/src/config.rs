@@ -4,6 +4,7 @@
 //! from `CSQ_LEDGER_SIGNING_KEY_PATH` (see [`crate::signing`]); everything else
 //! is a flag with an env fallback for container deployment.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -32,10 +33,16 @@ pub struct Config {
     #[arg(long, env = "CSQ_LEDGER_PORT", default_value_t = 8080)]
     pub port: u16,
 
-    /// Bind address. Defaults to all interfaces (operator fronts this with a
-    /// reverse proxy / firewall per the no-authn-in-M10 scope).
-    #[arg(long, env = "CSQ_LEDGER_BIND", default_value = "0.0.0.0")]
-    pub bind: String,
+    /// Literal IP address for the read/write listener (no hostnames).
+    /// Non-loopback addresses require --allow-public-bind.
+    #[arg(long, env = "CSQ_LEDGER_BIND", default_value = "127.0.0.1")]
+    pub bind: IpAddr,
+
+    /// Acknowledge non-loopback exposure of either listener, including private
+    /// and wildcard addresses. No authentication is added: operators MUST keep
+    /// both listeners inside a trusted network, never on the public internet.
+    #[arg(long, env = "CSQ_LEDGER_ALLOW_PUBLIC_BIND")]
+    pub allow_public_bind: bool,
 
     /// External sink to anchor checkpoints to (Strengthening 1). One of the
     /// M07 sink names: `rekor`, `s3`, `azure`, `gcp`, or another csq-ledger
@@ -58,28 +65,41 @@ pub struct Config {
     #[arg(long, env = "CSQ_LEDGER_AUTHORITY_PORT", default_value_t = 8081)]
     pub authority_port: u16,
 
-    /// Bind address for the AUTHORITY listener. Defaults to `127.0.0.1`
-    /// (loopback-only) — unlike `--bind`'s all-interfaces default, reaching
-    /// revoke/verifier-bootstrap from beyond the local host requires an
-    /// explicit operator opt-in, so the internal-only posture is the DEFAULT
-    /// rather than a deployment note the operator must remember to apply.
+    /// Literal IP address for the AUTHORITY listener (no hostnames).
+    /// Non-loopback addresses require --allow-public-bind.
     #[arg(long, env = "CSQ_LEDGER_AUTHORITY_BIND", default_value = "127.0.0.1")]
-    pub authority_bind: String,
+    pub authority_bind: IpAddr,
 }
 
 impl Config {
-    /// The socket address string (`bind:port`) to bind the read/write axum
-    /// server to.
-    #[must_use]
-    pub fn socket_addr(&self) -> String {
-        format!("{}:{}", self.bind, self.port)
+    /// Reject non-loopback exposure BEFORE creating files or starting tasks.
+    /// Validate the same typed IPs passed to bind: no DNS re-resolution/TOCTOU.
+    pub fn validate_bind_posture(&self) -> Result<(), String> {
+        for (flag, addr) in [
+            ("--bind", self.bind),
+            ("--authority-bind", self.authority_bind),
+        ] {
+            if !addr.is_loopback() && !self.allow_public_bind {
+                return Err(format!(
+                    "{flag} {addr} is non-loopback; --allow-public-bind (or \
+                     CSQ_LEDGER_ALLOW_PUBLIC_BIND=true) is required; keep both \
+                     unauthenticated listeners inside a trusted network"
+                ));
+            }
+        }
+        Ok(())
     }
 
-    /// The socket address string (`authority_bind:authority_port`) to bind
-    /// the AUTHORITY axum server to.
+    /// Exact read/write socket address; accepts IPv4 and IPv6, never DNS.
     #[must_use]
-    pub fn authority_socket_addr(&self) -> String {
-        format!("{}:{}", self.authority_bind, self.authority_port)
+    pub fn socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind, self.port)
+    }
+
+    /// Exact AUTHORITY socket address; accepts IPv4 and IPv6, never DNS.
+    #[must_use]
+    pub fn authority_socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.authority_bind, self.authority_port)
     }
 }
 
@@ -92,12 +112,15 @@ mod tests {
     fn config_parses_minimal_args_with_defaults() {
         let cfg = Config::try_parse_from(["csq-ledger", "--data-dir", "/tmp/x"]).unwrap();
         assert_eq!(cfg.port, 8080);
-        assert_eq!(cfg.bind, "0.0.0.0");
+        assert_eq!(cfg.bind.to_string(), "127.0.0.1");
+        assert!(!cfg.allow_public_bind);
+        assert!(cfg.validate_bind_posture().is_ok());
         assert_eq!(cfg.anchor_cadence, DEFAULT_ANCHOR_CADENCE_SECS);
         assert!(cfg.anchor_to_sink.is_none());
         assert_eq!(cfg.authority_port, 8081);
         assert_eq!(
-            cfg.authority_bind, "127.0.0.1",
+            cfg.authority_bind.to_string(),
+            "127.0.0.1",
             "the authority listener defaults to loopback-only (H3): internal-only \
              is the out-of-box posture, not a deployment note"
         );
@@ -116,7 +139,7 @@ mod tests {
             "10.0.0.5",
         ])
         .unwrap();
-        assert_eq!(cfg.authority_socket_addr(), "10.0.0.5:9091");
+        assert_eq!(cfg.authority_socket_addr().to_string(), "10.0.0.5:9091");
     }
 
     /// `test config_parses_anchor_to_sink_and_cadence`
@@ -149,6 +172,26 @@ mod tests {
             "127.0.0.1",
         ])
         .unwrap();
-        assert_eq!(cfg.socket_addr(), "127.0.0.1:9090");
+        assert_eq!(cfg.socket_addr().to_string(), "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn explicit_acknowledgement_accepts_non_loopback_on_both_typed_addresses() {
+        for ip in ["0.0.0.0", "10.0.0.5", "8.8.8.8", "::", "fc00::1"] {
+            let addr: IpAddr = ip.parse().unwrap();
+            let cfg = Config {
+                data_dir: PathBuf::new(),
+                port: 0,
+                bind: addr,
+                allow_public_bind: true,
+                anchor_to_sink: None,
+                anchor_cadence: DEFAULT_ANCHOR_CADENCE_SECS,
+                authority_port: 0,
+                authority_bind: addr,
+            };
+            assert!(cfg.validate_bind_posture().is_ok(), "{ip}");
+            assert_eq!(cfg.socket_addr().ip(), addr);
+            assert_eq!(cfg.authority_socket_addr().ip(), addr);
+        }
     }
 }

@@ -1,0 +1,34 @@
+{
+  "toolchains": ["cargo", "rustc", "npm", "npx", "vitest"],
+  "read_only_flags": ["--version", "-V", "--help", "-h"],
+  "load_instruments": [
+    "uptime",
+    "top",
+    "vm_stat",
+    "sysctl",
+    "cat /proc/loadavg"
+  ],
+  "$why": [
+    "THE LIST IS THIS REPO'S OWN FACT, not a fleet default: the engine refuses (exit 2)",
+    "rather than guess, so an undeclared toolchain is silently unguarded.",
+    "",
+    "cargo/rustc: the workspace's primary long jobs (build, test, clippy, nextest) —",
+    "minutes, dependency-heavy, the workload offload exists for.",
+    "npm/npx/vitest: the csq/ui Svelte suite (vitest + svelte-check).",
+    "",
+    "DELIBERATELY NOT DECLARED, each for the same reason — the guard's cost is",
+    "attention, and a guard that reds on trivial invocations gets uninstalled",
+    "(runbook § 'The false-positive corpus is the whole risk'):",
+    "  python3 / node — routinely invoked here as one-line gates and --check syntax",
+    "    probes (score()s of these run per session, nearly all sub-second). Declaring",
+    "    them would put an advisory on almost every tool call.",
+    "  If a specific long python3/node job recurs, wrap THAT call in `trestle run --`",
+    "    by hand rather than declaring the interpreter repo-wide.",
+    "",
+    "KNOWN BOUNDARY, documented rather than hidden: read_only_flags applies to the flag",
+    "in the program's OWN argument slot, so `cargo --version` is clean but",
+    "`cargo build --help` is a finding. That is the engine's semantics, not a csq",
+    "widening candidate; do not silence the hook over it (rules/offload-discipline.md",
+    "MUST NOT 2)."
+  ]
+}

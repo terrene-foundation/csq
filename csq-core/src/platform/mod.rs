@@ -10,6 +10,7 @@ pub mod fs;
 pub mod fs_symlink_unix;
 #[cfg(windows)]
 pub mod fs_symlink_windows;
+pub mod home;
 pub mod lock;
 pub mod process;
 pub mod secret;

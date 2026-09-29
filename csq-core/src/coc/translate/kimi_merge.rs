@@ -15,7 +15,7 @@
 //!   ownership marker (`csq_managed_hook_commands` /
 //!   `csq_managed_permission_patterns`, nested under the vendor's own
 //!   `[raw]` passthrough table — see
-//!   [`CSQ_MANAGED_HOOK_COMMANDS_KEY`]/[`CSQ_MANAGED_PERMISSION_PATTERNS_KEY`]
+//!   `CSQ_MANAGED_HOOK_COMMANDS_KEY`/`CSQ_MANAGED_PERMISSION_PATTERNS_KEY`
 //!   for why the marker can't live inside the entry itself). On every
 //!   call: entries NOT in the marker (hand-authored by the user, or
 //!   pre-dating csq's first write) survive untouched; entries THAT ARE in
@@ -36,7 +36,7 @@
 //!   matchers with `new RegExp(...)` and swallows a malformed pattern into
 //!   "matches nothing" (report 13 §4.3), so a Rust-invalid pattern would
 //!   otherwise silently ship a hook that never fires. (2) A JS-dialect
-//!   compatibility check ([`is_js_regex_compatible`]) — a pattern can be
+//!   compatibility check (`is_js_regex_compatible`) — a pattern can be
 //!   VALID Rust regex yet compile to a DIFFERENT matcher under Kimi's JS
 //!   non-unicode `RegExp` (Unicode property escapes `\p{L}`/`\P{...}` and
 //!   POSIX bracket expressions `[:alpha:]` are both silently
@@ -245,12 +245,12 @@ fn set_raw_marker(table: &mut toml::value::Table, key: &str, value: toml::Value)
 ///   `CodexSpawnPayload::config_toml_overlay`).
 /// * `permission_rules` — `[[permission.rules]]` entries THIS call
 ///   contributes. Replaces only the entries csq itself previously wrote
-///   (tracked via [`CSQ_MANAGED_PERMISSION_PATTERNS_KEY`]); user-authored
+///   (tracked via `CSQ_MANAGED_PERMISSION_PATTERNS_KEY`); user-authored
 ///   entries always survive. Empty ⇒ retract every csq-owned entry while
 ///   still preserving user-authored ones and the rest of `[permission]`.
 /// * `hooks` — `[[hooks]]` entries THIS call contributes. Same
 ///   replace-mine-preserve-theirs semantics as `permission_rules`, tracked
-///   via [`CSQ_MANAGED_HOOK_COMMANDS_KEY`].
+///   via `CSQ_MANAGED_HOOK_COMMANDS_KEY`.
 pub fn merge_kimi_config_via_toml_value(
     canonical: &str,
     config_toml_overlay: &BTreeMap<String, String>,

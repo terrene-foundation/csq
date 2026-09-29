@@ -37,7 +37,7 @@
 //!
 //! CLI flags WIN. The per-invocation CLI flag is the highest-priority
 //! signal; persisted settings provide the durable default. The CLI
-//! integration in `csq-cli/src/commands/run.rs` reads these settings
+//! integration in `csq/src/cli/commands/run.rs` reads these settings
 //! at startup and OR's them with any explicit `--no-*` flag, so the
 //! CLI flag can disable a technique even if the persisted setting
 //! says enabled.

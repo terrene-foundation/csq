@@ -152,6 +152,39 @@ const RECOGNISED_SINK_NAMES: &[&str] = &[
     "customer-body-store",
 ];
 
+/// Sink kinds whose current `LedgerSink` implementation is an IN-MEMORY MOCK
+/// substrate: `append`/`verify_at` round-trip through a `Mutex<HashMap<..>>`
+/// (or, for `rekor`, an in-process mock backend) that dies with the daemon
+/// process. NOTHING leaves the host. `append` still returns `Ok(SinkReceipt)`
+/// unconditionally (the trait contract requires a receipt to prove the
+/// round-trip works in CI), a signed `ReplicationAck` still lands in the
+/// chain, and `csq doctor` still renders a fresh `last_anchor_ts` — every
+/// signal an operator has says the record is durably anchored in
+/// WORM/compliance storage. It is not.
+///
+/// `csq-ledger` and `customer-body-store` are the two REAL sinks: both are
+/// `reqwest`-backed and actually leave the process (a csq-ledger server, or
+/// the operator's own named endpoint, respectively).
+///
+/// Single source of truth for the mock-vs-real distinction — used by
+/// [`SinkDoctorSnapshot::load`]'s `mock_backend` field AND by the
+/// `anchor_sink_mock_backend` WARN emitted at resolve-time
+/// (`csq/src/cli/commands/daemon.rs::resolve_anchor_sink` and its desktop
+/// mirror). Keep this list and those two call sites in sync — a sink added
+/// here without the matching WARN (or vice versa) reintroduces the "fails in
+/// the reassuring direction" class this const exists to name.
+const MOCK_BACKED_SINK_NAMES: &[&str] = &["rekor", "s3", "azure", "gcp", "azure-sql"];
+
+/// Returns `true` when `sink_name`'s current implementation is an in-memory
+/// mock substrate (see `MOCK_BACKED_SINK_NAMES`). `"none"` and any
+/// unrecognised name are `false` — `"none"` has no sink to be mock-backed,
+/// and an unrecognised name never resolves to any `LedgerSink` at all
+/// (`resolve_anchor_sink`'s catch-all).
+#[must_use]
+pub fn is_mock_backed_sink(sink_name: &str) -> bool {
+    MOCK_BACKED_SINK_NAMES.contains(&sink_name)
+}
+
 impl AuditSinkConfig {
     /// Returns the path of the sink config file under `base_dir`.
     pub fn path(base_dir: &Path) -> std::path::PathBuf {
@@ -360,6 +393,13 @@ pub struct SinkDoctorSnapshot {
     pub pending_count: u64,
     /// Count of drift events detected since last reset.
     pub replication_drift_count: u64,
+    /// `true` when `active_sink`'s current implementation is an in-memory
+    /// mock substrate (see [`is_mock_backed_sink`]) — nothing has actually
+    /// left the process, regardless of what `last_anchor_ts` or
+    /// `pending_count` above suggest. `csq doctor` MUST surface this
+    /// alongside the sink status; a clean `last_anchor_ts` with
+    /// `mock_backend: true` is NOT a durable compliance attestation.
+    pub mock_backend: bool,
 }
 
 impl SinkDoctorSnapshot {
@@ -375,6 +415,7 @@ impl SinkDoctorSnapshot {
             last_anchor_ts,
             pending_count,
             replication_drift_count,
+            mock_backend: is_mock_backed_sink(active_sink),
         }
     }
 }
@@ -577,5 +618,62 @@ mod tests {
             cfg.set_sink("azure-sql")
                 .expect("azure-sql-sink compiled in, must succeed");
         }
+    }
+
+    // ── mock-backend honesty (orchestrator security-review finding) ────────
+    //
+    // Reviewed finding: `s3`/`azure`/`gcp`/`azure-sql` (and `rekor`, already
+    // labelled) are IN-MEMORY MOCK `LedgerSink` implementations that report
+    // `append` success unconditionally — nothing leaves the process, yet
+    // `csq doctor` renders a clean `last_anchor_ts` with no distinguishing
+    // signal. `is_mock_backed_sink` + `SinkDoctorSnapshot::mock_backend` are
+    // the fix: a single source of truth an operator-facing surface can read.
+
+    /// Every mock-backed kind reports `true`; both real (`reqwest`-backed)
+    /// kinds and `"none"` report `false`. This enumerates the CURRENT state
+    /// of the catalog — if a mock sink is ever hardened to a real transport,
+    /// this test's failure is the reminder to move it out of
+    /// `MOCK_BACKED_SINK_NAMES`.
+    #[test]
+    fn is_mock_backed_sink_matches_the_current_catalog_state() {
+        for mock_kind in ["rekor", "s3", "azure", "gcp", "azure-sql"] {
+            assert!(
+                is_mock_backed_sink(mock_kind),
+                "{mock_kind} is currently a mock LedgerSink and must report true"
+            );
+        }
+        for real_kind in ["csq-ledger", "customer-body-store", "none", "unknown-xyz"] {
+            assert!(
+                !is_mock_backed_sink(real_kind),
+                "{real_kind} must not be reported as mock-backed"
+            );
+        }
+    }
+
+    /// `SinkDoctorSnapshot::load` MUST populate `mock_backend` from the SAME
+    /// predicate `resolve_anchor_sink` and its desktop mirror consult before
+    /// emitting `anchor_sink_mock_backend` — a doctor snapshot claiming
+    /// `mock_backend: false` for a mock-backed sink is exactly the
+    /// "reassuring failure" this fix exists to close.
+    #[test]
+    fn sink_doctor_snapshot_load_reports_mock_backend_honestly() {
+        let dir = temp_dir();
+        let base = dir.path();
+
+        let mock_snap = SinkDoctorSnapshot::load(base, "s3");
+        assert!(
+            mock_snap.mock_backend,
+            "s3 is mock-backed; snapshot must say so"
+        );
+
+        let real_snap = SinkDoctorSnapshot::load(base, "customer-body-store");
+        assert!(
+            !real_snap.mock_backend,
+            "customer-body-store is a real reqwest-backed sink; \
+             snapshot must not report it as mock-backed"
+        );
+
+        let none_snap = SinkDoctorSnapshot::load(base, "none");
+        assert!(!none_snap.mock_backend, "\"none\" has no sink to be mock");
     }
 }

@@ -632,13 +632,17 @@ mod tests {
         let lock_sha = test_lock_sha();
         std::fs::create_dir_all(cache_dir(root.path())).unwrap();
         let path = cache_file(root.path(), &lock_sha);
-        // Create a FIFO at the cache file path.
-        // `mknod` is the POSIX way; use `std::process::Command` for portability.
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .expect("mkfifo");
-        assert!(status.success(), "mkfifo failed");
+        // Create a FIFO at the cache file path with the syscall directly.
+        // Spawning the `mkfifo` program resolved it through PATH, which
+        // sibling tests mutate under the shared env lock this test does not
+        // hold — so it intermittently failed with NotFound (an internal ticket CI).
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `c_path` is a valid NUL-terminated path for this call.
+            let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+            assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        }
 
         // O_NOFOLLOW does not block FIFO opens on all platforms; the
         // is_file() check is the load-bearing guard here.

@@ -16,6 +16,13 @@ pub struct QuotaFile {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub accounts: HashMap<String, AccountQuota>,
+    /// Per-slot poller health, keyed identically to `accounts` (decimal
+    /// slot id as a string). Absent on any file written before this field
+    /// existed — `#[serde(default)]` makes that indistinguishable from
+    /// "no health recorded yet" rather than a parse failure, so a v2 file
+    /// with no `poller_health` object round-trips cleanly.
+    #[serde(default)]
+    pub poller_health: HashMap<String, PollerHealth>,
 }
 
 fn default_schema_version() -> u32 {
@@ -27,6 +34,7 @@ impl QuotaFile {
         Self {
             schema_version: 1,
             accounts: HashMap::new(),
+            poller_health: HashMap::new(),
         }
     }
 
@@ -38,6 +46,17 @@ impl QuotaFile {
     /// Sets quota for an account.
     pub fn set(&mut self, account: u16, quota: AccountQuota) {
         self.accounts.insert(account.to_string(), quota);
+    }
+
+    /// Gets the poller health record for a slot, or `None` if never
+    /// recorded.
+    pub fn get_health(&self, account: u16) -> Option<&PollerHealth> {
+        self.poller_health.get(&account.to_string())
+    }
+
+    /// Sets the poller health record for a slot.
+    pub fn set_health(&mut self, account: u16, health: PollerHealth) {
+        self.poller_health.insert(account.to_string(), health);
     }
 }
 
@@ -356,6 +375,96 @@ impl RateLimitData {
 pub struct UsageWindow {
     pub used_percentage: f64,
     pub resets_at: u64,
+}
+
+/// Typed outcome of a single per-slot poller attempt.
+///
+/// Persisted alongside the quota row so an operator surface (`csq doctor`,
+/// `csq probe`) can answer "why did this slot stop updating" without
+/// re-deriving it from `updated_at` age (`account-terminal-separation.md` /
+/// `diagnostic-surface-parity.md`: the diagnostic reads what the daemon
+/// itself recorded, not a guess). `snake_case` on the wire so a hand-read
+/// `quota.json` matches the variant names below verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollOutcome {
+    /// The poll succeeded and a fresh quota row was written in the same
+    /// [`QuotaFile`] save.
+    Ok,
+    /// The upstream endpoint returned 401 — the stored access token was
+    /// rejected.
+    Unauthorized,
+    /// The upstream endpoint returned 429.
+    RateLimited,
+    /// A non-200, non-429, non-401 HTTP status (`PollError::HttpError`) —
+    /// the request reached the server and the server answered, just not
+    /// with a status this poller treats as success.
+    ServerError,
+    /// A connect/DNS/socket-level transport failure (`PollError::Transport`),
+    /// or a pre-flight URL/token rejection (`PollError::BadUrl`) — bucketed
+    /// together because both mean the request never produced a server
+    /// response at all (one fails before the socket opens, the other after
+    /// it would have, but neither is the server "answering").
+    Transport,
+    /// The response body could not be parsed as the expected JSON shape
+    /// (`PollError::Parse`).
+    Parse,
+    /// The blocking HTTP call did not return within `CALL_TIMEOUT`.
+    Timeout,
+    /// The blocking poll task panicked.
+    Panic,
+    /// The slot was not polled this tick because it is still inside a
+    /// previously-set cooldown window. Not itself a new failure — see
+    /// [`PollerHealth::consecutive_failures`]'s doc for why this outcome
+    /// does not increment that counter.
+    SkippedCooldown,
+    /// The slot was not polled this tick because no readable credential
+    /// file exists for it (load failure, or no identity/legacy file at
+    /// all).
+    SkippedNoCredentials,
+}
+
+/// Per-slot poller health, written by the SAME [`QuotaFile`] save as the
+/// slot's [`AccountQuota`] row (never a separate file or a separate lock
+/// acquisition) so the two can never observe each other as stale.
+///
+/// Slot-id provenance: callers MUST source the key this is stored under
+/// from the poller's own per-slot loop state — channel (a) under
+/// `account-terminal-separation.md` MUST Rule 1. Never from a marker,
+/// `CLAUDE_CONFIG_DIR`, or a terminal-scoped JSON blob.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PollerHealth {
+    /// Epoch seconds of the most recent poll ATTEMPT (successful or not;
+    /// a skip still counts as an attempt to observe the slot this tick).
+    pub last_attempt_at: f64,
+    /// The outcome of that attempt.
+    pub last_outcome: PollOutcome,
+    /// Count of consecutive non-[`PollOutcome::Ok`] outcomes that
+    /// represent an actual failed poll — i.e. every variant except `Ok`
+    /// AND except `SkippedCooldown`. A `SkippedCooldown` tick re-observes
+    /// the SAME still-cooling-down failure rather than a new one, so it
+    /// carries the counter forward unchanged; incrementing it on every
+    /// skip would inflate this number once per tick for the entire
+    /// cooldown window (up to 8x `FAILURE_COOLDOWN`) without a single new
+    /// attempt against upstream. Resets to 0 on `Ok`.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Epoch seconds after which the in-memory cooldown for this slot
+    /// expires, when the last outcome put the slot into backoff. `None`
+    /// when the slot is not currently cooling down (e.g. after `Ok`, or
+    /// after `SkippedNoCredentials`, which sets no cooldown of its own —
+    /// the daemon simply retries next tick since there is nothing to wait
+    /// out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<f64>,
+    /// Earliest epoch seconds at which the poller will attempt this slot
+    /// again. Currently always equal to `cooldown_until` when set — the
+    /// poller has no scheduler concept finer than "cooldown expired, try
+    /// on the next regular tick" — kept as a distinct field so a future
+    /// scheduler (e.g. jittered retry) can diverge from the raw cooldown
+    /// deadline without a schema change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<f64>,
 }
 
 #[cfg(test)]
@@ -745,6 +854,7 @@ mod tests {
         let mut original = QuotaFile {
             schema_version: 2,
             accounts: std::collections::HashMap::new(),
+            poller_health: std::collections::HashMap::new(),
         };
         original.set(
             1,

@@ -378,7 +378,7 @@ On a mid-session subsystem exit (the `SessionStop::SubsystemExited` path, § 4.3
 - `specs/01-cc-credential-architecture.md` — CC's `saveOAuthTokensIfNeeded` write path; the daemon refresher mirrors its subscription-preservation behavior.
 - `specs/02-csq-handle-dir-model.md` — handle dir sweep invariants.
 - `specs/05-quota-polling-contracts.md` — usage poller endpoint contracts.
-- `specs/07-codex-auth.md` — per-surface credential write narrative (Codex).
+- `specs/07-provider-surface-dispatch.md` §7.2.2 — per-surface credential write narrative (Codex).
 - `specs/12-audit-trail.md` — full prose contract for `POST /api/audit/record` + §4.2.8 sweep / drain semantics; retention policy; the hash-chained ledger format verified in §4.2.10.
 
 ## Revisions

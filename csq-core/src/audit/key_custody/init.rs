@@ -195,7 +195,7 @@ where
 ///
 /// - `Ok(true)` — key was generated and stored.
 /// - `Ok(false)` — key already present; no-op.
-/// - `Err(...)` — generation, keychain write, or `eatp-runs/chain.json` write failed.
+/// - `Err(...)` — generation, keychain write, or `<base_dir>/eatp-runs/chain.json` write failed.
 pub fn eatp_audit_init(base_dir: &std::path::Path, service: &str) -> Result<bool, KeyCustodyError> {
     eatp_audit_init_inner(base_dir, service, |state, base| {
         state.save_in(base, EATP_RUNS_SUBDIR)
@@ -245,7 +245,7 @@ where
 
     let mut state = ChainState::load_in(base_dir, EATP_RUNS_SUBDIR)?;
 
-    // H-1: derive the keychain account from the EATP chain_id. If `eatp-runs/chain.json`
+    // H-1: derive the keychain account from the EATP chain_id. If `<base_dir>/eatp-runs/chain.json`
     // does not yet exist, initialise it via the canonical persist-layer helper
     // (already serialized by the chain-lock above).
     let account = if state.chain_id.is_empty() {

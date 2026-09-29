@@ -1,0 +1,37 @@
+name: DIAG windows doctest link (temporary, do not merge)
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          rustup default 1.94.1
+      - name: Env of interest
+        shell: pwsh
+        run: |
+          Get-ChildItem env: | Where-Object { $_.Name -match 'VCRUNTIME|RUSTFLAGS|CARGO|TAURI|LIB$' } | Format-Table -AutoSize | Out-String -Width 400
+      - name: (A) csq-core doctests alone
+        shell: pwsh
+        continue-on-error: true
+        run: cargo test -p csq-core --doc --features test-utils -- redact_path init_mock_keyring
+      - name: (C) what the csq build script emitted
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo build -p csq --features csq/test-utils,csq-core/test-utils
+          Get-ChildItem target\debug\build -Directory -Filter 'csq-*' | ForEach-Object {
+            "== $($_.FullName)"
+            if (Test-Path "$($_.FullName)\output") { Get-Content "$($_.FullName)\output" }
+            if (Test-Path "$($_.FullName)\out") { Get-ChildItem "$($_.FullName)\out" -Filter *.lib | Select-Object Name,Length }
+          }
+      - name: (B) workspace doctests (the failing command's doc half)
+        shell: pwsh
+        continue-on-error: true
+        run: cargo test --workspace --doc --features csq/test-utils,csq-core/test-utils -- redact_path init_mock_keyring

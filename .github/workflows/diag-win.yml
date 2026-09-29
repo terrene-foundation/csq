@@ -17,21 +17,12 @@ jobs:
         shell: pwsh
         run: |
           Get-ChildItem env: | Where-Object { $_.Name -match 'VCRUNTIME|RUSTFLAGS|CARGO|TAURI|LIB$' } | Format-Table -AutoSize | Out-String -Width 400
-      - name: (A) csq-core doctests alone
+      - name: (D) full test build first (what the failing job does)
         shell: pwsh
         continue-on-error: true
-        run: cargo test -p csq-core --doc --features test-utils -- redact_path init_mock_keyring
-      - name: (C) what the csq build script emitted
+        run: cargo test --workspace --no-run --features csq/test-utils,csq-core/test-utils
+      - name: (E) doctests after the full build, verbose (see rustdoc -L flags)
         shell: pwsh
         continue-on-error: true
         run: |
-          cargo build -p csq --features csq/test-utils,csq-core/test-utils
-          Get-ChildItem target\debug\build -Directory -Filter 'csq-*' | ForEach-Object {
-            "== $($_.FullName)"
-            if (Test-Path "$($_.FullName)\output") { Get-Content "$($_.FullName)\output" }
-            if (Test-Path "$($_.FullName)\out") { Get-ChildItem "$($_.FullName)\out" -Filter *.lib | Select-Object Name,Length }
-          }
-      - name: (B) workspace doctests (the failing command's doc half)
-        shell: pwsh
-        continue-on-error: true
-        run: cargo test --workspace --doc --features csq/test-utils,csq-core/test-utils -- redact_path init_mock_keyring
+          cargo test --workspace --doc -v --features csq/test-utils,csq-core/test-utils -- redact_path 2>&1 | Select-String -Pattern "Running .*rustdoc.*csq_core|test result|FAILED|LNK|csq-[0-9a-f]+\\out" | ForEach-Object { $_.Line.Substring(0, [Math]::Min(3000, $_.Line.Length)) }

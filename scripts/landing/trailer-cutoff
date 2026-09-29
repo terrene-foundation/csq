@@ -1,6 +1,0 @@
-e124d6ecb651438bde6abadd723a3be51a851d43
-# ^ Commits that are ancestors of this commit predate the landing-trailer rule
-# and are exempt from scripts/landing/check-trailers.sh. Every commit after it
-# must carry Landed-From or Landed-Partial. This line is set ONCE, when the rule
-# was introduced (2026-09-28, dev head e124d6ec); never move it forward to make a
-# refusal go away — add the trailer instead.

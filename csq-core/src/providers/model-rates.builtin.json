@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "2026-09-14.builtin",
+  "revision": "2026-09-29.builtin",
   "models": [
     {
       "id": "claude-opus-4-8",
@@ -9,6 +9,14 @@
       "context_window": 1000000,
       "output_limit": 128000,
       "aliases": ["opus", "opus-4-8", "opus-4-7"]
+    },
+    {
+      "id": "claude-opus-5-5",
+      "name": "Claude Opus 5.5",
+      "provider": "claude",
+      "context_window": 1000000,
+      "output_limit": 128000,
+      "aliases": ["opus-5-5"]
     },
     {
       "id": "claude-sonnet-5",
@@ -256,6 +264,25 @@
     },
     {
       "match_kind": "contains",
+      "patterns": ["claude-opus-5-5"],
+      "strip_context_hint": false,
+      "epochs": [
+        {
+          "start_unix": null,
+          "end_unix": null,
+          "rate": {
+            "input_per_1m_usd": 4.0,
+            "output_per_1m_usd": 20.0,
+            "cache_read_per_1m_usd": 0.2,
+            "cache_write_per_1m_usd": 5.0
+          },
+          "peak": null
+        }
+      ],
+      "evidence": "Anthropic list price verified 2026-09-29: https://platform.claude.com/docs/en/about-claude/pricing (global-endpoint pricing; Google Cloud regional and multi-region endpoints carry a 10% premium; Google Cloud's own price page not verified). Cache hits on Opus 5.5 are 0.05x base input ($0.20), not the standard 0.1x."
+    },
+    {
+      "match_kind": "contains",
       "patterns": ["claude-opus-4-8"],
       "strip_context_hint": false,
       "epochs": [
@@ -263,15 +290,15 @@
           "start_unix": null,
           "end_unix": null,
           "rate": {
-            "input_per_1m_usd": 15.0,
-            "output_per_1m_usd": 75.0,
-            "cache_read_per_1m_usd": 1.5,
-            "cache_write_per_1m_usd": 18.75
+            "input_per_1m_usd": 5.0,
+            "output_per_1m_usd": 25.0,
+            "cache_read_per_1m_usd": 0.5,
+            "cache_write_per_1m_usd": 6.25
           },
           "peak": null
         }
       ],
-      "evidence": "Carried forward from source checkpoint f59f2b23; original verification 2026-05-06. No new vendor verification by manifest extraction."
+      "evidence": "Anthropic list price verified 2026-09-29: https://platform.claude.com/docs/en/about-claude/pricing (global-endpoint pricing; Google Cloud regional and multi-region endpoints carry a 10% premium; Google Cloud's own price page not verified). Replaces a carried-forward row that never matched the published price. Was $15/$75."
     },
     {
       "match_kind": "contains",
@@ -282,15 +309,15 @@
           "start_unix": null,
           "end_unix": null,
           "rate": {
-            "input_per_1m_usd": 15.0,
-            "output_per_1m_usd": 75.0,
-            "cache_read_per_1m_usd": 1.5,
-            "cache_write_per_1m_usd": 18.75
+            "input_per_1m_usd": 5.0,
+            "output_per_1m_usd": 25.0,
+            "cache_read_per_1m_usd": 0.5,
+            "cache_write_per_1m_usd": 6.25
           },
           "peak": null
         }
       ],
-      "evidence": "Carried forward from source checkpoint f59f2b23; original verification 2026-05-06. No new vendor verification by manifest extraction."
+      "evidence": "Anthropic list price verified 2026-09-29: https://platform.claude.com/docs/en/about-claude/pricing (global-endpoint pricing; Google Cloud regional and multi-region endpoints carry a 10% premium; Google Cloud's own price page not verified). Replaces a carried-forward row that never matched the published price. Was $15/$75."
     },
     {
       "match_kind": "contains",
@@ -301,15 +328,53 @@
           "start_unix": null,
           "end_unix": null,
           "rate": {
-            "input_per_1m_usd": 15.0,
-            "output_per_1m_usd": 75.0,
-            "cache_read_per_1m_usd": 1.5,
-            "cache_write_per_1m_usd": 18.75
+            "input_per_1m_usd": 5.0,
+            "output_per_1m_usd": 25.0,
+            "cache_read_per_1m_usd": 0.5,
+            "cache_write_per_1m_usd": 6.25
           },
           "peak": null
         }
       ],
-      "evidence": "Carried forward from source checkpoint f59f2b23; original verification 2026-05-06. No new vendor verification by manifest extraction."
+      "evidence": "Anthropic list price verified 2026-09-29: https://platform.claude.com/docs/en/about-claude/pricing (global-endpoint pricing; Google Cloud regional and multi-region endpoints carry a 10% premium; Google Cloud's own price page not verified). Replaces a carried-forward row that never matched the published price. Was $15/$75."
+    },
+    {
+      "match_kind": "contains",
+      "patterns": ["claude-opus-5"],
+      "strip_context_hint": false,
+      "epochs": [
+        {
+          "start_unix": null,
+          "end_unix": null,
+          "rate": {
+            "input_per_1m_usd": 5.0,
+            "output_per_1m_usd": 25.0,
+            "cache_read_per_1m_usd": 0.5,
+            "cache_write_per_1m_usd": 6.25
+          },
+          "peak": null
+        }
+      ],
+      "evidence": "Anthropic list price verified 2026-09-29: https://platform.claude.com/docs/en/about-claude/pricing (global-endpoint pricing; Google Cloud regional and multi-region endpoints carry a 10% premium; Google Cloud's own price page not verified). Placed after claude-opus-5-5, which this pattern would otherwise also match, and ahead of the claude-opus catch-all ($15/$75, Opus 4 and 4.1)."
+    },
+    {
+      "match_kind": "contains",
+      "patterns": ["claude-opus-4-5"],
+      "strip_context_hint": false,
+      "epochs": [
+        {
+          "start_unix": null,
+          "end_unix": null,
+          "rate": {
+            "input_per_1m_usd": 5.0,
+            "output_per_1m_usd": 25.0,
+            "cache_read_per_1m_usd": 0.5,
+            "cache_write_per_1m_usd": 6.25
+          },
+          "peak": null
+        }
+      ],
+      "evidence": "Anthropic list price verified 2026-09-29: https://platform.claude.com/docs/en/about-claude/pricing (global-endpoint pricing; Google Cloud regional and multi-region endpoints carry a 10% premium; Google Cloud's own price page not verified). Placed after claude-opus-5-5, which this pattern would otherwise also match, and ahead of the claude-opus catch-all ($15/$75, Opus 4 and 4.1)."
     },
     {
       "match_kind": "contains",
@@ -339,15 +404,15 @@
           "start_unix": null,
           "end_unix": null,
           "rate": {
-            "input_per_1m_usd": 3.0,
-            "output_per_1m_usd": 15.0,
-            "cache_read_per_1m_usd": 0.30000000000000004,
-            "cache_write_per_1m_usd": 3.75
+            "input_per_1m_usd": 2.0,
+            "output_per_1m_usd": 10.0,
+            "cache_read_per_1m_usd": 0.2,
+            "cache_write_per_1m_usd": 2.5
           },
           "peak": null
         }
       ],
-      "evidence": "Carried forward from source checkpoint f59f2b23; original verification 2026-05-06. No new vendor verification by manifest extraction."
+      "evidence": "Anthropic list price verified 2026-09-29: https://platform.claude.com/docs/en/about-claude/pricing (global-endpoint pricing; Google Cloud regional and multi-region endpoints carry a 10% premium; Google Cloud's own price page not verified). Replaces a carried-forward row that never matched the published price. Was $3/$15; the $2/$10 launch price is now standard."
     },
     {
       "match_kind": "contains",

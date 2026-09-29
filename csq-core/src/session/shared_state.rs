@@ -33,6 +33,17 @@
 //! `.lock` are a LIVE session registry, not history, and are conservatively
 //! kept per-slot to avoid cross-slot corruption of an in-flight lock.
 //!
+//! `codex-plugins` is an entitlement-sensitive cache too: measured on a
+//! maintainer host 2026-09-29, one slot's tree carried an `openai-bundled`
+//! plugin group (`sites`, `browser`, `visualize`) that another slot's did not,
+//! and the curated plugins carry per-account connector install ids. Sharing it
+//! would offer every slot the union of every account's plugins. `codex-skills`
+//! holds only codex's own `.system/` bundle (same version marker on every
+//! slot, no user skills), which codex rewrites itself — sharing it buys
+//! nothing and lets two codex versions overwrite each other's copy.
+//! Codex's `*.sqlite` state is shared separately, not through this list — see
+//! the `codex_sqlite` module.
+//!
 //! # Safety model
 //!
 //! Migration is MERGE, never CLOBBER, and FAIL-CLOSED:
@@ -1959,7 +1970,12 @@ pub mod codex_sqlite {
         // BEGIN never lands a commit record, so closing the connection with
         // it still open lets SQLite's own crash-recovery / uncommitted-
         // transaction discard drop it entirely.
-        command.args(["-batch", "-noheader", "-list", "-bail"]);
+        // `-init /dev/null`: with the environment cleared, sqlite3 still finds
+        // the user's home via getpwuid and loads `~/.sqliterc`, whose
+        // `.separator` / `.mode` would change the `-list` output every caller
+        // here parses. No rc file is ever read.
+        let empty_rc = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        command.args(["-init", empty_rc, "-batch", "-noheader", "-list", "-bail"]);
         if readonly {
             command.arg("-readonly");
             // S-F8 (defense in depth): `-safe` disables dangerous shell
@@ -2591,6 +2607,214 @@ pub mod codex_sqlite {
         Ok(())
     }
 
+    /// Escapes an arbitrary SQL string LITERAL for interpolation into a
+    /// generated script by DOUBLING every embedded `'` (as opposed to
+    /// [`sql_quote_path`], which does the identical doubling but is named
+    /// for its one call site) — the script is sent as a single batch over
+    /// `sqlite3`'s stdin ([`run_sqlite3_with`], `-batch -bail`), never as a
+    /// bound parameter, so an unescaped `'` would close the literal early
+    /// and let whatever follows execute as SQL. Shared by
+    /// [`repair_dead_rollout_paths`] for the `id` / `rollout_path` values it
+    /// interpolates — these are READ BACK out of the database before being
+    /// written into a new statement, so they are NOT this module's own
+    /// writes: they are whatever codex-cli itself wrote, or whatever another
+    /// slot's row carried into this one through an earlier
+    /// [`merge_threads`] cross-slot merge.
+    fn sql_quote_str(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    /// M1: a newline, carriage return, or NUL byte inside a value that is
+    /// about to be single-quote-escaped and interpolated into a generated
+    /// SQL script (never bound as a parameter — see [`run_sqlite3_with`]'s
+    /// stdin-script transport) can desynchronize the script this module
+    /// sends to `sqlite3`'s stdin, the same class [`ensure_safe_attach_path`]
+    /// already refuses for `ATTACH DATABASE` paths. Used on every value
+    /// [`repair_dead_rollout_paths`] reads back OUT of a database before
+    /// writing it into a new statement — those values are not this
+    /// process's own writes; they are whatever codex-cli, or a merge from
+    /// another slot, put there.
+    fn contains_sql_literal_control_byte(s: &str) -> bool {
+        s.contains(['\n', '\r', '\0'])
+    }
+
+    /// T2: repairs `threads.rollout_path` rows left dangling by a deleted
+    /// handle dir. `csq run`'s codex launch points `CODEX_HOME` at the
+    /// EPHEMERAL `term-<pid>/` handle dir (`csq/src/cli/commands/run.rs`),
+    /// so every rollout path codex-cli records while that dir is alive has
+    /// the shape `<base>/term-<pid>/sessions/<rest>` — and the handle dir is
+    /// removed once the session exits, even though the SAME rollout file
+    /// also lives on, untouched, at
+    /// `<base>/shared-state/codex/codex-sessions/<rest>` (the
+    /// [`super::super::CODEX_SHARED`] symlink target every codex slot links
+    /// its `codex-sessions` entry to). `resume` against the dead
+    /// `term-<pid>` path then fails even though the transcript is fully
+    /// intact under the shared root.
+    ///
+    /// A row is rewritten ONLY when its recorded path does not exist ON
+    /// DISK and the computed shared-root replacement DOES: a row whose file
+    /// is missing everywhere is left alone (that transcript is genuinely
+    /// gone; inventing a target for it would point `resume` at nothing),
+    /// and a row whose original path still resolves has nothing to repair.
+    ///
+    /// `db_path` MUST be the CANONICAL shared `threads` database — this is
+    /// called only from [`share_codex_sqlite_locked`], on a
+    /// basename it has already confirmed carries [`SqliteDbRole::State`],
+    /// never on a per-slot working copy.
+    fn repair_dead_rollout_paths(
+        binary: &Path,
+        db_path: &Path,
+        base: &Path,
+    ) -> Result<usize, ShareError> {
+        if !base.is_absolute() {
+            // The prefix match below is meaningless against a relative
+            // base, and could in principle match relative to sqlite3's own
+            // (or this process's) working directory instead of the
+            // intended one — refuse rather than guess.
+            return Err(ShareError::io(
+                base,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "rollout-path repair requires an absolute base",
+                ),
+            ));
+        }
+        // S-F8/S-F9 posture: `base` is this process's own configured root,
+        // never externally supplied, but the newline/CR/NUL check costs
+        // nothing and removes the question — same posture as every other
+        // path this module interpolates into a SQL literal.
+        ensure_safe_attach_path(base)?;
+
+        let has_threads = table_set(binary, db_path)?.contains("threads");
+        if !has_threads {
+            return Ok(0);
+        }
+
+        // `rollout_path` is a codex-cli schema addition, not a column every
+        // `threads` table carries — an older codex-cli, or a test fixture
+        // built before this column existed, has a `threads` table with no
+        // such column at all. Querying it unconditionally turns "nothing to
+        // repair" into a hard sqlite parse error (`no such column:
+        // rollout_path`), which would fail this call over a column that was
+        // simply never expected to be there. Check first, via
+        // `PRAGMA table_info`, and skip cleanly when it is absent.
+        let columns = run_sqlite3_readonly(binary, db_path, "PRAGMA table_info(threads);")?;
+        let has_rollout_path = columns.lines().any(|line| {
+            let mut fields = line.split('|');
+            let _cid = fields.next();
+            fields.next() == Some("rollout_path")
+        });
+        if !has_rollout_path {
+            tracing::debug!(
+                db = %crate::cli_deps::sanitize::redact_path(db_path),
+                "codex sqlite rollout-path repair: no rollout_path column, nothing to repair"
+            );
+            return Ok(0);
+        }
+
+        let base_str = base.display().to_string();
+        let term_prefix = format!("{base_str}/term-");
+        let shared_sessions_root = format!("{base_str}/shared-state/codex/codex-sessions/");
+
+        // Coarse pre-filter only — every candidate is re-verified in Rust
+        // below against the EXACT `<base>/term-<digits>/sessions/` shape,
+        // so a `%`/`_` occurring literally inside `base_str` can only widen
+        // this SELECT's candidate set, never cause an incorrect REWRITE.
+        let rows = run_sqlite3_readonly(
+            binary,
+            db_path,
+            "SELECT id, rollout_path FROM threads WHERE rollout_path LIKE '%/term-%/sessions/%';",
+        )?;
+
+        let mut updates: Vec<(String, String, String)> = Vec::new(); // (id, old, new)
+        for line in rows.lines() {
+            let mut fields = line.splitn(2, '|');
+            let (Some(id), Some(rollout_path)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            // M1: `id`/`rollout_path` are read from the database this call is
+            // about to WRITE BACK into via a generated SQL literal — a row
+            // this module did not itself insert (a hand-modified or
+            // maliciously merged `threads` table) could carry a control byte
+            // that desynchronizes the generated script. Refuse rather than
+            // interpolate, matching `ensure_safe_attach_path`'s posture on
+            // every other value this module attaches into SQL.
+            if contains_sql_literal_control_byte(id)
+                || contains_sql_literal_control_byte(rollout_path)
+            {
+                continue;
+            }
+            let Some(after_term) = rollout_path.strip_prefix(&term_prefix) else {
+                continue;
+            };
+            let Some(slash_idx) = after_term.find('/') else {
+                continue;
+            };
+            let (pid_part, remainder) = after_term.split_at(slash_idx);
+            if pid_part.is_empty() || !pid_part.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Some(rest) = remainder[1..].strip_prefix("sessions/") else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            // M1: `rest` becomes a path SUFFIX appended onto
+            // `shared_sessions_root` below — a `..` component (or an
+            // absolute/prefix/`.` component `Path::join` would still resolve
+            // against the filesystem root rather than the intended subtree)
+            // lets a hand-modified `rollout_path` point the rewritten value
+            // OUTSIDE `shared-state/codex/codex-sessions/` entirely, at a
+            // path this call never verified. Every component must be a
+            // plain (`Component::Normal`) segment.
+            let rest_is_safe = Path::new(rest)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+            if !rest_is_safe {
+                continue;
+            }
+            let new_path = format!("{shared_sessions_root}{rest}");
+            if contains_sql_literal_control_byte(&new_path) {
+                continue;
+            }
+            let old_exists = Path::new(rollout_path).symlink_metadata().is_ok();
+            // A regular FILE, not merely "something exists": a `rest` with a
+            // trailing `/` (which `components()` drops) names a directory in
+            // the shared root, and a rollout path must name a transcript.
+            let new_exists = fs::metadata(&new_path)
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            if !old_exists && new_exists {
+                updates.push((id.to_string(), rollout_path.to_string(), new_path));
+            }
+        }
+
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        // This is the SHARED database: another already-migrated slot's live
+        // codex session can hold a brief write lock on it independent of
+        // whatever guard gated the CALLER of this repair (`csq sessions
+        // share`'s live-writer refusal covers slots not yet linked here, not
+        // ordinary read/write traffic from slots that already ARE). A busy
+        // timeout makes a transient collision wait and retry inside sqlite3
+        // itself rather than surfacing as `SQLITE_BUSY`.
+        let mut script = String::from("PRAGMA busy_timeout=5000;\nBEGIN IMMEDIATE;\n");
+        for (id, old, new) in &updates {
+            script.push_str(&format!(
+                "UPDATE threads SET rollout_path = '{}' WHERE id = '{}' AND rollout_path = '{}';\n",
+                sql_quote_str(new),
+                sql_quote_str(id),
+                sql_quote_str(old),
+            ));
+        }
+        script.push_str("COMMIT;\n");
+        run_sqlite3(binary, db_path, &script)?;
+        Ok(updates.len())
+    }
+
     /// Delete every row from every table in `db_path` except sqlite's own
     /// bookkeeping tables and `_sqlx_migrations` — the "adopt schema, drop
     /// content" strategy for a rebuildable projection database.
@@ -2831,6 +3055,12 @@ pub mod codex_sqlite {
     /// this same process already holds it, and `flock` is not reentrant
     /// across descriptions, so the second acquire would simply time out
     /// against itself.
+    ///
+    /// T2: after every basename this call finds in `SqliteDbRole::State`
+    /// (merged just now, or already shared from a prior run), repairs any
+    /// `threads.rollout_path` left dangling by a deleted handle dir — see
+    /// [`repair_dead_rollout_paths`]. Skipped entirely on a dry run, which
+    /// never mutates.
     pub(super) fn share_codex_sqlite_locked(
         base: &Path,
         dry_run: bool,
@@ -2885,6 +3115,54 @@ pub mod codex_sqlite {
                 apply_basename_plan(base, &binary, &shared_dir, &basename, plan, dry_run, force)?;
             databases.push(report);
         }
+
+        // T2: repair dangling rollout paths on every State-role basename
+        // this call touched — regardless of whether phase 2 found it
+        // `AlreadyShared` (that report's `role` field always reads
+        // `KeptPerSlot` for that outcome, since a no-op plan never checks
+        // the true role) or freshly `Merged`, so role is re-derived here
+        // directly from `basenames` rather than trusted from `databases`.
+        //
+        // ADVISORY ONLY, deliberately: by this point phase 2 has already
+        // committed the merge (renamed originals to `.pre-share-*` backups
+        // and linked the symlinks) — the merge's own result is already
+        // durable and correct. A repair failure (role detection erroring,
+        // or `repair_dead_rollout_paths` itself) MUST NOT turn that already-
+        // successful merge into an `Err` for this call: doing so once made
+        // `csq sessions share` report a hard failure on a host where
+        // `threads` simply had no `rollout_path` column yet — the merge
+        // had, in fact, already succeeded on disk. Every error here is
+        // logged and swallowed.
+        if !dry_run {
+            for basename in &basenames {
+                let shared_path = shared_dir.join(basename);
+                if !shared_path.exists() {
+                    continue;
+                }
+                match detect_role(&binary, &shared_path) {
+                    Ok(SqliteDbRole::State) => {
+                        if let Err(e) = repair_dead_rollout_paths(&binary, &shared_path, base) {
+                            tracing::warn!(
+                                basename = %basename,
+                                error = %e,
+                                "codex sqlite rollout-path repair failed (advisory only; \
+                                 the merge itself is unaffected)"
+                            );
+                        }
+                    }
+                    Ok(SqliteDbRole::KeptPerSlot) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            basename = %basename,
+                            error = %e,
+                            "codex sqlite rollout-path repair: could not determine role \
+                             (advisory only; the merge itself is unaffected)"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(CodexSqliteReport { databases })
     }
 
@@ -3687,8 +3965,8 @@ mod tests {
         let _procs_guard = force_list_running_processes(vec![]);
         match codex_sqlite::resolve_sqlite3() {
             Ok(_) => {}
-            Err(_) if cfg!(target_os = "macos") => panic!(
-                "this test requires a `sqlite3` binary (macOS ships /usr/bin/sqlite3) — see CSQ_SQLITE3"
+            Err(_) if cfg!(target_os = "macos") || sqlite3_required_in_ci() => panic!(
+                "this test requires a `sqlite3` binary (macOS ships /usr/bin/sqlite3; CI must provide one) — see CSQ_SQLITE3"
             ),
             Err(_) => {
                 eprintln!("SKIPPED: no `sqlite3` binary on this host (set CSQ_SQLITE3 to run)");
@@ -3722,6 +4000,21 @@ mod tests {
     }
 
     // ── S-L7: the lock dir and the lock file itself refuse a symlink ─────
+
+    /// A skipped sqlite test reports `ok`, and libtest hides a passing test's
+    /// output, so a CI log cannot tell "ran" from "skipped". Measured
+    /// 2026-09-29: on a Linux host with no `sqlite3` (`CI=1`), 40 tests here
+    /// passed without running and hid 12 real regressions. Under CI (`CI`
+    /// set, as GitHub Actions does) a missing binary therefore fails
+    /// instead. No `#[cfg(unix)]` needed: the body's own `cfg!(unix)` is a
+    /// RUNTIME check, so this compiles (and simply reads `false`) on every
+    /// platform, including the ordinary unconditional callers below and in
+    /// `codex_sqlite_tests`. Unix only in EFFECT: the Windows CI leg keeps
+    /// the skip (no pinned binary is provisioned there, and the share runs
+    /// on the macOS/Linux legs).
+    fn sqlite3_required_in_ci() -> bool {
+        cfg!(unix) && std::env::var_os("CI").is_some_and(|v| !v.is_empty())
+    }
 
     /// A `shared-state/codex` planted as a symlink (rather than a real
     /// directory) must be refused, not silently followed into whatever it
@@ -4821,15 +5114,15 @@ mod tests {
         ///
         /// macOS always ships `/usr/bin/sqlite3`, so on macOS a missing binary is a
         /// broken environment and the test FAILS rather than skipping: the macOS CI
-        /// leg is where this suite's coverage is guaranteed. Elsewhere (e.g. a Linux
-        /// build host or CI runner without the sqlite3 CLI) the test is skipped with
-        /// a line on stderr; `csq sessions share` itself refuses there with a clear
-        /// error, so there is no product behaviour to exercise.
+        /// leg is where this suite's coverage is guaranteed. Under CI on any unix
+        /// host it FAILS too (`sqlite3_required_in_ci`): a skipped test reports
+        /// `ok` and libtest hides its output. Only outside CI (e.g. a Linux dev
+        /// host without the sqlite3 CLI) is the test skipped, with a line on stderr.
         fn require_sqlite3() -> Option<PathBuf> {
             match codex_sqlite::resolve_sqlite3() {
                 Ok(bin) => Some(bin),
-                Err(_) if cfg!(target_os = "macos") => panic!(
-                    "this suite requires a `sqlite3` binary (macOS ships /usr/bin/sqlite3) — see CSQ_SQLITE3"
+                Err(_) if cfg!(target_os = "macos") || super::sqlite3_required_in_ci() => panic!(
+                    "this suite requires a `sqlite3` binary (macOS ships /usr/bin/sqlite3; CI must provide one) — see CSQ_SQLITE3"
                 ),
                 Err(_) => {
                     eprintln!("SKIPPED: no `sqlite3` binary on this host (set CSQ_SQLITE3 to run)");
@@ -7196,6 +7489,294 @@ mod tests {
             assert!(
                 leftover.is_empty(),
                 "no stranded backup must remain after rollback: {leftover:?}"
+            );
+        }
+
+        // ── T2: dead rollout-path repair ──────────────────────────────
+
+        /// A `threads` table with NO `rollout_path` column at all (the shape
+        /// every fixture built with this suite's own [`create_state_db`]
+        /// has, and the shape a pre-`rollout_path` codex-cli install has on a
+        /// real host) must never fail the merge. Falsifying result named up
+        /// front: before the `PRAGMA table_info` presence check, this exact
+        /// scenario made `share_codex_sqlite_locked` return `Err`
+        /// with `SqliteCommandFailed { ... "no such column: rollout_path" }`
+        /// — on a database the merge itself had ALREADY committed
+        /// successfully.
+        #[test]
+        fn merge_succeeds_when_threads_has_no_rollout_path_column() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home5 = slot_home(base, Surface::Codex, slot_num(5)).unwrap();
+            create_state_db(
+                &bin,
+                &home5.join("state_5.sqlite"),
+                &[ThreadRow {
+                    id: "t1",
+                    name: "no-rollout-column",
+                    updated_at_ms: 1,
+                }],
+                true,
+            );
+
+            let report = codex_sqlite::share_codex_sqlite_locked(base, false, true)
+                .expect("a merge must succeed regardless of whether rollout_path exists");
+            assert!(
+                report
+                    .databases
+                    .iter()
+                    .any(|d| d.basename == "state_5.sqlite"
+                        && matches!(d.role, SqliteDbRole::State)
+                        && matches!(d.outcome, SqliteDbOutcome::Merged { slots_merged: 1 })),
+                "{report:?}"
+            );
+            assert!(
+                home5
+                    .join("state_5.sqlite")
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the merge's own effect must still land even though repair had nothing to touch"
+            );
+        }
+
+        /// `state_N.sqlite` with a `threads.rollout_path` column — the shape
+        /// this suite's [`create_state_db`] does not model, since T2's repair
+        /// is the only production reader/writer of that column.
+        fn create_state_db_with_rollout(bin: &Path, path: &Path, id: &str, rollout_path: &str) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let _ = fs::remove_file(path);
+            sh(
+                bin,
+                path,
+                "CREATE TABLE threads (\
+                   id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, \
+                   updated_at TEXT, updated_at_ms INTEGER, cwd TEXT, model_provider TEXT, \
+                   rollout_path TEXT\
+                 );",
+            );
+            let insert = format!(
+                "INSERT INTO threads (id, title, name, updated_at, updated_at_ms, cwd, \
+                 model_provider, rollout_path) \
+                 VALUES ('{id}', 'untitled', 'n', 'ts', 1, '/work', 'anthropic', '{}');",
+                rollout_path.replace('\'', "''"),
+            );
+            sh(bin, path, &insert);
+            sh(
+                bin,
+                path,
+                "CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, description TEXT); \
+                 INSERT INTO _sqlx_migrations VALUES (1, 'init');",
+            );
+        }
+
+        /// Falsifying result named up front: before T2's repair existed,
+        /// `rollout_path` would still read the dead `term-<pid>` path after
+        /// this merge — `resume` against it would fail even though the exact
+        /// same transcript bytes are reachable at the shared-root path this
+        /// test creates.
+        #[test]
+        fn rollout_path_repair_rewrites_a_dead_term_path_when_the_shared_file_exists() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home5 = slot_home(base, Surface::Codex, slot_num(5)).unwrap();
+
+            let dead = base.join("term-55555/sessions/2026/09/29/rollout-abc.jsonl");
+            let alive = base.join("shared-state/codex/codex-sessions/2026/09/29/rollout-abc.jsonl");
+            fs::create_dir_all(alive.parent().unwrap()).unwrap();
+            fs::write(&alive, b"TRANSCRIPT").unwrap();
+            assert!(!dead.exists(), "fixture: the dead path must not exist");
+
+            create_state_db_with_rollout(
+                &bin,
+                &home5.join("state_5.sqlite"),
+                "t1",
+                &dead.display().to_string(),
+            );
+
+            let report = codex_sqlite::share_codex_sqlite_locked(base, false, true).unwrap();
+            assert!(
+                report
+                    .databases
+                    .iter()
+                    .any(|d| d.basename == "state_5.sqlite"),
+                "{report:?}"
+            );
+
+            let shared_path = shared_root(base, Surface::Codex).join("state_5.sqlite");
+            let repaired = thread_field(&bin, &shared_path, "t1", "rollout_path");
+            assert_eq!(
+                repaired,
+                alive.display().to_string(),
+                "the dead term-<pid> path must be rewritten to the shared-root equivalent"
+            );
+        }
+
+        /// A row whose file is missing EVERYWHERE (neither the recorded
+        /// `term-<pid>` path nor its shared-root equivalent exists) must be
+        /// left exactly as recorded — rewriting it would invent a resume
+        /// target with no transcript behind it.
+        #[test]
+        fn rollout_path_repair_leaves_a_row_alone_when_the_file_is_missing_everywhere() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home5 = slot_home(base, Surface::Codex, slot_num(5)).unwrap();
+
+            let dead = base.join("term-55556/sessions/2026/09/29/rollout-def.jsonl");
+            // Deliberately never created anywhere — neither `dead` nor its
+            // shared-root equivalent exists on disk.
+
+            create_state_db_with_rollout(
+                &bin,
+                &home5.join("state_5.sqlite"),
+                "t2",
+                &dead.display().to_string(),
+            );
+
+            codex_sqlite::share_codex_sqlite_locked(base, false, true).unwrap();
+
+            let shared_path = shared_root(base, Surface::Codex).join("state_5.sqlite");
+            let unchanged = thread_field(&bin, &shared_path, "t2", "rollout_path");
+            assert_eq!(
+                unchanged,
+                dead.display().to_string(),
+                "a row with no surviving file anywhere must never be rewritten"
+            );
+        }
+
+        /// A row whose recorded path STILL resolves has nothing to repair —
+        /// it must be left byte-for-byte as recorded, even though a
+        /// shared-root file of the same name also happens to exist.
+        #[test]
+        fn rollout_path_repair_leaves_a_still_resolving_path_alone() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home5 = slot_home(base, Surface::Codex, slot_num(5)).unwrap();
+
+            let still_alive = base.join("term-55557/sessions/2026/09/29/rollout-ghi.jsonl");
+            fs::create_dir_all(still_alive.parent().unwrap()).unwrap();
+            fs::write(&still_alive, b"TRANSCRIPT").unwrap();
+            let shared_equivalent =
+                base.join("shared-state/codex/codex-sessions/2026/09/29/rollout-ghi.jsonl");
+            fs::create_dir_all(shared_equivalent.parent().unwrap()).unwrap();
+            fs::write(&shared_equivalent, b"TRANSCRIPT").unwrap();
+
+            create_state_db_with_rollout(
+                &bin,
+                &home5.join("state_5.sqlite"),
+                "t3",
+                &still_alive.display().to_string(),
+            );
+
+            codex_sqlite::share_codex_sqlite_locked(base, false, true).unwrap();
+
+            let shared_path = shared_root(base, Surface::Codex).join("state_5.sqlite");
+            let unchanged = thread_field(&bin, &shared_path, "t3", "rollout_path");
+            assert_eq!(
+                unchanged,
+                still_alive.display().to_string(),
+                "a path that still resolves has nothing to repair"
+            );
+        }
+
+        /// M1: a `rest` containing `..` must never be rewritten, even when
+        /// the path it traverses to actually exists — rewriting it would
+        /// point `resume` at a file OUTSIDE
+        /// `shared-state/codex/codex-sessions/` that this call never
+        /// verified belongs to this thread at all.
+        ///
+        /// Falsifying result named up front (and VERIFIED by temporarily
+        /// commenting out the `rest_is_safe` check and re-running only this
+        /// test, 2026-09-29): without the check, `rest = "../../x"` passes
+        /// every other filter (`old_exists` is false because
+        /// `term-99999/sessions/` was never created, so the OS cannot even
+        /// resolve the `..` components to stat it; `new_exists` is true
+        /// because this test plants a file at the traversed-to location),
+        /// so the row gets rewritten to
+        /// `<base>/shared-state/x` — two levels OUTSIDE the
+        /// `codex-sessions` subtree.
+        #[test]
+        fn rollout_path_repair_refuses_a_traversal_rest_even_when_the_target_exists() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home5 = slot_home(base, Surface::Codex, slot_num(5)).unwrap();
+
+            // Never created on disk — `term-99999/sessions/` does not exist,
+            // so the OS cannot resolve the `..` components to stat it, and
+            // `old_exists` is false purely from that (not from any check
+            // this fix adds).
+            let traversal_old = base.join("term-99999/sessions/../../x");
+            // `codex-sessions/` must exist as a REAL directory for the OS to
+            // resolve `..` through it at all — otherwise `new_exists` below
+            // is false for the wrong reason (ENOENT on an intermediate
+            // component) and this test would pass even with the check
+            // removed, proving nothing.
+            fs::create_dir_all(shared_root(base, Surface::Codex).join("codex-sessions")).unwrap();
+            // The traversed-to target DOES exist: two levels above
+            // `codex-sessions/`, i.e. `<base>/shared-state/x`.
+            let traversal_target = base.join("shared-state/x");
+            fs::write(&traversal_target, b"OUTSIDE THE SHARED SESSIONS TREE").unwrap();
+
+            create_state_db_with_rollout(
+                &bin,
+                &home5.join("state_5.sqlite"),
+                "t4",
+                &traversal_old.display().to_string(),
+            );
+
+            codex_sqlite::share_codex_sqlite_locked(base, false, true).unwrap();
+
+            let shared_path = shared_root(base, Surface::Codex).join("state_5.sqlite");
+            let unchanged = thread_field(&bin, &shared_path, "t4", "rollout_path");
+            assert_eq!(
+                unchanged,
+                traversal_old.display().to_string(),
+                "a `..`-containing rest must never be rewritten, regardless of what it resolves to"
+            );
+        }
+
+        /// A `rest` with a trailing `/` survives the component check (which
+        /// drops it) and names a DIRECTORY in the shared root. A rollout path
+        /// must name a transcript file, so the row is left alone. Falsifying
+        /// result: the row rewritten to `.../codex-sessions/2026/09/`, which is
+        /// what an existence-only check produced.
+        #[test]
+        fn rollout_path_repair_never_points_a_thread_at_a_directory() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home5 = slot_home(base, Surface::Codex, slot_num(5)).unwrap();
+            fs::create_dir_all(shared_root(base, Surface::Codex).join("codex-sessions/2026/09"))
+                .unwrap();
+            let dir_old = format!("{}/", base.join("term-99998/sessions/2026/09").display());
+            create_state_db_with_rollout(&bin, &home5.join("state_5.sqlite"), "t5", &dir_old);
+
+            codex_sqlite::share_codex_sqlite_locked(base, false, true).unwrap();
+
+            let shared_path = shared_root(base, Surface::Codex).join("state_5.sqlite");
+            assert_eq!(
+                thread_field(&bin, &shared_path, "t5", "rollout_path"),
+                dir_old
             );
         }
     }

@@ -1972,12 +1972,12 @@ mod tests {
         assert_eq!(event.cache_creation_tokens, 930_906);
         assert_eq!(event.cache_read_tokens, 8_839_479);
         // an internal ticket: cost now bills input + output + cache-write(1.25×) + cache-read(0.10×)
-        // at claude-opus input rate ($15/1M).
+        // at claude-opus-4-8 input rate ($5/1M).
         let cost = event.cost_usd_estimate.unwrap();
-        let expected = 100.0 * 15.0 / 1e6            // input
-            + 50.0 * 75.0 / 1e6                       // output
-            + 930_906.0 * 15.0 * 1.25 / 1e6           // cache write
-            + 8_839_479.0 * 15.0 * 0.10 / 1e6; // cache read
+        let expected = 100.0 * 5.0 / 1e6             // input
+            + 50.0 * 25.0 / 1e6                       // output
+            + 930_906.0 * 5.0 * 1.25 / 1e6            // cache write
+            + 8_839_479.0 * 5.0 * 0.10 / 1e6; // cache read
         assert!(
             (cost - expected).abs() < 1e-9,
             "expected cache-inclusive ${expected}, got ${cost}"
@@ -3074,12 +3074,12 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].model, "claude-sonnet-4-6");
         assert_eq!(events[1].model, "claude-opus-4-8");
-        // 1M input at sonnet ($3/1M) and at opus ($15/1M) — the whole point is
+        // 1M input at sonnet ($3/1M) and at opus ($5/1M) — the whole point is
         // that these differ; pre-an internal ticket both billed $3.
         let sonnet = events[0].cost_usd_estimate.unwrap();
         let opus = events[1].cost_usd_estimate.unwrap();
         assert!((sonnet - 3.0).abs() < 1e-9, "sonnet: {sonnet}");
-        assert!((opus - 15.0).abs() < 1e-9, "opus: {opus}");
+        assert!((opus - 5.0).abs() < 1e-9, "opus: {opus}");
     }
 
     /// A UTC pricing-window edge INSIDE one session. DeepSeek's post-cutover
@@ -3297,7 +3297,7 @@ mod tests {
         );
         assert_eq!(s.total_input_tokens, 1_000_777, "its tokens still count");
         assert!(
-            (s.total_cost_usd - 15.0).abs() < 1e-9,
+            (s.total_cost_usd - 5.0).abs() < 1e-9,
             "the priced sibling still prices: {}",
             s.total_cost_usd
         );

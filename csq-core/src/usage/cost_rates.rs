@@ -183,9 +183,10 @@ pub fn rate_for_model_at(model: &str, at: Option<DateTime<Utc>>) -> Option<CostR
 }
 
 /// Last bundled verification checkpoint, not the revision of a local manifest.
-/// V4.1 Flash was verified 2026-09-14; other rows retain their older evidence
-/// boundaries, recorded per rule in `model-rates.builtin.json`.
-pub const RATES_AS_OF: &str = "2026-09-14";
+/// The Claude rows were re-verified 2026-09-29 and V4.1 Flash 2026-09-14; other
+/// rows retain their older evidence boundaries, recorded per rule in
+/// `model-rates.builtin.json`.
+pub const RATES_AS_OF: &str = "2026-09-29";
 
 #[cfg(test)]
 mod tests {
@@ -624,6 +625,41 @@ mod tests {
         let rate = rate_for_model_at("kimi-k3", any_instant()).unwrap();
         let cost = rate.estimate_usd(1_000_000, 1_000_000);
         assert!((cost - 18.0).abs() < 0.001, "expected ~$18.0, got ${cost}");
+    }
+
+    /// Opus 5.5 must own its row. The `claude-opus` catch-all ($15/$75, Opus
+    /// 4 / 4.1) matches the id by substring, so without a dedicated earlier
+    /// rule Opus 5.5 was billed 3.75x its published price. Falsifying result:
+    /// 15.0 / 75.0, which is what this returned before the row existed.
+    #[test]
+    fn opus_5_5_and_4_8_bill_at_published_prices() {
+        let r = rate_for_model_at("claude-opus-5-5[1m]", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 0) - 4.0).abs() < 1e-9);
+        assert!((r.estimate_usd(0, 1_000_000) - 20.0).abs() < 1e-9);
+        // Cache hits on Opus 5.5 are 0.05x base input, not 0.1x.
+        let read_only = r.estimate_usd_with_cache(0, 0, 0, 1_000_000);
+        assert!((read_only - 0.2).abs() < 1e-9, "cache read: {read_only}");
+        let r = rate_for_model_at("claude-opus-4-8", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 1_000_000) - 30.0).abs() < 1e-9);
+        // Opus 5 and 4.5 are $5/$25 too, and must not fall to the catch-all;
+        // `claude-opus-5` is a substring of `claude-opus-5-5`, so order matters.
+        for id in ["claude-opus-5", "claude-opus-4-5-20251101"] {
+            let r = rate_for_model_at(id, any_instant()).unwrap();
+            assert!(
+                (r.estimate_usd(1_000_000, 1_000_000) - 30.0).abs() < 1e-9,
+                "{id}"
+            );
+        }
+        let r = rate_for_model_at("claude-opus-5-5", any_instant()).unwrap();
+        assert!(
+            (r.estimate_usd(1_000_000, 0) - 4.0).abs() < 1e-9,
+            "5.5 kept its own row"
+        );
+        // The catch-all still prices Opus 4.1 at its own published $15/$75.
+        let r = rate_for_model_at("claude-opus-4-1-20250805", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 1_000_000) - 90.0).abs() < 1e-9);
+        let r = rate_for_model_at("claude-sonnet-5", any_instant()).unwrap();
+        assert!((r.estimate_usd(1_000_000, 1_000_000) - 12.0).abs() < 1e-9);
     }
 
     #[test]

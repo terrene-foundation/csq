@@ -321,7 +321,7 @@ pub fn handle_switch(
                 provider_id
             ));
         }
-        m.id.clone()
+        with_context_annotation(provider_id, model_query, &m.id, m.context_window)
     };
 
     // INV-P06 write-path dispatch by `ModelConfigTarget`.
@@ -501,6 +501,32 @@ fn resolve_codex_model(query: &str, force: bool, catalog: &ModelCatalog) -> Resu
          arbitrary OpenAI model id (csq does not validate it against your \
          ChatGPT subscription entitlements)"
     ))
+}
+
+/// The id to write for a catalog hit, keeping the query's `[1m]` annotation.
+///
+/// Claude only. `ModelCatalog::find` strips `[1m]` to match, so writing the
+/// bare `m.id` silently turned `claude-opus-5-5[1m]` into `claude-opus-5-5` —
+/// and Claude Code sizes the window from that suffix: measured on a Vertex
+/// slot, the bare id ran with a 200000-token window and the annotated one with
+/// 1000000. The suffix is Claude Code's annotation, not part of any vendor's
+/// model id, so no other provider gets it (gemini-cli would send
+/// `gemini-2.5-pro[1m]` to Google verbatim). It is kept only when the catalog
+/// row has a 1M window, so it never promises context the model lacks.
+fn with_context_annotation(
+    provider_id: &str,
+    query: &str,
+    id: &str,
+    context_window: Option<u64>,
+) -> String {
+    const ONE_M: &str = "[1m]";
+    let asked = query.trim().to_ascii_lowercase().ends_with(ONE_M);
+    let has = id.to_ascii_lowercase().ends_with(ONE_M);
+    if provider_id == "claude" && asked && !has && context_window.is_some_and(|w| w >= 1_000_000) {
+        format!("{id}{ONE_M}")
+    } else {
+        id.to_string()
+    }
 }
 
 /// Rewrites every `ANTHROPIC_*_MODEL` key in the slot's settings.json to
@@ -1066,6 +1092,60 @@ mod tests {
         assert!(model.starts_with("claude-opus-4-"), "got: {model}");
     }
 
+    /// Asking for the `[1m]` form must write the `[1m]` form: Claude Code
+    /// sizes the window from the suffix (200000 without it, 1000000 with it).
+    /// Falsifying result: `claude-opus-5-5`, which is what the catalog-id
+    /// write produced before `with_context_annotation`.
+    #[test]
+    fn switch_claude_keeps_the_1m_annotation() {
+        let dir = TempDir::new().unwrap();
+        handle_switch(
+            dir.path(),
+            "claude",
+            "claude-opus-5-5[1m]",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.pointer("/env/ANTHROPIC_MODEL").and_then(|x| x.as_str()),
+            Some("claude-opus-5-5[1m]")
+        );
+    }
+
+    #[test]
+    fn context_annotation_is_kept_only_where_the_window_exists() {
+        let one_m = Some(1_000_000);
+        assert_eq!(
+            with_context_annotation("claude", "claude-opus-5-5", "claude-opus-5-5", one_m),
+            "claude-opus-5-5"
+        );
+        // A 200K model never gets a 1M promise, whatever was asked.
+        assert_eq!(
+            with_context_annotation(
+                "claude",
+                "haiku[1m]",
+                "claude-haiku-4-5-20251001",
+                Some(200_000)
+            ),
+            "claude-haiku-4-5-20251001"
+        );
+        // An id carrying the annotation natively is not doubled.
+        assert_eq!(
+            with_context_annotation("zai", "glm-5.3[1m]", "glm-5.3[1m]", one_m),
+            "glm-5.3[1m]"
+        );
+        assert_eq!(
+            with_context_annotation("claude", "opus[1M]", "claude-opus-4-8", one_m),
+            "claude-opus-4-8[1m]"
+        );
+    }
+
     #[test]
     fn switch_claude_rejects_unknown_model() {
         let dir = TempDir::new().unwrap();
@@ -1301,6 +1381,25 @@ mod tests {
             dir.path(),
             "gemini",
             "pro",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 4), "gemini-2.5-pro");
+    }
+
+    /// `[1m]` is Claude Code's annotation. A Gemini slot asked for
+    /// `gemini-2.5-pro[1m]` must still write the vendor id, or gemini-cli
+    /// sends the suffixed id to Google. Falsifying result: `gemini-2.5-pro[1m]`.
+    #[test]
+    fn switch_gemini_never_writes_the_1m_annotation() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "gemini-2.5-pro[1m]",
             Some(AccountNum::try_from(4u16).unwrap()),
             false,
             false,

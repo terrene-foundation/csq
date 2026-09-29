@@ -542,8 +542,8 @@ mod tests {
     #[test]
     fn bundled_manifest_has_all_extracted_models_and_rate_rules() {
         let manifest = ModelManifest::from_slice(BUILTIN).unwrap();
-        assert_eq!(manifest.models.len(), 13);
-        assert_eq!(manifest.rates.len(), 28);
+        assert_eq!(manifest.models.len(), 14);
+        assert_eq!(manifest.rates.len(), 31);
         assert_eq!(manifest.catalog().find("4.1").unwrap().id, "deepseek-flash");
         assert_eq!(
             manifest.catalog().find("opus").unwrap().context_window,
@@ -784,7 +784,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         assert_eq!(
             ModelManifest::load(dir.path()).unwrap().revision,
-            "2026-09-14.builtin"
+            "2026-09-29.builtin"
         );
         std::fs::write(manifest_path(dir.path()), b"{").unwrap();
         assert!(ModelManifest::load(dir.path()).is_err());

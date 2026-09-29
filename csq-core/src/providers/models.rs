@@ -147,6 +147,13 @@ mod tests {
         let cat = ModelCatalog::default_catalog();
         assert!(!cat.models.is_empty());
         assert!(cat.find("claude-opus-4-8").is_some());
+        // Vertex slot 19's pin: the [1m] annotation must still resolve to the
+        // 1M window, or the statusline over-reports context use 5x.
+        let opus55 = cat
+            .find("claude-opus-5-5[1m]")
+            .expect("opus 5.5 in catalog");
+        assert_eq!(opus55.id, "claude-opus-5-5");
+        assert_eq!(opus55.context_window, Some(1_000_000));
 
         // Vertex pins a version suffix in the slot's ANTHROPIC_MODEL. Before
         // normalisation this returned None, so `ctx_window_true` was None for

@@ -135,10 +135,20 @@ pub fn handle_share(base: &Path, surface: Option<&str>, dry_run: bool, force: bo
 }
 
 fn print_codex_sqlite_report(report: &CodexSqliteReport, dry_run: bool) {
-    if report.databases.is_empty() {
-        return;
+    if let Err(e) = write_codex_sqlite_report(&mut std::io::stdout().lock(), report, dry_run) {
+        eprintln!("could not print the codex sqlite report: {e}");
     }
-    println!("== codex sqlite state ==");
+}
+
+fn write_codex_sqlite_report(
+    out: &mut impl std::io::Write,
+    report: &CodexSqliteReport,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    if report.databases.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "== codex sqlite state ==")?;
     for db in &report.databases {
         let role = match db.role {
             SqliteDbRole::State => "state (thread names/recency)",
@@ -154,8 +164,16 @@ fn print_codex_sqlite_report(report: &CodexSqliteReport, dry_run: bool) {
                 format!("left untouched in {slots} slot(s) (no cross-slot value established)")
             }
         };
-        println!("  {} [{role}]: {detail}", db.basename);
+        writeln!(out, "  {} [{role}]: {detail}", db.basename)?;
+        if let Some(backup) = &db.backup_path {
+            writeln!(
+                out,
+                "    shared index backed up before merging: {}",
+                csq_core::cli_deps::sanitize::redact_path(backup)
+            )?;
+        }
     }
+    Ok(())
 }
 
 fn print_slot_report(report: &SlotReport, dry_run: bool) {
@@ -383,6 +401,41 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    fn report_with_backup(backup: Option<&str>) -> CodexSqliteReport {
+        CodexSqliteReport {
+            databases: vec![
+                csq_core::session::shared_state::codex_sqlite::SqliteDbReport {
+                    basename: "state_5.sqlite".to_string(),
+                    role: SqliteDbRole::State,
+                    outcome: SqliteDbOutcome::Merged { slots_merged: 2 },
+                    backup_path: backup.map(std::path::PathBuf::from),
+                },
+            ],
+        }
+    }
+
+    fn render(report: &CodexSqliteReport) -> String {
+        let mut buf = Vec::new();
+        write_codex_sqlite_report(&mut buf, report, false).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The backup line names the (redacted) pre-merge backup when one was
+    /// taken, and is absent when none was.
+    #[test]
+    fn report_prints_the_backup_path_only_when_one_was_taken() {
+        let path = "/nonexistent-csq-test-root/state_5.sqlite.pre-merge-1-2";
+        let with = render(&report_with_backup(Some(path)));
+        let expected = format!(
+            "    shared index backed up before merging: {}",
+            csq_core::cli_deps::sanitize::redact_path(std::path::Path::new(path))
+        );
+        assert!(with.lines().any(|l| l == expected), "{with}");
+        let without = render(&report_with_backup(None));
+        assert!(!without.contains("backed up"), "{without}");
+        assert!(without.contains("state_5.sqlite"), "{without}");
+    }
 
     fn slot(n: u16) -> AccountNum {
         AccountNum::try_from(n).expect("valid slot")

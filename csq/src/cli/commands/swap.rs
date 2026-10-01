@@ -3317,6 +3317,27 @@ fn notify_daemon_cache_invalidation(base_dir: &Path) {
 #[allow(dead_code)] // ensure markers/Surface paths compile on all targets
 mod tests {
     use super::*;
+
+    /// Wait (bounded, 10s) until `path` holds a complete pid. Polling for
+    /// mere EXISTENCE races the shell's `echo $! > file`, which creates the
+    /// file before writing it: the enterprise CI leg read it empty
+    /// (`ParseIntError { kind: Empty }`). A timeout is a FAILURE, never a skip.
+    fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if let Ok(pid) = s.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} never held a complete pid within 10s",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     #[cfg(unix)]
     use crate::cli::commands::fake_daemon_test_support::{
         spawn_fake_healthy_daemon, spawn_no_daemon_env_guard,
@@ -4520,15 +4541,7 @@ mod tests {
             .expect("spawn signal-trapping supervisor stand-in");
         let supervisor_pid = supervisor.id();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !child_pid_file.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let ancestor_pid: u32 = std::fs::read_to_string(&child_pid_file)
-            .expect("child pid file readable")
-            .trim()
-            .parse()
-            .expect("child pid file parses as u32");
+        let ancestor_pid: u32 = wait_for_pid_file(&child_pid_file);
 
         // Give the child a moment to reach steady state (open fds) before
         // this test relies on it, and confirm S-F11's precondition holds
@@ -4874,15 +4887,7 @@ mod tests {
             .expect("spawn signal-trapping supervisor stand-in");
         let supervisor_pid = supervisor.id();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !child_pid_file.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let ancestor_pid: u32 = std::fs::read_to_string(&child_pid_file)
-            .expect("child pid file readable")
-            .trim()
-            .parse()
-            .expect("child pid file parses as u32");
+        let ancestor_pid: u32 = wait_for_pid_file(&child_pid_file);
 
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
@@ -4969,15 +4974,7 @@ mod tests {
             .expect("spawn signal-trapping supervisor stand-in");
         let supervisor_pid = supervisor.id();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !child_pid_file.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let ancestor_pid: u32 = std::fs::read_to_string(&child_pid_file)
-            .expect("child pid file readable")
-            .trim()
-            .parse()
-            .expect("child pid file parses as u32");
+        let ancestor_pid: u32 = wait_for_pid_file(&child_pid_file);
 
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
@@ -5072,15 +5069,7 @@ mod tests {
             .expect("spawn signal-trapping supervisor stand-in");
         let supervisor_pid = supervisor.id();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !child_pid_file.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let ancestor_pid: u32 = std::fs::read_to_string(&child_pid_file)
-            .expect("child pid file readable")
-            .trim()
-            .parse()
-            .expect("child pid file parses as u32");
+        let ancestor_pid: u32 = wait_for_pid_file(&child_pid_file);
 
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
@@ -5193,15 +5182,7 @@ mod tests {
             .expect("spawn signal-trapping supervisor stand-in");
         let supervisor_pid = supervisor.id();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !child_pid_file.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let ancestor_pid: u32 = std::fs::read_to_string(&child_pid_file)
-            .expect("child pid file readable")
-            .trim()
-            .parse()
-            .expect("child pid file parses as u32");
+        let ancestor_pid: u32 = wait_for_pid_file(&child_pid_file);
 
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(

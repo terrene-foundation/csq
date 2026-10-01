@@ -141,7 +141,7 @@ pub fn redact_home_anywhere(s: &str) -> String {
     // `$HOME` value. The LONGER needle runs first so a canonical form that
     // CONTAINS the literal one (e.g. `/private/tmp/h` vs `/tmp/h`) is not
     // half-rewritten by the shorter pass before it can match.
-    match canonical_home_string() {
+    let redacted = match canonical_home_string() {
         Some(canon) => {
             let canon = canon.trim_end_matches(is_path_sep);
             if canon.is_empty() || canon == literal {
@@ -153,7 +153,52 @@ pub fn redact_home_anywhere(s: &str) -> String {
             }
         }
         None => redact_needle_anywhere(s, literal),
+    };
+    // T4: also redact the PERCENT-ENCODED form of the literal `$HOME` —
+    // `session::shared_state::codex_sqlite::sqlite_uri_path` builds a
+    // `file:`-URI form of a path (for a read-only sqlite3 connection) by
+    // percent-encoding every byte outside RFC 3986's unreserved set, so a
+    // HOME containing a space (or any other reserved character) reaches
+    // sqlite3's stderr as `%20`, not a literal space — a needle search for
+    // the literal home string would silently miss it. Most home paths have
+    // no such bytes, in which case this pass is a no-op equal to the
+    // literal one already run above.
+    // The CANONICAL home needs the same pass: a symlinked `$HOME` whose
+    // target contains a reserved byte surfaces in its resolved, encoded form.
+    // Longer needle first, as above.
+    let mut raws: Vec<String> = vec![literal.to_string()];
+    if let Some(canon) = canonical_home_string() {
+        raws.push(canon.trim_end_matches(is_path_sep).to_string());
     }
+    let mut needles: Vec<String> = raws
+        .iter()
+        .map(|raw| (percent_encode_unreserved(raw), raw))
+        .filter(|(enc, raw)| enc != *raw && !enc.is_empty())
+        .map(|(enc, _)| enc)
+        .collect();
+    needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    needles.dedup();
+    needles
+        .iter()
+        .fold(redacted, |acc, needle| redact_needle_anywhere(&acc, needle))
+}
+
+/// RFC 3986 unreserved-set percent-encoding, byte-for-byte identical to
+/// `session::shared_state::codex_sqlite::sqlite_uri_path`'s scheme (ALPHA /
+/// DIGIT / `-` / `.` / `_` / `~` / `/` pass through literally; everything
+/// else becomes `%XX`), so the needle this produces matches exactly what
+/// that function would have put into a `file:` URI.
+fn percent_encode_unreserved(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(*b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Resolves the operator's home directory as a `String` — `$HOME`, falling
@@ -334,6 +379,36 @@ mod tests {
         }));
         let _ = std::fs::remove_file(&link_path);
         result.expect("test body panicked");
+    }
+
+    /// L4: the PERCENT-ENCODED form of the CANONICAL home must be redacted
+    /// too (a symlinked `$HOME` whose real target contains a space).
+    #[test]
+    #[cfg(unix)]
+    fn redact_home_anywhere_redacts_percent_encoded_canonical_home() {
+        let real_dir = tempfile::tempdir().expect("real tempdir");
+        let real_target = real_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("real home");
+        std::fs::create_dir(&real_target).expect("mkdir");
+        let link_path = real_dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(format!("link-home-{}", std::process::id()));
+        std::os::unix::fs::symlink(&real_target, &link_path).expect("symlink");
+
+        let encoded_real = percent_encode_unreserved(real_target.to_str().unwrap());
+        with_home(Some(link_path.to_str().unwrap()), || {
+            let redacted = redact_home_anywhere(&format!("sqlite3: unable to open {encoded_real}"));
+            assert!(
+                !redacted.contains("real%20home"),
+                "percent-encoded canonical home leaked: {redacted}"
+            );
+            assert!(redacted.contains('~'), "{redacted}");
+        });
     }
 
     #[test]

@@ -95,7 +95,7 @@ cd ~/repos/dev/csq   # the ENTERPRISE repo. NOT ~/repos/csq —
                      # that path still exists but is a stale COMMUNITY clone
                      # (terrene-foundation/csq @ v2.16.2, Jun 19). Building
                      # there signs the wrong edition at the wrong version and
-                     # publishes it under the new tag. `release-preflight.sh`
+                     # publishes it under the new tag. `scripts/verify/release-preflight.sh`
                      # asserts this mechanically; run it before you start.
 BUILD_START=$(date +%s)              # freshness anchor — asserted below
 cd csq && npm install && cd -    # if not already installed
@@ -210,7 +210,7 @@ echo "Bundle freshness + version coherence + universal slices OK: v$PLIST_VERSIO
 # placeholder that is BOTH missing "Limited" AND carries a fake team id, so
 # copy-pasting either block failed with `no identity found` mid-cut. Deriving it
 # means the doc cannot drift from the keychain again (scripts/dev-install.sh
-# already derived it; the doc did not). release-preflight.sh asserts it resolves.
+# already derived it; the doc did not). scripts/verify/release-preflight.sh asserts it resolves.
 IDENTITY=$(security find-identity -v -p codesigning \
   | grep "Developer ID Application: Terrene Foundation" | head -1 \
   | sed 's/.*"\(.*\)"/\1/')

@@ -54,6 +54,7 @@
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   writeFileSync,
@@ -93,7 +94,10 @@ const RECEIPT = join(ROOT, ".csq-dev-preflight.json");
 // describes the working tree regardless of what the index held before — and
 // git's stat cache makes every call after the first cheap. Re-seeding per call
 // measured 2.4-5.4 s each, which made a per-gate check cost about a minute.
-const FP_INDEX = join(tmpdir(), `csq-preflight-idx-${process.pid}-${Date.now()}`);
+const FP_INDEX = join(
+  tmpdir(),
+  `csq-preflight-idx-${process.pid}-${Date.now()}`,
+);
 process.on("exit", () => {
   try {
     unlinkSync(FP_INDEX);
@@ -150,7 +154,8 @@ function gate(name, fn) {
   // restored mid-run (A -> B -> A) fingerprints identically at start and end,
   // yet some gates tested B (round-3 security review). A per-gate check closes
   // every window except one that opens and shuts inside a single gate.
-  if (!treeMovedAfter && treeFingerprint() !== START_FINGERPRINT) treeMovedAfter = name;
+  if (!treeMovedAfter && treeFingerprint() !== START_FINGERPRINT)
+    treeMovedAfter = name;
 }
 
 // TEST HOOK. DEV_PREFLIGHT_SHOW_DERIVED=<step name> prints the command
@@ -988,7 +993,8 @@ gate("shellcheck — derived from test.yml", () => {
   if (end === -1) {
     return {
       state: "UNDETERMINED",
-      detail: "test.yml's `files=(` array is unterminated — cannot derive the file set",
+      detail:
+        "test.yml's `files=(` array is unterminated — cannot derive the file set",
     };
   }
   const arrayText = lines.slice(start, end + 1).join("\n");
@@ -1024,7 +1030,10 @@ gate("shellcheck — derived from test.yml", () => {
   }
   if (res.ok) {
     const n = (res.out.match(/shellchecking (\d+) file/) || [])[1] || "?";
-    return { state: "GREEN", detail: `clean; ${n} file(s) at shellcheck ${pin[1]} (glob derived from test.yml)` };
+    return {
+      state: "GREEN",
+      detail: `clean; ${n} file(s) at shellcheck ${pin[1]} (glob derived from test.yml)`,
+    };
   }
   const findings = res.out
     .split("\n")
@@ -1114,17 +1123,26 @@ gate("shell-gate self-tests (globbed from scripts/tests/)", () => {
   // bare test name -> the token its exemption declares
   let undeterminedOk = new Map();
   try {
-    const out = execFileSync("python3", ["scripts/ci/undetermined-allowlist.py"], {
-      cwd: ROOT,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const out = execFileSync(
+      "python3",
+      ["scripts/ci/undetermined-allowlist.py"],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     for (const line of out.split("\n")) {
       const [kind, test, token] = line.split("\t");
       // Only ALLOW grants anything, and only for a path the helper validated
       // as scripts/tests/<safe-name>.test.sh. Keyed by bare file name because
       // that is what `names` holds (readdirSync of scripts/tests).
-      if (kind === "ALLOW" && test && token && test.startsWith("scripts/tests/")) {
+      if (
+        kind === "ALLOW" &&
+        test &&
+        token &&
+        test.startsWith("scripts/tests/")
+      ) {
         undeterminedOk.set(test.slice("scripts/tests/".length), token);
       }
     }
@@ -1188,7 +1206,7 @@ gate("shell-gate self-tests (globbed from scripts/tests/)", () => {
         ok = true;
       }
     }
-    results.push({ n, ok, ms: Date.now() - t0, out });
+    results.push({ n, ok, rc, ms: Date.now() - t0, out });
   }
 
   const failed = results.filter((r) => !r.ok);
@@ -1210,17 +1228,40 @@ gate("shell-gate self-tests (globbed from scripts/tests/)", () => {
   const why = failed
     .slice(0, 3)
     .map((f) => {
-      const line = f.out.split("\n").find((l) => /^\s*(FAIL|not ok|error)/i.test(l));
-      const msg = (line || f.out.split("\n").filter((l) => l.trim()).pop() || "")
+      const line = f.out
+        .split("\n")
+        .find((l) => /^\s*(FAIL|not ok|error)/i.test(l));
+      const msg = (
+        line ||
+        f.out
+          .split("\n")
+          .filter((l) => l.trim())
+          .pop() ||
+        ""
+      )
         .trim()
         .slice(0, 100);
       return msg ? `${f.n}: ${msg}` : f.n;
     })
     .join(" | ");
   const more = failed.length > 3 ? ` (+${failed.length - 3} more)` : "";
+  // KEEP every failing test's FULL output. The detail above is a 100-character
+  // pointer, and a failure that does not reproduce in isolation (an internal ticket:
+  // a different test failed on each of three runs, each passing alone) cannot
+  // be diagnosed from a pointer. Written to a fresh temp dir, named here.
+  let logs = "";
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "dev-preflight-selftests-"));
+    for (const f of failed) {
+      writeFileSync(join(dir, `${f.n}.log`), `exit ${f.rc}\n${f.out}`);
+    }
+    logs = ` — full output of each failing test kept in ${dir}`;
+  } catch (e) {
+    logs = ` — could not keep the failing output (${e.code || e.message})`;
+  }
   return {
     state: "RED",
-    detail: `${failed.length}/${results.length} self-test(s) failed — ${why}${more} — ${timing}${undetNote}`,
+    detail: `${failed.length}/${results.length} self-test(s) failed — ${why}${more} — ${timing}${undetNote}${logs}`,
   };
 });
 
@@ -1247,7 +1288,9 @@ if (treeMovedAfter && END_FINGERPRINT === START_FINGERPRINT) {
   console.log(
     `dev-preflight: UNDETERMINED — the tree changed during the run (first seen after '${treeMovedAfter}') and was later restored. No receipt written.`,
   );
-  console.log("  Some gates tested a different tree than the one being vouched for. Re-run on a quiet tree.");
+  console.log(
+    "  Some gates tested a different tree than the one being vouched for. Re-run on a quiet tree.",
+  );
   process.exit(2);
 }
 if (END_FINGERPRINT !== START_FINGERPRINT) {
@@ -1256,8 +1299,12 @@ if (END_FINGERPRINT !== START_FINGERPRINT) {
   console.log(
     "dev-preflight: UNDETERMINED — the tree changed while the gates were running. No receipt written.",
   );
-  console.log(`    HEAD: ${sHead.slice(0, 8)} -> ${eHead.slice(0, 8)}${sHead === eHead ? " (unchanged)" : " (MOVED)"}`);
-  console.log(`    tree: ${sTree.slice(0, 8)} -> ${eTree.slice(0, 8)}${sTree === eTree ? " (unchanged)" : " (CHANGED)"}`);
+  console.log(
+    `    HEAD: ${sHead.slice(0, 8)} -> ${eHead.slice(0, 8)}${sHead === eHead ? " (unchanged)" : " (MOVED)"}`,
+  );
+  console.log(
+    `    tree: ${sTree.slice(0, 8)} -> ${eTree.slice(0, 8)}${sTree === eTree ? " (unchanged)" : " (CHANGED)"}`,
+  );
   console.log("  Re-run on a tree nobody is editing. This is NOT a pass.");
   process.exit(2);
 }

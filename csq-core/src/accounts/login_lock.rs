@@ -687,8 +687,13 @@ mod tests {
             Ok(AcquireOutcome::Acquired(g)) => g,
             other => panic!("helper must acquire the lock, got {other:?}"),
         };
-        std::fs::write(dir.join("ready"), format!("{}\n", std::process::id()))
-            .expect("helper writes ready");
+        // Write-then-rename so `ready` appears COMPLETE in one step. A plain
+        // `fs::write` creates the file before filling it, and the parent polls
+        // for existence: on windows-latest it read the file in that window and
+        // parsed an empty pid (`ParseIntError { kind: Empty }`).
+        let tmp = dir.join("ready.tmp");
+        std::fs::write(&tmp, format!("{}\n", std::process::id())).expect("helper writes ready.tmp");
+        std::fs::rename(&tmp, dir.join("ready")).expect("helper publishes ready");
 
         // Bounded hold: if the parent dies without writing `stop`, exit rather
         // than wedge a CI job forever.

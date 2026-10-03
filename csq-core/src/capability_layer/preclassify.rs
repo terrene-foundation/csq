@@ -81,7 +81,8 @@ impl PipelineStage for PreClassifyStage {
 /// surface).
 ///
 /// Surface-aware one-shot detection (CU2, spec 10 §10.4.2):
-/// - CC / Codex: `--print` / `-p` / `-pX` combinator.
+/// - Codex: `exec` / `e` / `review` subcommands.
+/// - CC: `--print` / `-p` / `-pX` combinator.
 /// - Gemini: `--prompt=<text>` (single-arg) or `--prompt <text>`
 ///   (space-separated). Match EXACT `--prompt` / `--prompt=`, never
 ///   `starts_with("--prompt")` to avoid false positives on
@@ -91,6 +92,14 @@ fn classify(argv: &[String], stdin_is_tty: bool, surface: Surface) -> SpawnMode 
     // piped input has no human at the terminal to interact with.
     if !stdin_is_tty {
         return SpawnMode::OneShot;
+    }
+
+    if surface == Surface::Codex {
+        return if codex_one_shot_prompt(argv).is_some() {
+            SpawnMode::OneShot
+        } else {
+            SpawnMode::Interactive
+        };
     }
 
     // Surface-specific one-shot flag detection.
@@ -114,7 +123,7 @@ fn classify(argv: &[String], stdin_is_tty: bool, surface: Surface) -> SpawnMode 
         return SpawnMode::Interactive;
     }
 
-    // CC / Codex: `--print` / `-p` flag is documented as one-shot mode —
+    // CC: `--print` / `-p` flag is documented as one-shot mode —
     // CC emits the model's output and exits.
     for arg in argv {
         if arg == "--print" || arg == "-p" {
@@ -130,12 +139,233 @@ fn classify(argv: &[String], stdin_is_tty: bool, surface: Surface) -> SpawnMode 
     SpawnMode::Interactive
 }
 
+/// Inspect native Codex argv without confusing option values with subcommands or
+/// prompts. `Some("")` means a noninteractive invocation whose prompt is absent
+/// or comes from stdin; `None` means an interactive or unrelated command.
+///
+/// Codex 0.159.3 uses `-p` for profiles, and accepts global options before the
+/// command. Keep this parser shared by mode selection and prompt classification.
+pub(crate) fn codex_one_shot_prompt(argv: &[String]) -> Option<&str> {
+    let mut positionals: Vec<(&str, bool)> = Vec::new();
+    let mut literal = false;
+    let mut last = false;
+    let mut args = argv.iter().peekable();
+    while let Some(arg) = args.next() {
+        if !literal && arg == "--" {
+            literal = true;
+            continue;
+        }
+        if !literal && arg == "--last" {
+            last = true;
+            continue;
+        }
+        if !literal && arg.starts_with('-') && arg != "-" {
+            // Top-level and exec images are variadic; resume/fork images take
+            // exactly one token. Equals/attached forms terminate the value list.
+            if arg == "-i" || arg == "--image" {
+                args.next();
+                let single_image = matches!(positionals.first(), Some(&("exec" | "e", false)))
+                    && matches!(positionals.get(1), Some(&("resume" | "fork", false)));
+                if !single_image {
+                    while args.peek().is_some_and(|next| !next.starts_with('-')) {
+                        args.next();
+                    }
+                }
+                continue;
+            }
+            let name = arg.split('=').next().unwrap_or(arg);
+            if matches!(
+                name,
+                "-c" | "--config"
+                    | "--enable"
+                    | "--disable"
+                    | "--remote"
+                    | "--remote-auth-token-env"
+                    | "-i"
+                    | "--image"
+                    | "-m"
+                    | "--model"
+                    | "--local-provider"
+                    | "-p"
+                    | "--profile"
+                    | "-s"
+                    | "--sandbox"
+                    | "-C"
+                    | "--cd"
+                    | "--add-dir"
+                    | "-a"
+                    | "--ask-for-approval"
+                    | "--thread-source"
+                    | "--output-schema"
+                    | "--color"
+                    | "-o"
+                    | "--output-last-message"
+                    | "--base"
+                    | "--commit"
+                    | "--title"
+            ) && !arg.contains('=')
+            {
+                args.next();
+            }
+            // Attached short option values (-pwork, -cmodel=...) are contained
+            // in this token; switches have no following value to consume.
+            continue;
+        }
+        positionals.push((arg.as_str(), literal));
+    }
+    let &(command, escaped) = positionals.first()?;
+    if escaped || !matches!(command, "exec" | "e" | "review") {
+        return None;
+    }
+    let mut prompt_index = 1;
+    if command != "review" {
+        if let Some(&(subcommand, false)) = positionals.get(1) {
+            match subcommand {
+                "resume" => {
+                    // --last reinterprets SESSION_ID only if no explicit PROMPT
+                    // was supplied (upstream ResumeArgs::from).
+                    prompt_index = if last && positionals.get(3).is_none() {
+                        2
+                    } else {
+                        3
+                    };
+                }
+                "fork" => prompt_index = 3,
+                "review" => prompt_index = 2,
+                "help" => return None,
+                _ => {}
+            }
+        }
+    }
+    Some(match positionals.get(prompt_index) {
+        Some(&(prompt, _)) if prompt != "-" => prompt,
+        _ => "",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn codex_native_modes_and_prompt_positions() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&["exec", "governance query"], Some("governance query")),
+            (&["e", "query"], Some("query")),
+            (&["review", "review query"], Some("review query")),
+            (&["exec"], Some("")),
+            (&["exec", "-"], Some("")),
+            (
+                &["exec", "resume", "thread-id", "resume query"],
+                Some("resume query"),
+            ),
+            (
+                &["exec", "resume", "--last", "resume query"],
+                Some("resume query"),
+            ),
+            (&["exec", "resume", "thread-id"], Some("")),
+            (
+                &["exec", "resume", "--last", "thread-id", "actual query"],
+                Some("actual query"),
+            ),
+            (&["exec", "resume", "--last", "thread-id", "-"], Some("")),
+            (
+                &["exec", "--image", "one.png", "two.png", "--json"],
+                Some(""),
+            ),
+            (
+                &[
+                    "exec",
+                    "--image",
+                    "one.png",
+                    "two.png",
+                    "--json",
+                    "actual query",
+                ],
+                Some("actual query"),
+            ),
+            (&["--image", "one.png", "two.png", "exec"], None),
+            (
+                &["--image=one.png,two.png", "exec", "actual query"],
+                Some("actual query"),
+            ),
+            (&["-ione.png", "exec", "actual query"], Some("actual query")),
+            (
+                &[
+                    "exec",
+                    "resume",
+                    "--image",
+                    "one.png",
+                    "thread-id",
+                    "actual query",
+                ],
+                Some("actual query"),
+            ),
+            (
+                &["exec", "fork", "thread-id", "fork query"],
+                Some("fork query"),
+            ),
+            (&["exec", "review", "--base", "main"], Some("")),
+            (&["review", "--commit", "sha", "--title", "title"], Some("")),
+            (&["-p", "exec"], None),
+            (&["--profile=exec"], None),
+            (&["-pexec"], None),
+            (&["--model", "exec", "interactive query"], None),
+            (&["--config", "exec", "interactive query"], None),
+            (&["--", "exec"], None),
+            (&["interactive query", "exec"], None),
+            (&["exec", "--", "review"], Some("review")),
+            (&["exec", "--", "-p"], Some("-p")),
+            (&["exec", "help"], None),
+            (
+                &[
+                    "-p",
+                    "work",
+                    "--config",
+                    "model=example",
+                    "exec",
+                    "--output-schema",
+                    "schema.json",
+                    "--image",
+                    "image.png",
+                    "--json",
+                    "query",
+                ],
+                Some("query"),
+            ),
+            (
+                &[
+                    "--enable=multi_agent",
+                    "exec",
+                    "-mexample",
+                    "--color=never",
+                    "query",
+                ],
+                Some("query"),
+            ),
+            (&["--print", "query"], None),
+        ];
+        for &(input, expected) in cases {
+            let argv: Vec<String> = input.iter().map(|arg| (*arg).to_string()).collect();
+            assert_eq!(codex_one_shot_prompt(&argv), expected, "argv: {input:?}");
+            assert_eq!(
+                classify(&argv, true, Surface::Codex),
+                if expected.is_some() {
+                    SpawnMode::OneShot
+                } else {
+                    SpawnMode::Interactive
+                },
+                "argv: {input:?}"
+            );
+        }
+        assert_eq!(
+            classify(&["-p".into(), "work".into()], false, Surface::Codex),
+            SpawnMode::OneShot
+        );
+    }
+
     // ---------------------------------------------------------------
-    // CC / Codex surface tests (existing behavior, unchanged by CU2)
+    // Claude Code surface tests
     // ---------------------------------------------------------------
 
     #[test]

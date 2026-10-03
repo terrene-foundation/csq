@@ -128,7 +128,7 @@ pub struct CodexSpawnPayload {
     /// only (no embedded `\n`, no trailing comments, no multi-line tables).
     /// Origin: PR-CA8 round-2 R2-C1 + round-3 R3-L1.
     pub config_toml_overlay: BTreeMap<String, String>,
-    /// Long-form `instructions = "..."` block written into config.toml.
+    /// Long-form `developer_instructions = "..."` block written into config.toml.
     /// Built by concatenating in-scope rule bodies in deterministic order.
     pub instructions: String,
     /// Sandbox mode for `--sandbox <mode>` argv flag.
@@ -147,7 +147,7 @@ pub struct CodexSpawnPayload {
     /// `ClaudeSpawnPayload::output_schema_directive` and
     /// `GeminiSpawnPayload::output_schema_directive` per spec 10
     /// §10.4.6.1. Delivered to codex via the per-spawn handle-dir
-    /// `config.toml::instructions` block (PR-CA8 commit 2).
+    /// `config.toml::developer_instructions` block (PR-CA8 commit 2).
     ///
     /// Phase 2a deviation per spec 10 §10.4.6: Phase 2b's csq-owns-the-
     /// API-call shape will use native `response_format` enforcement.

@@ -1,6 +1,6 @@
 //! `csq run [N]` — launch Claude Code or Codex with isolated credentials.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use csq_core::accounts::{discovery, markers, AccountSource};
 use csq_core::capability_layer::{
     load_capability_layer_toggles, run_post_spawn_toggled, run_with_layer_toggled,
@@ -1520,7 +1520,7 @@ pub(crate) fn launch_codex(
     // OFF (default for v2.4.0-alpha) or `.coc/` resolves to fallback,
     // the path is the v2.3.1 path verbatim (Inherit branch below).
     // When ON and `.coc/` populated, the per-spawn handle-dir
-    // `config.toml` is materialized with the layer's `instructions`
+    // `config.toml` is materialized with the layer's `developer_instructions`
     // block (spec 10 §10.4.6.1 codex row).
     let layer_control = match run_capability_layer_preflight(
         base_dir,
@@ -1782,7 +1782,7 @@ pub(crate) fn launch_codex(
             ..
         } => {
             // PR-CA8 commit 2: materialize per-spawn config.toml in the
-            // handle dir with the layer's `instructions` block merged
+            // handle dir with the layer's `developer_instructions` block merged
             // in (+ Shard 3a MCP-proxy rewrite when a policy is active).
             // Replaces the symlink at handle_dir/config.toml with a
             // regular file (spec 07 §7.2.2 deviation under the with-layer
@@ -1797,7 +1797,7 @@ pub(crate) fn launch_codex(
             // Fix A (native-delegation gate): suppress the flattened `.coc/`
             // scaffold when the target's native `.codex/` / `AGENTS.md` are
             // present — codex loads its own artifacts, so injecting the full
-            // `.coc/` flatten into `config.toml instructions` duplicated + blew
+            // `.coc/` flatten into `config.toml developer_instructions` duplicated + blew
             // past codex's context window (the `csq run 9` bug). An MCP-policy
             // rewrite (`mcp_wrap`) is orthogonal and still materializes.
             // `CSQ_COC_PARITY_TEST=1` forces injection for parity testing.
@@ -1805,17 +1805,20 @@ pub(crate) fn launch_codex(
             let inject = should_inject_scaffold(Surface::Codex, &cwd, project_root.as_deref());
             // S3 (an internal ticket): deliver codex-native SKILLS through
             // `$CODEX_HOME/skills/` (native progressive disclosure instead of a
-            // flattened prose blob). agents/commands/rules have no native codex
-            // primitive, so they stay prose. The materialization falls back to
+            // flattened prose blob). The current emitter leaves agents, commands,
+            // and rules as prose. The materialization falls back to
             // prose INDEPENDENTLY on failure — nothing is ever dropped.
             let mut skills_native = false;
             if inject && !artifacts.skills.is_empty() {
                 match materialize_codex_native(&handle_dir_abs, &artifacts) {
                     Ok(()) => skills_native = true,
                     Err(e) => {
-                        // Fail-safe: tear down the partial tree; skills fall back
-                        // to prose alongside the other kinds.
-                        let _ = std::fs::remove_dir_all(handle_dir_abs.join("skills"));
+                        if e.downcast_ref::<CodexSkillsPublicationError>().is_some() {
+                            return Err(e)
+                                .context("refusing launch after unsafe Codex skills publication");
+                        }
+                        // The materializer keeps inherited skills intact on error;
+                        // only generated skills fall back to prose.
                         tracing::warn!(
                             error_kind = "coc_codex_native_failed",
                             "codex-native skills materialization failed; falling back to prose: {}",
@@ -1824,7 +1827,7 @@ pub(crate) fn launch_codex(
                     }
                 }
             }
-            // Prose (config.toml `instructions`) = exactly the kinds NOT delivered
+            // Prose (config.toml `developer_instructions`) = exactly the kinds NOT delivered
             // natively. When !inject (project carries its own native `.codex/`),
             // defer entirely — Level-1 behavior byte-unchanged.
             let prose_owned: Option<String> = if !inject {
@@ -2053,7 +2056,7 @@ fn codex_command(base_dir: &Path, account: AccountNum, handle_dir: &Path) -> Res
 /// canonical `config-<N>/config.toml`:
 ///
 /// 1. `instructions` (capability layer, both editions): merge the per-spawn
-///    `instructions = "..."` block via `merge_instructions_via_toml_value`.
+///    `developer_instructions = "..."` block via `merge_instructions_via_toml_value`.
 /// 2. `mcp_wrap` (M6 T6.2 Shard 3a, enterprise-only): rewrite every STDIO
 ///    `[mcp_servers.*]` table so its `command`/`args` route through
 ///    `csq mcp-proxy --envelope <path> -- …`, gating the MCP tool-calls through
@@ -2551,34 +2554,167 @@ fn verify_materialized_dir_is_real(dir: &Path) -> Result<()> {
 
 /// S3 (an internal ticket): materialize codex-native SKILLS into `$CODEX_HOME/skills/`
 /// (the handle dir IS `$CODEX_HOME`, spec 07 §7.2.2). codex has native skill
-/// discovery only — agents (no registry), commands (`prompts/` is TUI-only), and
-/// rules (no native primitive) stay Level-1 prose, so ONLY `skills/` is written.
+/// delivery in the current emitter; agents, commands, and rules stay Level-1
+/// prose here. This describes csq's implementation, not Codex's capabilities.
 ///
-/// Creates a FRESH `<handle_dir>/skills/` (removing any residue first so the pure
-/// [`emit_codex_native`](csq_core::coc::translate::emit_codex_native) writer gets
-/// the clean, csq-owned, non-symlink `dest` its caller-contract requires — the
-/// codex handle-dir symlink set never includes `skills`, so it should not
-/// pre-exist), emits, then re-stats the dir is real before the caller spawns. On
-/// ANY error the partial tree is torn down and the error propagated so the caller
-/// falls back to Level-1 prose for skills too.
+/// Stage generated skills alongside a complete copy of inherited skills. The
+/// baseline may be a directory symlink; its target is never written. Nested
+/// symlinks and special files are rejected explicitly so resource loss cannot
+/// masquerade as successful delivery. Colliding skill names fail to prose.
+/// The original entry survives every build failure and is restored on swap failure.
 fn materialize_codex_native(
     handle_dir_abs: &Path,
     artifacts: &csq_core::coc::translate::SurfaceArtifacts,
 ) -> Result<()> {
+    materialize_codex_native_with_rename(handle_dir_abs, artifacts, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+/// Publication failures are fatal: prose fallback is valid only while the
+/// inherited skills entry remains usable at its original path.
+#[derive(Debug)]
+struct CodexSkillsPublicationError(String);
+
+impl std::fmt::Display for CodexSkillsPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CodexSkillsPublicationError {}
+
+fn materialize_codex_native_with_rename<F>(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+    mut rename: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    materialize_codex_native_with_operations(handle_dir_abs, artifacts, &mut rename, |backup| {
+        if backup.symlink_metadata()?.file_type().is_symlink() {
+            std::fs::remove_file(backup)
+        } else {
+            std::fs::remove_dir_all(backup)
+        }
+    })
+}
+
+fn materialize_codex_native_with_operations<F, C>(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+    mut rename: F,
+    mut cleanup: C,
+) -> Result<()>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+    C: FnMut(&Path) -> std::io::Result<()>,
+{
     use csq_core::coc::translate::emit_codex_native;
 
     let skills_dir = handle_dir_abs.join("skills");
-    if skills_dir.exists() || skills_dir.symlink_metadata().is_ok() {
-        std::fs::remove_dir_all(&skills_dir)
-            .with_context(|| format!("clearing stale {}", redact_path(&skills_dir)))?;
+    let staging = handle_dir_abs.join("skills.coc-staging");
+    let backup = handle_dir_abs.join("skills.coc-baseline");
+    // Never clobber residue or follow an attacker-supplied staging symlink.
+    if backup.symlink_metadata().is_ok() {
+        return Err(CodexSkillsPublicationError(
+            "Codex skills baseline backup already exists; publication state needs recovery"
+                .to_string(),
+        )
+        .into());
     }
-    // The emitter joins `skills/<id>/SKILL.md` under `handle_dir_abs`, so pass the
-    // handle dir as `dest`. On any error, tear down the partial skills/ tree.
-    if let Err(e) = emit_codex_native(artifacts, handle_dir_abs) {
-        let _ = std::fs::remove_dir_all(&skills_dir);
-        return Err(anyhow!("materializing codex-native skills: {e}"));
+    std::fs::create_dir(&staging).context("creating Codex skills staging directory")?;
+    let result = (|| -> Result<()> {
+        // Emit into a fresh owned root before incorporating inherited content.
+        emit_codex_native(artifacts, &staging)
+            .map_err(|e| anyhow!("materializing codex-native skills: {e}"))?;
+        let staged_skills = staging.join("skills");
+        std::fs::create_dir_all(&staged_skills)?;
+        let inherited = match skills_dir.symlink_metadata() {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if inherited {
+            // Following the root link is deliberate; descendants are checked
+            // without following links by copy_codex_inherited_skills.
+            if !skills_dir.is_dir() {
+                bail!("inherited Codex skills entry is not a readable directory");
+            }
+            let emitted: std::collections::BTreeSet<_> = std::fs::read_dir(&staged_skills)?
+                .map(|entry| entry.map(|e| e.file_name().to_string_lossy().to_ascii_lowercase()))
+                .collect::<std::io::Result<_>>()?;
+            for entry in std::fs::read_dir(&skills_dir)? {
+                let entry = entry?;
+                if emitted.contains(&entry.file_name().to_string_lossy().to_ascii_lowercase()) {
+                    bail!(
+                        "generated Codex skill collides with inherited entry {}",
+                        entry.file_name().to_string_lossy()
+                    );
+                }
+            }
+            copy_codex_inherited_skills(&skills_dir, &staged_skills)?;
+        }
+        verify_materialized_dir_is_real(&staged_skills)?;
+        if inherited {
+            rename(&skills_dir, &backup).context("backing up inherited Codex skills")?;
+        }
+        if let Err(error) = rename(&staged_skills, &skills_dir) {
+            if inherited {
+                if let Err(restore) = rename(&backup, &skills_dir) {
+                    return Err(CodexSkillsPublicationError(format!(
+                        "Codex skills installation and baseline restoration failed: {error}; {restore}; baseline retained at {}",
+                        redact_path(&backup)
+                    )).into());
+                }
+            }
+            return Err(error).context("installing staged Codex skills");
+        }
+        // Check the published entry, not only its staging predecessor. A link
+        // or file substituted during publication must abort the launch.
+        verify_materialized_dir_is_real(&skills_dir).map_err(|error| {
+            anyhow!(CodexSkillsPublicationError(format!(
+                "published Codex skills verification failed: {error}; baseline retained at {}",
+                redact_path(&backup)
+            )))
+        })?;
+        if inherited {
+            if let Err(error) = cleanup(&backup) {
+                // Delivery already succeeded; returning Err would duplicate the
+                // installed skills through the caller's prose fallback.
+                tracing::warn!(
+                    error_kind = "coc_codex_baseline_cleanup_failed",
+                    "verified Codex skills installed; retained baseline backup: {}",
+                    csq_core::error::redact_tokens(&error.to_string())
+                );
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Unlike the rule copier, unsupported resources cause an explicit fallback,
+/// preserving the original tree rather than silently omitting symlinks.
+fn copy_codex_inherited_skills(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if kind.is_dir() {
+            std::fs::create_dir(&to)?;
+            copy_codex_inherited_skills(&from, &to)?;
+        } else if kind.is_file() {
+            std::fs::copy(&from, &to)?;
+        } else {
+            bail!(
+                "unsupported symlink or special resource in inherited Codex skills: {}",
+                redact_path(&from)
+            );
+        }
     }
-    verify_materialized_dir_is_real(&skills_dir)?;
     Ok(())
 }
 
@@ -4391,7 +4527,10 @@ fn map_spawn_error(
         // the same shard (see `csq-core/src/providers/gemini/spawn.rs`
         // `SpawnError::ShadowAuth` design-intent comment). Drop the
         // path; keep the actionable variable name + remediation hint.
-        S::ShadowAuth { env_file: _, variable } => anyhow!(
+        S::ShadowAuth {
+            env_file: _,
+            variable,
+        } => anyhow!(
             "refusing Gemini spawn — a `.env` file declares {} which would override the csq-injected key. \
              Remove or rename the variable before retrying, or run `csq run` from a different directory.",
             variable
@@ -6326,6 +6465,283 @@ mod tests {
         assert!(!handle.join("rules").exists());
     }
 
+    #[cfg(unix)]
+    fn inherited_codex_skills_fixture() -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let baseline = dir.path().join("canonical-skills");
+        let handle = dir.path().join("term-codex");
+        std::fs::create_dir_all(baseline.join("keep/references")).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(baseline.join("keep/SKILL.md"), "Read references/details.md").unwrap();
+        std::fs::write(
+            baseline.join("keep/references/details.md"),
+            "operator reference bytes",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&baseline, handle.join("skills")).unwrap();
+        (dir, handle, baseline)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_preserves_inherited_resources() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        materialize_codex_native(&handle, &arts).unwrap();
+        assert!(!handle
+            .join("skills")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        for path in ["keep/SKILL.md", "keep/references/details.md"] {
+            assert_eq!(
+                std::fs::read(handle.join("skills").join(path)).unwrap(),
+                std::fs::read(baseline.join(path)).unwrap()
+            );
+        }
+        assert!(handle.join("skills/SKILL-NEW/SKILL.md").is_file());
+        assert!(!baseline.join("SKILL-NEW").exists());
+        assert!(!handle.join("skills.coc-staging").exists());
+        assert!(!handle.join("skills.coc-baseline").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_roundtrips_binary_executable_and_empty_resources() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        std::fs::create_dir_all(baseline.join("keep/scripts")).unwrap();
+        std::fs::create_dir_all(baseline.join("keep/assets/empty")).unwrap();
+        let script = baseline.join("keep/scripts/check.sh");
+        std::fs::write(&script, b"#!/bin/sh\nprintf resource-ok\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let binary = baseline.join("keep/assets/data.bin");
+        std::fs::write(&binary, [0, 255, 128, 10, 13, 0]).unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+
+        materialize_codex_native(&handle, &arts).unwrap();
+
+        for path in ["keep/scripts/check.sh", "keep/assets/data.bin"] {
+            let delivered = handle.join("skills").join(path);
+            let original = baseline.join(path);
+            assert_eq!(
+                std::fs::read(&delivered).unwrap(),
+                std::fs::read(&original).unwrap()
+            );
+            assert_eq!(
+                std::fs::metadata(&delivered).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            );
+        }
+        assert!(handle.join("skills/keep/assets/empty").is_dir());
+        assert!(!baseline.join("SKILL-NEW").exists());
+        assert!(!handle.join("skills.coc-staging").exists());
+        assert!(!handle.join("skills.coc-baseline").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_bad_id_keeps_baseline() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![
+                rule("SKILL-NEW", "generated", &[]),
+                rule("../bad", "invalid", &[]),
+            ],
+            ..Default::default()
+        };
+        assert!(materialize_codex_native(&handle, &arts).is_err());
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert!(handle.join("skills/keep/references/details.md").is_file());
+        assert!(!handle.join("skills.coc-staging").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_rejects_inherited_case_collision() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("KEEP", "would overwrite operator skill", &[])],
+            ..Default::default()
+        };
+        let error = materialize_codex_native(&handle, &arts).unwrap_err();
+        assert!(error.to_string().contains("collides"));
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert_eq!(
+            std::fs::read_to_string(handle.join("skills/keep/SKILL.md")).unwrap(),
+            "Read references/details.md"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_rejects_linked_resources_without_loss() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        std::os::unix::fs::symlink("details.md", baseline.join("keep/references/alias.md"))
+            .unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        assert!(materialize_codex_native(&handle, &arts)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported symlink"));
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert_eq!(
+            std::fs::read_link(handle.join("skills/keep/references/alias.md")).unwrap(),
+            PathBuf::from("details.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_failed_swap_restores_baseline() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        let result = materialize_codex_native_with_rename(&handle, &arts, |from, to| {
+            if from
+                .parent()
+                .is_some_and(|p| p.ends_with("skills.coc-staging"))
+            {
+                Err(std::io::Error::other("injected swap failure"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("installing staged"));
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert!(handle.join("skills/keep/references/details.md").is_file());
+        assert!(!handle.join("skills.coc-staging").exists());
+        assert!(!handle.join("skills.coc-baseline").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_failed_restore_is_fatal() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        let error = materialize_codex_native_with_rename(&handle, &arts, |from, to| {
+            if from == handle.join("skills") {
+                std::fs::rename(from, to)
+            } else {
+                Err(std::io::Error::other("injected install/restore failure"))
+            }
+        })
+        .unwrap_err();
+        assert!(error
+            .downcast_ref::<CodexSkillsPublicationError>()
+            .is_some());
+        assert_eq!(
+            std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+            baseline
+        );
+        assert!(!handle.join("skills").exists());
+        assert_eq!(
+            std::fs::read_to_string(baseline.join("keep/references/details.md")).unwrap(),
+            "operator reference bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_unresolved_backup_is_fatal() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        std::fs::rename(handle.join("skills"), handle.join("skills.coc-baseline")).unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts::default();
+        let error = materialize_codex_native(&handle, &arts).unwrap_err();
+        assert!(error
+            .downcast_ref::<CodexSkillsPublicationError>()
+            .is_some());
+        assert_eq!(
+            std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+            baseline
+        );
+        assert!(!handle.join("skills").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_substituted_publication_is_fatal() {
+        for replace_with_link in [true, false] {
+            let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+            let arts = csq_core::coc::translate::SurfaceArtifacts {
+                skills: vec![rule("SKILL-NEW", "generated", &[])],
+                ..Default::default()
+            };
+            let error = materialize_codex_native_with_rename(&handle, &arts, |from, to| {
+                std::fs::rename(from, to)?;
+                if from
+                    .parent()
+                    .is_some_and(|p| p.ends_with("skills.coc-staging"))
+                {
+                    std::fs::remove_dir_all(to)?;
+                    if replace_with_link {
+                        std::os::unix::fs::symlink(&baseline, to)?;
+                    } else {
+                        std::fs::write(to, "attacker file")?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(error
+                .downcast_ref::<CodexSkillsPublicationError>()
+                .is_some());
+            assert_eq!(
+                std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+                baseline
+            );
+            assert_eq!(
+                std::fs::read_to_string(baseline.join("keep/references/details.md")).unwrap(),
+                "operator reference bytes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_cleanup_failure_keeps_native_success() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        materialize_codex_native_with_operations(
+            &handle,
+            &arts,
+            |from, to| std::fs::rename(from, to),
+            |_| Err(std::io::Error::other("injected cleanup failure")),
+        )
+        .unwrap();
+        assert!(handle.join("skills/SKILL-NEW/SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+            baseline
+        );
+        assert_eq!(
+            std::fs::read_to_string(baseline.join("keep/references/details.md")).unwrap(),
+            "operator reference bytes"
+        );
+    }
+
     // ── S4 (an internal ticket): gemini-native wiring ──────────────────────────────
 
     /// S4: `materialize_gemini_native` writes skills + commands into `.gemini/`,
@@ -7548,7 +7964,7 @@ mod tests {
     /// `reconcile_keychain_to_marker`, so it could not be driven to its `Err`
     /// arms from a test in THIS crate. `force_sync_for_launch` now checks the
     /// override FIRST, matching its siblings — see
-    /// `foreign_login_unharvested_routes_through_force_sync_for_launch_directly`
+    /// `foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch`
     /// below, which drives the SAME scenario through `force_sync_for_launch`
     /// itself. This test is UNCHANGED and kept alongside it: it still pins
     /// the routing through `force_sync_account_changed` directly, and the
@@ -7657,7 +8073,7 @@ mod tests {
     /// `Ok(true)` short-circuit fires instead.
     #[cfg(target_os = "macos")]
     #[test]
-    fn foreign_login_unharvested_routes_through_force_sync_for_launch_directly() {
+    fn foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch() {
         use csq_core::accounts::identity_store;
         use csq_core::credentials::keychain::{
             clear_test_keychain_executor, set_test_keychain_executor, RawContentClassification,
@@ -7716,7 +8132,7 @@ mod tests {
         });
         let foreign_json = serde_json::to_string(&foreign).unwrap();
         let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
-            RawContentClassification::Content(foreign_json),
+            RawContentClassification::Content(foreign_json.clone()),
         ));
         set_test_keychain_executor(exec);
 
@@ -7726,17 +8142,17 @@ mod tests {
             csq_core::credentials::keychain::force_sync_for_launch(base.path(), &handle_dir_abs);
         clear_test_keychain_executor();
 
-        assert_eq!(
-            result,
-            Err(
-                "the keychain holds a login csq could not identify as this account's own; \
-                 nothing was changed — if it belongs to a different account, run `csq login \
-                 <n>` for that account to establish ownership, then retry the launch"
-                    .to_string()
-            ),
-            "force_sync_for_launch must reach the ForeignLoginUnharvested Err arm, not the \
-             trivial Ok(true) short-circuit, when a test executor is installed"
-        );
+        // A fresh launch dir no longer refuses: the unidentified item is
+        // saved to the quarantine dir and replaced. (Ok(true) = mirror
+        // applied; the old trivial short-circuit would also be Ok(true), so
+        // the quarantine file below is what proves the foreign path ran.)
+        assert_eq!(result, Ok(true), "{result:?}");
+        let qdir = base.path().join("keychain-quarantine");
+        let saved: Vec<_> = std::fs::read_dir(&qdir)
+            .expect("quarantine dir must exist")
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(saved, vec![foreign_json], "exact foreign payload saved");
     }
 
     // ============================================================
@@ -7978,10 +8394,11 @@ mod tests {
             body.contains("model"),
             "canonical model key must survive merge: {body}"
         );
-        assert!(
-            body.contains("Cite RULE_IDs"),
-            "scaffold body must reach instructions: {body}"
-        );
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(parsed["developer_instructions"].as_str(), Some(scaffold));
+        assert!(parsed.get("instructions").is_none());
+        let canonical = std::fs::read_to_string(canonical_dir.join("config.toml")).unwrap();
+        assert!(!canonical.contains("developer_instructions"));
     }
 
     /// M6 T6.2 Shard 3a: the MCP-wrap materialization path rewrites the

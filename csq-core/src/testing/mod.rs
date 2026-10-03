@@ -14,3 +14,16 @@
 //! `discovery_test_utils_feature_gate_pattern`.
 
 pub mod identity_fixtures;
+
+/// Serialises every test in this crate that installs a scoped tracing
+/// dispatcher (`tracing::subscriber::with_default`) to capture events.
+///
+/// `with_default` is thread-local, but entering and leaving it also updates
+/// tracing's process-global max-level filter, which `warn!` consults before
+/// dispatching. Two captures running concurrently can transiently lower that
+/// filter while the other thread's event is evaluated, so the capture sees
+/// nothing: a false RED for "event emitted" and a false GREEN for "no event".
+/// One lock shared by every capturing test closes that window. A test that
+/// reaches a captured callsite WITHOUT capturing it takes the lock too: its
+/// first hit can cache the callsite as disabled mid-capture.
+pub static TRACING_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

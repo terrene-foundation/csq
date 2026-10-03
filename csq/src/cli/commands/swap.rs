@@ -547,7 +547,19 @@ fn read_codex_account_id(base_dir: &Path, slot: AccountNum) -> Option<String> {
 
 /// PR-C7 entry point. `yes` bypasses the cross-surface confirmation
 /// prompt (INV-P05 `--yes`).
+///
+/// A swap is an operator-initiated command, so its keychain calls run inside
+/// `with_interactive_keychain`: a macOS password dialog gets the interactive
+/// bound instead of being killed after the 5s non-interactive bound. The
+/// whole synchronous body runs on this thread; the daemon's `auto_rotate`
+/// does not pass through here and stays non-interactive.
 pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
+    csq_core::credentials::keychain::with_interactive_keychain(|| {
+        handle_inner(base_dir, target, yes)
+    })
+}
+
+fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     let source = detect_source_handle(base_dir, target)?;
     let target_surface = resolve_target_surface(base_dir, target)?;
 

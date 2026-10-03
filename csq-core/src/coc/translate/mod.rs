@@ -71,7 +71,7 @@ pub fn translate(coc_set: &CocSet, surface: Surface, host_ctx: &HostContext) -> 
         // hermes-parity an internal journal entry + 0133 supersession). The prior
         // Codex-aliasing route was inert in both directions: `codex::
         // translate` emits a `CodexSpawnPayload.instructions` field destined
-        // for `~/.codex/config.toml::instructions`, a key Kimi's config
+        // for `~/.codex/config.toml::developer_instructions`, a key Kimi's config
         // schema does not have and Grok never reads at all (harness-
         // decomposition reports 13 §5.1 / 14 §6.2). Neither vendor's actual
         // read path — `<KIMI_CODE_HOME>/AGENTS.md` / `$GROK_HOME/AGENTS.md`
@@ -84,7 +84,7 @@ pub fn translate(coc_set: &CocSet, surface: Surface, host_ctx: &HostContext) -> 
 /// FR-CL-01 system-prompt directive instructing the model to emit a
 /// `{"rule_id","decision","rationale"}` JSON envelope for compliance-class
 /// prompts. Surface-agnostic: same directive text reaches each Surface through its per-Surface
-/// delivery mechanism (CC env var / Codex `instructions` block in
+/// delivery mechanism (CC env var / Codex `developer_instructions` block in
 /// config.toml / Gemini `system_instruction` field in settings.json /
 /// Kimi `AGENTS.md` prose / Grok `--rules` flag).
 ///

@@ -2153,6 +2153,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -2222,6 +2226,10 @@ mod tests {
 
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(80));
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -2403,6 +2411,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -2485,6 +2497,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -3205,6 +3221,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -3304,6 +3324,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -3822,6 +3846,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -3885,6 +3913,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -4182,6 +4214,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -4239,6 +4275,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -4314,6 +4354,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -4424,6 +4468,10 @@ mod tests {
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             sup::write_swap_request(&handle_dir_for_writer, &req).expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -4585,6 +4633,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -4714,6 +4766,10 @@ mod tests {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             sup::write_swap_request(&handle_dir_for_writer, &req).expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }
@@ -4820,6 +4876,10 @@ mod tests {
                 },
             )
             .expect("write swap request");
+            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
+            // first: a signal raised before `run_supervised` installs it would
+            // otherwise take the default action and kill the test process.
+            ensure_signal_handlers_installed();
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
             }

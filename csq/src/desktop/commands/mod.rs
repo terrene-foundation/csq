@@ -834,8 +834,21 @@ fn warn_outcome_emit_failed(account: u16, e: &csq_core::audit::persist::AuditV2E
     );
 }
 
+/// Async so the UI thread never waits on the keychain: the interactive
+/// keychain bound inside `logout_account` is up to 60s per call (a password
+/// dialog the user may be answering). The body, including its
+/// `with_interactive_keychain` scope, runs on one blocking-pool thread.
 #[tauri::command]
-pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSummary, String> {
+pub async fn remove_account(
+    base_dir: String,
+    account: u16,
+) -> Result<RemoveAccountSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || remove_account_blocking(base_dir, account))
+        .await
+        .map_err(|e| format!("remove_account task join error: {e}"))?
+}
+
+fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccountSummary, String> {
     use csq_core::accounts::logout::{logout_account, LogoutError};
     use csq_core::audit::op_emit;
     use csq_core::audit::types::{
@@ -947,7 +960,11 @@ pub fn remove_account(base_dir: String, account: u16) -> Result<RemoveAccountSum
         None
     };
 
-    match logout_account(&base, account_num) {
+    // User-initiated: keychain clears in this logout may raise the unlock
+    // dialog even though the desktop process is declared background.
+    match csq_core::credentials::keychain::with_interactive_keychain(|| {
+        logout_account(&base, account_num)
+    }) {
         Ok(s) => {
             // Best-effort daemon cache invalidation. Mirrors `csq logout`.
             #[cfg(unix)]
@@ -4193,7 +4210,9 @@ pub async fn complete_codex_login(
     let child_slot_for_cleanup = child_slot.clone();
 
     tokio::task::spawn_blocking(move || {
-        let result = csq_core::providers::codex::desktop_login::complete_login(
+        // User-initiated login: the Codex keychain purge in it may prompt.
+        let result = csq_core::credentials::keychain::with_interactive_keychain(|| {
+            csq_core::providers::codex::desktop_login::complete_login(
             &base,
             account_num,
             purge_keychain,
@@ -4208,6 +4227,7 @@ pub async fn complete_codex_login(
                 let _ = app_for_task.emit_to("main", "codex-device-code", &info);
             },
         )
+        })
         // an internal journal entry finding M3: pass the full anyhow chain
         // through `redact_tokens` before it reaches the renderer.
         // Defense-in-depth — inner call sites already redact, but
@@ -8932,7 +8952,7 @@ mod tests {
         let _shared_env_guard = csq_core::platform::test_env::lock();
         let prev = std::env::var("CSQ_SECRET_BACKEND").ok();
         unsafe { std::env::set_var("CSQ_SECRET_BACKEND", "in-memory") };
-        let result = remove_account(base.to_string_lossy().into_owned(), 3);
+        let result = remove_account_blocking(base.to_string_lossy().into_owned(), 3);
         match prev {
             Some(v) => unsafe { std::env::set_var("CSQ_SECRET_BACKEND", v) },
             None => unsafe { std::env::remove_var("CSQ_SECRET_BACKEND") },
@@ -8980,7 +9000,7 @@ mod tests {
         let _shared_env_guard = csq_core::platform::test_env::lock();
         let prev = std::env::var("CSQ_SECRET_BACKEND").ok();
         unsafe { std::env::set_var("CSQ_SECRET_BACKEND", "in-memory") };
-        let result = remove_account(base.to_string_lossy().into_owned(), 5);
+        let result = remove_account_blocking(base.to_string_lossy().into_owned(), 5);
         match prev {
             Some(v) => unsafe { std::env::set_var("CSQ_SECRET_BACKEND", v) },
             None => unsafe { std::env::remove_var("CSQ_SECRET_BACKEND") },
@@ -9036,7 +9056,7 @@ mod tests {
         std::fs::write(creds_dir.join("1.json"), "{}").unwrap();
 
         // No CSQ_SECRET_BACKEND override — vault open must NOT be reached.
-        let result = remove_account(base.to_string_lossy().into_owned(), 1);
+        let result = remove_account_blocking(base.to_string_lossy().into_owned(), 1);
         assert!(
             result.is_ok(),
             "remove_account for ClaudeCode slot must succeed: {result:?}"
@@ -9642,7 +9662,7 @@ mod tests {
             .expect("vault must contain the provisioned key");
 
         // Drive the desktop's remove path against the same base_dir.
-        let result = remove_account(base.to_string_lossy().into_owned(), 99);
+        let result = remove_account_blocking(base.to_string_lossy().into_owned(), 99);
         assert!(result.is_ok(), "remove_account must succeed: {result:?}");
 
         assert!(

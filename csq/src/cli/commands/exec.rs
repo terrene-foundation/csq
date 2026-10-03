@@ -880,6 +880,12 @@ fn spawn_capture(
 
     let mut out = child.stdout.take().expect("stdout piped");
     let mut err = child.stderr.take().expect("stderr piped");
+    // Record the child so handle-dir liveness sees it even if csq is killed
+    // (macOS has no parent-death signal; `.live-pid` names csq, not claude).
+    if let Err(e) = csq_core::accounts::markers::write_live_cc_pid(handle_dir_abs, child.id()) {
+        tracing::debug!(error = %e, "csq exec: could not record the claude child PID");
+    }
+
     let out_reader = thread::spawn(move || capture_bounded(&mut out, MAX_CAPTURE_BYTES));
     let err_reader = thread::spawn(move || capture_bounded(&mut err, MAX_CAPTURE_BYTES));
 

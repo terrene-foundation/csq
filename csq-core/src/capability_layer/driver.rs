@@ -214,13 +214,13 @@ pub fn run_with_layer_toggled(
 
     // Prompt classifier (FR-CL classifier; spec 10 §10.7) — runs
     // BEFORE scaffold per the canonical order in spec 10 §10.2.1.
-    // Extracts the prompt from one-shot argv (`--print` / `-p`); for
+    // Extracts the prompt from surface-native one-shot argv; for
     // interactive launches the prompt is empty here and the
     // classifier falls through to its fail-secure Compliance default
     // because csq cannot see the per-turn prompt at preflight.
     // PR-CA7b moves classification per-turn for the interactive path
     // when the post-validation PTY shape lands.
-    let prompt = extract_prompt_from_argv(&argv);
+    let prompt = extract_prompt_from_argv(&argv, surface);
     let keywords = build_keyword_index(&coc_set, surface);
     let mut class = PromptClass::PR_CA4_DEFAULT;
     match ClassifierStage::run(
@@ -311,22 +311,29 @@ pub fn extract_rule_ids_in_scope(coc_set: &CocSet, surface: Surface) -> BTreeSet
 
 /// Extract a one-shot prompt from argv. Recognizes:
 ///
-/// - CC/Codex: `--print PROMPT`, `--print=PROMPT`, `-p PROMPT`,
+/// - Codex: native `exec` / `e` / `review`, including exec resume/fork/review.
+/// - CC: `--print PROMPT`, `--print=PROMPT`, `-p PROMPT`,
 ///   `-pPROMPT` short combinator.
 /// - Gemini (CU2, an internal ticket): `--prompt PROMPT`, `--prompt=PROMPT`.
 ///
-/// Surface-agnostic extraction is correct here: only Gemini argv
-/// carries `--prompt`, and only CC argv carries `--print`/`-p`, so
-/// there is no cross-surface ambiguity in practice. Returns an empty
+/// Extraction is surface-aware: Codex `-p` selects a profile, while
+/// Claude `-p` and Gemini `--prompt` introduce one-shot prompts. Returns an empty
 /// `UserPrompt` for interactive launches — the classifier's
 /// fail-secure path then handles them.
 ///
 /// Pure function; deterministic; no side effects.
-fn extract_prompt_from_argv(argv: &[String]) -> UserPrompt {
+fn extract_prompt_from_argv(argv: &[String], surface: Surface) -> UserPrompt {
+    if surface == Surface::Codex {
+        return UserPrompt {
+            text: super::preclassify::codex_one_shot_prompt(argv)
+                .unwrap_or_default()
+                .to_string(),
+        };
+    }
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        // CC / Codex: space-separated `--print PROMPT` or `-p PROMPT`.
-        if arg == "--print" || arg == "-p" {
+        // CC: space-separated `--print PROMPT` or `-p PROMPT`.
+        if surface != Surface::Gemini && (arg == "--print" || arg == "-p") {
             // Next arg is the prompt; if missing, return empty.
             if let Some(next) = iter.next() {
                 return UserPrompt { text: next.clone() };
@@ -335,20 +342,27 @@ fn extract_prompt_from_argv(argv: &[String]) -> UserPrompt {
                 text: String::new(),
             };
         }
-        if let Some(rest) = arg.strip_prefix("--print=") {
+        if let Some(rest) = arg
+            .strip_prefix("--print=")
+            .filter(|_| surface != Surface::Gemini)
+        {
             return UserPrompt {
                 text: rest.to_string(),
             };
         }
         // CC `-pX` short combinator (no space). Same `-p` test the
         // pre-classifier uses for one-shot mode (spec 10 §10.4.2).
-        if arg.starts_with("-p") && !arg.starts_with("--") && arg.len() > 2 {
+        if surface != Surface::Gemini
+            && arg.starts_with("-p")
+            && !arg.starts_with("--")
+            && arg.len() > 2
+        {
             return UserPrompt {
                 text: arg[2..].to_string(),
             };
         }
         // Gemini (CU2): `--prompt PROMPT` space-separated form.
-        if arg == "--prompt" {
+        if surface == Surface::Gemini && arg == "--prompt" {
             if let Some(next) = iter.next() {
                 return UserPrompt { text: next.clone() };
             }
@@ -357,7 +371,10 @@ fn extract_prompt_from_argv(argv: &[String]) -> UserPrompt {
             };
         }
         // Gemini (CU2): `--prompt=PROMPT` single-arg form.
-        if let Some(rest) = arg.strip_prefix("--prompt=") {
+        if let Some(rest) = arg
+            .strip_prefix("--prompt=")
+            .filter(|_| surface == Surface::Gemini)
+        {
             return UserPrompt {
                 text: rest.to_string(),
             };
@@ -770,11 +787,11 @@ mod tests {
     }
 
     /// PR-CA7a + CU2: `extract_prompt_from_argv` recognizes all
-    /// supported one-shot forms — CC/Codex and Gemini.
+    /// supported one-shot forms — Claude Code and Gemini.
     #[test]
     fn extract_prompt_from_argv_recognizes_all_one_shot_forms() {
         let cases: &[(&[&str], &str)] = &[
-            // CC / Codex forms (unchanged)
+            // Claude Code forms
             (&["--print", "hello world"], "hello world"),
             (&["--print=hello world"], "hello world"),
             (&["-p", "hello world"], "hello world"),
@@ -788,13 +805,56 @@ mod tests {
         ];
         for (argv_strs, expected) in cases {
             let argv: Vec<String> = argv_strs.iter().map(|s| s.to_string()).collect();
-            let prompt = extract_prompt_from_argv(&argv);
+            let surface = if argv.first().is_some_and(|arg| arg.starts_with("--prompt")) {
+                Surface::Gemini
+            } else {
+                Surface::ClaudeCode
+            };
+            let prompt = extract_prompt_from_argv(&argv, surface);
             assert_eq!(
                 prompt.text, *expected,
                 "argv {argv:?} must extract prompt {expected:?}, got {:?}",
                 prompt.text
             );
         }
+    }
+
+    #[test]
+    fn codex_prompt_extraction_uses_native_subcommands_and_excludes_profiles() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["exec", "--output-schema", "shape.json", "query"], "query"),
+            (&["-p", "work", "e", "query"], "query"),
+            (&["review", "--base", "main"], ""),
+            (&["exec", "resume", "--last", "query"], "query"),
+            (&["exec", "resume", "thread-id", "query"], "query"),
+            (&["exec", "resume", "--last", "thread-id", "query"], "query"),
+            (&["exec", "--image", "one.png", "two.png", "--json"], ""),
+            (&["exec", "review", "query"], "query"),
+            (&["-p", "work"], ""),
+            (&["--prompt", "query"], ""),
+            (&["--print", "query"], ""),
+        ];
+        for &(input, expected) in cases {
+            let argv: Vec<String> = input.iter().map(|arg| (*arg).to_string()).collect();
+            assert_eq!(
+                extract_prompt_from_argv(&argv, Surface::Codex).text,
+                expected,
+                "argv: {input:?}"
+            );
+        }
+        assert_eq!(
+            extract_prompt_from_argv(&["-p".into(), "query".into()], Surface::ClaudeCode).text,
+            "query"
+        );
+        assert_eq!(
+            extract_prompt_from_argv(&["-p".into(), "query".into()], Surface::Gemini).text,
+            ""
+        );
+        assert_eq!(
+            extract_prompt_from_argv(&["--prompt".into(), "query".into()], Surface::ClaudeCode)
+                .text,
+            ""
+        );
     }
 
     /// PR-CA7b1: `extract_rule_ids_in_scope` includes a rule with

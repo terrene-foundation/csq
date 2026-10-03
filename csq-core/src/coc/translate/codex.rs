@@ -2,7 +2,7 @@
 //!
 //! Maps a `CocSet` to a `CodexSpawnPayload` per spec 09 + spec 07
 //! §7.2.2/§7.3.3/§7.7.2. The capability layer's spawn step writes the
-//! `instructions` block to `~/.codex/config.toml` (handle-dir copy)
+//! `developer_instructions` block to `~/.codex/config.toml` (handle-dir copy)
 //! and applies the sandbox-mode argv flag.
 //!
 //! Note: codex has no native MCP allowlist as of 2026-04 (per FR-DISP-03);
@@ -52,7 +52,7 @@ pub fn translate(coc_set: &CocSet) -> CodexSpawnPayload {
         mcp_filter: McpFilter::default(),
         contributing_ids,
         // PR-CA8 commit 1a: Surface-agnostic structured-output directive.
-        // Delivered into config.toml::instructions by csq-cli's
+        // Delivered into config.toml::developer_instructions by csq-cli's
         // materialize_handle_config_toml helper at spawn time (PR-CA8
         // commit 2; renamed from _with_instructions in M6 T6.2 Shard 3a
         // when the MCP-proxy rewrite transform was composed in).
@@ -236,7 +236,7 @@ mod tests {
     /// PR-CA8 commit 1a: every Codex payload carries the FR-CL-01
     /// structured-output directive (Surface-agnostic body shared with
     /// CC + Gemini per spec 10 §10.4.6.1). Delivered to codex via the
-    /// per-spawn handle-dir `config.toml::instructions` block in
+    /// per-spawn handle-dir `config.toml::developer_instructions` block in
     /// PR-CA8 commit 2.
     #[test]
     fn output_schema_directive_present_on_codex_payload() {

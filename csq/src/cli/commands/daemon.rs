@@ -50,6 +50,9 @@ use std::sync::Arc;
 /// is stopped (socket removed) and the PID file is removed via
 /// `PidFile`'s Drop impl.
 pub fn handle_start(base_dir: &Path) -> Result<()> {
+    // Background keychain work must never raise the unlock dialog, even when
+    // this foreground daemon was started from a terminal.
+    csq_core::credentials::keychain::declare_background_keychain_process();
     // an internal ticket: an explicit start always undoes a prior explicit stop —
     // clear FIRST, before anything else can observe the sentinel.
     daemon::clear_stop_requested(base_dir);
@@ -125,6 +128,7 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
 /// `ProgramArguments`; users still run `csq daemon start` (foreground) or
 /// `-d` (background) directly.
 pub fn handle_start_supervised(base_dir: &Path) -> Result<()> {
+    csq_core::credentials::keychain::declare_background_keychain_process();
     // an internal ticket: this is also the path a reboot takes via launchd/systemd
     // `RunAtLoad` — the crash-recovery boundary for a stop-requested
     // sentinel left set by an unclean shutdown. Clear FIRST.

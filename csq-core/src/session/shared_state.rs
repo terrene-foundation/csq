@@ -11490,11 +11490,13 @@ mod tests {
         // T4: a PRIVATE $HOME for these tests — never the real one, so this
         // test never touches (or `remove_file`s anything under) the actual
         // operator's home directory. `std::env::set_var` is process-global,
-        // so a lock is required against other tests in this SAME process
-        // that also read/mutate `$HOME`, matching the `ENV_LOCK` pattern
-        // already used elsewhere in this crate for the same class of test
-        // (`platform::secret::file`/`mod.rs`).
-        static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // so each test holds the crate-wide `platform::test_env::lock()` —
+        // the SAME mutex every other HOME-mutating test in this crate
+        // (`error.rs`, `cli_deps::*`, `accounts::login`, and the other
+        // `shared_state` tests) holds. A module-local mutex here did NOT
+        // serialize against those writers: a concurrent `set_var("HOME")`
+        // changed what `redact_home_anywhere` read mid-call, so the raw
+        // private path leaked into the error string.
 
         /// M3/T4: a failing sqlite3 invocation against a source path that
         /// does not exist. The failure is NOT `ATTACH DATABASE` — it is
@@ -11512,7 +11514,7 @@ mod tests {
             let Some(bin) = require_sqlite3() else {
                 return;
             };
-            let _env_guard = HOME_ENV_LOCK.lock().unwrap();
+            let _env_guard = crate::platform::test_env::lock();
             let private_home = TempDir::new().unwrap();
             let real_home = std::env::var_os("HOME");
             std::env::set_var("HOME", private_home.path());
@@ -11578,7 +11580,7 @@ mod tests {
             let Some(bin) = require_sqlite3() else {
                 return;
             };
-            let _env_guard = HOME_ENV_LOCK.lock().unwrap();
+            let _env_guard = crate::platform::test_env::lock();
             let tmp_root = TempDir::new().unwrap();
             let private_home = tmp_root.path().join("home with space");
             fs::create_dir_all(&private_home).unwrap();

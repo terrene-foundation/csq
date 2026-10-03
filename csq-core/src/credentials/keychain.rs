@@ -1173,21 +1173,29 @@ pub fn lock_handle_dir_for_swap(
 /// directly since v4) each hold this SAME lock across the FULL guarded span
 /// of a swap transition: [`force_sync_account_changed`] (ONE RMW — a single
 /// `find` + a single `add`/`delete`, EACH call bounded at
-/// [`KEYCHAIN_OP_TIMEOUT`] + [`MIN_POST_EXIT_GRACE`] = 5.25s per call — see
-/// `write_raw`'s own doc, which derives the identical per-call figure —
-/// so this RMW's true worst case is `2 * 5.25s` = **10.5s**, NOT
-/// `2 * KEYCHAIN_OP_TIMEOUT` = 10s) → `repoint_handle_dir` (fast fs symlink
+/// [`KEYCHAIN_OP_TIMEOUT`] + [`MIN_POST_EXIT_GRACE`] = 5.25s per call. The
+/// write is now delete-then-create, so the RMW's `security` calls are the
+/// outer `find`, 1 to [`MAX_DUPLICATE_DELETE_ITERATIONS`] (5) deletes, the
+/// add, and at most one siblings-only re-add after a failed add: 4 to 8
+/// calls, so **8 * 5.25s = 42s** non-interactive worst case) → `repoint_handle_dir` (fast fs symlink
 /// work) → `begin_swap_audit`/`finish_swap_audit` (the audit-chain
 /// INTENT/RESULT record writes). v4 ("switch now or say so") removed the
 /// SEPARATE post-repoint sync this doc previously enumerated here — the
 /// keychain write happens exactly ONCE, before the repoint, not once before
-/// and once after — so the guarded span's `security`-call budget is now
-/// this single 10.5s RMW, not 10.5s (clear) + 15.75s (a second full sync).
+/// and once after — so the guarded span's `security`-call budget is this
+/// single RMW (4 to 8 calls, above), not a clear plus a second full sync.
 ///
-/// **TRUE holder worst case: `10.5s` (the one RMW) + UNBOUNDED (repoint +
+/// **Interactive swaps (K2): inside [`with_interactive_keychain`] (and only
+/// there; a bare TTY keeps 5s) each `security` call is bounded by
+/// [`KEYCHAIN_INTERACTIVE_OP_TIMEOUT`] (60s) instead, so the holder bound for
+/// the RMW's calls is up to `8 * (60s + MIN_POST_EXIT_GRACE)` = 482s (the 4 to
+/// 8 calls above), not 42s. Waiters already treat `TimedOut` as "skip the
+/// mirror".**
+///
+/// **TRUE holder worst case (non-interactive): `42s` (the one RMW) + UNBOUNDED (repoint +
 /// audit-chain fs work — neither is `security`-shelling, so neither is
 /// bounded by [`KEYCHAIN_OP_TIMEOUT`]; a stalled filesystem is not modeled
-/// here) — at minimum **10.5s** in the `security`-call budget alone, before
+/// here) — at minimum **42s** in the `security`-call budget alone, before
 /// whatever the repoint+audit step actually costs on a given host.**
 ///
 /// **This bound (20.25s, derived below) does NOT cover that span, and is
@@ -1495,12 +1503,11 @@ fn delete_service_retrying(svc: &str) -> Option<std::process::Output> {
 /// said `write_raw` "already loops for exactly this reason" and that
 /// `delete_keychain_item`'s single-shot delete relied on "the next
 /// account-changed write's delete-loop" to clear stragglers — both
-/// describe the PRE-v3 delete-all-then-create-one design. Current v3
-/// `write_raw` (`write_raw_with_executor`) is update-in-place: exactly
-/// one `find` plus, at most, one `add` — it never issues a `delete` at all
-/// (pinned by `s10_write_raw_content_x_is_exactly_one_add_no_delete`), so
-/// it has no delete-loop for this constant to be "the same value for
-/// consistency" with anymore. [`drain_service`] (and this constant) now
+/// describe the PRE-v3 delete-all-then-create-one design. The v3 write
+/// path (since retired; its executor-level successor is
+/// `KeychainExecutor::add`) was update-in-place with `-U`; that is itself
+/// superseded: `add` now deletes (looping to exit 44, bounded by this same
+/// constant) and then creates, so a write DOES issue deletes. [`drain_service`] (and this constant) now
 /// exist solely for the CLEAR/logout-adjacent paths —
 /// [`clear_service_reporting`], reached from the pending-clears queue
 /// populated at `csq logout` time (`accounts::logout`) and by the
@@ -1509,12 +1516,11 @@ fn delete_service_retrying(svc: &str) -> Option<std::process::Output> {
 /// afterward to naturally clobber a straggler.
 ///
 /// **Why a duplicate could be resident at all, under v3: NOT created by
-/// current `write_raw` (it cannot — it never deletes, so it cannot race
-/// its own delete against another call's create). A resident duplicate
-/// can only be a LEFTOVER from before this module's v3 migration, or from
-/// out-of-band keychain manipulation (an operator, or a future
-/// regression) — never expected to occur from v3's own steady-state
-/// operation, but "not expected" is not "cannot happen", which is exactly
+/// the write path: `KeychainExecutor::add` deletes (to exit 44) then
+/// creates, and two concurrent writers are serialized by the swap lock, so
+/// it is not expected to leave one. A resident duplicate is a LEFTOVER from
+/// an older csq, or from out-of-band keychain manipulation (an operator, or
+/// a future regression) — "not expected" is not "cannot happen", which is exactly
 /// why this drain loop still runs on every clear rather than assuming a
 /// single delete always suffices.**
 ///
@@ -2019,12 +2025,67 @@ fn decide_and_clear_queued_service_with_executor(
                     }
                 }
             }
-            warn!(
-                error_kind = "keychain_pending_clear_unmatched_kept",
-                "pending-clear retry: item holds a login unmatched to the \
-                 recorded marker account and could not be confirmed; kept, \
-                 not deleted (stays queued, backed off, never dropped)"
-            );
+            // The entry exists because its handle dir is GONE, so an item
+            // that stays unidentified belongs to a dead terminal and would
+            // collide with a recycled PID. Save it, then delete it. Only when
+            // no directory that hashes to this service exists (a re-created
+            // dir may have a live owner), and only if the save succeeded;
+            // otherwise keep it as before.
+            if let RawContentClassification::Content(raw) = &x {
+                if !handle_dir_exists_for_service(base_dir, svc)
+                    && quarantine_foreign_item(base_dir, svc, raw).is_ok()
+                {
+                    // Re-check immediately before the delete: a dir created
+                    // since the first check may have a live owner.
+                    if handle_dir_exists_for_service(base_dir, svc) {
+                        warn!(
+                            error_kind = "keychain_pending_clear_quarantined_dir_reappeared",
+                            svc_hash = quarantine_svc_hash(svc),
+                            "pending-clear retry: an unidentified login was saved to the \
+                             quarantine folder, but its handle dir reappeared before the \
+                             delete; kept and stays queued"
+                        );
+                        return Err(KeychainClearUnconfirmed);
+                    }
+                    // Absent view: delete the whole item, merge nothing.
+                    let outcome = apply_dead_handle_strip(
+                        exec,
+                        svc,
+                        &ours,
+                        &RawContentClassification::Absent,
+                    );
+                    return match outcome {
+                        Ok(true) => {
+                            warn!(
+                                error_kind = "keychain_pending_clear_quarantined_foreign_item",
+                                svc_hash = quarantine_svc_hash(svc),
+                                "pending-clear retry: an unidentified login for a dead \
+                                 handle dir was saved to the quarantine folder and removed"
+                            );
+                            Ok(true)
+                        }
+                        Ok(false) | Err(_) => {
+                            warn!(
+                                error_kind =
+                                    "keychain_pending_clear_quarantined_removal_unconfirmed",
+                                svc_hash = quarantine_svc_hash(svc),
+                                "pending-clear retry: an unidentified login for a dead \
+                                 handle dir was saved to the quarantine folder but its \
+                                 removal is unconfirmed; stays queued"
+                            );
+                            Err(KeychainClearUnconfirmed)
+                        }
+                    };
+                }
+            }
+            if warn_due(svc) {
+                warn!(
+                    error_kind = "keychain_pending_clear_unmatched_kept",
+                    "pending-clear retry: item holds a login unmatched to the \
+                     recorded marker account and could not be confirmed; kept, \
+                     not deleted (stays queued, backed off, never dropped)"
+                );
+            }
             // `Err`, not `Ok(false)` — DELIBERATELY different from
             // `decide_and_clear_dead_handle`'s choice for its own
             // structurally-identical branch. That function returns
@@ -3381,7 +3442,7 @@ fn sweep_pending_clears_inner(
     // queue after a sweep means live keychain items are STILL uncleared;
     // that must be visible somewhere, not only inferable from a returned
     // tuple nobody reads.
-    if remaining > 0 {
+    if remaining > 0 && warn_due("pending-clears-remaining") {
         warn!(
             error_kind = "keychain_pending_clears_remaining",
             cleared,
@@ -3991,6 +4052,29 @@ fn read_raw_keychain(config_dir: &Path) -> Option<String> {
 #[cfg(target_os = "macos")]
 const KEYCHAIN_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Per-call bound when the operator is present to answer a macOS password
+/// dialog: used only inside [`with_interactive_keychain`].
+/// [`KEYCHAIN_OP_TIMEOUT`] would kill the `security` call before a person can
+/// type a password, leaving an orphaned dialog and a "could not be read"
+/// result.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+const KEYCHAIN_INTERACTIVE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The per-call `security` bound. The long bound applies ONLY inside the
+/// explicit [`with_interactive_keychain`] scope (`in_interactive_scope`); a
+/// process that merely has a terminal on stdin keeps [`KEYCHAIN_OP_TIMEOUT`],
+/// so an unrelated stalled call never holds a lock for a minute.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+fn security_op_timeout(in_interactive_scope: bool) -> std::time::Duration {
+    if in_interactive_scope {
+        KEYCHAIN_INTERACTIVE_OP_TIMEOUT
+    } else {
+        KEYCHAIN_OP_TIMEOUT
+    }
+}
+
 /// Poll interval for [`run_security_bounded`]'s `try_wait` loop. Small enough
 /// that the loop's own granularity is negligible against
 /// [`KEYCHAIN_OP_TIMEOUT`] (5s / 20ms = 250 polls in the worst case), large
@@ -4105,6 +4189,11 @@ impl fmt::Debug for BoundedOutput {
 ///   whose `_ => Err(..)` arm treats an unresolved `None` as "needs retry"
 ///   (the logout-adjacent drain path, out of the kc-simplify-brief's
 ///   scope).
+///
+/// Outside this module, `providers::codex::keychain`'s `run_security_find`
+/// and `run_security_delete` also call this fn; both map `None` to
+/// `SecurityExit::Error` (a failed probe or purge, reported as such), never
+/// to a completed ask.
 #[cfg(all(target_os = "macos", any(test, feature = "test-utils")))]
 pub(crate) fn run_security_bounded(args: &[&str], stdin: Option<Vec<u8>>) -> Option<BoundedOutput> {
     // Test/hermetic guard — never shell `security` against the operator's real
@@ -4129,9 +4218,312 @@ pub(crate) fn run_security_bounded(args: &[&str], stdin: Option<Vec<u8>>) -> Opt
     if keychain_mirror_disabled() {
         return None;
     }
+    // A LOCKED default keychain makes `security` raise macOS's interactive
+    // "security wants to use the login keychain" unlock dialog — one per
+    // call. When nobody is there to answer it the calls queue while the
+    // screen is locked and all appear at unlock. So a NON-interactive caller
+    // asks the Security framework for the lock state first (that query shows
+    // no UI) and, if locked, answers "could not ask" (`None`), which no caller
+    // conflates with a completed ask (see this fn's contract above): reads
+    // become unknown/skip, writes a retryable error, drains stay queued.
+    //
+    // Non-interactive = the process DECLARED itself background
+    // (`declare_background_keychain_process`: the daemon in every start mode,
+    // and the desktop app, which hosts the daemon in-process), or it is a
+    // plain CLI invocation whose stdin is not a terminal (automation). A CLI
+    // command run at a terminal keeps the prompt — the operator asked for it
+    // — and so does any call made inside `with_interactive_keychain` (the
+    // desktop's user-initiated logout and Codex login).
+    //
+    // Skipped work is caught up by the daemon: its refresher re-runs the
+    // keychain sweep on the first tick after the keychain stops reading as
+    // locked (`keychain_catch_up_due`). When the lock state cannot be read,
+    // behaviour is unchanged (we proceed).
+    use std::io::IsTerminal;
+    let in_interactive_scope = interactive_scope_active();
+    // Lock-deferral concept (unchanged): may a password/unlock dialog be
+    // raised at all? Distinct from the timeout choice below.
+    let interactive =
+        in_interactive_scope || (!process_declared_background() && std::io::stdin().is_terminal());
+    if should_defer_for_locked_keychain(interactive, || {
+        keychain_lock_state(bounded_default_keychain_lock_probe)
+    }) {
+        note_keychain_deferral();
+        return None;
+    }
     let mut cmd = std::process::Command::new("security");
     cmd.args(args);
-    run_bounded(cmd, KEYCHAIN_OP_TIMEOUT, stdin)
+    run_bounded(cmd, security_op_timeout(in_interactive_scope), stdin)
+}
+
+/// Whether the default (login) keychain is locked, as far as csq can tell
+/// without prompting.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeychainLockState {
+    Locked,
+    Unlocked,
+    /// The status could not be read; callers proceed as before.
+    Unknown,
+}
+
+/// Raw probe result: `Some(status_bits)` from `SecKeychainGetStatus`, or
+/// `None` when the default keychain or its status could not be obtained.
+/// Injected so the classification is testable without the real keychain.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+pub(crate) type KeychainStatusProbe = fn() -> Option<u32>;
+
+/// `kSecUnlockStateStatus` from `SecKeychain.h`: set when the keychain is
+/// unlocked.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+const K_SEC_UNLOCK_STATE_STATUS: u32 = 1;
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+pub(crate) fn keychain_lock_state(probe: KeychainStatusProbe) -> KeychainLockState {
+    match probe() {
+        Some(bits) if bits & K_SEC_UNLOCK_STATE_STATUS != 0 => KeychainLockState::Unlocked,
+        Some(_) => KeychainLockState::Locked,
+        None => KeychainLockState::Unknown,
+    }
+}
+
+/// True when a keychain call should be skipped rather than allowed to prompt:
+/// only for a NON-interactive process, and only when the keychain is
+/// confirmed locked. The lock state is read lazily, so an interactive process
+/// never pays for the probe.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+pub(crate) fn should_defer_for_locked_keychain(
+    interactive: bool,
+    lock_state: impl FnOnce() -> KeychainLockState,
+) -> bool {
+    !interactive && lock_state() == KeychainLockState::Locked
+}
+
+/// Set when a keychain call in THIS process was skipped because the keychain
+/// was locked; read and cleared by [`keychain_catch_up_due`] so the daemon
+/// redoes the skipped mirroring once the keychain is unlocked rather than
+/// waiting for the account's next token refresh.
+#[cfg(target_os = "macos")]
+static KEYCHAIN_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+fn note_keychain_deferral() {
+    // Log once per locked episode at info, not once per call.
+    if !KEYCHAIN_DEFERRED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        tracing::info!(
+            error_kind = "keychain_locked_deferred",
+            "keychain is locked; deferring keychain updates without prompting until it is unlocked"
+        );
+    }
+}
+
+/// Set once at startup by a process that must never raise the keychain
+/// unlock dialog: the daemon (foreground, supervised, background) and the
+/// desktop app (which runs the daemon in-process). See
+/// [`run_security_bounded`].
+static PROCESS_KEYCHAIN_BACKGROUND: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declare this process a background keychain user (never prompt while the
+/// keychain is locked; defer instead). Call once at process start.
+pub fn declare_background_keychain_process() {
+    PROCESS_KEYCHAIN_BACKGROUND.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg_attr(
+    any(not(target_os = "macos"), feature = "test-utils"),
+    allow(dead_code)
+)]
+fn process_declared_background() -> bool {
+    PROCESS_KEYCHAIN_BACKGROUND.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Upper bound on the lock-state probe (`security.md` §6: every keychain
+/// call has a timeout path). The Security framework answers a status query
+/// in well under a millisecond normally; if it does not answer within this
+/// bound the state is Unknown, which proceeds under the old (itself bounded)
+/// behaviour. A probe thread stranded by a hang is left to finish on its own.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+const KEYCHAIN_LOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+fn bounded_default_keychain_lock_probe() -> Option<u32> {
+    bounded_probe(default_keychain_lock_probe, KEYCHAIN_LOCK_PROBE_TIMEOUT)
+}
+
+/// At most one lock probe is in flight per process, so a keychain service
+/// that stops answering strands ONE helper thread, not one per call.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+static PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+fn bounded_probe(probe: fn() -> Option<u32>, timeout: std::time::Duration) -> Option<u32> {
+    bounded_probe_with(&PROBE_IN_FLIGHT, probe, timeout)
+}
+
+/// Runs `probe` on a helper thread and waits at most `timeout`; `None` (an
+/// Unknown lock state) if it does not answer in time, or — without spawning —
+/// if a previous probe is still in flight (`in_flight` set). The helper
+/// clears `in_flight` once its probe returns.
+#[cfg(target_os = "macos")]
+fn bounded_probe_with(
+    in_flight: &'static std::sync::atomic::AtomicBool,
+    probe: fn() -> Option<u32>,
+    timeout: std::time::Duration,
+) -> Option<u32> {
+    use std::sync::atomic::Ordering;
+    if in_flight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("csq-keychain-lock-probe".into())
+        .spawn(move || {
+            let result = probe();
+            in_flight.store(false, Ordering::SeqCst);
+            let _ = tx.send(result);
+        });
+    if spawned.is_err() {
+        in_flight.store(false, Ordering::SeqCst);
+        return None;
+    }
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
+thread_local! {
+    static INTERACTIVE_SCOPE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` as an operation the user explicitly asked for (e.g. a desktop
+/// logout or Codex login): keychain calls made on THIS thread inside `f` may
+/// raise the unlock dialog even in a process declared background. Wrap the
+/// synchronous body on the thread that performs the keychain call — inside
+/// any `spawn_blocking`, never around an `.await`.
+pub fn with_interactive_keychain<T>(f: impl FnOnce() -> T) -> T {
+    struct Exit;
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            INTERACTIVE_SCOPE.with(|c| c.set(c.get().saturating_sub(1)));
+        }
+    }
+    INTERACTIVE_SCOPE.with(|c| c.set(c.get() + 1));
+    let _exit = Exit;
+    f()
+}
+
+#[cfg_attr(
+    any(not(target_os = "macos"), feature = "test-utils"),
+    allow(dead_code)
+)]
+fn interactive_scope_active() -> bool {
+    INTERACTIVE_SCOPE.with(|c| c.get() > 0)
+}
+
+/// Last lock state the daemon's refresher observed (true = locked), used to
+/// detect the locked -> unlocked transition regardless of WHICH process
+/// skipped work while it was locked.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+static LAST_SEEN_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when the daemon should re-run its keychain sweep now: either this
+/// process deferred a call while the keychain was locked and it is now
+/// unlocked, or the keychain went from locked to not-locked since the last
+/// check (another process — a `csq run` from automation — may have skipped
+/// its launch-time mirror during that time). Probes the lock state once.
+/// Test builds never probe the real keychain: this returns false there.
+#[cfg(all(target_os = "macos", not(any(test, feature = "test-utils"))))]
+pub(crate) fn keychain_catch_up_due() -> bool {
+    let state = keychain_lock_state(bounded_default_keychain_lock_probe);
+    catch_up_due_with(&KEYCHAIN_DEFERRED, &LAST_SEEN_LOCKED, state)
+}
+
+#[cfg(all(target_os = "macos", any(test, feature = "test-utils")))]
+pub(crate) fn keychain_catch_up_due() -> bool {
+    false
+}
+
+/// Pure decision for [`keychain_catch_up_due`], testable without a keychain.
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-utils", allow(dead_code))]
+fn catch_up_due_with(
+    deferred: &std::sync::atomic::AtomicBool,
+    last_locked: &std::sync::atomic::AtomicBool,
+    state: KeychainLockState,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let locked = state == KeychainLockState::Locked;
+    let was_locked = last_locked.swap(locked, Ordering::SeqCst);
+    if locked {
+        return false;
+    }
+    let had_deferral = deferred.swap(false, Ordering::SeqCst);
+    had_deferral || was_locked
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn keychain_catch_up_due() -> bool {
+    false
+}
+
+/// Reads the default keychain's status bits via `SecKeychainCopyDefault` +
+/// `SecKeychainGetStatus`. These report state rather than request access
+/// (unlike `security find-generic-password`, which asks the user to unlock a
+/// locked keychain); measured on the maintainer host 2026-10-02 against an
+/// unlocked login keychain: status `0b111`, no dialog. The keychain reference
+/// is released on every path that obtained one.
+///
+/// The DEFAULT keychain is the proxy because csq never passes a keychain
+/// path: `security add-generic-password` writes to the default keychain, and
+/// on a standard macOS account the default keychain is the login keychain
+/// that holds Claude Code's items. On an account whose default keychain is
+/// some other, locked keychain, csq's background keychain calls are skipped
+/// until it is unlocked.
+// Test builds never reach the real chokepoint (the tripwire variant runs
+// instead), so the real probe is unused there by design.
+#[cfg(target_os = "macos")]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
+pub(crate) fn default_keychain_lock_probe() -> Option<u32> {
+    use std::ffi::c_void;
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecKeychainCopyDefault(keychain: *mut *mut c_void) -> i32;
+        fn SecKeychainGetStatus(keychain: *mut c_void, status: *mut u32) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+    let mut keychain: *mut c_void = std::ptr::null_mut();
+    // SAFETY: out-pointer to a local; on success the callee stores a +1
+    // retained SecKeychainRef that we release below.
+    let rc = unsafe { SecKeychainCopyDefault(&mut keychain) };
+    if rc != 0 || keychain.is_null() {
+        return None;
+    }
+    let mut status: u32 = 0;
+    // SAFETY: `keychain` is the non-null reference obtained above; `status`
+    // is a local out-pointer.
+    let rc = unsafe { SecKeychainGetStatus(keychain, &mut status) };
+    // SAFETY: balances the +1 from SecKeychainCopyDefault exactly once.
+    unsafe { CFRelease(keychain as *const c_void) };
+    if rc != 0 {
+        return None;
+    }
+    Some(status)
 }
 
 /// L1 tripwire (`instrument-discipline.md` MUST-2 / `guard-reader-writer-parity.md`
@@ -4467,13 +4859,13 @@ fn run_bounded(
 /// the life of the call — "same-user" does not make that acceptable
 /// (`zero-tolerance.md` Rule 5's BLOCKED corpus names exactly that
 /// rationalization). The write spawns `security -i` with argv `["-i"]` only
-/// and feeds ONE command line — `add-generic-password -U -A -s <svc> -a
+/// and feeds ONE command line — `add-generic-password -A -s <svc> -a
 /// <account> -X <hex(payload)>` — on its stdin, hex-encoded; see
 /// [`build_add_stdin_command`].
 ///
 /// **an internal ticket (round 4, owner-accepted residual) — a payload too large for
 /// that stdin line DOES fall back to argv,** byte-for-byte the pre-an internal ticket
-/// v2.19 call shape (`add-generic-password -U -A -s <svc> -a <account> -w
+/// v2.19 call shape minus `-U` (`add-generic-password -A -s <svc> -a <account> -w
 /// <payload>`), so a user whose credential (with `mcpOAuth` siblings) makes
 /// the payload exceed `security -i`'s measured line limit does not regress
 /// to a refused write vs v2.19. See [`select_add_invocation`] for the
@@ -4601,13 +4993,15 @@ fn build_write_payload(
 // The planner (`plan_mirror_write`) is a PURE function over ONE already
 // -classified read — it performs no I/O and no mutation. The executor
 // (the macOS `write_raw` below) is the only place that shells `security`,
-// and it always executes the plan's write; X is NEVER deleted on this
-// path.
+// and it always executes the plan's write. The write itself is
+// delete-then-create inside the executor's `add` (never `-U`); the planner
+// issues no delete of its own.
 
 /// The planner's output for the single-item RMW write path: the JSON
-/// payload to persist into X via `security -i`'s `add-generic-password -U
-/// -A -s svc -a account -X <hex(write_x)>` (an internal ticket: hex-encoded on stdin,
-/// never as an argv literal) — an in-place UPDATE, never a delete-then-create.
+/// payload to persist into X via `security -i`'s `add-generic-password -A
+/// -s svc -a account -X <hex(write_x)>` (an internal ticket: hex-encoded on stdin,
+/// never as an argv literal), issued by `KeychainExecutor::add` AFTER it
+/// deletes the existing item — never `-U`, never an in-place update.
 // Platform-independent pure plan type — unconditional so it compiles and
 // its tests run on every platform; its only PRODUCTION caller is still
 // macOS-gated, so it is genuinely unused in a non-test, non-macOS build.
@@ -4682,9 +5076,13 @@ fn plan_mirror_write(
         RawContentClassification::Absent => (serde_json::Map::new(), None),
         RawContentClassification::Content(json) => {
             let siblings = extract_sibling_object(json);
+            // An emptied login carries no identity, so it cannot prove it
+            // belongs to the account being written: never backfill plan
+            // metadata from it.
             let existing = serde_json::from_str::<serde_json::Value>(json)
                 .ok()
-                .and_then(|v| v.get("claudeAiOauth").cloned());
+                .and_then(|v| v.get("claudeAiOauth").cloned())
+                .filter(|o| !oauth_tokens_both_empty(o));
             (siblings, existing)
         }
     };
@@ -4727,11 +5125,30 @@ pub trait KeychainExecutor {
     /// implementation such as `ScriptedKeychainExecutor` returns its own
     /// caller-supplied classification directly).
     fn find(&self, svc: &str, account: &str) -> RawContentClassification;
-    /// `security -i`'s stdin `add-generic-password -U -A -s svc -a account
-    /// -X <hex(payload)>` (an internal ticket — the credential travels hex-encoded on
-    /// stdin, never as an argv literal) — an in-place UPDATE, never a
-    /// delete-then-create.
+    /// `security delete-generic-password -s svc -a account`, THEN `security
+    /// -i`'s stdin `add-generic-password -A -s svc -a account -X
+    /// <hex(payload)>` (an internal ticket — the credential travels hex-encoded on
+    /// stdin, never as an argv literal). Never `-U`: Apple's `-U` on an
+    /// existing item rewrites its access control and raises a password
+    /// dialog, so a write is delete-then-create (see
+    /// [`add_via_delete_create`]).
     fn add(&self, svc: &str, account: &str, payload: &str) -> Result<(), PlatformError>;
+    /// [`KeychainExecutor::add`], plus: if the create fails after the item was
+    /// deleted, ONE best-effort re-add of `siblings_only` (the caller's
+    /// already-read previous content with `claudeAiOauth` removed; never the
+    /// full previous content). The default ignores it; only the production
+    /// executor, whose `add` deletes first, acts on it. No extra keychain read
+    /// is made to compute it.
+    fn add_restoring(
+        &self,
+        svc: &str,
+        account: &str,
+        payload: &str,
+        siblings_only: Option<String>,
+    ) -> Result<(), PlatformError> {
+        let _ = siblings_only;
+        self.add(svc, account, payload)
+    }
     /// `security delete-generic-password -s svc -a account`, confirmed via
     /// `security_delete_call_resolved` (a private helper of this module's
     /// production `SecurityCliExecutor` implementation) — never assumed
@@ -4996,8 +5413,7 @@ fn is_stdin_token_safe(s: &str) -> bool {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn build_add_stdin_command(svc: &str, account: &str, payload: &str) -> Vec<u8> {
     let hex_payload = hex::encode(payload.as_bytes());
-    format!("add-generic-password -U -A -s \"{svc}\" -a \"{account}\" -X {hex_payload}\n")
-        .into_bytes()
+    format!("add-generic-password -A -s \"{svc}\" -a \"{account}\" -X {hex_payload}\n").into_bytes()
 }
 
 /// RETRACTED FINDING, re-derived (2026-09-27) — an earlier version of this
@@ -5100,7 +5516,9 @@ enum AddInvocation {
     /// Fits `security -i`'s stdin line — argv is always [`ADD_STDIN_ARGV`].
     Stdin(Vec<u8>),
     /// an internal ticket — does not fit; the byte-for-byte pre-an internal ticket v2.19 argv shape:
-    /// `["add-generic-password", "-U", "-A", "-s", svc, "-a", account, "-w", payload]`.
+    /// `["add-generic-password", "-A", "-s", svc, "-a", account, "-w", payload]`
+    /// (pre-an internal ticket minus `-U`: every write is delete-then-create, see
+    /// [`add_via_delete_create`]).
     ArgvFallback(Vec<String>),
 }
 
@@ -5132,7 +5550,6 @@ fn select_add_invocation(
             }
             Ok(AddInvocation::ArgvFallback(vec![
                 "add-generic-password".to_string(),
-                "-U".to_string(),
                 "-A".to_string(),
                 "-s".to_string(),
                 svc.to_string(),
@@ -5320,6 +5737,16 @@ impl KeychainExecutor for SecurityCliExecutor {
     }
 
     fn add(&self, svc: &str, account: &str, payload: &str) -> Result<(), PlatformError> {
+        self.add_restoring(svc, account, payload, None)
+    }
+
+    fn add_restoring(
+        &self,
+        svc: &str,
+        account: &str,
+        payload: &str,
+        siblings_only: Option<String>,
+    ) -> Result<(), PlatformError> {
         // an internal ticket: the credential (previously the literal argument after
         // `-w`, readable in `ps` output for the life of the call) now
         // travels hex-encoded on `security -i`'s stdin only when it fits;
@@ -5333,98 +5760,183 @@ impl KeychainExecutor for SecurityCliExecutor {
         // exact argv exposure an internal ticket exists to close everywhere else — a
         // deliberate owner trade-off against silently refusing every write
         // for a user with enough `mcpOAuth` siblings to cross it.
-        match select_add_invocation(svc, account, payload)? {
-            AddInvocation::Stdin(stdin_cmd) => {
-                let bo =
-                    run_security_bounded(&ADD_STDIN_ARGV, Some(stdin_cmd)).ok_or_else(|| {
-                        PlatformError::Keychain(
-                            "keychain write timed out (likely a locked or non-interactive \
-                         keychain — e.g. an SSH/tmux session that cannot answer an \
-                         authorization prompt)"
-                                .into(),
-                        )
-                    })?;
-                let stderr_complete = bo.stderr_complete;
-                let output = bo.output;
-                // an internal ticket — empirically measured on a throwaway keychain
-                // (mac-mini, 2026-09-27): `security -i`'s OWN exit code DOES
-                // reflect the inner command's outcome — a successful add
-                // exits 0 with empty stdout/stderr; forcing a duplicate-item
-                // failure (an `add` without `-U` against an already-present
-                // item) exits 45 (`errSecDuplicateItem`) with the
-                // `SecKeychainItemCreateFromContent … already exists` text
-                // on stderr; an unrecognized `-i` subcommand exits 1. So the
-                // exit code alone is sufficient (matching the old `-w`
-                // path's `output.status.success()` check) — the
-                // stderr-empty check below is additional defense-in-depth,
-                // not a correction for an exit code known to lie.
-                // `!stderr_complete` (BUG-R3-1: a descendant still holding
-                // the pipe) is ALSO treated as failure — an incomplete
-                // capture must never be read as "confirmed empty".
-                if !output.status.success() || !stderr_complete || !output.stderr.is_empty() {
-                    // F7: fixed-vocabulary only — no `security` stderr at
-                    // all, not even `redact_tokens`-filtered.
-                    // `redact_tokens` strips KNOWN token shapes (`sk-ant-*`,
-                    // long hex); `security`'s own error text is not drawn
-                    // from a closed vocabulary this crate controls, so
-                    // "filtered" is not the same claim as "safe" — the exit
-                    // CODE alone is sufficient for diagnosis (locked
-                    // keychain, denied ACL, etc. each have distinct,
-                    // documented exit codes) without embedding any of the
-                    // command's own output.
-                    let code = output
-                        .status
-                        .code()
-                        .map_or_else(|| "signal".to_string(), |c| c.to_string());
-                    return Err(PlatformError::Keychain(format!(
-                        "keychain write failed (security exit {code})"
-                    )));
-                }
-                Ok(())
-            }
-            AddInvocation::ArgvFallback(argv) => {
-                // an internal ticket — fixed-vocabulary only: no credential bytes, no
-                // svc/account, no size (not even a coarse bucket) — the
-                // fact of the fallback plus the issue number is the whole
-                // diagnostic surface.
-                warn!(
-                    error_kind = "keychain_add_argv_fallback_oversized",
-                    "keychain add payload exceeds security -i's safe stdin line limit; \
-                     falling back to the pre-an internal ticket argv write shape (an internal ticket, \
-                     owner-accepted residual) rather than refusing the write"
-                );
-                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                let bo = run_security_bounded(&argv_refs, None).ok_or_else(|| {
-                    PlatformError::Keychain(
-                        "keychain write timed out (likely a locked or non-interactive \
-                         keychain — e.g. an SSH/tmux session that cannot answer an \
-                         authorization prompt)"
-                            .into(),
-                    )
-                })?;
-                let output = bo.output;
-                // v2.19 parity: `output.status.success()` alone, no
-                // stderr-empty check — that check is specific to `-i`'s own
-                // quirks (see the Stdin arm above) and was never part of the
-                // argv path this fallback reproduces byte-for-byte.
-                if !output.status.success() {
-                    let code = output
-                        .status
-                        .code()
-                        .map_or_else(|| "signal".to_string(), |c| c.to_string());
-                    return Err(PlatformError::Keychain(format!(
-                        "keychain write failed (security exit {code})"
-                    )));
-                }
-                Ok(())
-            }
-        }
+        // Validate BEFORE deleting: a refused name or token must leave the
+        // existing item untouched.
+        let invocation = select_add_invocation(svc, account, payload)?;
+        add_via_delete_create(
+            svc,
+            account,
+            invocation,
+            siblings_only,
+            &run_security_bounded,
+        )
     }
 
     fn delete(&self, svc: &str, account: &str) -> bool {
         match run_security_bounded(&["delete-generic-password", "-s", svc, "-a", account], None) {
             Some(bo) => security_delete_call_resolved(&bo.output),
             None => false,
+        }
+    }
+}
+
+/// Signature of [`run_security_bounded`], injectable so the delete-then-create
+/// sequencing in [`add_via_delete_create`] is testable without a real `security`.
+#[cfg(target_os = "macos")]
+type SecurityRunner<'a> = &'a dyn Fn(&[&str], Option<Vec<u8>>) -> Option<BoundedOutput>;
+
+/// Write one keychain item by DELETE, then CREATE — never `-U`.
+///
+/// Apple's `add-generic-password -U` on an existing item calls
+/// `SecKeychainItemSetAccess`, which raises a "security wants to access key"
+/// password dialog (observed after `csq swap`). A fresh `add-generic-password
+/// -A` creates the item with the allow-all-apps ACL and never prompts.
+///
+/// Sequence: (1) `delete-generic-password`, repeated while it exits 0 (a
+/// duplicate item may remain) until it exits [`SECURITY_ITEM_NOT_FOUND`]
+/// (44), at most [`MAX_DUPLICATE_DELETE_ITERATIONS`] times; any other
+/// outcome, a timeout, or an exhausted budget returns `Err`, no add is
+/// attempted, and the item's state is then UNKNOWN (an earlier iteration
+/// may already have removed a duplicate); (2) the create.
+///
+/// If the create fails after the deletes, the item is absent and this
+/// returns `Err`. `siblings_only` (the previous content with
+/// `claudeAiOauth` removed, never the full previous content, which would
+/// restore a superseded account's token) is then re-added ONCE, best
+/// effort, so non-token siblings such as `mcpOAuth` are not lost; its own
+/// failure is ignored. Claude Code then reads the symlinked
+/// `.credentials.json` for the token, which is csq's documented fallback.
+#[cfg(target_os = "macos")]
+fn add_via_delete_create(
+    svc: &str,
+    account: &str,
+    invocation: AddInvocation,
+    siblings_only: Option<String>,
+    run: SecurityRunner<'_>,
+) -> Result<(), PlatformError> {
+    let mut confirmed_absent = false;
+    for _ in 0..MAX_DUPLICATE_DELETE_ITERATIONS {
+        match run(&["delete-generic-password", "-s", svc, "-a", account], None)
+            .map(|bo| bo.output.status.code())
+        {
+            Some(Some(0)) => continue,
+            Some(Some(SECURITY_ITEM_NOT_FOUND)) => {
+                confirmed_absent = true;
+                break;
+            }
+            // Timeout, signal, or any other exit: unconfirmed.
+            _ => break,
+        }
+    }
+    if !confirmed_absent {
+        // F7: fixed vocabulary — no `security` output, svc, or account.
+        return Err(PlatformError::Keychain(
+            "keychain write refused: removal of the existing item was not confirmed, \
+             so its state is unknown; no new item was written"
+                .into(),
+        ));
+    }
+    let result = run_add_invocation(invocation, run);
+    if result.is_err() {
+        if let Some(payload) = siblings_only {
+            if let Ok(inv) = select_add_invocation(svc, account, &payload) {
+                // Best effort: the original error is what the caller sees.
+                let _ = run_add_invocation(inv, run);
+            }
+        }
+    }
+    result
+}
+
+/// Execute one already-selected add invocation through `run`.
+#[cfg(target_os = "macos")]
+fn run_add_invocation(
+    invocation: AddInvocation,
+    run: SecurityRunner<'_>,
+) -> Result<(), PlatformError> {
+    match invocation {
+        AddInvocation::Stdin(stdin_cmd) => {
+            let bo = run(&ADD_STDIN_ARGV, Some(stdin_cmd)).ok_or_else(|| {
+                PlatformError::Keychain(
+                    "keychain write timed out (likely a locked or non-interactive \
+                     keychain — e.g. an SSH/tmux session that cannot answer an \
+                     authorization prompt)"
+                        .into(),
+                )
+            })?;
+            let stderr_complete = bo.stderr_complete;
+            let output = bo.output;
+            // an internal ticket — empirically measured on a throwaway keychain
+            // (mac-mini, 2026-09-27): `security -i`'s OWN exit code DOES
+            // reflect the inner command's outcome — a successful add
+            // exits 0 with empty stdout/stderr; forcing a duplicate-item
+            // failure (an `add` without `-U` against an already-present
+            // item) exits 45 (`errSecDuplicateItem`) with the
+            // `SecKeychainItemCreateFromContent … already exists` text
+            // on stderr; an unrecognized `-i` subcommand exits 1. So the
+            // exit code alone is sufficient (matching the old `-w`
+            // path's `output.status.success()` check) — the
+            // stderr-empty check below is additional defense-in-depth,
+            // not a correction for an exit code known to lie.
+            // `!stderr_complete` (BUG-R3-1: a descendant still holding
+            // the pipe) is ALSO treated as failure — an incomplete
+            // capture must never be read as "confirmed empty".
+            if !output.status.success() || !stderr_complete || !output.stderr.is_empty() {
+                // F7: fixed-vocabulary only — no `security` stderr at
+                // all, not even `redact_tokens`-filtered.
+                // `redact_tokens` strips KNOWN token shapes (`sk-ant-*`,
+                // long hex); `security`'s own error text is not drawn
+                // from a closed vocabulary this crate controls, so
+                // "filtered" is not the same claim as "safe" — the exit
+                // CODE alone is sufficient for diagnosis (locked
+                // keychain, denied ACL, etc. each have distinct,
+                // documented exit codes) without embedding any of the
+                // command's own output.
+                let code = output
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string());
+                return Err(PlatformError::Keychain(format!(
+                    "keychain write failed (security exit {code})"
+                )));
+            }
+            Ok(())
+        }
+        AddInvocation::ArgvFallback(argv) => {
+            // an internal ticket — fixed-vocabulary only: no credential bytes, no
+            // svc/account, no size (not even a coarse bucket) — the
+            // fact of the fallback plus the issue number is the whole
+            // diagnostic surface.
+            warn!(
+                error_kind = "keychain_add_argv_fallback_oversized",
+                "keychain add payload exceeds security -i's safe stdin line limit; \
+                 falling back to the pre-an internal ticket argv write shape (an internal ticket, \
+                 owner-accepted residual) rather than refusing the write"
+            );
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let bo = run(&argv_refs, None).ok_or_else(|| {
+                PlatformError::Keychain(
+                    "keychain write timed out (likely a locked or non-interactive \
+                     keychain — e.g. an SSH/tmux session that cannot answer an \
+                     authorization prompt)"
+                        .into(),
+                )
+            })?;
+            let output = bo.output;
+            // v2.19 parity: `output.status.success()` alone, no
+            // stderr-empty check — that check is specific to `-i`'s own
+            // quirks (see the Stdin arm above) and was never part of the
+            // argv path this fallback reproduces byte-for-byte.
+            if !output.status.success() {
+                let code = output
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string());
+                return Err(PlatformError::Keychain(format!(
+                    "keychain write failed (security exit {code})"
+                )));
+            }
+            Ok(())
         }
     }
 }
@@ -5484,7 +5996,7 @@ pub enum ForcedSyncResult {
     /// S4: X was read and held REAL content, and this call's forced write
     /// attempt itself FAILED. Unlike [`ForcedSyncResult::AbsentWriteFailed`],
     /// a failing `security` exit here does NOT prove no mutation landed — a
-    /// watchdog-timed-out `add -U`/`delete` can report a non-zero exit while
+    /// watchdog-timed-out `add`/`delete` can report a non-zero exit while
     /// the write already partially committed (the same race F8 names for
     /// the absent case, except here the pre-write state was NOT "nothing to
     /// lose"). v5: the caller no longer restores a snapshot here — it
@@ -5513,6 +6025,10 @@ pub enum ForcedSyncResult {
     ///
     /// [`ForeignLoginUnharvested`]: ForcedSyncResult::ForeignLoginUnharvested
     TargetTokenInvalidated,
+    /// Fresh-launch path only: an unidentified keychain login could not be
+    /// saved to the quarantine folder, so it was left untouched. No mutation
+    /// was performed.
+    QuarantineSaveFailed,
 }
 
 /// v4 core (S10-style executor injection, mirroring `write_raw_with_executor`):
@@ -5534,6 +6050,180 @@ fn force_sync_account_changed_with_executor(
     base: &Path,
     handle_dir: &Path,
     new_credentials_json: Option<&str>,
+) -> Result<ForcedSyncResult, PlatformError> {
+    force_sync_inner(exec, base, handle_dir, new_credentials_json, false)
+}
+
+/// Directory (under the accounts base) holding quarantined foreign logins.
+#[cfg(target_os = "macos")]
+const QUARANTINE_DIR_NAME: &str = "keychain-quarantine";
+
+/// Minimum gap between repeats of the same recurring warning.
+#[cfg(target_os = "macos")]
+const WARN_REPEAT_INTERVAL_MS: u64 = 3_600_000;
+
+/// True at most once per [`WARN_REPEAT_INTERVAL_MS`] for `key` in this
+/// process, so a sweep that cannot resolve an entry does not log every tick.
+#[cfg(target_os = "macos")]
+fn warn_due(key: &str) -> bool {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    let now = now_ms();
+    let Ok(mut map) = LAST.get_or_init(Default::default).lock() else {
+        return true;
+    };
+    match map.get(key) {
+        Some(&last) if now.saturating_sub(last) < WARN_REPEAT_INTERVAL_MS => false,
+        _ => {
+            map.retain(|_, t| now.saturating_sub(*t) < WARN_REPEAT_INTERVAL_MS);
+            map.insert(key.to_string(), now);
+            true
+        }
+    }
+}
+
+/// True when some directory directly under `base_dir` hashes to `svc` (the
+/// handle dir this queue entry was recorded for exists again, e.g. a recycled
+/// PID's new session, which may have a live owner).
+#[cfg(target_os = "macos")]
+fn handle_dir_exists_for_service(base_dir: &Path, svc: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(base_dir) else {
+        // Cannot enumerate: do not claim the dir is gone.
+        return true;
+    };
+    rd.filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .any(|p| {
+            let (abs, canonical) = canonicalize_for_keychain_sync(&p);
+            dir_may_own_service(&abs, canonical, svc)
+        })
+}
+
+/// A dir whose real path could not be resolved is assumed to own the service
+/// (keep the item); otherwise it owns it iff its service name matches.
+#[cfg(target_os = "macos")]
+fn dir_may_own_service(abs: &Path, canonical: bool, svc: &str) -> bool {
+    !canonical || service_name(abs) == svc
+}
+
+/// Save an unidentified keychain item's raw payload before it is replaced:
+/// `<base>/keychain-quarantine/<utc>-<svc-hash>.json`, dir 0700, file 0600,
+/// written via tmp + `secure_file` + `atomic_replace` with the tmp removed on
+/// every failure branch (security.md §5a). Returns `Err` if it could not be
+/// saved, in which case the caller MUST NOT discard the item.
+#[cfg(target_os = "macos")]
+fn quarantine_foreign_item(base: &Path, svc: &str, raw: &str) -> Result<(), PlatformError> {
+    use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+    let dir = base.join(QUARANTINE_DIR_NAME);
+    // A symlinked quarantine dir could redirect the saved login elsewhere.
+    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+        if meta.file_type().is_symlink() {
+            return Err(PlatformError::Keychain(
+                "keychain quarantine directory is a symlink".to_string(),
+            ));
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let hash = quarantine_svc_hash(svc);
+    // Already saved (a retry after an unconfirmed delete): do not write a
+    // second copy, which would push other services' files out of the
+    // newest-N retention.
+    let suffix = format!("-{hash}.json");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(&suffix)
+                && std::fs::read_to_string(entry.path()).is_ok_and(|c| c == raw)
+            {
+                return Ok(());
+            }
+        }
+    }
+    let stamp = chrono::DateTime::from_timestamp_millis(now_ms() as i64)
+        .map(|t| t.format("%Y%m%dT%H%M%S%3fZ").to_string())
+        .unwrap_or_else(|| now_ms().to_string());
+    let target = dir.join(format!("{stamp}-{hash}.json"));
+    let tmp = unique_tmp_path(&target);
+    if let Err(e) = std::fs::write(&tmp, raw.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = atomic_replace(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    prune_quarantine(&dir, QUARANTINE_KEEP, QUARANTINE_MAX_AGE);
+    Ok(())
+}
+
+/// The 8-hex suffix of a `Claude Code-credentials-{hash}` service name. It
+/// names the quarantine file and is logged with every quarantine event so a
+/// saved file can be matched to the event that wrote it. Not a secret: it is
+/// a hash of a handle-dir path (see the pending-clear queue note above).
+#[cfg(target_os = "macos")]
+fn quarantine_svc_hash(svc: &str) -> &str {
+    svc.rsplit('-').next().unwrap_or("unknown")
+}
+
+/// Newest files kept in the quarantine dir.
+#[cfg(target_os = "macos")]
+const QUARANTINE_KEEP: usize = 10;
+/// Files older than this are removed regardless of count.
+#[cfg(target_os = "macos")]
+const QUARANTINE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// Best-effort retention: keep the newest `keep` `*.json` files (the UTC
+/// stamp makes name order chronological) and drop any older than `max_age`
+/// by mtime. Never fails the caller.
+#[cfg(target_os = "macos")]
+fn prune_quarantine(dir: &Path, keep: usize, max_age: std::time::Duration) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<std::path::PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    files.reverse(); // newest first
+    let now = std::time::SystemTime::now();
+    for (i, path) in files.iter().enumerate() {
+        let too_old = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > max_age);
+        if (i >= keep || too_old) && std::fs::remove_file(path).is_err() {
+            warn!(
+                error_kind = "keychain_quarantine_prune_failed",
+                "could not remove an old quarantined keychain file"
+            );
+        }
+    }
+}
+
+/// Shared body of [`force_sync_account_changed_with_executor`].
+/// `quarantine_foreign` is true ONLY for a fresh-handle-dir launch, where any
+/// existing item belongs to a dead terminal (PID reuse): an item that stays
+/// unidentified after the normal recognition is saved to the quarantine dir
+/// and then replaced, instead of refusing the launch. Swaps and the daemon
+/// pass false and still refuse.
+#[cfg(target_os = "macos")]
+fn force_sync_inner(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    handle_dir: &Path,
+    new_credentials_json: Option<&str>,
+    quarantine_foreign: bool,
 ) -> Result<ForcedSyncResult, PlatformError> {
     let svc = service_name(handle_dir);
     let ours = keychain_account_for(handle_dir);
@@ -5602,6 +6292,45 @@ fn force_sync_account_changed_with_executor(
     };
 
     match decide_cc_keychain_write(&x, &known, intended) {
+        WriteDecision::RefuseUnharvested if quarantine_foreign => {
+            // Fresh-launch path: save the unidentified login, then replace
+            // it. If it cannot be saved it is NOT discarded: refuse as before.
+            // `RefuseUnharvested` is only decided over `Content`; if that ever
+            // stops holding, the item's state is unknown, not a disk problem.
+            let RawContentClassification::Content(raw_x) = &x else {
+                return Ok(ForcedSyncResult::WriteFailedUnknown);
+            };
+            if quarantine_foreign_item(base, &svc, raw_x).is_err() {
+                warn!(
+                    error_kind = "keychain_fresh_launch_quarantine_failed",
+                    svc_hash = quarantine_svc_hash(&svc),
+                    "could not save the unidentified keychain login; refusing the launch"
+                );
+                return Ok(ForcedSyncResult::QuarantineSaveFailed);
+            }
+            warn!(
+                error_kind = "keychain_fresh_launch_quarantined_foreign_item",
+                svc_hash = quarantine_svc_hash(&svc),
+                "an unidentified keychain login on a fresh launch was saved and replaced"
+            );
+            // Write against an ABSENT view so nothing from the foreign item
+            // (its siblings) is merged into the new account's item.
+            let absent = RawContentClassification::Absent;
+            let decision = match intended {
+                Intended::Token(raw) => WriteDecision::Write(raw),
+                Intended::Strip => WriteDecision::StripAllowed,
+            };
+            match apply_cc_keychain_write(exec, &svc, &ours, &absent, decision, false) {
+                ApplyOutcome::Applied { wrote_token } => {
+                    Ok(ForcedSyncResult::Applied { wrote_token })
+                }
+                // The foreign item is saved; a failed replace leaves its
+                // state unknown, so do not launch against it.
+                ApplyOutcome::AbsentWriteFailed
+                | ApplyOutcome::WriteFailed
+                | ApplyOutcome::NoOp => Ok(ForcedSyncResult::WriteFailedUnknown),
+            }
+        }
         WriteDecision::RefuseUnharvested => Ok(ForcedSyncResult::ForeignLoginUnharvested),
         // `keychain-fix-r11.md` S-M-3 residual: `intended` was already
         // filtered to `ms > now_ms()` above before `Intended::Token` was even
@@ -5689,6 +6418,39 @@ pub fn force_sync_account_changed(
         handle_dir,
         new_credentials_json,
     )
+}
+
+/// [`force_sync_account_changed`] for a FRESH-handle-dir launch: an item that
+/// stays unidentified is quarantined and replaced rather than refused.
+#[cfg(target_os = "macos")]
+fn force_sync_account_changed_for_launch(
+    base: &Path,
+    handle_dir: &Path,
+    new_credentials_json: Option<&str>,
+) -> Result<ForcedSyncResult, PlatformError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(exec) = test_keychain_executor_override() {
+        return force_sync_inner(&*exec, base, handle_dir, new_credentials_json, true);
+    }
+    if keychain_mirror_disabled() {
+        return Ok(ForcedSyncResult::Applied { wrote_token: false });
+    }
+    force_sync_inner(
+        &SecurityCliExecutor,
+        base,
+        handle_dir,
+        new_credentials_json,
+        true,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn force_sync_account_changed_for_launch(
+    base: &Path,
+    handle_dir: &Path,
+    new_credentials_json: Option<&str>,
+) -> Result<ForcedSyncResult, PlatformError> {
+    force_sync_account_changed_with_executor(base, handle_dir, new_credentials_json)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -5824,7 +6586,8 @@ fn oauth_identity(v: &serde_json::Value) -> Option<(&str, &str)> {
 
 /// Directive rule 1: `x` holds NO login at all — either the item is
 /// confirmed absent, or its content parses as a JSON object that lacks
-/// the `claudeAiOauth` key ENTIRELY (as opposed to one present but
+/// the `claudeAiOauth` key ENTIRELY or carries it with both tokens empty
+/// ([`oauth_tokens_both_empty`]) (as opposed to one present but
 /// malformed/incomplete, which stays rule 6/7's "unclassifiable, never
 /// overwrite" case — this fn does NOT collapse the two). A keychain item
 /// with no login recorded is free to write; nothing is lost by doing so.
@@ -5834,9 +6597,43 @@ fn holds_no_login(x: &RawContentClassification) -> bool {
         RawContentClassification::Absent => true,
         RawContentClassification::Content(json) => serde_json::from_str::<serde_json::Value>(json)
             .ok()
-            .and_then(|v| v.as_object().map(|o| !o.contains_key("claudeAiOauth")))
+            .and_then(|v| {
+                v.as_object().map(|o| match o.get("claudeAiOauth") {
+                    None => true,
+                    Some(oauth) => oauth_tokens_both_empty(oauth),
+                })
+            })
             .unwrap_or(false),
         RawContentClassification::Unreadable(_) => false,
+    }
+}
+
+/// `true` when a `claudeAiOauth` object carries BOTH `accessToken` and
+/// `refreshToken` as empty strings: the shape Claude Code leaves after a
+/// failed refresh clears its login (observed 2026-10-02: empty tokens,
+/// `expiresAt: 0`, plan metadata kept). With no refresh token there is no
+/// login to lose, so this is "no login" (rule 1), never an unidentified
+/// account. Exactly-empty on BOTH sides only: a single empty token, a
+/// missing field, or a non-string value is not this shape and stays with the
+/// unparseable/unidentified rules.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn oauth_tokens_both_empty(oauth: &serde_json::Value) -> bool {
+    let empty = |k: &str| oauth.get(k).and_then(|t| t.as_str()) == Some("");
+    empty("accessToken") && empty("refreshToken")
+}
+
+/// `true` when `x` is content whose `claudeAiOauth` has both tokens empty
+/// ([`oauth_tokens_both_empty`]). Such an item holds no credential, but Claude
+/// Code reads it keychain-first and is logged out, so a path that would leave
+/// it in place must not report the terminal as current.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn holds_emptied_login(x: &RawContentClassification) -> bool {
+    match x {
+        RawContentClassification::Content(json) => serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|v| v.get("claudeAiOauth").map(oauth_tokens_both_empty))
+            .unwrap_or(false),
+        RawContentClassification::Absent | RawContentClassification::Unreadable(_) => false,
     }
 }
 
@@ -5857,7 +6654,9 @@ fn keychain_content_matches_token(x: &RawContentClassification, candidate_raw: &
                 return false;
             };
             match (oauth_identity(&x_val), oauth_identity(&candidate_val)) {
-                (Some(a), Some(b)) => a == b,
+                // An empty refresh token is no credential, so it identifies
+                // nothing: two emptied logins must never "match".
+                (Some(a), Some(b)) => !a.1.is_empty() && a == b,
                 _ => false,
             }
         }
@@ -5989,7 +6788,10 @@ fn reconcile_keychain_to_marker_with_executor(
     // handle dir's own marker account as untrustworthy — the exact
     // "leaving the terminal on the wrong account" case C-F7 names.
     let Some(marker_raw) = marker_token.as_valid_str() else {
-        if holds_no_login(&x) {
+        // An emptied login is "no login" for write safety, but it leaves the
+        // terminal logged out; with no trusted token to replace it, report it
+        // rather than calling the terminal current.
+        if holds_no_login(&x) && !holds_emptied_login(&x) {
             return ReconcileOutcome::AlreadyCurrent { marker_account };
         }
         if let Some(csq_written) = forced_write.and_then(|fw| fw.raw_json) {
@@ -6235,6 +7037,10 @@ fn decide_swap_disposition(
              run `csq login <n>` for that account, then retry the swap"
                 .to_string(),
         ),
+        // Produced only by the fresh-launch path; a swap never quarantines.
+        Ok(ForcedSyncResult::QuarantineSaveFailed) => {
+            Err("the keychain is busy or unavailable; nothing changed — retry the swap".to_string())
+        }
         Ok(applied) => Ok(applied),
         Err(_e) => {
             Err("the keychain is busy or unavailable; nothing changed — retry the swap".to_string())
@@ -6403,6 +7209,11 @@ pub fn repoint_refused_real_file_operator_line(item: &str, reconcile_line: &str)
 /// - Write fails after a readable read of REAL content → `Err` (A2: do NOT
 ///   launch — a fresh dir with a colliding stale item from PID reuse must
 ///   not launch against the wrong account).
+/// - X holds a login that stays unidentified → the raw payload is saved to
+///   `<base>/keychain-quarantine/` (0600) and the item is then replaced with
+///   this account's token (`force_sync_account_changed_for_launch`); if the
+///   save fails the launch is refused and the item is left alone. Swaps and
+///   the daemon sweep do NOT do this.
 /// - Otherwise → `Ok(true)` (mirror applied).
 pub fn force_sync_for_launch(base: &Path, handle_dir_abs: &Path) -> Result<bool, String> {
     // keychain-fix-r8d.md item 2: same override-first ordering as
@@ -6436,7 +7247,7 @@ pub fn force_sync_for_launch(base: &Path, handle_dir_abs: &Path) -> Result<bool,
 fn force_sync_for_launch_locked(base: &Path, handle_dir_abs: &Path) -> Result<bool, String> {
     record_keychain_account_hint(handle_dir_abs);
     let raw = std::fs::read_to_string(handle_dir_abs.join(".credentials.json")).ok();
-    decide_launch_disposition(force_sync_account_changed(
+    decide_launch_disposition(force_sync_account_changed_for_launch(
         base,
         handle_dir_abs,
         raw.as_deref(),
@@ -6504,11 +7315,10 @@ fn decide_launch_disposition(
             Err("keychain busy or unavailable; retry the launch".to_string())
         }
         // round 7c D1/D5: rule 3 — X holds a valid Anthropic identity from
-        // no account this call could name (a stale item from an earlier
-        // occupant of this PID, or a genuinely foreign login). The D5 caller
-        // harvests (D3's IPC route) before reaching this point on an
-        // EXISTING dir's launch path; a fresh dir has nothing to harvest
-        // from, so this is the un-recoverable case — refuse the launch.
+        // no account this call could name. The launch path now quarantines
+        // such an item and replaces it (`force_sync_account_changed_for_launch`),
+        // so this arm is kept only for exhaustiveness and is not produced
+        // by a production launch; if it were, refusing is the safe answer.
         //
         // `keychain-fix-r8.md` C-F1 (message rewrite): see the identical
         // rewrite in `decide_swap_disposition` — C-F1's history match already
@@ -6536,6 +7346,12 @@ fn decide_launch_disposition(
         Ok(ForcedSyncResult::TargetTokenInvalidated) => Err(
             "this account's own login is no longer valid; nothing changed — \
              run `csq login <n>` for this account, then retry the launch"
+                .to_string(),
+        ),
+        Ok(ForcedSyncResult::QuarantineSaveFailed) => Err(
+            "csq could not save the unidentified keychain login to the keychain-quarantine \
+             folder in your csq accounts directory (check disk space and permissions); \
+             nothing was changed — fix that and retry the launch"
                 .to_string(),
         ),
         Ok(ForcedSyncResult::Applied { .. }) => Ok(true),
@@ -6735,8 +7551,8 @@ impl fmt::Debug for WriteDecision<'_> {
 /// `true` when `current` is [`RawContentClassification::Content`] and its
 /// `claudeAiOauth` key is present but its `accessToken`/`refreshToken`
 /// identity could NOT be parsed — the rule-4 "present but malformed" case,
-/// distinct from [`holds_no_login`] (no `claudeAiOauth` key at all, which is
-/// rule 1, free-to-write) and distinct from a parseable identity that
+/// distinct from [`holds_no_login`] (no `claudeAiOauth` key at all, or one
+/// with both tokens empty, which is rule 1, free-to-write) and distinct from a parseable identity that
 /// simply matches nothing known (rule 3, harvest candidate). Re-parses
 /// `current`'s JSON rather than threading a borrowed `Value` through,
 /// mirroring [`keychain_content_matches_token`]'s own re-parse-per-call
@@ -6773,7 +7589,8 @@ fn current_oauth_unparseable(current: &RawContentClassification) -> bool {
 /// `current` and `known`.
 ///
 /// Implements the five rules verbatim:
-/// 1. `current` absent, or present with no `claudeAiOauth` key at all →
+/// 1. `current` absent, present with no `claudeAiOauth` key at all, or
+///    present with both tokens empty ([`oauth_tokens_both_empty`]) →
 ///    free to write/strip.
 /// 2. `current` holds content matching SOME known account's token → nothing
 ///    lost by overwriting; write (or strip, for [`Intended::Strip`]).
@@ -7033,6 +7850,26 @@ pub(crate) enum ApplyOutcome {
     WriteFailed,
 }
 
+/// The previous content with `claudeAiOauth` removed, serialized, or `None`
+/// when there is nothing to keep. Taken from the caller's ALREADY-READ
+/// classification, so no extra keychain read (a possible password dialog) is
+/// made. Never the full content: restoring the old token mid-swap would put
+/// a superseded account's login back.
+#[cfg(target_os = "macos")]
+fn siblings_only_payload(current: &RawContentClassification) -> Option<String> {
+    match current {
+        RawContentClassification::Content(json) => {
+            let siblings = extract_sibling_object(json);
+            if siblings.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&serde_json::Value::Object(siblings)).ok()
+            }
+        }
+        RawContentClassification::Absent | RawContentClassification::Unreadable(_) => None,
+    }
+}
+
 /// The single executor-level entry every production caller of CC-item
 /// add/delete MUST route through (`keychain-fix-r7b.md`). Takes the SAME
 /// `current` [`decide_cc_keychain_write`] decided against, so
@@ -7062,7 +7899,12 @@ fn apply_cc_keychain_write(
     };
     match decision {
         WriteDecision::Write(raw) => match plan_mirror_write(current, raw, backfill_allowed) {
-            Ok(plan) => match exec.add(svc, account, &plan.write_x) {
+            Ok(plan) => match exec.add_restoring(
+                svc,
+                account,
+                &plan.write_x,
+                siblings_only_payload(current),
+            ) {
                 Ok(()) => ApplyOutcome::Applied { wrote_token: true },
                 Err(_) => on_write_failure(),
             },
@@ -9256,6 +10098,219 @@ mod tests {
         }
     }
 
+    /// Drives `add_via_delete_create` with a scripted runner. Deletes pop
+    /// `delete_codes` in order (`None` = timeout); once exhausted they report
+    /// 44. Adds pop `add_codes` in order, then report 0. Returns every call
+    /// (argv, with the stdin line appended) and the result.
+    #[cfg(target_os = "macos")]
+    fn run_add_scripted(
+        invocation: AddInvocation,
+        siblings_only: Option<String>,
+        delete_codes: Vec<Option<i32>>,
+        add_codes: Vec<i32>,
+    ) -> (Vec<Vec<String>>, Result<(), PlatformError>) {
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let deletes = std::cell::RefCell::new(std::collections::VecDeque::from(delete_codes));
+        let adds = std::cell::RefCell::new(std::collections::VecDeque::from(add_codes));
+        let runner = |args: &[&str], stdin: Option<Vec<u8>>| -> Option<BoundedOutput> {
+            let mut rec: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            if let Some(line) = stdin {
+                rec.push(String::from_utf8_lossy(&line).into_owned());
+            }
+            let is_delete = args.first() == Some(&"delete-generic-password");
+            calls.borrow_mut().push(rec);
+            if is_delete {
+                match deletes.borrow_mut().pop_front() {
+                    Some(c) => c.map(|c| fake_bounded_output(c, b"", true)),
+                    None => Some(fake_bounded_output(SECURITY_ITEM_NOT_FOUND, b"", true)),
+                }
+            } else {
+                let c = adds.borrow_mut().pop_front().unwrap_or(0);
+                Some(fake_bounded_output(c, b"", true))
+            }
+        };
+        let result = add_via_delete_create("svc", "acct", invocation, siblings_only, &runner);
+        (calls.into_inner(), result)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_never_uses_dash_u_and_deletes_before_adding() {
+        let small = select_add_invocation("svc", "acct", "payload").unwrap();
+        let big_payload = "a".repeat(SECURITY_I_MAX_SAFE_LINE_BYTES);
+        let big = select_add_invocation("svc", "acct", &big_payload).unwrap();
+        assert!(matches!(big, AddInvocation::ArgvFallback(_)));
+        for inv in [small, big] {
+            let (calls, result) = run_add_scripted(inv, None, vec![], vec![]);
+            result.expect("delete(44) then add(0) must succeed");
+            assert_eq!(calls.len(), 2, "exactly one delete and one add: {calls:?}");
+            assert_eq!(calls[0][0], "delete-generic-password", "delete first");
+            assert_ne!(calls[1][0], "delete-generic-password");
+            for call in &calls {
+                assert!(
+                    !call
+                        .iter()
+                        .any(|a| a == "-U" || a.contains("add-generic-password -U")),
+                    "no write invocation may carry -U: {:?}",
+                    call.first()
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn delete_failure_other_than_not_found_skips_the_add() {
+        for delete_code in [Some(1), Some(51), None] {
+            let inv = select_add_invocation("svc", "acct", "payload").unwrap();
+            let (calls, result) = run_add_scripted(inv, None, vec![delete_code], vec![]);
+            let err = result.expect_err("an unconfirmed delete must fail the write");
+            assert!(
+                err.to_string().contains("state is unknown"),
+                "wording must not claim nothing changed: {err}"
+            );
+            assert_eq!(calls.len(), 1, "no add after a failed delete: {calls:?}");
+            assert_eq!(calls[0][0], "delete-generic-password");
+        }
+    }
+
+    /// Duplicates: two successful deletes then 44, and only then the add.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_items_are_deleted_until_not_found_before_the_add() {
+        let inv = select_add_invocation("svc", "acct", "payload").unwrap();
+        let (calls, result) = run_add_scripted(inv, None, vec![Some(0), Some(0)], vec![]);
+        assert!(result.is_ok());
+        let verbs: Vec<&str> = calls.iter().map(|c| c[0].as_str()).collect();
+        assert_eq!(
+            verbs,
+            ["delete-generic-password"; 3]
+                .iter()
+                .copied()
+                .chain(["-i"])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A delete that never reaches 44 within the budget refuses the write.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn endless_duplicates_exhaust_the_delete_budget_and_skip_the_add() {
+        let inv = select_add_invocation("svc", "acct", "payload").unwrap();
+        let codes = vec![Some(0); MAX_DUPLICATE_DELETE_ITERATIONS as usize + 3];
+        let (calls, result) = run_add_scripted(inv, None, codes, vec![]);
+        assert!(result.is_err());
+        assert_eq!(calls.len(), MAX_DUPLICATE_DELETE_ITERATIONS as usize);
+        assert!(calls.iter().all(|c| c[0] == "delete-generic-password"));
+    }
+
+    /// Add fails after the delete: ONE siblings-only re-add. The previous
+    /// content holds BOTH `claudeAiOauth` and `mcpOAuth`; the siblings come
+    /// from the real extraction (`siblings_only_payload`), so the re-added
+    /// payload must keep `mcpOAuth` and must NOT carry `claudeAiOauth`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn add_failure_after_delete_re_adds_siblings_only() {
+        let previous = RawContentClassification::Content(
+            r#"{"claudeAiOauth":{"accessToken":"OLDTOKEN"},"mcpOAuth":{"t":"x"}}"#.to_string(),
+        );
+        let inv = select_add_invocation("svc", "acct", "payload").unwrap();
+        let (calls, result) =
+            run_add_scripted(inv, siblings_only_payload(&previous), vec![], vec![1, 0]);
+        assert!(result.is_err(), "the original add failure must surface");
+        assert_eq!(calls.len(), 3, "delete, failed add, re-add: {calls:?}");
+        let readd = calls[2].join(" ");
+        let hex_payload = readd.rsplit("-X ").next().unwrap().trim();
+        let decoded = String::from_utf8(hex::decode(hex_payload).unwrap()).unwrap();
+        assert!(decoded.contains("mcpOAuth"), "{decoded}");
+        assert!(!decoded.contains("claudeAiOauth"), "{decoded}");
+        assert!(!decoded.contains("OLDTOKEN"), "{decoded}");
+    }
+
+    /// `apply_cc_keychain_write` hands the executor siblings derived from
+    /// the caller's already-read `current`, with no extra `find`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apply_write_passes_siblings_from_current_without_extra_find() {
+        struct Spy {
+            seen: std::cell::RefCell<Option<Option<String>>>,
+            finds: std::cell::Cell<u32>,
+        }
+        impl KeychainExecutor for Spy {
+            fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                self.finds.set(self.finds.get() + 1);
+                RawContentClassification::Absent
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                panic!("the write must go through add_restoring")
+            }
+            fn add_restoring(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                siblings_only: Option<String>,
+            ) -> Result<(), PlatformError> {
+                *self.seen.borrow_mut() = Some(siblings_only);
+                Ok(())
+            }
+            fn delete(&self, _: &str, _: &str) -> bool {
+                false
+            }
+        }
+        let spy = Spy {
+            seen: std::cell::RefCell::new(None),
+            finds: std::cell::Cell::new(0),
+        };
+        let current = RawContentClassification::Content(
+            r#"{"claudeAiOauth":{"accessToken":"OLD"},"mcpOAuth":{"t":"x"}}"#.to_string(),
+        );
+        let raw = r#"{"claudeAiOauth":{"accessToken":"NEW","refreshToken":"r","expiresAt":4102444800000}}"#;
+        let out = apply_cc_keychain_write(
+            &spy,
+            "svc",
+            "acct",
+            &current,
+            WriteDecision::Write(raw),
+            false,
+        );
+        assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+        assert_eq!(spy.finds.get(), 0, "no extra keychain read");
+        let seen = spy.seen.borrow().clone().expect("add_restoring called");
+        let siblings = seen.expect("siblings derived from current");
+        assert!(siblings.contains("mcpOAuth") && !siblings.contains("claudeAiOauth"));
+    }
+
+    /// No previous siblings: no re-add is attempted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn add_failure_after_delete_without_siblings_does_not_re_add() {
+        let inv = select_add_invocation("svc", "acct", "payload").unwrap();
+        let (calls, result) = run_add_scripted(inv, None, vec![], vec![1]);
+        assert!(result.is_err());
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_op_timeout_long_bound_only_in_explicit_scope() {
+        assert_eq!(security_op_timeout(false), KEYCHAIN_OP_TIMEOUT);
+        assert_eq!(security_op_timeout(true), KEYCHAIN_INTERACTIVE_OP_TIMEOUT);
+        assert!(KEYCHAIN_INTERACTIVE_OP_TIMEOUT > KEYCHAIN_OP_TIMEOUT);
+        // A tty-only caller is outside the scope, so it is passed `false`.
+        assert!(!interactive_scope_active());
+        assert_eq!(
+            security_op_timeout(interactive_scope_active()),
+            KEYCHAIN_OP_TIMEOUT
+        );
+        with_interactive_keychain(|| {
+            assert_eq!(
+                security_op_timeout(interactive_scope_active()),
+                KEYCHAIN_INTERACTIVE_OP_TIMEOUT
+            );
+        });
+    }
+
     /// F3: a raw wait status whose LOW bits encode a terminating SIGNAL
     /// (never an exit code) — the shape `ExitStatus::code()` returns `None`
     /// for on Unix. Exercises the "signal death" path `classify_raw_content`
@@ -9480,6 +10535,42 @@ mod tests {
         assert_eq!(value["claudeAiOauth"]["rateLimitTier"], "tier4");
     }
 
+    /// An emptied login carries no identity, so it never backfills plan
+    /// metadata into the account being written; its siblings still survive.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plan_mirror_write_emptied_login_keeps_siblings_but_never_backfills() {
+        let x = RawContentClassification::Content(
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max","rateLimitTier":"tier4"},"mcpOAuth":{"k":"v"}}"#
+                .to_string(),
+        );
+        let file = r#"{"claudeAiOauth":{"accessToken":"new","refreshToken":"new-rt","subscriptionType":null,"rateLimitTier":null}}"#;
+        let plan = plan_mirror_write(&x, file, true).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plan.write_x).unwrap();
+        assert_eq!(value["claudeAiOauth"]["accessToken"], "new");
+        assert!(
+            value["claudeAiOauth"]["subscriptionType"].is_null(),
+            "{value}"
+        );
+        assert!(value["claudeAiOauth"]["rateLimitTier"].is_null(), "{value}");
+        assert_eq!(
+            value["mcpOAuth"]["k"], "v",
+            "siblings must survive: {value}"
+        );
+    }
+
+    /// Two emptied logins never "match": an empty refresh token identifies
+    /// nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn emptied_logins_never_match_each_other() {
+        let emptied = r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#;
+        assert!(!keychain_content_matches_token(
+            &RawContentClassification::Content(emptied.to_string()),
+            emptied
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn build_write_payload_does_not_backfill_when_file_already_has_a_value() {
@@ -9575,6 +10666,135 @@ mod tests {
     // pipes open long after the awaited process itself is gone; before the
     // fix, joining the reader threads unconditionally blocked on that
     // descendant regardless of which path (timeout or normal-exit) was hit.
+
+    /// The keychain-lock classifier that keeps csq's background keychain
+    /// traffic from raising macOS's "security wants to use the login
+    /// keychain" unlock dialog. Locked must be recognised from the status
+    /// bits (kSecUnlockStateStatus CLEAR), unlocked from the bit SET, and an
+    /// unreadable status must NOT be read as locked (that would silently
+    /// stop every keychain mirror on a host where the probe fails).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn keychain_lock_state_classifies_status_bits() {
+        fn locked() -> Option<u32> {
+            Some(0) // readable, writable bits may be set elsewhere; unlock bit clear
+        }
+        fn locked_other_bits() -> Option<u32> {
+            Some(0b110) // kSecReadPermStatus | kSecWritePermStatus, unlock bit clear
+        }
+        fn unlocked() -> Option<u32> {
+            Some(0b111)
+        }
+        fn unreadable() -> Option<u32> {
+            None
+        }
+        assert_eq!(keychain_lock_state(locked), KeychainLockState::Locked);
+        assert_eq!(
+            keychain_lock_state(locked_other_bits),
+            KeychainLockState::Locked
+        );
+        assert_eq!(keychain_lock_state(unlocked), KeychainLockState::Unlocked);
+        assert_eq!(keychain_lock_state(unreadable), KeychainLockState::Unknown);
+    }
+
+    /// Only a NON-interactive process with a CONFIRMED-locked keychain skips
+    /// the call. An interactive process keeps the prompt (the operator asked
+    /// for the operation and is there to answer it) and never pays for the
+    /// probe; an unknown lock state proceeds.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn defer_only_when_non_interactive_and_locked() {
+        assert!(should_defer_for_locked_keychain(false, || {
+            KeychainLockState::Locked
+        }));
+        assert!(!should_defer_for_locked_keychain(false, || {
+            KeychainLockState::Unlocked
+        }));
+        assert!(!should_defer_for_locked_keychain(false, || {
+            KeychainLockState::Unknown
+        }));
+        assert!(!should_defer_for_locked_keychain(true, || {
+            panic!("an interactive process must not probe the keychain")
+        }));
+    }
+
+    /// The lock probe is bounded: an answering probe passes its value
+    /// through, a hung one yields Unknown (None) within the bound.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn bounded_probe_returns_value_or_none_on_timeout() {
+        fn quick() -> Option<u32> {
+            Some(0b111)
+        }
+        fn hung() -> Option<u32> {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Some(0)
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static FLIGHT: AtomicBool = AtomicBool::new(false);
+        assert_eq!(
+            bounded_probe_with(&FLIGHT, quick, std::time::Duration::from_secs(2)),
+            Some(0b111)
+        );
+        assert!(
+            !FLIGHT.load(Ordering::SeqCst),
+            "a finished probe clears in-flight"
+        );
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            bounded_probe_with(&FLIGHT, hung, std::time::Duration::from_millis(200)),
+            None
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        // The hung probe is still in flight: a second call must not spawn
+        // another thread — it returns Unknown immediately.
+        assert!(FLIGHT.load(Ordering::SeqCst));
+        let t1 = std::time::Instant::now();
+        assert_eq!(
+            bounded_probe_with(&FLIGHT, quick, std::time::Duration::from_secs(2)),
+            None
+        );
+        assert!(t1.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    /// The interactive scope is active only inside the closure, nests, and
+    /// is cleared even if the closure panics.
+    #[test]
+    fn interactive_scope_is_scoped_and_unwind_safe() {
+        assert!(!interactive_scope_active());
+        with_interactive_keychain(|| {
+            assert!(interactive_scope_active());
+            with_interactive_keychain(|| assert!(interactive_scope_active()));
+            assert!(interactive_scope_active());
+        });
+        assert!(!interactive_scope_active());
+        let _ = std::panic::catch_unwind(|| with_interactive_keychain(|| panic!("boom")));
+        assert!(!interactive_scope_active());
+    }
+
+    /// The daemon's catch-up sweep is due exactly once after the keychain
+    /// stops reading as locked — whether THIS process deferred a call or
+    /// another process (which leaves no flag here) skipped work while it was
+    /// locked — and never while it is still locked.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn catch_up_due_once_after_unlock_from_either_signal() {
+        use std::sync::atomic::AtomicBool;
+        use KeychainLockState::{Locked, Unknown, Unlocked};
+        // Steady unlocked, nothing deferred: no sweep.
+        let (d, l) = (AtomicBool::new(false), AtomicBool::new(false));
+        assert!(!catch_up_due_with(&d, &l, Unlocked));
+        // Locked (another process skipped work): no sweep while locked...
+        assert!(!catch_up_due_with(&d, &l, Locked));
+        assert!(!catch_up_due_with(&d, &l, Locked));
+        // ...one sweep on the transition, then none.
+        assert!(catch_up_due_with(&d, &l, Unlocked));
+        assert!(!catch_up_due_with(&d, &l, Unlocked));
+        // A deferral in this process (no observed lock) also triggers once.
+        d.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(catch_up_due_with(&d, &l, Unknown));
+        assert!(!catch_up_due_with(&d, &l, Unknown));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -10565,7 +11785,7 @@ mod tests {";
     fn s4_force_sync_write_failure_after_content_read_is_write_failed_unknown() {
         // S4: a failing write over KNOWN prior content no longer propagates
         // as a bare `Err` (which callers read as "nothing changed") — the
-        // disk state is UNKNOWN (a watchdog-timed-out `add -U` may have
+        // disk state is UNKNOWN (a watchdog-timed-out `add` may have
         // partially committed). v5: the caller no longer restores a
         // snapshot from this outcome — it proceeds to the repoint exactly
         // as for `Applied`, and `reconcile_keychain_to_marker` is the
@@ -10585,6 +11805,217 @@ mod tests {";
         assert!(
             matches!(result, Ok(ForcedSyncResult::WriteFailedUnknown)),
             "expected Ok(WriteFailedUnknown), got {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    const FOREIGN_RAW: &str = r#"{"claudeAiOauth":{"accessToken":"foreign-at","refreshToken":"foreign-rt","expiresAt":9999999999999},"mcpOAuth":{"k":"v"}}"#;
+
+    /// Swap/daemon path (`quarantine_foreign = false`): an unidentified item
+    /// is still refused, nothing deleted or written.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_item_without_quarantine_still_refuses() {
+        let rec =
+            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::ForeignLoginUnharvested)),
+            "{result:?}"
+        );
+        assert!(
+            rec.calls().iter().all(|c| c.0 == "find"),
+            "{:?}",
+            rec.calls()
+        );
+        assert!(!dir.path().join(QUARANTINE_DIR_NAME).exists());
+    }
+
+    /// Swap/daemon path: an item Claude Code emptied after a failed refresh
+    /// is replaced with the account's token, not refused, and nothing is
+    /// quarantined because there is no login to save.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swap_path_replaces_an_emptied_login() {
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max"}}"#
+                .to_string(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
+            "{result:?}"
+        );
+        assert!(!dir.path().join(QUARANTINE_DIR_NAME).exists());
+    }
+
+    /// Fresh-launch path: the foreign payload is saved byte-for-byte at 0600
+    /// in a 0700 dir, then the write proceeds and carries none of the
+    /// foreign item's content.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_quarantines_foreign_item_then_writes() {
+        let _trace = quarantine_trace_guard();
+        use std::os::unix::fs::PermissionsExt;
+        let rec =
+            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
+            "{result:?}"
+        );
+        let qdir = dir.path().join(QUARANTINE_DIR_NAME);
+        assert_eq!(
+            std::fs::metadata(&qdir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let files: Vec<_> = std::fs::read_dir(&qdir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), FOREIGN_RAW);
+        assert_eq!(
+            std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let payload = rec
+            .add_payloads
+            .borrow()
+            .last()
+            .cloned()
+            .expect("an add happened");
+        assert!(
+            !payload.contains("foreign-at") && !payload.contains("mcpOAuth"),
+            "{payload}"
+        );
+    }
+
+    /// If the quarantine cannot be written the item is NOT discarded: refuse,
+    /// no add and no delete.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_quarantine_failure_refuses_without_mutation() {
+        let _trace = quarantine_trace_guard();
+        let rec =
+            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        // A FILE where the quarantine directory must go.
+        std::fs::write(dir.path().join(QUARANTINE_DIR_NAME), b"x").unwrap();
+        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::QuarantineSaveFailed)),
+            "{result:?}"
+        );
+        assert!(
+            rec.calls().iter().all(|c| c.0 == "find"),
+            "{:?}",
+            rec.calls()
+        );
+    }
+
+    /// A symlinked quarantine dir is refused (no write through the link).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_quarantine_refuses_symlinked_dir() {
+        let _trace = quarantine_trace_guard();
+        let rec =
+            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(QUARANTINE_DIR_NAME)).unwrap();
+        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::QuarantineSaveFailed)),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+        assert!(rec.calls().iter().all(|c| c.0 == "find"));
+    }
+
+    /// Quarantine saves, then the replace add FAILS: the saved copy stays,
+    /// the result is `WriteFailedUnknown`, and the launch refuses.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_quarantine_ok_but_replace_fails_refuses_launch() {
+        let _trace = quarantine_trace_guard();
+        let rec =
+            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        rec.add_ok.set(false);
+        let dir = tempfile::tempdir().unwrap();
+        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::WriteFailedUnknown)),
+            "{result:?}"
+        );
+        let q = dir.path().join(QUARANTINE_DIR_NAME);
+        assert_eq!(std::fs::read_dir(&q).unwrap().count(), 1, "copy kept");
+        assert!(decide_launch_disposition(result).is_err());
+    }
+
+    /// Age prune: an old `.json` goes, a fresh one stays, a non-json file
+    /// (`notes.txt`) is never touched even when old.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quarantine_prune_removes_only_old_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 3600);
+        for name in ["20240101T000000000Z-a.json", "notes.txt"] {
+            std::fs::write(q.join(name), "x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(q.join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        std::fs::write(q.join("20990101T000000000Z-b.json"), "x").unwrap();
+        prune_quarantine(q, QUARANTINE_KEEP, QUARANTINE_MAX_AGE);
+        assert!(
+            !q.join("20240101T000000000Z-a.json").exists(),
+            "old json removed"
+        );
+        assert!(
+            q.join("20990101T000000000Z-b.json").exists(),
+            "fresh json kept"
+        );
+        assert!(q.join("notes.txt").exists(), "non-json untouched");
+    }
+
+    /// 12 files, then `prune_quarantine`: only the newest 10 remain (by
+    /// name), the oldest two are removed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quarantine_prunes_to_newest_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(QUARANTINE_DIR_NAME);
+        std::fs::create_dir_all(&q).unwrap();
+        for i in 0..12 {
+            std::fs::write(
+                q.join(format!("20990101T0000{i:02}000Z-aaaaaaaa.json")),
+                "{}",
+            )
+            .unwrap();
+        }
+        prune_quarantine(&q, QUARANTINE_KEEP, QUARANTINE_MAX_AGE);
+        let mut names: Vec<String> = std::fs::read_dir(&q)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 10, "{names:?}");
+        assert!(
+            names[0].contains("000002000Z") || names[0].contains("00002000Z"),
+            "{names:?}"
+        );
+        assert!(
+            names.last().unwrap().contains("000011000Z")
+                || names.last().unwrap().contains("00011000Z"),
+            "{names:?}"
         );
     }
 
@@ -10884,7 +12315,6 @@ mod tests {";
 
     // T5 — ordinary (K5) sync still applies the freshness guard and allows
     // same-account backfill; never strips. Covered end-to-end by the
-    // pre-existing `s10_write_raw_content_x_is_exactly_one_add_no_delete`,
     // `r7_6_write_raw_skips_add_when_keychain_already_fresher_or_equal`, and
     // `build_write_payload_backfills_subscription_fields_when_file_is_null_same_account`
     // — unchanged by round 7c D2 (the ordinary `write_raw` path's decision
@@ -11419,6 +12849,44 @@ mod tests {";
         );
     }
 
+    /// The marker account's own token is untrusted and X is an emptied
+    /// login: nothing safe can replace it, and the terminal is logged out,
+    /// so reconcile must report it, not call the terminal current.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconcile_reports_emptied_login_when_marker_account_untrusted() {
+        let fixture = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let base = fixture.path();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+        let identity_creds_path = crate::accounts::identity_store::credentials_path_for(base, uuid);
+        std::fs::create_dir_all(identity_creds_path.parent().unwrap()).unwrap();
+        let expired = now_ms().saturating_sub(60_000);
+        std::fs::write(
+            &identity_creds_path,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":{expired}}}}}"#
+            ),
+        )
+        .expect("write identity credentials");
+        let handle_dir = base.join("term-reconcile-emptied");
+        std::fs::create_dir_all(&handle_dir).unwrap();
+        crate::accounts::markers::write_csq_account(&handle_dir, uuid)
+            .expect("write .csq-account marker");
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#.to_string(),
+        ));
+        let outcome = reconcile_keychain_to_marker_with_executor(&exec, base, &handle_dir, None);
+        assert!(
+            !matches!(outcome, ReconcileOutcome::AlreadyCurrent { .. }),
+            "an emptied login must not read as current: {outcome:?}"
+        );
+        assert!(
+            exec.calls().iter().all(|(v, ..)| *v == "find"),
+            "no mutation without a trusted token: {:?}",
+            exec.calls()
+        );
+    }
+
     // ── decide_and_clear_dead_handle (keychain-fix-r8.md C-F3) ────────────────
 
     #[cfg(target_os = "macos")]
@@ -11712,21 +13180,23 @@ mod tests {";
         assert!(exec.calls().iter().any(|(v, ..)| *v == "delete"));
     }
 
-    /// Mirrors `decide_and_clear_dead_handle_keeps_unconfirmed_candidate`,
-    /// but this function's own contract is the OPPOSITE `Ok`/`Err` choice
-    /// for the identical decision (see the inline comment at the
-    /// `Err(KeychainClearUnconfirmed)` return site for why: this function
-    /// IS the retry loop, so `Err` costs a backoff bump, never a blind
-    /// delete).
+    /// An unidentified Anthropic login with a sibling (`mcpOAuth`).
+    #[cfg(target_os = "macos")]
+    const UNMATCHED_RAW: &str = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000},"mcpOAuth":{"k":"v"}}"#;
+
+    /// Unidentified item, dead handle dir: saved byte-for-byte to the
+    /// quarantine folder, then the WHOLE item is deleted (no sibling remainder
+    /// is written back) and the entry resolves.
     #[cfg(target_os = "macos")]
     #[test]
-    fn decide_and_clear_queued_service_keeps_unconfirmed_candidate() {
+    fn decide_and_clear_queued_service_quarantines_then_deletes_unconfirmed_candidate() {
+        let _trace = quarantine_trace_guard();
         let (fixture, _handle_dir, _far_future) = reconcile_fixture();
         let base = fixture.path();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
-        let unmatched = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000}}"#;
-        let exec =
-            RecordingExecutor::scripted(RawContentClassification::Content(unmatched.to_string()));
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            UNMATCHED_RAW.to_string(),
+        ));
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
             base,
@@ -11736,18 +13206,348 @@ mod tests {";
             None,
             &|_, _| false,
         );
-        assert_eq!(
-            result,
-            Err(KeychainClearUnconfirmed),
-            "an unconfirmed candidate must be KEPT and backed off, never deleted"
+        assert_eq!(result, Ok(true));
+        let calls = exec.calls();
+        assert!(calls.iter().any(|(v, ..)| *v == "delete"), "{calls:?}");
+        assert!(
+            calls.iter().all(|(v, ..)| *v != "add"),
+            "no remainder add: {calls:?}"
         );
+        let saved: Vec<String> = std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(saved, vec![UNMATCHED_RAW.to_string()]);
+    }
+
+    /// Taken by every test that reaches a quarantine `warn!` without
+    /// capturing it. A test hitting a callsite for the first time with no
+    /// subscriber installed can cache it as disabled while a capturing test
+    /// is installing its subscriber, and the capture then sees nothing.
+    #[cfg(target_os = "macos")]
+    fn quarantine_trace_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `(error_kind, svc_hash)` of every event emitted while `run` executes.
+    #[cfg(target_os = "macos")]
+    fn capture_quarantine_events<T>(run: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+        use std::sync::{Arc, Mutex};
+        struct Fields(Option<String>, Option<String>);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                match f.name() {
+                    "error_kind" => self.0 = Some(v.to_string()),
+                    "svc_hash" => self.1 = Some(v.to_string()),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.record_str(f, format!("{v:?}").trim_matches('"'));
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut f = Fields(None, None);
+                event.record(&mut f);
+                if let Some(kind) = f.0 {
+                    self.0.lock().unwrap().push((kind, f.1.unwrap_or_default()));
+                }
+            }
+        }
+        let _guard = quarantine_trace_guard();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        // A sibling test hitting the same `warn!` with no subscriber installed
+        // can register the callsite as "never interested" concurrently with
+        // this capture; rebuild the cache once the capture is in place so the
+        // callsite is re-evaluated against it.
+        let result = tracing::subscriber::with_default(Capture(Arc::clone(&events)), || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    /// The hash suffix of the single quarantined file under `base`.
+    #[cfg(target_os = "macos")]
+    fn only_quarantine_file_hash(base: &Path) -> String {
+        let names: Vec<String> = std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        names[0]
+            .trim_end_matches(".json")
+            .rsplit('-')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The fresh-launch quarantine event names the saved file's hash, so the
+    /// file can be matched to the launch that wrote it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_quarantine_event_names_the_saved_file() {
+        let rec =
+            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let (result, events) = capture_quarantine_events(|| {
+            force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true)
+        });
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
+            "{result:?}"
+        );
+        let hash = only_quarantine_file_hash(dir.path());
+        assert!(
+            events.contains(&(
+                "keychain_fresh_launch_quarantined_foreign_item".to_string(),
+                hash.clone()
+            )),
+            "expected the event to carry svc_hash={hash}: {events:?}"
+        );
+    }
+
+    /// The pending-clear quarantine event names the saved file's hash.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_quarantine_event_names_the_saved_file() {
+        let (fixture, _handle_dir, _far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let acct = crate::types::AccountNum::try_from(1u16).unwrap();
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            UNMATCHED_RAW.to_string(),
+        ));
+        let (result, events) = capture_quarantine_events(|| {
+            decide_and_clear_queued_service_with_executor(
+                &exec,
+                base,
+                "Claude Code-credentials-deadbeef",
+                Some(acct),
+                None,
+                None,
+                &|_, _| false,
+            )
+        });
+        assert_eq!(result, Ok(true));
+        let hash = only_quarantine_file_hash(base);
+        assert_eq!(hash, "deadbeef", "suffix of the service name");
+        assert!(
+            events.contains(&(
+                "keychain_pending_clear_quarantined_foreign_item".to_string(),
+                hash.clone()
+            )),
+            "expected the event to carry svc_hash={hash}: {events:?}"
+        );
+    }
+
+    /// The handle dir that owns the service appears between the first
+    /// ownership check and the delete: the item is kept, the entry stays
+    /// queued, and the event says so. Deterministic: the service is the one
+    /// the quarantine dir itself would own, so the save creates the dir the
+    /// re-check then finds.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_dir_reappearing_before_delete_keeps_item_and_logs() {
+        let (fixture, _handle_dir, _far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let acct = crate::types::AccountNum::try_from(1u16).unwrap();
+        let svc = service_name(
+            &std::fs::canonicalize(base)
+                .unwrap()
+                .join(QUARANTINE_DIR_NAME),
+        );
+        assert!(!base.join(QUARANTINE_DIR_NAME).exists());
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            UNMATCHED_RAW.to_string(),
+        ));
+        let (result, events) = capture_quarantine_events(|| {
+            decide_and_clear_queued_service_with_executor(
+                &exec,
+                base,
+                &svc,
+                Some(acct),
+                None,
+                None,
+                &|_, _| false,
+            )
+        });
+        assert_eq!(result, Err(KeychainClearUnconfirmed));
+        let calls = exec.calls();
+        assert!(calls.iter().all(|(v, ..)| *v != "delete"), "{calls:?}");
+        let hash = only_quarantine_file_hash(base);
+        assert!(
+            events.contains(&(
+                "keychain_pending_clear_quarantined_dir_reappeared".to_string(),
+                hash.clone()
+            )),
+            "expected the reappeared event with svc_hash={hash}: {events:?}"
+        );
+    }
+
+    /// Quarantine cannot be written: the item and the entry are KEPT.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decide_and_clear_queued_service_keeps_item_when_quarantine_fails() {
+        let _trace = quarantine_trace_guard();
+        let (fixture, _handle_dir, _far_future) = reconcile_fixture();
+        let base = fixture.path();
+        std::fs::write(base.join(QUARANTINE_DIR_NAME), b"x").unwrap();
+        let acct = crate::types::AccountNum::try_from(1u16).unwrap();
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            UNMATCHED_RAW.to_string(),
+        ));
+        let result = decide_and_clear_queued_service_with_executor(
+            &exec,
+            base,
+            "svc-irrelevant-to-decide",
+            Some(acct),
+            None,
+            None,
+            &|_, _| false,
+        );
+        assert_eq!(result, Err(KeychainClearUnconfirmed));
         assert!(
             exec.calls()
                 .iter()
                 .all(|(v, ..)| *v != "delete" && *v != "add"),
-            "must not mutate X when adoption is not confirmed, got {:?}",
+            "must not mutate X, got {:?}",
             exec.calls()
         );
+    }
+
+    /// A directory that hashes to this service exists again (a recycled PID's
+    /// new session): untouched, nothing quarantined, entry kept.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decide_and_clear_queued_service_leaves_item_when_a_dir_owns_the_service() {
+        let _trace = quarantine_trace_guard();
+        let (fixture, _handle_dir, _far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let live = base.join("term-424242");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join(".live-pid"), std::process::id().to_string()).unwrap();
+        let svc = service_name(&canonicalize_for_keychain_sync(&live).0);
+        let acct = crate::types::AccountNum::try_from(1u16).unwrap();
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            UNMATCHED_RAW.to_string(),
+        ));
+        let result = decide_and_clear_queued_service_with_executor(
+            &exec,
+            base,
+            &svc,
+            Some(acct),
+            None,
+            None,
+            &|_, _| false,
+        );
+        assert_eq!(result, Err(KeychainClearUnconfirmed));
+        assert!(exec
+            .calls()
+            .iter()
+            .all(|(v, ..)| *v != "delete" && *v != "add"));
+        assert!(!base.join(QUARANTINE_DIR_NAME).exists());
+    }
+
+    /// Quarantine saves, the delete is NOT confirmed: Err (entry kept) and the
+    /// saved copy remains.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_quarantined_but_delete_unconfirmed_keeps_entry() {
+        let _trace = quarantine_trace_guard();
+        let (fixture, _h, _f) = reconcile_fixture();
+        let base = fixture.path();
+        let acct = crate::types::AccountNum::try_from(1u16).unwrap();
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            UNMATCHED_RAW.to_string(),
+        ));
+        exec.delete_ok.set(false);
+        let result = decide_and_clear_queued_service_with_executor(
+            &exec,
+            base,
+            "svc-irrelevant-to-decide",
+            Some(acct),
+            None,
+            None,
+            &|_, _| false,
+        );
+        assert_eq!(result, Err(KeychainClearUnconfirmed));
+        assert_eq!(
+            std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    /// A dir whose real path cannot be resolved counts as present; an
+    /// unreadable base counts as present too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unresolvable_dir_or_base_counts_as_owning_the_service() {
+        let svc = "Claude Code-credentials-00000000";
+        assert!(dir_may_own_service(Path::new("/nonexistent/x"), false, svc));
+        assert!(!dir_may_own_service(Path::new("/nonexistent/x"), true, svc));
+        assert!(handle_dir_exists_for_service(
+            Path::new("/nonexistent-base-dir"),
+            svc
+        ));
+    }
+
+    /// Repeated retries of the same unconfirmed item write ONE quarantine
+    /// file, so they cannot push other services' files out of retention.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repeated_pending_clear_retry_creates_no_duplicate_quarantine_file() {
+        let _trace = quarantine_trace_guard();
+        let (fixture, _h, _f) = reconcile_fixture();
+        let base = fixture.path();
+        let acct = crate::types::AccountNum::try_from(1u16).unwrap();
+        for _ in 0..3 {
+            let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+                UNMATCHED_RAW.to_string(),
+            ));
+            exec.delete_ok.set(false);
+            let _ = decide_and_clear_queued_service_with_executor(
+                &exec,
+                base,
+                "svc-irrelevant-to-decide",
+                Some(acct),
+                None,
+                None,
+                &|_, _| false,
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    /// The recurring warning is emitted once per key per interval.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn warn_due_rate_limits_per_key() {
+        assert!(warn_due("rate-limit-test-key"));
+        assert!(!warn_due("rate-limit-test-key"));
+        assert!(warn_due("rate-limit-test-other-key"));
     }
 
     /// RED proof (quoted in the commit): the fail-closed guard for a
@@ -12134,6 +13934,11 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn live_handle_dir_maps_to_service_finds_live_matching_dir() {
+        // `live_handle_dir_maps_to_service` shells out to `ps` (via
+        // `read_start_time`), resolved through the process-global PATH; other
+        // tests set PATH to a tempdir/empty. Hold the shared env lock so PATH
+        // is stable for the whole call.
+        let _env_guard = crate::platform::test_env::lock();
         let dir = tempfile::tempdir().unwrap();
         let pid = std::process::id();
         let handle = dir.path().join(format!("term-{pid}"));
@@ -12210,6 +14015,11 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn live_handle_dir_maps_to_service_finds_collision_with_different_queued_identity() {
+        // `live_handle_dir_maps_to_service` shells out to `ps` (via
+        // `read_start_time`), resolved through the process-global PATH; other
+        // tests set PATH to a tempdir/empty. Hold the shared env lock so PATH
+        // is stable for the whole call.
+        let _env_guard = crate::platform::test_env::lock();
         let dir = tempfile::tempdir().unwrap();
         let pid = std::process::id();
         let handle = dir.path().join(format!("term-{pid}"));
@@ -12630,7 +14440,6 @@ mod tests {";
         let result = std::panic::catch_unwind(|| {
             real_security_spawn_tripwire(&[
                 "add-generic-password",
-                "-U",
                 "-A",
                 "-s",
                 "svc",
@@ -12802,7 +14611,6 @@ mod tests {";
                     argv,
                     vec![
                         "add-generic-password".to_string(),
-                        "-U".to_string(),
                         "-A".to_string(),
                         "-s".to_string(),
                         "svc".to_string(),
@@ -12873,7 +14681,6 @@ mod tests {";
         let add_result = std::process::Command::new("security")
             .args([
                 "add-generic-password",
-                "-U",
                 "-A",
                 "-s",
                 svc,
@@ -12964,7 +14771,6 @@ mod tests {";
         let create = std::process::Command::new("security")
             .args([
                 "add-generic-password",
-                "-U",
                 "-A",
                 "-s",
                 svc,
@@ -13108,7 +14914,6 @@ mod tests {";
         let seed = std::process::Command::new("security")
             .args([
                 "add-generic-password",
-                "-U",
                 "-A",
                 "-s",
                 svc,
@@ -13303,7 +15108,7 @@ mod tests {";
         // Quoted, matching build_add_stdin_command's real shape exactly
         // (production always quotes svc/account — see that fn's doc).
         let stdin_cmd = format!(
-            "add-generic-password -U -A -s \"{svc}\" -a \"{account}\" -X {hex_payload} {tmp_str}\n"
+            "add-generic-password -A -s \"{svc}\" -a \"{account}\" -X {hex_payload} {tmp_str}\n"
         );
 
         let mut child = Command::new("security")
@@ -13411,7 +15216,7 @@ mod tests {";
         let intended: &[u8] = b"a\x0a\xe6\x97\xa5b";
         let hex_payload = hex::encode(intended);
         let stdin_cmd = format!(
-            "add-generic-password -U -A -s \"{svc}\" -a \"{account}\" -X {hex_payload} {tmp_str}\n"
+            "add-generic-password -A -s \"{svc}\" -a \"{account}\" -X {hex_payload} {tmp_str}\n"
         );
         let mut child = Command::new("security")
             .arg("-i")
@@ -13590,6 +15395,47 @@ mod tests {";
             Intended::Strip,
         );
         assert_eq!(decision, WriteDecision::StripAllowed);
+    }
+
+    /// The login Claude Code leaves after a failed refresh: both tokens
+    /// empty, `expiresAt` 0, plan metadata kept.
+    fn emptied_login_content() -> String {
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":["user:inference"],"subscriptionType":"max"}}"#.to_string()
+    }
+
+    // Rule 1: a login whose tokens are both empty holds nothing to lose.
+    #[test]
+    fn decide_rule1_emptied_login_write_writes() {
+        let intended = tok("new-at", "new-rt");
+        let decision = decide_cc_keychain_write(
+            &RawContentClassification::Content(emptied_login_content()),
+            &KnownTokens::default(),
+            Intended::Token(&intended),
+        );
+        assert!(matches!(decision, WriteDecision::Write(t) if t == intended));
+    }
+
+    #[test]
+    fn decide_rule1_emptied_login_strip_is_allowed() {
+        let decision = decide_cc_keychain_write(
+            &RawContentClassification::Content(emptied_login_content()),
+            &KnownTokens::default(),
+            Intended::Strip,
+        );
+        assert_eq!(decision, WriteDecision::StripAllowed);
+    }
+
+    // Only BOTH empty is "no login": an empty access token next to a real
+    // refresh token may still be a live login, so it stays unidentified.
+    #[test]
+    fn decide_one_empty_token_is_not_no_login() {
+        let intended = tok("new-at", "new-rt");
+        let decision = decide_cc_keychain_write(
+            &RawContentClassification::Content(tok("", "someone-elses-rt")),
+            &KnownTokens::default(),
+            Intended::Token(&intended),
+        );
+        assert_eq!(decision, WriteDecision::RefuseUnharvested);
     }
 
     // Rule 4a: the ask itself did not resolve to a clean read -> Unknown,

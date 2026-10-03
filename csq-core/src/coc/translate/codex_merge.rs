@@ -12,8 +12,8 @@
 //! Two non-trivial pieces of logic:
 //!
 //! 1. **Hand-edit preservation** (round-1 H2 / round-2 H5). When the
-//!    canonical content already has a non-empty `instructions = "..."`
-//!    value, the user's value is preserved. The layer scaffold is
+//!    canonical content already has a non-empty `developer_instructions` or
+//!    legacy `instructions` value, the user's value is preserved. The scaffold is
 //!    appended after a sentinel fence (`[csq:layer-scaffold-begin]` /
 //!    `[csq:layer-scaffold-end]`) chosen for unambiguous audit grep —
 //!    NOT the markdown `---` separator (round-2 H5 retracted that
@@ -30,8 +30,8 @@
 //!
 //! # Pre-seeded fence-marker refusal (round-3 L3)
 //!
-//! If the canonical `instructions` already contains either fence
-//! marker, the merge refuses with an actionable error. A pre-seeded
+//! If canonical `developer_instructions` or legacy `instructions` contains
+//! either fence marker, the merge refuses with an actionable error. A pre-seeded
 //! fence in the canonical means a prior csq write was hand-edited or
 //! the user pre-seeded the fence literal; either case warrants a
 //! `csq login N --provider codex` re-seed.
@@ -56,13 +56,13 @@ const FENCE_END: &str = "[csq:layer-scaffold-end]";
 /// * `canonical` — full text of `config-<N>/config.toml`.
 /// * `scaffold` — capability-layer scaffold (rules + structured-output
 ///   directive when class is Compliance) destined for the
-///   `instructions = "..."` field.
+///   `developer_instructions = "..."` field.
 /// * `overlay` — pre-rendered TOML scalar expressions for additional
 ///   top-level keys (e.g., reserved for PR-CA6c MCP filter
 ///   parameters; today always empty in the v2.4.0-alpha shape).
 ///
 /// On any error, returns a sanitized message. The pure-text round-
-/// trip parse + byte-equal assertion on the `instructions` field is
+/// trip parse + byte-equal assertion on the `developer_instructions` field is
 /// the safety net for serializer bugs (round-1 R1-C1 + round-2 R2-H1).
 pub fn merge_instructions_via_toml_value(
     canonical: &str,
@@ -82,37 +82,48 @@ pub fn merge_instructions_via_toml_value(
         .as_table_mut()
         .ok_or_else(|| anyhow!("canonical config.toml is not a TOML Table"))?;
 
-    // Compute merged instructions value. If canonical already has a
-    // non-empty instructions, append the scaffold under sentinel
-    // fences to preserve the user's text and make audit grep
-    // unambiguous (round-2 H5).
-    let merged_instructions = match table_mut.get("instructions") {
-        Some(toml::Value::String(existing)) if !existing.is_empty() => {
-            // Round-3 L3: refuse if canonical already contains a fence
-            // marker. A pre-seeded fence means a prior csq write was
-            // hand-edited or the user pre-seeded the literal — either
-            // way the recovery is `csq login` to re-seed cleanly.
-            if existing.contains(FENCE_BEGIN) || existing.contains(FENCE_END) {
+    // Codex's `instructions` key is reserved and unused. Deliver through
+    // `developer_instructions`, preserving both supported user instructions
+    // and text from csq's legacy key. Keep the legacy key unchanged in the
+    // handle copy; canonical account configuration is never mutated here.
+    let mut user_instructions = Vec::new();
+    for key in ["developer_instructions", "instructions"] {
+        match table_mut.get(key) {
+            Some(toml::Value::String(existing)) => {
+                if existing.contains(FENCE_BEGIN) || existing.contains(FENCE_END) {
+                    return Err(anyhow!(
+                        "config-N/config.toml::{key} already contains a csq layer-scaffold \
+                         fence marker; re-run `csq login N --provider codex` to re-seed cleanly"
+                    ));
+                }
+                if !existing.is_empty() {
+                    user_instructions.push(existing.as_str());
+                }
+            }
+            Some(_) => {
                 return Err(anyhow!(
-                    "config-N/config.toml::instructions already contains a csq layer-scaffold \
-                     fence marker (`{FENCE_BEGIN}` or `{FENCE_END}`). This may indicate a prior \
-                     csq write was hand-edited or the fence literal was pre-seeded. Re-run \
-                     `csq login N --provider codex` to re-seed cleanly."
+                    "config-N/config.toml::{key} must be a TOML string; edit config.toml \
+                     or re-run `csq login N --provider codex` to re-seed cleanly"
                 ));
             }
-            tracing::info!(
-                error_kind = "codex_user_instructions_extended",
-                user_bytes = existing.len(),
-                layer_bytes = scaffold.len(),
-                "appending capability-layer scaffold to user-authored instructions"
-            );
-            format!("{existing}\n\n{FENCE_BEGIN}\n\n{scaffold}\n\n{FENCE_END}\n\n")
+            None => {}
         }
-        _ => scaffold.to_string(),
+    }
+    let merged_instructions = if user_instructions.is_empty() {
+        scaffold.to_string()
+    } else {
+        let existing = user_instructions.join("\n\n");
+        tracing::info!(
+            error_kind = "codex_user_instructions_extended",
+            user_bytes = existing.len(),
+            layer_bytes = scaffold.len(),
+            "appending capability-layer scaffold to user-authored developer instructions"
+        );
+        format!("{existing}\n\n{FENCE_BEGIN}\n\n{scaffold}\n\n{FENCE_END}\n\n")
     };
 
     table_mut.insert(
-        "instructions".to_string(),
+        "developer_instructions".to_string(),
         toml::Value::String(merged_instructions.clone()),
     );
 
@@ -122,6 +133,11 @@ pub fn merge_instructions_via_toml_value(
     // extract the typed scalar; reject anything beyond a single
     // scalar (no multi-line tables, no trailing comments).
     for (k, raw_value) in overlay {
+        if matches!(k.as_str(), "instructions" | "developer_instructions") {
+            return Err(anyhow!(
+                "config_toml_overlay key {k}: instruction keys are managed by the scaffold merge"
+            ));
+        }
         let synthetic = format!("__x = {raw_value}");
         // Discard the parser's error body — same token-leak discipline as
         // the canonical-parse `map_err(|_| ...)` above (LOW-I / round-2
@@ -194,17 +210,17 @@ pub fn merge_instructions_via_toml_value(
     let serialized = toml::to_string(&table).context("serializing merged config.toml")?;
 
     // Round-1 R1-C1 + round-2 R2-H1: round-trip parse + byte-equal
-    // assertion on the instructions value catches serializer bugs.
+    // assertion on the developer_instructions value catches serializer bugs.
     let verify: toml::Value =
         toml::from_str(&serialized).context("merged config.toml fails round-trip parse")?;
     let extracted = verify
         .as_table()
-        .and_then(|t| t.get("instructions"))
+        .and_then(|t| t.get("developer_instructions"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("round-trip lost instructions key"))?;
+        .ok_or_else(|| anyhow!("round-trip lost developer_instructions key"))?;
     if extracted != merged_instructions {
         return Err(anyhow!(
-            "round-trip lost instructions content (expected {} bytes, got {} bytes)",
+            "round-trip lost developer_instructions content (expected {} bytes, got {} bytes)",
             merged_instructions.len(),
             extracted.len()
         ));
@@ -234,9 +250,9 @@ model = "gpt-5"
                 .unwrap();
         let parsed: toml::Value = toml::from_str(&merged).unwrap();
         assert_eq!(
-            parsed["instructions"].as_str().unwrap(),
+            parsed["developer_instructions"].as_str().unwrap(),
             "scaffold body",
-            "instructions must equal scaffold when canonical has no instructions key"
+            "developer_instructions must equal scaffold when no user instructions exist"
         );
     }
 
@@ -249,7 +265,7 @@ instructions = "User authored: be terse"
         let merged =
             merge_instructions_via_toml_value(canonical, "layer scaffold", &no_overlay()).unwrap();
         let parsed: toml::Value = toml::from_str(&merged).unwrap();
-        let instructions = parsed["instructions"].as_str().unwrap();
+        let instructions = parsed["developer_instructions"].as_str().unwrap();
         assert!(
             instructions.starts_with("User authored: be terse"),
             "user value must come first: {instructions}"
@@ -266,6 +282,75 @@ instructions = "User authored: be terse"
             instructions.contains("layer scaffold"),
             "layer scaffold body must appear: {instructions}"
         );
+    }
+
+    #[test]
+    fn merge_preserves_supported_and_legacy_user_instructions() {
+        for (developer, legacy) in [
+            ("Native user instructions", ""),
+            ("", "Legacy user instructions"),
+            ("Native user instructions", "Legacy user instructions"),
+            ("", ""),
+        ] {
+            let canonical =
+                format!("developer_instructions = {developer:?}\ninstructions = {legacy:?}\n");
+            let merged =
+                merge_instructions_via_toml_value(&canonical, "scaffold", &no_overlay()).unwrap();
+            let parsed: toml::Value = toml::from_str(&merged).unwrap();
+            let effective = parsed["developer_instructions"].as_str().unwrap();
+            assert!(effective.contains("scaffold"));
+            assert_eq!(parsed["instructions"].as_str(), Some(legacy));
+            let user = [developer, legacy]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if user.is_empty() {
+                assert_eq!(effective, "scaffold");
+            } else {
+                assert_eq!(
+                    effective,
+                    format!("{user}\n\n{FENCE_BEGIN}\n\nscaffold\n\n{FENCE_END}\n\n")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_refuses_non_string_instruction_keys_without_echoing_values() {
+        for key in ["developer_instructions", "instructions"] {
+            for value in ["42", "true", "[]", "{ secret = \"sensitive-value\" }"] {
+                let canonical = format!("{key} = {value}\n");
+                let err = merge_instructions_via_toml_value(&canonical, "body", &no_overlay())
+                    .unwrap_err();
+                let message = format!("{err:?}");
+                assert!(message.contains(key) && message.contains("must be a TOML string"));
+                assert!(!message.contains("sensitive-value"));
+            }
+        }
+    }
+
+    #[test]
+    fn merge_refuses_both_fence_markers_in_supported_and_legacy_instruction_keys() {
+        for key in ["developer_instructions", "instructions"] {
+            for marker in [FENCE_BEGIN, FENCE_END] {
+                let canonical = format!("{key} = {marker:?}\n");
+                let err = merge_instructions_via_toml_value(&canonical, "body", &no_overlay())
+                    .unwrap_err();
+                assert!(err.to_string().contains(key));
+                assert!(err.to_string().contains("fence marker"));
+            }
+        }
+    }
+
+    #[test]
+    fn merge_refuses_overlay_at_managed_instruction_keys() {
+        for key in ["developer_instructions", "instructions"] {
+            let overlay = BTreeMap::from([(key.to_string(), "\"replacement\"".to_string())]);
+            let err = merge_instructions_via_toml_value(canonical_minimal(), "body", &overlay)
+                .unwrap_err();
+            assert!(err.to_string().contains("managed by the scaffold merge"));
+        }
     }
 
     #[test]
@@ -286,7 +371,7 @@ instructions = "User authored: be terse"
                     .unwrap_or_else(|e| panic!("merge failed for body: {body:?}: {e}"));
             let parsed: toml::Value = toml::from_str(&merged)
                 .unwrap_or_else(|e| panic!("round-trip parse failed for body: {body:?}: {e}"));
-            let extracted = parsed["instructions"].as_str().unwrap();
+            let extracted = parsed["developer_instructions"].as_str().unwrap();
             assert_eq!(
                 extracted, body,
                 "round-trip lost content for body: {body:?}"
@@ -508,10 +593,10 @@ instructions = "[csq:layer-scaffold-begin] preseeded literal"
             merge_instructions_via_toml_value(canonical_minimal(), "body", &no_overlay()).unwrap();
         let parsed: toml::Value = toml::from_str(&merged).unwrap();
         let table = parsed.as_table().unwrap();
-        // Original keys + the instructions key we wrote.
+        // Original keys + the supported developer_instructions key we wrote.
         assert!(table.contains_key("cli_auth_credentials_store"));
         assert!(table.contains_key("model"));
-        assert!(table.contains_key("instructions"));
+        assert!(table.contains_key("developer_instructions"));
         // No extras.
         assert_eq!(table.len(), 3, "no extra keys: {merged}");
     }

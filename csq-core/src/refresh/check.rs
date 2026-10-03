@@ -1328,39 +1328,15 @@ mod tests {
         }
     }
 
-    /// Serialises every scoped-dispatcher capture in this binary.
-    ///
-    /// `tracing::subscriber::with_default` installs a THREAD-LOCAL subscriber,
-    /// which by itself is race-free — but it also updates tracing's PROCESS-GLOBAL
-    /// runtime max-level filter, and the `warn!` macro consults that filter before
-    /// it dispatches anything. Two tests entering and leaving `with_default`
-    /// concurrently can therefore transiently lower the global max while the other
-    /// thread's `warn!` is being evaluated: the event is filtered out before it ever
-    /// reaches the subscriber, and the capture legitimately sees zero events.
-    ///
-    /// That is the shape of the failure observed on CI's macos leg at 08e26839 —
-    /// `Refreshed must still emit the clock-skew event: left: 0, right: 1` — with
-    /// `BrokerResult::Refreshed` and `calls == 1` both asserted green immediately
-    /// above it, so the refresh unambiguously ran and only the CAPTURE came back
-    /// empty.
-    ///
-    /// The second caller is the reason this is not merely a flake to wait out:
-    /// `broker_codex_check_missing_or_invalid_date_emits_no_clock_skew_warn`
-    /// asserts the ABSENCE of the event, so under the same race it passes for the
-    /// wrong reason and reports on nothing (`instrument-discipline.md` MUST-1).
-    /// Serialising fixes a false RED and a false GREEN with one lock.
-    ///
-    /// A dedicated mutex rather than `platform::test_env::lock()`: the subject is
-    /// the tracing dispatcher, not the process environment, and borrowing the env
-    /// lock would couple these tests to every env-mutating test in the workspace
-    /// for no isolation benefit.
-    static BROKER_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn capture_broker_events<T>(run: impl FnOnce() -> T) -> (T, Vec<BrokerEvent>) {
         // Held for the whole scope, INCLUDING the drop of the dispatcher guard
         // inside `with_default` — releasing early would leave exactly the window
         // this lock exists to close.
-        let _capture_guard = BROKER_CAPTURE_LOCK
+        // Shared with every capturing test in the crate: the race is on
+        // tracing's process-global max-level filter (see the lock's doc), and
+        // it reproduced on CI's macos leg at 08e26839 as a zero-event capture
+        // right after the refresh was asserted to have run.
+        let _capture_guard = crate::testing::TRACING_CAPTURE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));

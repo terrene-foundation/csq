@@ -19,7 +19,7 @@ not listed here.
 
 ## Overview
 
-- **MIT License** — 465 crate(s)
+- **MIT License** — 472 crate(s)
 - **Unicode License v3** — 19 crate(s)
 - **Apache License 2.0** — 10 crate(s)
 - **BSD 3-Clause "New" or "Revised" License** — 7 crate(s)
@@ -674,8 +674,8 @@ Apache License
 
 Used by:
 
-- [csq-redact 2.20.1](https://github.com/terrene-foundation/csq)
-- [csq-sdk 2.20.1](https://github.com/terrene-foundation/csq)
+- [csq-redact 2.20.2](https://github.com/terrene-foundation/csq)
+- [csq-sdk 2.20.2](https://github.com/terrene-foundation/csq)
 - [dunce 1.0.5](https://gitlab.com/kornelski/dunce)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [sync_wrapper 1.0.2](https://github.com/Actyx/sync_wrapper)
@@ -1255,6 +1255,7 @@ Used by:
 
 - [core-foundation-sys 0.8.7](https://github.com/servo/core-foundation-rs)
 - [core-foundation 0.10.1](https://github.com/servo/core-foundation-rs)
+- [core-foundation 0.9.4](https://github.com/servo/core-foundation-rs)
 - [core-graphics-types 0.2.0](https://github.com/servo/core-foundation-rs)
 - [core-graphics 0.25.0](https://github.com/servo/core-foundation-rs)
 - [string_cache 0.9.0](https://github.com/servo/string-cache)
@@ -1620,7 +1621,7 @@ Used by:
 - [bitflags 1.3.2](https://github.com/bitflags/bitflags)
 - [bitflags 2.11.0](https://github.com/bitflags/bitflags)
 - [glob 0.3.3](https://github.com/rust-lang/glob)
-- [log 0.4.29](https://github.com/rust-lang/log)
+- [log 0.4.34](https://github.com/rust-lang/log)
 - [num-bigint 0.4.6](https://github.com/rust-num/num-bigint)
 - [num-complex 0.4.6](https://github.com/rust-num/num-complex)
 - [num-integer 0.1.46](https://github.com/rust-num/num-integer)
@@ -1831,7 +1832,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- [hyper 1.9.0](https://github.com/hyperium/hyper)
+- [hyper 1.11.1](https://github.com/hyperium/hyper)
 
 ```
 Copyright (c) 2014-2026 Sean McArthur
@@ -4868,6 +4869,44 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- [system-configuration-sys 0.6.0](https://github.com/mullvad/system-configuration-rs)
+- [system-configuration 0.7.0](https://github.com/mullvad/system-configuration-rs)
+
+```
+Copyright (c) 2024 Mullvad VPN AB
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+---
+
+## MIT License
+
+Used by:
+
 - [zbus 4.4.0](https://github.com/dbus2/zbus/)
 - [zbus 5.14.0](https://github.com/z-galaxy/zbus/)
 - [zbus_macros 4.4.0](https://github.com/dbus2/zbus/)
@@ -6650,13 +6689,13 @@ Used by:
 - [tauri-codegen 2.6.3](https://github.com/tauri-apps/tauri)
 - [tauri-macros 2.6.3](https://github.com/tauri-apps/tauri)
 - [tauri-plugin-autostart 2.5.1](https://github.com/tauri-apps/plugins-workspace)
-- [tauri-plugin-dialog 2.7.0](https://github.com/tauri-apps/plugins-workspace)
-- [tauri-plugin-fs 2.5.0](https://github.com/tauri-apps/plugins-workspace)
+- [tauri-plugin-dialog 2.7.3](https://github.com/tauri-apps/plugins-workspace)
+- [tauri-plugin-fs 2.5.2](https://github.com/tauri-apps/plugins-workspace)
 - [tauri-plugin-log 2.8.0](https://github.com/tauri-apps/plugins-workspace)
 - [tauri-plugin-opener 2.5.3](https://github.com/tauri-apps/plugins-workspace)
 - [tauri-plugin-process 2.3.1](https://github.com/tauri-apps/plugins-workspace)
-- [tauri-plugin-single-instance 2.4.1](https://github.com/tauri-apps/plugins-workspace)
-- [tauri-plugin-updater 2.10.1](https://github.com/tauri-apps/plugins-workspace)
+- [tauri-plugin-single-instance 2.4.5](https://github.com/tauri-apps/plugins-workspace)
+- [tauri-plugin-updater 2.12.0](https://github.com/tauri-apps/plugins-workspace)
 - [tauri-runtime-wry 2.11.4](https://github.com/tauri-apps/tauri)
 - [tauri-runtime 2.11.3](https://github.com/tauri-apps/tauri)
 - [tauri-utils 2.9.3](https://github.com/tauri-apps/tauri)
@@ -6677,8 +6716,11 @@ Used by:
 - [windows-link 0.1.3](https://github.com/microsoft/windows-rs)
 - [windows-link 0.2.1](https://github.com/microsoft/windows-rs)
 - [windows-numerics 0.2.0](https://github.com/microsoft/windows-rs)
+- [windows-registry 0.6.1](https://github.com/microsoft/windows-rs)
 - [windows-result 0.3.4](https://github.com/microsoft/windows-rs)
+- [windows-result 0.4.1](https://github.com/microsoft/windows-rs)
 - [windows-strings 0.4.2](https://github.com/microsoft/windows-rs)
+- [windows-strings 0.5.1](https://github.com/microsoft/windows-rs)
 - [windows-sys 0.48.0](https://github.com/microsoft/windows-rs)
 - [windows-sys 0.52.0](https://github.com/microsoft/windows-rs)
 - [windows-sys 0.59.0](https://github.com/microsoft/windows-rs)
@@ -6933,7 +6975,7 @@ DEALINGS IN THE SOFTWARE.
 Used by:
 
 - [adler2 2.0.1](https://github.com/oyvindln/adler2)
-- [anyhow 1.0.103](https://github.com/dtolnay/anyhow)
+- [anyhow 1.0.104](https://github.com/dtolnay/anyhow)
 - [async-channel 2.5.0](https://github.com/smol-rs/async-channel)
 - [async-executor 1.14.0](https://github.com/smol-rs/async-executor)
 - [async-io 2.6.0](https://github.com/smol-rs/async-io)
@@ -6941,7 +6983,7 @@ Used by:
 - [async-process 2.5.0](https://github.com/smol-rs/async-process)
 - [async-signal 0.2.14](https://github.com/smol-rs/async-signal)
 - [async-task 4.7.1](https://github.com/smol-rs/async-task)
-- [async-trait 0.1.89](https://github.com/dtolnay/async-trait)
+- [async-trait 0.1.92](https://github.com/dtolnay/async-trait)
 - [atomic-waker 1.1.2](https://github.com/smol-rs/atomic-waker)
 - [blocking 1.6.2](https://github.com/smol-rs/blocking)
 - [camino 1.2.2](https://github.com/camino-rs/camino)
@@ -6985,6 +7027,7 @@ Used by:
 - [servo_arc 0.4.3](https://github.com/servo/stylo)
 - [syn 1.0.109](https://github.com/dtolnay/syn)
 - [syn 2.0.117](https://github.com/dtolnay/syn)
+- [syn 3.0.6](https://github.com/dtolnay/syn)
 - [thiserror-impl 1.0.69](https://github.com/dtolnay/thiserror)
 - [thiserror-impl 2.0.18](https://github.com/dtolnay/thiserror)
 - [thiserror 1.0.69](https://github.com/dtolnay/thiserror)

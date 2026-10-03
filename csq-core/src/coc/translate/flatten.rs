@@ -652,7 +652,7 @@ mod tests {
     /// the aliasing it encoded was itself inert (harness-decomposition
     /// reports 13 §5.1 / 14 §6.2) — `codex::translate` emits a
     /// `CodexSpawnPayload.instructions` field destined for
-    /// `~/.codex/config.toml::instructions`, a key Kimi's config schema does
+    /// `~/.codex/config.toml::developer_instructions`, a key Kimi's config schema does
     /// not have and Grok never reads at all. Kimi/Grok now each get their
     /// own translator + header, pinned against their own empty output below
     /// (workspace hermes-parity an internal journal entry).

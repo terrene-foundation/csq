@@ -1604,8 +1604,9 @@ async fn tick_impl(
 
     // If any Anthropic token rotated this tick, mirror the fresh tokens into the
     // keychain items CC reads (CC is keychain-first). Account-agnostic sweep; the
-    // newer-than-keychain guard no-ops unchanged dirs. Only runs on a real
-    // refresh, so idle ticks pay nothing.
+    // newer-than-keychain guard no-ops unchanged dirs. Runs on a real
+    // refresh, or once after the keychain stops reading as locked; an idle
+    // tick pays one bounded lock-state probe and no `security` calls.
     //
     // Runs in `spawn_blocking`: the sweep shells one or more `security`
     // subprocesses per live handle dir, synchronous but NOT unbounded — every
@@ -1620,11 +1621,19 @@ async fn tick_impl(
     // half the runtime and delay socket IPC (mirrors `run_held_sweep_tick`'s
     // wrapper), which is why this still runs off the async runtime even
     // though no individual step blocks forever.
-    if any_anthropic_refreshed {
+    // Also re-run the sweep once after a period in which keychain calls were
+    // skipped because the keychain was locked (see `run_security_bounded`):
+    // otherwise a mirror skipped while the screen was locked would wait for
+    // the account's next refresh, leaving CC on the previous token.
+    // The lock probe is a blocking OS call, so it runs inside the same
+    // spawn_blocking as the sweep (once per tick), never on a runtime worker.
+    {
         let sweep_base = base_dir.to_path_buf();
         let sweep_refreshed = refreshed;
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            sync_refreshed_keychains(&sweep_base, &sweep_refreshed);
+            if any_anthropic_refreshed || crate::credentials::keychain::keychain_catch_up_due() {
+                sync_refreshed_keychains(&sweep_base, &sweep_refreshed);
+            }
         })
         .await
         {

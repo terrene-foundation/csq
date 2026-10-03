@@ -516,6 +516,31 @@ pub fn create_handle_dir(
     create_handle_dir_named(base_dir, claude_home, account, pid, &format!("term-{pid}"))
 }
 
+/// The child recorded in `.live-cc-pid` is still running. Plain liveness,
+/// exactly as `sweep_dead_handles` uses: the marker is also written for
+/// codex and other non-claude children, so an identity check would make this
+/// guard inert for them, and a refusal here only costs one retry with a new
+/// PID. On macOS `csq exec` spawns `claude` as a child, and a SIGKILLed csq
+/// leaves it running while `.live-pid` names a dead PID. An unreadable
+/// marker is ignored (current behaviour) with a debug line.
+fn cc_child_is_live(handle_dir: &Path) -> Option<u32> {
+    let path = handle_dir.join(".live-cc-pid");
+    if path.symlink_metadata().is_err() {
+        return None;
+    }
+    match markers::read_live_cc_pid(handle_dir) {
+        Some(cc) if is_pid_alive(cc) => Some(cc),
+        Some(_) => None,
+        None => {
+            tracing::debug!(
+                error_kind = "handle_dir_live_cc_pid_unreadable",
+                "ignoring an unreadable .live-cc-pid"
+            );
+            None
+        }
+    }
+}
+
 /// `create_handle_dir` generalized to an explicit `dir_name`.
 ///
 /// `create_handle_dir` is the thin wrapper that passes `term-<pid>`. The
@@ -570,6 +595,18 @@ pub fn create_handle_dir_named(
                     ),
                 });
             }
+        }
+        if let Some(cc) = cc_child_is_live(&handle_dir) {
+            return Err(CredentialError::Corrupt {
+                path: handle_dir.clone(),
+                reason: format!(
+                    "handle dir {dir_name} may still be in use by a child process \
+                     (PID {cc}); it was left untouched. Retry the launch — a new \
+                     launch normally gets a different process id and so a different \
+                     directory. Do not stop PID {cc} unless you have confirmed it is \
+                     a leftover csq child."
+                ),
+            });
         }
 
         warn!(
@@ -886,6 +923,18 @@ pub fn create_handle_dir_codex_named(
                     ),
                 });
             }
+        }
+        if let Some(cc) = cc_child_is_live(&handle_dir) {
+            return Err(CredentialError::Corrupt {
+                path: handle_dir.clone(),
+                reason: format!(
+                    "handle dir {dir_name} may still be in use by a child process \
+                     (PID {cc}); it was left untouched. Retry the launch — a new \
+                     launch normally gets a different process id and so a different \
+                     directory. Do not stop PID {cc} unless you have confirmed it is \
+                     a leftover csq child."
+                ),
+            });
         }
 
         warn!(
@@ -3184,9 +3233,10 @@ fn sweep_dead_handles_inner(
             continue;
         }
 
-        // Windows: also honor `.live-cc-pid` (the spawned CC child).
-        // On Unix, exec replaces csq-cli with claude so there is a
-        // single PID and this marker is not written.
+        // Also honor `.live-cc-pid` (the spawned child). Written by any
+        // spawn-capture launch (`csq run` OneShot/Interactive spawn modes,
+        // `csq exec`, the codex supervisor) and on Windows; the plain Unix
+        // `csq run` exec path writes none.
         let cc_pid = markers::read_live_cc_pid(&path);
         if let Some(cc) = cc_pid {
             if is_pid_alive(cc) {
@@ -8635,6 +8685,85 @@ mod tests {
             }
             other => panic!("expected Corrupt for live pid collision, got: {other:?}"),
         }
+    }
+
+    fn orphan_dir_with(base: &Path, pid: u32, live_pid: &str, cc_pid: Option<String>) -> PathBuf {
+        let handle = base.join(format!("term-{pid}"));
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".live-pid"), live_pid).unwrap();
+        std::fs::write(handle.join("sentinel"), "keep").unwrap();
+        if let Some(cc) = cc_pid {
+            std::fs::write(handle.join(".live-cc-pid"), cc).unwrap();
+        }
+        handle
+    }
+
+    /// `.live-pid` dead but `.live-cc-pid` names a live NON-claude child (a
+    /// codex child, or anything else): refuse and leave the dir untouched.
+    #[cfg(unix)]
+    #[test]
+    fn create_handle_dir_refuses_when_child_is_live() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 7);
+        let account = AccountNum::try_from(7u16).unwrap();
+        let mut child = crate::platform::process::spawn_foreign_test_process();
+        let pid = 999_999_001u32;
+        let handle = orphan_dir_with(base, pid, "999999002", Some(child.id().to_string()));
+        let result = create_handle_dir_codex(base, account, pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        match result {
+            Err(CredentialError::Corrupt { reason, .. }) => {
+                assert!(
+                    reason.contains("may still be in use by a child process"),
+                    "{reason}"
+                );
+                assert!(reason.contains("left untouched"), "{reason}");
+                assert!(
+                    reason.contains("a different process id and so a different directory"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(handle.join("sentinel").exists(), "dir must be untouched");
+    }
+
+    /// Any live process named in `.live-cc-pid` counts, whatever it is.
+    #[cfg(unix)]
+    #[test]
+    fn cc_child_is_live_true_for_any_live_pid() {
+        let dir = TempDir::new().unwrap();
+        let mut foreign = crate::platform::process::spawn_foreign_test_process();
+        std::fs::write(dir.path().join(".live-cc-pid"), foreign.id().to_string()).unwrap();
+        let live = cc_child_is_live(dir.path());
+        let expected = Some(foreign.id());
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert_eq!(live, expected);
+    }
+
+    /// Both dead (and an unreadable marker): proceeds as before.
+    #[test]
+    fn cc_child_is_live_false_when_dead_or_unreadable() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".live-cc-pid"), "999999003").unwrap();
+        assert_eq!(cc_child_is_live(dir.path()), None);
+        std::fs::write(dir.path().join(".live-cc-pid"), "not-a-pid").unwrap();
+        assert_eq!(cc_child_is_live(dir.path()), None);
+    }
+
+    #[test]
+    fn create_handle_dir_proceeds_when_both_pids_dead() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_codex_slot(base, 7);
+        let account = AccountNum::try_from(7u16).unwrap();
+        let pid = 999_999_004u32;
+        orphan_dir_with(base, pid, "999999005", Some("999999006".to_string()));
+        let result = create_handle_dir_codex(base, account, pid);
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

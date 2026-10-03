@@ -123,6 +123,11 @@ impl Fingerprint {
 pub(crate) fn fingerprint_from_raw_json(raw_json: &str) -> Option<Fingerprint> {
     let val: serde_json::Value = serde_json::from_str(raw_json).ok()?;
     let refresh = val.get("claudeAiOauth")?.get("refreshToken")?.as_str()?;
+    // An empty refresh token is no credential: every such item would share
+    // one fingerprint, so it identifies nothing.
+    if refresh.is_empty() {
+        return None;
+    }
     Some(Fingerprint::of_refresh_token(refresh))
 }
 
@@ -471,6 +476,12 @@ mod tests {
     #[test]
     fn fingerprint_from_raw_json_none_on_missing_refresh_token() {
         let raw = r#"{"claudeAiOauth":{"accessToken":"at"}}"#;
+        assert!(fingerprint_from_raw_json(raw).is_none());
+    }
+
+    #[test]
+    fn fingerprint_from_raw_json_none_on_empty_refresh_token() {
+        let raw = r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":""}}"#;
         assert!(fingerprint_from_raw_json(raw).is_none());
     }
 

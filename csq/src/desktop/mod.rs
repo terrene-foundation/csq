@@ -1396,6 +1396,10 @@ fn init_logging_subscriber(base_dir: &Path) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The desktop app hosts the daemon in-process and has no terminal: its
+    // keychain work must defer while the keychain is locked rather than raise
+    // the unlock dialog (see csq_core::credentials::keychain).
+    csq_core::credentials::keychain::declare_background_keychain_process();
     // ── Headless self-test mode (an internal ticket) ──────────────────────────────────────
     //
     // When `CSQ_DESKTOP_SELFTEST=1` is set (or `--self-test` is the sole arg),

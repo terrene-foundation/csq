@@ -1598,8 +1598,11 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
             .arg(
-                "i=0; while [ $i -lt 500 ]; do date +%s%N >> \"$1\" 2>/dev/null; \
-                 i=$((i+1)); sleep 0.02; done & sleep 30",
+                // Absolute paths: sibling tests set PATH to an empty dir
+                // under `test_env::lock()`, which this test does not hold, so
+                // a bare `date`/`sleep` can intermittently fail to resolve.
+                "i=0; while [ $i -lt 500 ]; do /bin/date +%s%N >> \"$1\" 2>/dev/null; \
+                 i=$((i+1)); /bin/sleep 0.02; done & /bin/sleep 30",
             )
             .arg("worker") // $0 inside the script (unused, but conventional)
             .arg(&marker); // $1 inside the script — the marker path
@@ -1656,7 +1659,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let marker = dir.path().join("worker.marker");
 
-        let mut cmd = Command::new("perl");
+        // Absolute path for the same reason as the shell scripts above: a
+        // sibling test may have PATH pointed at an empty dir.
+        let mut cmd = Command::new("/usr/bin/perl");
         cmd.arg("-e").arg(
             "use POSIX qw(setsid); \
              my $marker = $ARGV[0]; \
@@ -1766,18 +1771,35 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
             .arg(
-                "i=0; while [ $i -lt 500 ]; do date +%s%N >> \"$1\" 2>/dev/null; \
-                 i=$((i+1)); sleep 0.02; done & sleep 30",
+                // Absolute paths: sibling tests set PATH to an empty dir
+                // under `test_env::lock()`, which this test does not hold, so
+                // a bare `date`/`sleep` can intermittently fail to resolve.
+                "i=0; while [ $i -lt 500 ]; do /bin/date +%s%N >> \"$1\" 2>/dev/null; \
+                 i=$((i+1)); /bin/sleep 0.02; done & /bin/sleep 30",
             )
             .arg("worker")
             .arg(&marker);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
-        // Raise SIGINT against our own pid shortly after the wait starts —
-        // well before the 20s bound below, and well before the subprocess's
-        // own `sleep 30` would return on its own.
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(200));
+        // Raise SIGINT against our own pid once the worker has written its
+        // first line — so the "worker wrote before SIGINT" precondition below
+        // holds by construction rather than by a fixed delay (a fixed 200ms
+        // lost the race to `sh` + `date` startup under a loaded parallel run:
+        // 1 failure in 30 runs of `auto_update::tests`). Bounded at 10s, well
+        // inside the 20s wait bound and the subprocess's own `sleep 30`; if
+        // the worker never writes, SIGINT still fires and the assertion below
+        // reports the missing write.
+        let marker_for_signal = marker.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::fs::metadata(&marker_for_signal)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                == 0
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGINT);
             }
